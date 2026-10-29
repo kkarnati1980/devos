@@ -1,59 +1,59 @@
 # Phase 0 — Server & Environment Setup
 
-Status: spec for KK to action. Derived from Decision Record v1.3.0 (O1–O7, O10) and PRD v1.3.0. Nothing here touches MyBrain.
+Status: spec for KK to action. Module/human-task numbering matches Linear project **AI Development Team** (team Devos) and Decision Record v1.3.0. Nothing here touches MyBrain.
 
-This is the checklist that must be done **before** the DevOS build agents can run end-to-end. It separates **what KK does by hand** (accounts, money, secrets) from **what DevOS/Claude does in code** (provisioning, config, wiring). Secrets are entered directly into the server's secret store or the provider console — **never pasted into chat or committed**.
+This is the checklist that must be done **before** the DevOS build agents can run end-to-end. It separates **what KK does by hand** (accounts, money, secrets — Linear issues H1–H9) from **what DevOS/Claude does in code** (the P0 spike/scaffold modules M0.1–M0.6). Secrets are entered directly into the server's secret store or the provider console — **never pasted into chat or committed**.
 
 ---
 
 ## A. What KK provisions by hand (Linear human tasks H1–H9)
 
-| # | Task | Detail | Needed for |
-|---|------|--------|-----------|
-| H1 | Buy the DevOS server | Hostinger **KVM 8** (8 vCPU / 32 GB / 400 GB NVMe), India DC, template **"Ubuntu 24.04 with Coolify"**. Dedicated to DevOS; MyBrain stays on srv1834343 (KVM 1), untouched. | O1 |
-| H2 | Cloudflare Zero Trust | Enable Access + Tunnel on `accelr8.in`; Google as the identity provider; one Access application for `devos.accelr8.in` (policy: allow KK's Google account). | O3, O4 |
-| H3 | GitHub token | Fine-grained PAT, **All repositories**, 1-year expiry, permissions: Administration (incl. repo creation), Contents, Issues, Pull requests, Workflows, Actions, Commit statuses, Webhooks, Secrets, Environments, Metadata (RW where applicable). Store in DevOS secret store as `GITHUB_TOKEN`. | O7, O10 |
-| H4 | Codex GitHub App | Install OpenAI Codex app on the `kkarnati1980` account, **review on, auto-fix off**, scope All repositories. | D1 |
-| H5 | Anthropic API key | New key, provider-side monthly cap **USD 15** (editable). Store as `ANTHROPIC_API_KEY`. | O5 |
-| H6 | OpenAI API key | New key (for Codex), provider-side monthly cap **USD 15**. Store as `OPENAI_API_KEY`. | O5 |
-| H7 | Cloudflare R2 bucket | One bucket for off-server Postgres backups; R2 token with object RW. Store creds as `R2_*`. | O2 |
-| H8 | Linear API key | Personal API key for the orchestrator to read/write issues. Store as `LINEAR_API_KEY`. | D10 |
-| H9 | Domain DNS | Confirm `accelr8.in` is on Cloudflare; DevOS subdomains created by Tunnel config (no manual A records). | O3 |
+| # | Task | Detail | Unblocks |
+|---|------|--------|----------|
+| H1 | Buy the DevOS server | Hostinger **KVM 8** (8 vCPU / 32 GB / 400 GB NVMe), India DC (cannot change after setup), template **"Ubuntu 24.04 with Coolify"**. Dedicated to DevOS; MyBrain stays on srv1834343 (KVM 1), untouched. Share hostname in the issue; never paste passwords. | M0.1 |
+| H2 | Cloudflare Zero Trust | Confirm `accelr8.in` is on Cloudflare; enable Zero Trust (free). Access + Tunnel, Google login, for `devos.accelr8.in` and `*.devos.accelr8.in`. | M0.2 |
+| H3 | GitHub token | Fine-grained PAT, **All repositories**, 1-year expiry, **Admin + repository-creation + the stated set** (Contents, Issues, Pull requests, Workflows, Actions, Commit statuses, Webhooks, Secrets, Environments, Metadata). Store in the server secret store as `GITHUB_TOKEN`; never in chat. | M0.6 |
+| H4 | Anthropic API key | New key, provider-side monthly cap **USD 15** (editable). Store as `ANTHROPIC_API_KEY`. | M0.5 |
+| H5 | OpenAI API key | New key (for Codex), provider-side monthly cap **USD 15**. Store as `OPENAI_API_KEY`. | M0.3 |
+| H6 | Codex GitHub App | Install OpenAI Codex app on `kkarnati1980/devos`, **review on, "@codex fix" off** (only Claude writes code). | M0.3 / review loop |
+| H7 | Cloudflare R2 bucket | Bucket `devos-backups` + an access key scoped to it, for off-server Postgres backups. Store creds as `R2_*`. | M4.5 |
+| H8 | Linear API key | Personal API key in workspace `kishoremb`, so DevOS creates one Linear project per build (M2.6). Enter in the setup wizard. | M2.6 |
+| H9 | Enter keys + confirm caps | In the DevOS setup wizard: enter the real keys and confirm the three USD 15 caps (Anthropic, OpenAI, per-project), editable. | Gate G1 |
 
 KK also confirms, in Phase 0, the technical defaults so they can be logged as ADRs: 15-minute deploy probation, 30-day archive window, NFR targets, Uptime Kuma + Sentry monitoring, R2 backup retention.
 
----
-
-## B. What DevOS/Claude does in code (Phase-0 modules M0.1–M0.6)
-
-These run on KK's existing setup (this environment + the new server) under the normal build loop. DevOS never deploys changes to itself without KK's approval.
-
-| Module | Output |
-|--------|--------|
-| M0.1 | Repo + monorepo scaffold (**this repo** — done), `rules.md` → `CLAUDE.md`/`AGENTS.md`, CI (install/typecheck/lint/test + rules-drift), branch protection on `main`. |
-| M0.2 | Coolify bootstrap: DevOS stack definition (Docker Compose), Postgres service, Redis service, per-project preview+live stack template. |
-| M0.3 | Cloudflare Tunnel + Access config as code; `devos.accelr8.in` routed to the dashboard; per-project subdomain pattern. |
-| M0.4 | Secret store on the server (what the agents read `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, `LINEAR_API_KEY`, `R2_*` from); env schema + validation. |
-| M0.5 | Postgres backup job → R2, nightly, with weekly automated test-restore. |
-| M0.6 | Agent runner base image: Node 22, pnpm, Claude Code / Agent SDK, Codex CLI, git, the sandbox the RE/skills/repo-read capabilities (D11–D13) run inside. |
-
-**Gate G0 (closes Phase 0):** stored evidence that — CI is green on `main`; branch protection blocks direct pushes; the server resolves `devos.accelr8.in` behind Access (Google login enforced, no public exposure); Postgres backup to R2 ran and a test-restore succeeded; the agent runner image builds and can execute one trivial Claude + Codex round trip reading secrets from the store.
+**Blocking items for the first agent run:** H3 (GitHub token), H4 (Anthropic key), H5 (OpenAI key). H1/H2 gate the server-side modules; H7/H8 are needed later (P4 / P2).
 
 ---
 
-## C. What this environment (where we are now) already covers
+## B. What DevOS/Claude does in code — P0 modules (M0.1–M0.6)
 
-- **This repo** is scaffolded and pushed (M0.1 in progress).
-- **Linear**: team Devos / project "AI Development Team", milestones per phase, module issues, labels, One-way GitHub→Linear sync, PR/branch linking (O10) — configured.
-- **GitHub**: `devos` repo created (private, under `kkarnati1980`); Claude GitHub App scoped to All repositories.
+These run on KK's existing setup (this environment + the new server) under the normal build loop. DevOS never deploys changes to itself without KK's approval. Each module's contract (`docs/modules/M0.x.md`) is written by the Architect at phase start.
+
+| Module | Lane | Depends on | Done when |
+|--------|------|-----------|-----------|
+| **M0.1** Server baseline | A (critical path) | H1 | KVM 8 hardened, Coolify private, snapshots on — Coolify reachable only over an SSH tunnel; evidence stored. |
+| **M0.2** Private access | A | M0.1, H2 | Cloudflare Tunnel + Access live; `devos.accelr8.in` refuses everyone but KK's Google login. |
+| **M0.3** Codex review spike | B | H5 | `codex exec review` returns valid PASS / CHANGES_REQUESTED JSON on a sample repo with a planted bug. |
+| **M0.4** Coolify API spike | A (critical path) | M0.1 | Create, deploy, roll back, delete a stack by Coolify API — all four scripted and repeatable (else Dokploy chosen and logged). |
+| **M0.5** Agent SDK spike | B | M0.1, H4 | Unattended Agent SDK run in a container with a tool allow-list; a blocked tool call is denied by hook; time + cost recorded. |
+| **M0.6** Repo scaffold | C | H3 | Monorepo (dashboard, api, shared), CI, one rules file → CLAUDE.md + AGENTS.md; **CI green on an empty build. ✓ DONE 29 Oct 2026** (commit `4580580`, CI run #40866008923 green). |
+
+**Gate G0 (closes Phase 0):** stored evidence that every spike M0.1–M0.6 has a recorded working run, and any failed spike has chosen its fallback (Dokploy for Coolify; `codex exec` + schema for review).
+
+---
+
+## C. What this environment already covers
+
+- **Repo**: `kkarnati1980/devos` scaffolded and pushed to `main`; CI green (M0.6 ✓). Branch protection on `main` still to be enabled by KK (the agent proxy blocks that API path).
+- **Linear**: team Devos / project "AI Development Team" (P-DEVOS-3), 7 milestones P0–P6, 51 issues restored to Backlog, labels, One-way GitHub→Linear sync, PR/branch linking (O10).
+- **GitHub**: `devos` repo created (private, `kkarnati1980`); Claude GitHub App scoped to All repositories.
 
 ---
 
 ## D. Order of operations
 
-1. KK completes H1–H9 (server, Cloudflare, tokens, keys, R2) and enters secrets into the provider consoles / server store.
-2. DevOS runs M0.2–M0.6 against the new server.
+1. KK completes H1–H9 (server, Cloudflare, tokens, keys, R2, wizard) — secrets into provider consoles / server store, not chat.
+2. DevOS runs the P0 spikes M0.1–M0.5 against the new server (M0.6 already done).
 3. Gate G0 evidence captured → Phase 0 closes.
-4. Phase 1 (orchestrator + dashboard skeleton) begins.
-
-KK's blocking items for the **first** agent run are **H3 (GitHub token), H5 (Anthropic key), H6 (OpenAI key), H8 (Linear key)**. H1/H2/H7 are needed before M0.2 (server-side modules) but not before the repo/CI work.
+4. Phase 1 (data model, API+auth, dashboard shell, setup wizard, run engine, notifications) begins.
