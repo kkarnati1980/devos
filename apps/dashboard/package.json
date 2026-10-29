@@ -1,0 +1,6 @@
+{
+  "name": "@devos/dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "description": "DevOS dashboard (Next.js). Built in M1.3."
+}

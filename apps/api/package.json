@@ -1,0 +1,6 @@
+{
+  "name": "@devos/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "DevOS orchestrator + API (NestJS + Prisma). Built in M1.2."
+}
