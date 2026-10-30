@@ -11,7 +11,7 @@ This is the checklist that must be done **before** the DevOS build agents can ru
 | # | Task | Detail | Unblocks |
 |---|------|--------|----------|
 | H1 | Buy the DevOS server ✓ | Hostinger **KVM 4** (4 vCPU / 16 GB / 200 GB NVMe), India DC, template **"Ubuntu 24.04 with Coolify"** (ADR-0002 supersedes the earlier KVM 8). Dedicated to DevOS; MyBrain stays on srv1834343 (KVM 1), untouched. **Done 30 Oct 2026** — IP shared with Claude. | M0.1 |
-| H2 | Cloudflare Zero Trust | Confirm `accelr8.in` is on Cloudflare; enable Zero Trust (free). Access + Tunnel, Google login, for `devos.accelr8.in` and `*.devos.accelr8.in`. | M0.2 |
+| H2 | ~~Cloudflare Zero Trust~~ — **not needed** | Dropped (ADR-0003): private access is via Tailscale, not Cloudflare. `accelr8.in` stays untouched at GoDaddy. In M0.2 you'll instead approve the server joining your Tailscale tailnet (Google login) and install Tailscale on your devices. | M0.2 |
 | H3 | GitHub token | Fine-grained PAT, **All repositories**, 1-year expiry, **Admin + repository-creation + the stated set** (Contents, Issues, Pull requests, Workflows, Actions, Commit statuses, Webhooks, Secrets, Environments, Metadata). Store in the server secret store as `GITHUB_TOKEN`; never in chat. | M0.6 |
 | H4 | Anthropic API key | New key, provider-side monthly cap **USD 15** (editable). Store as `ANTHROPIC_API_KEY`. | M0.5 |
 | H5 | OpenAI API key | New key (for Codex), provider-side monthly cap **USD 15**. Store as `OPENAI_API_KEY`. | M0.3 |
@@ -33,7 +33,7 @@ These run on KK's existing setup (this environment + the new server) under the n
 | Module | Lane | Depends on | Done when |
 |--------|------|-----------|-----------|
 | **M0.1** Server baseline | A (critical path) | H1 | KVM 8 hardened, Coolify private, snapshots on — Coolify reachable only over an SSH tunnel; evidence stored. |
-| **M0.2** Private access | A | M0.1, H2 | Cloudflare Tunnel + Access live; `devos.accelr8.in` refuses everyone but KK's Google login. |
+| **M0.2** Private access (Tailscale) | A | M0.1 | Server on KK's tailnet; dashboard + Coolify reachable only over Tailscale (Google SSO), nothing public (ADR-0003). |
 | **M0.3** Codex review spike | B | H5 | `codex exec review` (CLI, OpenAI-API-key auth per ADR-0002) returns valid PASS / CHANGES_REQUESTED JSON on a sample repo with a planted bug. |
 | **M0.4** Coolify API spike | A (critical path) | M0.1 | Create, deploy, roll back, delete a stack by Coolify API — all four scripted and repeatable (else Dokploy chosen and logged). |
 | **M0.5** Agent SDK spike | B | M0.1, H4 | Unattended Agent SDK run in a container with a tool allow-list; a blocked tool call is denied by hook; time + cost recorded. |
