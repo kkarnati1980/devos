@@ -46,6 +46,15 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 - **GitHub** holds code; PRs link to Linear issues by branch name. No GitHub issue mirroring.
 - Decisions: `docs/decisions/`. Module contracts: `docs/modules/`.
 
+## Review guidelines
+Codex (CLI `codex exec review` and, if enabled, the GitHub code-review app) reviews against these. Review only; never implement, fix, or push changes — Claude writes all code.
+- **Verdict:** PASS only if the change meets its module contract and acceptance tests, introduces no regression, and ships no secret. Otherwise CHANGES_REQUESTED, each finding tied to a file/line with the concrete failure.
+- **Correctness first:** does it satisfy the cited requirement IDs and the `docs/modules/<id>.md` contract? Flag logic errors, unhandled edge cases, race conditions, and broken error handling over style.
+- **Security:** no secrets, keys, or tokens in code or config; input validated at trust boundaries; no new network egress outside the allow-list; least-privilege tokens only.
+- **Tests:** acceptance tests exist for the requirement and actually exercise it; no test weakened or skipped to pass.
+- **Scope:** change touches only the assigned module's files; one module = one PR.
+- **Boundaries (D11/D13):** no circumvention of copy protection/DRM/licensing/paywalls, no lifting proprietary code, no malware/exploits; referenced-repo licences kept intact.
+
 
 ## Codex review
 Review the diff against these rules and the module contract. Return `PASS` or `CHANGES_REQUESTED` using the JSON verdict schema in `packages/shared`. Do not edit code; auto-fix is off.
