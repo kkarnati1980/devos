@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # DevOS M0.3 — Codex review spike (ADR-0002: Codex CLI, API-key auth, read-only, structured verdict)
-# Version: 1.0.2
+# Version: 1.0.3
 # v1.0.1 (Codex review 55ee78d): strict schema validation (types of every field);
 # AT2 requires the finding to identify the missing /100.
 # v1.0.2 (Codex review 2473191): a verdict is written to verdicts/<sha>.json only after
-# schema, SHA, read-only and AT checks pass; AT2 requires the literal '/ 100' (or '/100').
+# schema, SHA, read-only and AT checks pass.
+# v1.0.3 (server run): AT2 matched wording ('/ 100') and failed on a correct finding
+# phrased differently. AT2 now requires a high/medium finding on discount.py at the
+# planted-bug line, derived from commit B itself - objective and wording-independent.
 # Run as root on the DevOS server (interactive, for the hidden key prompt):
 #     ssh -t root@devos 'bash /root/03-codex-review-spike.sh'
 # The OpenAI key goes to /root/.devos/openai.env (600) via a hidden prompt and is fed
@@ -191,13 +194,15 @@ before="$(g -C "$REPO" status --porcelain --untracked-files=all)"
 [[ -z "$before" ]] || fail "sample repo not clean before reviews"
 rm -f "$VDIR/$B.json" "$VDIR/$C.json"
 
+BUGLINE="$(git show "$B:discount.py" | grep -n 'price \* (1 - pct)' | cut -d: -f1)"
+[[ "$BUGLINE" =~ ^[0-9]+$ ]] || fail "could not locate the planted-bug line in $B"
 tB="$(review "$B" bug)"
 pristine "$B"
 check_schema "$DIR/last-bug.json" "$B"
-jq -e '.verdict == "CHANGES_REQUESTED" and ([.findings[] | select((.severity=="high" or .severity=="medium") and (.file | test("discount\\.py$")) and ((.evidence + " " + .consequence) | test("/ ?100")))] | length >= 1)' \
-  "$DIR/last-bug.json" >/dev/null || { cat "$DIR/last-bug.json"; fail "AT2: no high/medium discount.py finding naming the missing / 100"; }
+jq -e --argjson L "$BUGLINE" '.verdict == "CHANGES_REQUESTED" and ([.findings[] | select((.severity=="high" or .severity=="medium") and (.file | test("(^|/)discount\\.py$")) and .line == $L)] | length >= 1)' \
+  "$DIR/last-bug.json" >/dev/null || { cat "$DIR/last-bug.json"; fail "AT2: no high/medium finding on discount.py:$BUGLINE (the planted bug)"; }
 store "$DIR/last-bug.json" "$B"
-pass "AT2 buggy commit -> CHANGES_REQUESTED naming the missing / 100 (${tB}s)"
+pass "AT2 buggy commit -> CHANGES_REQUESTED at discount.py:$BUGLINE, the planted bug (${tB}s)"
 
 tC="$(review "$C" clean)"
 pristine "$C"
@@ -211,7 +216,7 @@ pass "AT5 read-only: HEAD unchanged, working tree clean after each review"
 pass "AT6 validated verdicts stored per SHA in $VDIR"
 
 say "6/6 Evidence"
-echo "----- M0.3 evidence v1.0.2 $(date -u +%FT%TZ) -----"
+echo "----- M0.3 evidence v1.0.3 $(date -u +%FT%TZ) -----"
 echo "# versions"; echo "node $(node -v); $(codex --version 2>&1 | head -n1)"
 echo "# model"; grep -m1 -iE '^model|model:' "$DIR/codex-bug.log" | redact || echo "(default; see codex logs)"
 echo "# verdict B ($B, ${tB}s)"; jq . "$VDIR/$B.json"
