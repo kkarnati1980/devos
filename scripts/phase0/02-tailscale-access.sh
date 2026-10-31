@@ -70,7 +70,7 @@ tailscale serve reset || true
 ufw route allow in on tailscale0 comment 'tailnet -> containers (M0.2)'
 
 HOST="$(ts_dnsname)"
-echo "----- M0.2 evidence v1.1.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.2 evidence v1.2.0 $(date -u +%FT%TZ) -----"
 echo "# tailscale";  tailscale status
 echo "# dnsname";    echo "${HOST}"
 echo "# serve";      tailscale serve status 2>&1 | head -3
