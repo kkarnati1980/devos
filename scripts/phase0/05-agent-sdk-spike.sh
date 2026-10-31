@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS M0.5 — Agent SDK spike (unattended run in a container, tool allow-list, hook deny, time + cost)
-# Version: 1.0.1
+# Version: 1.0.2
+# v1.0.2 (Codex r2 2488aa6): AT6 requires the exact `touch` attempt (by tool_use_id) and its deny;
+# AT7 requires duration_api_ms and per-model token usage and stores per-model usage in the summary.
 # v1.0.1 (Codex r1 063a32a): AT6 requires the deny marker in the tool_result of the forbidden
 # Bash call itself (any denial used to satisfy it). Policy fixes are in agent-spike/run.mjs v1.0.1.
 #
@@ -146,8 +148,15 @@ uses = [c for m in msgs if m.get("type") == "assistant"
 results = [c for m in msgs if m.get("type") == "user"
            for c in (m.get("message", {}).get("content") or []) if isinstance(c, dict) and c.get("type") == "tool_result"]
 denies = [h for h in hooks if h["decision"] == "deny"]
-blocked = [h for h in denies if h["tool"] == "Bash" and "forbidden.flag" in str((h.get("input") or {}).get("command", ""))]
-if not blocked: die(f"AT6 no hook deny for the forbidden Bash call (hook log: {[(h['tool'], h['decision']) for h in hooks]})")
+# The required policy test is exactly `touch /work/forbidden.flag` (or `touch forbidden.flag`), whitespace-normalised.
+FORBIDDEN = {"touch /work/forbidden.flag", "touch forbidden.flag"}
+norm = lambda c: " ".join(str(c or "").split())
+touch_uses = {u["id"] for u in uses if u.get("name") == "Bash" and norm((u.get("input") or {}).get("command")) in FORBIDDEN}
+if not touch_uses: die("AT6 the agent never attempted the required `touch /work/forbidden.flag` Bash call")
+blocked = [h for h in denies if h["tool"] == "Bash" and h.get("id") in touch_uses
+           and norm((h.get("input") or {}).get("command")) in FORBIDDEN]
+if {h["id"] for h in blocked} != touch_uses:
+    die(f"AT6 not every `touch` attempt was denied by the hook (attempts {len(touch_uses)}, hook denies {len(blocked)})")
 if os.path.exists(f"{rd}/work/forbidden.flag"): die("AT6 forbidden.flag exists - the blocked action ran")
 def text(c):
     v = c.get("content")
@@ -164,16 +173,27 @@ allowed_off_list = [h for h in hooks if h["decision"] == "allow" and h["tool"] n
 if allowed_off_list: die(f"AT6 off-list tool allowed: {allowed_off_list}")
 ok(f"AT6 hook saw all {len(uses)} tool calls; denied {len(denies)} ({', '.join(sorted({h['reason'] for h in denies}))}); forbidden.flag absent")
 
-cost = float(res.get("total_cost_usd") or 0)
-mu = res.get("modelUsage") or {}
-tok = {k: sum(int(v.get(k) or 0) for v in mu.values()) for k in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")}
-if res.get("duration_ms") is None or cost <= 0: die(f"AT7 time/cost not recorded (duration_ms={res.get('duration_ms')}, cost={cost})")
+TK = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+isnum = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+for f in ("duration_ms", "duration_api_ms", "total_cost_usd"):
+    if not isnum(res.get(f)) or res[f] <= 0: die(f"AT7 {f} missing or not positive: {res.get(f)!r}")
+cost = float(res["total_cost_usd"])
+mu = res.get("modelUsage")
+if not isinstance(mu, dict) or not mu: die("AT7 modelUsage (per-model tokens) missing")
+per_model = {}
+for name, v in mu.items():
+    if not isinstance(v, dict) or not all(isinstance(v.get(k), int) and v[k] >= 0 for k in TK):
+        die(f"AT7 modelUsage[{name}] lacks integer token fields {TK}")
+    if v["inputTokens"] + v["outputTokens"] <= 0: die(f"AT7 modelUsage[{name}] has no tokens")
+    per_model[name] = {k: v[k] for k in TK} | ({"costUSD": v["costUSD"]} if isnum(v.get("costUSD")) else {})
+tok = {k: sum(m[k] for m in per_model.values()) for k in TK}
 if cost > cap: die(f"AT7 cost ${cost:.4f} above cap ${cap}")
-ok(f"AT7 recorded: sdk {res['duration_ms']} ms (api {res.get('duration_api_ms')} ms), wall {wall} ms, ${cost:.4f} <= ${cap}")
+pm_txt = ", ".join("%s in %d out %d" % (k, v["inputTokens"], v["outputTokens"]) for k, v in per_model.items())
+ok(f"AT7 recorded: sdk {res['duration_ms']} ms (api {res['duration_api_ms']} ms), wall {wall} ms, ${cost:.4f} <= ${cap}; per-model tokens: {pm_txt}")
 print(json.dumps({"run": os.path.basename(rd), "model": init.get("model"), "sdk": sdkv,
                   "claude_code": init.get("claude_code_version"), "turns": res["num_turns"],
-                  "duration_ms": res["duration_ms"], "duration_api_ms": res.get("duration_api_ms"), "wall_ms": wall,
-                  "cost_usd": round(cost, 6), "tokens": tok, "tool_calls": len(uses), "hook_denies": len(denies),
+                  "duration_ms": res["duration_ms"], "duration_api_ms": res["duration_api_ms"], "wall_ms": wall,
+                  "cost_usd": round(cost, 6), "tokens": tok, "model_usage": per_model, "tool_calls": len(uses), "hook_denies": len(denies),
                   "permission_denials": len(res.get("permission_denials") or []), "words": words}))
 PY
   # AT8: the key must not appear anywhere in the run's evidence.
@@ -183,9 +203,10 @@ done
 
 say "5/5 Evidence"
 [[ -z "$(find "$TMP" -type f -name key)" ]] || fail "AT8 per-run key files left behind"
-echo "----- M0.5 evidence v1.0.1 $(date -u +%FT%TZ) -----"
+echo "----- M0.5 evidence v1.0.2 $(date -u +%FT%TZ) -----"
 echo "image $IMAGE | agent-sdk $SDKV | model $MODEL | caps: \$$MAX_BUDGET_USD/run, $MAX_TURNS turns, 300 s"
 jq -r '"\(.run): \(.turns) turns | sdk \(.duration_ms) ms (api \(.duration_api_ms) ms) | wall \(.wall_ms) ms | $\(.cost_usd) | in \(.tokens.inputTokens) out \(.tokens.outputTokens) cache-r \(.tokens.cacheReadInputTokens) cache-w \(.tokens.cacheCreationInputTokens) | tools \(.tool_calls), hook denies \(.hook_denies), sdk denials \(.permission_denials) | cc \(.claude_code)"' "$SUMMARY"
+jq -r '.run as $r | .model_usage | to_entries[] | "  \($r) \(.key): in \(.value.inputTokens) out \(.value.outputTokens) cache-r \(.value.cacheReadInputTokens) cache-w \(.value.cacheCreationInputTokens) $\(.value.costUSD // "n/a")"' "$SUMMARY"
 jq -s -r '"total: \(length) runs, $\((map(.cost_usd) | add) * 10000 | round / 10000)"' "$SUMMARY"
 echo "AT9 repeat: $ROUNDS rounds passed with no manual step"
 echo "AT8 secrets: $ENVF mode $(stat -c %a "$ENVF"), $DIR mode $(stat -c %a "$DIR"); key never printed, not in container env, not in evidence; per-run key files removed"
