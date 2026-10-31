@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # DevOS M0.4b — Coolify API lifecycle spike (create → deploy → update → rollback → delete, ×ROUNDS)
-# Version: 1.0.3
+# Version: 1.0.4
 # v1.0.1 (Codex review 14e71f7): ROUNDS must be an integer >= 2; leftover scan checks
 # names AND labels of containers, volumes and networks; project deletion is required
 # and verified (GET -> 404).
 # v1.0.2 (Codex review d0e39c5): leftovers() fails on a docker inspect error instead of
 # reading it as zero; only grep's no-match counts as 0. fail() writes to stderr.
 # v1.0.3 (Codex review 73a8ee2): the docker listing calls are checked explicitly too.
+# v1.0.4 (Codex review 6db46b4): the failure trap also removes a spike project created by
+# this run (after its app), retrying while the app deletion settles; a pre-existing project
+# is never deleted by the trap.
 # Run as root on the DevOS server after 04a:  bash 04b-coolify-api-lifecycle.sh
 #
 # Uses only the Coolify API (http://localhost:8000/api/v1) plus read-only `docker`
@@ -115,11 +118,20 @@ deploy() {  # deploy APP_UUID
   wait_deploy "$dep"
 }
 
-APP=""; PROJ=""
+APP=""; PROJ=""; PROJ_CREATED=0
 cleanup() {
   if [[ -n "$APP" ]]; then
-    echo "  cleanup: deleting app $APP after failure"
+    echo "  cleanup: deleting app $APP after failure" >&2
     api DELETE "/applications/$APP?delete_configurations=true&delete_volumes=true&docker_cleanup=true&delete_connected_networks=true" || true
+  fi
+  if [[ "$PROJ_CREATED" -eq 1 && -n "$PROJ" ]]; then
+    echo "  cleanup: deleting spike project $PROJ created by this run" >&2
+    for _ in $(seq 1 12); do
+      api DELETE "/projects/$PROJ" || true
+      [[ "$CODE" =~ ^2 || "$CODE" == 404 ]] && { echo "  cleanup: project delete HTTP $CODE" >&2; return 0; }
+      sleep 5   # app deletion may still be settling
+    done
+    echo "  cleanup: could not delete project $PROJ (last HTTP $CODE) - remove it in Coolify" >&2
   fi
 }
 trap cleanup EXIT
@@ -136,7 +148,7 @@ api GET /projects; need "list projects"
 PROJ="$(jq -r --arg n "$PROJECT_NAME" '.[] | select(.name==$n) | .uuid' <<<"$BODY" | head -n1)"
 if [[ -z "$PROJ" ]]; then
   api POST /projects "$(jq -nc --arg n "$PROJECT_NAME" '{name:$n}')"; need "create project"
-  PROJ="$(jq -r .uuid <<<"$BODY")"
+  PROJ="$(jq -r .uuid <<<"$BODY")"; PROJ_CREATED=1
 fi
 api GET "/projects/$PROJ/environments"; need "list environments"
 ENVNAME="$(jq -r '[.[]? | .name] | first // empty' <<<"$BODY")"
@@ -206,7 +218,7 @@ api GET "/projects/$PROJ"; [[ "$CODE" == 404 ]] || fail "project $PROJ still pre
 pass "spike project deleted (GET -> 404)"
 
 trap - EXIT
-echo "----- M0.4 evidence v1.0.3 $(date -u +%FT%TZ) -----"
+echo "----- M0.4 evidence v1.0.4 $(date -u +%FT%TZ) -----"
 printf '%s\n' "${SUMMARY[@]}"
 echo "AT7 repeat: $ROUNDS rounds passed with no manual cleanup"
 echo "AT8 secrets: $ENVF mode $(stat -c %a "$ENVF"), $DIR mode $(stat -c %a "$DIR"); token never printed"
