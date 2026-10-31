@@ -94,7 +94,7 @@ echo "# docker";       docker ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' 
 echo "# coolify-http"; curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' http://localhost:8000 2>&1 || echo "no local response"
 echo "----- end evidence -----"
 
-cat <<'NEXT'
+cat <<'EOF_NEXT'
 
 NEXT STEPS
 1. From YOUR LAPTOP (not the server), confirm nothing is public — each should time out:
@@ -105,4 +105,4 @@ NEXT STEPS
 3. In hPanel, confirm VPS snapshots/backups are enabled for this server.
 4. Send Claude: the evidence block above + the laptop curl output + "snapshots on: yes/no".
 Permanent private access (Tailscale, Google login) is set up next in M0.2.
-NEXT
+EOF_NEXT
