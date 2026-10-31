@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS M0.4b — Coolify API lifecycle spike (create → deploy → update → rollback → delete, ×ROUNDS)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1 (Codex review 14e71f7): ROUNDS must be an integer >= 2; leftover scan checks
+# names AND labels of containers, volumes and networks; project deletion is required
+# and verified (GET -> 404).
 # Run as root on the DevOS server after 04a:  bash 04b-coolify-api-lifecycle.sh
 #
 # Uses only the Coolify API (http://localhost:8000/api/v1) plus read-only `docker`
@@ -18,6 +21,7 @@ IMG=nginx
 V1=1.26-alpine
 V2=1.27-alpine
 ROUNDS="${ROUNDS:-2}"
+[[ "$ROUNDS" =~ ^[0-9]+$ && "$ROUNDS" -ge 2 ]] || { echo "ROUNDS must be an integer >= 2 (AT7 needs a repeat run)"; exit 1; }
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 pass() { printf '  \033[1;32mPASS\033[0m %s\n' "$*"; }
@@ -50,6 +54,18 @@ print(json.dumps({"body": sorted(sch.get("properties", {}).keys()), "required": 
 PY
 }
 
+leftovers() {  # leftovers container|volume|network UUID -> count of objects whose name or labels mention UUID
+  local kind="$1" id="$2" ids fmt
+  case "$kind" in
+    container) ids="$(docker ps -aq)";        fmt='{{.Name}} {{json .Config.Labels}}' ;;
+    volume)    ids="$(docker volume ls -q)";  fmt='{{.Name}} {{json .Labels}}' ;;
+    network)   ids="$(docker network ls -q)"; fmt='{{.Name}} {{json .Labels}}' ;;
+  esac
+  [[ -z "$ids" ]] && { echo 0; return; }
+  # Errors are not hidden: a failed inspect must not read as "no leftovers".
+  # shellcheck disable=SC2086
+  docker "$kind" inspect --format "$fmt" $ids | grep -c -- "$id" || true
+}
 images_for() { docker ps --filter "name=$1" --format '{{.Image}}' | sort -u; }
 expect_image() {  # expect_image APP TAG
   local imgs
@@ -169,9 +185,7 @@ for r in $(seq 1 "$ROUNDS"); do
   # AT6 delete
   api DELETE "/applications/$APP?delete_configurations=true&delete_volumes=true&docker_cleanup=true&delete_connected_networks=true"; need "delete app"
   for _ in $(seq 1 24); do [[ -z "$(docker ps -a --filter "name=$APP" -q)" ]] && break; sleep 5; done
-  c="$(docker ps -a --filter "name=$APP" -q | wc -l)"
-  v="$(docker volume ls -q | grep -c -- "$APP" || true)"
-  n="$(docker network ls --format '{{.Name}}' | grep -c -- "$APP" || true)"
+  c="$(leftovers container "$APP")"; v="$(leftovers volume "$APP")"; n="$(leftovers network "$APP")"
   api GET "/applications/$APP"; gone="$CODE"
   [[ "$c" -eq 0 && "$v" -eq 0 && "$n" -eq 0 && "$gone" == 404 ]] || fail "leftovers: containers=$c volumes=$v networks=$n api=$gone"
   pass "AT6 deleted — containers=0 volumes=0 networks=0, GET app -> 404"
@@ -181,10 +195,12 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 
 say "Remove spike project"
-api DELETE "/projects/$PROJ"; echo "  DELETE project HTTP $CODE"
+api DELETE "/projects/$PROJ"; need "delete project"
+api GET "/projects/$PROJ"; [[ "$CODE" == 404 ]] || fail "project $PROJ still present (GET -> $CODE)"
+pass "spike project deleted (GET -> 404)"
 
 trap - EXIT
-echo "----- M0.4 evidence v1.0.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.4 evidence v1.0.1 $(date -u +%FT%TZ) -----"
 printf '%s\n' "${SUMMARY[@]}"
 echo "AT7 repeat: $ROUNDS rounds passed with no manual cleanup"
 echo "AT8 secrets: $ENVF mode $(stat -c %a "$ENVF"), $DIR mode $(stat -c %a "$DIR"); token never printed"
