@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # DevOS M0.3 — Codex review spike (ADR-0002: Codex CLI, API-key auth, read-only, structured verdict)
-# Version: 1.0.1
+# Version: 1.0.2
 # v1.0.1 (Codex review 55ee78d): strict schema validation (types of every field);
 # AT2 requires the finding to identify the missing /100.
+# v1.0.2 (Codex review 2473191): a verdict is written to verdicts/<sha>.json only after
+# schema, SHA, read-only and AT checks pass; AT2 requires the literal '/ 100' (or '/100').
 # Run as root on the DevOS server (interactive, for the hidden key prompt):
 #     ssh -t root@devos 'bash /root/03-codex-review-spike.sh'
 # The OpenAI key goes to /root/.devos/openai.env (600) via a hidden prompt and is fed
@@ -144,7 +146,7 @@ PY
 g add -A; g commit -qm "C: add apply_discounts helper with test"; C="$(git rev-parse HEAD)"
 echo "  A=$A"; echo "  B=$B (planted bug)"; echo "  C=$C (clean)"
 
-review() {  # review SHA LABEL -> writes $VDIR/<sha>.json, echoes seconds
+review() {  # review SHA LABEL -> writes $DIR/last-<label>.json (unvalidated), echoes seconds
   local sha="$1" label="$2" out="$DIR/last-$2.json" t0 t1 prompt
   g checkout -q --detach "$sha"
   prompt="You are the Reviewer in a build/review pipeline. You review only; never modify files.
@@ -160,7 +162,6 @@ Set \"sha\" to ${sha}. Respond only with the JSON object."
     || { tail -n 20 "$DIR/codex-$label.log" | redact >&2; fail "codex exec failed for $label"; }
   t1="$(date +%s)"
   jq -e . "$out" >/dev/null || fail "$label: last message is not JSON"
-  cp "$out" "$VDIR/$sha.json"
   echo "$((t1 - t0))"
 }
 
@@ -184,24 +185,33 @@ PY
 }
 
 say "5/6 Reviews"
-before="$(g -C "$REPO" status --porcelain)"
+pristine() { [[ "$(git rev-parse HEAD)" == "$1" && -z "$(git status --porcelain --untracked-files=all)" ]] || fail "AT5 repo modified during review of $1"; }
+store() { cp "$1" "$VDIR/$2.json"; }   # only called after every check on that verdict passed
+before="$(g -C "$REPO" status --porcelain --untracked-files=all)"
+[[ -z "$before" ]] || fail "sample repo not clean before reviews"
+rm -f "$VDIR/$B.json" "$VDIR/$C.json"
+
 tB="$(review "$B" bug)"
-check_schema "$VDIR/$B.json" "$B"
-jq -e '.verdict == "CHANGES_REQUESTED" and ([.findings[] | select((.severity=="high" or .severity=="medium") and (.file | test("discount\\.py$")) and ((.evidence + " " + .consequence) | test("/ ?100|divid|percent"; "i")))] | length >= 1)' \
-  "$VDIR/$B.json" >/dev/null && pass "AT2 buggy commit -> CHANGES_REQUESTED (${tB}s)" || { cat "$VDIR/$B.json"; fail "AT2"; }
-[[ "$(git rev-parse HEAD)" == "$B" && -z "$(git status --porcelain)" ]] || fail "AT5 repo modified during review of B"
+pristine "$B"
+check_schema "$DIR/last-bug.json" "$B"
+jq -e '.verdict == "CHANGES_REQUESTED" and ([.findings[] | select((.severity=="high" or .severity=="medium") and (.file | test("discount\\.py$")) and ((.evidence + " " + .consequence) | test("/ ?100")))] | length >= 1)' \
+  "$DIR/last-bug.json" >/dev/null || { cat "$DIR/last-bug.json"; fail "AT2: no high/medium discount.py finding naming the missing / 100"; }
+store "$DIR/last-bug.json" "$B"
+pass "AT2 buggy commit -> CHANGES_REQUESTED naming the missing / 100 (${tB}s)"
 
 tC="$(review "$C" clean)"
-check_schema "$VDIR/$C.json" "$C"
+pristine "$C"
+check_schema "$DIR/last-clean.json" "$C"
 jq -e '.verdict == "PASS" and ([.findings[] | select(.severity=="high" or .severity=="medium")] | length == 0)' \
-  "$VDIR/$C.json" >/dev/null && pass "AT3 clean commit -> PASS (${tC}s)" || { cat "$VDIR/$C.json"; fail "AT3"; }
-[[ "$(git rev-parse HEAD)" == "$C" && -z "$(git status --porcelain)" && -z "$before" ]] || fail "AT5 repo modified during review of C"
-pass "AT4 both verdicts match the schema"
+  "$DIR/last-clean.json" >/dev/null || { cat "$DIR/last-clean.json"; fail "AT3"; }
+store "$DIR/last-clean.json" "$C"
+pass "AT3 clean commit -> PASS (${tC}s)"
+pass "AT4 both verdicts match the schema (validated before storage)"
 pass "AT5 read-only: HEAD unchanged, working tree clean after each review"
-[[ -s "$VDIR/$B.json" && -s "$VDIR/$C.json" ]] && pass "AT6 verdicts stored per SHA in $VDIR"
+pass "AT6 validated verdicts stored per SHA in $VDIR"
 
 say "6/6 Evidence"
-echo "----- M0.3 evidence v1.0.1 $(date -u +%FT%TZ) -----"
+echo "----- M0.3 evidence v1.0.2 $(date -u +%FT%TZ) -----"
 echo "# versions"; echo "node $(node -v); $(codex --version 2>&1 | head -n1)"
 echo "# model"; grep -m1 -iE '^model|model:' "$DIR/codex-bug.log" | redact || echo "(default; see codex logs)"
 echo "# verdict B ($B, ${tB}s)"; jq . "$VDIR/$B.json"
