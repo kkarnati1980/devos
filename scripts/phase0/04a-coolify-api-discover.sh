@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # DevOS M0.4a — Coolify API discovery (read-only)
-# Version: 1.0.1
+# Version: 1.0.2
 # v1.0.1: never source the env file — Coolify tokens contain '|', which the shell
 # treated as a pipe and echoed part of the token in an error. Read it as data.
+# v1.0.2 (Codex review 73a8ee2): AT1 is asserted - HTTP 200 and a 4.5.x version, else exit 1.
 # Run as root on the DevOS server:  bash 04a-coolify-api-discover.sh
 # Stores the Coolify API token in /root/.devos/coolify.env (600) via a hidden prompt.
 # Never prints the token. Creates nothing in Coolify.
@@ -30,7 +31,11 @@ echo "  token stored: $ENVF ($(stat -c %a "$ENVF")), dir $(stat -c %a "$DIR")"
 api() { curl -sS -w '\n%{http_code}' -H "Authorization: Bearer ${COOLIFY_TOKEN}" -H 'Accept: application/json' "$API$1"; }
 
 say "2/5 Version (AT1)"
-OUT="$(api /version)"; echo "  HTTP $(tail -n1 <<<"$OUT")  body: $(head -n -1 <<<"$OUT" | head -c 200)"
+OUT="$(api /version)"; VCODE="$(tail -n1 <<<"$OUT")"; VBODY="$(head -n -1 <<<"$OUT" | tr -d '"[:space:]' | head -c 200)"
+echo "  HTTP $VCODE  body: $VBODY"
+[[ "$VCODE" == 200 ]] || { echo "  FAIL AT1: /version returned HTTP $VCODE (API access or token?)"; exit 1; }
+[[ "$VBODY" =~ ^v?4\.5\.[0-9]+ ]] || { echo "  FAIL AT1: Coolify version '$VBODY' is not 4.5.x - re-run 04a against the new spec before using 04b"; exit 1; }
+echo "  PASS AT1 version $VBODY"
 
 say "3/5 Servers + projects"
 for ep in /servers /projects; do

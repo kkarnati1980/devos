@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # DevOS M0.4b — Coolify API lifecycle spike (create → deploy → update → rollback → delete, ×ROUNDS)
-# Version: 1.0.2
+# Version: 1.0.3
 # v1.0.1 (Codex review 14e71f7): ROUNDS must be an integer >= 2; leftover scan checks
 # names AND labels of containers, volumes and networks; project deletion is required
 # and verified (GET -> 404).
 # v1.0.2 (Codex review d0e39c5): leftovers() fails on a docker inspect error instead of
 # reading it as zero; only grep's no-match counts as 0. fail() writes to stderr.
+# v1.0.3 (Codex review 73a8ee2): the docker listing calls are checked explicitly too.
 # Run as root on the DevOS server after 04a:  bash 04b-coolify-api-lifecycle.sh
 #
 # Uses only the Coolify API (http://localhost:8000/api/v1) plus read-only `docker`
@@ -59,9 +60,10 @@ PY
 leftovers() {  # leftovers container|volume|network UUID -> count of objects whose name or labels mention UUID
   local kind="$1" id="$2" ids fmt
   case "$kind" in
-    container) ids="$(docker ps -aq)";        fmt='{{.Name}} {{json .Config.Labels}}' ;;
-    volume)    ids="$(docker volume ls -q)";  fmt='{{.Name}} {{json .Labels}}' ;;
-    network)   ids="$(docker network ls -q)"; fmt='{{.Name}} {{json .Labels}}' ;;
+    container) ids="$(docker ps -aq)"        || fail "docker ps failed - cannot verify cleanup";       fmt='{{.Name}} {{json .Config.Labels}}' ;;
+    volume)    ids="$(docker volume ls -q)"  || fail "docker volume ls failed - cannot verify cleanup"; fmt='{{.Name}} {{json .Labels}}' ;;
+    network)   ids="$(docker network ls -q)" || fail "docker network ls failed - cannot verify cleanup"; fmt='{{.Name}} {{json .Labels}}' ;;
+    *) fail "leftovers: unknown kind $kind" ;;
   esac
   [[ -z "$ids" ]] && { echo 0; return; }
   # A failed inspect must not read as "no leftovers": capture first, then count.
@@ -204,7 +206,7 @@ api GET "/projects/$PROJ"; [[ "$CODE" == 404 ]] || fail "project $PROJ still pre
 pass "spike project deleted (GET -> 404)"
 
 trap - EXIT
-echo "----- M0.4 evidence v1.0.2 $(date -u +%FT%TZ) -----"
+echo "----- M0.4 evidence v1.0.3 $(date -u +%FT%TZ) -----"
 printf '%s\n' "${SUMMARY[@]}"
 echo "AT7 repeat: $ROUNDS rounds passed with no manual cleanup"
 echo "AT8 secrets: $ENVF mode $(stat -c %a "$ENVF"), $DIR mode $(stat -c %a "$DIR"); token never printed"
