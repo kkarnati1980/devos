@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.1 — Server baseline hardening (Hostinger KVM 4, Ubuntu 24.04 + Coolify)
-# Version: 1.1.0
+# Version: 1.2.0
 # Run as root on the DevOS server, e.g. in Hostinger's browser terminal:
 #     sudo bash 01-server-baseline.sh
 #
@@ -12,6 +12,10 @@
 # UFW's INPUT rules — "ufw deny" alone leaves :8000/:80/:443/:6001/:6002 public.
 # This version filters inbound traffic to containers in the DOCKER-USER chain
 # (managed from /etc/ufw/after.rules so it survives reboots and ufw reloads).
+#
+# v1.2.0: Coolify's Docker network has IPv6 enabled, so Docker also DNATs the same
+# ports over IPv6 (ip6tables). The IPv6 DOCKER-USER chain is filtered the same way
+# from /etc/ufw/after6.rules (container ULA range fd00::/8).
 set -euo pipefail
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -66,6 +70,31 @@ RULES
 else
   echo "  DOCKER-USER rules already present"
 fi
+AFTER6_RULES=/etc/ufw/after6.rules
+if ! grep -q '^# BEGIN DEVOS UFW AND DOCKER' "${AFTER6_RULES}"; then
+  cat >> "${AFTER6_RULES}" <<'RULES6'
+
+# BEGIN DEVOS UFW AND DOCKER (M0.1, IPv6) — inbound to containers (ULA fd00::/8)
+# is denied unless it comes from a container; egress and replies are unaffected.
+*filter
+:ufw6-user-forward - [0:0]
+:ufw6-docker-logging-deny - [0:0]
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -j ufw6-user-forward
+-A DOCKER-USER -j RETURN -s fd00::/8
+-A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
+-A DOCKER-USER -j ufw6-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d fd00::/8
+-A DOCKER-USER -j ufw6-docker-logging-deny -p udp -m udp --dport 0:32767 -d fd00::/8
+-A DOCKER-USER -j RETURN
+-A ufw6-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+-A ufw6-docker-logging-deny -j DROP
+COMMIT
+# END DEVOS UFW AND DOCKER
+RULES6
+  echo "  IPv6 DOCKER-USER rules added to ${AFTER6_RULES}"
+else
+  echo "  IPv6 DOCKER-USER rules already present"
+fi
 ufw --force enable
 ufw reload
 
@@ -82,11 +111,12 @@ else
 fi
 
 say "6/6 EVIDENCE BLOCK (copy this whole section back to Claude for DEVOS-33)"
-echo "----- M0.1 evidence v1.1.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.1 evidence v1.2.0 $(date -u +%FT%TZ) -----"
 echo "# host";         uname -a
 echo "# os";           . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}"
 echo "# ufw";          ufw status verbose
 echo "# docker-user";  iptables -S DOCKER-USER 2>&1
+echo "# docker-user6"; ip6tables -S DOCKER-USER 2>&1
 echo "# services";     systemctl is-enabled unattended-upgrades fail2ban 2>&1
 echo "# fail2ban";     fail2ban-client status sshd 2>&1 | head -4
 echo "# listening";    ss -ltnH | awk '{print $4}' | sort -u
