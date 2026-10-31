@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.3 — Codex review spike (ADR-0002: Codex CLI, API-key auth, read-only, structured verdict)
-# Version: 1.0.3
+# Version: 1.0.4
 # v1.0.1 (Codex review 55ee78d): strict schema validation (types of every field);
 # AT2 requires the finding to identify the missing /100.
 # v1.0.2 (Codex review 2473191): a verdict is written to verdicts/<sha>.json only after
@@ -8,6 +8,7 @@
 # v1.0.3 (server run): AT2 matched wording ('/ 100') and failed on a correct finding
 # phrased differently. AT2 now requires a high/medium finding on discount.py at the
 # planted-bug line, derived from commit B itself - objective and wording-independent.
+# v1.0.4: validator also rejects a verdict that contradicts its findings (same as runner).
 # Run as root on the DevOS server (interactive, for the hidden key prompt):
 #     ssh -t root@devos 'bash /root/03-codex-review-spike.sh'
 # The OpenAI key goes to /root/.devos/openai.env (600) via a hidden prompt and is fed
@@ -183,6 +184,9 @@ for i, f in enumerate(d["findings"]):
     assert f["severity"] in ("high", "medium", "low"), f"finding {i} severity"
     assert text(f["file"]) and text(f["evidence"]) and text(f["consequence"]), f"finding {i} text fields"
     assert isinstance(f["line"], int) and not isinstance(f["line"], bool) and f["line"] >= 0, f"finding {i} line"
+blocking = [f for f in d["findings"] if f["severity"] in ("high", "medium")]
+assert not (d["verdict"] == "PASS" and blocking), "inconsistent: PASS with high/medium findings"
+assert not (d["verdict"] == "CHANGES_REQUESTED" and not blocking), "inconsistent: CHANGES_REQUESTED without a high/medium finding"
 print("  schema OK")
 PY
 }
@@ -216,7 +220,7 @@ pass "AT5 read-only: HEAD unchanged, working tree clean after each review"
 pass "AT6 validated verdicts stored per SHA in $VDIR"
 
 say "6/6 Evidence"
-echo "----- M0.3 evidence v1.0.3 $(date -u +%FT%TZ) -----"
+echo "----- M0.3 evidence v1.0.4 $(date -u +%FT%TZ) -----"
 echo "# versions"; echo "node $(node -v); $(codex --version 2>&1 | head -n1)"
 echo "# model"; grep -m1 -iE '^model|model:' "$DIR/codex-bug.log" | redact || echo "(default; see codex logs)"
 echo "# verdict B ($B, ${tB}s)"; jq . "$VDIR/$B.json"

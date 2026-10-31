@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # DevOS — Codex review of one change (D1 Reviewer; bootstrap tool for Phases 0–4, superseded by M3.4)
-# Version: 1.0.1
+# Version: 1.0.2
 # v1.0.1 (Codex review 55ee78d): pristine checkout — reset + clean the work tree, verify
 # HEAD == head SHA and an empty `git status` before AND after the review, else no verdict
 # is stored; strict schema validation; diff is base...head (merge-base), so a stacked
 # PR is judged on its own commits even after its base branch moves.
+# v1.0.2 (Codex review 65df054): an exclusive lock serialises whole reviews (the work tree
+# and output paths are shared); a verdict whose verdict field contradicts its findings
+# (PASS with high/medium, or CHANGES_REQUESTED without) is rejected, not stored.
 # Usage (as root on the DevOS server):
 #   review-commit.sh <base-ref> <head-ref> <contract-path> [label]
 #   e.g. review-commit.sh main kishore/devos-33-m01-server-baseline docs/modules/M0.1.md M0.1
@@ -28,6 +31,8 @@ redact() { sed -E 's/sk-[A-Za-z0-9_*.-]+/sk-[redacted]/g'; }
 base="$1"; head="$2"; contract="$3"; label="${4:-review}"
 [[ -s "$SCHEMA" ]] || fail "missing $SCHEMA — run the M0.3 spike first"
 install -d -m 700 "$VDIR"
+exec 9>"$DIR/review.lock"
+flock -n 9 || fail "another review is running (lock $DIR/review.lock) - reviews are serialised"
 command -v shellcheck >/dev/null 2>&1 || apt-get install -y -qq shellcheck >/dev/null
 
 if [[ -d "$WORK/.git" ]]; then
@@ -85,6 +90,9 @@ for i, f in enumerate(d["findings"]):
     assert f["severity"] in ("high", "medium", "low"), f"finding {i} severity"
     assert text(f["file"]) and text(f["evidence"]) and text(f["consequence"]), f"finding {i} text fields"
     assert isinstance(f["line"], int) and not isinstance(f["line"], bool) and f["line"] >= 0, f"finding {i} line"
+blocking = [f for f in d["findings"] if f["severity"] in ("high", "medium")]
+assert not (d["verdict"] == "PASS" and blocking), "inconsistent: PASS with high/medium findings"
+assert not (d["verdict"] == "CHANGES_REQUESTED" and not blocking), "inconsistent: CHANGES_REQUESTED without a high/medium finding"
 print("  schema OK")
 PY
 cp "$out" "$VDIR/$H.json"
