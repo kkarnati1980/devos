@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS M0.4a — Coolify API discovery (read-only)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1: never source the env file — Coolify tokens contain '|', which the shell
+# treated as a pipe and echoed part of the token in an error. Read it as data.
 # Run as root on the DevOS server:  bash 04a-coolify-api-discover.sh
 # Stores the Coolify API token in /root/.devos/coolify.env (600) via a hidden prompt.
 # Never prints the token. Creates nothing in Coolify.
@@ -21,8 +23,8 @@ if [[ ! -s "$ENVF" ]]; then
   umask 077; printf 'COOLIFY_TOKEN=%s\n' "$TOKEN" > "$ENVF"; unset TOKEN
 fi
 chmod 600 "$ENVF"
-# shellcheck disable=SC1090
-. "$ENVF"
+COOLIFY_TOKEN="$(sed -n 's/^COOLIFY_TOKEN=//p' "$ENVF" | head -n1)"
+[[ -n "$COOLIFY_TOKEN" ]] || { echo "Token file empty — delete $ENVF and re-run."; exit 1; }
 echo "  token stored: $ENVF ($(stat -c %a "$ENVF")), dir $(stat -c %a "$DIR")"
 
 api() { curl -sS -w '\n%{http_code}' -H "Authorization: Bearer ${COOLIFY_TOKEN}" -H 'Accept: application/json' "$API$1"; }
