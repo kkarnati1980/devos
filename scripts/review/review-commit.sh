@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — Codex review of one change (D1 Reviewer; bootstrap tool for Phases 0–4, superseded by M3.4)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1 (Codex review 55ee78d): pristine checkout — reset + clean the work tree, verify
+# HEAD == head SHA and an empty `git status` before AND after the review, else no verdict
+# is stored; strict schema validation; diff is base...head (merge-base), so a stacked
+# PR is judged on its own commits even after its base branch moves.
 # Usage (as root on the DevOS server):
 #   review-commit.sh <base-ref> <head-ref> <contract-path> [label]
 #   e.g. review-commit.sh main kishore/devos-33-m01-server-baseline docs/modules/M0.1.md M0.1
@@ -34,11 +38,21 @@ fi
 cd "$WORK"
 resolve() { git rev-parse --verify -q "origin/$1^{commit}" || git rev-parse --verify -q "$1^{commit}" || fail "cannot resolve $1"; }
 B="$(resolve "$base")"; H="$(resolve "$head")"
+pristine() {  # pristine SHA -> fail unless HEAD == SHA and the tree has no changes or untracked files
+  [[ "$(git rev-parse HEAD)" == "$1" ]] || fail "HEAD $(git rev-parse HEAD) != $1"
+  [[ -z "$(git status --porcelain --untracked-files=all)" ]] || { git status --short >&2; fail "work tree not clean"; }
+}
+git reset -q --hard
+git clean -qffdx
 git checkout -q --detach "$H"
+git reset -q --hard "$H"
+git clean -qffdx
+pristine "$H"
 [[ -f "$contract" ]] || fail "contract $contract not present at $H"
+MB="$(git merge-base "$B" "$H")"
 
 prompt="You are the independent Reviewer (Codex, read-only) for the DevOS repository.
-Review exactly this change: \`git diff ${B}..${H}\` (head commit ${H}, label ${label}).
+Review exactly this change: \`git diff ${MB}..${H}\` (the commits on ${H} since its merge-base with ${base}; label ${label}).
 Judge it against the module contract at ${contract} (goal, owned files, acceptance tests) and the
 'Review guidelines' section of rules.md. Use ADRs in docs/decisions/ that the contract cites as context.
 Rules for you:
@@ -56,18 +70,27 @@ timeout 900 codex exec --sandbox read-only --output-schema "$SCHEMA" --output-la
   </dev/null >"$log" 2>&1 || { tail -n 20 "$log" | redact >&2; fail "codex exec failed ($label)"; }
 t1="$(date +%s)"
 
+pristine "$H"   # Codex must not have changed anything; otherwise the verdict is void
 python3 - "$out" "$H" <<'PY' || fail "verdict does not match schema"
 import json, sys
-d = json.load(open(sys.argv[1]))
-assert set(d) == {"verdict", "sha", "summary", "findings"}
-assert d["verdict"] in ("PASS", "CHANGES_REQUESTED") and d["sha"] == sys.argv[2]
-for f in d["findings"]:
-    assert set(f) == {"severity", "file", "line", "evidence", "consequence"} and f["severity"] in ("high", "medium", "low")
+d = json.load(open(sys.argv[1])); sha = sys.argv[2]
+def text(x): return isinstance(x, str) and x.strip() != ""
+assert isinstance(d, dict) and set(d) == {"verdict", "sha", "summary", "findings"}, f"top-level keys {sorted(d) if isinstance(d, dict) else type(d)}"
+assert d["verdict"] in ("PASS", "CHANGES_REQUESTED"), f"verdict {d['verdict']!r}"
+assert isinstance(d["sha"], str) and d["sha"] == sha, f"sha {d['sha']!r} != {sha}"
+assert text(d["summary"]), "summary must be a non-empty string"
+assert isinstance(d["findings"], list), "findings must be a list"
+for i, f in enumerate(d["findings"]):
+    assert isinstance(f, dict) and set(f) == {"severity", "file", "line", "evidence", "consequence"}, f"finding {i} keys"
+    assert f["severity"] in ("high", "medium", "low"), f"finding {i} severity"
+    assert text(f["file"]) and text(f["evidence"]) and text(f["consequence"]), f"finding {i} text fields"
+    assert isinstance(f["line"], int) and not isinstance(f["line"], bool) and f["line"] >= 0, f"finding {i} line"
+print("  schema OK")
 PY
 cp "$out" "$VDIR/$H.json"
 verdict="$(jq -r .verdict "$out")"
 echo "----- review ${label} $(date -u +%FT%TZ) -----"
-echo "base ${base} ${B}"; echo "head ${head} ${H}"; echo "contract ${contract}"
+echo "base ${base} ${B} (merge-base ${MB})"; echo "head ${head} ${H}"; echo "contract ${contract}"
 echo "verdict ${verdict} ($((t1 - t0))s) — findings: $(jq -r '[.findings[].severity] | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$out")"
 jq . "$out"
 echo "----- end review ${label} -----"

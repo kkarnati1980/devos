@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS M0.3 — Codex review spike (ADR-0002: Codex CLI, API-key auth, read-only, structured verdict)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1 (Codex review 55ee78d): strict schema validation (types of every field);
+# AT2 requires the finding to identify the missing /100.
 # Run as root on the DevOS server (interactive, for the hidden key prompt):
 #     ssh -t root@devos 'bash /root/03-codex-review-spike.sh'
 # The OpenAI key goes to /root/.devos/openai.env (600) via a hidden prompt and is fed
@@ -166,12 +168,17 @@ check_schema() {  # check_schema FILE SHA
   python3 - "$1" "$2" <<'PY' || exit 1
 import json, sys
 d = json.load(open(sys.argv[1])); sha = sys.argv[2]
-assert set(d) == {"verdict", "sha", "summary", "findings"}, f"keys {sorted(d)}"
-assert d["verdict"] in ("PASS", "CHANGES_REQUESTED"), d["verdict"]
-assert d["sha"] == sha, f"sha {d['sha']} != {sha}"
-for f in d["findings"]:
-    assert set(f) == {"severity", "file", "line", "evidence", "consequence"}, sorted(f)
-    assert f["severity"] in ("high", "medium", "low") and isinstance(f["line"], int)
+def text(x): return isinstance(x, str) and x.strip() != ""
+assert isinstance(d, dict) and set(d) == {"verdict", "sha", "summary", "findings"}, f"top-level keys {sorted(d) if isinstance(d, dict) else type(d)}"
+assert d["verdict"] in ("PASS", "CHANGES_REQUESTED"), f"verdict {d['verdict']!r}"
+assert isinstance(d["sha"], str) and d["sha"] == sha, f"sha {d['sha']!r} != {sha}"
+assert text(d["summary"]), "summary must be a non-empty string"
+assert isinstance(d["findings"], list), "findings must be a list"
+for i, f in enumerate(d["findings"]):
+    assert isinstance(f, dict) and set(f) == {"severity", "file", "line", "evidence", "consequence"}, f"finding {i} keys"
+    assert f["severity"] in ("high", "medium", "low"), f"finding {i} severity"
+    assert text(f["file"]) and text(f["evidence"]) and text(f["consequence"]), f"finding {i} text fields"
+    assert isinstance(f["line"], int) and not isinstance(f["line"], bool) and f["line"] >= 0, f"finding {i} line"
 print("  schema OK")
 PY
 }
@@ -180,7 +187,7 @@ say "5/6 Reviews"
 before="$(g -C "$REPO" status --porcelain)"
 tB="$(review "$B" bug)"
 check_schema "$VDIR/$B.json" "$B"
-jq -e '.verdict == "CHANGES_REQUESTED" and ([.findings[] | select((.severity=="high" or .severity=="medium") and (.file | test("discount\\.py$")))] | length >= 1)' \
+jq -e '.verdict == "CHANGES_REQUESTED" and ([.findings[] | select((.severity=="high" or .severity=="medium") and (.file | test("discount\\.py$")) and ((.evidence + " " + .consequence) | test("/ ?100|divid|percent"; "i")))] | length >= 1)' \
   "$VDIR/$B.json" >/dev/null && pass "AT2 buggy commit -> CHANGES_REQUESTED (${tB}s)" || { cat "$VDIR/$B.json"; fail "AT2"; }
 [[ "$(git rev-parse HEAD)" == "$B" && -z "$(git status --porcelain)" ]] || fail "AT5 repo modified during review of B"
 
@@ -194,7 +201,7 @@ pass "AT5 read-only: HEAD unchanged, working tree clean after each review"
 [[ -s "$VDIR/$B.json" && -s "$VDIR/$C.json" ]] && pass "AT6 verdicts stored per SHA in $VDIR"
 
 say "6/6 Evidence"
-echo "----- M0.3 evidence v1.0.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.3 evidence v1.0.1 $(date -u +%FT%TZ) -----"
 echo "# versions"; echo "node $(node -v); $(codex --version 2>&1 | head -n1)"
 echo "# model"; grep -m1 -iE '^model|model:' "$DIR/codex-bug.log" | redact || echo "(default; see codex logs)"
 echo "# verdict B ($B, ${tB}s)"; jq . "$VDIR/$B.json"
