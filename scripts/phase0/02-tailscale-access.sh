@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.2 — Private access via Tailscale (ADR-0003, ADR-0004)
-# Version: 1.2.1
+# Version: 1.2.2
 #
 # v1.1.0 (ADR-0005): Tailscale Serve removed. Its listeners on the tailnet IP
 # (443/6001/6002) collided with Docker's 0.0.0.0 publishes at boot, so coolify
@@ -15,6 +15,10 @@
 #
 # v1.2.1 (Codex review 282b792): --close-public-ssh verifies the public 22/tcp
 # allow is really gone (v4 + v6) instead of ignoring a failed delete.
+#
+# v1.2.2 (Codex review c354b89): Serve reset must succeed and `tailscale serve status`
+# must report no config; otherwise stop (leftover Serve listeners re-create the
+# boot-time port clash, ADR-0005).
 #
 # Run as root on the DevOS server:
 #     bash 02-tailscale-access.sh                     # install, join tailnet, open containers to tailnet
@@ -77,11 +81,16 @@ JAIL
 systemctl restart fail2ban
 
 say "5/5 Tailnet -> Docker-published ports (no Tailscale Serve, ADR-0005)"
-tailscale serve reset || true
+tailscale serve reset
+if ! tailscale serve status 2>&1 | grep -q 'No serve config'; then
+  tailscale serve status || true
+  echo "Tailscale Serve config still present after reset - refusing to continue (ADR-0005)."; exit 1
+fi
+echo "  Tailscale Serve: no config (verified)"
 ufw route allow in on tailscale0 comment 'tailnet -> containers (M0.2)'
 
 HOST="$(ts_dnsname)"
-echo "----- M0.2 evidence v1.2.1 $(date -u +%FT%TZ) -----"
+echo "----- M0.2 evidence v1.2.2 $(date -u +%FT%TZ) -----"
 echo "# tailscale";  tailscale status
 echo "# dnsname";    echo "${HOST}"
 echo "# serve";      tailscale serve status 2>&1 | head -3
