@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # DevOS M0.2 — Private access via Tailscale (ADR-0003, ADR-0004)
-# Version: 1.0.0
+# Version: 1.1.0
+#
+# v1.1.0 (ADR-0005): Tailscale Serve removed. Its listeners on the tailnet IP
+# (443/6001/6002) collided with Docker's 0.0.0.0 publishes at boot, so coolify
+# and coolify-proxy failed to start after a reboot. Tailnet clients now reach
+# Docker-published ports directly via a UFW route rule (ufw-user-forward, which
+# the M0.1 DOCKER-USER chain consults first). Coolify: http://devos:8000.
+#
 # Run as root on the DevOS server:
-#     bash 02-tailscale-access.sh                     # install, join tailnet, serve Coolify
+#     bash 02-tailscale-access.sh                     # install, join tailnet, open containers to tailnet
 #     bash 02-tailscale-access.sh --close-public-ssh  # later, after SSH over the tailnet works
 #
 # Idempotent. Does not change Coolify config or the M0.1 Docker filters.
@@ -50,19 +57,19 @@ ignoreip = 127.0.0.1/8 ::1 100.64.0.0/10 fd7a:115c:a1e0::/48
 JAIL
 systemctl restart fail2ban
 
-say "5/5 Tailscale Serve: Coolify panel + realtime over tailnet HTTPS"
-tailscale serve --bg http://127.0.0.1:8000
-tailscale serve --bg --https=6001 http://127.0.0.1:6001
-tailscale serve --bg --https=6002 http://127.0.0.1:6002
+say "5/5 Tailnet -> Docker-published ports (no Tailscale Serve, ADR-0005)"
+tailscale serve reset || true
+ufw route allow in on tailscale0 comment 'tailnet -> containers (M0.2)'
 
 HOST="$(ts_dnsname)"
-echo "----- M0.2 evidence v1.0.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.2 evidence v1.1.0 $(date -u +%FT%TZ) -----"
 echo "# tailscale";  tailscale status
 echo "# dnsname";    echo "${HOST}"
-echo "# serve";      tailscale serve status
+echo "# serve";      tailscale serve status 2>&1 | head -3
+echo "# fwd-rule";   iptables -S ufw-user-forward; ip6tables -S ufw6-user-forward
 echo "# ufw";        ufw status verbose
 echo "# fail2ban";   fail2ban-client get sshd ignoreip
 echo "# coolify";    curl -fsS -o /dev/null -w 'localhost:8000 HTTP %{http_code}\n' http://localhost:8000 || echo "no local response"
 echo "----- end evidence -----"
 echo
-echo "Next: on the iMac (Tailscale on) open  https://${HOST}  and run  ssh root@devos"
+echo "Next: on the iMac (Tailscale on) open  http://devos:8000  (or http://${HOST}:8000)  and run  ssh root@devos"
