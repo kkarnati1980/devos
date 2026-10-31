@@ -1,5 +1,7 @@
 // DevOS M0.5 — Agent SDK spike runner (runs INSIDE the spike container)
-// Version: 1.0.0
+// Version: 1.0.1
+// v1.0.1 (Codex r1 063a32a): Bash is an exact whole-command allow-list (program+args matching
+// let `sort -o` write and `cat` read the key); Glob patterns must be relative with no `..`/`~`.
 //
 // One unattended Claude Agent SDK run with:
 //   - a built-in tool allow-list (`tools` + `allowedTools`), permissionMode 'dontAsk'
@@ -16,7 +18,13 @@ const WORK = process.env.WORK_DIR || '/work';
 const OUT = process.env.OUT_DIR || '/out';
 const MARK = 'DEVOS-POLICY-DENY';
 export const TOOLS = ['Read', 'Write', 'Glob', 'Bash'];
-const BASH_OK = /^(ls|cat|wc|head|tail|grep|sort|uniq|echo|pwd)(\s[^;&|`$<>(){}\\\n]*)?$/;
+// Bash: exact whole-command allow-list (after whitespace normalisation). No program+args
+// matching: any option or operand not listed here is denied (Codex r1: `sort -o`, `cat <key>`).
+const BASH_OK = new Set([
+  'wc -w input.txt', `wc -w ${WORK}/input.txt`,
+  'cat input.txt', `cat ${WORK}/input.txt`,
+  'ls', `ls ${WORK}`, 'ls -l', `ls -l ${WORK}`, 'pwd',
+]);
 const WRITE_OK = new Set([path.join(WORK, 'result.json')]);
 
 const inside = (p) => {
@@ -24,20 +32,26 @@ const inside = (p) => {
   const abs = path.resolve(WORK, p);
   return abs === WORK || abs.startsWith(WORK + path.sep);
 };
+// Glob: the pattern itself must stay under the search root - relative, no `..`, no `~`.
+const safePattern = (g) => typeof g === 'string' && g !== '' && !path.isAbsolute(g)
+  && !g.startsWith('~') && !g.split(/[\\/]/).includes('..') && !g.includes('..');
 
 // Deny-by-default policy. Returns null to allow, or a reason string to deny.
 export function policy(tool, input) {
   const i = input && typeof input === 'object' ? input : {};
   if (!TOOLS.includes(tool)) return `tool ${tool} is not on the allow-list`;
   if (tool === 'Read') return inside(i.file_path) ? null : 'Read outside /work';
-  if (tool === 'Glob') return i.path === undefined || inside(i.path) ? null : 'Glob outside /work';
+  if (tool === 'Glob') {
+    if (i.path !== undefined && !inside(i.path)) return 'Glob root outside /work';
+    return safePattern(i.pattern) ? null : 'Glob pattern must be relative to /work (no absolute, ~ or ..)';
+  }
   if (tool === 'Write') {
     if (!inside(i.file_path)) return 'Write outside /work';
     return WRITE_OK.has(path.resolve(WORK, i.file_path)) ? null : 'Write allowed only to /work/result.json';
   }
   if (tool === 'Bash') {
-    const cmd = typeof i.command === 'string' ? i.command.trim() : '';
-    return BASH_OK.test(cmd) ? null : `command not on the allow-list: ${cmd.slice(0, 80)}`;
+    const cmd = typeof i.command === 'string' ? i.command.trim().replace(/[ \t]+/g, ' ') : '';
+    return BASH_OK.has(cmd) ? null : `command not on the allow-list: ${cmd.slice(0, 80)}`;
   }
   return 'unreachable';
 }
@@ -49,6 +63,17 @@ function selfTest() {
     ['Bash', { command: 'wc -w input.txt; touch x' }, false],
     ['Bash', { command: 'cat $(echo /etc/passwd)' }, false],
     ['Bash', { command: 'curl https://example.com' }, false],
+    ['Bash', { command: 'wc  -w   input.txt' }, true],
+    ['Bash', { command: 'sort -o /work/forbidden.flag /work/input.txt' }, false],
+    ['Bash', { command: 'cat /run/secrets/anthropic_key' }, false],
+    ['Bash', { command: 'ls /out' }, false],
+    ['Bash', { command: 'wc -w input.txt\ntouch x' }, false],
+    ['Bash', { command: 'echo hi > /out/result.json' }, false],
+    ['Glob', { pattern: '/run/secrets/*' }, false],
+    ['Glob', { pattern: '../*' }, false],
+    ['Glob', { pattern: 'a/../../run/*' }, false],
+    ['Glob', { pattern: '~/*' }, false],
+    ['Glob', { pattern: '**/*.txt', path: '/work' }, true],
     ['Read', { file_path: '/work/input.txt' }, true],
     ['Read', { file_path: '/work/../etc/passwd' }, false],
     ['Read', { file_path: '/run/secrets/anthropic_key' }, false],

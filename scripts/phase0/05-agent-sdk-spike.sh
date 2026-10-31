@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS M0.5 — Agent SDK spike (unattended run in a container, tool allow-list, hook deny, time + cost)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1 (Codex r1 063a32a): AT6 requires the deny marker in the tool_result of the forbidden
+# Bash call itself (any denial used to satisfy it). Policy fixes are in agent-spike/run.mjs v1.0.1.
 #
 # Run as root on the DevOS server, from a checkout of this repo (interactive only for the
 # first-time hidden key prompt):
@@ -150,9 +152,11 @@ if os.path.exists(f"{rd}/work/forbidden.flag"): die("AT6 forbidden.flag exists -
 def text(c):
     v = c.get("content")
     return v if isinstance(v, str) else json.dumps(v)
-deny_ids = {h["id"] for h in denies}
-if not any(r.get("tool_use_id") in deny_ids and MARK in text(r) for r in results):
-    die("AT6 the hook's deny reason never reached the agent as a tool_result")
+blocked_ids = {h["id"] for h in blocked}
+by_id = {r.get("tool_use_id"): r for r in results}
+unreported = [i for i in blocked_ids if not (i in by_id and MARK in text(by_id[i]))]
+if unreported:
+    die(f"AT6 the deny for the forbidden Bash call never reached the agent as its tool_result: {unreported}")
 hook_ids = {h["id"] for h in hooks}
 missing = [u["name"] for u in uses if u.get("id") not in hook_ids]
 if missing: die(f"AT6 tool calls that bypassed the hook: {missing}")
@@ -179,7 +183,7 @@ done
 
 say "5/5 Evidence"
 [[ -z "$(find "$TMP" -type f -name key)" ]] || fail "AT8 per-run key files left behind"
-echo "----- M0.5 evidence v1.0.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.5 evidence v1.0.1 $(date -u +%FT%TZ) -----"
 echo "image $IMAGE | agent-sdk $SDKV | model $MODEL | caps: \$$MAX_BUDGET_USD/run, $MAX_TURNS turns, 300 s"
 jq -r '"\(.run): \(.turns) turns | sdk \(.duration_ms) ms (api \(.duration_api_ms) ms) | wall \(.wall_ms) ms | $\(.cost_usd) | in \(.tokens.inputTokens) out \(.tokens.outputTokens) cache-r \(.tokens.cacheReadInputTokens) cache-w \(.tokens.cacheCreationInputTokens) | tools \(.tool_calls), hook denies \(.hook_denies), sdk denials \(.permission_denials) | cc \(.claude_code)"' "$SUMMARY"
 jq -s -r '"total: \(length) runs, $\((map(.cost_usd) | add) * 10000 | round / 10000)"' "$SUMMARY"
