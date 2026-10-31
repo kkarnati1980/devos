@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.2 — Private access via Tailscale (ADR-0003, ADR-0004)
-# Version: 1.2.0
+# Version: 1.2.1
 #
 # v1.1.0 (ADR-0005): Tailscale Serve removed. Its listeners on the tailnet IP
 # (443/6001/6002) collided with Docker's 0.0.0.0 publishes at boot, so coolify
@@ -12,6 +12,9 @@
 # ranges. Coolify manages 'localhost' by SSHing from its container (e.g.
 # 172.16.1.6 -> 172.16.0.1:22); without this, its seeder/server checks hang and
 # the Reverb (6001) and terminal (6002) services inside the container never start.
+#
+# v1.2.1 (Codex review 282b792): --close-public-ssh verifies the public 22/tcp
+# allow is really gone (v4 + v6) instead of ignoring a failed delete.
 #
 # Run as root on the DevOS server:
 #     bash 02-tailscale-access.sh                     # install, join tailnet, open containers to tailnet
@@ -35,9 +38,17 @@ if [[ "${1:-}" == "--close-public-ssh" ]]; then
   for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
     ufw allow from "$net" to any port 22 proto tcp comment 'docker -> host SSH (Coolify)'
   done
-  ufw delete allow 22/tcp || true
+  public22() { ufw status | grep -Eq '^22/tcp( \(v6\))? +ALLOW( IN)? +Anywhere( \(v6\))?( |$)'; }
+  if public22; then
+    ufw delete allow 22/tcp
+  fi
+  if public22; then
+    ufw status verbose
+    echo "Public 22/tcp allow still present — NOT closed. Remove it by hand (ufw status numbered)."; exit 1
+  fi
   ufw status verbose
-  echo "Public SSH closed. Use: ssh root@devos (Tailscale on). Break-glass: hPanel browser console."
+  echo "Public SSH closed (verified: no 'Anywhere' allow on 22/tcp, v4 or v6)."
+  echo "Use: ssh root@devos (Tailscale on). Break-glass: hPanel browser console."
   exit 0
 fi
 
@@ -70,7 +81,7 @@ tailscale serve reset || true
 ufw route allow in on tailscale0 comment 'tailnet -> containers (M0.2)'
 
 HOST="$(ts_dnsname)"
-echo "----- M0.2 evidence v1.2.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.2 evidence v1.2.1 $(date -u +%FT%TZ) -----"
 echo "# tailscale";  tailscale status
 echo "# dnsname";    echo "${HOST}"
 echo "# serve";      tailscale serve status 2>&1 | head -3
