@@ -8,7 +8,7 @@
     "build": "pnpm -r --if-present build",
     "typecheck": "pnpm -r --if-present typecheck",
     "lint": "pnpm -r --if-present lint",
-    "test": "pnpm -r --if-present test",
+    "test": "pnpm -r --if-present test && node --test \"scripts/test/*.test.mjs\"",
     "gen:rules": "node scripts/gen-rules.mjs",
     "check:rules": "node scripts/gen-rules.mjs --check"
   },
