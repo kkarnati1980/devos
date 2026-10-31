@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.1 — Server baseline hardening (Hostinger KVM 4, Ubuntu 24.04 + Coolify)
-# Version: 1.3.0
+# Version: 1.3.1
 # Run as root on the DevOS server, e.g. in Hostinger's browser terminal:
 #     sudo bash 01-server-baseline.sh
 #
@@ -28,6 +28,12 @@
 #   it is not re-added.
 # - The DEVOS block in after.rules/after6.rules is replaced, not appended, so
 #   upgrades apply on re-run.
+#
+# v1.3.1 (Codex review c2a195e + server run):
+# - Public 22/tcp is added only on first setup (UFW inactive at start), never on re-run.
+# - ufw writes its rule files as ASCII and crashed on an em dash in the v1.1/1.2 block
+#   comment; all rule text is ASCII now and non-ASCII is scrubbed from /etc/ufw/*.rules
+#   before any ufw command runs.
 set -euo pipefail
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -43,18 +49,29 @@ dpkg-reconfigure -f noninteractive unattended-upgrades || true
 systemctl enable --now unattended-upgrades
 
 say "2/6 Firewall (UFW): default deny incoming"
+# ufw rewrites /etc/ufw/*.rules as ASCII; scrub any non-ASCII left by older versions first.
+python3 - /etc/ufw/*.rules <<'PY'
+import sys
+for p in sys.argv[1:]:
+    t = open(p, encoding="utf-8", errors="replace").read()
+    a = "".join(c if ord(c) < 128 else "-" for c in t)
+    if a != t:
+        open(p, "w", encoding="ascii").write(a); print(f"  scrubbed non-ASCII from {p}")
+PY
 if ufw status | grep -q '^Status: active'; then
-  echo "  UFW already active — keeping existing rules (no reset; M0.2 rules live here)"
+  FIRST_SETUP=0
+  echo "  UFW already active - keeping existing rules (no reset; later modules' rules live here)"
 else
+  FIRST_SETUP=1
   ufw --force reset
 fi
 ufw default deny incoming
 ufw default allow outgoing
 ufw default deny routed
-if ufw status | grep -q 'on tailscale0'; then
-  echo "  tailnet-only SSH in place (ADR-0004) — public 22/tcp not re-added"
-else
+if [[ "$FIRST_SETUP" -eq 1 ]]; then
   ufw allow 22/tcp comment 'SSH'
+else
+  echo "  re-run: SSH rules left as they are (public 22/tcp is only added on first setup)"
 fi
 # Coolify panel (8000), realtime (6001/6002), proxy (80/443/8080) are NOT opened publicly.
 
@@ -67,7 +84,7 @@ replace_block() {  # replace_block FILE  (block body on stdin)
   rm -f "$tmp"
 }
 replace_block /etc/ufw/after.rules <<'RULES'
-# BEGIN DEVOS UFW AND DOCKER (M0.1 v1.3.0) — default-deny for traffic forwarded to
+# BEGIN DEVOS UFW AND DOCKER (M0.1 v1.3.1) - default-deny for traffic forwarded to
 # containers: ufw route rules (tailnet), replies and private sources pass; all else drops.
 *filter
 :ufw-user-forward - [0:0]
@@ -85,7 +102,7 @@ COMMIT
 # END DEVOS UFW AND DOCKER
 RULES
 replace_block /etc/ufw/after6.rules <<'RULES6'
-# BEGIN DEVOS UFW AND DOCKER (M0.1 v1.3.0, IPv6) — same policy; containers use ULA fd00::/8.
+# BEGIN DEVOS UFW AND DOCKER (M0.1 v1.3.1, IPv6) - same policy; containers use ULA fd00::/8.
 *filter
 :ufw6-user-forward - [0:0]
 :ufw6-docker-logging-deny - [0:0]
@@ -116,7 +133,7 @@ else
 fi
 
 say "6/6 EVIDENCE BLOCK (copy this whole section back to Claude for DEVOS-33)"
-echo "----- M0.1 evidence v1.3.0 $(date -u +%FT%TZ) -----"
+echo "----- M0.1 evidence v1.3.1 $(date -u +%FT%TZ) -----"
 echo "# host";         uname -a
 echo "# os";           . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}"
 echo "# ufw";          ufw status verbose
