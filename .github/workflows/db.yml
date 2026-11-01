@@ -1,0 +1,62 @@
+# M1.1 — DevOS data model checks against a real Postgres 17 (docs/modules/M1.1.md, AT1–AT9, AT11a).
+name: db
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: db-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: devos
+          POSTGRES_PASSWORD: devos_ci_only
+          POSTGRES_DB: devos
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U devos" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # CI-only throwaway database in the job's service container; not a real credential.
+      DATABASE_URL: postgresql://devos:devos_ci_only@localhost:5432/devos
+      SHADOW_DATABASE_URL: postgresql://devos:devos_ci_only@localhost:5432/devos_shadow
+    defaults:
+      run:
+        working-directory: packages/db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+        working-directory: .
+      - name: Create shadow database
+        run: psql "postgresql://devos:devos_ci_only@localhost:5432/devos" -c "CREATE DATABASE devos_shadow"
+      - name: "Bootstrap (temporary): schema SQL and format diff"
+        run: |
+          pnpm exec prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script > /tmp/schema.sql
+          echo "----- BEGIN SCHEMA SQL -----"; cat /tmp/schema.sql; echo "----- END SCHEMA SQL -----"
+          cp prisma/schema.prisma /tmp/schema.orig && pnpm exec prisma format && (diff -u /tmp/schema.orig prisma/schema.prisma || true) && cp /tmp/schema.orig prisma/schema.prisma
+      - name: AT1 schema valid and formatted
+        run: pnpm exec prisma validate && pnpm exec prisma format --check
+      - name: AT2 migrations apply clean (twice)
+        run: |
+          pnpm exec prisma migrate deploy
+          pnpm exec prisma migrate deploy | tee /tmp/second.txt
+          grep -q "No pending migrations to apply" /tmp/second.txt
+      - name: AT3 no drift between migrations and schema
+        run: pnpm exec prisma migrate diff --from-migrations prisma/migrations --to-schema prisma/schema.prisma --exit-code
+      - name: AT9 generate client and typecheck
+        run: pnpm run typecheck
+      - name: AT4-AT9 database tests
+        run: pnpm run test:db
