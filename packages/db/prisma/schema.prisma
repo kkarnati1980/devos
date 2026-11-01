@@ -353,15 +353,15 @@ model Requirement {
 }
 
 model Milestone {
-  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  projectId          String    @map("project_id") @db.Uuid
-  ordinal            Int
-  name               String
-  gateName           String    @map("gate_name")
-  closedAt           DateTime? @map("closed_at") @db.Timestamptz(6)
-  gateApprovalId     String?   @map("gate_approval_id") @db.Uuid
-  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId      String    @map("project_id") @db.Uuid
+  ordinal        Int
+  name           String
+  gateName       String    @map("gate_name")
+  closedAt       DateTime? @map("closed_at") @db.Timestamptz(6)
+  gateApprovalId String?   @map("gate_approval_id") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   project      Project       @relation(fields: [projectId], references: [id], onDelete: Restrict)
   gateApproval Approval?     @relation(fields: [gateApprovalId], references: [id], onDelete: Restrict)
@@ -639,12 +639,12 @@ model Deploy {
   createdAt         DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  project        Project        @relation(fields: [projectId], references: [id], onDelete: Restrict)
-  commit         Commit         @relation(fields: [commitId], references: [id], onDelete: Restrict)
-  reviewVerdict  ReviewVerdict? @relation(fields: [reviewVerdictId], references: [id], onDelete: Restrict)
-  approval       Approval?      @relation(fields: [approvalId], references: [id], onDelete: Restrict)
-  rolledBackTo   Deploy?        @relation("rollback", fields: [rolledBackToId], references: [id], onDelete: Restrict)
-  rollbacksOfThis Deploy[]      @relation("rollback")
+  project         Project        @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  commit          Commit         @relation(fields: [commitId], references: [id], onDelete: Restrict)
+  reviewVerdict   ReviewVerdict? @relation(fields: [reviewVerdictId], references: [id], onDelete: Restrict)
+  approval        Approval?      @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  rolledBackTo    Deploy?        @relation("rollback", fields: [rolledBackToId], references: [id], onDelete: Restrict)
+  rollbacksOfThis Deploy[]       @relation("rollback")
 
   @@index([projectId, environment, createdAt])
   @@index([commitId])

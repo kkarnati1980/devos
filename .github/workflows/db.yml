@@ -42,11 +42,6 @@ jobs:
         working-directory: .
       - name: Create shadow database
         run: psql "postgresql://devos:devos_ci_only@localhost:5432/devos" -c "CREATE DATABASE devos_shadow"
-      - name: "Bootstrap (temporary): schema SQL and format diff"
-        run: |
-          pnpm exec prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script > /tmp/schema.sql
-          echo "----- BEGIN SCHEMA SQL -----"; cat /tmp/schema.sql; echo "----- END SCHEMA SQL -----"
-          cp prisma/schema.prisma /tmp/schema.orig && pnpm exec prisma format && (diff -u /tmp/schema.orig prisma/schema.prisma || true) && cp /tmp/schema.orig prisma/schema.prisma
       - name: AT1 schema valid and formatted
         run: pnpm exec prisma validate && pnpm exec prisma format --check
       - name: AT2 migrations apply clean (twice)
@@ -56,7 +51,7 @@ jobs:
           grep -q "No pending migrations to apply" /tmp/second.txt
       - name: AT3 no drift between migrations and schema
         run: pnpm exec prisma migrate diff --from-migrations prisma/migrations --to-schema prisma/schema.prisma --exit-code
-      - name: AT9 generate client and typecheck
-        run: pnpm run typecheck
+      - name: AT9 generate client, typecheck and build
+        run: pnpm run typecheck && pnpm run build
       - name: AT4-AT9 database tests
         run: pnpm run test:db
