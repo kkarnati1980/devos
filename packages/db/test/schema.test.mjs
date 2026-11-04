@@ -6,8 +6,8 @@ import { readFileSync, readdirSync } from "node:fs";
 const schema = readFileSync(new URL("../prisma/schema.prisma", import.meta.url), "utf8");
 const models = [...schema.matchAll(/^model (\w+) \{([\s\S]*?)^\}/gm)].map((m) => ({ name: m[1], body: m[2] }));
 
-test("31 models, each mapped to a snake_case table", () => {
-  assert.equal(models.length, 31);
+test("44 models (31 core + 13 ADR-0006/0008/0009), each mapped to a snake_case table", () => {
+  assert.equal(models.length, 44);
   for (const m of models) {
     const map = m.body.match(/@@map\("([a-z_]+)"\)/);
     assert.ok(map, `${m.name} has no @@map`);
@@ -22,16 +22,17 @@ test("single-column ids are Postgres-generated uuids", () => {
   }
 });
 
-test("every DateTime is timestamptz; every Decimal is numeric(12,6)", () => {
+test("every DateTime is timestamptz; money Decimals are numeric(12,6); rates are numeric(5,4)", () => {
   for (const line of schema.split("\n")) {
     if (/^\s+\w+\s+DateTime\??\s/.test(line)) assert.match(line, /@db\.Timestamptz\(6\)/, line.trim());
-    if (/^\s+\w+\s+Decimal\??\s/.test(line)) assert.match(line, /@db\.Decimal\(12, 6\)/, line.trim());
+    if (/^\s+\w+Rate\s+Decimal\??\s/.test(line)) assert.match(line, /@db\.Decimal\(5, 4\)/, line.trim());
+    else if (/^\s+\w+\s+Decimal\??\s/.test(line)) assert.match(line, /@db\.Decimal\(12, 6\)/, line.trim());
   }
 });
 
 test("every relation with fields is ON DELETE RESTRICT", () => {
   const rels = [...schema.matchAll(/@relation\(([^)]*fields:[^)]*)\)/g)].map((m) => m[1]);
-  assert.ok(rels.length >= 40);
+  assert.ok(rels.length >= 55);
   for (const r of rels) assert.match(r, /onDelete: Restrict/, r);
 });
 
@@ -56,3 +57,15 @@ test("migrations carry no connection string or credential", () => {
     assert.doesNotMatch(sql, /postgres(ql)?:\/\/|password\s*=|sk-ant-|sk-[A-Za-z0-9]{20}/i, d.name);
   }
 });
+
+test("ADR-0006 provenance is on evidence and memory records", () => {
+  for (const name of ["TestEvidence", "MemoryItem"]) {
+    const b = models.find((m) => m.name === name).body;
+    assert.match(b, /provenance\s+Provenance\s+@default\(unknown\)/, name);
+    assert.match(b, /sourceRef\s+String\?/, name);
+  }
+  const prov = schema.match(/enum Provenance \{([\s\S]*?)\}/)[1];
+  for (const v of ["kk_approved", "system_observation", "tool_result", "agent_output", "user_claim", "unknown"])
+    assert.match(prov, new RegExp(`\\b${v}\\b`), v);
+});
+

@@ -42,11 +42,6 @@ jobs:
         working-directory: .
       - name: Create shadow database
         run: psql "postgresql://devos:devos_ci_only@localhost:5432/devos" -c "CREATE DATABASE devos_shadow"
-      - name: "Bootstrap (temporary): migration SQL for schema changes"
-        run: |
-          pnpm exec prisma migrate diff --from-migrations prisma/migrations --to-schema prisma/schema.prisma --script > /tmp/m.sql || true
-          echo "----- BEGIN SCHEMA SQL -----"; cat /tmp/m.sql; echo "----- END SCHEMA SQL -----"
-          cp prisma/schema.prisma /tmp/schema.orig && pnpm exec prisma format && (diff -u /tmp/schema.orig prisma/schema.prisma || true) && cp /tmp/schema.orig prisma/schema.prisma
       - name: AT1 schema valid and formatted
         run: pnpm exec prisma validate && pnpm exec prisma format --check
       - name: AT2 migrations apply clean (twice)

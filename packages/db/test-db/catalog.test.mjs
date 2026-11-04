@@ -9,6 +9,12 @@ const TABLES = [
   "commit", "test_evidence", "review_verdict", "review_finding", "deploy", "health_check", "approval",
   "approval_comment", "resource", "app_settings", "role_model", "notification_channel", "vault_secret",
   "memory_item", "audit_event", "notification", "report",
+  // ADR-0006
+  "policy_rule", "policy_state", "policy_decision", "approval_grant", "capability_envelope", "budget_reservation",
+  // ADR-0009
+  "run_event", "run_error",
+  // ADR-0008
+  "run_telemetry", "artifact", "log_receipt", "mechanism_flag", "guard_metric",
 ];
 
 // Unique keys the contract names (table -> column lists).
@@ -28,16 +34,26 @@ const UNIQUES = {
   vault_secret: [["project_id", "name"]],
   report: [["kind", "period_start"]],
   app_settings: [["singleton"]],
+  policy_rule: [["name", "version"]],
+  policy_state: [["singleton"]],
+  policy_decision: [["chain", "seq"], ["hash"]],
+  run_event: [["run_id", "seq"]],
+  mechanism_flag: [["role", "mechanism"]],
 };
 
 const CHECKS = [
   "project_slug_format", "commit_sha_format", "project_lanes_range", "project_cap_positive",
   "module_dependency_no_self", "cost_entry_usd_nonneg", "cost_entry_one_source", "app_settings_singleton",
   "app_settings_values", "approval_decided_has_time", "approval_purge_confirmed", "review_finding_line_nonneg",
+  "policy_state_singleton", "policy_decision_seq_positive", "policy_decision_hash_format", "approval_grant_issuer_is_kk",
+  "approval_grant_uses", "approval_grant_expiry", "capability_envelope_limits", "budget_reservation_reconciled_has_actuals",
+  "run_event_seq_positive", "run_error_not_an_attempt", "artifact_values", "guard_metric_values",
 ];
 const TRIGGERS = [
   "requirements_doc_one_approved", "vault_secret_global_unique", "deploy_requires_pass",
   "review_verdict_immutable", "audit_event_no_update", "audit_event_no_truncate",
+  "policy_state_mode_guard", "policy_decision_chain", "policy_decision_no_update", "policy_decision_no_truncate",
+  "capability_envelope_shrinks", "capability_envelope_immutable", "run_event_gapless", "run_event_immutable",
 ];
 
 test("AT4 every contract table exists, and no others", async () => {
@@ -108,7 +124,7 @@ test("AT5 every foreign key is ON DELETE RESTRICT and its column leads an index"
       FROM pg_constraint con JOIN pg_class t ON t.oid = con.conrelid
       JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = 'public'
       WHERE con.contype = 'f'`);
-    assert.ok(fks.rows.length >= 40);
+    assert.ok(fks.rows.length >= 55);
     const idx = await c.query(`
       SELECT t.relname AS tbl, i.indkey[0] AS lead
       FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid
