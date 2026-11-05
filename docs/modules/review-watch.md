@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-60 · P1 · Lane C (ops tooling; bootstrap until M3.4 Codex reviewer replaces it)
 - **Depends on:** M0.3 (review runner `scripts/review/review-commit.sh` v1.0.2, Codex CLI, read-only deploy key, verdict schema on the server)
-- **Owned files:** `scripts/review/review-watch.sh` (v1.1.1), `scripts/review/install-review-watch.sh` (v1.1.0), this contract.
+- **Owned files:** `scripts/review/review-watch.sh` (v1.1.2), `scripts/review/install-review-watch.sh` (v1.1.0), this contract.
 - **Approved by KK:** 4 Nov 2026 (build plan v1.0.0, section 7).
 
 ## Goal
@@ -64,3 +64,5 @@ Run the existing Codex review automatically on every new PR head, so a review no
 - **Service timeout:** two reviews in one tick could exceed `TimeoutStartSec=1200` (900 s each). Now one review runs per tick.
 - **Redaction:** verdict comments are now redacted like runner logs.
 - **Builder verification (mock):** comment posts fail on ticks 1 and 2, and PR #3 moves to a new head between them. On tick 3, PR #3's old SHA is published ("no longer the PR head"). Tick 1 reviewed one SHA and queued the other; tick 2 reviewed the queued one. A GitHub token and an `sk-` key placed in a verdict appear only as `[redacted]`; 0 leaks. `bash -n` and `shellcheck -S warning` pass.
+
+**v1.1.2 (5 Nov 2026, Codex PR9-r4, medium):** a stored manual verdict was published without recording its PR number, so the drain could not finish it after the PR moved on. The number is now written before publishing. **Mock test:** a manual PASS has its status post fail; the PR then moves to a new head; the next tick completes the publication ("no longer the PR head"). No review was run for that SHA.

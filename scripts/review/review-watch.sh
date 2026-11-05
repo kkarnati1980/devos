@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.1.1
+# Version: 1.1.2
+# v1.1.2 (Codex PR9-r4): a stored manual verdict records its PR number before publishing, so the drain can
+# complete it after the PR moves on.
 # v1.1.1 (Codex PR9-r3): pending publications are drained for every stored SHA, including ones a PR has
 # moved past; at most one review runs per tick, so the runner's 900 s limit always fits inside the service's
 # 1200 s TimeoutStartSec; verdict comments are redacted like runner logs.
@@ -157,6 +159,7 @@ for i in $(seq 0 $((count - 1))); do
     tried[$sha]=1
     if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD publish the stored verdict"; continue; fi
     label="$(cat "$STATE/$sha.label" 2>/dev/null || echo "PR${pr}-manual")"
+    echo "$pr" > "$STATE/$sha.pr"   # recorded before publishing, so the drain can finish it later
     verdict_msg "$sha" "$label" "${contract:-unknown}"
     publish "$pr" "$sha" && log "PR #$pr ${sha:0:7}: stored verdict published"
     continue
