@@ -1,4 +1,4 @@
--- M1.1 v1.3: fixes for Codex review PR7-r1 (docs/modules/M1.1.md, AT14-AT18).
+-- M1.1 v1.3: fixes for Codex reviews PR7-r1 and PR7-r2 (docs/modules/M1.1.md, AT14-AT20).
 -- Check constraints and triggers only; no table or column changes. Every rule raises check_violation (23514).
 
 -- ---------- F1: a commit's identity is fixed once stored ----------
@@ -65,6 +65,12 @@ BEGIN
   IF NEW.closed_at IS NULL OR NEW.gate_approval_id IS NULL THEN
     RETURN NEW;
   END IF;
+  -- Materialise the conflict with a concurrent change to this approval (PR7-r2): a no-op write takes the
+  -- row lock and creates a new row version. A concurrent status change then waits for this transaction
+  -- (READ COMMITTED: its trigger sees the closed milestone) or fails with a serialization error
+  -- (REPEATABLE READ / SERIALIZABLE). If the other change came first, this statement waits, then reads
+  -- the committed status below. The trigger on approval fires only for status / project_id, not here.
+  UPDATE approval SET updated_at = updated_at WHERE id = NEW.gate_approval_id;
   SELECT status, project_id INTO a_status, a_project FROM approval WHERE id = NEW.gate_approval_id;
   IF a_status IS DISTINCT FROM 'approved' THEN
     RAISE EXCEPTION 'milestone %: gate approval is not approved (status %)', NEW.id, a_status
@@ -91,3 +97,38 @@ BEGIN
 END $$;
 CREATE TRIGGER approval_keeps_closed_gate BEFORE UPDATE OF status, project_id ON "approval"
   FOR EACH ROW EXECUTE FUNCTION devos_approval_keeps_closed_gate();
+
+-- ---------- PR7-r2 F1: a child envelope needs an existing parent before any comparison ----------
+-- In a multi-row INSERT, a child can precede its parent. The parent lookup then finds nothing, every
+-- comparison against the NULL record is NULL, no IF fires, and the FK is checked only at statement end,
+-- when the parent exists. Reject a missing parent, and treat any NULL comparison as a widening.
+CREATE OR REPLACE FUNCTION devos_envelope_shrinks() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  p capability_envelope%ROWTYPE;
+BEGIN
+  IF NEW.parent_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+  SELECT * INTO p FROM capability_envelope WHERE id = NEW.parent_id FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'envelope parent % not found (insert the parent first)', NEW.parent_id
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF (NEW.depth = p.depth + 1) IS NOT TRUE THEN
+    RAISE EXCEPTION 'envelope depth must be parent depth + 1' USING ERRCODE = 'check_violation';
+  END IF;
+  IF (NEW.tools <@ p.tools) IS NOT TRUE THEN
+    RAISE EXCEPTION 'envelope widens tools' USING ERRCODE = 'check_violation';
+  END IF;
+  IF (devos_paths_within(NEW.read_paths, p.read_paths) AND devos_paths_within(NEW.write_paths, p.write_paths)) IS NOT TRUE THEN
+    RAISE EXCEPTION 'envelope widens paths' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.network AND ((p.network AND NEW.network_allow_list IS NOT DISTINCT FROM p.network_allow_list) IS NOT TRUE) THEN
+    RAISE EXCEPTION 'envelope widens network' USING ERRCODE = 'check_violation';
+  END IF;
+  IF (NEW.max_cost_usd <= p.max_cost_usd AND NEW.max_tokens <= p.max_tokens
+      AND NEW.max_concurrency <= p.max_concurrency AND NEW.expires_at <= p.expires_at) IS NOT TRUE THEN
+    RAISE EXCEPTION 'envelope widens cost, tokens, concurrency or expiry' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;

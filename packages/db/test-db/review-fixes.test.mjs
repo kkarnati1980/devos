@@ -1,7 +1,8 @@
 // M1.1 v1.3: fixes for Codex review PR7-r1 (AT14-AT18). Each test proves the bypass Codex described is closed.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withTx, rejects, one, fixture, sha } from "./helpers.mjs";
+import pg from "pg";
+import { withTx, rejects, one, fixture, sha, url } from "./helpers.mjs";
 
 const CHECK = "23514";
 
@@ -85,3 +86,86 @@ test("AT18 a milestone closes only with an approved gate approval of the same pr
     await c.query("UPDATE approval SET status = 'approved', decided_at = now() WHERE id = $1", [pending.id]);
   });
 });
+
+// ---------- PR7-r2 ----------
+
+test("AT19 a child envelope placed before its parent in one multi-row INSERT is rejected", async () => {
+  await withTx(async (c) => {
+    const exp = new Date(Date.now() + 3600e3);
+    const parent = "00000000-0000-4000-8000-000000000001", child = "00000000-0000-4000-8000-000000000002";
+    // The Codex scenario: empty paths, network off, and every limit wider than the parent's.
+    await rejects(c, `INSERT INTO capability_envelope (id, parent_id, tools, read_paths, write_paths, network, max_cost_usd, max_tokens, max_concurrency, expires_at, depth) VALUES
+      ($1, $2, '{Read,Write,Bash,WebFetch}', '{}', '{}', false, 99, 9999999, 50, $4, 7),
+      ($2, NULL, '{Read}', '{/work}', '{/work}', false, 0.1, 10, 1, $3, 0)`,
+      [child, parent, exp, new Date(exp.getTime() + 864e5)], { code: CHECK, message: /parent .* not found/ });
+    // Parent first in the same statement is fine.
+    await c.query(`INSERT INTO capability_envelope (id, parent_id, tools, read_paths, write_paths, network, max_cost_usd, max_tokens, max_concurrency, expires_at, depth) VALUES
+      ($2, NULL, '{Read}', '{/work}', '{/work}', false, 0.1, 10, 1, $3, 0),
+      ($1, $2, '{Read}', '{}', '{}', false, 0.1, 10, 1, $3, 1)`, [child, parent, exp]);
+  });
+});
+
+/** Committed fixture for the two-session tests: project, approved approval, open milestone. */
+async function raceFixture(slug) {
+  const c = new pg.Client({ connectionString: url() });
+  await c.connect();
+  const p = await one(c, "INSERT INTO project (slug, name, updated_at) VALUES ($1, 'Race', now()) RETURNING id", [slug]);
+  const a = await one(c, "INSERT INTO approval (project_id, gate, action, target, reason, status, decided_at, updated_at) VALUES ($1, 'decision', 'close gate', 'G1', 'r', 'approved', now(), now()) RETURNING id", [p.id]);
+  const m = await one(c, "INSERT INTO milestone (project_id, ordinal, name, gate_name, updated_at) VALUES ($1, 1, 'P1', 'G1', now()) RETURNING id", [p.id]);
+  const cleanup = async () => {
+    await c.query("DELETE FROM milestone WHERE id = $1", [m.id]);
+    await c.query("DELETE FROM approval WHERE id = $1", [a.id]);
+    await c.query("DELETE FROM project WHERE id = $1", [p.id]);
+    await c.end();
+  };
+  return { approval: a.id, milestone: m.id, cleanup };
+}
+async function session(isolation) {
+  const s = new pg.Client({ connectionString: url() });
+  await s.connect();
+  await s.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+  return s;
+}
+const settle = (p) => p.then(() => null, (e) => e);
+const CLOSE = "UPDATE milestone SET closed_at = now(), gate_approval_id = $2 WHERE id = $1";
+const REJECT = "UPDATE approval SET status = 'rejected' WHERE id = $1";
+
+for (const iso of ["READ COMMITTED", "REPEATABLE READ"]) {
+  test(`AT20 (${iso}) close first, then a concurrent rejection of the same approval: the rejection fails`, async () => {
+    const f = await raceFixture(`race-a-${iso === "READ COMMITTED" ? "rc" : "rr"}`);
+    const A = await session(iso), B = await session(iso);
+    try {
+      await B.query("SELECT 1"); // B's snapshot predates A's commit
+      await A.query(CLOSE, [f.milestone, f.approval]);
+      const b = settle(B.query(REJECT, [f.approval])); // blocks on A
+      await A.query("COMMIT");
+      const err = await b;
+      assert.ok(err, "the concurrent rejection must fail");
+      assert.ok(["23514", "40001"].includes(err.code), `${err.code} ${err.message}`);
+      await B.query("ROLLBACK");
+      const s = await one(A, "SELECT status FROM approval WHERE id = $1", [f.approval]);
+      assert.equal(s.status, "approved");
+    } finally {
+      await A.end(); await B.end(); await f.cleanup();
+    }
+  });
+
+  test(`AT20 (${iso}) rejection first, then a concurrent close with that approval: the close fails`, async () => {
+    const f = await raceFixture(`race-b-${iso === "READ COMMITTED" ? "rc" : "rr"}`);
+    const A = await session(iso), B = await session(iso);
+    try {
+      await A.query("SELECT 1");
+      await B.query(REJECT, [f.approval]);
+      const a = settle(A.query(CLOSE, [f.milestone, f.approval])); // blocks on B
+      await B.query("COMMIT");
+      const err = await a;
+      assert.ok(err, "the concurrent close must fail");
+      assert.ok(["23514", "40001"].includes(err.code), `${err.code} ${err.message}`);
+      await A.query("ROLLBACK");
+      const m = await one(B, "SELECT closed_at FROM milestone WHERE id = $1", [f.milestone]);
+      assert.equal(m.closed_at, null);
+    } finally {
+      await A.end(); await B.end(); await f.cleanup();
+    }
+  });
+}
