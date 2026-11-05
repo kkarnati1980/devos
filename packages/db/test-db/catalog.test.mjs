@@ -58,6 +58,7 @@ const TRIGGERS = [
   "commit_identity_fixed", "review_verdict_no_delete", "review_verdict_no_truncate",
   "policy_state_no_delete", "policy_state_no_truncate", "run_event_no_delete", "run_event_no_truncate",
   "milestone_gate_approved", "approval_keeps_closed_gate",
+  "capability_envelope_no_delete", "capability_envelope_no_truncate",
 ];
 
 test("AT4 every contract table exists, and no others", async () => {

@@ -1,4 +1,4 @@
--- M1.1 v1.3: fixes for Codex reviews PR7-r1 and PR7-r2 and PR7-r3 (docs/modules/M1.1.md, AT14-AT21).
+-- M1.1 v1.3: fixes for Codex reviews PR7-r1 and PR7-r2 PR7-r3 and PR7-r4 (docs/modules/M1.1.md, AT14-AT22).
 -- Check constraints and triggers only; no table or column changes. Every rule raises check_violation (23514).
 
 -- ---------- F1: a commit's identity is fixed once stored ----------
@@ -171,3 +171,11 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+
+-- ---------- PR7-r4: an issued envelope cannot be deleted and re-issued wider ----------
+-- UPDATE was already rejected. Without these, a child could be deleted and re-inserted under the same id
+-- and run as a root (parent NULL, depth 0) with broader capabilities. Envelopes are issued, never removed.
+CREATE TRIGGER capability_envelope_no_delete BEFORE DELETE ON "capability_envelope"
+  FOR EACH ROW EXECUTE FUNCTION devos_reject_update();
+CREATE TRIGGER capability_envelope_no_truncate BEFORE TRUNCATE ON "capability_envelope"
+  FOR EACH STATEMENT EXECUTE FUNCTION devos_reject_update();

@@ -241,3 +241,23 @@ for (const iso of ["READ COMMITTED", "SERIALIZABLE"]) {
     }
   });
 }
+
+// ---------- PR7-r4 ----------
+test("AT22 an issued envelope cannot be deleted, truncated, or replaced under the same id as a wider root", async () => {
+  await withTx(async (c) => {
+    const exp = new Date(Date.now() + 3600e3);
+    const root = await one(c, `INSERT INTO capability_envelope (tools, read_paths, write_paths, network, max_cost_usd, max_tokens, max_concurrency, expires_at, depth)
+      VALUES ('{Read,Bash}', '{/work}', '{/work/out}', false, 0.5, 1000, 2, $1, 0) RETURNING id`, [exp]);
+    const child = await one(c, `INSERT INTO capability_envelope (parent_id, tools, read_paths, write_paths, network, max_cost_usd, max_tokens, max_concurrency, expires_at, depth)
+      VALUES ($1, '{Read}', '{/work/src}', '{/work/out/a}', false, 0.1, 100, 1, $2, 1) RETURNING id`, [root.id, exp]);
+    await rejects(c, "DELETE FROM capability_envelope WHERE id = $1", [child.id], { code: CHECK, message: /append-only/ });
+    await rejects(c, "TRUNCATE capability_envelope CASCADE", [], { code: CHECK, message: /append-only/ });
+    // The Codex scenario: delete the child, then re-insert its id as a broader root, in one transaction.
+    await rejects(c, `WITH d AS (DELETE FROM capability_envelope WHERE id = $1 RETURNING id)
+      INSERT INTO capability_envelope (id, tools, read_paths, write_paths, network, max_cost_usd, max_tokens, max_concurrency, expires_at, depth)
+      SELECT id, '{Read,Write,Bash,WebFetch}', '{/}', '{/}', true, 99, 9999999, 50, $2, 0 FROM d`, [child.id, exp], { code: CHECK, message: /append-only/ });
+    const row = await one(c, "SELECT parent_id, depth, tools FROM capability_envelope WHERE id = $1", [child.id]);
+    assert.equal(row.parent_id, root.id);
+    assert.equal(row.depth, 1);
+  });
+});
