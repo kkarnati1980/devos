@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.0.2
+# Version: 1.1.0
+# v1.1.0 (Codex PR9-r2): publication is tracked per SHA (comment and status separately) and retried on
+# later ticks until both succeed, so a transient API failure never loses a verdict; open PRs and workflow
+# runs are read across all pages.
 # v1.0.2: CI state comes from the Actions API (workflow runs for the head SHA, latest run per workflow);
 # fine-grained personal tokens cannot hold Checks: Read, so the check-runs API is not used. Needs Actions: Read.
 # v1.0.1 (first server run, 5 Nov 2026): log() writes to stderr, so API errors are visible instead of being
@@ -51,12 +54,26 @@ gh_api() {  # method path [json-body-file] -> body on stdout; non-2xx is an erro
 }
 redact() { sed -E 's/(sk-[A-Za-z0-9_*.-]{6})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g'; }
 
+# All pages of a list endpoint. path must already contain '?'. key: JSON field holding the array ('' = top level).
+gh_all() {
+  local path="$1" key="$2" page=1 chunk n acc='[]'
+  while :; do
+    chunk="$(gh_api GET "${path}&per_page=100&page=${page}")" || return 1
+    if [[ -n "$key" ]]; then chunk="$(jq -c ".${key}" <<<"$chunk")"; fi
+    acc="$(jq -c --argjson c "$chunk" '. + $c' <<<"$acc")"
+    n="$(jq 'length' <<<"$chunk")"
+    if (( n < 100 )) || (( page >= 30 )); then break; fi
+    page=$((page + 1))
+  done
+  printf '%s' "$acc"
+}
+
 ci_green() {  # sha -> 0 green; 1 not green; 3 cannot read workflow runs (token lacks Actions: Read)
-  # All DevOS CI is GitHub Actions. Take the latest run of each workflow for this SHA; every one must have
-  # completed with success/skipped/neutral, and there must be at least one.
+  # All DevOS CI is GitHub Actions. Take the latest run of each workflow for this SHA (all pages); every one
+  # must have completed with success/skipped/neutral, and there must be at least one.
   local runs
-  runs="$(gh_api GET "/repos/$REPO/actions/runs?head_sha=$1&per_page=100")" || return 3
-  jq -e '[.workflow_runs | group_by(.workflow_id)[] | max_by(.created_at)] as $latest
+  runs="$(gh_all "/repos/$REPO/actions/runs?head_sha=$1" workflow_runs)" || return 3
+  jq -e '[group_by(.workflow_id)[] | max_by(.created_at)] as $latest
          | ($latest | length) > 0 and all($latest[]; .status == "completed"
            and (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral"))' \
      <<<"$runs" >/dev/null
@@ -72,7 +89,45 @@ comment() {  # pr markdown-file
   gh_api POST "/repos/$REPO/issues/$1/comments" "$TMP/comment.json" >/dev/null
 }
 
-prs="$(gh_api GET "/repos/$REPO/pulls?state=open&per_page=50")" || die "cannot list PRs"
+# Per-SHA state in $STATE:
+#   <sha>.pr / <sha>.label   PR number and review label, written when the review runs
+#   <sha>.msg                the comment to publish (verdict or could-not-run report)
+#   <sha>.state              final status to publish: "<success|failure|error> <description>"
+#   <sha>.commented, <sha>.statused   publication steps that succeeded (each done exactly once)
+#   <sha>.published          both done; <sha>.done is the v1.0.x equivalent
+published() { [[ -e "$STATE/$1.published" || -e "$STATE/$1.done" ]]; }
+publish() {  # pr sha -> 0 when comment and final status are both posted (retried on later ticks otherwise)
+  local pr="$1" sha="$2" st desc
+  [[ -s "$STATE/$sha.msg" && -s "$STATE/$sha.state" ]] || { log "PR #$pr ${sha:0:7}: nothing to publish"; return 1; }
+  if [[ ! -e "$STATE/$sha.commented" ]]; then
+    if comment "$pr" "$STATE/$sha.msg"; then touch "$STATE/$sha.commented"; else log "PR #$pr ${sha:0:7}: comment failed; will retry"; fi
+  fi
+  if [[ ! -e "$STATE/$sha.statused" ]]; then
+    read -r st desc < "$STATE/$sha.state"
+    if set_status "$sha" "$st" "$desc"; then touch "$STATE/$sha.statused"; else log "PR #$pr ${sha:0:7}: status failed; will retry"; fi
+  fi
+  if [[ -e "$STATE/$sha.commented" && -e "$STATE/$sha.statused" ]]; then touch "$STATE/$sha.published"; return 0; fi
+  return 1
+}
+
+verdict_msg() {  # sha label contract -> writes <sha>.msg and <sha>.state from the stored verdict
+  local sha="$1" label="$2" contract="$3" v
+  v="$(jq -r .verdict "$VDIR/$sha.json")"
+  {
+    printf '### Codex review %s — **%s**\n\n' "$label" "$v"
+    printf -- '- **Commit:** `%s`\n- **Contract:** `%s`\n- **Summary:** %s\n\n' "$sha" "$contract" "$(jq -r .summary "$VDIR/$sha.json")"
+    if [[ "$(jq '.findings | length' "$VDIR/$sha.json")" -gt 0 ]]; then
+      printf '| Severity | File:line | Evidence | Consequence |\n|---|---|---|---|\n'
+      jq -r '.findings[] | "| \(.severity) | `\(.file):\(.line)` | \(.evidence | gsub("\\|"; "\\\\|") | gsub("\n"; " ")) | \(.consequence | gsub("\\|"; "\\\\|") | gsub("\n"; " ")) |"' "$VDIR/$sha.json"
+      printf '\n'
+    fi
+    printf 'Merge gate (D1): green CI **and** a PASS on this exact SHA. Verdict stored on the server as `verdicts/%s.json`.\n' "$sha"
+  } > "$STATE/$sha.msg"
+  if [[ "$v" == "PASS" ]]; then echo "success Codex PASS ($label)" > "$STATE/$sha.state"
+  else echo "failure Codex CHANGES_REQUESTED ($label)" > "$STATE/$sha.state"; fi
+}
+
+prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
 count="$(jq 'length' <<<"$prs")"
 log "open PRs: $count"
 
@@ -83,7 +138,23 @@ for i in $(seq 0 $((count - 1))); do
   contract="$(jq -r ".[$i].body // \"\"" <<<"$prs" | sed -n 's/^[[:space:]]*Review-Contract:[[:space:]]*\(docs\/[A-Za-z0-9._/-]*\.md\)[[:space:]]*$/\1/p' | head -n1)"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { log "PR #$pr: bad head sha"; continue; }
   if [[ "$draft" == "true" ]]; then log "PR #$pr ${sha:0:7}: draft, skipped"; continue; fi
-  if [[ -s "$VDIR/$sha.json" || -e "$STATE/$sha.done" ]]; then log "PR #$pr ${sha:0:7}: already reviewed"; continue; fi
+  if published "$sha"; then log "PR #$pr ${sha:0:7}: already reviewed and published"; continue; fi
+
+  # Reviewed (or could not run) earlier, but publication is incomplete: publish again, never re-review.
+  if [[ -s "$STATE/$sha.msg" ]]; then
+    if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication"; continue; fi
+    if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed"; fi
+    continue
+  fi
+  # A stored verdict without a message (e.g. from a manual run): build the message and publish it.
+  if [[ -s "$VDIR/$sha.json" ]]; then
+    if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD publish the stored verdict"; continue; fi
+    label="$(cat "$STATE/$sha.label" 2>/dev/null || echo "PR${pr}-manual")"
+    verdict_msg "$sha" "$label" "${contract:-unknown}"
+    publish "$pr" "$sha" && log "PR #$pr ${sha:0:7}: stored verdict published"
+    continue
+  fi
+
   if [[ -z "$contract" || "$contract" == *..* ]]; then
     log "PR #$pr ${sha:0:7}: no valid 'Review-Contract: docs/....md' line"
     if [[ ! -e "$STATE/$sha.nocontract" && $DRY -eq 0 ]]; then
@@ -115,32 +186,18 @@ for i in $(seq 0 $((count - 1))); do
     continue
   fi
   echo "$pr" > "$STATE/$sha.pr"
+  echo "$label" > "$STATE/$sha.label"
   if [[ $rc -eq 0 || $rc -eq 2 ]] && [[ -s "$VDIR/$sha.json" ]]; then
-    v="$(jq -r .verdict "$VDIR/$sha.json")"
-    {
-      printf '### Codex review %s — **%s**\n\n' "$label" "$v"
-      printf -- '- **Commit:** `%s`\n- **Contract:** `%s`\n- **Summary:** %s\n\n' "$sha" "$contract" "$(jq -r .summary "$VDIR/$sha.json")"
-      if [[ "$(jq '.findings | length' "$VDIR/$sha.json")" -gt 0 ]]; then
-        printf '| Severity | File:line | Evidence | Consequence |\n|---|---|---|---|\n'
-        jq -r '.findings[] | "| \(.severity) | `\(.file):\(.line)` | \(.evidence | gsub("\\|"; "\\\\|") | gsub("\n"; " ")) | \(.consequence | gsub("\\|"; "\\\\|") | gsub("\n"; " ")) |"' "$VDIR/$sha.json"
-        printf '\n'
-      fi
-      printf 'Merge gate (D1): green CI **and** a PASS on this exact SHA. Verdict stored on the server as `verdicts/%s.json`.\n' "$sha"
-    } > "$TMP/c.md"
-    comment "$pr" "$TMP/c.md" || log "PR #$pr: comment failed"
-    if [[ "$v" == "PASS" ]]; then set_status "$sha" success "Codex PASS ($label)" || true
-    else set_status "$sha" failure "Codex CHANGES_REQUESTED ($label)" || true; fi
-    touch "$STATE/$sha.done"
-    log "PR #$pr ${sha:0:7}: $v"
+    verdict_msg "$sha" "$label" "$contract"
+    log "PR #$pr ${sha:0:7}: $(jq -r .verdict "$VDIR/$sha.json")"
   else
     {
       printf '### Codex review %s — could not run (exit %s)\n\nNo verdict was stored. Last lines of the runner log:\n\n```\n' "$label" "$rc"
       tail -n 15 "$TMP/run.safe"
-      printf '```\nIt will not be retried for this commit; push a new commit or ask KK to run it by hand.\n'
-    } > "$TMP/c.md"
-    comment "$pr" "$TMP/c.md" || true
-    set_status "$sha" error "Codex review could not run ($label)" || true
-    touch "$STATE/$sha.done"
+      printf '```\nIt will not be retried for this commit; push a new commit, or run the installer with RETRY_FAILED=1.\n'
+    } > "$STATE/$sha.msg"
+    echo "error Codex review could not run ($label)" > "$STATE/$sha.state"
     log "PR #$pr ${sha:0:7}: runner failed (exit $rc)"
   fi
+  publish "$pr" "$sha" || true
 done

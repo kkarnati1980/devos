@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — install the review watcher on the DevOS server (DEVOS-60)
-# Version: 1.0.3
+# Version: 1.1.0
+# v1.1.0: RETRY_FAILED=1 also clears the v1.1.0 per-SHA publication state (msg, state, commented, statused,
+# published, label) of SHAs whose review could not run.
 # v1.0.3 (first live tick, 5 Nov): the service runs with User=root, HOME=/root and a normal PATH. Under systemd's
 # bare environment the runner's SSH fetch failed (Permission denied (publickey)), and codex needs HOME for its
 # login. RETRY_FAILED=1 clears done-markers of SHAs whose review could not run, so they are reviewed again.
@@ -57,10 +59,13 @@ pass "token can read PRs ($n open), commits, workflow runs and statuses; file mo
 echo "  (write access to comments and statuses is proven by the first real review, AT8)"
 
 if [[ "${RETRY_FAILED:-0}" == 1 ]]; then
-  for f in "$DIR"/watch/*.done; do
+  for f in "$DIR"/watch/*.done "$DIR"/watch/*.msg; do
     [[ -e "$f" ]] || continue
-    sha="$(basename "$f" .done)"
-    if [[ ! -s "$DIR/verdicts/$sha.json" ]]; then rm -f "$f" "$DIR/watch/$sha.pr"; echo "  cleared failed attempt for ${sha:0:7}"; fi
+    sha="$(basename "${f%.*}")"
+    [[ -s "$DIR/verdicts/$sha.json" ]] && continue
+    [[ -e "$DIR/watch/$sha.pr" || -e "$DIR/watch/$sha.done" || -e "$DIR/watch/$sha.msg" ]] || continue
+    rm -f "$DIR/watch/$sha".{done,pr,label,msg,state,commented,statused,published}
+    echo "  cleared failed attempt for ${sha:0:7}"
   done
 fi
 echo "==> 3/4 dry run"
