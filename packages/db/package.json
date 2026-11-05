@@ -1,0 +1,35 @@
+{
+  "name": "@devos/db",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DevOS data model: Prisma schema, migrations and client factory (M1.1).",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "generate": "prisma generate",
+    "build": "prisma generate && tsc -p tsconfig.json",
+    "typecheck": "prisma generate && tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"test/*.test.mjs\"",
+    "test:db": "node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
+    "db:migrate": "prisma migrate deploy",
+    "db:validate": "prisma validate && prisma format --check"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "@types/pg": "8.15.6",
+    "prisma": "7.10.1",
+    "typescript": "^5.6.3"
+  }
+}
