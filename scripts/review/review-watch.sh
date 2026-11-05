@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.1.0
+# Version: 1.1.1
+# v1.1.1 (Codex PR9-r3): pending publications are drained for every stored SHA, including ones a PR has
+# moved past; at most one review runs per tick, so the runner's 900 s limit always fits inside the service's
+# 1200 s TimeoutStartSec; verdict comments are redacted like runner logs.
 # v1.1.0 (Codex PR9-r2): publication is tracked per SHA (comment and status separately) and retried on
 # later ticks until both succeed, so a transient API failure never loses a verdict; open PRs and workflow
 # runs are read across all pages.
@@ -122,11 +125,13 @@ verdict_msg() {  # sha label contract -> writes <sha>.msg and <sha>.state from t
       printf '\n'
     fi
     printf 'Merge gate (D1): green CI **and** a PASS on this exact SHA. Verdict stored on the server as `verdicts/%s.json`.\n' "$sha"
-  } > "$STATE/$sha.msg"
+  } | redact > "$STATE/$sha.msg"
   if [[ "$v" == "PASS" ]]; then echo "success Codex PASS ($label)" > "$STATE/$sha.state"
   else echo "failure Codex CHANGES_REQUESTED ($label)" > "$STATE/$sha.state"; fi
 }
 
+reviewed=0          # reviews run this tick (max 1: runner limit 900 s < service limit 1200 s)
+declare -A tried=() # SHAs whose publication was attempted this tick
 prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
 count="$(jq 'length' <<<"$prs")"
 log "open PRs: $count"
@@ -142,12 +147,14 @@ for i in $(seq 0 $((count - 1))); do
 
   # Reviewed (or could not run) earlier, but publication is incomplete: publish again, never re-review.
   if [[ -s "$STATE/$sha.msg" ]]; then
+    tried[$sha]=1
     if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication"; continue; fi
     if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed"; fi
     continue
   fi
   # A stored verdict without a message (e.g. from a manual run): build the message and publish it.
   if [[ -s "$VDIR/$sha.json" ]]; then
+    tried[$sha]=1
     if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD publish the stored verdict"; continue; fi
     label="$(cat "$STATE/$sha.label" 2>/dev/null || echo "PR${pr}-manual")"
     verdict_msg "$sha" "$label" "${contract:-unknown}"
@@ -172,6 +179,7 @@ for i in $(seq 0 $((count - 1))); do
     if [[ -f "$f" && "$(cat "$f")" == "$pr" ]]; then round=$((round + 1)); fi
   done
   label="PR${pr}-r${round}"
+  if (( reviewed >= 1 )); then log "PR #$pr ${sha:0:7}: queued for the next tick (one review per tick)"; continue; fi
   if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD review as $label against $contract"; continue; fi
 
   log "PR #$pr ${sha:0:7}: reviewing as $label against $contract"
@@ -185,6 +193,8 @@ for i in $(seq 0 $((count - 1))); do
     set_status "$sha" pending "Codex review queued (runner busy)" || true
     continue
   fi
+  reviewed=1
+  tried[$sha]=1
   echo "$pr" > "$STATE/$sha.pr"
   echo "$label" > "$STATE/$sha.label"
   if [[ $rc -eq 0 || $rc -eq 2 ]] && [[ -s "$VDIR/$sha.json" ]]; then
@@ -200,4 +210,17 @@ for i in $(seq 0 $((count - 1))); do
     log "PR #$pr ${sha:0:7}: runner failed (exit $rc)"
   fi
   publish "$pr" "$sha" || true
+done
+
+# Drain: a SHA reviewed earlier whose comment or status never posted is published even if its PR has since
+# moved to a newer head or closed. The PR number comes from <sha>.pr, recorded when the review ran.
+for m in "$STATE"/*.msg; do
+  [[ -e "$m" ]] || continue
+  sha="$(basename "$m" .msg)"
+  [[ -n "${tried[$sha]:-}" ]] && continue
+  published "$sha" && continue
+  pr="$(cat "$STATE/$sha.pr" 2>/dev/null || true)"
+  [[ "$pr" =~ ^[0-9]+$ ]] || { log "${sha:0:7}: pending publication has no PR number; skipped"; continue; }
+  if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication (no longer the PR head)"; continue; fi
+  if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed (no longer the PR head)"; fi
 done
