@@ -96,10 +96,12 @@ echo "  service-environment check (deploy-key fetch as the service would run it)
 if systemd-run --quiet --wait --pipe --collect -p User=root -E HOME=/root \
      -E PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
      /usr/bin/env GIT_SSH_COMMAND="ssh -i /root/.ssh/devos_ro -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-     git -C /root/devos-review fetch -q origin >/dev/null 2>&1; then
+     git -C /root/devos-review fetch -q origin > "$TMP/fetch.log" 2>&1; then
   pass "deploy-key fetch works under systemd"
 else
-  fail "deploy-key fetch fails under systemd - send KK's terminal output to Claude"
+  sed 's/^/    /' "$TMP/fetch.log"
+  ls -l /root/.ssh/devos_ro /root/.ssh/known_hosts 2>&1 | sed 's/^/    /'
+  fail "deploy-key fetch fails under systemd - send this output to Claude"
 fi
 systemctl list-timers devos-review-watch.timer --no-pager | sed 's/^/  /'
 pass "timer enabled; logs: journalctl -u devos-review-watch -n 50"
