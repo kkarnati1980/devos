@@ -1,4 +1,4 @@
--- M1.1 v1.3: fixes for Codex reviews PR7-r1 and PR7-r2 (docs/modules/M1.1.md, AT14-AT20).
+-- M1.1 v1.3: fixes for Codex reviews PR7-r1 and PR7-r2 and PR7-r3 (docs/modules/M1.1.md, AT14-AT21).
 -- Check constraints and triggers only; no table or column changes. Every rule raises check_violation (23514).
 
 -- ---------- F1: a commit's identity is fixed once stored ----------
@@ -129,6 +129,45 @@ BEGIN
   IF (NEW.max_cost_usd <= p.max_cost_usd AND NEW.max_tokens <= p.max_tokens
       AND NEW.max_concurrency <= p.max_concurrency AND NEW.expires_at <= p.expires_at) IS NOT TRUE THEN
     RAISE EXCEPTION 'envelope widens cost, tokens, concurrency or expiry' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+
+-- ---------- PR7-r3: snapshot-safe uniqueness guards ----------
+-- requirements_doc_one_approved and vault_secret_global_unique serialise writers with an advisory lock,
+-- then check with EXISTS. That is correct in READ COMMITTED (each statement takes a fresh snapshot after
+-- the lock) and in SERIALIZABLE (SSI aborts the write skew), but in REPEATABLE READ the EXISTS can read a
+-- snapshot taken before the other writer committed. Those two guards therefore refuse REPEATABLE READ.
+CREATE FUNCTION devos_require_fresh_snapshot(guard text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('transaction_isolation') = 'repeatable read' THEN
+    RAISE EXCEPTION '%: not allowed under REPEATABLE READ (use READ COMMITTED or SERIALIZABLE)', guard
+      USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION devos_one_approved_requirements_doc() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.status = 'approved' THEN
+    PERFORM devos_require_fresh_snapshot('requirements_doc approval');
+    PERFORM pg_advisory_xact_lock(hashtext('requirements_doc:' || NEW.project_id::text));
+    IF EXISTS (SELECT 1 FROM requirements_doc
+               WHERE project_id = NEW.project_id AND status = 'approved' AND id <> NEW.id) THEN
+      RAISE EXCEPTION 'project % already has an approved requirements doc', NEW.project_id
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE OR REPLACE FUNCTION devos_vault_global_unique() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.project_id IS NULL THEN
+    PERFORM devos_require_fresh_snapshot('global vault secret');
+    PERFORM pg_advisory_xact_lock(hashtext('vault_secret:global:' || NEW.name));
+    IF EXISTS (SELECT 1 FROM vault_secret WHERE project_id IS NULL AND name = NEW.name AND id <> NEW.id) THEN
+      RAISE EXCEPTION 'global vault secret % already exists', NEW.name USING ERRCODE = 'check_violation';
+    END IF;
   END IF;
   RETURN NEW;
 END $$;

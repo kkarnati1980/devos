@@ -169,3 +169,75 @@ for (const iso of ["READ COMMITTED", "REPEATABLE READ"]) {
     }
   });
 }
+
+// ---------- PR7-r3: concurrent uniqueness guards ----------
+const REQ = "INSERT INTO requirements_doc (project_id, version, repo_path, status, updated_at) VALUES ($1, $2, 'docs/requirements.md', 'approved', now())";
+const VAULT = "INSERT INTO vault_secret (project_id, name, ciphertext, nonce, key_version, updated_at) VALUES (NULL, $1, '\\x01', '\\x02', 1, now())";
+
+async function committedProject(slug) {
+  const c = new pg.Client({ connectionString: url() });
+  await c.connect();
+  const p = await one(c, "INSERT INTO project (slug, name, updated_at) VALUES ($1, 'Race', now()) RETURNING id", [slug]);
+  return { id: p.id, cleanup: async (secret) => {
+    await c.query("DELETE FROM requirements_doc WHERE project_id = $1", [p.id]);
+    if (secret) await c.query("DELETE FROM vault_secret WHERE project_id IS NULL AND name = $1", [secret]);
+    await c.query("DELETE FROM project WHERE id = $1", [p.id]);
+    await c.end();
+  } };
+}
+
+test("AT21 under REPEATABLE READ both uniqueness guards refuse to run", async () => {
+  const p = await committedProject("race-rr-guard");
+  const s = await session("REPEATABLE READ");
+  try {
+    await rejects(s, REQ, [p.id, 1], { code: CHECK, message: /REPEATABLE READ/ });
+    await rejects(s, VAULT, ["RR_GLOBAL"], { code: CHECK, message: /REPEATABLE READ/ });
+    // Non-approved docs and per-project secrets are not affected.
+    await s.query("INSERT INTO requirements_doc (project_id, version, repo_path, status, updated_at) VALUES ($1, 1, 'docs/requirements.md', 'draft', now())", [p.id]);
+    await s.query("ROLLBACK");
+  } finally {
+    await s.end(); await p.cleanup();
+  }
+});
+
+for (const iso of ["READ COMMITTED", "SERIALIZABLE"]) {
+  const tag = iso === "READ COMMITTED" ? "rc" : "sr";
+  test(`AT21 (${iso}) two concurrent approved requirements docs: exactly one commits`, async () => {
+    const p = await committedProject(`race-req-${tag}`);
+    const A = await session(iso), B = await session(iso);
+    try {
+      await A.query("SELECT 1"); await B.query("SELECT 1"); // both snapshots predate either insert
+      await A.query(REQ, [p.id, 1]);
+      const b = settle(B.query(REQ, [p.id, 2]).then(() => B.query("COMMIT")));
+      await A.query("COMMIT");
+      const err = await b;
+      assert.ok(err, "the second approved doc must fail");
+      assert.ok(["23514", "40001"].includes(err.code), `${err.code} ${err.message}`);
+      await B.query("ROLLBACK").catch(() => {});
+      const n = await one(A, "SELECT count(*)::int AS n FROM requirements_doc WHERE project_id = $1 AND status = 'approved'", [p.id]);
+      assert.equal(n.n, 1);
+    } finally {
+      await A.end(); await B.end(); await p.cleanup();
+    }
+  });
+
+  test(`AT21 (${iso}) two concurrent global vault secrets with one name: exactly one commits`, async () => {
+    const name = `RACE_GLOBAL_${tag.toUpperCase()}`;
+    const p = await committedProject(`race-vault-${tag}`);
+    const A = await session(iso), B = await session(iso);
+    try {
+      await A.query("SELECT 1"); await B.query("SELECT 1");
+      await A.query(VAULT, [name]);
+      const b = settle(B.query(VAULT, [name]).then(() => B.query("COMMIT")));
+      await A.query("COMMIT");
+      const err = await b;
+      assert.ok(err, "the second global secret must fail");
+      assert.ok(["23514", "40001"].includes(err.code), `${err.code} ${err.message}`);
+      await B.query("ROLLBACK").catch(() => {});
+      const n = await one(A, "SELECT count(*)::int AS n FROM vault_secret WHERE project_id IS NULL AND name = $1", [name]);
+      assert.equal(n.n, 1);
+    } finally {
+      await A.end(); await B.end(); await p.cleanup(name);
+    }
+  });
+}
