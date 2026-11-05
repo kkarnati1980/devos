@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — install the review watcher on the DevOS server (DEVOS-60)
-# Version: 1.0.2
+# Version: 1.0.3
+# v1.0.3 (first live tick, 5 Nov): the service runs with User=root, HOME=/root and a normal PATH. Under systemd's
+# bare environment the runner's SSH fetch failed (Permission denied (publickey)), and codex needs HOME for its
+# login. RETRY_FAILED=1 clears done-markers of SHAs whose review could not run, so they are reviewed again.
 # v1.0.2: CI state is read via the Actions API (fine-grained tokens cannot hold Checks); probe Actions: Read.
 # v1.0.1: the token check covers every read the watcher needs (pulls, check runs, statuses) and names the
 # missing permission; Checks: Read added to the required list.
@@ -53,6 +56,13 @@ probe "/commits/$head/statuses" "Commit statuses: Read and write"
 pass "token can read PRs ($n open), commits, workflow runs and statuses; file mode $(stat -c %a "$ENVF")"
 echo "  (write access to comments and statuses is proven by the first real review, AT8)"
 
+if [[ "${RETRY_FAILED:-0}" == 1 ]]; then
+  for f in "$DIR"/watch/*.done; do
+    [[ -e "$f" ]] || continue
+    sha="$(basename "$f" .done)"
+    if [[ ! -s "$DIR/verdicts/$sha.json" ]]; then rm -f "$f" "$DIR/watch/$sha.pr"; echo "  cleared failed attempt for ${sha:0:7}"; fi
+  done
+fi
 echo "==> 3/4 dry run"
 "$DIR/bin/review-watch.sh" --dry-run 2>&1 | sed "s/^/  /"
 
@@ -63,6 +73,10 @@ Description=DevOS review watcher (Codex review on new PR heads)
 After=network-online.target
 [Service]
 Type=oneshot
+User=root
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=/root
 ExecStart=$DIR/bin/review-watch.sh
 TimeoutStartSec=1200
 UNIT
@@ -78,6 +92,15 @@ WantedBy=timers.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now devos-review-watch.timer >/dev/null
+echo "  service-environment check (deploy-key fetch as the service would run it):"
+if systemd-run --quiet --wait --pipe --collect -p User=root -E HOME=/root \
+     -E PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+     /usr/bin/env GIT_SSH_COMMAND="ssh -i /root/.ssh/devos_ro -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+     git -C /root/devos-review fetch -q origin >/dev/null 2>&1; then
+  pass "deploy-key fetch works under systemd"
+else
+  fail "deploy-key fetch fails under systemd - send KK's terminal output to Claude"
+fi
 systemctl list-timers devos-review-watch.timer --no-pager | sed 's/^/  /'
 pass "timer enabled; logs: journalctl -u devos-review-watch -n 50"
 echo "Uninstall: systemctl disable --now devos-review-watch.timer"

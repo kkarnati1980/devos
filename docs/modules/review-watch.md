@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-60 · P1 · Lane C (ops tooling; bootstrap until M3.4 Codex reviewer replaces it)
 - **Depends on:** M0.3 (review runner `scripts/review/review-commit.sh` v1.0.2, Codex CLI, read-only deploy key, verdict schema on the server)
-- **Owned files:** `scripts/review/review-watch.sh` (v1.0.2), `scripts/review/install-review-watch.sh` (v1.0.2), this contract.
+- **Owned files:** `scripts/review/review-watch.sh` (v1.0.2), `scripts/review/install-review-watch.sh` (v1.0.3), this contract.
 - **Approved by KK:** 4 Nov 2026 (build plan v1.0.0, section 7).
 
 ## Goal
@@ -41,3 +41,8 @@ Run the existing Codex review automatically on every new PR head, so a review no
 **v1.0.1 (5 Nov 2026, first server run):** the dry run reported all three green PRs as "CI not green". The fine-grained token lacked **Checks: Read**, which the check-runs API needs, and `log()` wrote to stdout, so the HTTP 403 was captured into a variable instead of being shown. Both are fixed, and the installer now probes each read permission.
 
 **v1.0.2 (5 Nov 2026):** fine-grained personal tokens cannot be given Checks permission (GitHub offers it only to GitHub Apps), so CI state now comes from the Actions API. It uses the latest workflow run per workflow for the head SHA, with **Actions: Read**.
+
+**v1.0.3 (5 Nov 2026, first live tick):**
+- **What happened:** the watcher found all three PRs, ran the runner, and posted the error comments and statuses, which proves the write permissions (part of AT8). Each runner failed at the deploy-key fetch (`Permission denied (publickey)`) under systemd's bare environment.
+- **Fix:** the unit now sets `User=root`, `HOME=/root` and a normal `PATH`. The installer checks the deploy-key fetch under systemd.
+- **Retry:** `RETRY_FAILED=1` clears the done-markers of SHAs whose review could not run.
