@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.0.1
+# Version: 1.0.2
+# v1.0.2: CI state comes from the Actions API (workflow runs for the head SHA, latest run per workflow);
+# fine-grained personal tokens cannot hold Checks: Read, so the check-runs API is not used. Needs Actions: Read.
 # v1.0.1 (first server run, 5 Nov 2026): log() writes to stderr, so API errors are visible instead of being
 # captured into variables; an unreadable check-runs API is reported as a token problem, not as "CI not green".
-# The token also needs Checks: Read (the check-runs API).
 #
 # Runs on the DevOS server from a systemd timer (installed by install-review-watch.sh). Each tick:
 #   1. lists open, non-draft PRs on kkarnati1980/devos;
@@ -17,7 +18,7 @@
 #
 # Usage:  review-watch.sh [--dry-run]     (--dry-run: report what would be reviewed, change nothing)
 # Token:  /root/.devos/github-review.env (600), GITHUB_REVIEW_TOKEN=..., fine-grained, devos repo only:
-#         Pull requests RW, Commit statuses RW, Checks R, Contents R, Metadata R. Read with sed, never sourced,
+#         Pull requests RW, Commit statuses RW, Actions R, Contents R, Metadata R. Read with sed, never sourced,
 #         passed to curl via a 600 header file, never printed.
 set -euo pipefail
 
@@ -50,11 +51,14 @@ gh_api() {  # method path [json-body-file] -> body on stdout; non-2xx is an erro
 }
 redact() { sed -E 's/(sk-[A-Za-z0-9_*.-]{6})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g'; }
 
-ci_green() {  # sha -> 0 green; 1 not green; 3 cannot read check runs (token lacks Checks: Read)
+ci_green() {  # sha -> 0 green; 1 not green; 3 cannot read workflow runs (token lacks Actions: Read)
+  # All DevOS CI is GitHub Actions. Take the latest run of each workflow for this SHA; every one must have
+  # completed with success/skipped/neutral, and there must be at least one.
   local runs
-  runs="$(gh_api GET "/repos/$REPO/commits/$1/check-runs?per_page=100")" || return 3
-  jq -e '(.check_runs | length) > 0 and all(.check_runs[]; .status == "completed"
-          and (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral"))' \
+  runs="$(gh_api GET "/repos/$REPO/actions/runs?head_sha=$1&per_page=100")" || return 3
+  jq -e '[.workflow_runs | group_by(.workflow_id)[] | max_by(.created_at)] as $latest
+         | ($latest | length) > 0 and all($latest[]; .status == "completed"
+           and (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral"))' \
      <<<"$runs" >/dev/null
 }
 
@@ -89,7 +93,7 @@ for i in $(seq 0 $((count - 1))); do
     continue
   fi
   set +e; ci_green "$sha"; ci=$?; set -e
-  if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read check runs - the token needs 'Checks: Read'"; continue; fi
+  if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; continue; fi
   if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; continue; fi
 
   round=1

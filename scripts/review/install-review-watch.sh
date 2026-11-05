@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — install the review watcher on the DevOS server (DEVOS-60)
-# Version: 1.0.1
+# Version: 1.0.2
+# v1.0.2: CI state is read via the Actions API (fine-grained tokens cannot hold Checks); probe Actions: Read.
 # v1.0.1: the token check covers every read the watcher needs (pulls, check runs, statuses) and names the
 # missing permission; Checks: Read added to the required list.
 # Run as root from a checkout of this repo (interactive only for the first-time hidden token prompt):
@@ -30,7 +31,7 @@ bash -n "$DIR/bin/review-watch.sh" && pass "scripts installed to $DIR/bin"
 echo "==> 2/4 GitHub token (hidden)"
 if [[ ! -s "$ENVF" || "${ROTATE_TOKEN:-0}" == 1 ]]; then
   echo "  Fine-grained token, repository kkarnati1980/devos ONLY:"
-  echo "  Pull requests: Read and write · Commit statuses: Read and write · Checks: Read · Contents: Read · Metadata: Read"
+  echo "  Pull requests: Read and write · Commit statuses: Read and write · Actions: Read · Contents: Read · Metadata: Read"
   read -rsp "  Paste the token (input hidden), then Enter: " T; echo
   [[ "$T" =~ ^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$ ]] || { unset T; fail "that does not look like a GitHub token"; }
   ( umask 077; printf 'GITHUB_REVIEW_TOKEN=%s\n' "$T" > "$ENVF" ); unset T
@@ -47,9 +48,9 @@ probe "/pulls?state=open" "Pull requests: Read and write"
 n="$(jq length "$TMP/r")"
 probe "/commits/main" "Contents: Read"
 head="$(jq -r .sha "$TMP/r")"
-probe "/commits/$head/check-runs" "Checks: Read"
+probe "/actions/runs?head_sha=$head&per_page=1" "Actions: Read"
 probe "/commits/$head/statuses" "Commit statuses: Read and write"
-pass "token can read PRs ($n open), commits, check runs and statuses; file mode $(stat -c %a "$ENVF")"
+pass "token can read PRs ($n open), commits, workflow runs and statuses; file mode $(stat -c %a "$ENVF")"
 echo "  (write access to comments and statuses is proven by the first real review, AT8)"
 
 echo "==> 3/4 dry run"
