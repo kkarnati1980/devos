@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — install the review watcher on the DevOS server (DEVOS-60)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1: the token check covers every read the watcher needs (pulls, check runs, statuses) and names the
+# missing permission; Checks: Read added to the required list.
 # Run as root from a checkout of this repo (interactive only for the first-time hidden token prompt):
 #   ssh -t root@devos 'cd /root/devos-review && bash scripts/review/install-review-watch.sh'
 # ROTATE_TOKEN=1 re-prompts. INTERVAL=3min sets the timer period.
@@ -28,7 +30,7 @@ bash -n "$DIR/bin/review-watch.sh" && pass "scripts installed to $DIR/bin"
 echo "==> 2/4 GitHub token (hidden)"
 if [[ ! -s "$ENVF" || "${ROTATE_TOKEN:-0}" == 1 ]]; then
   echo "  Fine-grained token, repository kkarnati1980/devos ONLY:"
-  echo "  Pull requests: Read and write · Commit statuses: Read and write · Contents: Read · Metadata: Read"
+  echo "  Pull requests: Read and write · Commit statuses: Read and write · Checks: Read · Contents: Read · Metadata: Read"
   read -rsp "  Paste the token (input hidden), then Enter: " T; echo
   [[ "$T" =~ ^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$ ]] || { unset T; fail "that does not look like a GitHub token"; }
   ( umask 077; printf 'GITHUB_REVIEW_TOKEN=%s\n' "$T" > "$ENVF" ); unset T
@@ -36,12 +38,22 @@ fi
 chmod 600 "$ENVF"
 TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
 ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^GITHUB_REVIEW_TOKEN=//p' "$ENVF" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
-code="$(curl -sS -o "$TMP/r" -w '%{http_code}' -H @"$TMP/auth" -H 'Accept: application/vnd.github+json' https://api.github.com/repos/kkarnati1980/devos/pulls?state=open)"
-[[ "$code" == 200 ]] || fail "token cannot list devos PRs (HTTP $code)"
-pass "token can read devos PRs ($(jq length "$TMP/r") open); file mode $(stat -c %a "$ENVF")"
+probe() {  # path permission-name -> 200 or fail naming the missing permission
+  local c
+  c="$(curl -sS -o "$TMP/r" -w '%{http_code}' -H @"$TMP/auth" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/kkarnati1980/devos$1")"
+  [[ "$c" == 200 ]] || fail "token cannot read $1 (HTTP $c) - add '$2' to the token (GitHub token settings, Edit; the token value stays the same)"
+}
+probe "/pulls?state=open" "Pull requests: Read and write"
+n="$(jq length "$TMP/r")"
+probe "/commits/main" "Contents: Read"
+head="$(jq -r .sha "$TMP/r")"
+probe "/commits/$head/check-runs" "Checks: Read"
+probe "/commits/$head/statuses" "Commit statuses: Read and write"
+pass "token can read PRs ($n open), commits, check runs and statuses; file mode $(stat -c %a "$ENVF")"
+echo "  (write access to comments and statuses is proven by the first real review, AT8)"
 
 echo "==> 3/4 dry run"
-"$DIR/bin/review-watch.sh" --dry-run | sed 's/^/  /'
+"$DIR/bin/review-watch.sh" --dry-run 2>&1 | sed "s/^/  /"
 
 echo "==> 4/4 systemd timer (every $INTERVAL)"
 cat > /etc/systemd/system/devos-review-watch.service <<UNIT
