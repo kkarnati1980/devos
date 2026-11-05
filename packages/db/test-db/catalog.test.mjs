@@ -48,12 +48,16 @@ const CHECKS = [
   "policy_state_singleton", "policy_decision_seq_positive", "policy_decision_hash_format", "approval_grant_issuer_is_kk",
   "approval_grant_uses", "approval_grant_expiry", "capability_envelope_limits", "budget_reservation_reconciled_has_actuals",
   "run_event_seq_positive", "run_error_not_an_attempt", "artifact_values", "guard_metric_values",
+  "capability_envelope_paths_canonical", "milestone_closed_has_gate_approval",
 ];
 const TRIGGERS = [
   "requirements_doc_one_approved", "vault_secret_global_unique", "deploy_requires_pass",
   "review_verdict_immutable", "audit_event_no_update", "audit_event_no_truncate",
   "policy_state_mode_guard", "policy_decision_chain", "policy_decision_no_update", "policy_decision_no_truncate",
   "capability_envelope_shrinks", "capability_envelope_immutable", "run_event_gapless", "run_event_immutable",
+  "commit_identity_fixed", "review_verdict_no_delete", "review_verdict_no_truncate",
+  "policy_state_no_delete", "policy_state_no_truncate", "run_event_no_delete", "run_event_no_truncate",
+  "milestone_gate_approved", "approval_keeps_closed_gate",
 ];
 
 test("AT4 every contract table exists, and no others", async () => {
