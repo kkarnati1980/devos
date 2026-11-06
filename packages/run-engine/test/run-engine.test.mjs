@@ -602,3 +602,23 @@ test("r6-2 max_seconds bounds start and result too: a slow start then a clean en
     assert.equal(cancelled, true, `${slow}: the runtime was cancelled`);
   }
 });
+
+// ---- Codex PR16-r7 regression ----
+
+test("r7-1 a resumed run that already used max_turns ends limit_hit without starting the runtime or reserving", async () => {
+  const s = setup({ maxTurns: 2 });
+  // The worker dies after turn 2 is checkpointed, before the ending is saved.
+  s.store.failCheckpoint = { when: (d) => Boolean(d.state.ending), times: 1 };
+  s.store.failAddCostTimes = 1; // leave nothing settled: worst case
+  const calls = [];
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 2, calls }) }) });
+  await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }));
+  assert.equal((await s.store.latestCheckpoint(s.runId)).data.turn, 2);
+  const out = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(out.status, "limit_hit");
+  assert.equal(s.store.errors.at(-1).message, "max-turns");
+  assert.equal(calls.length, 1, "the runtime did not start again");
+  assert.equal(s.pstore.reservations.length, 1, "no new reservation");
+  assert.equal(s.pstore.reservations[0].status, "reconciled", "the orphan was still charged");
+  assert.equal(assertGapless(s.store, s.runId).at(-1).type, "error");
+});

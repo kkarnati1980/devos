@@ -189,6 +189,17 @@ export class RunEngine {
       return { ...base, status: "paused", errorType: "budget_exceeded", costUsd: 0, turns: state.turn, lastSeq: seq };
     }
 
+    // ---- a resumed run that already used its turns: end it, never start the runtime again ----
+    if (state.turn >= run.maxTurns) {
+      const ending: Ending = {
+        step: "record", status: "limit_hit", errorType: "internal", message: "max-turns", retryable: false, countsAsAttempt: false,
+        reservationId: null, usd: 0, tokens: 0, usage: ZERO_USAGE, costEstimated: false, provider: input.provider, totalUsd: state.costUsd, seqBefore: seq,
+      };
+      state.state.ending = ending;
+      await checkpoint();
+      return this.finalize(run, state, ending, emit, checkpoint, () => seq);
+    }
+
     // ---- reserve (M1.7, fail-closed) ----
     const envelope = await store.loadEnvelope(run.id);
     const remainingUsd = Math.max(0, run.maxCostUsd - state.costUsd);
