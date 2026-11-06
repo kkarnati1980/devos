@@ -1,0 +1,104 @@
+// R1 AT3 (static half): deploy/compose.yaml and the Dockerfile keep the R1-b deploy rules
+// (docs/modules/R1.md). The live half (compose config refuses a missing DEVOS_BIND_IP, images carry no
+// secret) runs in .github/workflows/release-images.yml.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parse } from "yaml";
+
+const root = fileURLToPath(new URL("../../", import.meta.url));
+const composeText = readFileSync(`${root}deploy/compose.yaml`, "utf8");
+const compose = parse(composeText, { merge: true });
+const dockerfile = readFileSync(`${root}Dockerfile`, "utf8");
+const dockerignore = readFileSync(`${root}.dockerignore`, "utf8");
+
+test("AT3 the stack has exactly the R1-b services", () => {
+  assert.deepEqual(Object.keys(compose.services).sort(), ["api", "dashboard", "migrate", "postgres", "redis", "worker"]);
+});
+
+test("AT3 only api and dashboard publish ports, each on the required DEVOS_BIND_IP", () => {
+  for (const [name, svc] of Object.entries(compose.services)) {
+    const ports = svc.ports ?? [];
+    if (name === "api" || name === "dashboard") {
+      assert.equal(ports.length, 1, `${name} publishes one port`);
+      assert.match(String(ports[0]), /^\$\{DEVOS_BIND_IP:\?[^}]*\}:/, `${name} binds only to the required DEVOS_BIND_IP`);
+    } else {
+      assert.equal(ports.length, 0, `${name} publishes nothing`);
+      assert.equal(svc.network_mode, undefined, `${name} is not on the host network`);
+    }
+  }
+});
+
+test("AT3 the tailscaled socket and the cert directory are read-only bind mounts that are never created", () => {
+  const sock = compose.services.api.volumes.find((v) => v.target === "/var/run/tailscale/tailscaled.sock");
+  const certs = compose.services.dashboard.volumes.find((v) => v.target === "/certs");
+  for (const m of [sock, certs]) {
+    assert.ok(m, "mount present");
+    assert.equal(m.type, "bind");
+    assert.equal(m.read_only, true);
+    assert.equal(m.bind?.create_host_path, false);
+  }
+});
+
+test("AT3 M1.3-a: secure cookies are on by default; migrate gates the api and the worker", () => {
+  assert.equal(compose.services.api.environment.DEVOS_COOKIE_SECURE, "${DEVOS_COOKIE_SECURE:-1}");
+  for (const s of ["api", "worker"]) assert.equal(compose.services[s].depends_on.migrate.condition, "service_completed_successfully");
+  assert.equal(compose.services.migrate.depends_on.postgres.condition, "service_healthy");
+});
+
+test("AT3 no secret value is written in the compose file: every secret is a required or empty ${NAME}", () => {
+  const secretish = /(PASSWORD|SECRET|_KEY|TOKEN)$/;
+  const envs = Object.values(compose.services).flatMap((s) => Object.entries(s.environment ?? {}));
+  for (const [k, v] of envs) {
+    if (!secretish.test(k)) continue;
+    assert.match(String(v), /^\$\{[A-Z0-9_]+(:\?[^}]*|:-)?\}$/, `${k} comes from the environment by name`);
+  }
+  assert.match(compose["x-db-env"].DATABASE_URL, /^postgresql:\/\/devos:\$\{POSTGRES_PASSWORD:\?[^}]*\}@postgres:5432\/devos$/);
+  assert.doesNotMatch(composeText, /sk-[A-Za-z0-9]|ghp_|github_pat_|BEGIN [A-Z ]*PRIVATE KEY/);
+});
+
+test("AT3 images: four targets, unprivileged runtime, no secret build argument, secrets kept out of the context", () => {
+  for (const t of ["api", "dashboard", "worker", "migrate"]) assert.match(dockerfile, new RegExp(`^FROM runtime AS ${t}$`, "m"));
+  assert.match(dockerfile, /^USER node$/m);
+  const args = [...dockerfile.matchAll(/^ARG\s+([A-Z0-9_]+)/gm)].map((m) => m[1]);
+  assert.deepEqual(args, ["GIT_SHA"]);
+  for (const line of [".env", ".env.*", ".git", "**/node_modules"]) assert.ok(dockerignore.split("\n").includes(line), `.dockerignore has ${line}`);
+});
+
+// R1 AT5: the health-sha server check against fake `tailscale` and `curl` on PATH.
+
+const CHECK = `${root}scripts/server/checks/health-sha.sh`;
+const SHA = "a".repeat(40);
+
+function runCheck({ code, body = "", tsIp = "100.64.0.7", sha = SHA }) {
+  const bin = mkdtempSync(join(tmpdir(), "r1-check-"));
+  writeFileSync(join(bin, "tailscale"), `#!/usr/bin/env bash\necho ${tsIp}\n`);
+  // Fake curl: prints the body, a newline and the HTTP code (what -w '\n%{http_code}' produces).
+  writeFileSync(join(bin, "curl"), `#!/usr/bin/env bash\nprintf '%s\\n%s' "$FAKE_BODY" "$FAKE_CODE"\n`);
+  for (const f of ["tailscale", "curl"]) chmodSync(join(bin, f), 0o755);
+  return spawnSync("bash", [CHECK], {
+    env: { PATH: `${bin}:${process.env.PATH}`, DEVOS_DIR: bin, DEVOS_SHA: sha, FAKE_BODY: body, FAKE_CODE: code },
+    encoding: "utf8",
+  });
+}
+
+test("AT5 health-sha: pass when /health reports the deployed SHA", () => {
+  const r = runCheck({ code: "200", body: JSON.stringify({ status: "ok", sha: SHA, startedAt: "x" }) });
+  assert.equal(r.status, 0, r.stdout);
+});
+
+test("AT5 health-sha: skipped (3) while nothing answers, never counted as a pass", () => {
+  assert.equal(runCheck({ code: "000" }).status, 3);
+});
+
+test("AT5 health-sha: fail on another SHA, a non-200, no tailnet IP or a bad DEVOS_SHA", () => {
+  assert.equal(runCheck({ code: "200", body: JSON.stringify({ sha: "b".repeat(40) }) }).status, 1);
+  assert.equal(runCheck({ code: "200", body: JSON.stringify({ sha: "unknown" }) }).status, 1);
+  assert.equal(runCheck({ code: "503", body: "{}" }).status, 1);
+  assert.equal(runCheck({ code: "200", body: JSON.stringify({ sha: SHA }), tsIp: "203.0.113.9" }).status, 1);
+  assert.equal(runCheck({ code: "200", body: JSON.stringify({ sha: SHA }), sha: "abc" }).status, 1);
+});

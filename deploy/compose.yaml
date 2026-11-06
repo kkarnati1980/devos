@@ -1,0 +1,123 @@
+# DevOS Coolify application (R1-b, docs/modules/R1.md). One compose app: postgres, redis, migrate, api,
+# dashboard, worker. Every value comes from the environment BY NAME (Coolify env); nothing secret is here.
+# DEVOS_BIND_IP is required: on the server it is the tailnet IPv4, so no port is ever published on 0.0.0.0
+# (ADR-0005, build-standard F3). Postgres and Redis publish nothing.
+name: devos
+
+x-build: &build
+  context: ..
+  dockerfile: Dockerfile
+  args:
+    GIT_SHA: ${GIT_SHA:-${SOURCE_COMMIT:-unknown}}
+
+x-db-env: &db-env
+  DATABASE_URL: postgresql://devos:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/devos
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: devos
+      POSTGRES_DB: devos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - devos-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devos -d devos"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 1g
+
+  redis:
+    image: redis:7.4
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - devos-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 256m
+
+  migrate:
+    build: { <<: *build, target: migrate }
+    restart: "no"
+    environment: *db-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    mem_limit: 512m
+
+  api:
+    build: { <<: *build, target: api }
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      PORT: "3001"
+      DEVOS_KK_LOGIN: ${DEVOS_KK_LOGIN:?DEVOS_KK_LOGIN is required}
+      DEVOS_SESSION_KEY: ${DEVOS_SESSION_KEY:?DEVOS_SESSION_KEY is required}
+      DEVOS_ALLOWED_ORIGINS: ${DEVOS_ALLOWED_ORIGINS:?DEVOS_ALLOWED_ORIGINS is required}
+      DEVOS_COOKIE_SECURE: ${DEVOS_COOKIE_SECURE:-1}
+      DEVOS_DASHBOARD_URL: ${DEVOS_DASHBOARD_URL:-}
+      DEVOS_POLICY_HMAC_KEY: ${DEVOS_POLICY_HMAC_KEY:-}
+      DEVOS_VAULT_KEY: ${DEVOS_VAULT_KEY:-}
+      DEVOS_VAULT_KEY_VERSION: ${DEVOS_VAULT_KEY_VERSION:-}
+      DEVOS_SMTP_HOST: ${DEVOS_SMTP_HOST:-}
+      DEVOS_SMTP_PORT: ${DEVOS_SMTP_PORT:-}
+      DEVOS_SMTP_SECURITY: ${DEVOS_SMTP_SECURITY:-}
+      DEVOS_SMTP_USER: ${DEVOS_SMTP_USER:-}
+      DEVOS_SMTP_FROM: ${DEVOS_SMTP_FROM:-}
+      DEVOS_TAILSCALE_SOCKET: /var/run/tailscale/tailscaled.sock
+    ports:
+      # M1.2 deploy requirement: published on the host directly (no proxy), so the tailnet peer
+      # address reaches the whois identity check.
+      - "${DEVOS_BIND_IP:?DEVOS_BIND_IP is required}:${DEVOS_API_PORT:-3001}:3001"
+    volumes:
+      - type: bind
+        source: ${DEVOS_TAILSCALE_SOCKET_HOST:-/var/run/tailscale/tailscaled.sock}
+        target: /var/run/tailscale/tailscaled.sock
+        read_only: true
+        bind: { create_host_path: false }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    mem_limit: 512m
+
+  dashboard:
+    build: { <<: *build, target: dashboard }
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      HOST: 0.0.0.0
+      # M1.3-a: in-process HTTPS from `tailscale cert`; both empty = plain HTTP (CI only).
+      DEVOS_TLS_CERT_FILE: ${DEVOS_TLS_CERT_FILE:-}
+      DEVOS_TLS_KEY_FILE: ${DEVOS_TLS_KEY_FILE:-}
+    ports:
+      - "${DEVOS_BIND_IP:?DEVOS_BIND_IP is required}:${DASHBOARD_PORT:-3000}:3000"
+    volumes:
+      - type: bind
+        source: ${DEVOS_TLS_DIR:-/root/.devos/tls}
+        target: /certs
+        read_only: true
+        bind: { create_host_path: false }
+    mem_limit: 512m
+
+  worker:
+    build: { <<: *build, target: worker }
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      REDIS_URL: redis://redis:6379
+      DEVOS_POLICY_HMAC_KEY: ${DEVOS_POLICY_HMAC_KEY:-}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    stop_grace_period: 60s
+    mem_limit: 1g
+
+volumes:
+  devos-pg:
+  devos-redis:
