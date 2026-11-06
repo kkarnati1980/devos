@@ -84,38 +84,57 @@ async function probeProject(db: Db): Promise<{ projectId: string; taskId: string
   return { projectId: project.id, taskId: task.id, pausedAt: project.pausedAt ?? null };
 }
 
+/** Whether a probe run's queue job can still execute: `removed`/`absent` = it never will. */
+export type JobFate = "removed" | "absent" | "present" | "unknown";
+
+export interface ProbeJobs {
+  enqueue(input: { runId: string; provider: "anthropic"; prompt: string; cwd: string; reserveTokens: number; reserveUsd: number }): Promise<unknown>;
+  /**
+   * PR21-r2: make sure the run's job can never execute: remove it if it is waiting/delayed/failed,
+   * report `present` if a worker holds it (active), `absent` if Redis has no such job.
+   */
+  retire(runId: string): Promise<JobFate>;
+}
+
 /**
- * probe-start: refuses while any other run is queued or running, or a recent probe run is unfinished.
- * Creates one run and queues it. PR21-r1: a probe run whose job never reached the queue is closed as
- * failed at once (enqueue error) or once stale, so a lost job never blocks later checks.
+ * probe-start: refuses while any other run is queued or running, or a probe run is unfinished.
+ * Creates one run and queues it. A probe run is closed as failed only once its queue job is confirmed
+ * gone (removed, or absent): after an enqueue error at once, and an unfinished probe older than
+ * PROBE_STALE_MS (a lost job) before the open-probe check. When the job's fate is unknown (Redis down)
+ * or a worker holds it, the row stays open and the check fails: never a closed run with a live job
+ * (PR21-r1, PR21-r2).
  */
-export async function probeStart(
-  db: Db,
-  enqueue: (input: { runId: string; provider: "anthropic"; prompt: string; cwd: string; reserveTokens: number; reserveUsd: number }) => Promise<unknown>,
-  now: () => number = Date.now,
-): Promise<Verdict> {
+export async function probeStart(db: Db, jobs: ProbeJobs, now: () => number = Date.now): Promise<Verdict> {
   const { projectId, taskId, pausedAt } = await probeProject(db);
   if (pausedAt) return fail("probe-project-paused", { projectId });
   const busy = await db.run.count({ where: { status: { in: ["queued", "running"] }, projectId: { not: projectId } } });
   if (busy > 0) return skip("worker-busy", { activeRuns: busy });
-  const stale = await db.run.updateMany({
+  const staleRuns: { id: string }[] = await db.run.findMany({
     where: { projectId, status: { in: ["queued", "running"] }, createdAt: { lt: new Date(now() - PROBE_STALE_MS) } },
-    data: { status: "failed", error: "probe-stale", endedAt: new Date(now()) },
+    select: { id: true },
   });
+  let closedStale = 0;
+  for (const r of staleRuns) if (await closeIfRetired(db, jobs, r.id, "probe-stale", now)) closedStale++;
   const open = await db.run.count({ where: { status: { in: ["queued", "running"] }, projectId } });
   if (open > 0) return fail("probe-run-unfinished", { openProbeRuns: open });
   const run = await db.run.create({
     data: { taskId, projectId, role: "tester", model: PROBE_MODEL, maxTurns: PROBE_TURNS + 6, maxSeconds: PROBE_MAX_SECONDS, maxCostUsd: PROBE_MAX_COST_USD },
   });
   try {
-    await enqueue({ runId: run.id, provider: "anthropic", prompt: "g1 probe", cwd: "/tmp", reserveTokens: PROBE_RESERVE_TOKENS, reserveUsd: PROBE_RESERVE_USD });
+    await jobs.enqueue({ runId: run.id, provider: "anthropic", prompt: "g1 probe", cwd: "/tmp", reserveTokens: PROBE_RESERVE_TOKENS, reserveUsd: PROBE_RESERVE_USD });
   } catch (e) {
-    // The job may or may not have reached Redis; a run nobody will execute must not stay open. If the
-    // job did arrive, the engine sees a finished run and does not start it again (M1.5 rule 8).
-    await db.run.update({ where: { id: run.id }, data: { status: "failed", error: "probe-enqueue-failed", endedAt: new Date(now()) } });
-    return fail("probe-enqueue-failed", { runId: run.id, code: errorCode(e) });
+    // The job may or may not have reached Redis. Close the row only once the job is confirmed gone.
+    const closed = await closeIfRetired(db, jobs, run.id, "probe-enqueue-failed", now);
+    return fail(closed ? "probe-enqueue-failed" : "probe-enqueue-uncertain", { runId: run.id, code: errorCode(e) });
   }
-  return ok({ runId: run.id, projectId, ...(stale.count > 0 ? { closedStaleProbeRuns: stale.count } : {}) });
+  return ok({ runId: run.id, projectId, ...(closedStale > 0 ? { closedStaleProbeRuns: closedStale } : {}) });
+}
+
+async function closeIfRetired(db: Db, jobs: ProbeJobs, runId: string, error: string, now: () => number): Promise<boolean> {
+  const fate = await jobs.retire(runId).catch((): JobFate => "unknown");
+  if (fate !== "removed" && fate !== "absent") return false;
+  const res = await db.run.updateMany({ where: { id: runId, status: { in: ["queued", "running"] } }, data: { status: "failed", error, endedAt: new Date(now()) } });
+  return res.count === 1;
 }
 
 /**
@@ -197,6 +216,11 @@ export function micros(v: unknown): number {
   return m[1] ? -n : n;
 }
 
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  let t: NodeJS.Timeout;
+  return Promise.race([p.finally(() => clearTimeout(t)), new Promise<T>((_, reject) => (t = setTimeout(() => reject(new Error("queue-retire-timeout")), ms)))]);
+}
+
 /** Reduce any error to a code: never a message (it may carry a URL or a value). */
 export function errorCode(e: unknown): string {
   if (e instanceof Error) {
@@ -228,14 +252,34 @@ export async function cli(argv: string[], env: NodeJS.ProcessEnv): Promise<Verdi
     const redisUrl = env.REDIS_URL ?? "";
     if (!/^rediss?:\/\//.test(redisUrl)) return fail("config-redis-url-required");
     const { RunQueue } = await import("./queue.js");
-    const queue = new RunQueue({ redisUrl });
+    let queue = new RunQueue({ redisUrl });
     try {
       if (cmd === "probe-guard") {
         const active = await queue.queue.getActive();
         const concurrency = Number(env.DEVOS_WORKER_CONCURRENCY ?? 1);
         return await probeGuard(db, arg ?? "", active.map((j) => String(j.id)), concurrency);
       }
-      return await probeStart(db, (input) => queue.enqueue(input));
+      let fresh = false;
+      return await probeStart(db, {
+        enqueue: (input) => queue.enqueue(input),
+        retire: async (runId) => {
+          // A timed-out add may still sit in the first connection: drop it before looking (once).
+          if (!fresh) {
+            await queue.close().catch(() => undefined);
+            queue = new RunQueue({ redisUrl });
+            fresh = true;
+          }
+          const job = await withDeadline(queue.queue.getJob(runId), 10_000);
+          if (!job) return "absent";
+          if ((await withDeadline(job.getState(), 10_000)) === "active") return "present";
+          try {
+            await withDeadline(job.remove(), 10_000);
+            return "removed";
+          } catch {
+            return "present"; // locked by a worker that just took it
+          }
+        },
+      });
     } finally {
       await queue.close().catch(() => undefined);
     }

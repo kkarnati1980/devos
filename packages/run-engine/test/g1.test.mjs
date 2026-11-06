@@ -10,6 +10,7 @@ import { probeGated } from "../dist/worker-main.js";
 import { checkCaps, checkReceipts, probeStart, probeGuard, probeStatus, errorCode, cli, micros, PROBE_RESERVE_USD, PROBE_MAX_COST_USD, PROBE_STALE_MS } from "../dist/g1-cli.js";
 
 const fast = () => new ProbeAdapter({ turnMs: 5 });
+const jobs = (enqueue, fate = "absent") => ({ enqueue, retire: async () => { if (fate instanceof Error) throw fate; return fate; } });
 
 function setup(model) {
   const store = new MemoryRunStore();
@@ -79,8 +80,9 @@ function fakeDb(seed = {}) {
       count: async ({ where }) => db.rows.run.filter((r) => (typeof where.status === "string" ? r.status === where.status : where.status.in.includes(r.status)) && (where.projectId.not ? r.projectId !== where.projectId.not : r.projectId === where.projectId)).length,
       create: async ({ data }) => { const r = { id: "22222222-2222-4222-8222-222222222222", status: "queued", createdAt: new Date(), ...data }; db.rows.run.push(r); return r; },
       update: async ({ where, data }) => Object.assign(db.rows.run.find((r) => r.id === where.id), data),
+      findMany: async ({ where }) => db.rows.run.filter((r) => r.projectId === where.projectId && where.status.in.includes(r.status) && r.createdAt < where.createdAt.lt).map((r) => ({ id: r.id })),
       updateMany: async ({ where, data }) => {
-        const hit = db.rows.run.filter((r) => r.projectId === where.projectId && where.status.in.includes(r.status) && r.createdAt < where.createdAt.lt);
+        const hit = db.rows.run.filter((r) => r.id === where.id && where.status.in.includes(r.status));
         for (const r of hit) Object.assign(r, data);
         return { count: hit.length };
       },
@@ -131,7 +133,7 @@ test("AT3 receipts over the real PolicyEngine: a changed receipt byte fails", as
 test("AT4 probe-start: creates the g1-probe project, task and run, queues it; never while another run is active", async () => {
   const db = fakeDb();
   const queued = [];
-  const v = await probeStart(db, async (i) => queued.push(i));
+  const v = await probeStart(db, jobs(async (i) => queued.push(i)));
   assert.equal(v.code, 0);
   assert.equal(db.rows.project[0].slug, "g1-probe");
   assert.equal(db.rows.run[0].model, PROBE_MODEL);
@@ -139,11 +141,11 @@ test("AT4 probe-start: creates the g1-probe project, task and run, queues it; ne
   assert.equal(queued[0].reserveUsd, PROBE_RESERVE_USD);
   assert.ok(PROBE_RESERVE_USD * 2 < PROBE_MAX_COST_USD, "a hard-killed attempt's full charge still leaves room to resume");
   // the probe run is unfinished: a second start fails instead of stacking runs
-  assert.equal((await probeStart(db, async () => {})).code, 1);
+  assert.equal((await probeStart(db, jobs(async () => {}))).code, 1);
   // a real run is active: skipped, nothing queued (the check must never kill a worker holding a real run)
   const busy = fakeDb({ run: [{ id: "r", projectId: "other", status: "running" }] });
   const q2 = [];
-  const b = await probeStart(busy, async (i) => q2.push(i));
+  const b = await probeStart(busy, jobs(async (i) => q2.push(i)));
   assert.equal(b.code, 3);
   assert.equal(b.out.reason, "worker-busy");
   assert.equal(q2.length, 0);
@@ -208,22 +210,22 @@ test("AT5 PR21: a killed worker's job resumes quickly: lock 15 s and stalled che
 
 test("PR21-r1 probe-start: a failed enqueue closes the new run as failed, so the next check can start", async () => {
   const db = fakeDb();
-  const v = await probeStart(db, async () => { throw Object.assign(new Error("connect ECONNREFUSED redis://secret@x"), { code: "ECONNREFUSED" }); });
+  const v = await probeStart(db, jobs(async () => { throw Object.assign(new Error("connect ECONNREFUSED redis://secret@x"), { code: "ECONNREFUSED" }); }));
   assert.equal(v.code, 1);
   assert.equal(v.out.reason, "probe-enqueue-failed");
   assert.ok(!JSON.stringify(v.out).includes("secret"));
   assert.equal(db.rows.run[0].status, "failed");
   db.rows.run[0].id = "33333333-3333-4333-8333-333333333333";
-  assert.equal((await probeStart(db, async () => {})).code, 0, "not blocked by the failed enqueue");
+  assert.equal((await probeStart(db, jobs(async () => {}))).code, 0, "not blocked by the failed enqueue");
 });
 
 test("PR21-r1 probe-start: a stale unfinished probe run (lost job) is closed; a recent one still blocks", async () => {
   const db = fakeDb();
-  await probeStart(db, async () => {});
-  assert.equal((await probeStart(db, async () => {})).code, 1, "a recent unfinished probe blocks");
+  await probeStart(db, jobs(async () => {}));
+  assert.equal((await probeStart(db, jobs(async () => {}))).code, 1, "a recent unfinished probe blocks");
   db.rows.run[0].id = "44444444-4444-4444-8444-444444444444";
   const later = Date.now() + PROBE_STALE_MS + 1000;
-  const v = await probeStart(db, async () => {}, () => later);
+  const v = await probeStart(db, jobs(async () => {}), () => later);
   assert.equal(v.code, 0);
   assert.equal(v.out.closedStaleProbeRuns, 1);
   assert.equal(db.rows.run[0].error, "probe-stale");
@@ -258,4 +260,26 @@ test("PR21-r1 probe-status: money is compared in exact microdollars (a duplicate
   const dup = await probeStatus(fakeDb({ ...base, reservations: [{ status: "reconciled", actualUsd: "0.001003" }], costs: [{ usd: "0.001" }, { usd: "0.000004" }] }), RUN, true);
   assert.equal(dup.code, 1);
   assert.equal(dup.out.reason, "cost-not-reconciled");
+});
+
+test("PR21-r2 a probe run is closed only once its queue job is confirmed gone; otherwise it stays open", async () => {
+  const boom = async () => { throw new Error("queue-enqueue-timeout"); };
+  for (const fate of ["present", "unknown", new Error("redis down")]) {
+    const db = fakeDb();
+    const v = await probeStart(db, jobs(boom, fate));
+    assert.equal(v.out.reason, "probe-enqueue-uncertain", String(fate));
+    assert.equal(db.rows.run[0].status, "queued", "a run whose job may still execute is never closed");
+  }
+  for (const fate of ["removed", "absent"]) {
+    const db = fakeDb();
+    assert.equal((await probeStart(db, jobs(boom, fate))).out.reason, "probe-enqueue-failed");
+    assert.equal(db.rows.run[0].status, "failed");
+  }
+  // a stale probe whose job a worker holds is not closed, and still blocks a new probe
+  const db = fakeDb();
+  await probeStart(db, jobs(async () => {}));
+  const later = Date.now() + PROBE_STALE_MS + 1000;
+  const held = await probeStart(db, jobs(async () => {}, "present"), () => later);
+  assert.equal(held.out.reason, "probe-run-unfinished");
+  assert.equal(db.rows.run.length, 1, "no second probe while the old job can still run");
 });
