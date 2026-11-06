@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — install the server agent on the DevOS server (DEVOS-74). Contract: docs/modules/server-agent.md
-# Version: 1.2.0
+# Version: 1.2.1
+# v1.2.1 (Codex PR12-r1): running the installed copy (ROTATE_COOLIFY=1 bash /root/.devos/bin/...) skips the copy
+# step instead of failing on install's same-file check.
 # v1.2.0: the Coolify token is optional (Enter skips it) until a DevOS app exists in Coolify (M1.2);
 # without it deploy-on-PASS cannot be turned on, and self-update + server checks still run.
 # v1.1.2 (Codex PR11-r4): --deploy-on and --deploy-off change the switch under the agent's lock.
@@ -51,11 +53,17 @@ if [[ "${1:-}" != --deploy-on ]]; then
 
   echo "==> 1/4 scripts"
   install -d -m 700 "$DIR" "$DIR/bin" "$DIR/bin/checks" "$ST"
-  bash -n "$SRC/server-agent.sh"
-  install -m 700 "$SRC/server-agent.sh" "$DIR/bin/server-agent.sh"
-  install -m 700 "$SRC/install-server-agent.sh" "$DIR/bin/install-server-agent.sh"
-  for f in "$SRC"/checks/*.sh; do [[ -e "$f" ]] && bash -n "$f" && install -m 700 "$f" "$DIR/bin/checks/"; done
-  pass "installed to $DIR/bin ($(ls "$DIR"/bin/checks/*.sh 2>/dev/null | wc -l) checks)"
+  if [[ "$SRC" -ef "$DIR/bin" ]]; then
+    # Run from the installed copy (e.g. ROTATE_COOLIFY=1 later): the scripts are already in place and the agent
+    # keeps them current from main, so nothing is copied.
+    pass "running from $DIR/bin: scripts already installed (kept current by the agent's self-update)"
+  else
+    bash -n "$SRC/server-agent.sh"
+    install -m 700 "$SRC/server-agent.sh" "$DIR/bin/server-agent.sh"
+    install -m 700 "$SRC/install-server-agent.sh" "$DIR/bin/install-server-agent.sh"
+    for f in "$SRC"/checks/*.sh; do [[ -e "$f" ]] && bash -n "$f" && install -m 700 "$f" "$DIR/bin/checks/"; done
+    pass "installed to $DIR/bin ($(ls "$DIR"/bin/checks/*.sh 2>/dev/null | wc -l) checks)"
+  fi
 
   echo "==> 2/4 Coolify API token (hidden)"
   if [[ ! -s "$CF_ENV" || "${ROTATE_COOLIFY:-0}" == 1 ]]; then

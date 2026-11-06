@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-74 · P1 · Lane C · critical path (blocks DEVOS-47, the G1 gate)
 - **Depends on:** M0.3 (read-only deploy key `/root/.ssh/devos_ro`), the review watcher (DEVOS-60: `codex-review` commit status and the GitHub token in `/root/.devos/github-review.env`), M0.4 (local Coolify API on `http://localhost:8000/api/v1`).
-- **Owned files:** `scripts/server/server-agent.sh` (v1.1.2), `scripts/server/install-server-agent.sh` (v1.2.0), `scripts/server/checks/*.sh`, `scripts/test/server-agent.test.mjs`, this contract.
+- **Owned files:** `scripts/server/server-agent.sh` (v1.1.2), `scripts/server/install-server-agent.sh` (v1.2.1), `scripts/server/checks/*.sh`, `scripts/test/server-agent.test.mjs`, this contract.
 - **Approved by KK:** 6 Nov 2026 (DEVOS-74). It removes the need for KK at the server terminal after one install.
 - **Applies:** ADR-0011 (timeouts on every outbound call, retries only for safe operations), D1 (merge and deploy only on green CI + Codex PASS for the exact SHA), the continuous-build runbook (no runner access to the server; one installer that KK runs once).
 
@@ -73,3 +73,5 @@ AT1–AT9 run in CI (9 tests, including the PR11-r1 regressions: unreadable tree
 **Installer v1.1.2 (6 Nov 2026, Codex PR11-r4, 1 medium, accepted):** `--deploy-on` / `--deploy-off` take the agent lock (waiting up to 25 min for a running tick) before changing the switch and clearing the SHA's markers.
 
 **Installer v1.2.0 (6 Nov 2026):** the Coolify token is optional until the DevOS Coolify app exists (M1.2), so KK can install the agent now for self-update and server checks (AT10 parts 1 and 3); deploy-on-PASS cannot be enabled without it.
+
+**Installer v1.2.1 (6 Nov 2026, Codex PR12-r1, 1 medium, accepted):** running the installed copy (`ROTATE_COOLIFY=1 bash /root/.devos/bin/install-server-agent.sh`) skips the copy step instead of failing on the same-file check, so the token can be added later as documented.
