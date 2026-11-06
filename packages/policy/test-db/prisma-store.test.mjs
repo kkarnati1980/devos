@@ -79,11 +79,27 @@ test("AT8 (db): the row exists when decide resolves; a failed insert rolls back 
   const row = await db.policyDecision.findUnique({ where: { hash: d.receipt.hash } });
   assert.ok(row);
   assert.equal(row.enforcedOutcome, "allow");
-  // A run id that does not exist fails a run FK inside the decision transaction: decide must reject,
-  // and nothing from that transaction (reservation or receipt) may remain.
-  const before = await db.budgetReservation.count();
-  await assert.rejects(engine.decide({ chain, identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "anthropic", runId: randomUUID(), costUsd: 0.2, tokens: 5 } }));
-  assert.equal(await db.budgetReservation.count(), before);
+  // PR13-r2: the reservation insert must SUCCEED and the receipt insert then fail in Postgres (a
+  // hash that breaks the policy_decision_hash_format CHECK). Both writes must be absent afterwards.
+  const store = new PrismaPolicyStore(db);
+  const realDecide = store.decide.bind(store);
+  let reservationsInTx = -1;
+  store.decide = (fn) => realDecide((tx) => fn({
+    ...tx,
+    insertReservation: async (r) => {
+      const id = await tx.insertReservation(r);
+      reservationsInTx = 1;
+      return id;
+    },
+    insertDecision: (row) => tx.insertDecision({ ...row, hash: "not-a-sha256" }),
+  }));
+  const failing = new PolicyEngine({ store, hmacKey: KEY, budgets: [{ id: "c", provider: "anthropic", maxCostUsd: 1000, maxTokens: 1e9 }] });
+  const reservationsBefore = await db.budgetReservation.count();
+  const decisionsBefore = await db.policyDecision.count();
+  await assert.rejects(failing.decide({ chain, identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "anthropic", costUsd: 0.2, tokens: 5 } }), /hash_format|check|constraint/i);
+  assert.equal(reservationsInTx, 1, "the reservation was written inside the failed transaction");
+  assert.equal(await db.budgetReservation.count(), reservationsBefore, "reservation rolled back");
+  assert.equal(await db.policyDecision.count(), decisionsBefore, "no receipt");
   assert.equal(await db.policyDecision.count({ where: { chain } }), 1);
 });
 

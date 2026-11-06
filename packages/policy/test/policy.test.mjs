@@ -10,6 +10,8 @@ import {
   envelopeWidening,
   delegateEnvelope,
   verifyLedger,
+  usdToMicros,
+  ceilMicroUsd,
 } from "../dist/index.js";
 
 const KEY = randomBytes(32);
@@ -257,6 +259,27 @@ test("AT6 (PR13-r1): sub-micro-dollar costs round up, so repeated calls cannot p
   assert.equal(store.reservations[0].actualUsd, 0.000001, "actuals round up too");
   assert.equal((await call()).enforcedOutcome, "deny");
   await assert.rejects(engine.decide({ identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", costUsd: 0, tokens: 1.5 } }), /invalid-policy-action-tokens/);
+});
+
+test("AT6 (PR13-r2): micro-dollar conversion is exact at the boundaries", async () => {
+  const cases = [
+    [0.0000000001, "ceil", 1], [0.0000010001, "ceil", 2], [0.0000009999, "floor", 0], [0.0000009999, "ceil", 1],
+    [0.15, "ceil", 150000], [0.15, "floor", 150000], [0.1, "ceil", 100000], [1, "floor", 1000000], [0, "ceil", 0],
+    [15, "floor", 15000000], [1e-7, "ceil", 1], [1e-7, "floor", 0], [123456.0000001, "ceil", 123456000001],
+  ];
+  for (const [usd, dir, want] of cases) assert.equal(usdToMicros(usd, dir), want, `${usd} ${dir}`);
+  assert.equal(ceilMicroUsd(0.0000010001), 0.000002);
+  assert.throws(() => usdToMicros(-1, "ceil"), /invalid-usd-amount/);
+  // A ceiling below one micro-dollar allows nothing; a 1e-10 call reserves a full micro-dollar.
+  const { engine, store } = setup({ rules: [rule("llm", "allow", { actions: ["llm.call"] })], budgets: [{ id: "sub-micro", provider: "openai", maxCostUsd: 0.0000009999, maxTokens: 1e9 }] });
+  const d = await engine.decide({ identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", costUsd: 0.0000000001, tokens: 0 } });
+  assert.deepEqual([d.enforcedOutcome, d.reason], ["deny", "budget-exceeded:sub-micro"]);
+  const two = setup({ rules: [rule("llm", "allow", { actions: ["llm.call"] })], budgets: [{ id: "c", provider: "openai", maxCostUsd: 1, maxTokens: 1e9 }] });
+  await two.engine.decide({ identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", costUsd: 0.0000000001, tokens: 0 } });
+  assert.equal(two.store.reservations[0].reservedUsd, 0.000001);
+  await two.engine.reconcile(two.store.reservations[0].id, 0.0000010001, 0);
+  assert.equal(two.store.reservations[0].actualUsd, 0.000002);
+  assert.equal(store.reservations.length, 0);
 });
 
 test("AT10: THIRD_PARTY_NOTICES.md and the per-file headers are present", () => {

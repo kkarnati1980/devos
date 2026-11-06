@@ -27,15 +27,30 @@ export const MAX_GRANT_MS = 90 * 24 * 60 * 60 * 1000;
 export const MIN_HMAC_KEY_BYTES = 32;
 
 /**
- * USD amounts are stored as Decimal(12, 6). Round UP to the micro-dollar so what is checked equals
- * what is stored and rounding can never undercount spend (PR13-r1).
+ * Exact conversion of a USD amount to integer micro-dollars (the Decimal(12, 6) scale of
+ * budget_reservation), rounding up or down. Works on the number's shortest decimal form with BigInt,
+ * so there is no intermediate float rounding (PR13-r2): 1e-10 ceils to 1 micro, 0.0000010001 to 2,
+ * and a ceiling of 0.0000009999 floors to 0.
  */
-export function ceilMicroUsd(usd: number): number {
-  return Math.ceil(Number((usd * 1e6).toFixed(3))) / 1e6;
+export function usdToMicros(usd: number, direction: "ceil" | "floor"): number {
+  if (!Number.isFinite(usd) || usd < 0) throw new Error("invalid-usd-amount");
+  const m = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/.exec(usd.toString());
+  if (!m) throw new Error("invalid-usd-amount");
+  const frac = m[2] ?? "";
+  const digits = BigInt(`${m[1]}${frac}`);
+  const scale = Number(m[3] ?? 0) - frac.length + 6; // value in micros = digits * 10^scale
+  if (scale >= 0) return Number(digits * 10n ** BigInt(scale));
+  const div = 10n ** BigInt(-scale);
+  const q = digits / div;
+  return Number(direction === "ceil" && digits % div !== 0n ? q + 1n : q);
 }
+
+/** Round UP to the micro-dollar: what is checked equals what is stored; spend is never undercounted. */
+export function ceilMicroUsd(usd: number): number {
+  return usdToMicros(usd, "ceil") / 1e6;
+}
+/** Usage sums come from micro-exact rows, so nearest is exact here. */
 const micros = (usd: number): number => Math.round(usd * 1e6);
-/** A ceiling rounds DOWN to the micro-dollar (never grants more than configured). */
-const ceilingMicros = (usd: number): number => Math.floor(Number((usd * 1e6).toFixed(3)));
 
 /** The dashboard session presenting KK's Tailscale identity (O4). Verified by the caller's hook. */
 export interface KkSession {
@@ -188,7 +203,7 @@ export class PolicyEngine {
               runId: c.runId,
               since: c.periodMs ? new Date(nowMs - c.periodMs) : undefined,
             });
-            if (micros(used.usd) + micros(costUsd) > ceilingMicros(c.maxCostUsd) || used.tokens + a.tokens > c.maxTokens) {
+            if (micros(used.usd) + usdToMicros(a.costUsd, "ceil") > usdToMicros(c.maxCostUsd, "floor") || used.tokens + a.tokens > c.maxTokens) {
               budgetDeny(`budget-exceeded:${c.id}`);
               break;
             }
