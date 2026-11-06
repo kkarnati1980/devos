@@ -38,7 +38,7 @@ test("AT2 licence evaluation: permissive passes, copyleft and unknown fail, revi
   for (const l of ["MIT", "Apache-2.0", "MIT and ISC", "(MIT OR GPL-3.0)", "BSD-3-Clause", "CC-BY-4.0"]) {
     assert.equal(evalLicences(listing(l), policy).ok, true, l);
   }
-  for (const l of ["GPL-3.0", "AGPL-3.0-only", "GPL-2.0-or-later", "MIT AND GPL-2.0", "UNKNOWN", "SEE LICENSE IN LICENSE", "SSPL-1.0", "(MIT) OR (GPL"]) {
+  for (const l of ["GPL-3.0", "AGPL-3.0-only", "GPL-2.0-or-later", "MIT AND GPL-2.0", "UNKNOWN", "SEE LICENSE IN LICENSE", "SSPL-1.0", "(MIT) OR (GPL", "MIT OR OR GPL-3.0", "MIT OR", "AND MIT", "MIT AND AND ISC", "()"]) {
     assert.equal(evalLicences(listing(l), policy).ok, false, l);
   }
   assert.equal(evalLicences({ x: [{ name: "nolicence", versions: ["1.0.0"] }] }, policy).ok, false);
@@ -49,6 +49,10 @@ test("AT2 licence evaluation: permissive passes, copyleft and unknown fail, revi
   assert.equal(reviewed.ok, true);
   assert.equal(reviewed.reviewedUsed.length, 1);
   assert.equal(evalLicences(listing("LGPL-3.0-or-later", "@img/sharp-libvips-linux-x64", ["1.3.5"]), policy).ok, false);
+  // PR19-r1: a review covers its recorded licence only.
+  assert.equal(evalLicences(listing("EPL-2.0", "elkjs", ["0.11.1"]), policy).ok, true);
+  assert.equal(evalLicences(listing("LGPL-3.0-or-later", "elkjs", ["0.11.1"]), policy).ok, false);
+  assert.equal(evalLicences(listing("EPL-2.0 AND MPL-2.0", "elkjs", ["0.11.1"]), policy).ok, false);
   const strong = evalLicences(listing("GPL-3.0", "gpl-lib"), policy);
   assert.match(strong.failures[0].why, /decision card/);
 });

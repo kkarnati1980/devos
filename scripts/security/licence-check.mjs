@@ -44,19 +44,24 @@ export function classifyExpression(expr, policy) {
       } else cur += t;
     }
     parts.push(cur.trim());
-    return parts.filter(Boolean);
+    return parts; // empty operands are kept so a dangling or doubled operator fails closed (PR19-r1)
   };
   const ors = split(text, "OR");
+  if (ors.some((p) => !p)) return "unknown";
   if (ors.length > 1) return ors.map((p) => classifyExpression(p, policy)).sort((a, b) => RANK[a] - RANK[b])[0];
   const ands = split(text, "AND");
+  if (ands.some((p) => !p)) return "unknown";
   if (ands.length > 1) return ands.map((p) => classifyExpression(p, policy)).sort((a, b) => RANK[b] - RANK[a])[0];
   if (text.startsWith("(") && text.endsWith(")")) return classifyExpression(text.slice(1, -1), policy);
   if (/[\s()]/.test(text)) return "unknown";
   return classifyId(text, policy);
 }
 
-const isReviewed = (name, version, policy) =>
-  (policy.reviewed ?? []).some((r) => r.name === name && (r.versions ?? []).includes(version));
+// A review covers one package, version and licence: a different reported licence needs its own assessment (PR19-r1).
+const isReviewed = (name, version, licence, policy) =>
+  (policy.reviewed ?? []).some(
+    (r) => r.name === name && (r.versions ?? []).includes(version) && String(r.licence).trim() === String(licence).trim(),
+  );
 
 // listing: output of `pnpm licenses list --json` ({ licence: [{ name, versions, license }] }).
 export function evaluate(listing, policy) {
@@ -70,7 +75,7 @@ export function evaluate(listing, policy) {
       (report[licence] ??= []).push(`${p.name}@${(p.versions ?? []).join(",")}`);
       for (const version of p.versions ?? [""]) {
         if (cls === "permissive") continue;
-        if (cls === "weak" && isReviewed(p.name, version, policy)) {
+        if (cls === "weak" && isReviewed(p.name, version, licence, policy)) {
           reviewedUsed.push(`${p.name}@${version} (${licence})`);
           continue;
         }
