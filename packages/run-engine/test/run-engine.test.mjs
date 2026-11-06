@@ -442,3 +442,52 @@ test("r2-3 Codex always runs with --sandbox read-only; sandbox/approval override
   const wo = await new RunEngine({ store: w.store, policy: w.policy, adapterFor: () => fakeCodexAdapter("ok") }).execute({ runId: w.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4, reserveTokens: 1000 });
   assert.equal(wo.errorType, "policy_denied");
 });
+
+// ---- Codex PR16-r3 regressions ----
+
+test("r3-1 a store failure on the first usage event still charges the billable usage (fail-closed)", async () => {
+  const s = setup({ maxCostUsd: 2 });
+  s.store.failTelemetryTimes = 1;
+  // The SDK reports usage but no cost (aborted after the crash): runTokens is 0, result.usage is not.
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 1, hang: true }) }) });
+  await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }), /store-down/);
+  const r = s.pstore.reservations[0];
+  assert.equal(r.status, "reconciled", "not released");
+  assert.equal(r.actualUsd, 2, "charged the whole reservation");
+  assert.equal(s.store.costs.length, 1);
+  assert.equal(s.store.costs[0].usd, 2);
+});
+
+test("r3-2 a failed ending checkpoint settles the money at once; the retry never double-charges or leaves it open", async () => {
+  const s = setup();
+  s.store.failCheckpoint = { when: (d) => Boolean(d.state.ending), times: 1 };
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 1, cost: 0.2 }) }) });
+  await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }), /store-down/);
+  assert.equal(s.pstore.reservations[0].status, "reconciled");
+  assert.deepEqual(s.store.costs.map((c) => c.usd), [0.2]);
+  const out = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(out.status, "succeeded");
+  assert.ok(s.pstore.reservations.every((r) => r.status !== "reserved"), "nothing left open");
+  assert.deepEqual(s.store.costs.map((c) => c.usd), [0.2, 0.2], "the first attempt's spend counted once");
+  // The resumed attempt reserved only what was left.
+  assert.ok(Math.abs(s.pstore.reservations[1].reservedUsd - (5 - 0.2)) < 1e-6);
+});
+
+test("r3-3 if the store is down for cost and checkpoint, the next execute charges the open reservation in full", async () => {
+  const s = setup({ maxCostUsd: 3 });
+  s.store.failCheckpoint = { when: (d) => Boolean(d.state.ending), times: 1 };
+  s.store.failAddCostTimes = 1;
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 1, cost: 0.2 }) }) });
+  await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }), /store-down/);
+  assert.equal(s.pstore.reservations[0].status, "reserved", "left open: cost was not recorded");
+  const out = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(s.pstore.reservations[0].status, "reconciled");
+  assert.equal(s.pstore.reservations[0].actualUsd, 3, "orphan charged in full");
+  assert.equal(s.store.costs[0].usd, 3);
+  assert.ok(assertGapless(s.store, s.runId).some((e) => e.payload.state === "recovered"));
+  // 3 already spent of 3: the resumed attempt is a budget stop before the runtime, paused, card.
+  assert.equal(out.status, "limit_hit");
+  assert.equal(out.errorType, "budget_exceeded");
+  assert.equal(s.pstore.reservations.length, 1, "no new reservation once max_cost_usd is spent");
+  assert.ok(s.store.paused.has("proj-1"));
+});

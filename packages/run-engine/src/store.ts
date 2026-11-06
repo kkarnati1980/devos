@@ -104,11 +104,23 @@ export class MemoryRunStore implements RunStore {
     if (event.seq !== last + 1) throw new Error(`run_event gap: got ${event.seq}, expected ${last + 1}`);
     this.events.push(structuredClone(event));
   }
+  /** Test hook: throw for the next n checkpoints matching the predicate. */
+  failCheckpoint: { when: (d: CheckpointData) => boolean; times: number } | null = null;
+  /** Test hook: throw on the next n addTelemetry calls. */
+  failTelemetryTimes = 0;
   async saveCheckpoint(runId: string, seq: number, data: CheckpointData) {
+    if (this.failCheckpoint && this.failCheckpoint.times > 0 && this.failCheckpoint.when(data)) {
+      this.failCheckpoint.times -= 1;
+      throw new Error("store-down");
+    }
     if (this.checkpoints.some((c) => c.runId === runId && c.seq === seq)) throw new Error("checkpoint seq taken");
     this.checkpoints.push({ runId, seq, data: structuredClone(data) });
   }
   async addTelemetry(runId: string, usage: TurnUsage) {
+    if (this.failTelemetryTimes > 0) {
+      this.failTelemetryTimes -= 1;
+      throw new Error("store-down");
+    }
     this.telemetry.push({ runId, ...usage });
   }
   /** Test hook: throw on the next n addCost calls. */

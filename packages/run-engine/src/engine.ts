@@ -77,6 +77,17 @@ interface Ending {
   cardId?: string;
 }
 
+const usageTokens = (u: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | undefined): number =>
+  u ? u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheWriteTokens : 0;
+
+/** An attempt that reserved budget and may have run; cleared once its ending is checkpointed. */
+interface OpenAttempt {
+  reservationId: string;
+  usd: number;
+  tokens: number;
+  provider: Provider;
+}
+
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
 /**
@@ -150,6 +161,18 @@ export class RunEngine {
       await emit("status", { state: "retrying", after: prior.errorType ?? "failed" });
     }
 
+    // ---- an attempt that reserved budget but left no ending (the store failed hard) ----
+    // Fail-closed: charge it the whole reservation unless it was already settled.
+    const orphan = state.state.attempt as OpenAttempt | undefined;
+    if (orphan) {
+      if (await this.settleOrphan(orphan)) {
+        await store.addCost({ projectId: run.projectId, runId: run.id, provider: orphan.provider, model: run.model, role: run.role, ...ZERO_USAGE, usd: orphan.usd });
+      }
+      delete state.state.attempt;
+      await emit("status", { state: "recovered", reservationId: orphan.reservationId });
+      await checkpoint();
+    }
+
     // Spend so far: the larger of the checkpoint and the recorded cost entries (a crash may have
     // recorded cost after the last checkpoint).
     state.costUsd = Math.max(state.costUsd, await store.runCostUsd(run.id));
@@ -164,7 +187,10 @@ export class RunEngine {
     const reserveUsd = input.reserveUsd ?? remainingUsd;
     const reserveTokens = input.reserveTokens ?? envelope?.maxTokens ?? 1_000_000;
     let decision: PolicyDecision | null = null;
-    try {
+    if (remainingUsd <= 0) {
+      // max_cost_usd already spent: a budget stop without asking for a reservation.
+      decision = { outcome: "deny", enforcedOutcome: "deny", wouldBlock: false, reason: "run-max-cost-reached", mode: "enforce", matchedRuleIds: [], approvalGrantId: null, reservationId: null, stop: "budget_exceeded", receipt: { chain: "", seq: 0, hash: "" } };
+    } else try {
       decision = await policy.decide({
         identity: { id: `agent:${run.role}:${run.id}`, type: "agent", roles: [run.role] },
         action: { type: "model.run", resource: `run:${run.id}`, budgeted: true, provider: input.provider, costUsd: reserveUsd, tokens: Math.ceil(reserveTokens), projectId: run.projectId, runId: run.id },
@@ -186,6 +212,15 @@ export class RunEngine {
       return this.finalize(run, state, ending, emit, checkpoint, () => seq);
     }
     const reservationId = decision.reservationId;
+    if (reservationId) {
+      state.state.attempt = { reservationId, usd: reserveUsd, tokens: Math.ceil(reserveTokens), provider: input.provider } satisfies OpenAttempt;
+      try {
+        await checkpoint();
+      } catch (e) {
+        await this.settle(reservationId, 0, 0).catch(() => undefined); // never ran: free it
+        throw e;
+      }
+    }
 
     // ---- run ----
     const adapter = this.opts.adapterFor(input.provider);
@@ -251,14 +286,9 @@ export class RunEngine {
       if (streamError.type === "internal" && !(e instanceof RunFailure)) {
         // The store failed mid-run (the worker is as good as dead): settle the money, then rethrow so
         // the queue retries and the next execute resumes from the last checkpoint.
-        const crashUsd = failClosedUsd(result, runTokens, reserveUsd);
-        await this.settle(reservationId, crashUsd, runTokens).catch(() => undefined);
-        await store
-          .addCost({ projectId: run.projectId, runId: run.id, provider: input.provider, model: run.model, role: run.role, ...(result?.usage ?? ZERO_USAGE), usd: crashUsd })
-          .catch(() => undefined);
-        // Best effort: carry the spend into a checkpoint too (the next execute also reads cost_entry).
-        state.costUsd += crashUsd;
-        await checkpoint().catch(() => undefined);
+        const crashTokens = Math.max(runTokens, usageTokens(result?.usage));
+        const crashUsd = failClosedUsd(result, crashTokens, reserveUsd);
+        await this.bestEffortSettle(run, state, reservationId, crashUsd, crashTokens, result?.usage ?? ZERO_USAGE, input.provider, checkpoint);
         this.active.delete(run.id);
         throw e;
       }
@@ -306,8 +336,53 @@ export class RunEngine {
       usage, costEstimated, provider: input.provider, totalUsd: state.costUsd, seqBefore: seq,
     };
     state.state.ending = ending;
-    await checkpoint();
+    delete state.state.attempt;
+    try {
+      await checkpoint();
+    } catch (e) {
+      // The outcome could not be stored: settle the money now (best effort) so a retry never leaves
+      // this reservation open or this spend unrecorded; the retry resumes from the last checkpoint.
+      delete state.state.ending;
+      state.state.attempt = reservationId ? ({ reservationId, usd: reserveUsd, tokens: Math.ceil(reserveTokens), provider: input.provider } satisfies OpenAttempt) : undefined;
+      state.costUsd -= costUsd;
+      await this.bestEffortSettle(run, state, reservationId, costUsd, Math.ceil(tokensUsed), usage, input.provider, checkpoint);
+      throw e;
+    }
     return this.finalize(run, state, ending, emit, checkpoint, () => seq);
+  }
+
+  /**
+   * After a store failure: record the cost, then (only if that worked) settle the reservation, then
+   * try to checkpoint without the open-attempt marker. Each step is best effort; a reservation left
+   * open is charged in full by the next execute (settleOrphan). A lost step can only over-count.
+   */
+  private async bestEffortSettle(
+    run: RunRow, state: CheckpointData, reservationId: string | null, usd: number, tokens: number,
+    usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }, provider: Provider,
+    checkpoint: () => Promise<void>,
+  ): Promise<void> {
+    const recorded = await this.opts.store
+      .addCost({ projectId: run.projectId, runId: run.id, provider, model: run.model, role: run.role, ...usage, usd })
+      .then(() => true, () => false);
+    // Settle only once the cost is recorded: if recording failed, the reservation stays open and the
+    // next execute charges it in full (settleOrphan) — spend never escapes the caps.
+    const settled = recorded && (await this.settle(reservationId, usd, tokens).then(() => true, () => false));
+    if (recorded && settled) {
+      delete state.state.attempt;
+      state.costUsd += usd;
+      await checkpoint().catch(() => undefined);
+    }
+  }
+
+  /** Charge an orphaned reservation in full. false = it was already settled (nothing to record). */
+  private async settleOrphan(o: OpenAttempt): Promise<boolean> {
+    try {
+      await this.opts.policy.reconcile(o.reservationId, o.usd, o.tokens);
+      return true;
+    } catch (e) {
+      if (/reservation-not-open/.test((e as Error)?.message ?? "")) return false;
+      throw e;
+    }
   }
 
   /**
