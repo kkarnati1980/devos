@@ -20,6 +20,8 @@ import {
   type SetupServices,
 } from "./routes.js";
 import { SessionService } from "./session.js";
+import { NotificationsController, type NotifyServices } from "./notify-routes.js";
+import { NOTIFY } from "./notify.js";
 
 export interface AppDeps {
   config: ApiConfig;
@@ -33,6 +35,8 @@ export interface AppDeps {
   kkSessions?: KkSessionRegistry;
   /** M1.4 settings store and vault (null parts answer 503 `*-not-configured`). */
   setup?: SetupServices;
+  /** M1.6 notifier (null → notification routes answer 503 `notifications-not-configured`). */
+  notify?: NotifyServices;
 }
 
 @Module({})
@@ -40,7 +44,7 @@ class ApiModule {
   static register(deps: Required<Omit<AppDeps, "now" | "log">> & { sessions: SessionService }): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController],
+      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController],
       providers: [
         { provide: CONFIG, useValue: deps.config },
         { provide: IDENTITY, useValue: deps.identity },
@@ -49,6 +53,7 @@ class ApiModule {
         { provide: READINESS, useValue: deps.readiness },
         { provide: KK_SESSIONS, useValue: deps.kkSessions },
         { provide: SETUP, useValue: deps.setup },
+        { provide: NOTIFY, useValue: deps.notify },
         { provide: APP_GUARD, useClass: AccessGuard },
       ],
     };
@@ -66,6 +71,7 @@ export async function createApp(deps: AppDeps): Promise<NestExpressApplication> 
       readiness: deps.readiness ?? (async () => {}),
       kkSessions: deps.kkSessions ?? new KkSessionRegistry(),
       setup: deps.setup ?? { settings: null, vault: null },
+      notify: deps.notify ?? { notifier: null },
       sessions,
     }),
     { logger: false, bodyParser: false },
