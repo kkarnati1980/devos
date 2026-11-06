@@ -605,3 +605,37 @@ test("M1.6 AT16 (PR18-r1): with the dashboard channel off, notices and failed de
   assert.deepEqual(pfeed.map((f) => [f.id, f.deliveries.length]), [["b", 2], ["a", 1]]);
 });
 
+test("M1.6 AT17 (PR18-r2): the bell deadline covers DNS and the response body; nothing is sent late or left open", async () => {
+  const { postBell } = await import("../dist/bell.js");
+  let hits = 0;
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    hits++;
+    req.resume();
+    // Headers at once, then a body that never ends.
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.write("x");
+  });
+  server.on("connection", (s) => {
+    sockets.add(s);
+    s.on("close", () => sockets.delete(s));
+  });
+  await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
+  const url = `http://late.example.com:${server.address().port}/bell`;
+  try {
+    // A resolver slower than the deadline: timeout, and no request is ever made afterwards.
+    const slow = () => new Promise((ok) => setTimeout(() => ok([{ address: "127.0.0.1", family: 4 }]), 400));
+    assert.equal(await postBell({ url, headers: {}, body: "{}", timeoutMs: 150, allowLoopback: true, resolve: slow }), "mybrain-timeout");
+    await new Promise((ok) => setTimeout(ok, 500));
+    assert.equal(hits, 0, "no signed POST after the deadline");
+    // Headers then an endless body: sent, and the connection is closed straight away.
+    const fast = async () => [{ address: "127.0.0.1", family: 4 }];
+    assert.equal(await postBell({ url, headers: {}, body: "{}", timeoutMs: 2000, allowLoopback: true, resolve: fast }), null);
+    assert.equal(hits, 1);
+    await new Promise((ok) => setTimeout(ok, 200));
+    assert.equal(sockets.size, 0, "no connection is left open");
+  } finally {
+    server.close();
+  }
+});
+

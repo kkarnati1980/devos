@@ -78,9 +78,16 @@ export interface BellRequest {
 export async function postBell(r: BellRequest): Promise<string | null> {
   let timer: NodeJS.Timeout | undefined;
   let req: http.ClientRequest | undefined;
+  // PR18-r2: once the deadline passes (or the outcome is known) no request may start, and any
+  // request or response still open is destroyed, so nothing is sent or kept open late.
+  let done = false;
+  const finish = () => {
+    done = true;
+    req?.destroy();
+  };
   const deadline = new Promise<string>((resolve) => {
     timer = setTimeout(() => {
-      req?.destroy();
+      finish();
       resolve("mybrain-timeout");
     }, r.timeoutMs);
   });
@@ -97,6 +104,7 @@ export async function postBell(r: BellRequest): Promise<string | null> {
         return "mybrain-dns";
       }
     }
+    if (done) return "mybrain-timeout"; // the resolver answered after the deadline: never send
     if (addrs.length === 0) return "mybrain-dns";
     // Every address must pass, not just the first: a resolver can return mixed answers.
     if (!addrs.every((a) => allowed(a.address))) return "mybrain-blocked-address";
@@ -118,8 +126,10 @@ export async function postBell(r: BellRequest): Promise<string | null> {
             opts && opts.all ? cb(null, [{ address: pin.address, family: pin.family }]) : cb(null, pin.address, pin.family)) as never,
         },
         (res) => {
-          res.resume(); // discarded unread: untrusted data
+          // Only the status matters: the body (untrusted data) is never read, and the response and
+          // its connection are destroyed at once, so a stalled or endless body holds nothing open.
           const s = res.statusCode ?? 0;
+          res.destroy();
           resolve(s >= 200 && s < 300 ? null : `mybrain-http-${s}`);
         },
       );
@@ -131,5 +141,6 @@ export async function postBell(r: BellRequest): Promise<string | null> {
     return await Promise.race([run().catch(() => "mybrain-network"), deadline]);
   } finally {
     clearTimeout(timer);
+    finish();
   }
 }
