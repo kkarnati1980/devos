@@ -6,6 +6,7 @@ import { PolicyEngine, PrismaPolicyStore, type PrismaLike as PolicyPrismaLike, t
 import { RunEngine, type PolicyLike } from "./engine.js";
 import { PrismaRunStore, type PrismaLike } from "./prisma-store.js";
 import { RunQueue } from "./queue.js";
+import { ProbeGateAdapter } from "./probe-adapter.js";
 import { RunFailure, type AdapterEvent, type RunAdapter, type RunResult, type RunTask } from "./types.js";
 
 export const MIN_HMAC_KEY_BYTES = 32;
@@ -15,6 +16,13 @@ export const MIN_HMAC_KEY_BYTES = 32;
  * `stop_grace_period: 60s`, so the drain ends before Docker sends SIGKILL.
  */
 export const DRAIN_TIMEOUT_MS = 50_000;
+/**
+ * R2: a worker killed without a drain (OOM, host restart, the G1 `run-resume` check) leaves its job
+ * active until the BullMQ lock expires; a stalled check then moves it back and the run resumes from its
+ * checkpoint. 15 s / 5 s bounds that to about 20 s (BullMQ's 30 s / 30 s took up to ~90 s in CI).
+ */
+export const LOCK_DURATION_MS = 15_000;
+export const STALLED_INTERVAL_MS = 5_000;
 
 export interface WorkerConfig {
   databaseUrl: string;
@@ -77,6 +85,15 @@ export function adapterFor(registry: AdapterRegistry): (provider: Provider) => R
   return (provider) => registry[provider]?.() ?? new UnconfiguredAdapter(provider);
 }
 
+/**
+ * R2-b: every provider's adapter is wrapped so a run whose model is PROBE_MODEL (the G1 `run-resume`
+ * check's own run) gets the in-image probe; every other run keeps the registry's adapter.
+ */
+export function probeGated(registry: AdapterRegistry): (provider: Provider) => RunAdapter {
+  const normal = adapterFor(registry);
+  return (provider) => new ProbeGateAdapter(provider, () => normal(provider));
+}
+
 type Db = PrismaLike & PolicyPrismaLike & { $disconnect(): Promise<void> };
 
 function log(level: "info" | "error", msg: string, extra: Record<string, unknown> = {}): void {
@@ -90,8 +107,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<{ stop
   const { createDb } = (await import(dbModuleName)) as { createDb: (url: string) => Db };
   const db = createDb(cfg.databaseUrl);
   const policy = new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: cfg.hmacKey }) as unknown as PolicyLike;
-  const engine = new RunEngine({ store: new PrismaRunStore(db), policy, adapterFor: adapterFor({}) });
-  const queue = new RunQueue({ redisUrl: cfg.redisUrl, concurrency: cfg.concurrency, opTimeoutMs: DRAIN_TIMEOUT_MS });
+  const engine = new RunEngine({ store: new PrismaRunStore(db), policy, adapterFor: probeGated({}) });
+  const queue = new RunQueue({ redisUrl: cfg.redisUrl, concurrency: cfg.concurrency, opTimeoutMs: DRAIN_TIMEOUT_MS, lockDurationMs: LOCK_DURATION_MS, stalledIntervalMs: STALLED_INTERVAL_MS });
   queue.start(engine);
   log("info", "worker-started", { concurrency: cfg.concurrency });
 
