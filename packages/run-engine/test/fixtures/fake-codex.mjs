@@ -8,6 +8,14 @@ process.stdin.on("data", (c) => (prompt += c));
 process.stdin.on("end", () => {
   const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
   out({ type: "thread.started", thread_id: "t-1" });
+  if (mode === "orphan") {
+    // The parent exits on SIGTERM; a grandchild that ignores SIGTERM and holds none of our stdio stays.
+    const g = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    if (process.env.FAKE_CODEX_PIDFILE) writeFileSync(process.env.FAKE_CODEX_PIDFILE, String(g.pid));
+    process.on("SIGTERM", () => process.exit(143));
+    setInterval(() => {}, 1000);
+    return;
+  }
   if (mode === "hang") {
     // A grandchild in the same process group: cancel must kill it too.
     const g = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });

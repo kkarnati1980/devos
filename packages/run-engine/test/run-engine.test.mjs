@@ -23,7 +23,7 @@ function setup({ budgets = [], maxTurns = 50, maxSeconds = 600, maxCostUsd = 5 }
 }
 
 /** A fake Agent SDK `query`: n assistant turns with usage and a tool result, then a result message. */
-function fakeQuery({ turns = 2, cost = 0.12, hang = false, calls = [] } = {}) {
+function fakeQuery({ turns = 2, cost = 0.12, hang = false, calls = [], throwAfter = false } = {}) {
   return ({ prompt, options }) => {
     calls.push({ prompt, options });
     return (async function* () {
@@ -32,6 +32,7 @@ function fakeQuery({ turns = 2, cost = 0.12, hang = false, calls = [] } = {}) {
         yield { type: "assistant", message: { model: "claude-sonnet", content: [{ type: "text", text: `t${t}` }, { type: "tool_use", id: `u${t}`, name: "Read", input: {} }], usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 10 } } };
         yield { type: "user", message: { content: [{ type: "tool_result", tool_use_id: `u${t}`, content: "y".repeat(64) }] } };
       }
+      if (throwAfter) throw Object.assign(new Error("overloaded"), { status: 529 });
       if (hang) {
         await new Promise((resolve, reject) => {
           if (options.abortController.signal.aborted) return reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
@@ -47,6 +48,15 @@ function fakeQuery({ turns = 2, cost = 0.12, hang = false, calls = [] } = {}) {
 function fakeCodexAdapter(mode, extra = {}) {
   const a = new CodexExecAdapter({ bin: process.execPath, estimateUsd: 0.4, prices: { "gpt-codex": { input: 1, cachedInput: 0.1, output: 10 } }, env: { FAKE_CODEX_MODE: mode, ...extra }, killGraceMs: 1000, scriptArgs: [FAKE_CODEX] });
   return a;
+}
+
+/** Alive = exists and is not a zombie (a killed orphan may wait for PID 1 to reap it). */
+function alive(pid) {
+  try {
+    return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]?.[0] !== "Z";
+  } catch {
+    return false;
+  }
 }
 
 function assertGapless(store, runId) {
@@ -111,7 +121,7 @@ test("AT2 cancel stops each runtime within 10 s and records cancelled", async ()
     assert.ok(Date.now() - t0 < 10_000, "cancelled within 10 s");
     assert.equal(out.status, "cancelled");
     await new Promise((r) => setTimeout(r, 200));
-    assert.throws(() => process.kill(gc, 0), /ESRCH/, "grandchild killed with the group");
+    assert.equal(alive(gc), false, "grandchild killed with the group");
     assert.equal(assertGapless(s.store, s.runId).at(-1).type, "error");
   }
 });
@@ -267,4 +277,97 @@ test("AT10 a tool gate (policy) can deny a tool call through the SDK canUseTool 
   const gate = calls[0].options.canUseTool;
   assert.equal((await gate("Read", {})).behavior, "allow");
   assert.equal((await gate("Bash", {})).behavior, "deny");
+});
+
+// ---- Codex PR16-r1 regressions ----
+
+test("r1-1 an SDK error after billable turns charges the whole reservation (fail-closed), flagged estimated", async () => {
+  const s = setup({ maxCostUsd: 2 });
+  const out = await new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 2, throwAfter: true }) }) }).execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(out.status, "failed");
+  assert.equal(out.costUsd, 2);
+  assert.equal(out.costEstimated, true);
+  assert.equal(s.pstore.reservations[0].status, "reconciled");
+  assert.equal(s.pstore.reservations[0].actualUsd, 2);
+  // A cancel after billable turns is charged the same way.
+  const c = setup({ maxCostUsd: 3 });
+  const engine = new RunEngine({ store: c.store, policy: c.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 1, hang: true }) }) });
+  const p = engine.execute({ runId: c.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  await new Promise((r) => setTimeout(r, 100));
+  await engine.cancel(c.runId);
+  const co = await p;
+  assert.equal(co.status, "cancelled");
+  assert.equal(co.costUsd, 3);
+});
+
+test("r1-2 after a crash the next reservation is only what is left of max_cost_usd", async () => {
+  const s = setup({ maxCostUsd: 5 });
+  s.store.failAppendAt = 7;
+  await assert.rejects(new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 2 }) }) }).execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }));
+  const spent = s.store.costs.reduce((a, c) => a + c.usd, 0);
+  assert.ok(spent > 0, "the interrupted execution's cost was recorded");
+  s.store.failAppendAt = null;
+  await new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 1 }) }) }).execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.ok(Math.abs(s.pstore.reservations[1].reservedUsd - (5 - spent)) < 1e-6, "reserved the remainder, not the full cap");
+});
+
+test("r1-3 cost over max_cost_usd pauses and raises a card even when max-turns ended the run", async () => {
+  const s = setup({ maxTurns: 1, maxCostUsd: 0.1 });
+  const out = await new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 3, cost: 0.5 }) }) }).execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(out.status, "limit_hit");
+  assert.equal(out.errorType, "budget_exceeded");
+  assert.ok(s.store.paused.has("proj-1"));
+  assert.equal(s.store.cards.length, 1);
+});
+
+test("r1-4 a failure after the outcome is recorded never reruns the runtime; exactly one terminal event", async () => {
+  const s = setup();
+  const calls = [];
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ calls }) }) });
+  s.store.failFinishTimes = 1;
+  await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }), /store-down/);
+  const out = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(out.status, "succeeded");
+  assert.equal(calls.length, 1, "runtime started once");
+  assert.equal(s.store.finished.get(s.runId).status, "succeeded");
+  assert.equal(assertGapless(s.store, s.runId).filter((e) => e.type === "done" || e.type === "error").length, 1);
+  assert.equal(s.pstore.reservations.length, 1, "no second reservation");
+  // Outcome checkpointed but the terminal event itself was lost: the retry writes it, still no rerun.
+  const t = setup();
+  const tcalls = [];
+  const e2 = new RunEngine({ store: t.store, policy: t.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ calls: tcalls }) }) });
+  const realAppend = t.store.appendEvent.bind(t.store);
+  let dropDone = true;
+  t.store.appendEvent = async (e) => {
+    if (dropDone && e.type === "done") {
+      dropDone = false;
+      throw new Error("store-down");
+    }
+    return realAppend(e);
+  };
+  await assert.rejects(e2.execute({ runId: t.runId, provider: "anthropic", prompt: "x", cwd: "." }));
+  const o2 = await e2.execute({ runId: t.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(o2.status, "succeeded");
+  assert.equal(tcalls.length, 1);
+  assert.equal(assertGapless(t.store, t.runId).filter((e) => e.type === "done").length, 1);
+});
+
+test("r1-5 Codex cancel kills a TERM-ignoring grandchild even when the parent exits on SIGTERM", async () => {
+  const s = setup();
+  const pidfile = join(mkdtempSync(join(tmpdir(), "m15-")), "gc.pid");
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => fakeCodexAdapter("orphan", { FAKE_CODEX_PIDFILE: pidfile }) });
+  const p = engine.execute({ runId: s.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4 });
+  for (let i = 0; i < 50 && !existsSync(pidfile); i++) await new Promise((r) => setTimeout(r, 50));
+  const gc = Number(readFileSync(pidfile, "utf8"));
+  await engine.cancel(s.runId);
+  assert.equal((await p).status, "cancelled");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(alive(gc), false, "grandchild killed");
+});
+
+test("r1-6 Codex telemetry carries the turn's command-output bytes and tool name", async () => {
+  const c = setup();
+  c.store.runs.get(c.runId).model = "gpt-codex";
+  await new RunEngine({ store: c.store, policy: c.policy, adapterFor: () => fakeCodexAdapter("ok") }).execute({ runId: c.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4 });
+  assert.deepEqual(c.store.telemetry.map((r) => [r.toolName, r.toolResultBytes]), [["shell", 100], ["shell", 200]]);
 });

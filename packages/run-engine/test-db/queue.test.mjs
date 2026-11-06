@@ -75,3 +75,14 @@ test("Queue: a crash (thrown store error) is retried, so the next execute resume
   await until(async () => (await q.queue.getJobState(id)) === "completed");
   assert.equal(e.calls.get("crash-1"), 2);
 });
+
+test("Queue: public operations time out when Redis is unreachable (ADR-0011)", async () => {
+  const q = new RunQueue({ redisUrl: "redis://127.0.0.1:1", name: "m15-down", opTimeoutMs: 300 });
+  q.queue.on("error", () => {});
+  const t0 = Date.now();
+  await assert.rejects(q.enqueue({ runId: "x", provider: "anthropic", prompt: "x", cwd: "." }), /queue-enqueue-timeout/);
+  await assert.rejects(q.deadLetters(), /queue-dead-letters-timeout/);
+  await assert.rejects(q.retryDead("x"), /queue-retry-timeout/);
+  assert.ok(Date.now() - t0 < 3000);
+  await Promise.race([q.close().catch(() => {}), new Promise((r) => setTimeout(r, 500))]);
+});

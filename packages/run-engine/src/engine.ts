@@ -54,6 +54,20 @@ export interface RunOutcome {
 
 class Timeout extends Error {}
 
+type Terminal = { type: "done" | "error"; payload: Record<string, unknown> };
+
+const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
+/**
+ * The USD to charge. A runtime that used tokens but reported no cost (an SDK error or abort after
+ * billable turns) is charged the whole reservation: fail-closed (ADR-0006), flagged as an estimate.
+ */
+function failClosedUsd(result: { costUsd: number; costEstimated: boolean } | null | undefined, tokens: number, reservedUsd: number): number {
+  const usd = result?.costUsd ?? 0;
+  if (usd === 0 && tokens > 0 && (!result || result.costEstimated)) return reservedUsd;
+  return usd;
+}
+
 function within<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let t: NodeJS.Timeout;
   return Promise.race([
@@ -90,8 +104,9 @@ export class RunEngine {
     const cp = await store.latestCheckpoint(run.id);
     let seq = await store.lastEventSeq(run.id);
     const emit = async (type: RunEvent["type"], payload: Record<string, unknown>) => {
-      seq += 1;
-      await store.appendEvent({ runId: run.id, seq, ts: this.now(), type, payload });
+      const next = seq + 1;
+      await store.appendEvent({ runId: run.id, seq: next, ts: this.now(), type, payload });
+      seq = next;
     };
     let state: CheckpointData = cp?.data ? structuredClone(cp.data) : { turn: 0, lastSeq: 0, costUsd: 0, tokens: 0, state: {} };
     let cpSeq = cp?.seq ?? -1;
@@ -100,6 +115,24 @@ export class RunEngine {
       cpSeq += 1;
       await store.saveCheckpoint(run.id, cpSeq, state);
     };
+
+    // ---- already finished? (a retry after a failure past the terminal event must not rerun) ----
+    let last = await store.lastEvent(run.id);
+    const ended = state.state.ended as Terminal | undefined;
+    if (ended && !(last && (last.type === "done" || last.type === "error"))) {
+      await emit(ended.type, ended.payload);
+      last = { runId: run.id, seq, ts: this.now(), type: ended.type, payload: ended.payload };
+    }
+    if (last && (last.type === "done" || last.type === "error")) {
+      const p = last.payload as { status?: RunStatus; type?: RunErrorType; message?: string; retryable?: boolean; countsAsAttempt?: boolean; costUsd?: number; costEstimated?: boolean; cardId?: string };
+      const status: RunStatus = last.type === "done" ? "succeeded" : (p.status ?? "failed");
+      await store.finishRun(run.id, status, state.turn, last.type === "done" ? undefined : `${p.type}:${p.message ?? ""}`);
+      return { runId: run.id, status, errorType: last.type === "done" ? undefined : p.type, retryable: false, countsAsAttempt: Boolean(p.countsAsAttempt), costUsd: Number(p.costUsd ?? 0), costEstimated: Boolean(p.costEstimated), turns: state.turn, lastSeq: seq, ...(p.cardId ? { cardId: p.cardId } : {}) };
+    }
+
+    // Spend so far: the larger of the checkpoint and the recorded cost entries (a crash may have
+    // recorded cost after the last checkpoint).
+    state.costUsd = Math.max(state.costUsd, await store.runCostUsd(run.id));
 
     if (await store.isProjectPaused(run.projectId)) {
       return { ...base, status: "paused", errorType: "budget_exceeded", costUsd: 0, turns: state.turn, lastSeq: seq };
@@ -134,7 +167,7 @@ export class RunEngine {
         reason,
         costUsd: reserveUsd,
       });
-      await emit("error", { type, message: reason, retryable: false, countsAsAttempt: false, cardId });
+      await emit("error", { status: type === "budget_exceeded" ? "limit_hit" : "failed", type, message: reason, retryable: false, countsAsAttempt: false, costUsd: 0, cardId });
       await store.finishRun(run.id, type === "budget_exceeded" ? "limit_hit" : "failed", state.turn, type);
       return { ...base, status: type === "budget_exceeded" ? "limit_hit" : "failed", errorType: type, costUsd: 0, turns: state.turn, lastSeq: seq, cardId };
     }
@@ -204,12 +237,14 @@ export class RunEngine {
       if (streamError.type === "internal" && !(e instanceof RunFailure)) {
         // The store failed mid-run (the worker is as good as dead): settle the money, then rethrow so
         // the queue retries and the next execute resumes from the last checkpoint.
-        await this.settle(reservationId, result?.costUsd ?? 0, runTokens).catch(() => undefined);
-        if (result) {
-          await store
-            .addCost({ projectId: run.projectId, runId: run.id, provider: input.provider, model: run.model, role: run.role, ...result.usage, usd: result.costUsd })
-            .catch(() => undefined);
-        }
+        const crashUsd = failClosedUsd(result, runTokens, reserveUsd);
+        await this.settle(reservationId, crashUsd, runTokens).catch(() => undefined);
+        await store
+          .addCost({ projectId: run.projectId, runId: run.id, provider: input.provider, model: run.model, role: run.role, ...(result?.usage ?? ZERO_USAGE), usd: crashUsd })
+          .catch(() => undefined);
+        // Best effort: carry the spend into a checkpoint too (the next execute also reads cost_entry).
+        state.costUsd += crashUsd;
+        await checkpoint().catch(() => undefined);
         this.active.delete(run.id);
         throw e;
       }
@@ -218,14 +253,18 @@ export class RunEngine {
     }
 
     // ---- settle money ----
-    const costUsd = result?.costUsd ?? 0;
-    const costEstimated = result ? result.costEstimated : true;
-    const usage = result?.usage ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    const usage = result?.usage ?? ZERO_USAGE;
     const tokensUsed = Math.max(runTokens, usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens);
+    const costUsd = failClosedUsd(result, tokensUsed, reserveUsd);
+    const costEstimated = !result || result.costEstimated || costUsd !== result.costUsd;
     await this.settle(reservationId, costUsd, tokensUsed);
     await store.addCost({ projectId: run.projectId, runId: run.id, provider: input.provider, model: run.model, role: run.role, ...usage, usd: costUsd });
     state.costUsd += costUsd;
-    if (!limit && state.costUsd > run.maxCostUsd) limit = "budget_exceeded";
+    // Over max_cost_usd wins over every other ending: pause and card even after a cancel or a limit.
+    if (state.costUsd > run.maxCostUsd) {
+      limit = "budget_exceeded";
+      slot.reason = "limit";
+    }
 
     // ---- final event ----
     let status: RunStatus;
@@ -250,20 +289,25 @@ export class RunEngine {
     } else {
       status = "succeeded";
     }
-    await checkpoint();
     let cardId: string | undefined;
     const retryable = status === "failed" && errorType !== undefined && RETRYABLE.has(errorType) && (result?.error?.retryable ?? true);
     const countsAsAttempt = errorType !== undefined && !NOT_AN_ATTEMPT.has(errorType) && status !== "limit_hit";
-    if (status === "succeeded") {
-      await emit("done", { status, costUsd, costEstimated, turns: state.turn });
-    } else {
+    if (status !== "succeeded") {
       await store.recordError(run.id, errorType!, message, retryable, countsAsAttempt);
       if (errorType === "budget_exceeded") {
         await store.pauseProject(run.projectId);
         cardId = await store.raiseCard({ projectId: run.projectId, action: "raise-budget", target: `run:${run.id}`, reason: message, costUsd: state.costUsd });
       }
-      await emit("error", { type: errorType, message, retryable, countsAsAttempt, ...(cardId ? { cardId } : {}) });
     }
+    const terminal: Terminal =
+      status === "succeeded"
+        ? { type: "done", payload: { status, costUsd, costEstimated, turns: state.turn, countsAsAttempt: false } }
+        : { type: "error", payload: { status, type: errorType, message, retryable, countsAsAttempt, costUsd, costEstimated, ...(cardId ? { cardId } : {}) } };
+    // The outcome is checkpointed before the terminal event: a retry after a failure from here on
+    // finishes the run from this record and never starts the runtime again (ADR-0011 safe retry).
+    state.state.ended = terminal;
+    await checkpoint();
+    await emit(terminal.type, terminal.payload);
     await store.finishRun(run.id, status, state.turn, status === "succeeded" ? undefined : `${errorType}:${message}`);
     return { runId: run.id, status, errorType, retryable, countsAsAttempt, costUsd, costEstimated, turns: state.turn, lastSeq: seq, cardId };
   }

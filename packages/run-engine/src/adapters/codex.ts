@@ -69,6 +69,8 @@ export class CodexExecAdapter implements RunAdapter {
     const totals = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
     let turn = task.resume?.turn ?? 0;
     let sawUsage = false;
+    let pendingToolBytes = 0;
+    let lastTool: string | undefined;
     let failure: RunResult["error"] | undefined;
     let output: string | undefined;
     const closed = new Promise<number | null>((resolve) => child.once("close", (code) => resolve(code)));
@@ -90,6 +92,8 @@ export class CodexExecAdapter implements RunAdapter {
         this.queue.push({ type: "tool_call", payload: { id: item.id ?? null, tool: "shell", input: { command: item.command ?? null } } });
       } else if (type === "item.completed" && item.type === "command_execution") {
         const bytes = Buffer.byteLength(String(item.aggregated_output ?? ""));
+        pendingToolBytes += bytes;
+        lastTool = "shell";
         this.queue.push({ type: "tool_result", payload: { id: item.id ?? null, bytes, exitCode: item.exit_code ?? null } });
       } else if (type === "turn.completed") {
         const u = (ev.usage ?? {}) as Record<string, unknown>;
@@ -97,7 +101,8 @@ export class CodexExecAdapter implements RunAdapter {
         turn += 1;
         const cached = n(u.cached_input_tokens);
         const input = Math.max(0, n(u.input_tokens) - cached);
-        const usage = { turn, model: task.model, inputTokens: input, outputTokens: n(u.output_tokens), cacheReadTokens: cached, cacheWriteTokens: 0, contextTokens: n(u.input_tokens) };
+        const usage = { turn, model: task.model, inputTokens: input, outputTokens: n(u.output_tokens), cacheReadTokens: cached, cacheWriteTokens: 0, contextTokens: n(u.input_tokens), toolName: lastTool, toolResultBytes: pendingToolBytes };
+        pendingToolBytes = 0;
         totals.inputTokens += usage.inputTokens;
         totals.outputTokens += usage.outputTokens;
         totals.cacheReadTokens += usage.cacheReadTokens;
@@ -107,7 +112,12 @@ export class CodexExecAdapter implements RunAdapter {
       }
     }
     const code = await closed;
-    if (this.killTimer) clearTimeout(this.killTimer);
+    if (this.cancelled) {
+      // The direct child is gone, but a group member that ignores SIGTERM may live on (and need not
+      // hold our stdio): kill the whole group now rather than waiting for the grace timer.
+      if (this.killTimer) clearTimeout(this.killTimer);
+      this.killGroup("SIGKILL");
+    }
     const price = this.opts.prices?.[task.model];
     const metered = sawUsage && price !== undefined;
     const costUsd = metered
@@ -132,18 +142,20 @@ export class CodexExecAdapter implements RunAdapter {
   /** Kill the whole process group: SIGTERM now, SIGKILL after the grace period. */
   async cancel(): Promise<void> {
     this.cancelled = true;
-    const pid = this.child?.pid;
-    if (!pid || this.child?.exitCode !== null) return;
-    const kill = (sig: NodeJS.Signals) => {
-      try {
-        process.kill(-pid, sig);
-      } catch {
-        /* group already gone */
-      }
-    };
-    kill("SIGTERM");
-    this.killTimer = setTimeout(() => kill("SIGKILL"), this.opts.killGraceMs ?? 5000);
+    if (!this.child?.pid) return;
+    this.killGroup("SIGTERM");
+    this.killTimer = setTimeout(() => this.killGroup("SIGKILL"), this.opts.killGraceMs ?? 5000);
     this.killTimer.unref();
+  }
+
+  private killGroup(sig: NodeJS.Signals): void {
+    const pid = this.child?.pid;
+    if (!pid) return;
+    try {
+      process.kill(-pid, sig);
+    } catch {
+      /* group already gone */
+    }
   }
 
   result(): Promise<RunResult> {

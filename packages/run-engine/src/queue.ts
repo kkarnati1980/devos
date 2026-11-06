@@ -35,6 +35,19 @@ export interface RunQueueOptions {
   attempts?: number;
   backoff?: BackoffPolicy;
   concurrency?: number;
+  /** Deadline for each public queue operation (ms, default 10 s; ADR-0011). */
+  opTimeoutMs?: number;
+}
+
+/** Reject after `ms` (the Redis call itself is abandoned; ioredis keeps the socket). */
+function deadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let t: NodeJS.Timeout;
+  return Promise.race([
+    p.finally(() => clearTimeout(t)),
+    new Promise<T>((_, reject) => {
+      t = setTimeout(() => reject(new Error(`queue-${label}-timeout`)), ms);
+    }),
+  ]);
 }
 
 /** Turn an outcome into what BullMQ should do: return, retry (throw) or fail for good. */
@@ -50,29 +63,33 @@ export class RunQueue {
   private readonly clients: Redis[] = [];
   private readonly attempts: number;
   private readonly backoff: BackoffPolicy;
+  private readonly ms: number;
 
   constructor(private readonly opts: RunQueueOptions) {
     this.queue = new Queue(opts.name ?? "devos-runs", { connection: this.client() });
     this.attempts = opts.attempts ?? 3;
     this.backoff = opts.backoff ?? DEFAULT_BACKOFF;
+    this.ms = opts.opTimeoutMs ?? 10_000;
   }
 
   /** A Redis client with bounded connect/command timeouts (ADR-0011). BullMQ needs maxRetriesPerRequest=null. */
   private client(): Redis {
-    const c = new Redis(this.opts.redisUrl, { maxRetriesPerRequest: null, connectTimeout: 10_000, commandTimeout: undefined, lazyConnect: false });
+    // maxRetriesPerRequest=null is required by BullMQ workers (blocking commands); every public
+    // operation below has its own deadline instead.
+    const c = new Redis(this.opts.redisUrl, { maxRetriesPerRequest: null, connectTimeout: 10_000 });
     this.clients.push(c);
     return c;
   }
 
   /** One job per run; the job id is the run id, so a run is never queued twice. */
   async enqueue(input: RunInput): Promise<string> {
-    const job = await this.queue.add("run", input, {
+    const job = await deadline(this.queue.add("run", input, {
       jobId: input.runId,
       attempts: this.attempts,
       backoff: { type: "devos-jitter" },
       removeOnComplete: 1000,
       removeOnFail: false,
-    });
+    }), this.ms, "enqueue");
     return job.id!;
   }
 
@@ -101,7 +118,7 @@ export class RunQueue {
 
   /** Dead-letter view: jobs that failed for good (attempts exhausted or non-retryable). */
   async deadLetters(limit = 100): Promise<DeadLetter[]> {
-    const jobs = await this.queue.getFailed(0, Math.max(0, limit - 1));
+    const jobs = await deadline(this.queue.getFailed(0, Math.max(0, limit - 1)), this.ms, "dead-letters");
     return jobs.map((j) => ({
       jobId: String(j.id),
       runId: String((j.data as RunInput).runId),
@@ -113,10 +130,16 @@ export class RunQueue {
 
   /** Retry one dead-lettered job (KK's dashboard action). */
   async retryDead(jobId: string): Promise<boolean> {
-    const job = await this.queue.getJob(jobId);
-    if (!job || !(await job.isFailed())) return false;
-    await job.retry("failed");
-    return true;
+    return deadline(
+      (async () => {
+        const job = await this.queue.getJob(jobId);
+        if (!job || !(await job.isFailed())) return false;
+        await job.retry("failed");
+        return true;
+      })(),
+      this.ms,
+      "retry",
+    );
   }
 
   async close(): Promise<void> {

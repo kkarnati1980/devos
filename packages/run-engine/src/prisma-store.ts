@@ -60,6 +60,20 @@ export class PrismaRunStore implements RunStore {
     });
   }
 
+  lastEvent(runId: string): Promise<RunEvent | null> {
+    return this.tx(async (tx) => {
+      const e = await tx.runEvent.findFirst({ where: { runId }, orderBy: { seq: "desc" } });
+      return e ? { runId: e.runId, seq: e.seq, ts: new Date(e.ts).getTime(), type: e.type, payload: e.payload } : null;
+    });
+  }
+
+  runCostUsd(runId: string): Promise<number> {
+    return this.tx(async (tx) => {
+      const agg = await tx.costEntry.aggregate({ where: { runId }, _sum: { usd: true } });
+      return num(agg._sum.usd);
+    });
+  }
+
   appendEvent(e: RunEvent): Promise<void> {
     return this.tx(async (tx) => {
       await tx.runEvent.create({ data: { runId: e.runId, seq: e.seq, ts: new Date(e.ts), type: e.type, payload: e.payload } });

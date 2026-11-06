@@ -44,6 +44,10 @@ export interface RunStore {
   loadEnvelope(runId: string): Promise<CapabilityEnvelope | null>;
   latestCheckpoint(runId: string): Promise<{ seq: number; data: CheckpointData } | null>;
   lastEventSeq(runId: string): Promise<number>;
+  /** The run's newest event (to detect a run that already ended). */
+  lastEvent(runId: string): Promise<RunEvent | null>;
+  /** Sum of the run's cost_entry USD. */
+  runCostUsd(runId: string): Promise<number>;
   appendEvent(event: RunEvent): Promise<void>;
   saveCheckpoint(runId: string, seq: number, data: CheckpointData): Promise<void>;
   addTelemetry(runId: string, usage: TurnUsage): Promise<void>;
@@ -84,6 +88,15 @@ export class MemoryRunStore implements RunStore {
   async lastEventSeq(runId: string) {
     return this.events.filter((e) => e.runId === runId).reduce((m, e) => Math.max(m, e.seq), 0);
   }
+  async lastEvent(runId: string) {
+    const evs = this.events.filter((e) => e.runId === runId);
+    return evs.length ? structuredClone(evs[evs.length - 1]!) : null;
+  }
+  async runCostUsd(runId: string) {
+    return this.costs.filter((c) => c.runId === runId).reduce((a, c) => a + c.usd, 0);
+  }
+  /** Test hook: throw on the nth finishRun call. */
+  failFinishTimes = 0;
   async appendEvent(event: RunEvent) {
     this.appendCalls += 1;
     if (this.failAppendAt !== null && this.appendCalls >= this.failAppendAt) throw new Error("store-down");
@@ -110,6 +123,10 @@ export class MemoryRunStore implements RunStore {
     if (r) r.status = "running";
   }
   async finishRun(runId: string, status: RunStatus, turns: number, error?: string) {
+    if (this.failFinishTimes > 0) {
+      this.failFinishTimes -= 1;
+      throw new Error("store-down");
+    }
     const r = this.runs.get(runId);
     if (r) Object.assign(r, { status, turns });
     this.finished.set(runId, { status, turns, error });
