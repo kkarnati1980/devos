@@ -3,7 +3,9 @@
 import { PolicyEngine, PrismaPolicyStore, type PrismaLike } from "@devos/policy";
 import type { KkSessionRegistry } from "./auth.js";
 import { withTimeout } from "./http.js";
-import type { GrantService, ReadinessProbe } from "./routes.js";
+import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
+import { PrismaSettingsStore } from "./settings.js";
+import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 
 /** The subset of the Prisma client the API needs. */
 export interface DbClient extends PrismaLike {
@@ -35,6 +37,8 @@ export function dbReadiness(db: DbClient, timeoutMs: number): ReadinessProbe {
 export interface Runtime {
   grants: GrantService | null;
   readiness: ReadinessProbe;
+  /** M1.4: settings need the database; the vault also needs `DEVOS_VAULT_KEY`. */
+  setup: SetupServices;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -52,13 +56,21 @@ export async function buildRuntime(
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
   const hmac = env.DEVOS_POLICY_HMAC_KEY;
-  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured") };
-  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured") };
+  // A malformed vault key stops start-up with a code (never the value), even before the database.
+  const vaultKey = parseVaultKey(env.DEVOS_VAULT_KEY);
+  const vaultKeyVersion = parseVaultKeyVersion(env.DEVOS_VAULT_KEY_VERSION);
+  const noSetup: SetupServices = { settings: null, vault: null };
+  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup };
+  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup };
   const db = await opts.loadDb(databaseUrl);
+  const setup: SetupServices = {
+    settings: new PrismaSettingsStore(db, opts.outboundTimeoutMs),
+    vault: vaultKey ? new Vault(new PrismaVaultStore(db, opts.outboundTimeoutMs), vaultKey, vaultKeyVersion) : null,
+  };
   const grants = new PolicyEngine({
     store: new PrismaPolicyStore(db),
     hmacKey: Buffer.from(hmac, "utf8"),
     verifyKkSession: opts.kkSessions.verify,
   }) as unknown as GrantService;
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs) };
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup };
 }

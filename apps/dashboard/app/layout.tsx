@@ -20,7 +20,11 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       <body data-nonce-set={nonce ? "1" : "0"}>
         <header className="top">
           <a className="brand" href="/">DevOS</a>
-          <span className="mode">mock data</span>
+          <nav className="nav">
+            <a href="/setup">Setup</a>
+            <a href="/settings">Settings</a>
+            <span className="mode">mock data</span>
+          </nav>
         </header>
         <main className="wrap">{children}</main>
       </body>

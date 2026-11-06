@@ -4,7 +4,7 @@
 // prerendered page can never carry a stale nonce.
 import { NextResponse, type NextRequest } from "next/server";
 
-import { buildCsp } from "./lib/headers.mjs";
+import { buildCsp, parseApiOrigin } from "./lib/headers.mjs";
 
 function newNonce(): string {
   const bytes = new Uint8Array(18);
@@ -16,7 +16,7 @@ function newNonce(): string {
 
 export function middleware(request: NextRequest) {
   const nonce = newNonce();
-  const csp: string = buildCsp(nonce);
+  const csp: string = buildCsp(nonce, parseApiOrigin(process.env.DEVOS_API_ORIGIN));
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set("x-nonce", nonce);
   requestHeaders.set("content-security-policy", csp);
