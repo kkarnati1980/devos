@@ -27,6 +27,7 @@ case "$1" in
       caps) echo "$FAKE_CAPS_OUT"; exit "\${FAKE_CAPS_RC:-0}" ;;
       receipts) echo "$FAKE_RECEIPTS_OUT"; exit "\${FAKE_RECEIPTS_RC:-0}" ;;
       probe-start) echo "$FAKE_START_OUT"; exit "\${FAKE_START_HELPER_RC:-0}" ;;
+      probe-guard) echo "\${FAKE_GUARD_OUT:-{\"result\":\"pass\"}}"; exit "\${FAKE_GUARD_RC:-0}" ;;
       probe-status)
         if [[ -e "$FAKE_DIR/killed" ]]; then echo "$FAKE_STATUS_AFTER"; exit "\${FAKE_STATUS_AFTER_RC:-0}"
         else echo "$FAKE_STATUS_BEFORE"; exit "\${FAKE_STATUS_BEFORE_RC:-3}"; fi ;;
@@ -88,7 +89,8 @@ test("AT5 run-resume: starts a probe, SIGKILLs the worker after a checkpointed t
   const kill = lines.findIndex((l) => l === `kill --signal KILL ${ID}`);
   const start = lines.findIndex((l) => l === `start ${ID}`);
   assert.ok(kill > 0 && start > kill, `kill then start, got:\n${r.log}`);
-  assert.match(lines[kill - 1], /probe-status 2222/, "the kill follows a status read that showed a turn");
+  assert.match(lines[kill - 1], /probe-guard 2222/, "the kill directly follows a passing probe-guard");
+  assert.match(lines[kill - 2], /probe-status 2222/, "after a status read that showed a turn");
 });
 
 test("AT5 run-resume: another active run means skipped (3) and the worker is never killed", () => {
@@ -113,4 +115,14 @@ test("AT5 run-resume: seeded failures are 1 (resume evidence fails, start fails,
   const noRestart = run("run-resume.sh", { FAKE_START_OUT: START, FAKE_STATUS_BEFORE: RUNNING, FAKE_START_RC: "1" });
   assert.equal(noRestart.code, 1);
   assert.match(noRestart.out, /docker start failed/);
+});
+
+test("AT5 PR21-r1: run-resume never kills when probe-guard says the worker may hold more than the probe", () => {
+  const r = run("run-resume.sh", { FAKE_START_OUT: START, FAKE_STATUS_BEFORE: RUNNING, FAKE_GUARD_OUT: '{"result":"skipped","reason":"queue-active-not-only-probe"}', FAKE_GUARD_RC: "3" });
+  assert.equal(r.code, 3, r.out);
+  assert.doesNotMatch(r.log, /^kill/m);
+  assert.match(r.out, /not killing/);
+  const bad = run("run-resume.sh", { FAKE_START_OUT: START, FAKE_STATUS_BEFORE: RUNNING, FAKE_GUARD_OUT: "", FAKE_GUARD_RC: "1" });
+  assert.equal(bad.code, 1);
+  assert.doesNotMatch(bad.log, /^kill/m);
 });

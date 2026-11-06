@@ -7,7 +7,7 @@ import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { MemoryRunStore, RunEngine } from "../dist/index.js";
 import { PROBE_MODEL, PROBE_TURNS, ProbeAdapter, ProbeGateAdapter } from "../dist/probe-adapter.js";
 import { probeGated } from "../dist/worker-main.js";
-import { checkCaps, checkReceipts, probeStart, probeStatus, errorCode, cli, PROBE_RESERVE_USD, PROBE_MAX_COST_USD } from "../dist/g1-cli.js";
+import { checkCaps, checkReceipts, probeStart, probeGuard, probeStatus, errorCode, cli, micros, PROBE_RESERVE_USD, PROBE_MAX_COST_USD, PROBE_STALE_MS } from "../dist/g1-cli.js";
 
 const fast = () => new ProbeAdapter({ turnMs: 5 });
 
@@ -76,8 +76,14 @@ function fakeDb(seed = {}) {
       create: async ({ data }) => { const t = { id: "t1", ...data }; db.rows.task.push(t); return t; },
     },
     run: {
-      count: async ({ where }) => db.rows.run.filter((r) => where.status.in.includes(r.status) && (where.projectId.not ? r.projectId !== where.projectId.not : r.projectId === where.projectId)).length,
-      create: async ({ data }) => { const r = { id: "22222222-2222-4222-8222-222222222222", status: "queued", ...data }; db.rows.run.push(r); return r; },
+      count: async ({ where }) => db.rows.run.filter((r) => (typeof where.status === "string" ? r.status === where.status : where.status.in.includes(r.status)) && (where.projectId.not ? r.projectId !== where.projectId.not : r.projectId === where.projectId)).length,
+      create: async ({ data }) => { const r = { id: "22222222-2222-4222-8222-222222222222", status: "queued", createdAt: new Date(), ...data }; db.rows.run.push(r); return r; },
+      update: async ({ where, data }) => Object.assign(db.rows.run.find((r) => r.id === where.id), data),
+      updateMany: async ({ where, data }) => {
+        const hit = db.rows.run.filter((r) => r.projectId === where.projectId && where.status.in.includes(r.status) && r.createdAt < where.createdAt.lt);
+        for (const r of hit) Object.assign(r, data);
+        return { count: hit.length };
+      },
       findUnique: async ({ where }) => db.rows.run.find((r) => r.id === where.id) ?? null,
     },
     runEvent: { findMany: async () => seed.events ?? [] },
@@ -198,4 +204,58 @@ test("AT5 PR21: a killed worker's job resumes quickly: lock 15 s and stalled che
   assert.equal(w.opts.lockDuration, LOCK_DURATION_MS);
   assert.equal(w.opts.stalledInterval, STALLED_INTERVAL_MS);
   await q.close().catch(() => undefined);
+});
+
+test("PR21-r1 probe-start: a failed enqueue closes the new run as failed, so the next check can start", async () => {
+  const db = fakeDb();
+  const v = await probeStart(db, async () => { throw Object.assign(new Error("connect ECONNREFUSED redis://secret@x"), { code: "ECONNREFUSED" }); });
+  assert.equal(v.code, 1);
+  assert.equal(v.out.reason, "probe-enqueue-failed");
+  assert.ok(!JSON.stringify(v.out).includes("secret"));
+  assert.equal(db.rows.run[0].status, "failed");
+  db.rows.run[0].id = "33333333-3333-4333-8333-333333333333";
+  assert.equal((await probeStart(db, async () => {})).code, 0, "not blocked by the failed enqueue");
+});
+
+test("PR21-r1 probe-start: a stale unfinished probe run (lost job) is closed; a recent one still blocks", async () => {
+  const db = fakeDb();
+  await probeStart(db, async () => {});
+  assert.equal((await probeStart(db, async () => {})).code, 1, "a recent unfinished probe blocks");
+  db.rows.run[0].id = "44444444-4444-4444-8444-444444444444";
+  const later = Date.now() + PROBE_STALE_MS + 1000;
+  const v = await probeStart(db, async () => {}, () => later);
+  assert.equal(v.code, 0);
+  assert.equal(v.out.closedStaleProbeRuns, 1);
+  assert.equal(db.rows.run[0].error, "probe-stale");
+});
+
+test("PR21-r1 probe-guard: the kill is allowed only while the worker holds the probe alone, mid-run", async () => {
+  const seed = (status, turn, extra = []) => ({ project: [{ id: "pp", slug: "g1-probe" }], run: [{ id: RUN, projectId: "pp", model: PROBE_MODEL, status }, ...extra], turn });
+  assert.equal((await probeGuard(fakeDb(seed("running", 1)), RUN, [RUN], 1)).code, 0);
+  const skips = [
+    [seed("running", 1), [RUN], 2, "worker-concurrency-not-1"],
+    [seed("running", 1), [RUN, "other-job"], 1, "queue-active-not-only-probe"],
+    [seed("running", 1), [], 1, "queue-active-not-only-probe"],
+    [seed("running", 1, [{ id: "x", projectId: "real", status: "running" }]), [RUN], 1, "worker-busy"],
+    [seed("succeeded", 4), [RUN], 1, "probe-not-running"],
+    [seed("running", 3), [RUN], 1, "probe-turn-out-of-window"],
+    [seed("running", 0), [RUN], 1, "probe-turn-out-of-window"],
+  ];
+  for (const [db, active, conc, reason] of skips) {
+    const v = await probeGuard(fakeDb(db), RUN, active, conc);
+    assert.equal(v.code, 3, reason);
+    assert.equal(v.out.reason, reason);
+  }
+});
+
+test("PR21-r1 probe-status: money is compared in exact microdollars (a duplicate 1 µUSD charge fails)", async () => {
+  assert.equal(micros("0.001003"), 1003);
+  assert.equal(micros("15"), 15_000_000);
+  assert.ok(Number.isNaN(micros("1e-7")));
+  const base = { ...runRow("succeeded"), turn: 4, events: resumedEvents };
+  const exact = await probeStatus(fakeDb({ ...base, reservations: [{ status: "reconciled", actualUsd: "0.001003" }], costs: [{ usd: "0.001" }, { usd: "0.000003" }] }), RUN, true);
+  assert.equal(exact.code, 0, JSON.stringify(exact.out));
+  const dup = await probeStatus(fakeDb({ ...base, reservations: [{ status: "reconciled", actualUsd: "0.001003" }], costs: [{ usd: "0.001" }, { usd: "0.000004" }] }), RUN, true);
+  assert.equal(dup.code, 1);
+  assert.equal(dup.out.reason, "cost-not-reconciled");
 });

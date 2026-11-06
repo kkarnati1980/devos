@@ -3,8 +3,9 @@
 # in the dedicated `g1-probe` project (in-image probe adapter: no provider call, no spend), SIGKILL the
 # worker once the run has checkpointed a turn, start the worker again, and require the run to finish from
 # its checkpoint with every reservation closed and charged exactly once (`g1-cli.js probe-status`).
-# Exit 0 pass, 1 fail, 3 skipped (DevOS not deployed, or another run is active: the check never kills a
-# worker that holds a real run). Fits the server agent's 120 s check limit. Prints JSON lines; no secret.
+# Exit 0 pass, 1 fail, 3 skipped (DevOS not deployed, or the worker may hold another run: `probe-guard`
+# right before the kill; the check never kills a worker that may hold a real run).
+# Fits the server agent's 120 s check limit. Prints JSON lines; no secret.
 set -uo pipefail
 POLL="${G1_POLL_SECONDS:-2}"
 KILL_BY="${G1_KILL_BY_SECONDS:-30}"     # the probe must checkpoint a turn within this
@@ -33,6 +34,12 @@ while (( SECONDS < KILL_BY )); do
   sleep "$POLL"
 done
 (( ${turns:-0} >= 1 )) || { echo "probe did not checkpoint a turn within ${KILL_BY}s: ${st:-}"; exit 1; }
+# PR21-r1: last gate right before the kill: the worker runs one job at a time and holds only the probe,
+# which is mid-run with a turn left. Otherwise skip: the probe finishes on its own and nothing is killed.
+guard="$(helper probe-guard "$RUN")"; rc=$?
+echo "probe-guard: ${guard:-no output}"
+if [[ "$rc" == 3 ]]; then echo "skipped: the worker may hold more than the probe; not killing it"; exit 3; fi
+[[ "$rc" == 0 ]] || exit 1
 echo "killing worker ${ID:0:12} at turn $turns (SIGKILL, no drain)"
 timeout 20 docker kill --signal KILL "$ID" >/dev/null 2>&1 || { echo "docker kill failed"; exit 1; }
 sleep 1

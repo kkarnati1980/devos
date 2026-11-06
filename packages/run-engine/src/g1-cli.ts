@@ -7,6 +7,7 @@
 //   caps                  the wizard's caps are confirmed and positive (read-only)
 //   receipts              every policy receipt chain verifies with the server's HMAC key (read-only)
 //   probe-start           queue one probe run in the dedicated `g1-probe` project (no provider, no spend)
+//   probe-guard <runId>   the worker may be killed now: it holds only the probe (read-only)
 //   probe-status <runId>  the probe run's resume and money evidence (read-only)
 import { fileURLToPath } from "node:url";
 import { PolicyEngine, PrismaPolicyStore, type PrismaLike as PolicyPrismaLike } from "@devos/policy";
@@ -27,6 +28,8 @@ export const PROBE_RESERVE_TOKENS = 1_000;
  * fail-closed rule 9), so this is kept at a tenth of max_cost_usd: the resumed attempt still fits.
  */
 export const PROBE_RESERVE_USD = 0.001;
+/** An unfinished probe run older than this is stale (its job was lost): it is closed as failed. */
+export const PROBE_STALE_MS = 15 * 60_000;
 
 export interface Verdict {
   /** 0 pass, 1 fail, 2 usage, 3 skipped (or still running, for probe-status). */
@@ -82,21 +85,60 @@ async function probeProject(db: Db): Promise<{ projectId: string; taskId: string
 }
 
 /**
- * probe-start: refuses while any other run is running (the check kills the worker, so it must never cut a
- * real run short) or a probe run is still unfinished. Creates one run and queues it.
+ * probe-start: refuses while any other run is queued or running, or a recent probe run is unfinished.
+ * Creates one run and queues it. PR21-r1: a probe run whose job never reached the queue is closed as
+ * failed at once (enqueue error) or once stale, so a lost job never blocks later checks.
  */
-export async function probeStart(db: Db, enqueue: (input: { runId: string; provider: "anthropic"; prompt: string; cwd: string; reserveTokens: number; reserveUsd: number }) => Promise<unknown>): Promise<Verdict> {
+export async function probeStart(
+  db: Db,
+  enqueue: (input: { runId: string; provider: "anthropic"; prompt: string; cwd: string; reserveTokens: number; reserveUsd: number }) => Promise<unknown>,
+  now: () => number = Date.now,
+): Promise<Verdict> {
   const { projectId, taskId, pausedAt } = await probeProject(db);
   if (pausedAt) return fail("probe-project-paused", { projectId });
   const busy = await db.run.count({ where: { status: { in: ["queued", "running"] }, projectId: { not: projectId } } });
   if (busy > 0) return skip("worker-busy", { activeRuns: busy });
+  const stale = await db.run.updateMany({
+    where: { projectId, status: { in: ["queued", "running"] }, createdAt: { lt: new Date(now() - PROBE_STALE_MS) } },
+    data: { status: "failed", error: "probe-stale", endedAt: new Date(now()) },
+  });
   const open = await db.run.count({ where: { status: { in: ["queued", "running"] }, projectId } });
   if (open > 0) return fail("probe-run-unfinished", { openProbeRuns: open });
   const run = await db.run.create({
     data: { taskId, projectId, role: "tester", model: PROBE_MODEL, maxTurns: PROBE_TURNS + 6, maxSeconds: PROBE_MAX_SECONDS, maxCostUsd: PROBE_MAX_COST_USD },
   });
-  await enqueue({ runId: run.id, provider: "anthropic", prompt: "g1 probe", cwd: "/tmp", reserveTokens: PROBE_RESERVE_TOKENS, reserveUsd: PROBE_RESERVE_USD });
-  return ok({ runId: run.id, projectId });
+  try {
+    await enqueue({ runId: run.id, provider: "anthropic", prompt: "g1 probe", cwd: "/tmp", reserveTokens: PROBE_RESERVE_TOKENS, reserveUsd: PROBE_RESERVE_USD });
+  } catch (e) {
+    // The job may or may not have reached Redis; a run nobody will execute must not stay open. If the
+    // job did arrive, the engine sees a finished run and does not start it again (M1.5 rule 8).
+    await db.run.update({ where: { id: run.id }, data: { status: "failed", error: "probe-enqueue-failed", endedAt: new Date(now()) } });
+    return fail("probe-enqueue-failed", { runId: run.id, code: errorCode(e) });
+  }
+  return ok({ runId: run.id, projectId, ...(stale.count > 0 ? { closedStaleProbeRuns: stale.count } : {}) });
+}
+
+/**
+ * probe-guard (PR21-r1): the last gate before run-resume.sh kills the worker. Pass only when killing it
+ * can cut short nothing but the probe: the worker runs one job at a time, the queue's only active job is
+ * the probe, no other project's run is running, and the probe is mid-run with at least one turn left
+ * (so its slot stays taken until the kill a moment later). Anything else is skipped: no kill.
+ */
+export async function probeGuard(db: Db, runId: string, activeJobIds: string[], concurrency: number): Promise<Verdict> {
+  if (!UUID.test(runId)) return { code: 2, out: { result: "usage", reason: "run-id-invalid" } };
+  if (concurrency !== 1) return skip("worker-concurrency-not-1", { concurrency });
+  const others = activeJobIds.filter((id) => id !== runId);
+  if (others.length > 0 || !activeJobIds.includes(runId)) return skip("queue-active-not-only-probe", { activeJobs: activeJobIds.length });
+  const run = await db.run.findUnique({ where: { id: runId } });
+  if (!run || run.model !== PROBE_MODEL) return fail("probe-run-not-found");
+  const project = await db.project.findUnique({ where: { slug: PROBE_SLUG } });
+  const running = await db.run.count({ where: { status: "running", projectId: { not: project?.id ?? run.projectId } } });
+  if (running > 0) return skip("worker-busy", { activeRuns: running });
+  if (run.status !== "running") return skip("probe-not-running", { status: run.status });
+  const cps: { data: any }[] = await db.checkpoint.findMany({ where: { runId }, orderBy: { seq: "desc" }, take: 1, select: { data: true } });
+  const turn = num(cps[0]?.data?.turn);
+  if (turn < 1 || turn > PROBE_TURNS - 2) return skip("probe-turn-out-of-window", { turns: turn });
+  return ok({ runId, turns: turn });
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -121,8 +163,12 @@ export async function probeStatus(db: Db, runId: string, requireResume: boolean)
   const resumed = events.some((e) => e.type === "status" && e.payload?.state === "resumed");
   const recovered = events.some((e) => e.type === "status" && e.payload?.state === "recovered");
   const openReservations = reservations.filter((r) => r.status === "reserved").length;
-  const reconciledUsd = round6(reservations.filter((r) => r.status === "reconciled").reduce((a, r) => a + num(r.actualUsd), 0));
-  const costUsd = round6(costs.reduce((a, c) => a + num(c.usd), 0));
+  // PR21-r1: money is compared in integer microdollars, exactly (one turn is 1 µUSD).
+  const reconciledMicros = reservations.filter((r) => r.status === "reconciled").reduce((a, r) => a + micros(r.actualUsd), 0);
+  const costMicros = costs.reduce((a, c) => a + micros(c.usd), 0);
+  const maxMicros = micros(run.maxCostUsd);
+  const reconciledUsd = reconciledMicros / 1e6;
+  const costUsd = costMicros / 1e6;
   const out = {
     runId, status: run.status, turns: turn, events: events.length, gapless, resumed, recovered, reservations: reservations.length, openReservations,
     costEntries: costs.length, costUsd, reconciledUsd, maxCostUsd: num(run.maxCostUsd),
@@ -134,12 +180,22 @@ export async function probeStatus(db: Db, runId: string, requireResume: boolean)
   if (requireResume && !resumed) return fail("no-resume-event", out);
   if (openReservations > 0) return fail("reservation-open", out);
   if (costs.length === 0) return fail("no-cost-entry", out);
-  if (Math.abs(costUsd - reconciledUsd) > 1e-6) return fail("cost-not-reconciled", out);
-  if (costUsd > num(run.maxCostUsd) + 1e-6) return fail("cost-over-max", out);
+  if (costMicros !== reconciledMicros) return fail("cost-not-reconciled", out);
+  if (costMicros > maxMicros) return fail("cost-over-max", out);
   return ok(out);
 }
 
-const round6 = (n: number) => Math.round(n * 1e6) / 1e6;
+/**
+ * Decimal(12,6) USD → integer microdollars, from its decimal string (no float arithmetic). A value with
+ * more than 6 decimals, or not a plain decimal, is NaN, which fails every comparison.
+ */
+export function micros(v: unknown): number {
+  if (v === null || v === undefined) return 0;
+  const m = /^(-?)(\d+)(?:\.(\d{1,6}))?$/.exec(String(v).trim());
+  if (!m) return Number.NaN;
+  const n = Number(m[2]) * 1e6 + Number((m[3] ?? "").padEnd(6, "0"));
+  return m[1] ? -n : n;
+}
 
 /** Reduce any error to a code: never a message (it may carry a URL or a value). */
 export function errorCode(e: unknown): string {
@@ -154,7 +210,7 @@ export function errorCode(e: unknown): string {
 
 export async function cli(argv: string[], env: NodeJS.ProcessEnv): Promise<Verdict> {
   const [cmd, arg] = argv;
-  if (!["caps", "receipts", "probe-start", "probe-status"].includes(cmd ?? "")) return { code: 2, out: { result: "usage", reason: "unknown-command" } };
+  if (!["caps", "receipts", "probe-start", "probe-guard", "probe-status"].includes(cmd ?? "")) return { code: 2, out: { result: "usage", reason: "unknown-command" } };
   const url = env.DATABASE_URL ?? "";
   if (!/^postgres(ql)?:\/\//.test(url)) return fail("config-database-url-required");
   const dbModuleName = "@devos/db";
@@ -174,6 +230,11 @@ export async function cli(argv: string[], env: NodeJS.ProcessEnv): Promise<Verdi
     const { RunQueue } = await import("./queue.js");
     const queue = new RunQueue({ redisUrl });
     try {
+      if (cmd === "probe-guard") {
+        const active = await queue.queue.getActive();
+        const concurrency = Number(env.DEVOS_WORKER_CONCURRENCY ?? 1);
+        return await probeGuard(db, arg ?? "", active.map((j) => String(j.id)), concurrency);
+      }
       return await probeStart(db, (input) => queue.enqueue(input));
     } finally {
       await queue.close().catch(() => undefined);
