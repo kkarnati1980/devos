@@ -1,0 +1,216 @@
+// DEVOS-74 server agent: AT1–AT9 against a mock GitHub API, a mock Coolify API and a local git remote.
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import http from "node:http";
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const ROOT = path.resolve(import.meta.dirname, "../..");
+const AGENT = path.join(ROOT, "scripts/server/server-agent.sh");
+const GH_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+const CF_TOKEN = "7|coolifySecretValue0123456789xyz";
+const SK = "sk-proj-" + "abcdefghijklmnop1234";
+
+let srv, port, tmp, bare;
+let M; // mock state
+const reqs = [];
+
+function resetMock() {
+  M = { main: null, runs: {}, statuses: {}, pulls: {}, trees: {}, failStatus: 0, deployPatch: [], deployStatus: "finished" };
+  reqs.length = 0;
+}
+
+function git(cwd, ...args) {
+  return execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
+}
+
+// Make a commit on the bare remote's main with the given files; returns its sha.
+function commit(files, msg = "c") {
+  const w = path.join(tmp, "author");
+  if (!fs.existsSync(w)) { git(tmp, "clone", "-q", bare, w); git(w, "checkout", "-q", "-B", "main"); }
+  for (const [p, c] of Object.entries(files)) {
+    const f = path.join(w, p);
+    if (c === null) { fs.rmSync(f, { force: true }); continue; }
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, c);
+  }
+  git(w, "add", "-A");
+  git(w, "commit", "-q", "--allow-empty", "-m", msg);
+  git(w, "push", "-q", "origin", "HEAD:main");
+  const sha = git(w, "rev-parse", "HEAD");
+  M.trees[sha] = git(w, "rev-parse", "HEAD^{tree}");
+  return sha;
+}
+
+const real = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
+const baseFiles = () => ({
+  "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
+  "scripts/review/review-commit.sh": real("scripts/review/review-commit.sh"),
+  "scripts/server/server-agent.sh": real("scripts/server/server-agent.sh"),
+  "scripts/server/install-server-agent.sh": real("scripts/server/install-server-agent.sh"),
+  "scripts/server/checks/ok.sh": "#!/usr/bin/env bash\necho fine\n",
+  "scripts/server/checks/leaky.sh": `#!/usr/bin/env bash\necho "key ${SK} token ${GH_TOKEN} cf ${CF_TOKEN}"\nexit 1\n`,
+});
+
+const green = (sha) => { M.runs[sha] = [{ workflow_id: 1, created_at: "2026-11-06T00:00:00Z", status: "completed", conclusion: "success" }]; };
+const pass = (sha) => { (M.statuses[sha] ||= []).push({ context: "codex-review", state: "success", created_at: "2026-11-06T00:00:01Z" }); };
+
+function handler(req, res) {
+  let body = "";
+  req.on("data", (d) => (body += d));
+  req.on("end", () => {
+    const u = new URL(req.url, "http://x");
+    const p = u.pathname;
+    reqs.push({ method: req.method, path: p, auth: req.headers.authorization || "", body });
+    const json = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+    let m;
+    if (p === "/gh/repos/kkarnati1980/devos/commits/main") return json(200, { sha: M.main });
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/actions\/runs$/))) return json(200, { workflow_runs: M.runs[u.searchParams.get("head_sha")] || [] });
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/commits\/([0-9a-f]{40})\/statuses$/))) return json(200, M.statuses[m[1]] || []);
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/commits\/([0-9a-f]{40})\/pulls$/))) return json(200, M.pulls[m[1]] || []);
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/git\/commits\/([0-9a-f]{40})$/))) return json(200, { tree: { sha: M.trees[m[1]] } });
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/))) {
+      if (M.failStatus > 0) { M.failStatus--; return json(502, {}); }
+      return json(201, {});
+    }
+    if (p.match(/^\/gh\/repos\/kkarnati1980\/devos\/(issues\/\d+|commits\/[0-9a-f]{40})\/comments$/)) return json(201, {});
+    if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "PATCH") { M.deployPatch.push(JSON.parse(body)); return json(200, {}); }
+    if (p === "/cf/deploy") return json(200, { deployments: [{ deployment_uuid: "dep-1234abcd" }] });
+    if (p === "/cf/deployments/dep-1234abcd") return json(200, { status: M.deployStatus });
+    json(404, { p });
+  });
+}
+
+function runAgent(extra = {}) {
+  return new Promise((resolve) => {
+    const env = {
+      ...process.env,
+      GITHUB_API: `http://127.0.0.1:${port}/gh`, COOLIFY_API: `http://127.0.0.1:${port}/cf`,
+      DEVOS_DIR: path.join(tmp, ".devos"), AGENT_WORK: path.join(tmp, "work"), AGENT_REPO_URL: bare,
+      GIT_SSH_COMMAND: "ssh", POLL_SEC: "0", ...extra,
+    };
+    const ch = spawn("bash", [AGENT], { env });
+    let out = "";
+    ch.stdout.on("data", (d) => (out += d));
+    ch.stderr.on("data", (d) => (out += d));
+    ch.on("close", (code) => resolve({ code, out }));
+  });
+}
+const writes = () => reqs.filter((r) => r.method !== "GET");
+const statusPosts = (ctx) => writes().filter((r) => r.path.includes("/statuses/") && JSON.parse(r.body).context === ctx).map((r) => JSON.parse(r.body));
+const D = () => path.join(tmp, ".devos");
+
+function freshState({ deploy = false } = {}) {
+  fs.rmSync(D(), { recursive: true, force: true });
+  fs.mkdirSync(path.join(D(), "agent"), { recursive: true });
+  fs.writeFileSync(path.join(D(), "github-review.env"), `GITHUB_REVIEW_TOKEN=${GH_TOKEN}\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(D(), "coolify-deploy.env"), `COOLIFY_TOKEN=${CF_TOKEN}\nCOOLIFY_APP_UUID=app-uuid-1234\n`, { mode: 0o600 });
+  if (deploy) fs.writeFileSync(path.join(D(), "agent/deploy.enabled"), "x");
+}
+
+before(async () => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "devos-agent-"));
+  bare = path.join(tmp, "remote.git");
+  git(tmp, "init", "-q", "--bare", "-b", "main", bare);
+  srv = http.createServer(handler);
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  port = srv.address().port;
+});
+after(() => { srv.close(); fs.rmSync(tmp, { recursive: true, force: true }); });
+
+test("AT1/AT9: passing SHA installs the allow-list only; a second tick makes no writes", async () => {
+  resetMock(); freshState();
+  const sha = commit(baseFiles(), "base");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
+  assert.ok(!fs.existsSync(path.join(D(), "bin/install-server-agent.sh")), "installer is not on the allow-list");
+  assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), sha);
+  assert.equal(M.deployPatch.length, 0, "deploy disabled: Coolify never called (AT4)");
+  assert.ok(!reqs.some((q) => q.path.startsWith("/cf/")), "no Coolify request at all");
+  const sc = statusPosts("server-check");
+  assert.equal(sc.length, 1); assert.equal(sc[0].state, "failure"); assert.match(sc[0].description, /1\/2 passed/);
+  reqs.length = 0;
+  const r2 = await runAgent();
+  assert.equal(r2.code, 0); assert.equal(writes().length, 0, "AT9: no writes on a handled SHA");
+});
+
+test("AT3: a SHA without a PASS, or with red CI, is refused once", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ "x.txt": "1" }, "nopass");
+  M.main = sha; green(sha);
+  await runAgent();
+  assert.ok(!fs.existsSync(path.join(D(), "agent/installed.sha")), "nothing installed");
+  assert.equal(M.deployPatch.length, 0);
+  const st = statusPosts("devos-deploy");
+  assert.equal(st.length, 1); assert.equal(st[0].state, "failure"); assert.match(st[0].description, /no Codex PASS/);
+  reqs.length = 0; await runAgent(); assert.equal(writes().length, 0, "no repeat");
+
+  const red = commit({ "x.txt": "2" }, "red");
+  M.main = red; pass(red);
+  M.runs[red] = [{ workflow_id: 1, created_at: "t", status: "completed", conclusion: "failure" }];
+  reqs.length = 0; await runAgent();
+  assert.match(statusPosts("devos-deploy")[0].description, /CI is not green/);
+  assert.equal(M.deployPatch.length, 0);
+});
+
+test("AT2: merge commit accepted only when its tree equals the PASSed PR head's tree", async () => {
+  resetMock(); freshState();
+  const head = commit({ "y.txt": "head" }, "pr head");
+  const merge = commit({}, "merge (same tree)");
+  M.main = merge; green(merge); pass(head);
+  M.pulls[merge] = [{ number: 42, merge_commit_sha: merge, merged_at: "t", head: { sha: head } }];
+  await runAgent();
+  assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), merge);
+  assert.ok(writes().some((q) => q.path.endsWith("/issues/42/comments")), "check comment on the merged PR (AT5)");
+
+  const head2 = commit({ "z.txt": "head2" }, "pr2 head");
+  const merge2 = commit({ "other.txt": "main moved" }, "merge brings other changes");
+  M.main = merge2; green(merge2); pass(head2);
+  M.pulls[merge2] = [{ number: 43, merge_commit_sha: merge2, merged_at: "t", head: { sha: head2 } }];
+  reqs.length = 0; await runAgent();
+  assert.match(statusPosts("devos-deploy")[0].description, /tree differs/);
+  assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), merge);
+});
+
+test("AT4/AT5/AT6/AT7: deploys the exact SHA, posts statuses, retries a failed post without redeploying, redacts", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ "w.txt": String(Date.now()) }, "deployable");
+  M.main = sha; green(sha); pass(sha);
+  M.failStatus = 1; // the first status post (devos-deploy) fails
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(M.deployPatch, [{ git_commit_sha: sha }]);
+  const sc = statusPosts("server-check");
+  assert.equal(sc.length, 1); assert.equal(sc[0].state, "failure");
+  reqs.length = 0;
+  const r2 = await runAgent();
+  assert.equal(M.deployPatch.length, 1, "AT6: not redeployed");
+  const dd = statusPosts("devos-deploy");
+  assert.equal(dd.length, 1); assert.equal(dd[0].state, "success");
+  assert.equal(statusPosts("server-check").length, 0, "checks not re-posted");
+  reqs.length = 0; await runAgent(); assert.equal(writes().length, 0);
+  // AT7: no secret in any post body or the agent output.
+  const all = fs.readdirSync(path.join(D(), "agent")).filter((f) => f.endsWith(".md")).map((f) => fs.readFileSync(path.join(D(), "agent", f), "utf8")).join("\n");
+  assert.match(all, /\[redacted\]/);
+  for (const s of [GH_TOKEN, CF_TOKEN, SK]) {
+    assert.ok(!all.includes(s), "stored comment leaks a secret");
+    assert.ok(!(r.out + r2.out).includes(s), "agent log leaks a secret");
+  }
+  for (const q of reqs) for (const s of [GH_TOKEN, CF_TOKEN, SK]) assert.ok(!q.body.includes(s));
+});
+
+test("AT8: a file failing bash -n blocks the whole install", async () => {
+  resetMock(); freshState();
+  const before = fs.existsSync(path.join(D(), "agent/installed.sha"));
+  const sha = commit({ "scripts/server/checks/broken.sh": "#!/usr/bin/env bash\nif then fi (\n" }, "broken");
+  M.main = sha; green(sha); pass(sha);
+  await runAgent();
+  assert.ok(!before && !fs.existsSync(path.join(D(), "agent/installed.sha")), "nothing installed");
+  assert.ok(!fs.existsSync(path.join(D(), "bin/checks/broken.sh")));
+  assert.match(statusPosts("devos-deploy")[0].description, /install failed/);
+  commit({ "scripts/server/checks/broken.sh": null }, "fix");
+});
