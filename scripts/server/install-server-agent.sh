@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — install the server agent on the DevOS server (DEVOS-74). Contract: docs/modules/server-agent.md
-# Version: 1.1.1
+# Version: 1.1.2
+# v1.1.2 (Codex PR11-r4): --deploy-on and --deploy-off change the switch under the agent's lock.
 # v1.1.1 (Codex PR11-r2): RETRY_DEPLOY=1 clears only a recorded failure, under the agent's lock.
 # v1.1.0 (Codex PR11-r1): --uninstall also stops a running tick; RETRY_DEPLOY=1 clears a failed deploy of the
 # installed SHA so the next tick deploys it again.
@@ -32,7 +33,9 @@ case "${1:-}" in
     systemctl daemon-reload
     pass "server agent removed (env files, review watcher and $DIR/bin scripts left in place)"; exit 0 ;;
   --deploy-off)
-    rm -f "$ST/deploy.enabled"; pass "deploy-on-PASS is OFF"; exit 0 ;;
+    install -d -m 700 "$ST"; exec 6>>"$ST/agent.lock"
+    flock -w 1600 6 || fail "the agent tick did not finish; rerun --deploy-off"
+    rm -f "$ST/deploy.enabled"; flock -u 6; pass "deploy-on-PASS is OFF (a deployment already started is still finished and reported)"; exit 0 ;;
   --deploy-on) ASK_DEPLOY=1 ;;
   "") ASK_DEPLOY=1 ;;
   *) fail "unknown option $1" ;;
@@ -105,9 +108,15 @@ if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" ]]; then
   echo "==> First launch: deploy-on-PASS redeploys DevOS through Coolify for every main SHA with green CI + Codex PASS."
   read -rp "  Approve deploy-on-PASS now? Type yes or no: " A
   if [[ "$A" == yes ]]; then
-    install -d -m 700 "$ST"; date -u +%FT%TZ > "$ST/deploy.enabled"
+    install -d -m 700 "$ST"
+    # Hold the agent's lock, so a deploy-disabled tick cannot re-mark the SHA done after this cleanup.
+    exec 6>>"$ST/agent.lock"
+    echo "  waiting for any running agent tick to finish (up to 25 minutes)..."
+    flock -w 1600 6 || fail "the agent tick did not finish; deploy-on-PASS stays OFF - rerun --deploy-on"
+    date -u +%FT%TZ > "$ST/deploy.enabled"
     # Let the current main SHA be deployed on the next tick if it was handled while deploy was off.
     if [[ -s "$ST/installed.sha" ]]; then s="$(cat "$ST/installed.sha")"; [[ -e "$ST/deployed.$s" ]] || rm -f "$ST/done.$s" "$ST/$s.checks.state" "$ST/$s.checks.md" "$ST/check-statused.$s" "$ST/check-commented.$s"; fi
+    flock -u 6
     pass "deploy-on-PASS is ON (approved $(cat "$ST/deploy.enabled"))"
   else
     echo "  deploy-on-PASS stays OFF. Turn it on later: bash $DIR/bin/install-server-agent.sh --deploy-on"

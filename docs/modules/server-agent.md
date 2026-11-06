@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-74 · P1 · Lane C · critical path (blocks DEVOS-47, the G1 gate)
 - **Depends on:** M0.3 (read-only deploy key `/root/.ssh/devos_ro`), the review watcher (DEVOS-60: `codex-review` commit status and the GitHub token in `/root/.devos/github-review.env`), M0.4 (local Coolify API on `http://localhost:8000/api/v1`).
-- **Owned files:** `scripts/server/server-agent.sh` (v1.1.2), `scripts/server/install-server-agent.sh` (v1.1.1), `scripts/server/checks/*.sh`, `scripts/test/server-agent.test.mjs`, this contract.
+- **Owned files:** `scripts/server/server-agent.sh` (v1.1.2), `scripts/server/install-server-agent.sh` (v1.1.2), `scripts/server/checks/*.sh`, `scripts/test/server-agent.test.mjs`, this contract.
 - **Approved by KK:** 6 Nov 2026 (DEVOS-74). It removes the need for KK at the server terminal after one install.
 - **Applies:** ADR-0011 (timeouts on every outbound call, retries only for safe operations), D1 (merge and deploy only on green CI + Codex PASS for the exact SHA), the continuous-build runbook (no runner access to the server; one installer that KK runs once).
 
@@ -35,6 +35,7 @@ Any GitHub read error (runs, statuses, PRs, trees) means **wait** for the next t
 ## First launch and the deploy switch
 - Deploy is **off** until KK turns it on in the installer (rules.md: first launch needs KK's approval). The installer asks "Approve deploy-on-PASS now? (yes/no)"; only `yes` writes `/root/.devos/agent/deploy.enabled`. Until then each tick does the self-update and the checks, and logs "deploy disabled".
 - Approving later: `bash /root/.devos/bin/install-server-agent.sh --deploy-on` (asks yes/no). The current `main` SHA, if it was handled while deploy was off, is deployed on the next tick.
+- Turning deploy on or off (and its cleanup) happens under the agent's lock, after any running tick has ended, so a tick that started with deploy off cannot re-mark the SHA done.
 - A deployment already submitted is always reconciled (resumed and reported, then checked), even after deploy is turned off; turning deploy off only stops **new** submissions.
 - Turning it off again: `bash /root/.devos/bin/install-server-agent.sh --deploy-off`.
 
@@ -67,3 +68,5 @@ AT1–AT9 run in CI (9 tests, including the PR11-r1 regressions: unreadable tree
 **v1.1.1 (6 Nov 2026, Codex PR11-r2, 3 medium, all accepted):** a superseded in-flight deployment is resumed and reported before a newer deploy starts; `RETRY_DEPLOY=1` clears only a recorded failure, under the agent lock; `--dry-run` creates nothing. Two regression tests added (11 total).
 
 **v1.1.2 (6 Nov 2026, Codex PR11-r3, 2 medium, accepted):** a newer deploy or check waits until an earlier deployment's status has posted; a submitted deployment is reconciled even after `--deploy-off`. Two regression tests added (13 total).
+
+**Installer v1.1.2 (6 Nov 2026, Codex PR11-r4, 1 medium, accepted):** `--deploy-on` / `--deploy-off` take the agent lock (waiting up to 25 min for a running tick) before changing the switch and clearing the SHA's markers.
