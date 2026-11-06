@@ -6,6 +6,7 @@ import { PolicyEngine, PrismaPolicyStore, type PrismaLike as PolicyPrismaLike, t
 import { RunEngine, type PolicyLike } from "./engine.js";
 import { PrismaRunStore, type PrismaLike } from "./prisma-store.js";
 import { RunQueue } from "./queue.js";
+import { ProbeGateAdapter } from "./probe-adapter.js";
 import { RunFailure, type AdapterEvent, type RunAdapter, type RunResult, type RunTask } from "./types.js";
 
 export const MIN_HMAC_KEY_BYTES = 32;
@@ -77,6 +78,15 @@ export function adapterFor(registry: AdapterRegistry): (provider: Provider) => R
   return (provider) => registry[provider]?.() ?? new UnconfiguredAdapter(provider);
 }
 
+/**
+ * R2-b: every provider's adapter is wrapped so a run whose model is PROBE_MODEL (the G1 `run-resume`
+ * check's own run) gets the in-image probe; every other run keeps the registry's adapter.
+ */
+export function probeGated(registry: AdapterRegistry): (provider: Provider) => RunAdapter {
+  const normal = adapterFor(registry);
+  return (provider) => new ProbeGateAdapter(provider, () => normal(provider));
+}
+
 type Db = PrismaLike & PolicyPrismaLike & { $disconnect(): Promise<void> };
 
 function log(level: "info" | "error", msg: string, extra: Record<string, unknown> = {}): void {
@@ -90,7 +100,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<{ stop
   const { createDb } = (await import(dbModuleName)) as { createDb: (url: string) => Db };
   const db = createDb(cfg.databaseUrl);
   const policy = new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: cfg.hmacKey }) as unknown as PolicyLike;
-  const engine = new RunEngine({ store: new PrismaRunStore(db), policy, adapterFor: adapterFor({}) });
+  const engine = new RunEngine({ store: new PrismaRunStore(db), policy, adapterFor: probeGated({}) });
   const queue = new RunQueue({ redisUrl: cfg.redisUrl, concurrency: cfg.concurrency, opTimeoutMs: DRAIN_TIMEOUT_MS });
   queue.start(engine);
   log("info", "worker-started", { concurrency: cfg.concurrency });

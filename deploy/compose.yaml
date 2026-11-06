@@ -111,6 +111,9 @@ services:
   worker:
     build: { <<: *build, target: worker }
     restart: unless-stopped
+    # R2: the G1 server checks find this container by label (Coolify renames containers).
+    labels:
+      io.devos.service: worker
     environment:
       <<: *db-env
       REDIS_URL: redis://redis:6379

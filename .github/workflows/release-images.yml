@@ -94,6 +94,25 @@ jobs:
               if grep -qF "$v" layers.txt inspect.txt; then echo "a secret value is baked into image $img"; exit 1; fi
             done
           done
+      - name: R2 AT5 G1 server checks against the live stack (caps-saved, run-resume with a hard kill, receipt-chain)
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: |
+          set -uo pipefail
+          expect() { local want="$1"; shift; "$@"; local rc=$?; echo "-> exit $rc (want $want)"; [[ "$rc" == "$want" ]]; }
+          c=scripts/server/checks
+          expect 3 bash "$c/caps-saved.sh" || exit 1          # caps not confirmed yet (before H9)
+          expect 3 bash "$c/receipt-chain.sh" || exit 1       # no receipt written yet
+          expect 0 bash "$c/run-resume.sh" || exit 1          # probe run killed mid-run and resumed
+          expect 0 bash "$c/receipt-chain.sh" || exit 1       # the probe's receipts verify
+          docker compose exec -T postgres psql -U devos -d devos -v ON_ERROR_STOP=1 -qc \
+            "insert into app_settings (singleton, caps_confirmed_at, updated_at) values (true, now(), now()) on conflict (singleton) do update set caps_confirmed_at = now()"
+          expect 0 bash "$c/caps-saved.sh" || exit 1          # confirmed positive caps
+          docker compose exec -T postgres psql -U devos -d devos -v ON_ERROR_STOP=1 -qc "update app_settings set openai_cap_usd = 0"
+          expect 1 bash "$c/caps-saved.sh" || exit 1          # a zero cap fails
+          # Seeded failure: one changed receipt byte breaks the chain.
+          docker compose exec -T postgres psql -U devos -d devos -v ON_ERROR_STOP=1 -qc \
+            "alter table policy_decision disable trigger user; update policy_decision set bundle_hash = 'tampered' where seq = 1; alter table policy_decision enable trigger user"
+          expect 1 bash "$c/receipt-chain.sh" || exit 1
       - name: Logs on failure (values are per-run throwaways and masked)
         if: failure()
         env: { DEVOS_BIND_IP: 127.0.0.1 }
