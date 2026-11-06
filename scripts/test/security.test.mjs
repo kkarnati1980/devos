@@ -35,10 +35,10 @@ const policy = loadPolicy();
 const listing = (licence, name = "pkg", versions = ["1.0.0"]) => ({ [licence]: [{ name, versions, license: licence }] });
 
 test("AT2 licence evaluation: permissive passes, copyleft and unknown fail, reviewed weak copyleft passes only at its version", () => {
-  for (const l of ["MIT", "Apache-2.0", "MIT and ISC", "(MIT OR GPL-3.0)", "BSD-3-Clause", "CC-BY-4.0"]) {
+  for (const l of ["MIT", "Apache-2.0", "MIT and ISC", "(MIT OR GPL-3.0)", "MIT OR (ISC AND BSD-3-Clause)", "((MIT))", "BSD-3-Clause", "CC-BY-4.0"]) {
     assert.equal(evalLicences(listing(l), policy).ok, true, l);
   }
-  for (const l of ["GPL-3.0", "AGPL-3.0-only", "GPL-2.0-or-later", "MIT AND GPL-2.0", "UNKNOWN", "SEE LICENSE IN LICENSE", "SSPL-1.0", "(MIT) OR (GPL", "MIT OR OR GPL-3.0", "MIT OR", "AND MIT", "MIT AND AND ISC", "()"]) {
+  for (const l of ["GPL-3.0", "AGPL-3.0-only", "GPL-2.0-or-later", "MIT AND GPL-2.0", "UNKNOWN", "SEE LICENSE IN LICENSE", "SSPL-1.0", "(MIT) OR (GPL", "MIT OR OR GPL-3.0", "MIT OR", "AND MIT", "MIT AND AND ISC", "()", "MIT OR (GPL-3.0 OR)", "MIT OR (ISC AND)", "(MIT OR ISC) OR )", "MIT OR GPL-2.0 WITH Classpath-exception-2.0", "MIT ISC"]) {
     assert.equal(evalLicences(listing(l), policy).ok, false, l);
   }
   assert.equal(evalLicences({ x: [{ name: "nolicence", versions: ["1.0.0"] }] }, policy).ok, false);

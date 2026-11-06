@@ -20,41 +20,53 @@ export function classifyId(id, policy) {
 
 const RANK = { permissive: 0, weak: 1, unknown: 2, strong: 3 };
 
-// Classify an SPDX expression. OR takes the best side, AND the worst. Parentheses are flattened per level.
-export function classifyExpression(expr, policy) {
-  const text = String(expr ?? "").trim();
-  if (!text) return "unknown";
-  let balance = 0;
-  for (const ch of text) {
-    if (ch === "(") balance++;
-    if (ch === ")" && --balance < 0) return "unknown";
-  }
-  if (balance !== 0) return "unknown"; // malformed expression fails closed
-  const split = (s, op) => {
-    const parts = [];
-    let depth = 0;
-    let cur = "";
-    const tokens = s.split(/(\s+|\(|\))/).filter((t) => t !== "");
-    for (const t of tokens) {
-      if (t === "(") depth++;
-      if (t === ")") depth--;
-      if (depth === 0 && t.toUpperCase() === op) {
-        parts.push(cur.trim());
-        cur = "";
-      } else cur += t;
+// Parse an SPDX-style expression into a tree, or null when it is malformed (PR19-r2: syntax is checked
+// on the whole expression before any OR/AND semantics, so a malformed operand anywhere fails closed).
+// Grammar: or := and (OR and)* ; and := atom (AND atom)* ; atom := ID | "(" or ")". "and"/"or" match any case.
+export function parseExpression(expr) {
+  const tokens = String(expr ?? "").match(/\(|\)|[^\s()]+/g) ?? [];
+  let i = 0;
+  const peek = () => tokens[i];
+  const isOp = (t, op) => typeof t === "string" && t.toUpperCase() === op;
+  const atom = () => {
+    const t = tokens[i++];
+    if (t === undefined || t === ")" || isOp(t, "AND") || isOp(t, "OR") || isOp(t, "WITH")) return null;
+    if (t === "(") {
+      const inner = or();
+      if (inner === null || tokens[i++] !== ")") return null;
+      return inner;
     }
-    parts.push(cur.trim());
-    return parts; // empty operands are kept so a dangling or doubled operator fails closed (PR19-r1)
+    return { id: t };
   };
-  const ors = split(text, "OR");
-  if (ors.some((p) => !p)) return "unknown";
-  if (ors.length > 1) return ors.map((p) => classifyExpression(p, policy)).sort((a, b) => RANK[a] - RANK[b])[0];
-  const ands = split(text, "AND");
-  if (ands.some((p) => !p)) return "unknown";
-  if (ands.length > 1) return ands.map((p) => classifyExpression(p, policy)).sort((a, b) => RANK[b] - RANK[a])[0];
-  if (text.startsWith("(") && text.endsWith(")")) return classifyExpression(text.slice(1, -1), policy);
-  if (/[\s()]/.test(text)) return "unknown";
-  return classifyId(text, policy);
+  const chain = (next, op) => () => {
+    const first = next();
+    if (first === null) return null;
+    const parts = [first];
+    while (isOp(peek(), op)) {
+      i++;
+      const n = next();
+      if (n === null) return null;
+      parts.push(n);
+    }
+    return parts.length === 1 ? first : { op, parts };
+  };
+  const and = chain(atom, "AND");
+  const or = chain(and, "OR");
+  if (!tokens.length) return null;
+  const tree = or();
+  return tree !== null && i === tokens.length ? tree : null;
+}
+
+// Classify an SPDX expression. A malformed expression is unknown; OR takes the best side, AND the worst.
+export function classifyExpression(expr, policy) {
+  const tree = parseExpression(expr);
+  if (tree === null) return "unknown";
+  const walk = (n) => {
+    if (n.id !== undefined) return classifyId(n.id, policy);
+    const classes = n.parts.map(walk).sort((a, b) => (n.op === "OR" ? RANK[a] - RANK[b] : RANK[b] - RANK[a]));
+    return classes[0];
+  };
+  return walk(tree);
 }
 
 // A review covers one package, version and licence: a different reported licence needs its own assessment (PR19-r1).
