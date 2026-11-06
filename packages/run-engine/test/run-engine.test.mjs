@@ -491,3 +491,31 @@ test("r3-3 if the store is down for cost and checkpoint, the next execute charge
   assert.equal(s.pstore.reservations.length, 1, "no new reservation once max_cost_usd is spent");
   assert.ok(s.store.paused.has("proj-1"));
 });
+
+// ---- Codex PR16-r4 regression ----
+
+test("r4-1 a failure during orphan recovery never loses the orphan's charge", async () => {
+  for (const failAt of ["cost", "checkpoint", "settle"]) {
+    const s = setup({ maxCostUsd: 3 });
+    // Leave an orphan: outcome checkpoint and cost both fail on the first attempt.
+    s.store.failCheckpoint = { when: (d) => Boolean(d.state.ending), times: 1 };
+    s.store.failAddCostTimes = 1;
+    let reconcileFails = 0;
+    const policy = { decide: (r) => s.policy.decide(r), release: (id) => s.policy.release(id), reconcile: async (id, u, t) => { if (reconcileFails > 0) { reconcileFails -= 1; throw new Error("policy-down"); } return s.policy.reconcile(id, u, t); } };
+    const engine = new RunEngine({ store: s.store, policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ turns: 1, cost: 0.2 }) }) });
+    await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }));
+    assert.equal(s.pstore.reservations[0].status, "reserved", failAt);
+    // Recovery fails at one point.
+    if (failAt === "cost") s.store.failAddCostTimes = 1;
+    if (failAt === "checkpoint") s.store.failCheckpoint = { when: (d) => Boolean(d.state.attempt?.costRecorded), times: 1 };
+    if (failAt === "settle") reconcileFails = 1;
+    await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }), failAt);
+    // The next execute finishes recovery.
+    const out = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+    const spent = s.store.costs.reduce((a, c) => a + c.usd, 0);
+    assert.ok(spent >= 3, `${failAt}: the orphan's full charge is recorded (${spent})`);
+    assert.equal(s.pstore.reservations[0].status, "reconciled", failAt);
+    assert.equal(out.errorType, "budget_exceeded", `${failAt}: max_cost_usd is spent, no new reservation`);
+    assert.equal(s.pstore.reservations.length, 1, failAt);
+  }
+});

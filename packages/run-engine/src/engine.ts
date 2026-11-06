@@ -86,6 +86,8 @@ interface OpenAttempt {
   usd: number;
   tokens: number;
   provider: Provider;
+  /** Set once recovery has written the orphan's cost_entry. */
+  costRecorded?: boolean;
 }
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -165,9 +167,15 @@ export class RunEngine {
     // Fail-closed: charge it the whole reservation unless it was already settled.
     const orphan = state.state.attempt as OpenAttempt | undefined;
     if (orphan) {
-      if (await this.settleOrphan(orphan)) {
+      // Record the charge first and checkpoint that it is recorded, then settle: a failure at any
+      // point resumes here without ever skipping the charge (a repeat can only over-count).
+      if (!orphan.costRecorded) {
         await store.addCost({ projectId: run.projectId, runId: run.id, provider: orphan.provider, model: run.model, role: run.role, ...ZERO_USAGE, usd: orphan.usd });
+        orphan.costRecorded = true;
+        state.state.attempt = orphan;
+        await checkpoint();
       }
+      await this.settleOrphan(orphan);
       delete state.state.attempt;
       await emit("status", { state: "recovered", reservationId: orphan.reservationId });
       await checkpoint();
@@ -374,7 +382,7 @@ export class RunEngine {
     }
   }
 
-  /** Charge an orphaned reservation in full. false = it was already settled (nothing to record). */
+  /** Close an orphaned reservation at its full amount. false = it was already closed. */
   private async settleOrphan(o: OpenAttempt): Promise<boolean> {
     try {
       await this.opts.policy.reconcile(o.reservationId, o.usd, o.tokens);
