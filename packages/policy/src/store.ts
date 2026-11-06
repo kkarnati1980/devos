@@ -17,7 +17,10 @@ export interface PolicyTx {
   insertDecision(row: DecisionRow): Promise<void>;
   getGrant(id: string): Promise<ApprovalGrant | null>;
   useGrant(id: string): Promise<void>;
-  /** Reserved (not yet reconciled) + reconciled actuals; released rows count zero. */
+  /**
+   * Open reservations (whatever their age) + reconciled actuals created since `since`; released rows
+   * count zero.
+   */
   usage(filter: UsageFilter): Promise<{ usd: number; tokens: number }>;
   insertReservation(r: Omit<BudgetReservationRow, "id" | "createdAt" | "actualUsd" | "actualTokens" | "status">): Promise<string>;
 }
@@ -163,7 +166,8 @@ export function sumUsage(rows: readonly BudgetReservationRow[], f: UsageFilter):
     if (f.provider && r.provider !== f.provider) continue;
     if (f.projectId && r.projectId !== f.projectId) continue;
     if (f.runId && r.runId !== f.runId) continue;
-    if (f.since && r.createdAt < f.since) continue;
+    // Open reservations always count; only reconciled spend is windowed (PR13-r5).
+    if (f.since && r.status !== "reserved" && r.createdAt < f.since) continue;
     if (r.status === "reserved") {
       usd += r.reservedUsd;
       tokens += r.reservedTokens;

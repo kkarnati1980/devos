@@ -183,3 +183,17 @@ test("AT6 (db, PR13-r3): reconcile waits for the policy lock, so a decision neve
   assert.equal((await ask(base, 0.5)).enforcedOutcome, "allow", "0.2 actual + 0.3 + 0.5 = 1.00");
   assert.equal((await ask(base, 0.000001)).enforcedOutcome, "deny");
 });
+
+test("PR13-r5 (db): an open reservation keeps counting after it ages out of a rolling window", async () => {
+  const projectId = await project();
+  await rule("llm", "allow", ["llm.call"]);
+  const budgets = [{ id: "rolling", provider: "openai", projectId, maxCostUsd: 1, maxTokens: 1e9, periodMs: 1000 }];
+  const chain = `r5-${randomUUID()}`;
+  const ask = (engine) => engine.decide({ chain, identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", projectId, costUsd: 1, tokens: 1 } });
+  const first = await ask(engineFor(budgets));
+  assert.equal(first.enforcedOutcome, "allow");
+  const later = engineFor(budgets, () => Date.now() + 5000); // the first reservation is now outside the window
+  assert.equal((await ask(later)).enforcedOutcome, "deny", "still open: still counted");
+  await later.reconcile(first.reservationId, 1, 1);
+  assert.equal((await ask(later)).enforcedOutcome, "allow", "reconciled spend older than the window drops out");
+});

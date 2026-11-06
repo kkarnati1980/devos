@@ -337,6 +337,17 @@ test("PR13-r4: a host-bearing action is network use for rule constraints too", a
   assert.equal((await engine.decide({ identity: AGENT, action: { type: "fetch" } })).outcome, "allow");
 });
 
+test("PR13-r5: an open reservation keeps counting after it ages out of a rolling window", async () => {
+  const { engine, store } = setup({ now: Date.now, rules: [rule("llm", "allow", { actions: ["llm.call"] })], budgets: [{ id: "rolling", provider: "openai", maxCostUsd: 1, maxTokens: 1e9, periodMs: 1000 }] });
+  const ask = () => engine.decide({ identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", costUsd: 1, tokens: 1 } });
+  const first = await ask();
+  assert.equal(first.enforcedOutcome, "allow");
+  store.reservations[0].createdAt = new Date(Date.now() - 10_000);
+  assert.deepEqual([(await ask()).enforcedOutcome], ["deny"], "still open: still counted");
+  await engine.reconcile(first.reservationId, 1, 1);
+  assert.equal((await ask()).enforcedOutcome, "allow", "reconciled spend older than the window drops out");
+});
+
 test("AT10: THIRD_PARTY_NOTICES.md and the per-file headers are present", () => {
   const repo = new URL("../../../", import.meta.url);
   const notices = new URL("THIRD_PARTY_NOTICES.md", repo);

@@ -174,9 +174,11 @@ async function usageOf(t: any, f: UsageFilter): Promise<{ usd: number; tokens: n
   if (f.provider) where.provider = f.provider as Provider;
   if (f.projectId) where.projectId = f.projectId;
   if (f.runId) where.runId = f.runId;
-  if (f.since) where.createdAt = { gte: f.since };
+  // Open reservations are outstanding commitments: they count however old they are (PR13-r5).
+  // Only reconciled spend is windowed by the rolling period.
   const open = await t.budgetReservation.aggregate({ where: { ...where, status: "reserved" }, _sum: { reservedUsd: true, reservedTokens: true } });
-  const done = await t.budgetReservation.aggregate({ where: { ...where, status: "reconciled" }, _sum: { actualUsd: true, actualTokens: true } });
+  const doneWhere = f.since ? { ...where, status: "reconciled", createdAt: { gte: f.since } } : { ...where, status: "reconciled" };
+  const done = await t.budgetReservation.aggregate({ where: doneWhere, _sum: { actualUsd: true, actualTokens: true } });
   return {
     usd: num(open._sum.reservedUsd) + num(done._sum.actualUsd),
     tokens: num(open._sum.reservedTokens) + num(done._sum.actualTokens),
