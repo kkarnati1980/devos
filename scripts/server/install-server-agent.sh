@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — install the server agent on the DevOS server (DEVOS-74). Contract: docs/modules/server-agent.md
-# Version: 1.0.0
+# Version: 1.1.0
+# v1.1.0 (Codex PR11-r1): --uninstall also stops a running tick; RETRY_DEPLOY=1 clears a failed deploy of the
+# installed SHA so the next tick deploys it again.
 # Run once as root from a checkout of main (interactive: hidden prompts for the Coolify token and app UUID,
 # and a yes/no for KK's first-launch approval of deploy-on-PASS).
 #   bash scripts/server/install-server-agent.sh               install / update (keeps stored secrets)
@@ -8,6 +10,7 @@
 #   bash /root/.devos/bin/install-server-agent.sh --deploy-on  approve deploy-on-PASS (asks to confirm)
 #   bash /root/.devos/bin/install-server-agent.sh --deploy-off turn deploy-on-PASS off
 #   bash /root/.devos/bin/install-server-agent.sh --uninstall  stop and remove the timer and service
+#   RETRY_DEPLOY=1 bash /root/.devos/bin/install-server-agent.sh --deploy-on   retry a failed deploy of the installed SHA
 # Secrets are never printed; they are written to mode-600 files only.
 set -euo pipefail
 DIR=/root/.devos
@@ -22,6 +25,8 @@ fail() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
 case "${1:-}" in
   --uninstall)
     systemctl disable --now "$UNIT.timer" >/dev/null 2>&1 || true
+    systemctl stop "$UNIT.service" >/dev/null 2>&1 || true   # waits for a running tick to end
+    if systemctl is-active --quiet "$UNIT.service"; then fail "$UNIT.service is still running; rerun --uninstall"; fi
     rm -f "/etc/systemd/system/$UNIT.service" "/etc/systemd/system/$UNIT.timer"
     systemctl daemon-reload
     pass "server agent removed (env files, review watcher and $DIR/bin scripts left in place)"; exit 0 ;;
@@ -101,10 +106,20 @@ if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" ]]; then
   if [[ "$A" == yes ]]; then
     install -d -m 700 "$ST"; date -u +%FT%TZ > "$ST/deploy.enabled"
     # Let the current main SHA be deployed on the next tick if it was handled while deploy was off.
-    if [[ -s "$ST/installed.sha" ]]; then s="$(cat "$ST/installed.sha")"; rm -f "$ST/done.$s" "$ST/$s.checks.state" "$ST/$s.checks.md" "$ST/check-statused.$s" "$ST/check-commented.$s"; fi
+    if [[ -s "$ST/installed.sha" ]]; then s="$(cat "$ST/installed.sha")"; [[ -e "$ST/deployed.$s" ]] || rm -f "$ST/done.$s" "$ST/$s.checks.state" "$ST/$s.checks.md" "$ST/check-statused.$s" "$ST/check-commented.$s"; fi
     pass "deploy-on-PASS is ON (approved $(cat "$ST/deploy.enabled"))"
   else
     echo "  deploy-on-PASS stays OFF. Turn it on later: bash $DIR/bin/install-server-agent.sh --deploy-on"
   fi
+fi
+clear_sha() {  # sha -> forget its deploy, checks and done state (the install stays)
+  local s="$1"
+  rm -f "$ST/done.$s" "$ST/deployed.$s" "$ST/deploy-statused.$s" "$ST/deploy-started.$s" "$ST/deploy-uuid.$s" \
+        "$ST/$s.checks.state" "$ST/$s.checks.md" "$ST/check-statused.$s" "$ST/check-commented.$s"
+}
+if [[ "${RETRY_DEPLOY:-0}" == 1 && -s "$ST/installed.sha" ]]; then
+  s="$(cat "$ST/installed.sha")"
+  if [[ "$(cut -d' ' -f1 "$ST/deployed.$s" 2>/dev/null)" == success ]]; then echo "  ${s:0:7} is already deployed; nothing to retry"
+  else clear_sha "$s"; pass "cleared the failed deploy of ${s:0:7}; the next tick deploys it again"; fi
 fi
 echo "Uninstall: bash $DIR/bin/install-server-agent.sh --uninstall"

@@ -67,23 +67,28 @@ function handler(req, res) {
     const json = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
     let m;
     if (p === "/gh/repos/kkarnati1980/devos/commits/main") return json(200, { sha: M.main });
-    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/actions\/runs$/))) return json(200, { workflow_runs: M.runs[u.searchParams.get("head_sha")] || [] });
-    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/commits\/([0-9a-f]{40})\/statuses$/))) return json(200, M.statuses[m[1]] || []);
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/actions\/runs$/))) {
+      const all = M.runs[u.searchParams.get("head_sha")] || [];
+      const pg = Number(u.searchParams.get("page") || 1), per = Number(u.searchParams.get("per_page") || 30);
+      return json(200, { workflow_runs: all.slice((pg - 1) * per, pg * per) });
+    }
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/commits\/([0-9a-f]{40})\/status$/))) return json(200, { statuses: [...(M.statuses[m[1]] || [])].reverse() });
     if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/commits\/([0-9a-f]{40})\/pulls$/))) return json(200, M.pulls[m[1]] || []);
-    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/git\/commits\/([0-9a-f]{40})$/))) return json(200, { tree: { sha: M.trees[m[1]] } });
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/git\/commits\/([0-9a-f]{40})$/))) return M.failTree ? json(500, {}) : json(200, { tree: { sha: M.trees[m[1]] } });
     if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/))) {
       if (M.failStatus > 0) { M.failStatus--; return json(502, {}); }
       return json(201, {});
     }
     if (p.match(/^\/gh\/repos\/kkarnati1980\/devos\/(issues\/\d+|commits\/[0-9a-f]{40})\/comments$/)) return json(201, {});
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "PATCH") { M.deployPatch.push(JSON.parse(body)); return json(200, {}); }
+    if (p === "/cf/deploy") M.deployPosts = (M.deployPosts || 0) + 1;
     if (p === "/cf/deploy") return json(200, { deployments: [{ deployment_uuid: "dep-1234abcd" }] });
     if (p === "/cf/deployments/dep-1234abcd") return json(200, { status: M.deployStatus });
     json(404, { p });
   });
 }
 
-function runAgent(extra = {}) {
+function runAgent(extra = {}, args = []) {
   return new Promise((resolve) => {
     const env = {
       ...process.env,
@@ -91,7 +96,7 @@ function runAgent(extra = {}) {
       DEVOS_DIR: path.join(tmp, ".devos"), AGENT_WORK: path.join(tmp, "work"), AGENT_REPO_URL: bare,
       GIT_SSH_COMMAND: "ssh", POLL_SEC: "0", ...extra,
     };
-    const ch = spawn("bash", [AGENT], { env });
+    const ch = spawn("bash", [AGENT, ...args], { env });
     let out = "";
     ch.stdout.on("data", (d) => (out += d));
     ch.stderr.on("data", (d) => (out += d));
@@ -129,6 +134,7 @@ test("AT1/AT9: passing SHA installs the allow-list only; a second tick makes no 
   for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
   assert.ok(!fs.existsSync(path.join(D(), "bin/install-server-agent.sh")), "installer is not on the allow-list");
   assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), sha);
+  assert.ok(fs.existsSync(path.join(D(), `agent/done.${sha}`)), "SHA reaches done");
   assert.equal(M.deployPatch.length, 0, "deploy disabled: Coolify never called (AT4)");
   assert.ok(!reqs.some((q) => q.path.startsWith("/cf/")), "no Coolify request at all");
   const sc = statusPosts("server-check");
@@ -213,4 +219,64 @@ test("AT8: a file failing bash -n blocks the whole install", async () => {
   assert.ok(!fs.existsSync(path.join(D(), "bin/checks/broken.sh")));
   assert.match(statusPosts("devos-deploy")[0].description, /install failed/);
   commit({ "scripts/server/checks/broken.sh": null }, "fix");
+});
+
+test("AT2: an unreadable tree is a wait, never an accept or a refusal", async () => {
+  resetMock(); freshState();
+  const head = commit({ "t.txt": "h" }, "head");
+  const merge = commit({}, "merge");
+  M.main = merge; green(merge); pass(head); M.failTree = true;
+  M.pulls[merge] = [{ number: 50, merge_commit_sha: merge, merged_at: "t", head: { sha: head } }];
+  await runAgent();
+  assert.ok(!fs.existsSync(path.join(D(), "agent/installed.sha")), "not installed");
+  assert.equal(writes().length, 0, "no refusal posted");
+  M.failTree = false; await runAgent();
+  assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), merge);
+});
+
+test("AT3: CI is judged across all pages of workflow runs", async () => {
+  resetMock(); freshState();
+  const sha = commit({ "p.txt": "pages" }, "many runs");
+  M.main = sha; pass(sha);
+  M.runs[sha] = Array.from({ length: 150 }, (_, i) => ({ workflow_id: 100 + i, created_at: "t", status: "completed", conclusion: "success" }));
+  M.runs[sha][140].conclusion = "failure"; // on page 2
+  await runAgent();
+  assert.match(statusPosts("devos-deploy")[0].description, /CI is not green/);
+});
+
+test("AT6: a failed post is drained after main moves on; --dry-run never posts", async () => {
+  resetMock(); freshState();
+  const a = commit({ "d.txt": "a" }, "no pass a");
+  M.main = a; green(a); M.failStatus = 1;
+  await runAgent();
+  assert.ok(!fs.existsSync(path.join(D(), `agent/refuse-statused.${a}`)), "first post failed");
+  reqs.length = 0;
+  const r = await runAgent({}, ["--dry-run"]);
+  assert.equal(writes().length, 0, r.out);
+  const b = commit({ "d.txt": "b" }, "no pass b");
+  M.main = b; green(b);
+  reqs.length = 0; await runAgent();
+  const shas = writes().filter((q) => q.path.includes("/statuses/")).map((q) => q.path.split("/").pop());
+  assert.ok(shas.includes(a), "old SHA's refusal drained"); assert.ok(shas.includes(b));
+  assert.ok(fs.existsSync(path.join(D(), `agent/done.${a}`)));
+});
+
+test("AT4: a deploy is never submitted twice: resumed after a time-out, not resubmitted after an interruption", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ "r.txt": "resume" }, "resume");
+  M.main = sha; green(sha); pass(sha); M.deployStatus = "in_progress";
+  await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.equal(M.deployPosts, 1); assert.equal(statusPosts("devos-deploy").length, 0);
+  M.deployStatus = "finished";
+  await runAgent();
+  assert.equal(M.deployPosts, 1, "resumed, not resubmitted");
+  assert.equal(statusPosts("devos-deploy").at(-1).state, "success");
+
+  const s2 = commit({ "r.txt": "interrupted" }, "interrupted");
+  M.main = s2; green(s2); pass(s2);
+  fs.writeFileSync(path.join(D(), `agent/installed.${s2}`), "");
+  fs.writeFileSync(path.join(D(), `agent/deploy-started.${s2}`), "");
+  reqs.length = 0; await runAgent();
+  assert.equal(M.deployPosts, 1, "no second submit");
+  assert.equal(statusPosts("devos-deploy")[0].state, "failure");
 });
