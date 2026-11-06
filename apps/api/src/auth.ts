@@ -58,8 +58,11 @@ export class KkSessionRegistry {
 /** Origin (or, without it, Referer) must be an allowed origin; cross-site fetch metadata is refused. */
 export function sameOriginProblem(req: DevosRequest, allowed: readonly string[]): string | null {
   const site = req.headers["sec-fetch-site"];
-  if (typeof site === "string" && site !== "same-origin" && site !== "none") return "csrf-cross-site";
   const origin = req.headers.origin;
+  // M1.4: the dashboard and the API are the same site on different ports, so the browser sends
+  // `same-site`. That is accepted only together with an exact allowed Origin; `cross-site` never is.
+  const sameSiteAllowed = site === "same-site" && typeof origin === "string" && allowed.includes(origin);
+  if (typeof site === "string" && site !== "same-origin" && site !== "none" && !sameSiteAllowed) return "csrf-cross-site";
   if (typeof origin === "string") return allowed.includes(origin) ? null : "csrf-origin-refused";
   const referer = req.headers.referer;
   if (typeof referer === "string") {

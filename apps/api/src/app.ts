@@ -4,6 +4,7 @@ import { APP_GUARD, NestFactory } from "@nestjs/core";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { AccessGuard, CONFIG, GRANTS, IDENTITY, KK_SESSIONS, KkSessionRegistry, READINESS, SESSIONS, SETUP } from "./auth.js";
 import type { ApiConfig } from "./config.js";
+import { cors } from "./cors.js";
 import { requestContext, securityHeaders, stdoutSink, type LogSink } from "./http.js";
 import type { IdentityResolver } from "./identity.js";
 import {
@@ -74,6 +75,7 @@ export async function createApp(deps: AppDeps): Promise<NestExpressApplication> 
   app.set("trust proxy", false);
   app.use(requestContext(log));
   app.use(securityHeaders(deps.config.secureCookies));
+  app.use(cors(deps.config.allowedOrigins));
   app.useBodyParser("json", { limit: "64kb", strict: true, type: "application/json" });
   // M1.4: a body-parser failure answers a fixed code. The default handler can echo the parser's
   // message, which quotes the body, and a body may carry a secret.

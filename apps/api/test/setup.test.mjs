@@ -407,3 +407,41 @@ test("M1.4 AT10: settings routes answer 503 when no database is configured", asy
     await s.app.close();
   }
 });
+
+test("M1.4 AT11: CORS only for the exact allowed origin, with credentials; same-site needs that origin too", async () => {
+  const s = await start();
+  try {
+    const pre = await call(s.port, "OPTIONS", "/vault/secrets/github_token", {
+      headers: { origin: ORIGIN, "access-control-request-method": "PUT", "access-control-request-headers": "content-type, x-devos-csrf" },
+    });
+    assert.equal(pre.status, 204);
+    assert.equal(pre.headers["access-control-allow-origin"], ORIGIN);
+    assert.equal(pre.headers["access-control-allow-credentials"], "true");
+    assert.match(pre.headers["access-control-allow-methods"], /PUT/);
+    assert.match(pre.headers["access-control-allow-headers"], /x-devos-csrf/);
+    assert.match(pre.headers.vary, /Origin/);
+    assert.equal(pre.headers["x-content-type-options"], "nosniff");
+
+    const foreign = await call(s.port, "OPTIONS", "/vault/secrets/github_token", {
+      headers: { origin: "https://evil.example", "access-control-request-method": "PUT" },
+    });
+    assert.notEqual(foreign.status, 204);
+    assert.equal(foreign.headers["access-control-allow-origin"], undefined);
+
+    const kk = await session(s.port);
+    const value = secretFor("github_token");
+    const sameSite = await kk.put("/vault/secrets/github_token", { value }, { "sec-fetch-site": "same-site" });
+    assert.equal(sameSite.status, 200, sameSite.text);
+    assert.equal(sameSite.headers["access-control-allow-origin"], ORIGIN);
+    const sameSiteForeign = await kk.put("/vault/secrets/github_token", { value: secretFor("github_token", 2) }, {
+      "sec-fetch-site": "same-site",
+      origin: "http://devos:9999",
+    });
+    assert.equal(sameSiteForeign.status, 403);
+    assert.equal(sameSiteForeign.json.code, "csrf-cross-site");
+    assert.equal(sameSiteForeign.headers["access-control-allow-origin"], undefined);
+    assert.equal(await s.vault.reveal("github_token"), value);
+  } finally {
+    await s.app.close();
+  }
+});
