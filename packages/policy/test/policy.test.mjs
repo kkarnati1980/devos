@@ -295,6 +295,48 @@ test("rules (PR13-r3): only the highest enabled version of a rule is in force, i
   assert.deepEqual([x.outcome, x.matchedRuleIds], ["deny", ["r4"]], "a disabled newer version does not revive or hide the older one");
 });
 
+test("PR13-r4: memory-store reconcile/release/revoke wait for an in-flight decision and survive its rollback", async () => {
+  const { engine, store } = setup({ rules: [rule("llm", "allow", { actions: ["llm.call"] })], budgets: [{ id: "cap", provider: "openai", maxCostUsd: 1, maxTokens: 1e9 }] });
+  const ask = (e, costUsd) => e.decide({ identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", costUsd, tokens: 1 } });
+  const first = await ask(engine, 0.2);
+  const realDecide = store.decide.bind(store);
+  let release;
+  const paused = new Promise((r) => { release = r; });
+  let reached;
+  const inUsage = new Promise((r) => { reached = r; });
+  store.decide = (fn) => realDecide((tx) => fn({ ...tx, usage: async (f) => { const u = await tx.usage(f); reached(); await paused; return u; } }));
+  const pending = ask(engine, 0.5);
+  await inUsage;
+  let done = false;
+  const rec = engine.reconcile(first.reservationId, 0.9, 1).then(() => { done = true; });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(done, false, "reconcile waits for the decision");
+  release();
+  assert.equal((await pending).enforcedOutcome, "allow", "0.2 + 0.5 <= 1 when decided");
+  await rec;
+  store.decide = realDecide;
+  assert.equal((await ask(engine, 0.000001)).enforcedOutcome, "deny", "0.9 + 0.5 is at the cap: nothing more fits");
+
+  // A failed decision's rollback cannot undo a revocation made while it waited.
+  const grant = await engine.issueGrant(KK, { scopeAction: "x", expiresAt: new Date(T0 + HOUR) });
+  let go;
+  const gate = new Promise((r) => { go = r; });
+  store.decide = (fn) => realDecide(async (tx) => { await gate; throw new Error("boom"); });
+  const failing = engine.decide({ identity: AGENT, action: { type: "x" } }).catch((e) => e);
+  const revoked = engine.revokeGrant(KK, grant.id);
+  go();
+  assert.match(String(await failing), /boom/);
+  assert.equal(await revoked, true);
+  assert.ok(store.grants.find((g) => g.id === grant.id).revokedAt, "revocation kept");
+});
+
+test("PR13-r4: a host-bearing action is network use for rule constraints too", async () => {
+  const { engine } = setup({ rules: [rule("offline-only", "allow", { actions: ["fetch"], constraints: { network: false } })] });
+  assert.equal((await engine.decide({ identity: AGENT, action: { type: "fetch", host: "example.com" } })).outcome, "deny");
+  assert.equal((await engine.decide({ identity: AGENT, action: { type: "fetch", network: true } })).outcome, "deny");
+  assert.equal((await engine.decide({ identity: AGENT, action: { type: "fetch" } })).outcome, "allow");
+});
+
 test("AT10: THIRD_PARTY_NOTICES.md and the per-file headers are present", () => {
   const repo = new URL("../../../", import.meta.url);
   const notices = new URL("THIRD_PARTY_NOTICES.md", repo);

@@ -110,33 +110,45 @@ export class MemoryPolicyStore implements PolicyStore {
     return { mode: this.mode, rules: structuredClone(this.rules) };
   }
 
-  async insertGrant(g: Omit<ApprovalGrant, "id" | "uses" | "revokedAt" | "issuedAt"> & { issuedAt?: Date }) {
-    const issuedAt = g.issuedAt ?? new Date();
-    if (!g.issuedBy.startsWith("kk:")) throw new Error("approval_grant_issuer_is_kk");
-    if (!(g.expiresAt > issuedAt)) throw new Error("approval_grant_expiry");
-    if (!(g.maxUses >= 1)) throw new Error("approval_grant_uses");
-    const grant: ApprovalGrant = { ...g, id: randomUUID(), issuedAt, uses: 0, revokedAt: null };
-    this.grants.push(grant);
-    return { ...grant };
+  insertGrant(g: Omit<ApprovalGrant, "id" | "uses" | "revokedAt" | "issuedAt"> & { issuedAt?: Date }) {
+    // Serialised with decide() (PR13-r4): no mutation can interleave with a decision or be undone by its rollback.
+    return this.lock.run(async () => {
+      const issuedAt = g.issuedAt ?? new Date();
+      if (!g.issuedBy.startsWith("kk:")) throw new Error("approval_grant_issuer_is_kk");
+      if (!(g.expiresAt > issuedAt)) throw new Error("approval_grant_expiry");
+      if (!(g.maxUses >= 1)) throw new Error("approval_grant_uses");
+      const grant: ApprovalGrant = { ...g, id: randomUUID(), issuedAt, uses: 0, revokedAt: null };
+      this.grants.push(grant);
+      return { ...grant };
+    });
   }
 
-  async revokeGrant(id: string, at: Date) {
-    const g = this.grants.find((x) => x.id === id);
-    if (!g || g.revokedAt) return false;
-    g.revokedAt = at;
-    return true;
+  revokeGrant(id: string, at: Date) {
+    // Serialised with decide() (PR13-r4): no mutation can interleave with a decision or be undone by its rollback.
+    return this.lock.run(async () => {
+      const g = this.grants.find((x) => x.id === id);
+      if (!g || g.revokedAt) return false;
+      g.revokedAt = at;
+      return true;
+    });
   }
 
-  async reconcile(id: string, actualUsd: number, actualTokens: number) {
-    const r = this.reservations.find((x) => x.id === id);
-    if (!r || r.status !== "reserved") throw new Error("reservation-not-open");
-    Object.assign(r, { actualUsd, actualTokens, status: "reconciled" });
+  reconcile(id: string, actualUsd: number, actualTokens: number) {
+    // Serialised with decide() (PR13-r4): no mutation can interleave with a decision or be undone by its rollback.
+    return this.lock.run(async () => {
+      const r = this.reservations.find((x) => x.id === id);
+      if (!r || r.status !== "reserved") throw new Error("reservation-not-open");
+      Object.assign(r, { actualUsd, actualTokens, status: "reconciled" });
+    });
   }
 
-  async release(id: string) {
-    const r = this.reservations.find((x) => x.id === id);
-    if (!r || r.status !== "reserved") throw new Error("reservation-not-open");
-    r.status = "released";
+  release(id: string) {
+    // Serialised with decide() (PR13-r4): no mutation can interleave with a decision or be undone by its rollback.
+    return this.lock.run(async () => {
+      const r = this.reservations.find((x) => x.id === id);
+      if (!r || r.status !== "reserved") throw new Error("reservation-not-open");
+      r.status = "released";
+    });
   }
 
   async readChain(chain: string) {

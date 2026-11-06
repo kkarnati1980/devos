@@ -17,7 +17,8 @@ function constraintsPass(request: PolicyRequest, rule: PolicyRule): boolean {
   const { action } = request;
   if (c.maxCostUsd !== undefined && (action.costUsd === undefined || action.costUsd > c.maxCostUsd)) return false;
   if (c.maxTokens !== undefined && (action.tokens === undefined || action.tokens > c.maxTokens)) return false;
-  if (c.network === false && action.network === true) return false;
+  // A host means network use, exactly as checkEnvelope treats it (PR13-r4).
+  if (c.network === false && (action.network === true || action.host !== undefined)) return false;
   if (c.requiredProvenance?.length) {
     const have = new Set((request.evidence ?? []).map((e) => e.provenance));
     if (!c.requiredProvenance.every((p) => have.has(p))) return false;
