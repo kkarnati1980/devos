@@ -36,6 +36,20 @@ export function ruleMatches(rule: PolicyRule, request: PolicyRequest): boolean {
     && constraintsPass(request, rule);
 }
 
+/**
+ * The rules in force: enabled ones, highest version per name (contract behaviour 3). Applied here so
+ * every store gives the same decisions (PR13-r3).
+ */
+export function currentRules(rules: readonly PolicyRule[]): PolicyRule[] {
+  const latest = new Map<string, PolicyRule>();
+  for (const r of rules) {
+    if (!r.enabled) continue;
+    const seen = latest.get(r.name);
+    if (!seen || r.version > seen.version) latest.set(r.name, r);
+  }
+  return [...latest.values()];
+}
+
 export interface RuleEvaluation {
   outcome: PolicyEffect;
   enforcedOutcome: PolicyEffect;
@@ -61,7 +75,7 @@ export function evaluateRules(
       return { outcome: "deny", enforcedOutcome: "deny", reason: env.reason ?? "envelope-denied", matchedRuleIds: [], gate: true };
     }
   }
-  const matched = rules
+  const matched = currentRules(rules)
     .filter((r) => ruleMatches(r, request))
     .sort((a, b) => b.priority - a.priority || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const deny = matched.find((r) => r.effect === "deny");

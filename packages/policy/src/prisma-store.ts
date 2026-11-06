@@ -68,10 +68,20 @@ function toRow(d: any): DecisionRow {
 export class PrismaPolicyStore implements PolicyStore {
   constructor(private readonly db: PrismaLike, private readonly timeoutMs = 10_000) {}
 
-  decide<T>(fn: (tx: PolicyTx) => Promise<T>): Promise<T> {
+  /** Run `fn` in a transaction holding the global policy lock (decisions, reconcile, release, revoke). */
+  private locked<T>(fn: (t: any) => Promise<T>): Promise<T> {
     return this.db.$transaction(
       async (t: any) => {
         await t.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${LOCK_KEY}))) AS l`;
+        return fn(t);
+      },
+      { timeout: this.timeoutMs, maxWait: this.timeoutMs },
+    );
+  }
+
+  decide<T>(fn: (tx: PolicyTx) => Promise<T>): Promise<T> {
+    return this.locked(
+      async (t: any) => {
         const tx: PolicyTx = {
           head: async (chain) => {
             const last = await t.policyDecision.findFirst({ where: { chain }, orderBy: { seq: "desc" }, select: { seq: true, hash: true } });
@@ -104,7 +114,6 @@ export class PrismaPolicyStore implements PolicyStore {
         };
         return fn(tx);
       },
-      { timeout: this.timeoutMs, maxWait: this.timeoutMs },
     );
   }
 
@@ -136,20 +145,21 @@ export class PrismaPolicyStore implements PolicyStore {
   }
 
   async revokeGrant(id: string, at: Date): Promise<boolean> {
-    const res = await this.db.approvalGrant.updateMany({ where: { id, revokedAt: null }, data: { revokedAt: at } });
+    const res: { count: number } = await this.locked((t) => t.approvalGrant.updateMany({ where: { id, revokedAt: null }, data: { revokedAt: at } }));
     return res.count === 1;
   }
 
   async reconcile(id: string, actualUsd: number, actualTokens: number): Promise<void> {
-    const res = await this.db.budgetReservation.updateMany({
+    // Under the policy lock, so a decision never sees a row move between its usage reads (PR13-r3).
+    const res: { count: number } = await this.locked((t) => t.budgetReservation.updateMany({
       where: { id, status: "reserved" },
       data: { status: "reconciled", actualUsd: usd6(actualUsd), actualTokens },
-    });
+    }));
     if (res.count !== 1) throw new Error("reservation-not-open");
   }
 
   async release(id: string): Promise<void> {
-    const res = await this.db.budgetReservation.updateMany({ where: { id, status: "reserved" }, data: { status: "released" } });
+    const res: { count: number } = await this.locked((t) => t.budgetReservation.updateMany({ where: { id, status: "reserved" }, data: { status: "released" } }));
     if (res.count !== 1) throw new Error("reservation-not-open");
   }
 

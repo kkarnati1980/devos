@@ -282,6 +282,19 @@ test("AT6 (PR13-r2): micro-dollar conversion is exact at the boundaries", async 
   assert.equal(store.reservations.length, 0);
 });
 
+test("rules (PR13-r3): only the highest enabled version of a rule is in force, in every store", async () => {
+  const { engine } = setup({ rules: [
+    rule("r1", "deny", { name: "push-policy", version: 1, actions: ["git.push"] }),
+    rule("r2", "allow", { name: "push-policy", version: 2, actions: ["git.push"] }),
+    rule("r3", "allow", { name: "off", version: 3, actions: ["x"], enabled: false }),
+    rule("r4", "deny", { name: "off", version: 1, actions: ["x"] }),
+  ] });
+  const d = await engine.decide({ identity: AGENT, action: { type: "git.push" } });
+  assert.deepEqual([d.outcome, d.matchedRuleIds], ["allow", ["r2"]]);
+  const x = await engine.decide({ identity: AGENT, action: { type: "x" } });
+  assert.deepEqual([x.outcome, x.matchedRuleIds], ["deny", ["r4"]], "a disabled newer version does not revive or hide the older one");
+});
+
 test("AT10: THIRD_PARTY_NOTICES.md and the per-file headers are present", () => {
   const repo = new URL("../../../", import.meta.url);
   const notices = new URL("THIRD_PARTY_NOTICES.md", repo);

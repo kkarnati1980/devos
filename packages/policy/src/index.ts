@@ -2,7 +2,7 @@
 export * from "./types.js";
 export { canonicalize, canonicalCopy, sha256Hex, hmacHex, hmacValid } from "./canonical.js";
 export { checkEnvelope, envelopeWidening, delegateEnvelope, isCanonicalPath, pathWithin, MAX_ENVELOPE_DEPTH } from "./envelope.js";
-export { evaluateRules, ruleMatches, wildcard } from "./evaluator.js";
+export { evaluateRules, ruleMatches, wildcard, currentRules } from "./evaluator.js";
 export { sealRow, verifyLedger, receiptBody } from "./receipts.js";
 export { MemoryPolicyStore, sumUsage } from "./store.js";
 export type { PolicyStore, PolicyTx, UsageFilter } from "./store.js";

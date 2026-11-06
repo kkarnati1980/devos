@@ -150,3 +150,36 @@ test("AT4 (db, PR13-r1): self-approval, expiry, scope and issuer checks against 
   const unused = await db.approvalGrant.findUnique({ where: { id: expiring.id } });
   assert.equal(unused.uses, 0, "a rejected grant is not consumed");
 });
+
+test("AT6 (db, PR13-r3): reconcile waits for the policy lock, so a decision never double-counts a row", async () => {
+  const projectId = await project();
+  await rule("llm", "allow", ["llm.call"]);
+  const budgets = [{ id: "cap", provider: "openai", projectId, maxCostUsd: 1, maxTokens: 1e9 }];
+  const base = engineFor(budgets);
+  const chain = `r3-${randomUUID()}`;
+  const ask = (engine, costUsd) => engine.decide({ chain, identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", projectId, costUsd, tokens: 1 } });
+  const first = await ask(base, 0.6);
+  assert.equal(first.enforcedOutcome, "allow");
+
+  // A decision that pauses inside its usage read while holding the lock.
+  const store = new PrismaPolicyStore(db);
+  const realDecide = store.decide.bind(store);
+  let release;
+  const paused = new Promise((r) => { release = r; });
+  let inUsage;
+  const reached = new Promise((r) => { inUsage = r; });
+  store.decide = (fn) => realDecide((tx) => fn({ ...tx, usage: async (f) => { const u = await tx.usage(f); inUsage(); await paused; return u; } }));
+  const slow = new PolicyEngine({ store, hmacKey: KEY, budgets });
+  const pending = ask(slow, 0.3);
+  await reached;
+  let reconciled = false;
+  const rec = base.reconcile(first.reservationId, 0.2, 1).then(() => { reconciled = true; });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(reconciled, false, "reconcile is blocked while a decision holds the lock");
+  release();
+  const d = await pending;
+  await rec;
+  assert.equal(d.enforcedOutcome, "allow", "0.6 reserved + 0.3 fits a 1.00 ceiling");
+  assert.equal((await ask(base, 0.5)).enforcedOutcome, "allow", "0.2 actual + 0.3 + 0.5 = 1.00");
+  assert.equal((await ask(base, 0.000001)).enforcedOutcome, "deny");
+});
