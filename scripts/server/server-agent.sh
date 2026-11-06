@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.1.0
+# Version: 1.1.1
 # v1.1.0 (Codex PR11-r1): GitHub read errors (trees, statuses, PRs) mean "wait", never "ok"; every install step
 # propagates failure; a deploy is never submitted twice (start + deployment-id markers, wall-clock budget, resume);
 # a drain publishes results of earlier SHAs; markers are <name>.<sha> throughout; --dry-run never posts;
 # workflow runs are read across all pages.
+# v1.1.1 (Codex PR11-r2): an earlier SHA's in-flight deployment is finished (and its status posted) before a
+# newer deploy starts; --dry-run creates no directories or lock file.
 # Contract: docs/modules/server-agent.md. Runs as root from devos-server-agent.timer (install-server-agent.sh).
 # D1: nothing is installed or deployed for a main SHA unless its CI is green AND Codex passed that exact SHA
 # (its own codex-review status, or the merged PR head's PASS with an identical tree).
@@ -32,9 +34,14 @@ DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 die() { log "ERROR $*"; exit 1; }
-install -d -m 700 "$ST" "$BIN" "$BIN/checks"
-exec 8>"$ST/agent.lock"
-flock -n 8 || { log "previous tick still running; skipping"; exit 0; }
+if [[ $DRY -eq 0 ]]; then
+  install -d -m 700 "$ST" "$BIN" "$BIN/checks"
+  exec 8>>"$ST/agent.lock"   # append mode: never truncates; the installer takes the same lock
+  flock -n 8 || { log "previous tick still running; skipping"; exit 0; }
+elif [[ -e "$ST/agent.lock" ]]; then
+  exec 8<"$ST/agent.lock"    # --dry-run: read-only, creates nothing
+  flock -n 8 || { log "previous tick still running; skipping"; exit 0; }
+fi
 
 TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
 [[ -s "$GH_ENV" ]] || die "missing $GH_ENV (install the review watcher first)"
@@ -248,7 +255,7 @@ publish() {
   if [[ -s "$ST/deployed.$sha" ]]; then
     read -r st desc < "$ST/deployed.$sha"
     once_status deploy-statused "$sha" devos-deploy "$st" "$desc" || true
-    if [[ "$st" != success ]]; then [[ -e "$ST/deploy-statused.$sha" ]] && touch "$ST/done.$sha"; return 0; fi
+    if [[ "$st" != success || -e "$ST/superseded.$sha" ]]; then [[ -e "$ST/deploy-statused.$sha" ]] && touch "$ST/done.$sha"; return 0; fi
   fi
   [[ -s "$ST/$sha.checks.state" ]] || return 0
   read -r st desc < "$ST/$sha.checks.state"
@@ -273,7 +280,23 @@ sha="$(gh GET "/repos/$REPO/commits/main" | jq -r '.sha')" || die "cannot read m
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "bad main sha"
 deploy_on=0; [[ -e "$ST/deploy.enabled" ]] && deploy_on=1
 
-# Drain: earlier SHAs with stored results whose publication is incomplete (main has moved on since).
+# Drain 1: an earlier SHA's deployment that is still in flight (or was interrupted mid-submit) is finished
+# first; only its devos-deploy status is posted (server checks run for the current main SHA only). A newer
+# deploy is never submitted while an older one is running.
+for f in "$ST"/deploy-started.*; do
+  [[ -e "$f" ]] || continue
+  s="${f##*/deploy-started.}"
+  [[ "$s" =~ ^[0-9a-f]{40}$ && "$s" != "$sha" && ! -s "$ST/deployed.$s" ]] || continue
+  if [[ $DRY -eq 1 ]]; then log "${s:0:7}: WOULD resume the earlier deployment"; exit 0; fi
+  set +e; deploy "$s"; rc=$?; set -e
+  case "$rc" in
+    0) echo "success deployed $s (superseded by ${sha:0:7}; checks run on main only)" > "$ST/deployed.$s"; echo "$s" > "$ST/deployed.sha" ;;
+    2) log "${s:0:7}: earlier deployment still running; main ${sha:0:7} waits"; exit 0 ;;
+    *) echo "failure deploy failed (not retried for this SHA)" > "$ST/deployed.$s" ;;
+  esac
+  touch "$ST/superseded.$s"
+done
+# Drain 2: earlier SHAs with stored results whose publication is incomplete (main has moved on since).
 for f in "$ST"/refused.* "$ST"/deployed.* "$ST"/*.checks.state; do
   [[ -e "$f" ]] || continue
   s="$(basename "$f")"; s="${s#refused.}"; s="${s#deployed.}"; s="${s%.checks.state}"

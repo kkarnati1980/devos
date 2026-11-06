@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — install the server agent on the DevOS server (DEVOS-74). Contract: docs/modules/server-agent.md
-# Version: 1.1.0
+# Version: 1.1.1
+# v1.1.1 (Codex PR11-r2): RETRY_DEPLOY=1 clears only a recorded failure, under the agent's lock.
 # v1.1.0 (Codex PR11-r1): --uninstall also stops a running tick; RETRY_DEPLOY=1 clears a failed deploy of the
 # installed SHA so the next tick deploys it again.
 # Run once as root from a checkout of main (interactive: hidden prompts for the Coolify token and app UUID,
@@ -114,12 +115,17 @@ if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" ]]; then
 fi
 clear_sha() {  # sha -> forget its deploy, checks and done state (the install stays)
   local s="$1"
-  rm -f "$ST/done.$s" "$ST/deployed.$s" "$ST/deploy-statused.$s" "$ST/deploy-started.$s" "$ST/deploy-uuid.$s" \
+  rm -f "$ST/done.$s" "$ST/deployed.$s" "$ST/deploy-statused.$s" "$ST/deploy-started.$s" "$ST/deploy-uuid.$s" "$ST/superseded.$s" \
         "$ST/$s.checks.state" "$ST/$s.checks.md" "$ST/check-statused.$s" "$ST/check-commented.$s"
 }
 if [[ "${RETRY_DEPLOY:-0}" == 1 && -s "$ST/installed.sha" ]]; then
   s="$(cat "$ST/installed.sha")"
-  if [[ "$(cut -d' ' -f1 "$ST/deployed.$s" 2>/dev/null)" == success ]]; then echo "  ${s:0:7} is already deployed; nothing to retry"
-  else clear_sha "$s"; pass "cleared the failed deploy of ${s:0:7}; the next tick deploys it again"; fi
+  exec 7>>"$ST/agent.lock"
+  flock -w 120 7 || fail "the agent is busy (a tick holds the lock); try again in a few minutes"
+  # Only a recorded failure is retried; a running deployment (id stored, no result yet) is left alone.
+  if [[ "$(cut -d' ' -f1 "$ST/deployed.$s" 2>/dev/null)" == failure ]]; then
+    clear_sha "$s"; pass "cleared the failed deploy of ${s:0:7}; the next tick deploys it again"
+  else echo "  ${s:0:7} has no recorded deploy failure (deployed, running or not started); nothing to retry"; fi
+  flock -u 7
 fi
 echo "Uninstall: bash $DIR/bin/install-server-agent.sh --uninstall"

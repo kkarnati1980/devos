@@ -280,3 +280,33 @@ test("AT4: a deploy is never submitted twice: resumed after a time-out, not resu
   assert.equal(M.deployPosts, 1, "no second submit");
   assert.equal(statusPosts("devos-deploy")[0].state, "failure");
 });
+
+test("AT4: an earlier SHA's in-flight deploy is finished and reported before the new main SHA deploys", async () => {
+  resetMock(); freshState({ deploy: true });
+  const a = commit({ "q.txt": "a" }, "deploy a");
+  M.main = a; green(a); pass(a); M.deployStatus = "in_progress";
+  await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.equal(M.deployPosts, 1);
+  const b = commit({ "q.txt": "b" }, "deploy b");
+  M.main = b; green(b); pass(b);
+  reqs.length = 0; await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.equal(M.deployPosts, 1, "b waits while a is still running");
+  M.deployStatus = "finished";
+  reqs.length = 0; await runAgent();
+  assert.equal(M.deployPosts, 2, "a resumed (no resubmit), then b submitted once");
+  const dd = writes().filter((q) => q.path.includes("/statuses/") && JSON.parse(q.body).context === "devos-deploy");
+  assert.deepEqual(dd.map((q) => [q.path.split("/").pop(), JSON.parse(q.body).state]), [[a, "success"], [b, "success"]]);
+  assert.ok(fs.existsSync(path.join(D(), `agent/done.${a}`)));
+});
+
+test("AT6: --dry-run on a fresh server creates no directories or lock file", async () => {
+  resetMock(); freshState();
+  fs.rmSync(path.join(D(), "agent"), { recursive: true, force: true });
+  const sha = commit({ "dr.txt": "x" }, "dry");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent({}, ["--dry-run"]);
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!fs.existsSync(path.join(D(), "agent")) && !fs.existsSync(path.join(D(), "bin")), "nothing created");
+  assert.equal(writes().length, 0);
+  assert.match(r.out, /WOULD install/);
+});
