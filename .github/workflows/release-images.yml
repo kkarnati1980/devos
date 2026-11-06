@@ -124,8 +124,8 @@ jobs:
           docker compose exec -T postgres psql -U devos -d devos -v ON_ERROR_STOP=1 -qc \
             "insert into app_settings (singleton, caps_confirmed_at, updated_at) values (true, now(), now()) on conflict (singleton) do update set caps_confirmed_at = now()"
           expect 0 bash "$c/caps-saved.sh" || exit 1          # confirmed positive caps
-          docker compose exec -T postgres psql -U devos -d devos -v ON_ERROR_STOP=1 -qc "update app_settings set openai_cap_usd = 0"
-          expect 1 bash "$c/caps-saved.sh" || exit 1          # a zero cap fails
+          # (A zero cap cannot be stored: the M1.1 CHECK app_settings_values rejects it. The helper's
+          # zero-cap failure is covered by packages/run-engine/test/g1.test.mjs AT3.)
           # Seeded failure: one changed receipt byte breaks the chain.
           docker compose exec -T postgres psql -U devos -d devos -v ON_ERROR_STOP=1 -qc \
             "alter table policy_decision disable trigger user; update policy_decision set bundle_hash = 'tampered' where seq = 1; alter table policy_decision enable trigger user"
