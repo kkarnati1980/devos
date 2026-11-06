@@ -2,10 +2,10 @@
 // session cookie, a CSRF token, and write-only secrets (metadata back, values only recorded here).
 import http from "node:http";
 
-const NAMES = ["anthropic_api_key", "openai_api_key", "github_token", "linear_api_key", "r2_access_key_id", "r2_secret_access_key", "coolify_api_token"];
+const NAMES = ["anthropic_api_key", "openai_api_key", "github_token", "linear_api_key", "r2_access_key_id", "r2_secret_access_key", "coolify_api_token", "mybrain_bell_key", "smtp_password"];
 
 export async function startStubApi(allowedOrigin) {
-  const state = { signIns: 0, received: [], csrfSeen: [], settings: { anthropicCapUsd: "15.00", openaiCapUsd: "15.00", defaultProjectCapUsd: "15.00", defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null }, secrets: new Map() };
+  const state = { signIns: 0, received: [], csrfSeen: [], settings: { anthropicCapUsd: "15.00", openaiCapUsd: "15.00", defaultProjectCapUsd: "15.00", defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null }, secrets: new Map(), notices: [], channels: [{ kind: "dashboard", enabled: true, target: null, configured: true }, { kind: "mybrain", enabled: true, target: null, configured: true }, { kind: "email", enabled: true, target: null, configured: true }] };
   const meta = (name) => {
     const v = state.secrets.get(name);
     return v ? { name, set: true, hint: v.slice(-4), keyVersion: 1, createdAt: "2026-11-06T10:00:00.000Z", updatedAt: "2026-11-06T10:00:00.000Z" } : { name, set: false, hint: null, keyVersion: null, createdAt: null, updatedAt: null };
@@ -65,6 +65,23 @@ export async function startStubApi(allowedOrigin) {
       state.secrets.set(m[1], JSON.parse(body).value);
       state.received.push({ url, body: "(secret)" });
       return json(200, { secret: meta(m[1]), rotated });
+    }
+    // M1.6 notifications
+    if (req.method === "GET" && url === "/notifications") return json(200, { notices: state.notices });
+    if (req.method === "GET" && url === "/notifications/channels") return json(200, { channels: state.channels });
+    const ch = url.match(/^\/notifications\/channels\/(dashboard|mybrain|email)$/);
+    if (req.method === "PUT" && ch) {
+      state.received.push({ url, body });
+      const c = state.channels.find((x) => x.kind === ch[1]);
+      Object.assign(c, JSON.parse(body));
+      return json(200, { channel: { kind: c.kind, enabled: c.enabled, target: c.target } });
+    }
+    if (req.method === "POST" && url === "/notifications/test") {
+      state.received.push({ url, body });
+      const deliveries = state.channels.filter((c) => c.enabled).map((c) => ({ channel: c.kind, status: "sent", error: null }));
+      const id = `00000000-0000-4000-8000-${String(state.notices.length + 1).padStart(12, "0")}`;
+      state.notices.unshift({ id, kind: "test", title: "DevOS test card <script>window.__xss=1</script>", body: "This is a test notice.", reasons: ["Sent from the dashboard"], createdAt: "2026-11-06T10:00:00.000Z", deliveries });
+      return json(201, { notice: state.notices[0], deliveries });
     }
     return json(404, { statusCode: 404, code: "not-found" });
   });

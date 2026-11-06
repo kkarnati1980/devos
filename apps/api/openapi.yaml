@@ -90,6 +90,22 @@ components:
         keyVersion: { type: [integer, "null"] }
         createdAt: { type: [string, "null"], format: date-time }
         updatedAt: { type: [string, "null"], format: date-time }
+    ChannelKind: { type: string, enum: [dashboard, mybrain, email] }
+    ChannelPatch:
+      description: "M1.6: mybrain target = the bell URL (https, public host); email target = the recipient address."
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        enabled: { type: boolean }
+        target: { type: [string, "null"], maxLength: 500 }
+    Delivery:
+      type: object
+      required: [channel, status, error]
+      properties:
+        channel: { $ref: "#/components/schemas/ChannelKind" }
+        status: { type: string, enum: [pending, sent, failed] }
+        error: { type: [string, "null"], pattern: "^[a-z0-9-]{1,64}$", description: A fixed code, never a transport message }
   responses:
     Unauthorized: { description: No valid session for this tailnet identity, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     Forbidden: { description: Not KK, or a CSRF check failed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
@@ -250,6 +266,50 @@ paths:
       responses:
         "200": { description: "Saved or rotated: `{ secret: SecretMeta, rotated }`; the value is never returned" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /notifications:
+    get:
+      operationId: listNotifications
+      x-devos-access: session
+      responses:
+        "200": { description: "Dashboard feed: `{ notices: [{ id, kind, title, body, reasons, projectId, approvalId, createdAt, deliveries: Delivery[] }] }`, newest 50" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /notifications/channels:
+    get:
+      operationId: listNotificationChannels
+      x-devos-access: session
+      responses:
+        "200": { description: "`{ channels: [{ kind, enabled, target, configured }] }`; configured says whether the server has the bell key / SMTP settings, never their values" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /notifications/channels/{kind}:
+    put:
+      operationId: saveNotificationChannel
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: kind, in: path, required: true, schema: { $ref: "#/components/schemas/ChannelKind" } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChannelPatch" } } }
+      responses:
+        "200": { description: "`{ channel: { kind, enabled, target } }`; audited" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /notifications/test:
+    post:
+      operationId: sendTestNotification
+      x-devos-access: session
+      x-devos-state-changing: true
+      responses:
+        "201": { description: "A test card sent to every enabled channel: `{ notice, deliveries: Delivery[] }`" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/Unavailable" }

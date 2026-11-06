@@ -5,6 +5,9 @@ import type { KkSessionRegistry } from "./auth.js";
 import { withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore } from "./settings.js";
+import type { NotifyServices } from "./notify-routes.js";
+import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
+import { parseSmtpConfig } from "./smtp.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -39,6 +42,8 @@ export interface Runtime {
   readiness: ReadinessProbe;
   /** M1.4: settings need the database; the vault also needs `DEVOS_VAULT_KEY`. */
   setup: SetupServices;
+  /** M1.6: notifications need the database; the bell and email also need their configuration. */
+  notify: NotifyServices;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -59,9 +64,13 @@ export async function buildRuntime(
   // A malformed vault key stops start-up with a code (never the value), even before the database.
   const vaultKey = parseVaultKey(env.DEVOS_VAULT_KEY);
   const vaultKeyVersion = parseVaultKeyVersion(env.DEVOS_VAULT_KEY_VERSION);
+  // M1.6: a malformed SMTP setting or dashboard URL also stops start-up with a code.
+  const smtp = parseSmtpConfig(env);
+  const dashboardUrl = parseDashboardUrl(env.DEVOS_DASHBOARD_URL);
   const noSetup: SetupServices = { settings: null, vault: null };
-  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup };
-  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup };
+  const noNotify: NotifyServices = { notifier: null };
+  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup, notify: noNotify };
+  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup, notify: noNotify };
   const db = await opts.loadDb(databaseUrl);
   const setup: SetupServices = {
     settings: new PrismaSettingsStore(db, opts.outboundTimeoutMs),
@@ -72,5 +81,15 @@ export async function buildRuntime(
     hmacKey: Buffer.from(hmac, "utf8"),
     verifyKkSession: opts.kkSessions.verify,
   }) as unknown as GrantService;
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup };
+  const vault = setup.vault;
+  const notifier = new Notifier(new PrismaNotificationStore(db, opts.outboundTimeoutMs), {
+    // The bell key and SMTP password are vault secrets (entered in the wizard), read at send time.
+    secrets: vault
+      ? { reveal: (name) => vault.reveal(name), isSet: async (name) => (await vault.list()).some((m) => m.name === name && m.set) }
+      : null,
+    smtp,
+    dashboardUrl,
+    timeoutMs: opts.outboundTimeoutMs,
+  });
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier } };
 }

@@ -59,6 +59,8 @@ const SECRETS = {
   r2_access_key_id: "TESTONLY-r2id-eeeeeeeeeeeeeeeeeee-9I0J",
   r2_secret_access_key: "TESTONLY-r2secret-ffffffffffffff-KLMN",
   coolify_api_token: "TESTONLY-coolify-gggggggggggggg-OPQR",
+  mybrain_bell_key: "TESTONLY-bellkey-hhhhhhhhhhhhhh-STUV",
+  smtp_password: "TESTONLY-smtppass-iiiiiiiiiiiii-WX12",
 };
 
 test("M1.4 AT12 (amendment): the wizard saves three caps and every secret; no value is left in the page, storage or URL", async () => {
@@ -154,5 +156,31 @@ test("M1.4 AT17 (PR17-r1): a second tab reuses the session; a tab whose token we
   await b.locator('input[name="openaiCapUsd"]').fill("21");
   await b.getByTestId("save-settings").click();
   await b.getByTestId("notice").filter({ hasText: "Settings saved." }).waitFor();
+  await context.close();
+});
+
+test("M1.6 AT12: the notifications page sets the bell URL and recipient, sends a test card and shows each channel's outcome", async () => {
+  const { page, context, problems } = await open("/notifications");
+  await page.getByTestId("channels").waitFor();
+  await page.locator('input[name="target-mybrain"]').fill("https://my-brain.example.com/api/devos/bell");
+  await page.getByTestId("save-mybrain").click();
+  await page.getByTestId("notice").filter({ hasText: "MyBrain bell saved." }).waitFor();
+  await page.locator('input[name="target-email"]').fill("kk@example.com");
+  await page.getByTestId("save-email").click();
+  await page.getByTestId("notice").filter({ hasText: "Email saved." }).waitFor();
+  await page.getByTestId("send-test").click();
+  await page.getByTestId("notice").filter({ hasText: "Test card sent." }).waitFor();
+  const result = await page.getByTestId("test-result").innerText();
+  for (const label of ["Dashboard: sent", "MyBrain bell: sent", "Email: sent"]) assert.ok(result.includes(label), label);
+  await page.getByTestId("feed-item").first().waitFor();
+  assert.match(await page.getByTestId("feed-item").first().innerText(), /DevOS test card <script>/, "notice text is shown escaped, as text");
+  assert.equal(await page.evaluate(() => window.__xss), undefined, "a notice title never runs as script");
+  const writes = api.state.received.filter((r) => r.url.startsWith("/notifications"));
+  assert.deepEqual(writes.map((w) => w.url), ["/notifications/channels/mybrain", "/notifications/channels/email", "/notifications/test"]);
+  assert.deepEqual(JSON.parse(writes[0].body), { target: "https://my-brain.example.com/api/devos/bell" });
+  assert.ok(api.state.csrfSeen.length > 0 && api.state.csrfSeen.every((t) => typeof t === "string" && t.startsWith("stub-csrf-")));
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "no horizontal scroll at 390 px");
+  assert.deepEqual(problems, []);
   await context.close();
 });

@@ -13,6 +13,9 @@ export const SECRET_NAMES = [
   "r2_access_key_id",
   "r2_secret_access_key",
   "coolify_api_token",
+  // M1.6 (docs/modules/M1.6.md): the MyBrain bell HMAC key (shared with MyBrain) and the SMTP password.
+  "mybrain_bell_key",
+  "smtp_password",
 ] as const;
 export type SecretName = (typeof SECRET_NAMES)[number];
 export const isSecretName = (v: string): v is SecretName => (SECRET_NAMES as readonly string[]).includes(v);

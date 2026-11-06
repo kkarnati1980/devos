@@ -9,7 +9,7 @@ import { buildRuntime, type DbClient } from "./runtime.js";
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadDb: async (url) => {
@@ -28,10 +28,11 @@ async function main(): Promise<void> {
     readiness,
     kkSessions,
     setup,
+    notify,
   });
   app.enableShutdownHooks();
   await app.listen(config.port, config.host);
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, policyEngine: grants !== null, vault: setup.vault !== null });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null });
 }
 
 main().catch((e: unknown) => {

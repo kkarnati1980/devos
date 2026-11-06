@@ -34,6 +34,29 @@ export interface SetupStatus {
 
 const TIMEOUT_MS = 10_000; // ADR-0011 §9: every outbound call has a timeout
 
+/** M1.6 notifications. */
+export type ChannelKind = "dashboard" | "mybrain" | "email";
+export interface Delivery {
+  channel: ChannelKind;
+  status: "pending" | "sent" | "failed";
+  error: string | null;
+}
+export interface NoticeItem {
+  id: string;
+  kind: string;
+  title: string;
+  body: string;
+  reasons: string[];
+  createdAt: string;
+  deliveries: Delivery[];
+}
+export interface ChannelView {
+  kind: ChannelKind;
+  enabled: boolean;
+  target: string | null;
+  configured: boolean;
+}
+
 export class DevosApi {
   private csrf: string | null = null;
   constructor(private readonly origin: string) {}
@@ -126,6 +149,18 @@ export class DevosApi {
   saveSecret(name: string, value: string) {
     return this.call<{ secret: SecretMeta; rotated: boolean }>("PUT", `/vault/secrets/${encodeURIComponent(name)}`, { value });
   }
+  notifications() {
+    return this.call<{ notices: NoticeItem[] }>("GET", "/notifications");
+  }
+  channels() {
+    return this.call<{ channels: ChannelView[] }>("GET", "/notifications/channels");
+  }
+  saveChannel(kind: ChannelKind, patch: { enabled?: boolean; target?: string | null }) {
+    return this.call<{ channel: Omit<ChannelView, "configured"> }>("PUT", `/notifications/channels/${kind}`, patch);
+  }
+  sendTest() {
+    return this.call<{ deliveries: Delivery[] }>("POST", "/notifications/test");
+  }
 }
 
 export const SECRET_LABELS: Record<string, string> = {
@@ -136,12 +171,17 @@ export const SECRET_LABELS: Record<string, string> = {
   r2_access_key_id: "Cloudflare R2 access key ID",
   r2_secret_access_key: "Cloudflare R2 secret access key",
   coolify_api_token: "Coolify API token",
+  mybrain_bell_key: "MyBrain bell signing key (same value as in MyBrain)",
+  smtp_password: "Email (SMTP) password",
 };
 
 /** Human messages for API codes; the code itself is shown too, never any input. */
 export function explain(code: string): string {
   if (code === "api-unreachable") return "The DevOS API did not answer. Check you are on the tailnet.";
   if (code === "not-kk") return "This device is not signed in to the tailnet as KK.";
+  if (code === "notifications-not-configured") return "Notifications need the database (DATABASE_URL).";
+  if (code === "invalid:target-https-only") return "The MyBrain bell address must start with https://.";
+  if (code === "invalid:target-host") return "The MyBrain bell address must be a public host name, not an IP address or localhost.";
   if (code === "vault-not-configured") return "The server vault key is not set yet (DEVOS_VAULT_KEY).";
   if (code.startsWith("invalid:value")) return "That value is not a valid key (16–4,096 characters, no spaces).";
   if (code.startsWith("invalid:") || code.startsWith("missing:")) return `Check the field: ${code.split(":")[1]}.`;
