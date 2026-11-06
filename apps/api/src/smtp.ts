@@ -75,12 +75,18 @@ export function buildMessage(cfg: SmtpConfig, m: MailMessage, date: Date): strin
   ].join("\r\n");
 }
 
+const MAX_REPLY = 64 * 1024;
+const MAX_REPLY_LINES = 100;
+const MAX_CONVERSATION = 256 * 1024;
+
 /** Line-oriented SMTP reply reader over a socket that can be swapped for its TLS upgrade. */
 class Conversation {
   private buf = "";
   private waiters: Array<(r: { code: number; ext: string[] } | Error) => void> = [];
   private lines: string[] = [];
   private failed: Error | null = null;
+  private total = 0;
+  private replyBytes = 0;
 
   constructor(public sock: net.Socket) {
     this.attach(sock);
@@ -107,14 +113,22 @@ class Conversation {
   }
 
   private onData(d: string) {
+    if (this.failed) return;
+    // F3 (PR18-r3): the whole conversation, one reply (continuation lines included) and its line
+    // count are all bounded, not only the unparsed buffer; a peer cannot grow memory until the deadline.
+    this.total += d.length;
+    if (this.total > MAX_CONVERSATION) return this.fail(new Error("email-protocol"));
     this.buf += d;
-    if (this.buf.length > 64 * 1024) return this.fail(new Error("email-protocol"));
+    if (this.buf.length > MAX_REPLY) return this.fail(new Error("email-protocol"));
     let i: number;
     while ((i = this.buf.indexOf("\n")) >= 0) {
       const line = this.buf.slice(0, i).replace(/\r$/, "");
       this.buf = this.buf.slice(i + 1);
       this.lines.push(line);
+      this.replyBytes += line.length;
+      if (this.replyBytes > MAX_REPLY || this.lines.length > MAX_REPLY_LINES) return this.fail(new Error("email-protocol"));
       if (/^\d{3} /.test(line) || /^\d{3}$/.test(line)) {
+        this.replyBytes = 0;
         const done = this.lines.splice(0);
         const w = this.waiters.shift();
         if (w) w({ code: Number(line.slice(0, 3)), ext: done.map((l) => l.slice(4)) });

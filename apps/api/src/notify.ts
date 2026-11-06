@@ -258,13 +258,19 @@ export class Notifier {
     const valid = parseNotice(input);
     if (typeof valid === "string") throw new NoticeError(valid);
     const notice: Notice = { ...valid, id: randomUUID(), createdAt: new Date(this.now()).toISOString() };
-    const channels = await this.store.channels();
-    const enabled = channels.filter((c) => c.enabled);
-    await this.store.create(
-      notice,
-      enabled.map((c) => c.kind),
-      new Date(this.now()),
-    );
+    // Every store failure, these included, is the fixed `notifications-store-error`; a driver
+    // error never reaches a caller (PR18-r3).
+    let enabled: ChannelConfig[];
+    try {
+      enabled = (await this.store.channels()).filter((c) => c.enabled);
+      await this.store.create(
+        notice,
+        enabled.map((c) => c.kind),
+        new Date(this.now()),
+      );
+    } catch {
+      throw new Error("notifications-store-error");
+    }
     let recordFailed = false;
     const deliveries = await Promise.all(
       enabled.map(async (c): Promise<Delivery> => {

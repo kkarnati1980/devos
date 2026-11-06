@@ -639,3 +639,41 @@ test("M1.6 AT17 (PR18-r2): the bell deadline covers DNS and the response body; n
   }
 });
 
+test("M1.6 AT18 (PR18-r3): a failing channels() or create() is notifications-store-error, never the driver error", async () => {
+  for (const method of ["channels", "create"]) {
+    const store = new MemoryNotificationStore();
+    store[method] = async () => {
+      throw new Error("driver: password=hunter22 at db.internal");
+    };
+    const n = new Notifier(store, { secrets: null, smtp: null, dashboardUrl: null, timeoutMs: 1000 });
+    await assert.rejects(n.notify(parseNotice({ kind: "info", title: "x" })), (e) => e.message === "notifications-store-error", method);
+  }
+});
+
+test("M1.6 AT19 (PR18-r3): an SMTP peer cannot grow a reply without bound", async () => {
+  for (const flood of ["lines", "bytes"]) {
+    let sent = 0;
+    const server = net.createServer((sock) => {
+      sock.on("error", () => {});
+      // Greeting as endless continuation lines, in small chunks, never ending the reply.
+      const line = flood === "lines" ? "220-x\r\n" : `220-${"y".repeat(1000)}\r\n`;
+      const t = setInterval(() => {
+        if (sock.destroyed) return clearInterval(t);
+        sock.write(line.repeat(20));
+        sent += line.length * 20;
+      }, 1);
+      sock.on("close", () => clearInterval(t));
+    });
+    await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
+    try {
+      const cfg = { host: "127.0.0.1", port: server.address().port, security: "plain", user: null, pass: null, from: "devos@example.org" };
+      const t0 = Date.now();
+      const code = await sendMail(cfg, { to: "kk@example.com", subject: "s", text: "t", messageId: "m" }, 5000);
+      assert.equal(code, "email-protocol", flood);
+      assert.ok(Date.now() - t0 < 4000, "stopped by the limit, not the deadline");
+    } finally {
+      server.close();
+    }
+  }
+});
+
