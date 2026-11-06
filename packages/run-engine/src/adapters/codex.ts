@@ -34,7 +34,11 @@ export interface CodexAdapterOptions {
 }
 
 /** Flags that would change Codex's sandbox or approvals; never accepted from callers. */
-const SANDBOX_FLAGS = ["--sandbox", "-s", "--full-auto", "--dangerously-bypass-approvals-and-sandbox", "--yolo", "-a", "--ask-for-approval", "-c", "--config", "--profile", "-p"];
+/**
+ * The only extra `codex exec` arguments a caller may pass (an allow-list, so attached short forms
+ * such as `-pX` or `-cK=V` can never slip through). Sandbox, approvals, config and profile are fixed.
+ */
+export const CODEX_ALLOWED_ARGS: ReadonlySet<string> = new Set(["--skip-git-repo-check", "--ephemeral"]);
 
 const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
 
@@ -54,7 +58,7 @@ export class CodexExecAdapter implements RunAdapter {
     // D1: Codex reviews read-only. The sandbox is fixed here, whatever the installed CLI config says,
     // and no caller argument may change it or the approval policy.
     const extra = this.opts.args ?? [];
-    const bad = extra.find((a) => SANDBOX_FLAGS.some((f) => a === f || a.startsWith(`${f}=`)) || /sandbox|approval/i.test(a));
+    const bad = extra.find((a) => !CODEX_ALLOWED_ARGS.has(a));
     if (bad !== undefined) this.refuse(new RunFailure("policy_denied", "codex-arg-not-allowed", false));
     if (envelope && envelope.writePaths.length > 0) this.refuse(new RunFailure("policy_denied", "codex-review-is-read-only", false));
     const args = [...(this.opts.scriptArgs ?? []), "exec", "--json", "--sandbox", "read-only", ...extra, "--model", task.model, "-"];

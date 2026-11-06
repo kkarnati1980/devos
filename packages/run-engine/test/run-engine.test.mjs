@@ -567,3 +567,38 @@ test("r5-3 a failed finishRun is retried as bookkeeping; only a fully finished r
   assert.equal(third.status, "succeeded");
   assert.equal(calls.length, 2, "now the retryable failure is rerun");
 });
+
+// ---- Codex PR16-r6 regressions ----
+
+test("r6-1 Codex extra args are an allow-list: attached short forms are refused too", async () => {
+  for (const args of [["-pcustom"], ["-cmodel=\"other\""], ["-sworkspace-write"], ["--profile=x"], ["positional"]]) {
+    const t = setup();
+    const out = await new RunEngine({ store: t.store, policy: t.policy, adapterFor: () => fakeCodexAdapter("ok", {}, args) }).execute({ runId: t.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4 });
+    assert.equal(out.errorType, "policy_denied", args.join(" "));
+  }
+  const ok = setup();
+  ok.store.runs.get(ok.runId).model = "gpt-codex";
+  const out = await new RunEngine({ store: ok.store, policy: ok.policy, adapterFor: () => fakeCodexAdapter("ok", {}, ["--skip-git-repo-check"]) }).execute({ runId: ok.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4 });
+  assert.equal(out.status, "succeeded", "an allowed arg passes");
+});
+
+test("r6-2 max_seconds bounds start and result too: a slow start then a clean end is limit_hit", async () => {
+  for (const slow of ["start", "result"]) {
+    const s = setup({ maxSeconds: 1 });
+    let cancelled = false;
+    const adapter = {
+      name: "claude-agent-sdk",
+      async start() { if (slow === "start") await new Promise((r) => setTimeout(r, 1300)); },
+      events() { return (async function* () {})(); },
+      async cancel() { cancelled = true; },
+      async result() {
+        if (slow === "result") await new Promise((r) => setTimeout(r, 1300));
+        return { status: "succeeded", costUsd: 0.01, costEstimated: false, usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+      },
+    };
+    const out = await new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => adapter }).execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+    assert.equal(out.status, "limit_hit", slow);
+    assert.equal(out.errorType, "timeout", slow);
+    assert.equal(cancelled, true, `${slow}: the runtime was cancelled`);
+  }
+});

@@ -247,7 +247,9 @@ export class RunEngine {
     try {
       await store.markRunning(run.id);
       await emit("status", { state: cp ? "resumed" : "started", fromTurn: state.turn, adapter: adapter.name });
-      await within(adapter.start(task, envelope), this.opts.startTimeoutMs ?? 30_000, "start");
+      // Every wait is bounded by the run's max_seconds deadline as well as its own timeout.
+      const left = () => Math.max(1, deadline - this.now());
+      await within(adapter.start(task, envelope), Math.min(this.opts.startTimeoutMs ?? 30_000, left()), "start");
 
       const it = adapter.events()[Symbol.asyncIterator]();
       for (;;) {
@@ -262,7 +264,13 @@ export class RunEngine {
           await adapter.cancel(run.id);
           break;
         }
-        if (step.done) break;
+        if (step.done) {
+          if (this.now() > deadline && !limit) {
+            limit = "timeout";
+            slot.reason = "limit";
+          }
+          break;
+        }
         const ev = step.value;
         await emit(ev.type, ev.payload);
         if (ev.type === "status" && typeof ev.payload.sessionId === "string") state.state.sessionId = ev.payload.sessionId;
@@ -286,9 +294,25 @@ export class RunEngine {
           await adapter.cancel(run.id);
         }
       }
-      result = await within(adapter.result(), this.opts.resultTimeoutMs ?? 15_000, "result");
+      result = await within(adapter.result(), limit ? (this.opts.resultTimeoutMs ?? 15_000) : Math.min(this.opts.resultTimeoutMs ?? 15_000, left()), "result").catch(
+        async (e) => {
+          if (!(e instanceof Timeout) || limit || this.now() < deadline) throw e;
+          limit = "timeout"; // max_seconds ran out while waiting for the result
+          slot.reason = "limit";
+          await adapter.cancel(run.id);
+          return within(adapter.result(), this.opts.resultTimeoutMs ?? 15_000, "result");
+        },
+      );
+      if (this.now() > deadline && !limit) {
+        limit = "timeout";
+        slot.reason = "limit";
+      }
     } catch (e) {
       streamError = e instanceof RunFailure ? { type: e.type, message: e.message } : e instanceof Timeout ? { type: "timeout", message: `adapter-${e.message}-timeout` } : { type: "internal", message: "engine-error" };
+      if (e instanceof Timeout && this.now() >= deadline && !limit) {
+        limit = "timeout"; // the run's max_seconds, not just an adapter call, ran out
+        slot.reason = "limit";
+      }
       if (!(e instanceof RunFailure && e.type === "sandbox_error")) await adapter.cancel(run.id).catch(() => undefined);
       result = await within(adapter.result(), this.opts.resultTimeoutMs ?? 15_000, "result").catch(() => null);
       if (streamError.type === "internal" && !(e instanceof RunFailure)) {
