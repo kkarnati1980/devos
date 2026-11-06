@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import YAML from "yaml";
 import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
@@ -12,6 +12,7 @@ import { KkSessionRegistry } from "../dist/auth.js";
 import { loadConfig, SESSION_TTL_MS } from "../dist/config.js";
 import { SECURITY_HEADERS } from "../dist/http.js";
 import { parseWhois, TailscaleWhoisResolver } from "../dist/identity.js";
+import { buildRuntime, dbReadiness } from "../dist/runtime.js";
 
 const KK = "kk@example.com";
 const ORIGIN = "http://devos:3000";
@@ -371,4 +372,94 @@ test("AT10 whois parsing and configuration fail closed", () => {
   assert.throws(() => loadConfig({ ...ENV, DEVOS_ALLOWED_ORIGINS: "" }), /config-allowed-origins-required/);
   assert.throws(() => loadConfig({ ...ENV, DEVOS_ALLOWED_ORIGINS: "http://devos:3000/path" }), /config-origin-invalid/);
   assert.equal(randomUUID().length, 36);
+});
+
+test("AT9 PS (PR14-r1): whois has a hard elapsed deadline, not only an inactivity timeout", async () => {
+  // A tailscaled that sends headers, then a byte every 40 ms forever (never idle for 200 ms).
+  const dir = (await import("node:fs")).mkdtempSync((await import("node:os")).tmpdir() + "/devos-ts-");
+  const sock = `${dir}/tailscaled.sock`;
+  const timers = new Set();
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    const t = setInterval(() => res.write(" "), 40);
+    timers.add(t);
+    res.on("close", () => clearInterval(t));
+  });
+  server.listen(sock);
+  await new Promise((r) => server.once("listening", r));
+  try {
+    const resolver = new TailscaleWhoisResolver(sock, 300);
+    const t0 = Date.now();
+    await assert.rejects(resolver.whois("100.64.0.1", 50000), /whois-timeout/);
+    const took = Date.now() - t0;
+    assert.ok(took < 1000, `whois took ${took} ms with a 300 ms limit`);
+  } finally {
+    for (const t of timers) clearInterval(t);
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test("AT9 PS (PR14-r1): the readiness probe bounds the database operation itself", async () => {
+  const calls = [];
+  let options;
+  const db = {
+    async $transaction(fn, opts) {
+      options = opts;
+      return fn({ $queryRaw: async (strings, ...values) => calls.push([strings.join("?"), ...values]) });
+    },
+  };
+  await dbReadiness(db, 1234)();
+  assert.deepEqual(options, { timeout: 1234, maxWait: 1234 });
+  assert.match(calls[0][0], /set_config\('statement_timeout', \?, true\)/);
+  assert.equal(calls[0][1], "1234");
+  assert.match(calls[1][0], /SELECT 1/);
+
+  // A stalled database: the probe still answers within the limit.
+  const stalled = { $transaction: () => new Promise(() => {}) };
+  const t0 = Date.now();
+  await assert.rejects(dbReadiness(stalled, 150)(), /db-timeout/);
+  assert.ok(Date.now() - t0 < 1000);
+});
+
+test("AT9 PS (PR14-r1): /ready needs both DATABASE_URL and DEVOS_POLICY_HMAC_KEY", async () => {
+  const kkSessions = new KkSessionRegistry();
+  const okDb = { $transaction: async (fn) => fn({ $queryRaw: async () => [] }) };
+  let loads = 0;
+  const loadDb = async () => {
+    loads++;
+    return okDb;
+  };
+  const opts = { outboundTimeoutMs: 500, kkSessions, loadDb };
+
+  const none = await buildRuntime({}, opts);
+  assert.equal(none.grants, null);
+  await assert.rejects(none.readiness(), /database-not-configured/);
+
+  const noKey = await buildRuntime({ DATABASE_URL: "postgresql://x/y" }, opts);
+  assert.equal(noKey.grants, null);
+  await assert.rejects(noKey.readiness(), /policy-not-configured/);
+  assert.equal(loads, 0);
+  const s = await start({ readiness: noKey.readiness });
+  try {
+    const r = await call(s.port, "GET", "/ready");
+    assert.equal(r.status, 503);
+    assert.equal(r.json.code, "not-ready");
+  } finally {
+    await s.app.close();
+  }
+
+  const both = await buildRuntime({ DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" }, opts);
+  assert.notEqual(both.grants, null);
+  await both.readiness();
+  assert.equal(loads, 1);
+});
+
+test("PR14-r1: @devos/db is a declared dependency of @devos/api and resolves from apps/api", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(pkg.dependencies["@devos/db"], "workspace:*");
+  // Resolution goes through apps/api/node_modules (pnpm workspace link) to packages/db.
+  const resolved = realpathSync(new URL("../node_modules/@devos/db", import.meta.url));
+  assert.match(resolved, /packages\/db$/);
+  assert.match(import.meta.resolve("@devos/db"), /\/@devos\/db\/dist\/index\.js$/);
 });

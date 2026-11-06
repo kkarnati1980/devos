@@ -38,7 +38,18 @@ export class TailscaleWhoisResolver implements IdentityResolver {
     const ip = peerIp(remoteAddress);
     if (!ip || !Number.isInteger(remotePort) || remotePort <= 0) return Promise.resolve(null);
     const path = `/localapi/v0/whois?addr=${encodeURIComponent(whoisAddr(ip, remotePort))}`;
-    return new Promise((resolve, reject) => {
+    return new Promise<TailnetIdentity | null>((resolveP, rejectP) => {
+      // Hard elapsed deadline for the whole exchange (ADR-0011 §9, PR14-r1). The request's own
+      // `timeout` option only bounds socket inactivity, so a server dripping bytes could outlast it.
+      const deadline = setTimeout(() => req.destroy(new Error("whois-timeout")), this.timeoutMs);
+      const resolve = (v: TailnetIdentity | null) => {
+        clearTimeout(deadline);
+        resolveP(v);
+      };
+      const reject = (e: unknown) => {
+        clearTimeout(deadline);
+        rejectP(e);
+      };
       const req = http.request(
         { socketPath: this.socketPath, path, method: "GET", headers: { Host: "local-tailscaled.sock" }, timeout: this.timeoutMs },
         (res) => {
