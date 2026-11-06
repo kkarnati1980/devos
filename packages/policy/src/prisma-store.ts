@@ -68,15 +68,25 @@ function toRow(d: any): DecisionRow {
 export class PrismaPolicyStore implements PolicyStore {
   constructor(private readonly db: PrismaLike, private readonly timeoutMs = 10_000) {}
 
-  /** Run `fn` in a transaction holding the global policy lock (decisions, reconcile, release, revoke). */
-  private locked<T>(fn: (t: any) => Promise<T>): Promise<T> {
+  /**
+   * Every database call of this store runs here (ADR-0011 timeouts, PR13-r6): the connection wait is
+   * bounded by `maxWait`, the whole unit by `timeout`, and each statement by a transaction-local
+   * `statement_timeout`, so a stalled database fails the call instead of hanging it.
+   */
+  private bounded<T>(fn: (t: any) => Promise<T>, lock: boolean): Promise<T> {
     return this.db.$transaction(
       async (t: any) => {
-        await t.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${LOCK_KEY}))) AS l`;
+        await t.$queryRaw`SELECT set_config('statement_timeout', ${String(this.timeoutMs)}, true) AS statement_timeout`;
+        if (lock) await t.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${LOCK_KEY}))) AS l`;
         return fn(t);
       },
       { timeout: this.timeoutMs, maxWait: this.timeoutMs },
     );
+  }
+
+  /** Run `fn` in a transaction holding the global policy lock (decisions, reconcile, release, revoke). */
+  private locked<T>(fn: (t: any) => Promise<T>): Promise<T> {
+    return this.bounded(fn, true);
   }
 
   decide<T>(fn: (tx: PolicyTx) => Promise<T>): Promise<T> {
@@ -118,8 +128,10 @@ export class PrismaPolicyStore implements PolicyStore {
   }
 
   async loadPolicy(): Promise<{ mode: PolicyMode; rules: PolicyRule[] }> {
-    const state = await this.db.policyState.findFirst({ where: { singleton: true } });
-    const rows: any[] = await this.db.policyRule.findMany({ where: { enabled: true }, orderBy: [{ name: "asc" }, { version: "desc" }] });
+    const { state, rows } = await this.bounded(async (t) => ({
+      state: await t.policyState.findFirst({ where: { singleton: true } }),
+      rows: (await t.policyRule.findMany({ where: { enabled: true }, orderBy: [{ name: "asc" }, { version: "desc" }] })) as any[],
+    }), false);
     const latest = new Map<string, any>();
     for (const r of rows) if (!latest.has(r.name)) latest.set(r.name, r);
     const rules: PolicyRule[] = [...latest.values()].map((r) => ({
@@ -141,7 +153,7 @@ export class PrismaPolicyStore implements PolicyStore {
   }
 
   async insertGrant(g: Omit<ApprovalGrant, "id" | "uses" | "revokedAt" | "issuedAt"> & { issuedAt?: Date }): Promise<ApprovalGrant> {
-    return toGrant(await this.db.approvalGrant.create({ data: { ...g } }));
+    return toGrant(await this.bounded((t) => t.approvalGrant.create({ data: { ...g } }), false));
   }
 
   async revokeGrant(id: string, at: Date): Promise<boolean> {
@@ -164,7 +176,7 @@ export class PrismaPolicyStore implements PolicyStore {
   }
 
   async readChain(chain: string): Promise<DecisionRow[]> {
-    const rows: any[] = await this.db.policyDecision.findMany({ where: { chain }, orderBy: { seq: "asc" } });
+    const rows: any[] = await this.bounded((t) => t.policyDecision.findMany({ where: { chain }, orderBy: { seq: "asc" } }), false);
     return rows.map(toRow);
   }
 }

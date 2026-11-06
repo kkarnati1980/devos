@@ -12,6 +12,7 @@ import {
   verifyLedger,
   usdToMicros,
   ceilMicroUsd,
+  PrismaPolicyStore,
 } from "../dist/index.js";
 
 const KEY = randomBytes(32);
@@ -346,6 +347,38 @@ test("PR13-r5: an open reservation keeps counting after it ages out of a rolling
   assert.deepEqual([(await ask()).enforcedOutcome], ["deny"], "still open: still counted");
   await engine.reconcile(first.reservationId, 1, 1);
   assert.equal((await ask()).enforcedOutcome, "allow", "reconciled spend older than the window drops out");
+});
+
+test("PR13-r6: every PrismaPolicyStore database call is bounded (transaction timeout + statement_timeout)", async () => {
+  const calls = [];
+  const model = (name) => new Proxy({}, { get: (_, op) => async () => {
+    calls.push(`${name}.${String(op)}`);
+    if (op === "findMany") return [];
+    if (op === "updateMany") return { count: 1 };
+    if (op === "aggregate") return { _sum: {} };
+    if (op === "create") return { id: "00000000-0000-4000-8000-000000000001", issuedBy: "kk:x" };
+    return null;
+  } });
+  const tx = { $queryRaw: async (strings, ...values) => { calls.push(`sql:${strings.join("?").includes("statement_timeout") ? "timeout" : "lock"}:${values[0]}`); return [{}]; } };
+  for (const m of ["policyState", "policyRule", "policyDecision", "approvalGrant", "budgetReservation"]) tx[m] = model(`tx.${m}`);
+  const outside = {};
+  const db = { $transaction: async (fn, opts) => { calls.push(`tx(timeout=${opts?.timeout},maxWait=${opts?.maxWait})`); return fn(tx); } };
+  for (const m of ["policyState", "policyRule", "policyDecision", "approvalGrant", "budgetReservation"]) {
+    db[m] = new Proxy({}, { get: (_, op) => async () => { outside[`${m}.${String(op)}`] = true; } });
+  }
+  const store = new PrismaPolicyStore(db, 2500);
+  await store.loadPolicy();
+  await store.insertGrant({ approvalId: null, scopeAction: "x", scopeResource: null, projectId: null, sha: null, issuedBy: "kk:x", expiresAt: new Date(T0 + HOUR), maxUses: 1 });
+  await store.readChain("main");
+  await store.revokeGrant("g", new Date());
+  await store.reconcile("r", 0.1, 1);
+  await store.release("r");
+  await store.decide(async (t) => { await t.head("main"); await t.usage({}); return null; });
+  assert.deepEqual(outside, {}, "no query runs outside a bounded transaction");
+  const txCount = calls.filter((c) => c.startsWith("tx(")).length;
+  assert.equal(txCount, 7);
+  assert.ok(calls.filter((c) => c.startsWith("tx(")).every((c) => c === "tx(timeout=2500,maxWait=2500)"));
+  assert.equal(calls.filter((c) => c === "sql:timeout:2500").length, 7, "statement_timeout set in every transaction");
 });
 
 test("AT10: THIRD_PARTY_NOTICES.md and the per-file headers are present", () => {
