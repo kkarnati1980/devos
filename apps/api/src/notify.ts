@@ -3,10 +3,18 @@
 // is a `notification` row with its own status; a failed channel never stops the others.
 // Errors are fixed codes: a driver, HTTP or SMTP message is never stored, returned or logged.
 import { createHmac, randomUUID } from "node:crypto";
+import { postBell, type Resolver } from "./bell.js";
 import { sendMail, type SmtpConfig } from "./smtp.js";
 import { writeAudit, type AuditEntry } from "./settings.js";
 
 export const NOTIFY = Symbol("devos:notify");
+
+/** An invalid notice from any caller; `code` is the `parseNotice` code. Nothing was stored or sent. */
+export class NoticeError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+  }
+}
 
 export const CHANNELS = ["dashboard", "mybrain", "email"] as const;
 export type Channel = (typeof CHANNELS)[number];
@@ -139,7 +147,9 @@ export function checkBellUrl(v: unknown, allowLoopbackHttp = false): string | nu
   const loopback = isLoopbackHost(u.hostname);
   if (allowLoopbackHttp && loopback && (u.protocol === "http:" || u.protocol === "https:")) return null;
   if (u.protocol !== "https:") return "invalid:target-https-only";
-  if (loopback || /^[\d.]+$/.test(u.hostname) || u.hostname.startsWith("[")) return "invalid:target-host";
+  const host = u.hostname.replace(/\.$/, "");
+  if (loopback || isLoopbackHost(host) || host.endsWith(".localhost") || /^[\d.]+$/.test(host) || u.hostname.startsWith("[")) return "invalid:target-host";
+  // A name that resolves to a private address is refused at send time (bell.ts, PR18-r1).
   return null;
 }
 
@@ -210,7 +220,8 @@ export interface NotifierConfig {
   timeoutMs: number;
   /** Test-only: lets a stub bell listen on loopback http. Never set from the environment. */
   allowLoopbackHttp?: boolean;
-  fetch?: typeof fetch;
+  /** Test-only DNS resolver for the bell (defaults to the system resolver). */
+  resolve?: Resolver;
   send?: typeof sendMail;
   now?: () => number;
 }
@@ -238,11 +249,15 @@ export class Notifier {
   }
 
   /**
-   * Stores the notice for every enabled channel, then delivers it to MyBrain and email. Throws only
-   * if the notice cannot be stored; a channel failure is recorded on its row and returned.
+   * Validates the notice (PR18-r1: every caller, not only routes, goes through `parseNotice`), stores
+   * it for every enabled channel, then delivers it to MyBrain and email. A channel failure is
+   * recorded on its row and returned. Throws `NoticeError` for an invalid notice (nothing stored or
+   * sent) and `notifications-store-error` if the notice or any delivery outcome cannot be stored.
    */
   async notify(input: NoticeInput): Promise<{ notice: Notice; deliveries: Delivery[] }> {
-    const notice: Notice = { ...input, id: randomUUID(), createdAt: new Date(this.now()).toISOString() };
+    const valid = parseNotice(input);
+    if (typeof valid === "string") throw new NoticeError(valid);
+    const notice: Notice = { ...valid, id: randomUUID(), createdAt: new Date(this.now()).toISOString() };
     const channels = await this.store.channels();
     const enabled = channels.filter((c) => c.enabled);
     await this.store.create(
@@ -250,6 +265,7 @@ export class Notifier {
       enabled.map((c) => c.kind),
       new Date(this.now()),
     );
+    let recordFailed = false;
     const deliveries = await Promise.all(
       enabled.map(async (c): Promise<Delivery> => {
         if (c.kind === "dashboard") return { channel: "dashboard", status: "sent", error: null };
@@ -258,11 +274,13 @@ export class Notifier {
         try {
           await this.store.record(notice.id, c.kind, status, error, new Date(this.now()));
         } catch {
-          return { channel: c.kind, status, error: error ?? "record-failed" };
+          recordFailed = true;
         }
         return { channel: c.kind, status, error };
       }),
     );
+    // A delivery whose outcome could not be stored is a store failure, never a 201 (PR18-r1).
+    if (recordFailed) throw new Error("notifications-store-error");
     return { notice, deliveries };
   }
 
@@ -285,27 +303,19 @@ export class Notifier {
     if (!key) return "mybrain-not-configured";
     const body = JSON.stringify(bellPayload(n, this.cfg.dashboardUrl));
     const ts = Math.floor(this.now() / 1000);
-    const f = this.cfg.fetch ?? fetch;
-    let res: Response;
-    try {
-      res = await f(target, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-devos-timestamp": String(ts),
-          "x-devos-signature": signBell(Buffer.from(key, "utf8"), ts, body),
-          "x-devos-notice-id": n.id,
-        },
-        body,
-        redirect: "error",
-        signal: AbortSignal.timeout(this.cfg.timeoutMs),
-      });
-    } catch (e) {
-      return (e as { name?: string }).name === "TimeoutError" ? "mybrain-timeout" : "mybrain-network";
-    }
-    // The response body is never read or stored (it is untrusted data).
-    await res.body?.cancel().catch(() => {});
-    return res.status >= 200 && res.status < 300 ? null : `mybrain-http-${res.status}`;
+    return postBell({
+      url: target,
+      headers: {
+        "content-type": "application/json",
+        "x-devos-timestamp": String(ts),
+        "x-devos-signature": signBell(Buffer.from(key, "utf8"), ts, body),
+        "x-devos-notice-id": n.id,
+      },
+      body,
+      timeoutMs: this.cfg.timeoutMs,
+      allowLoopback: this.cfg.allowLoopbackHttp,
+      resolve: this.cfg.resolve,
+    });
   }
 
   private async email(target: string | null, n: Notice): Promise<string | null> {
@@ -374,11 +384,16 @@ export class MemoryNotificationStore implements NotificationStore {
     r.attempts += 1;
     if (status === "sent") r.sentAt = at;
   }
+  /** Newest notices across every stored channel, so a notice is listed even with the dashboard off (PR18-r1). */
   async feed(limit: number) {
-    const dash = this.rows.filter((r) => r.channel === "dashboard").sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit);
-    return dash.map((d) => ({
-      ...d.notice,
-      deliveries: this.rows.filter((r) => r.noticeId === d.noticeId).map((r) => ({ channel: r.channel, status: r.status, error: r.error })),
+    const seen = new Map<string, Notice>();
+    for (const r of [...this.rows].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || (a.noticeId < b.noticeId ? -1 : 1))) {
+      if (!seen.has(r.noticeId)) seen.set(r.noticeId, r.notice);
+      if (seen.size === limit) break;
+    }
+    return [...seen.values()].map((n) => ({
+      ...n,
+      deliveries: this.rows.filter((r) => r.noticeId === n.id).map((r) => ({ channel: r.channel, status: r.status, error: r.error })),
     }));
   }
 }
@@ -449,16 +464,29 @@ export class PrismaNotificationStore implements NotificationStore {
     });
   }
 
+  /**
+   * Newest `limit` notices across every channel (PR18-r1: not only dashboard rows). A notice has at
+   * most one row per channel and all its rows share `created_at`, so the newest `limit × channels`
+   * rows, ordered by (created_at, notice_id), contain every row of the newest `limit` notices.
+   */
   async feed(limit: number) {
     return this.tx(async (tx) => {
-      const dash = await tx.notification.findMany({ where: { channel: "dashboard", noticeId: { not: null } }, orderBy: { createdAt: "desc" }, take: limit });
-      if (dash.length === 0) return [];
-      const ids = dash.map((d: any) => d.noticeId);
-      const all = await tx.notification.findMany({ where: { noticeId: { in: ids } }, select: { noticeId: true, channel: true, status: true, error: true } });
-      return dash.map((d: any) => ({
-        ...noticeFromRow(d),
-        deliveries: all.filter((r: any) => r.noticeId === d.noticeId).map((r: any) => ({ channel: r.channel, status: r.status, error: r.error ?? null })),
-      }));
+      const recent = await tx.notification.findMany({
+        where: { noticeId: { not: null } },
+        orderBy: [{ createdAt: "desc" }, { noticeId: "asc" }],
+        take: limit * CHANNELS.length,
+        select: { noticeId: true },
+      });
+      const ids = [...new Set(recent.map((r: any) => r.noticeId as string))].slice(0, limit);
+      if (ids.length === 0) return [];
+      const rows = await tx.notification.findMany({ where: { noticeId: { in: ids } } });
+      return ids.map((id) => {
+        const mine = rows.filter((r: any) => r.noticeId === id);
+        return {
+          ...noticeFromRow(mine[0]),
+          deliveries: mine.map((r: any) => ({ channel: r.channel, status: r.status, error: r.error ?? null })),
+        };
+      });
     });
   }
 }

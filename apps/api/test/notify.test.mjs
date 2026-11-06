@@ -19,6 +19,7 @@ import {
   signBell,
 } from "../dist/notify.js";
 import { SECRET_NAMES } from "../dist/vault.js";
+import { isPublicAddress } from "../dist/bell.js";
 import { buildMessage, encodeHeader, parseSmtpConfig, sendMail } from "../dist/smtp.js";
 
 const KK = "kk@example.com";
@@ -311,7 +312,7 @@ test("M1.6 AT4: a failing channel is recorded with a fixed code and never stops 
     const n3 = notifierWith(store3, null, null);
     await store3.setChannel("mybrain", { target: `http://127.0.0.1:${redir.address().port}/bell` }, { action: "x", summary: "x", details: {} });
     const r3 = await n3.notify(parseNotice({ kind: "info", title: "Redirect" }));
-    assert.equal(r3.deliveries.find((d) => d.channel === "mybrain").error, "mybrain-network");
+    assert.equal(r3.deliveries.find((d) => d.channel === "mybrain").error, "mybrain-http-302", "a redirect is not followed");
     redir.close();
     // An SMTP server that never greets ends at the deadline.
     const mute = net.createServer(() => {});
@@ -501,3 +502,106 @@ test("M1.6 AT10: every Prisma store method runs in a bounded transaction; the ch
   assert.ok(opts.every((o) => o.timeout === 1234 && o.maxWait === 1234));
   assert.deepEqual(calls.slice(1, 3), [{ timeout: 1234, maxWait: 1234 }, "audit"]);
 });
+
+test("M1.6 AT13 (PR18-r1): notify() itself validates every notice; nothing is stored or sent for an invalid one", async () => {
+  const bell = await stubBell();
+  const store = new MemoryNotificationStore();
+  await store.setChannel("mybrain", { target: bell.url }, { action: "x", summary: "x", details: {} });
+  const n = notifierWith(store, bell, null);
+  try {
+    const base = { kind: "info", title: "T", body: "", reasons: [], projectId: null, approvalId: null };
+    for (const [input, code] of [
+      [{ ...base, body: "password: hunter22" }, "notice-contains-secret"],
+      [{ ...base, kind: "standard_selection" }, "missing:reasons"],
+      [{ ...base, title: "" }, "invalid:title"],
+      [{ ...base, kind: "spam" }, "invalid:kind"],
+    ]) {
+      await assert.rejects(n.notify(input), (e) => e.code === code, code);
+    }
+    assert.equal(store.rows.length, 0);
+    assert.equal(bell.received.length, 0);
+  } finally {
+    bell.close();
+  }
+});
+
+test("M1.6 AT14 (PR18-r1): the bell never connects to a private address, whatever the name resolves to", async () => {
+  for (const ip of ["10.0.0.5", "127.0.0.1", "169.254.169.254", "100.100.100.100", "172.16.1.1", "192.168.1.1", "0.0.0.0", "::1", "fd7a:115c:a1e0::1", "fe80::1", "::ffff:10.0.0.1", "::ffff:7f00:1"]) {
+    assert.equal(isPublicAddress(ip), false, ip);
+  }
+  for (const ip of ["93.184.216.34", "2606:4700::1111", "::ffff:93.184.216.34"]) assert.equal(isPublicAddress(ip), true, ip);
+  for (const t of ["https://localhost./bell", "https://x.localhost/bell"]) {
+    assert.equal(checkBellUrl(t), "invalid:target-host", t);
+  }
+  // A public-looking name that resolves to a private or mixed answer is refused before connecting.
+  let connected = 0;
+  const trap = http.createServer((_q, res) => (connected++, res.end()));
+  await new Promise((ok) => trap.listen(0, "127.0.0.1", ok));
+  try {
+    for (const answer of [[{ address: "10.0.0.5", family: 4 }], [{ address: "93.184.216.34", family: 4 }, { address: "127.0.0.1", family: 4 }], []]) {
+      const store = new MemoryNotificationStore();
+      await store.setChannel("mybrain", { target: `https://bell.example.com:${trap.address().port}/x` }, { action: "x", summary: "x", details: {} });
+      await store.setChannel("email", { enabled: false }, { action: "x", summary: "x", details: {} });
+      const n = new Notifier(store, { secrets: VAULT, smtp: null, dashboardUrl: null, timeoutMs: 1000, resolve: async () => answer });
+      const r = await n.notify(parseNotice({ kind: "info", title: "x" }));
+      assert.equal(r.deliveries.find((d) => d.channel === "mybrain").error, answer.length ? "mybrain-blocked-address" : "mybrain-dns");
+    }
+    assert.equal(connected, 0);
+    // The connection is pinned to the checked address: a resolver answer is the only address used.
+    const pinned = new Notifier(new MemoryNotificationStore(), { secrets: VAULT, smtp: null, dashboardUrl: null, timeoutMs: 1000, allowLoopbackHttp: true, resolve: async () => [{ address: "127.0.0.1", family: 4 }] });
+    await pinned.store.setChannel("mybrain", { target: `http://localhost:${trap.address().port}/x` }, { action: "x", summary: "x", details: {} });
+    await pinned.store.setChannel("email", { enabled: false }, { action: "x", summary: "x", details: {} });
+    const ok = await pinned.notify(parseNotice({ kind: "info", title: "x" }));
+    assert.equal(ok.deliveries.find((d) => d.channel === "mybrain").status, "sent");
+    assert.equal(connected, 1);
+  } finally {
+    trap.close();
+  }
+});
+
+test("M1.6 AT15 (PR18-r1): a delivery outcome that cannot be stored is a 503, never a 201", async () => {
+  const bell = await stubBell();
+  const store = new MemoryNotificationStore();
+  await store.setChannel("mybrain", { target: bell.url }, { action: "x", summary: "x", details: {} });
+  await store.setChannel("email", { enabled: false }, { action: "x", summary: "x", details: {} });
+  store.record = async () => {
+    throw new Error("db down: secret detail");
+  };
+  const s = await start({ notifier: notifierWith(store, bell, null) });
+  try {
+    const api = await kk(s.port);
+    const r = await api.post("/notifications/test");
+    assert.equal(r.status, 503);
+    assert.equal(r.json.code, "notifications-store-error");
+    assert.ok(!r.text.includes("secret detail"));
+    await assert.rejects(notifierWith(store, bell, null).notify(parseNotice({ kind: "info", title: "x" })), /notifications-store-error/);
+  } finally {
+    await s.app.close();
+    bell.close();
+  }
+});
+
+test("M1.6 AT16 (PR18-r1): with the dashboard channel off, notices and failed deliveries still appear in the feed", async () => {
+  const store = new MemoryNotificationStore();
+  await store.setChannel("dashboard", { enabled: false }, { action: "x", summary: "x", details: {} });
+  await store.setChannel("mybrain", { target: "https://my-brain.accelr8.in/api/devos/bell" }, { action: "x", summary: "x", details: {} });
+  const n = new Notifier(store, { secrets: null, smtp: null, dashboardUrl: null, timeoutMs: 1000 });
+  const first = await n.notify(parseNotice({ kind: "info", title: "one" }));
+  const second = await n.notify(parseNotice({ kind: "info", title: "two" }));
+  const feed = await store.feed(50);
+  assert.deepEqual(new Set(feed.map((f) => f.id)), new Set([first.notice.id, second.notice.id]));
+  for (const f of feed) {
+    assert.deepEqual(f.deliveries.map((d) => [d.channel, d.status, d.error]).sort(), [["email", "failed", "email-not-configured"], ["mybrain", "failed", "mybrain-not-configured"]]);
+  }
+  assert.equal((await store.feed(1)).length, 1);
+  // Prisma feed: groups across channels, newest first, bounded.
+  const rows = [
+    { noticeId: "b", channel: "mybrain", status: "sent", error: null, kind: "info", title: "B", body: "", reasons: [], createdAt: new Date(2) },
+    { noticeId: "b", channel: "email", status: "failed", error: "email-timeout", kind: "info", title: "B", body: "", reasons: [], createdAt: new Date(2) },
+    { noticeId: "a", channel: "email", status: "sent", error: null, kind: "info", title: "A", body: "", reasons: [], createdAt: new Date(1) },
+  ];
+  const tx = { notification: { findMany: async (q) => (q.select ? rows.slice(0, q.take) : rows.filter((r) => q.where.noticeId.in.includes(r.noticeId))) } };
+  const pfeed = await new PrismaNotificationStore({ $transaction: async (fn) => fn(tx) }, 1000).feed(50);
+  assert.deepEqual(pfeed.map((f) => [f.id, f.deliveries.length]), [["b", 2], ["a", 1]]);
+});
+

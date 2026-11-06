@@ -46,6 +46,18 @@ test("M1.6 AT11: notices, deliveries, feed and channel settings on Postgres", as
   await assert.rejects(store.create(notice({ kind: "spam" }), ["dashboard"], new Date()), "unknown kind refused");
   await assert.rejects(store.create(notice({ title: "x".repeat(121) }), ["dashboard"], new Date()), "long title refused");
   await assert.rejects(store.record(n.id, "email", "failed", "Upstream said: 550 user unknown", new Date()), "free-text error refused");
+  // PR18-r1: a notice row without a kind, body or reasons array is refused (CHECK cannot pass on NULL).
+  // Raw SQL, so the database check (not Prisma's input validation) is what refuses each row.
+  for (const [kind, body, reasons] of [["NULL", "''", "'[]'"], ["'info'", "''", "NULL"], ["'info'", "NULL", "'[]'"], ["'info'", "''", `'{"not":"array"}'`]]) {
+    await assert.rejects(
+      db.$executeRawUnsafe(`INSERT INTO "notification" ("id", "notice_id", "kind", "title", "body", "reasons", "channel", "updated_at") VALUES (gen_random_uuid(), gen_random_uuid(), ${kind}, 't', ${body}, ${reasons}::jsonb, 'dashboard', now())`),
+      `${kind} ${body} ${reasons}`,
+    );
+  }
+  // The feed lists a notice that has no dashboard row (dashboard channel off).
+  const quiet = notice();
+  await store.create(quiet, ["email"], new Date());
+  assert.ok((await store.feed(50)).some((f) => f.id === quiet.id && f.deliveries.length === 1));
 
   // Channel settings: upsert + audit in one transaction
   const before = await db.auditEvent.count({ where: { action: "notification.channel.updated" } });

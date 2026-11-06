@@ -12,13 +12,14 @@ ALTER TABLE "notification" ADD COLUMN "project_id" UUID;
 ALTER TABLE "notification" ADD CONSTRAINT "notification_project_id_fkey"
   FOREIGN KEY ("project_id") REFERENCES "project"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
--- A notice row carries a known kind and a title; limits match the API's validation.
+-- A notice row carries a known kind, a title, a body and an array of reasons (all NOT NULL: a CHECK
+-- that evaluates to UNKNOWN passes, PR18-r1); limits match the API's validation.
 ALTER TABLE "notification" ADD CONSTRAINT "notification_notice_shape" CHECK (
   "notice_id" IS NULL OR (
-    "kind" IN ('test', 'standard_selection', 'approval', 'info')
+    "kind" IS NOT NULL AND "kind" IN ('test', 'standard_selection', 'approval', 'info')
     AND "title" IS NOT NULL AND char_length("title") BETWEEN 1 AND 120
-    AND ("body" IS NULL OR char_length("body") <= 2000)
-    AND ("reasons" IS NULL OR jsonb_typeof("reasons") = 'array')
+    AND "body" IS NOT NULL AND char_length("body") <= 2000
+    AND "reasons" IS NOT NULL AND jsonb_typeof("reasons") = 'array'
   )
 ) NOT VALID;
 -- The stored delivery error is a fixed code, never a transport message.

@@ -1,7 +1,7 @@
 // M1.6 routes (docs/modules/M1.6.md). All `session` (deny by default); writes pass M1.2's CSRF checks.
 import { Body, Controller, Get, HttpCode, Inject, Param, Post, Put } from "@nestjs/common";
 import { httpError } from "./auth.js";
-import { NOTIFY, parseChannelPatch, type Notifier } from "./notify.js";
+import { NOTIFY, NoticeError, parseChannelPatch, type Notifier } from "./notify.js";
 
 export interface NotifyServices {
   notifier: Notifier | null;
@@ -14,6 +14,7 @@ async function guarded<T>(fn: () => Promise<T>): Promise<T> {
     return await fn();
   } catch (e) {
     if (e instanceof Error && "getStatus" in e) throw e;
+    if (e instanceof NoticeError) throw httpError(400, e.code);
     // A store or driver message is never returned or logged.
     throw httpError(503, "notifications-store-error");
   }
