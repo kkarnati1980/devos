@@ -16,7 +16,7 @@ const KK = { identity: { id: "kk:kk@kiot.io", type: "kk" }, tailscaleLogin: "kk@
 const AGENT = { id: "agent:builder:run-1", type: "agent", roles: ["builder"] };
 
 async function project() {
-  const slug = `policy-${randomUUID()}`;
+  const slug = `policy-${randomBytes(8).toString("hex")}`;
   return (await db.project.create({ data: { slug, name: slug } })).id;
 }
 
