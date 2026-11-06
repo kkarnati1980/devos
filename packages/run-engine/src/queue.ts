@@ -37,6 +37,13 @@ export interface RunQueueOptions {
   concurrency?: number;
   /** Deadline for each public queue operation (ms, default 10 s; ADR-0011). */
   opTimeoutMs?: number;
+  /**
+   * R2: BullMQ job lock and stalled-job check (ms; BullMQ defaults 30 s / 30 s). A worker killed without
+   * a drain leaves its job active until the lock expires and a stalled check moves it back; shorter
+   * values let a killed run resume sooner (the worker uses 15 s / 5 s).
+   */
+  lockDurationMs?: number;
+  stalledIntervalMs?: number;
 }
 
 /** Reject after `ms` (the Redis call itself is abandoned; ioredis keeps the socket). */
@@ -110,6 +117,8 @@ export class RunQueue {
       {
         connection: this.client(),
         concurrency: this.opts.concurrency ?? 1,
+        ...(this.opts.lockDurationMs ? { lockDuration: this.opts.lockDurationMs } : {}),
+        ...(this.opts.stalledIntervalMs ? { stalledInterval: this.opts.stalledIntervalMs } : {}),
         settings: { backoffStrategy: (attemptsMade: number) => backoffDelay(attemptsMade, backoff) },
       },
     );

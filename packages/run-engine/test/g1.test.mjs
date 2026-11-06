@@ -188,3 +188,14 @@ test("AT4 the helper prints codes, never values", async () => {
   assert.equal(v.out.reason, "config-database-url-required");
   assert.ok(!JSON.stringify(v.out).includes("mysql"));
 });
+
+test("AT5 PR21: a killed worker's job resumes quickly: lock 15 s and stalled check 5 s reach the BullMQ worker", async () => {
+  const { LOCK_DURATION_MS, STALLED_INTERVAL_MS } = await import("../dist/worker-main.js");
+  assert.ok(LOCK_DURATION_MS >= 3 * STALLED_INTERVAL_MS && LOCK_DURATION_MS + STALLED_INTERVAL_MS <= 30_000);
+  const { RunQueue } = await import("../dist/queue.js");
+  const q = new RunQueue({ redisUrl: "redis://127.0.0.1:1", lockDurationMs: LOCK_DURATION_MS, stalledIntervalMs: STALLED_INTERVAL_MS, opTimeoutMs: 500 });
+  const w = q.start({ execute: async () => ({}) });
+  assert.equal(w.opts.lockDuration, LOCK_DURATION_MS);
+  assert.equal(w.opts.stalledInterval, STALLED_INTERVAL_MS);
+  await q.close().catch(() => undefined);
+});

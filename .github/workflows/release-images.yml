@@ -102,7 +102,24 @@ jobs:
           c=scripts/server/checks
           expect 3 bash "$c/caps-saved.sh" || exit 1          # caps not confirmed yet (before H9)
           expect 3 bash "$c/receipt-chain.sh" || exit 1       # no receipt written yet
-          expect 0 bash "$c/run-resume.sh" || exit 1          # probe run killed mid-run and resumed
+          if ! expect 0 bash "$c/run-resume.sh"; then        # probe run killed mid-run and resumed
+            # Diagnostics (CI throwaway data only): the probe run's timeline and the queue job's state.
+            q() { docker compose exec -T postgres psql -U devos -d devos -P pager=off -c "$1"; }
+            q "select e.seq, e.ts, e.type, e.payload->>'state' as state, e.payload->>'turn' as turn from run_event e join run r on r.id = e.run_id where r.model = 'devos-g1-probe' order by e.seq"
+            q "select c.seq, c.created_at, c.data->>'turn' as turn, c.data->'state'->'ending'->>'step' as ending_step from checkpoint c join run r on r.id = c.run_id where r.model = 'devos-g1-probe' order by c.seq"
+            q "select type, message, retryable, created_at from run_error e join run r on r.id = e.run_id where r.model = 'devos-g1-probe'"
+            q "select status, reserved_usd, actual_usd, created_at, updated_at from budget_reservation b join run r on r.id = b.run_id where r.model = 'devos-g1-probe'"
+            for k in $(docker compose exec -T redis redis-cli --scan --pattern 'bull:devos-runs:*' | grep -v ':events$' | sort); do
+              echo "== $k ($(docker compose exec -T redis redis-cli type "$k" | tr -d '\r'))"
+              case "$(docker compose exec -T redis redis-cli type "$k" | tr -d '\r')" in
+                hash) docker compose exec -T redis redis-cli hgetall "$k" | grep -v '^{"runId"' | head -40 ;;
+                list) docker compose exec -T redis redis-cli lrange "$k" 0 -1 ;;
+                zset) docker compose exec -T redis redis-cli zrange "$k" 0 -1 withscores ;;
+                set) docker compose exec -T redis redis-cli smembers "$k" ;;
+              esac
+            done
+            exit 1
+          fi
           expect 0 bash "$c/receipt-chain.sh" || exit 1       # the probe's receipts verify
           docker compose exec -T postgres psql -U devos -d devos -v ON_ERROR_STOP=1 -qc \
             "insert into app_settings (singleton, caps_confirmed_at, updated_at) values (true, now(), now()) on conflict (singleton) do update set caps_confirmed_at = now()"

@@ -16,6 +16,13 @@ export const MIN_HMAC_KEY_BYTES = 32;
  * `stop_grace_period: 60s`, so the drain ends before Docker sends SIGKILL.
  */
 export const DRAIN_TIMEOUT_MS = 50_000;
+/**
+ * R2: a worker killed without a drain (OOM, host restart, the G1 `run-resume` check) leaves its job
+ * active until the BullMQ lock expires; a stalled check then moves it back and the run resumes from its
+ * checkpoint. 15 s / 5 s bounds that to about 20 s (BullMQ's 30 s / 30 s took up to ~90 s in CI).
+ */
+export const LOCK_DURATION_MS = 15_000;
+export const STALLED_INTERVAL_MS = 5_000;
 
 export interface WorkerConfig {
   databaseUrl: string;
@@ -101,7 +108,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<{ stop
   const db = createDb(cfg.databaseUrl);
   const policy = new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: cfg.hmacKey }) as unknown as PolicyLike;
   const engine = new RunEngine({ store: new PrismaRunStore(db), policy, adapterFor: probeGated({}) });
-  const queue = new RunQueue({ redisUrl: cfg.redisUrl, concurrency: cfg.concurrency, opTimeoutMs: DRAIN_TIMEOUT_MS });
+  const queue = new RunQueue({ redisUrl: cfg.redisUrl, concurrency: cfg.concurrency, opTimeoutMs: DRAIN_TIMEOUT_MS, lockDurationMs: LOCK_DURATION_MS, stalledIntervalMs: STALLED_INTERVAL_MS });
   queue.start(engine);
   log("info", "worker-started", { concurrency: cfg.concurrency });
 
