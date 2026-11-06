@@ -33,6 +33,10 @@ jobs:
             echo "DEVOS_KK_LOGIN=ci@example.com"
             echo "DEVOS_ALLOWED_ORIGINS=http://127.0.0.1:3000"
             echo "DEVOS_COOKIE_SECURE=0"
+            # PR20-r2: email on with only host and sender, so the api must start on its SMTP defaults
+            # (port and security unset). Nothing is sent during the smoke test.
+            echo "DEVOS_SMTP_HOST=smtp.example.com"
+            echo "DEVOS_SMTP_FROM=devos@example.com"
             echo "DEVOS_TLS_DIR=$RUNNER_TEMP/tls"
             echo "DEVOS_TAILSCALE_SOCKET_HOST=$RUNNER_TEMP/tailscaled.sock"
           } >> "$GITHUB_ENV"

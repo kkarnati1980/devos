@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
-import { databaseUrl } from "../../deploy/with-db-url.mjs";
+import { childEnv, databaseUrl } from "../../deploy/with-db-url.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const composeText = readFileSync(`${root}deploy/compose.yaml`, "utf8");
@@ -134,4 +134,25 @@ test("AT3 PR20-r1: with-db-url passes DATABASE_URL to the command, drops the raw
 
 test("AT4 PR20-r1: the worker's stop grace period covers the drain budget", () => {
   assert.equal(compose.services.worker.stop_grace_period, "60s");
+});
+
+// PR20-r2: an unset optional setting reaches the service as unset, not as an empty string.
+test("AT3 PR20-r2: empty DEVOS_* settings are removed before the service starts; set ones are kept", () => {
+  const env = childEnv({ PATH: "/bin", POSTGRES_PASSWORD: "x", DEVOS_SMTP_PORT: "", DEVOS_SMTP_SECURITY: "", DEVOS_SMTP_HOST: "smtp.example.com", DEVOS_COOKIE_SECURE: "1", OTHER: "" }, "postgresql://u@h/d");
+  assert.equal("DEVOS_SMTP_PORT" in env, false);
+  assert.equal("DEVOS_SMTP_SECURITY" in env, false);
+  assert.equal(env.DEVOS_SMTP_HOST, "smtp.example.com");
+  assert.equal(env.DEVOS_COOKIE_SECURE, "1");
+  assert.equal(env.OTHER, "", "only DEVOS_* settings are normalised");
+  assert.equal("POSTGRES_PASSWORD" in env, false);
+  assert.equal(env.DATABASE_URL, "postgresql://u@h/d");
+});
+
+test("AT3 PR20-r2: every optional DEVOS_* setting in compose defaults to empty (= unset), never to a guessed value", () => {
+  for (const s of ["api", "worker", "dashboard"]) {
+    for (const [k, v] of Object.entries(compose.services[s].environment ?? {})) {
+      if (!k.startsWith("DEVOS_") || k === "DEVOS_COOKIE_SECURE" || k === "DEVOS_TAILSCALE_SOCKET") continue;
+      assert.match(String(v), /^\$\{[A-Z0-9_]+(:\?[^}]*|:-)\}$/, `${s}.${k}`);
+    }
+  }
 });
