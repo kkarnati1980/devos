@@ -33,6 +33,9 @@ export interface CodexAdapterOptions {
   env?: Record<string, string>;
 }
 
+/** Flags that would change Codex's sandbox or approvals; never accepted from callers. */
+const SANDBOX_FLAGS = ["--sandbox", "-s", "--full-auto", "--dangerously-bypass-approvals-and-sandbox", "--yolo", "-a", "--ask-for-approval", "-c", "--config", "--profile", "-p"];
+
 const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
 
 export class CodexExecAdapter implements RunAdapter {
@@ -45,9 +48,15 @@ export class CodexExecAdapter implements RunAdapter {
 
   constructor(private readonly opts: CodexAdapterOptions) {}
 
-  async start(task: RunTask, _envelope: CapabilityEnvelope | null): Promise<void> {
+  async start(task: RunTask, envelope: CapabilityEnvelope | null): Promise<void> {
     if (this.child) throw new RunFailure("internal", "adapter already started", false);
-    const args = [...(this.opts.scriptArgs ?? []), "exec", "--json", ...(this.opts.args ?? []), "--model", task.model, "-"];
+    // D1: Codex reviews read-only. The sandbox is fixed here, whatever the installed CLI config says,
+    // and no caller argument may change it or the approval policy.
+    const extra = this.opts.args ?? [];
+    const bad = extra.find((a) => SANDBOX_FLAGS.some((f) => a === f || a.startsWith(`${f}=`)) || /sandbox|approval/i.test(a));
+    if (bad !== undefined) this.refuse(new RunFailure("policy_denied", "codex-arg-not-allowed", false));
+    if (envelope && envelope.writePaths.length > 0) this.refuse(new RunFailure("policy_denied", "codex-review-is-read-only", false));
+    const args = [...(this.opts.scriptArgs ?? []), "exec", "--json", "--sandbox", "read-only", ...extra, "--model", task.model, "-"];
     const child = spawn(this.opts.bin ?? "codex", args, {
       cwd: task.cwd,
       detached: true,
@@ -59,7 +68,7 @@ export class CodexExecAdapter implements RunAdapter {
       child.once("spawn", () => resolve());
       child.once("error", (e) => reject(new RunFailure("sandbox_error", `spawn-failed:${(e as NodeJS.ErrnoException).code ?? "error"}`, false)));
     });
-    await spawned;
+    await spawned.catch((e: RunFailure) => this.refuse(e));
     child.stdin?.end(task.prompt);
     child.stderr?.resume(); // stderr is not parsed (may hold provider text); drained so the child never blocks.
     void this.pump(child, task);
@@ -133,6 +142,13 @@ export class CodexExecAdapter implements RunAdapter {
     }
     this.queue.end();
     this.done.resolve(result);
+  }
+
+  /** The runtime never ran: end the stream and the result, then throw to the caller. */
+  private refuse(e: RunFailure): never {
+    this.queue.end();
+    this.done.resolve({ status: "failed", costUsd: 0, costEstimated: false, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, error: { type: e.type, message: e.message, retryable: e.retryable } });
+    throw e;
   }
 
   events(): AsyncIterable<AdapterEvent> {

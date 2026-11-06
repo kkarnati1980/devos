@@ -134,6 +134,8 @@ export class RunQueue {
       (async () => {
         const job = await this.queue.getJob(jobId);
         if (!job || !(await job.isFailed())) return false;
+        // KK's explicit retry: the engine reruns a run whose last attempt failed for good.
+        await job.updateData({ ...(job.data as RunInput), rerun: true });
         await job.retry("failed");
         return true;
       })(),
@@ -142,9 +144,19 @@ export class RunQueue {
     );
   }
 
+  /** Close within the deadline; the Redis sockets are dropped either way. */
   async close(): Promise<void> {
-    await this.worker?.close();
-    await this.queue.close();
-    for (const c of this.clients) c.disconnect();
+    try {
+      await deadline(
+        (async () => {
+          await this.worker?.close();
+          await this.queue.close();
+        })(),
+        this.ms,
+        "close",
+      );
+    } finally {
+      for (const c of this.clients) c.disconnect();
+    }
   }
 }

@@ -3,7 +3,8 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { RunQueue } from "../dist/index.js";
+import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
+import { ClaudeAgentSdkAdapter, MemoryRunStore, RunEngine, RunQueue } from "../dist/index.js";
 
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) throw new Error("REDIS_URL is required for test:db");
@@ -84,5 +85,44 @@ test("Queue: public operations time out when Redis is unreachable (ADR-0011)", a
   await assert.rejects(q.deadLetters(), /queue-dead-letters-timeout/);
   await assert.rejects(q.retryDead("x"), /queue-retry-timeout/);
   assert.ok(Date.now() - t0 < 3000);
-  await Promise.race([q.close().catch(() => {}), new Promise((r) => setTimeout(r, 500))]);
+  const c0 = Date.now();
+  await q.close().catch(() => {});
+  assert.ok(Date.now() - c0 < 2000, "close is bounded too");
+});
+
+test("Queue + real RunEngine: a retryable failure is retried to success; a final failure is dead-lettered and rerun by retryDead", async () => {
+  const store = new MemoryRunStore();
+  const policy = new PolicyEngine({ store: new MemoryPolicyStore(), hmacKey: randomBytes(32) });
+  const row = (id) => ({ id, taskId: "t", projectId: "p", role: "builder", model: "m", attempt: 1, status: "queued", maxTurns: 10, maxSeconds: 60, maxCostUsd: 5, turns: 0 });
+  store.runs.set("rq-1", row("rq-1"));
+  store.runs.set("rq-2", row("rq-2"));
+  const calls = { "rq-1": 0, "rq-2": 0 };
+  let finalBroken = true;
+  const query = ({ options }) => {
+    const id = options.cwd;
+    calls[id] += 1;
+    return (async function* () {
+      if (id === "rq-1" && calls[id] === 1) throw Object.assign(new Error("rate"), { status: 429 });
+      if (id === "rq-2" && finalBroken) throw Object.assign(new Error("bad"), { status: 400 });
+      yield { type: "system", session_id: "s" };
+      yield { type: "result", subtype: "success", total_cost_usd: 0.01 };
+    })();
+  };
+  const engine = new RunEngine({ store, policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query }) });
+  const q = new RunQueue({ redisUrl, name: `m15-${randomBytes(4).toString("hex")}`, attempts: 3, backoff: { baseMs: 10, maxMs: 20 } });
+  queues.push(q);
+  q.start(engine);
+  const j1 = await q.enqueue({ runId: "rq-1", provider: "anthropic", prompt: "x", cwd: "rq-1" });
+  await until(async () => (await q.queue.getJobState(j1)) === "completed");
+  assert.equal(calls["rq-1"], 2, "retried once, then succeeded");
+  assert.equal(store.finished.get("rq-1").status, "succeeded");
+
+  const j2 = await q.enqueue({ runId: "rq-2", provider: "anthropic", prompt: "x", cwd: "rq-2" });
+  await until(async () => (await q.deadLetters()).some((d) => d.jobId === j2));
+  assert.equal(calls["rq-2"], 1, "a non-retryable failure is never retried");
+  finalBroken = false;
+  assert.equal(await q.retryDead(j2), true);
+  await until(async () => (await q.queue.getJobState(j2)) === "completed");
+  assert.equal(calls["rq-2"], 2, "the dead-letter retry reran the runtime");
+  assert.equal(store.finished.get("rq-2").status, "succeeded");
 });

@@ -111,7 +111,13 @@ export class MemoryRunStore implements RunStore {
   async addTelemetry(runId: string, usage: TurnUsage) {
     this.telemetry.push({ runId, ...usage });
   }
+  /** Test hook: throw on the next n addCost calls. */
+  failAddCostTimes = 0;
   async addCost(row: CostRow) {
+    if (this.failAddCostTimes > 0) {
+      this.failAddCostTimes -= 1;
+      throw new Error("store-down");
+    }
     this.costs.push({ ...row });
   }
   async recordError(runId: string, type: RunErrorType, message: string, retryable: boolean, countsAsAttempt: boolean) {

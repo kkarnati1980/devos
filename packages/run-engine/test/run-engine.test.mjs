@@ -23,10 +23,11 @@ function setup({ budgets = [], maxTurns = 50, maxSeconds = 600, maxCostUsd = 5 }
 }
 
 /** A fake Agent SDK `query`: n assistant turns with usage and a tool result, then a result message. */
-function fakeQuery({ turns = 2, cost = 0.12, hang = false, calls = [], throwAfter = false } = {}) {
+function fakeQuery({ turns = 2, cost = 0.12, hang = false, calls = [], throwAfter = false, failFirst = 0 } = {}) {
   return ({ prompt, options }) => {
     calls.push({ prompt, options });
     return (async function* () {
+      if (failFirst > 0 && calls.length <= failFirst) throw Object.assign(new Error("rate"), { status: 429 });
       yield { type: "system", subtype: "init", session_id: options.resume ?? "sess-1" };
       for (let t = 1; t <= turns; t++) {
         yield { type: "assistant", message: { model: "claude-sonnet", content: [{ type: "text", text: `t${t}` }, { type: "tool_use", id: `u${t}`, name: "Read", input: {} }], usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 10 } } };
@@ -45,8 +46,8 @@ function fakeQuery({ turns = 2, cost = 0.12, hang = false, calls = [], throwAfte
 }
 
 /** Codex adapter whose binary is `node fake-codex.mjs`. */
-function fakeCodexAdapter(mode, extra = {}) {
-  const a = new CodexExecAdapter({ bin: process.execPath, estimateUsd: 0.4, prices: { "gpt-codex": { input: 1, cachedInput: 0.1, output: 10 } }, env: { FAKE_CODEX_MODE: mode, ...extra }, killGraceMs: 1000, scriptArgs: [FAKE_CODEX] });
+function fakeCodexAdapter(mode, extra = {}, args) {
+  const a = new CodexExecAdapter({ ...(args ? { args } : {}), bin: process.execPath, estimateUsd: 0.4, prices: { "gpt-codex": { input: 1, cachedInput: 0.1, output: 10 } }, env: { FAKE_CODEX_MODE: mode, ...extra }, killGraceMs: 1000, scriptArgs: [FAKE_CODEX] });
   return a;
 }
 
@@ -370,4 +371,74 @@ test("r1-6 Codex telemetry carries the turn's command-output bytes and tool name
   c.store.runs.get(c.runId).model = "gpt-codex";
   await new RunEngine({ store: c.store, policy: c.policy, adapterFor: () => fakeCodexAdapter("ok") }).execute({ runId: c.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4 });
   assert.deepEqual(c.store.telemetry.map((r) => [r.toolName, r.toolResultBytes]), [["shell", 100], ["shell", 200]]);
+});
+
+// ---- Codex PR16-r2 regressions ----
+
+test("r2-1 a retryable failure is rerun on the next execute; a final failure only with rerun (dead-letter retry)", async () => {
+  const s = setup();
+  const calls = [];
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ calls, failFirst: 1 }) }) });
+  const first = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(first.status, "failed");
+  assert.equal(first.errorType, "rate_limited");
+  assert.equal(first.retryable, true);
+  const second = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(second.status, "succeeded");
+  assert.equal(calls.length, 2, "the runtime ran again");
+  const evs = assertGapless(s.store, s.runId);
+  assert.deepEqual(evs.filter((e) => e.type === "done" || e.type === "error").map((e) => e.type), ["error", "done"]);
+  assert.ok(evs.some((e) => e.payload.state === "retrying"));
+
+  const t = setup();
+  const tcalls = [];
+  const bad = new RunEngine({ store: t.store, policy: t.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: (a) => { tcalls.push(a); return (async function* () { throw Object.assign(new Error("bad"), { status: 400 }); })(); } }) });
+  const f1 = await bad.execute({ runId: t.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(f1.retryable, false);
+  const f2 = await bad.execute({ runId: t.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(f2.status, "failed");
+  assert.equal(tcalls.length, 1, "a final failure is not rerun by a plain retry");
+  const ok = new RunEngine({ store: t.store, policy: t.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ calls: tcalls }) }) });
+  const f3 = await ok.execute({ runId: t.runId, provider: "anthropic", prompt: "x", cwd: ".", rerun: true });
+  assert.equal(f3.status, "succeeded");
+  assert.equal(tcalls.length, 2, "rerun: true (dead-letter retry) runs it again");
+});
+
+test("r2-2 a store failure during settlement resumes the bookkeeping, never the runtime; spend recorded once", async () => {
+  const s = setup();
+  const calls = [];
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ calls }) }) });
+  s.store.failAddCostTimes = 1;
+  await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }), /store-down/);
+  assert.equal(s.pstore.reservations[0].status, "reconciled", "settled before the failure");
+  const out = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(out.status, "succeeded");
+  assert.equal(calls.length, 1, "no rerun");
+  assert.equal(s.store.costs.length, 1);
+  assert.equal(s.store.costs[0].usd, 0.12);
+  assert.equal(s.pstore.reservations.length, 1, "no second reservation");
+  assert.equal(assertGapless(s.store, s.runId).filter((e) => e.type === "done").length, 1);
+});
+
+test("r2-3 Codex always runs with --sandbox read-only; sandbox/approval overrides and write envelopes are refused", async () => {
+  const s = setup();
+  s.store.runs.get(s.runId).model = "gpt-codex";
+  const argvfile = join(mkdtempSync(join(tmpdir(), "m15-")), "argv.json");
+  await new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => fakeCodexAdapter("ok", { FAKE_CODEX_ARGVFILE: argvfile }) }).execute({ runId: s.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4 });
+  const argv = JSON.parse(readFileSync(argvfile, "utf8"));
+  assert.equal(argv[argv.indexOf("--sandbox") + 1], "read-only");
+  assert.equal(argv.filter((a) => a === "--sandbox").length, 1);
+  for (const args of [["--sandbox", "workspace-write"], ["--full-auto"], ["-c", "sandbox_mode=danger-full-access"], ["--dangerously-bypass-approvals-and-sandbox"]]) {
+    const t = setup();
+    const t0 = Date.now();
+    const out = await new RunEngine({ store: t.store, policy: t.policy, adapterFor: () => fakeCodexAdapter("ok", {}, args) }).execute({ runId: t.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4 });
+    assert.equal(out.status, "failed", args.join(" "));
+    assert.equal(out.errorType, "policy_denied");
+    assert.equal(out.countsAsAttempt, false);
+    assert.ok(Date.now() - t0 < 3000, "refused at once");
+  }
+  const w = setup();
+  w.store.envelopes.set(w.runId, { tools: ["shell"], readPaths: ["src"], writePaths: ["src"], network: false, networkAllowList: null, maxCostUsd: 1, maxTokens: 2_000_000, maxConcurrency: 1, expiresAt: Date.now() + 60_000, depth: 1 });
+  const wo = await new RunEngine({ store: w.store, policy: w.policy, adapterFor: () => fakeCodexAdapter("ok") }).execute({ runId: w.runId, provider: "openai", prompt: "x", cwd: ".", reserveUsd: 0.4, reserveTokens: 1000 });
+  assert.equal(wo.errorType, "policy_denied");
 });
