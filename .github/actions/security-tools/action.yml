@@ -1,0 +1,30 @@
+# S2 — installs the pinned CI security tools and checks their SHA-256 (docs/modules/S2.md).
+# gitleaks 8.21.2 (MIT) and osv-scanner 1.9.1 (Apache-2.0): CI-only, never shipped or vendored.
+name: security-tools
+description: Install pinned gitleaks and osv-scanner with checksum verification
+runs:
+  using: composite
+  steps:
+    - name: Install gitleaks and osv-scanner (pinned, checksum-verified)
+      shell: bash
+      env:
+        GITLEAKS_VERSION: "8.21.2"
+        GITLEAKS_SHA256: "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba"
+        OSV_VERSION: "1.9.1"
+        OSV_SHA256: "c52d68f857d9aa6d6a2e98fcf0fda9e75307d59ee1fe1db26ffc588f1c5fda33"
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/s2-bin"
+        mkdir -p "$bin"
+        cd "$RUNNER_TEMP"
+        curl -fsSL --max-time 120 -o gitleaks.tgz \
+          "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+        echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+        tar -xzf gitleaks.tgz -C "$bin" gitleaks
+        curl -fsSL --max-time 120 -o "$bin/osv-scanner" \
+          "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+        echo "${OSV_SHA256}  $bin/osv-scanner" | sha256sum -c -
+        chmod +x "$bin/gitleaks" "$bin/osv-scanner"
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/gitleaks" version
+        "$bin/osv-scanner" --version

@@ -1,0 +1,68 @@
+# S2 — DevOS CI security gates (docs/modules/S2.md, ADR-0011 §8): secret scan, dependency vulnerabilities
+# (high/critical fail), licence report and check, plus a self-test proving each gate fails on a seeded fixture.
+name: security
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: ./.github/actions/security-tools
+      - name: AT7 secret scan of the full git history
+        run: node scripts/security/secret-scan.mjs .
+
+  vuln-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: ./.github/actions/security-tools
+      - name: AT7 dependency vulnerability scan (high/critical fail)
+        run: node scripts/security/vuln-scan.mjs pnpm-lock.yaml
+
+  licence-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: AT7 licence report and check (D13)
+        run: node scripts/security/licence-check.mjs
+
+  security-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: ./.github/actions/security-tools
+      - name: AT5 + AT6 seeded fake secret and pinned vulnerable package make their gates fail
+        run: node scripts/security/selftest.mjs

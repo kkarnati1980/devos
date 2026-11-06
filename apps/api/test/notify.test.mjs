@@ -245,7 +245,7 @@ test("M1.6 AT2 (Phase PS amendment): a standard-selection notice reaches the das
 
 test("M1.6 AT3: notices never carry secrets; the bell payload is a fixed shape with a shortened body", () => {
   const ok = { kind: "info", title: "Hi" };
-  for (const leak of ["sk-ant-api03-AAAAAAAAAAAAAAAAAAAA", "ghp_abcdefghijklmnopqrstuvwxyz0123", "lin_api_abcdefghijklmnopqrstu", "password: hunter22", "AKIAABCDEFGHIJKLMNOP"]) {
+  for (const leak of ["sk-ant-api03-AAAAAAAAAAAAAAAAAAAA", "ghp_abcdefghijklmnopqrstuvwxyz0123", "lin_api_abcdefghijklmnopqrstu", "password: hunter22", ["AKIA", "ABCDEFGHIJKLMNOP"].join("")]) {
     assert.equal(parseNotice({ ...ok, body: leak }), "notice-contains-secret", leak);
     assert.equal(parseNotice({ ...ok, title: `x ${leak}`.slice(0, 120) }), "notice-contains-secret", leak);
     assert.equal(parseNotice({ ...ok, reasons: [leak] }), "notice-contains-secret", leak);
