@@ -217,9 +217,8 @@ async function saveSettings(svc: SetupServices, body: unknown, requireCaps: bool
   const current = await guarded(() => settings.get(), "settings-store-error");
   const patch = parseAppSettings(body, current.maxLanes, requireCaps);
   if (typeof patch === "string") throw httpError(400, patch);
-  const saved = await guarded(() => settings.update(patch, new Date()), "settings-store-error");
-  await guarded(() => settings.audit("settings.updated", "Settings saved", { fields: Object.keys(patch) }), "settings-store-error");
-  return saved;
+  const audit = { action: "settings.updated", summary: "Settings saved", details: { fields: Object.keys(patch) } };
+  return guarded(() => settings.update(patch, new Date(), audit), "settings-store-error");
 }
 
 @Controller("settings")
@@ -253,10 +252,10 @@ export class ProjectSettingsController {
     const current = await guarded(() => settings.get(), "settings-store-error");
     const patch = parseProjectSettings(body, current.maxLanes);
     if (typeof patch === "string") throw httpError(400, patch);
-    const r = await guarded(() => settings.updateProject(id, patch), "settings-store-error");
+    const audit = { action: "project.settings.updated", summary: "Project settings saved", details: { fields: Object.keys(patch) }, projectId: id };
+    const r = await guarded(() => settings.updateProject(id, patch, audit), "settings-store-error");
     if (r === "not-found") throw httpError(404, "project-not-found");
     if (r === "archived") throw httpError(409, "project-archived");
-    await guarded(() => settings.audit("project.settings.updated", "Project settings saved", { fields: Object.keys(patch) }, id), "settings-store-error");
     return { project: r };
   }
 }
@@ -283,14 +282,8 @@ export class VaultController {
     const problem = checkSecretValue(b.value);
     if (problem) throw httpError(400, problem);
     const vault = ok(this.svc.vault, "vault-not-configured");
+    // The secret and its audit event commit in one transaction (PR17-r1).
     const { meta, rotated } = await guarded(() => vault.put(name, b.value as string), "vault-store-error");
-    if (this.svc.settings) {
-      const settings = this.svc.settings;
-      await guarded(
-        () => settings.audit(rotated ? "vault.secret.rotated" : "vault.secret.saved", `Secret ${name} ${rotated ? "rotated" : "saved"}`, { name, keyVersion: meta.keyVersion }),
-        "settings-store-error",
-      );
-    }
     return { secret: meta, rotated };
   }
 }

@@ -2,6 +2,7 @@
 // value once (AES-256-GCM under the server's vault key) and only ever returns its name, its last
 // 4 characters and its dates. Plaintext leaves this file only through `reveal`, which no route calls.
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { writeAudit, type AuditEntry } from "./settings.js";
 
 /** The secrets KK enters in the wizard (continuous-build amendment, 6 Nov 2026). Global, not per project. */
 export const SECRET_NAMES = [
@@ -52,8 +53,14 @@ export interface SealedSecret {
 }
 
 export interface VaultStore {
-  /** Inserts or replaces the global secret `name`; returns true when it replaced an existing value. */
-  upsert(row: Omit<SealedSecret, "createdAt" | "updatedAt">): Promise<{ row: SealedSecret; rotated: boolean }>;
+  /**
+   * Inserts or replaces the global secret `name` and, in the same transaction, writes the audit
+   * event `audit(rotated)` returns (PR17-r1): a failed audit rolls the secret back.
+   */
+  upsert(
+    row: Omit<SealedSecret, "createdAt" | "updatedAt">,
+    audit: (rotated: boolean) => AuditEntry,
+  ): Promise<{ row: SealedSecret; rotated: boolean }>;
   list(): Promise<SealedSecret[]>;
   get(name: string): Promise<SealedSecret | null>;
 }
@@ -95,7 +102,11 @@ export class Vault {
     const cipher = createCipheriv("aes-256-gcm", this.key, nonce);
     cipher.setAAD(aad(name, this.keyVersion));
     const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final(), cipher.getAuthTag()]);
-    const { row, rotated } = await this.store.upsert({ name, ciphertext, nonce, keyVersion: this.keyVersion, hint: value.slice(-4) });
+    const { row, rotated } = await this.store.upsert({ name, ciphertext, nonce, keyVersion: this.keyVersion, hint: value.slice(-4) }, (rotated) => ({
+      action: rotated ? "vault.secret.rotated" : "vault.secret.saved",
+      summary: `Secret ${name} ${rotated ? "rotated" : "saved"}`,
+      details: { name, keyVersion: this.keyVersion },
+    }));
     return { meta: toMeta(name, row), rotated };
   }
 
@@ -139,12 +150,16 @@ function toMeta(name: SecretName, row: SealedSecret | null): SecretMeta {
   };
 }
 
-/** In-memory store for tests and local runs without a database. */
+/** In-memory store for tests and local runs without a database. `failAudit` simulates an audit failure. */
 export class MemoryVaultStore implements VaultStore {
   readonly rows = new Map<string, SealedSecret>();
+  readonly audits: AuditEntry[] = [];
+  failAudit = false;
   constructor(private readonly now: () => number = Date.now) {}
-  async upsert(r: Omit<SealedSecret, "createdAt" | "updatedAt">) {
+  async upsert(r: Omit<SealedSecret, "createdAt" | "updatedAt">, audit: (rotated: boolean) => AuditEntry) {
     const prev = this.rows.get(r.name);
+    if (this.failAudit) throw new Error("audit insert failed");
+    this.audits.push(audit(prev !== undefined));
     const t = new Date(this.now());
     const row: SealedSecret = { ...r, createdAt: prev?.createdAt ?? t, updatedAt: t };
     this.rows.set(r.name, row);
@@ -168,22 +183,29 @@ export class PrismaVaultStore implements VaultStore {
     private readonly db: any,
     private readonly timeoutMs: number,
   ) {}
-  async upsert(r: Omit<SealedSecret, "createdAt" | "updatedAt">) {
-    return this.db.$transaction(async (tx: any) => {
+  private tx<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+    return this.db.$transaction(fn, { timeout: this.timeoutMs, maxWait: this.timeoutMs });
+  }
+  async upsert(r: Omit<SealedSecret, "createdAt" | "updatedAt">, audit: (rotated: boolean) => AuditEntry) {
+    return this.tx(async (tx: any) => {
       const prev = await tx.vaultSecret.findFirst({ where: { projectId: null, name: r.name }, select: { id: true } });
       const data = { ciphertext: r.ciphertext, nonce: r.nonce, keyVersion: r.keyVersion, hint: r.hint };
       const row = prev
         ? await tx.vaultSecret.update({ where: { id: prev.id }, data })
         : await tx.vaultSecret.create({ data: { name: r.name, projectId: null, ...data } });
+      await writeAudit(tx, audit(Boolean(prev)));
       return { row: fromRow(row), rotated: Boolean(prev) };
-    }, { timeout: this.timeoutMs, maxWait: this.timeoutMs });
+    });
   }
+  /** Reads are bounded too (ADR-0011 §9, PR17-r1). */
   async list() {
-    return (await this.db.vaultSecret.findMany({ where: { projectId: null } })).map(fromRow);
+    return this.tx(async (tx: any) => (await tx.vaultSecret.findMany({ where: { projectId: null } })).map(fromRow));
   }
   async get(name: string) {
-    const row = await this.db.vaultSecret.findFirst({ where: { projectId: null, name } });
-    return row ? fromRow(row) : null;
+    return this.tx(async (tx: any) => {
+      const row = await tx.vaultSecret.findFirst({ where: { projectId: null, name } });
+      return row ? fromRow(row) : null;
+    });
   }
 }
 

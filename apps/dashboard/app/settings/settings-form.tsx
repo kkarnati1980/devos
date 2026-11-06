@@ -10,7 +10,7 @@ export function SettingsForm({ apiOrigin }: { apiOrigin: string }) {
 
   useEffect(() => {
     (async () => {
-      const si = await api.signIn();
+      const si = await api.connect();
       if (!si.ok) return setNotice(`${explain(si.code)} (${si.code})`);
       const r = await api.settings();
       if (!r.ok) return setNotice(`${explain(r.code)} (${r.code})`);

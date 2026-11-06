@@ -7,8 +7,8 @@ import { createApp } from "../dist/app.js";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { loadConfig, startupErrorCode } from "../dist/config.js";
 import { buildRuntime } from "../dist/runtime.js";
-import { MemorySettingsStore } from "../dist/settings.js";
-import { MemoryVaultStore, SECRET_NAMES, Vault, parseVaultKey, parseVaultKeyVersion } from "../dist/vault.js";
+import { MemorySettingsStore, PrismaSettingsStore } from "../dist/settings.js";
+import { MemoryVaultStore, PrismaVaultStore, SECRET_NAMES, Vault, parseVaultKey, parseVaultKeyVersion } from "../dist/vault.js";
 
 const KK = "kk@example.com";
 const ORIGIN = "http://devos:3000";
@@ -182,11 +182,11 @@ test("M1.4 AT3 (amendment): every secret type is saved and rotated; no value app
     const st = await kk.get("/setup");
     assert.equal(st.json.complete, true);
 
-    const actions = s.settings.audits.filter((a) => a.action.startsWith("vault.")).map((a) => a.action);
+    const actions = s.vaultStore.audits.map((a) => a.action);
     assert.equal(actions.filter((a) => a === "vault.secret.saved").length, SECRET_NAMES.length);
     assert.equal(actions.filter((a) => a === "vault.secret.rotated").length, SECRET_NAMES.length);
 
-    const everything = [...texts, ...s.logs.map((l) => JSON.stringify(l)), JSON.stringify(s.settings.audits)].join("\n");
+    const everything = [...texts, ...s.logs.map((l) => JSON.stringify(l)), JSON.stringify(s.settings.audits), JSON.stringify(s.vaultStore.audits)].join("\n");
     for (const v of values) {
       assert.ok(!everything.includes(v), "a secret value leaked");
       assert.ok(!everything.includes(v.slice(0, 20)), "a secret prefix leaked");
@@ -444,4 +444,70 @@ test("M1.4 AT11: CORS only for the exact allowed origin, with credentials; same-
   } finally {
     await s.app.close();
   }
+});
+
+test("M1.4 AT15 (PR17-r1): a change and its audit event commit together; a failed audit changes nothing", async () => {
+  const s = await start();
+  try {
+    const kk = await session(s.port);
+    await kk.put("/setup/caps", CAPS);
+    const id = randomUUID();
+    s.settings.projects.set(id, { id, slug: "pilot", capUsd: "15.00", lanes: 2, archived: false });
+    const value = secretFor("coolify_api_token");
+    await kk.put("/vault/secrets/coolify_api_token", { value });
+    const before = (await kk.get("/settings")).json.settings;
+
+    s.settings.failAudit = true;
+    s.vaultStore.failAudit = true;
+    const set = await kk.put("/settings", { openaiCapUsd: 99 });
+    assert.equal(set.status, 503);
+    assert.equal(set.json.code, "settings-store-error");
+    const caps = await kk.put("/setup/caps", { ...CAPS, anthropicCapUsd: 99 });
+    assert.equal(caps.status, 503);
+    const proj = await kk.put(`/projects/${id}/settings`, { lanes: 3 });
+    assert.equal(proj.status, 503);
+    const sec = await kk.put("/vault/secrets/coolify_api_token", { value: secretFor("coolify_api_token", 2) });
+    assert.equal(sec.status, 503);
+    assert.equal(sec.json.code, "vault-store-error");
+
+    assert.deepEqual((await kk.get("/settings")).json.settings, before);
+    assert.equal(s.settings.projects.get(id).lanes, 2);
+    assert.equal(await s.vault.reveal("coolify_api_token"), value);
+  } finally {
+    await s.app.close();
+  }
+});
+
+test("M1.4 AT16 (PR17-r1): every Prisma store operation, reads included, runs in a bounded transaction with its audit", async () => {
+  const calls = [];
+  const ops = [];
+  const model = (name, rows) => new Proxy({}, {
+    get: (_t, op) => async () => {
+      ops.push(`${name}.${String(op)}`);
+      return rows(op);
+    },
+  });
+  const row = { name: "github_token", ciphertext: Buffer.alloc(40, 1), nonce: Buffer.alloc(12, 1), keyVersion: 1, hint: "abcd", createdAt: new Date(), updatedAt: new Date() };
+  const settingsRow = { anthropicCapUsd: "15", openaiCapUsd: "15", defaultProjectCapUsd: "15", defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: new Date() };
+  const tx = {
+    appSettings: model("appSettings", () => settingsRow),
+    project: model("project", (op) => (op === "findUnique" ? { id: "p", archivedAt: null } : { id: "p", slug: "s", capUsd: "15", lanes: 2 })),
+    vaultSecret: model("vaultSecret", (op) => (op === "findMany" ? [row] : op === "findFirst" ? null : row)),
+    auditEvent: model("auditEvent", () => ({})),
+  };
+  const db = new Proxy({ $transaction: async (fn, opts) => { calls.push(opts); return fn(tx); } }, {
+    get: (t, k) => (k === "$transaction" ? t.$transaction : (() => { throw new Error(`direct client call: ${String(k)}`); })()),
+  });
+  const settings = new PrismaSettingsStore(db, 1234);
+  const vault = new PrismaVaultStore(db, 1234);
+  const audit = { action: "x", summary: "x", details: {} };
+  await settings.get();
+  await settings.update({ deadlockAttempts: 3 }, new Date(), audit);
+  await settings.updateProject("p", { lanes: 1 }, audit);
+  await vault.list();
+  await vault.get("github_token");
+  await vault.upsert(row, () => audit);
+  assert.equal(calls.length, 6);
+  for (const c of calls) assert.deepEqual(c, { timeout: 1234, maxWait: 1234 });
+  assert.equal(ops.filter((o) => o === "auditEvent.create").length, 3);
 });

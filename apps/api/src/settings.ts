@@ -38,12 +38,23 @@ export interface ProjectSettingsView {
   lanes: number;
 }
 
+/** An `audit_event` row (actor `kk`) written in the same transaction as the change it records. */
+export interface AuditEntry {
+  action: string;
+  summary: string;
+  details: Record<string, unknown>;
+  projectId?: string | null;
+}
+
+/**
+ * Every mutation commits atomically with its audit event (PR17-r1): if the audit insert fails,
+ * the change is rolled back and the route answers 503.
+ */
 export interface SettingsStore {
   get(): Promise<AppSettingsView>;
   /** Applies the patch and stamps `capsConfirmedAt` (the wizard's caps step). */
-  update(patch: AppSettingsPatch, confirmedAt: Date): Promise<AppSettingsView>;
-  updateProject(id: string, patch: ProjectSettingsPatch): Promise<ProjectSettingsView | "not-found" | "archived">;
-  audit(action: string, summary: string, details: Record<string, unknown>, projectId?: string | null): Promise<void>;
+  update(patch: AppSettingsPatch, confirmedAt: Date, audit: AuditEntry): Promise<AppSettingsView>;
+  updateProject(id: string, patch: ProjectSettingsPatch, audit: AuditEntry): Promise<ProjectSettingsView | "not-found" | "archived">;
 }
 
 /** A USD amount: number or string, 0.01–10,000, at most 2 decimals. Normalised to "15.00". */
@@ -133,28 +144,33 @@ const DEFAULTS: AppSettingsView = {
   updatedAt: null,
 };
 
-/** In-memory store for tests and local runs. */
+/** In-memory store for tests and local runs. `failAudit` simulates an audit insert failing. */
 export class MemorySettingsStore implements SettingsStore {
   settings: AppSettingsView = { ...DEFAULTS };
+  failAudit = false;
   readonly projects = new Map<string, ProjectSettingsView & { archived: boolean }>();
   readonly audits: { action: string; summary: string; details: Record<string, unknown>; projectId: string | null }[] = [];
   constructor(private readonly now: () => number = Date.now) {}
+  private record(a: AuditEntry) {
+    if (this.failAudit) throw new Error("audit insert failed");
+    this.audits.push({ action: a.action, summary: a.summary, details: a.details, projectId: a.projectId ?? null });
+  }
   async get() {
     return { ...this.settings };
   }
-  async update(patch: AppSettingsPatch, confirmedAt: Date) {
-    this.settings = { ...this.settings, ...patch, capsConfirmedAt: confirmedAt.toISOString(), updatedAt: new Date(this.now()).toISOString() };
+  async update(patch: AppSettingsPatch, confirmedAt: Date, audit: AuditEntry) {
+    const next = { ...this.settings, ...patch, capsConfirmedAt: confirmedAt.toISOString(), updatedAt: new Date(this.now()).toISOString() };
+    this.record(audit); // before the change is applied: a failed audit leaves nothing changed
+    this.settings = next;
     return { ...this.settings };
   }
-  async updateProject(id: string, patch: ProjectSettingsPatch) {
+  async updateProject(id: string, patch: ProjectSettingsPatch, audit: AuditEntry) {
     const p = this.projects.get(id);
     if (!p) return "not-found" as const;
     if (p.archived) return "archived" as const;
+    this.record(audit);
     Object.assign(p, patch);
     return { id: p.id, slug: p.slug, capUsd: p.capUsd, lanes: p.lanes };
-  }
-  async audit(action: string, summary: string, details: Record<string, unknown>, projectId: string | null = null) {
-    this.audits.push({ action, summary, details, projectId });
   }
 }
 
@@ -173,7 +189,8 @@ function view(row: any): AppSettingsView {
   };
 }
 
-/** Prisma-backed store: the `app_settings` singleton row and `project`. Every call is time-bounded. */
+/** Prisma-backed store: the `app_settings` singleton row and `project`. Every operation, reads
+ * included, runs in a transaction bounded by `timeout` and `maxWait` (ADR-0011 §9, PR17-r1). */
 export class PrismaSettingsStore implements SettingsStore {
   constructor(
     private readonly db: any,
@@ -183,26 +200,32 @@ export class PrismaSettingsStore implements SettingsStore {
     return this.db.$transaction(fn, { timeout: this.timeoutMs, maxWait: this.timeoutMs });
   }
   async get() {
-    const row = await this.db.appSettings.findUnique({ where: { singleton: true } });
-    return row ? view(row) : { ...DEFAULTS };
+    return this.tx(async (tx) => {
+      const row = await tx.appSettings.findUnique({ where: { singleton: true } });
+      return row ? view(row) : { ...DEFAULTS };
+    });
   }
-  async update(patch: AppSettingsPatch, confirmedAt: Date) {
+  async update(patch: AppSettingsPatch, confirmedAt: Date, audit: AuditEntry) {
     return this.tx(async (tx) => {
       const data = { ...patch, capsConfirmedAt: confirmedAt };
       const row = await tx.appSettings.upsert({ where: { singleton: true }, update: data, create: { singleton: true, ...data } });
+      await writeAudit(tx, audit);
       return view(row);
     });
   }
-  async updateProject(id: string, patch: ProjectSettingsPatch) {
+  async updateProject(id: string, patch: ProjectSettingsPatch, audit: AuditEntry) {
     return this.tx(async (tx) => {
       const p = await tx.project.findUnique({ where: { id }, select: { id: true, archivedAt: true } });
       if (!p) return "not-found" as const;
       if (p.archivedAt) return "archived" as const;
       const row = await tx.project.update({ where: { id }, data: patch, select: { id: true, slug: true, capUsd: true, lanes: true } });
+      await writeAudit(tx, audit);
       return { id: row.id, slug: row.slug, capUsd: usd(row.capUsd), lanes: row.lanes };
     });
   }
-  async audit(action: string, summary: string, details: Record<string, unknown>, projectId: string | null = null) {
-    await this.tx((tx) => tx.auditEvent.create({ data: { actor: "kk", action, summary, details, projectId } }));
-  }
+}
+
+/** Inserts the audit row inside the caller's transaction. */
+export async function writeAudit(tx: any, a: AuditEntry): Promise<void> {
+  await tx.auditEvent.create({ data: { actor: "kk", action: a.action, summary: a.summary, details: a.details, projectId: a.projectId ?? null } });
 }

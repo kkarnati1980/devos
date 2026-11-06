@@ -38,7 +38,25 @@ export class DevosApi {
   private csrf: string | null = null;
   constructor(private readonly origin: string) {}
 
+  /**
+   * A write refused before it took effect because another tab signed in (new cookie, so this tab's
+   * CSRF token is stale) or the 12-hour session ended is retried once after recovering the token
+   * (PR17-r1). Both refusals happen in the API guard, before any change, so the retry is safe.
+   */
   private async call<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
+    const first = await this.once<T>(method, path, body);
+    if (first.ok || method === "GET" || path === "/auth/session") return first;
+    if (first.code === "csrf-token-invalid") {
+      const r = await this.refresh();
+      if (!r.ok) return first;
+    } else if (first.status === 401) {
+      const r = await this.signIn();
+      if (!r.ok) return first;
+    } else return first;
+    return this.once<T>(method, path, body);
+  }
+
+  private async once<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
     try {
@@ -64,9 +82,27 @@ export class DevosApi {
     }
   }
 
+  /** Re-reads the CSRF token for the current cookie (shared by every tab), without rotating it. */
+  private async refresh(): Promise<ApiResult<{ login: string; expiresAt: string }>> {
+    const r = await this.once<{ login: string; expiresAt: string; csrfToken: string }>("GET", "/auth/session");
+    if (!r.ok) return r;
+    this.csrf = r.data.csrfToken;
+    return { ok: true, data: { login: r.data.login, expiresAt: r.data.expiresAt } };
+  }
+
+  /**
+   * Page load: reuse the session another tab may already hold (no cookie rotation, so open tabs
+   * keep working); sign in only when there is no valid session.
+   */
+  async connect(): Promise<ApiResult<{ login: string; expiresAt: string }>> {
+    const r = await this.refresh();
+    if (r.ok || r.status !== 401) return r;
+    return this.signIn();
+  }
+
   /** Sign-in: a fresh 12-hour session for KK's tailnet identity; keeps the CSRF token in memory. */
   async signIn(): Promise<ApiResult<{ login: string; expiresAt: string }>> {
-    const r = await this.call<{ login: string; expiresAt: string; csrfToken: string }>("POST", "/auth/session");
+    const r = await this.once<{ login: string; expiresAt: string; csrfToken: string }>("POST", "/auth/session");
     if (!r.ok) return r;
     this.csrf = r.data.csrfToken;
     return { ok: true, data: { login: r.data.login, expiresAt: r.data.expiresAt } };

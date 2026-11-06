@@ -17,23 +17,27 @@ test("M1.4 AT14a: settings singleton is created, edited and audited; project cap
   const before = await store.get();
   assert.equal(before.deadlockAttempts, 3);
   const t = new Date();
-  const saved = await store.update({ anthropicCapUsd: "15.00", openaiCapUsd: "20.50", defaultProjectCapUsd: "15.00", deadlockAttempts: 3 }, t);
+  const audit = { action: "settings.updated", summary: "Settings saved", details: { fields: ["openaiCapUsd"] } };
+  const saved = await store.update({ anthropicCapUsd: "15.00", openaiCapUsd: "20.50", defaultProjectCapUsd: "15.00", deadlockAttempts: 3 }, t, audit);
   assert.equal(saved.openaiCapUsd, "20.50");
   assert.equal(saved.capsConfirmedAt, t.toISOString());
-  const again = await store.update({ defaultLanes: 3 }, t);
+  const again = await store.update({ defaultLanes: 3 }, t, audit);
   assert.equal(again.defaultLanes, 3);
   assert.equal(again.openaiCapUsd, "20.50");
   assert.equal(await db.appSettings.count(), 1);
-  await assert.rejects(store.update({ deadlockAttempts: 6 }, t)); // database check 1–5
+  const audits = await db.auditEvent.count({ where: { action: "settings.updated" } });
+  await assert.rejects(store.update({ deadlockAttempts: 6 }, t, audit)); // database check 1–5
+  assert.equal(await db.auditEvent.count({ where: { action: "settings.updated" } }), audits, "a refused change leaves no audit row");
 
   const slug = `m14-${randomBytes(6).toString("hex")}`;
   const p = await db.project.create({ data: { slug, name: slug } });
-  assert.deepEqual(await store.updateProject(p.id, { capUsd: "25.00", lanes: 3 }), { id: p.id, slug, capUsd: "25.00", lanes: 3 });
+  const pa = { action: "project.settings.updated", summary: "Project settings saved", details: { fields: ["capUsd", "lanes"] }, projectId: p.id };
+  assert.deepEqual(await store.updateProject(p.id, { capUsd: "25.00", lanes: 3 }, pa), { id: p.id, slug, capUsd: "25.00", lanes: 3 });
+  assert.equal(await db.auditEvent.count({ where: { projectId: p.id, action: "project.settings.updated" } }), 1);
   await db.project.update({ where: { id: p.id }, data: { archivedAt: new Date() } });
-  assert.equal(await store.updateProject(p.id, { lanes: 1 }), "archived");
-  assert.equal(await store.updateProject("00000000-0000-4000-8000-000000000000", { lanes: 1 }), "not-found");
+  assert.equal(await store.updateProject(p.id, { lanes: 1 }, pa), "archived");
+  assert.equal(await store.updateProject("00000000-0000-4000-8000-000000000000", { lanes: 1 }, pa), "not-found");
 
-  await store.audit("settings.updated", "Settings saved", { fields: ["openaiCapUsd"] });
   const ev = await db.auditEvent.findFirst({ where: { action: "settings.updated" }, orderBy: { occurredAt: "desc" } });
   assert.equal(ev.actor, "kk");
   assert.deepEqual(ev.details, { fields: ["openaiCapUsd"] });
@@ -47,6 +51,9 @@ test("M1.4 AT14b: global secrets are saved and rotated in place, with the hint c
   assert.equal(first.rotated, false);
   const second = await vault.put("linear_api_key", v2);
   assert.equal(second.rotated, true);
+  const vaultEvents = await db.auditEvent.findMany({ where: { action: { in: ["vault.secret.saved", "vault.secret.rotated"] } }, orderBy: { occurredAt: "asc" } });
+  assert.deepEqual(vaultEvents.slice(-2).map((e) => e.action), ["vault.secret.saved", "vault.secret.rotated"]);
+  assert.ok(!JSON.stringify(vaultEvents).includes(v2));
   assert.equal(second.meta.hint, v2.slice(-4));
   assert.equal(await vault.reveal("linear_api_key"), v2);
   const rows = await db.vaultSecret.findMany({ where: { projectId: null, name: "linear_api_key" } });

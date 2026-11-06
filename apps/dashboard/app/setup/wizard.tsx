@@ -22,7 +22,7 @@ export function SetupWizard({ apiOrigin }: { apiOrigin: string }) {
 
   useEffect(() => {
     (async () => {
-      const s = await api.signIn();
+      const s = await api.connect();
       if (!s.ok) return setError(`${explain(s.code)} (${s.code})`);
       const [st, set, sec] = await Promise.all([api.setup(), api.settings(), api.secrets()]);
       if (!st.ok) return setError(`${explain(st.code)} (${st.code})`);

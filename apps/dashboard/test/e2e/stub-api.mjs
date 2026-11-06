@@ -5,7 +5,7 @@ import http from "node:http";
 const NAMES = ["anthropic_api_key", "openai_api_key", "github_token", "linear_api_key", "r2_access_key_id", "r2_secret_access_key", "coolify_api_token"];
 
 export async function startStubApi(allowedOrigin) {
-  const state = { received: [], csrfSeen: [], settings: { anthropicCapUsd: "15.00", openaiCapUsd: "15.00", defaultProjectCapUsd: "15.00", defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null }, secrets: new Map() };
+  const state = { signIns: 0, received: [], csrfSeen: [], settings: { anthropicCapUsd: "15.00", openaiCapUsd: "15.00", defaultProjectCapUsd: "15.00", defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null }, secrets: new Map() };
   const meta = (name) => {
     const v = state.secrets.get(name);
     return v ? { name, set: true, hint: v.slice(-4), keyVersion: 1, createdAt: "2026-11-06T10:00:00.000Z", updatedAt: "2026-11-06T10:00:00.000Z" } : { name, set: false, hint: null, keyVersion: null, createdAt: null, updatedAt: null };
@@ -31,12 +31,22 @@ export async function startStubApi(allowedOrigin) {
     };
     const url = req.url ?? "";
     if (req.method !== "GET" && req.method !== "POST") state.csrfSeen.push(req.headers["x-devos-csrf"] ?? null);
+    // Like M1.2: every sign-in rotates the cookie and its CSRF token; GET /auth/session returns
+    // the token for the cookie presented; a write needs the token of the current cookie.
     if (req.method === "POST" && url === "/auth/session") {
-      res.setHeader("Set-Cookie", "devos_session=stub; HttpOnly; SameSite=Strict; Path=/");
-      return json(201, { login: "kk@example.com", expiresAt: "2026-11-06T22:00:00.000Z", csrfToken: "stub-csrf" });
+      const n = ++state.signIns;
+      res.setHeader("Set-Cookie", `devos_session=stub-${n}; HttpOnly; SameSite=Strict; Path=/`);
+      return json(201, { login: "kk@example.com", expiresAt: "2026-11-06T22:00:00.000Z", csrfToken: `stub-csrf-${n}` });
     }
-    if (!/devos_session=stub/.test(req.headers.cookie ?? "")) return json(401, { statusCode: 401, code: "session-required" });
-    if (req.method !== "GET" && req.headers["x-devos-csrf"] !== "stub-csrf") return json(403, { statusCode: 403, code: "csrf-token-invalid" });
+    const sid = (req.headers.cookie ?? "").match(/devos_session=stub-(\d+)/)?.[1];
+    if (!sid || Number(sid) !== state.signIns) return json(401, { statusCode: 401, code: "session-required" });
+    if (req.method === "GET" && url === "/auth/session") {
+      return json(200, { login: "kk@example.com", expiresAt: "2026-11-06T22:00:00.000Z", csrfToken: `stub-csrf-${sid}` });
+    }
+    if (req.method !== "GET" && req.headers["x-devos-csrf"] !== `stub-csrf-${sid}`) {
+      state.csrfRefused = (state.csrfRefused ?? 0) + 1;
+      return json(403, { statusCode: 403, code: "csrf-token-invalid" });
+    }
     if (req.method === "GET" && url === "/setup") {
       return json(200, { capsConfirmed: state.settings.capsConfirmedAt !== null, vaultConfigured: true, secrets: NAMES.map((n) => ({ name: n, set: state.secrets.has(n) })), complete: false });
     }

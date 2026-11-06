@@ -35,7 +35,14 @@ async function open(path) {
   const page = await context.newPage();
   const problems = [];
   page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") problems.push(`console: ${m.text()}`); });
+  // A fresh context has no cookie, so the page's first session probe (GET /auth/session) is an
+  // expected 401 before it signs in; at most one such resource error is allowed.
+  let probe401 = 0;
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    if (/^Failed to load resource: the server responded with a status of 401/.test(m.text()) && probe401++ === 0) return;
+    problems.push(`console: ${m.text()}`);
+  });
   await page.addInitScript(() => {
     window.__cspViolations = [];
     document.addEventListener("securitypolicyviolation", (e) => window.__cspViolations.push(`${e.violatedDirective} ${e.blockedURI}`));
@@ -81,7 +88,7 @@ test("M1.4 AT12 (amendment): the wizard saves three caps and every secret; no va
   await gh.getByTestId("secret-state").filter({ hasText: "•••• WXYZ" }).waitFor();
   assert.equal(api.state.secrets.get("github_token"), "TESTONLY-github-rotated-zzzzzzzzzz-WXYZ");
   for (const [name, value] of Object.entries(SECRETS)) if (name !== "github_token") assert.equal(api.state.secrets.get(name), value);
-  assert.ok(api.state.csrfSeen.length > 0 && api.state.csrfSeen.every((t) => t === "stub-csrf"), "every write carried the CSRF token");
+  assert.ok(api.state.csrfSeen.length > 0 && api.state.csrfSeen.every((t) => /^stub-csrf-\d+$/.test(t)), "every write carried the CSRF token");
 
   const dump = await page.evaluate(() => ({
     html: document.documentElement.outerHTML,
@@ -119,5 +126,33 @@ test("M1.4 AT13: settings edits the caps, default lanes and deadlock attempts", 
   const m = await page.evaluate(() => ({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }));
   assert.ok(m.sw <= m.cw);
   assert.deepEqual(problems, []);
+  await context.close();
+});
+
+test("M1.4 AT17 (PR17-r1): a second tab reuses the session; a tab whose token went stale recovers once and saves", async () => {
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const a = await context.newPage();
+  await a.goto(dash.base + "/setup");
+  await a.getByTestId("caps-step").waitFor();
+  const signInsAfterA = api.state.signIns;
+  const b = await context.newPage();
+  await b.goto(dash.base + "/settings");
+  await b.getByTestId("settings-form").waitFor();
+  assert.equal(api.state.signIns, signInsAfterA, "opening a second tab must not rotate the shared session");
+
+  // Something else signs in (a new cookie): tab A's in-memory token is now stale.
+  const status = await b.evaluate(async (origin) => (await fetch(origin + "/auth/session", { method: "POST", credentials: "include" })).status, api.origin);
+  assert.equal(status, 201);
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  const row = a.getByTestId("secret-linear_api_key");
+  await row.locator('input[name="value"]').fill("TESTONLY-linear-multitab-hhhhhhhhh-STUV");
+  await row.getByRole("button").click();
+  await row.getByTestId("secret-state").filter({ hasText: "•••• STUV" }).waitFor();
+  assert.equal(api.state.csrfRefused, refusedBefore + 1, "first attempt refused, then retried once with the refreshed token");
+  assert.equal(api.state.secrets.get("linear_api_key"), "TESTONLY-linear-multitab-hhhhhhhhh-STUV");
+
+  await b.locator('input[name="openaiCapUsd"]').fill("21");
+  await b.getByTestId("save-settings").click();
+  await b.getByTestId("notice").filter({ hasText: "Settings saved." }).waitFor();
   await context.close();
 });
