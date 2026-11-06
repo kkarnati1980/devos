@@ -9,7 +9,7 @@ import YAML from "yaml";
 import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { createApp } from "../dist/app.js";
 import { KkSessionRegistry } from "../dist/auth.js";
-import { loadConfig, SESSION_TTL_MS } from "../dist/config.js";
+import { loadConfig, SESSION_TTL_MS, startupErrorCode } from "../dist/config.js";
 import { SECURITY_HEADERS } from "../dist/http.js";
 import { parseWhois, TailscaleWhoisResolver } from "../dist/identity.js";
 import { buildRuntime, dbReadiness } from "../dist/runtime.js";
@@ -462,4 +462,38 @@ test("PR14-r1: @devos/db is a declared dependency of @devos/api and resolves fro
   const resolved = realpathSync(new URL("../node_modules/@devos/db", import.meta.url));
   assert.match(resolved, /packages\/db$/);
   assert.match(import.meta.resolve("@devos/db"), /\/@devos\/db\/dist\/index\.js$/);
+});
+
+test("AT10 (PR14-r2): DEVOS_COOKIE_SECURE accepts only 1, 0 or unset; anything else stops start-up", () => {
+  assert.equal(loadConfig({ ...ENV }).secureCookies, false);
+  assert.equal(loadConfig({ ...ENV, DEVOS_COOKIE_SECURE: "" }).secureCookies, false);
+  assert.equal(loadConfig({ ...ENV, DEVOS_COOKIE_SECURE: "0" }).secureCookies, false);
+  assert.equal(loadConfig({ ...ENV, DEVOS_COOKIE_SECURE: "1" }).secureCookies, true);
+  for (const bad of ["true", "yes", "on", "TRUE", " 1", "2"]) {
+    // The error is the fixed code only; the bad value is never echoed.
+    assert.throws(() => loadConfig({ ...ENV, DEVOS_COOKIE_SECURE: bad }), { message: "config-cookie-secure-invalid" });
+  }
+});
+
+test("AT10 (PR14-r2): start-up failures are logged as a controlled code, never the error message", async () => {
+  // Our own config codes pass through unchanged.
+  assert.equal(startupErrorCode(new Error("config-cookie-secure-invalid")), "config-cookie-secure-invalid");
+  // A dependency error carrying a configuration value is reduced to its system code.
+  const secretHost = "secret-host.internal.example";
+  const dns = Object.assign(new Error(`getaddrinfo ENOTFOUND ${secretHost}`), { code: "ENOTFOUND" });
+  assert.equal(startupErrorCode(dns), "startup-enotfound");
+  // Real listen failure on an unresolvable HOST: the code holds no hostname.
+  const server = http.createServer();
+  const err = await new Promise((resolve) => {
+    server.once("error", resolve);
+    server.listen(0, "unresolvable-host.invalid");
+  });
+  const code = startupErrorCode(err);
+  assert.match(code, /^startup-e[a-z0-9_]+$/);
+  assert.ok(!code.includes("unresolvable"));
+  // Anything else (no code, a message with values, a non-Error) → generic code.
+  assert.equal(startupErrorCode(new Error(`connect to postgresql://u:p@db/${secretHost} failed`)), "startup-failed");
+  assert.equal(startupErrorCode(Object.assign(new Error("x"), { code: `E ${secretHost}` })), "startup-failed");
+  assert.equal(startupErrorCode("boom"), "startup-failed");
+  assert.equal(startupErrorCode(undefined), "startup-failed");
 });

@@ -1,7 +1,7 @@
 // Entry point. Secrets are read by name from the environment (Coolify env / server vault), never logged.
 import { createApp } from "./app.js";
 import { KkSessionRegistry } from "./auth.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, startupErrorCode } from "./config.js";
 import { stdoutSink } from "./http.js";
 import { TailscaleWhoisResolver } from "./identity.js";
 import { buildRuntime, type DbClient } from "./runtime.js";
@@ -34,7 +34,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((e: unknown) => {
-  // Print only the error code, never configuration values.
-  stdoutSink({ ts: new Date().toISOString(), level: "error", msg: "api-start-failed", code: e instanceof Error ? e.message : "unknown" });
+  // Print only a controlled code, never e.message or configuration values (PR14-r2).
+  stdoutSink({ ts: new Date().toISOString(), level: "error", msg: "api-start-failed", code: startupErrorCode(e) });
   process.exit(1);
 });

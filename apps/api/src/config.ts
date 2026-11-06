@@ -33,6 +33,24 @@ function originOf(value: string): string {
   return url.origin;
 }
 
+const CONFIG_CODE = /^config-[a-z0-9-]+$/;
+const NODE_ERROR_CODE = /^E[A-Z0-9_]{1,40}$/;
+
+/**
+ * PR14-r2: map any start-up failure to a controlled code before it is logged. Only our own
+ * `config-*` codes and a bare Node system error code (e.g. `ENOTFOUND`, `EADDRINUSE`) pass;
+ * `e.message` from a dependency is never logged, because it can carry configuration values
+ * (a hostname, a path, a URL).
+ */
+export function startupErrorCode(e: unknown): string {
+  if (e instanceof Error) {
+    if (CONFIG_CODE.test(e.message)) return e.message;
+    const sys = (e as { code?: unknown }).code;
+    if (typeof sys === "string" && NODE_ERROR_CODE.test(sys)) return `startup-${sys.toLowerCase()}`;
+  }
+  return "startup-failed";
+}
+
 /** Parse and validate the environment. Throws a code (never the value) on a bad setting. */
 export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
   const kkLogin = (env.DEVOS_KK_LOGIN ?? "").trim().toLowerCase();
@@ -56,11 +74,18 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
   const port = Number(env.PORT ?? 3000);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("config-port-invalid");
 
+  // PR14-r2: only "1" (on) or "0"/unset (off). Anything else ("true", "yes", …) stops start-up,
+  // so a typo can never silently drop Secure cookies, the __Host- name and HSTS.
+  const rawSecure = env.DEVOS_COOKIE_SECURE;
+  if (rawSecure !== undefined && rawSecure !== "" && rawSecure !== "0" && rawSecure !== "1") {
+    throw new Error("config-cookie-secure-invalid");
+  }
+
   return {
     kkLogin,
     sessionKey,
     allowedOrigins,
-    secureCookies: env.DEVOS_COOKIE_SECURE === "1",
+    secureCookies: rawSecure === "1",
     tailscaleSocket: env.DEVOS_TAILSCALE_SOCKET ?? "/var/run/tailscale/tailscaled.sock",
     outboundTimeoutMs,
     host: env.HOST ?? "0.0.0.0",
