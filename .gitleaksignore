@@ -1,0 +1,4 @@
+# S2 (docs/modules/S2.md): fingerprints of fake test fixtures in historic commits that cannot be rewritten.
+# Each entry names one commit; the same value in the current tree or any new commit still fails the scan.
+# M1.6 AT3 fake AWS key fixture (a test input proving notices refuse secrets); the tree now builds it at run time.
+b6998432c1414fa63e65c6d0a752050d518471ef:apps/api/test/notify.test.mjs:aws-access-token:247

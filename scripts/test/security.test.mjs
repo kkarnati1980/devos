@@ -1,6 +1,7 @@
 // S2 acceptance tests AT1–AT4 (docs/modules/S2.md): gate evaluation logic, offline.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { evaluate as evalVulns } from "../security/vuln-scan.mjs";
 import { evaluate as evalLicences, classifyExpression, loadPolicy } from "../security/licence-check.mjs";
 import { evaluate as evalSecrets, formatFindings } from "../security/secret-scan.mjs";
@@ -71,4 +72,12 @@ test("AT4 the licence policy is well formed and reviews only weak copyleft", () 
     assert.ok(Array.isArray(r.versions) && r.versions.length, `${r.name} versions`);
     assert.equal(classifyExpression(r.licence, policy), "weak", `${r.name} must be weak copyleft`);
   }
+});
+
+test("AT4b .gitleaksignore holds only commit-qualified fingerprints of historic fixtures", () => {
+  const entries = readFileSync(new URL("../../.gitleaksignore", import.meta.url), "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  for (const e of entries) assert.match(e, /^[0-9a-f]{40}:[^:]+:[a-z0-9-]+:\d+$/, e);
 });
