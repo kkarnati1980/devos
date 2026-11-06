@@ -1,0 +1,104 @@
+# R1 AT1–AT3 (docs/modules/R1.md): every image builds from a clean checkout and the compose stack boots.
+# All values below are CI-only throwaways generated per run; no real credential is used or stored.
+name: release-images
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_FILE: deploy/compose.yaml
+      GIT_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Throwaway configuration (masked)
+        run: |
+          set -euo pipefail
+          gen() { openssl rand -hex "$1"; }
+          for n in DEVOS_SESSION_KEY:32 DEVOS_POLICY_HMAC_KEY:32; do
+            v="$(gen "${n#*:}")"; echo "::add-mask::$v"; echo "${n%%:*}=$v" >> "$GITHUB_ENV"
+          done
+          # PR20-r1: the Postgres password carries URL-reserved characters, so the smoke test proves
+          # with-db-url.mjs encodes them (a raw interpolation would break migrate and the api).
+          v="$(gen 16)#/@:%?&"; echo "::add-mask::$v"; echo "POSTGRES_PASSWORD=$v" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/tls" && touch "$RUNNER_TEMP/tailscaled.sock"
+          {
+            echo "DEVOS_KK_LOGIN=ci@example.com"
+            echo "DEVOS_ALLOWED_ORIGINS=http://127.0.0.1:3000"
+            echo "DEVOS_COOKIE_SECURE=0"
+            # PR20-r2: email on with only host and sender, so the api must start on its SMTP defaults
+            # (port and security unset). Nothing is sent during the smoke test.
+            echo "DEVOS_SMTP_HOST=smtp.example.com"
+            echo "DEVOS_SMTP_FROM=devos@example.com"
+            echo "DEVOS_TLS_DIR=$RUNNER_TEMP/tls"
+            echo "DEVOS_TAILSCALE_SOCKET_HOST=$RUNNER_TEMP/tailscaled.sock"
+          } >> "$GITHUB_ENV"
+      - name: AT3 compose refuses to start without DEVOS_BIND_IP
+        run: |
+          if docker compose config -q 2>err.txt; then echo "compose accepted a missing DEVOS_BIND_IP"; exit 1; fi
+          grep -q "DEVOS_BIND_IP is required" err.txt
+      - uses: ./.github/actions/security-tools
+      - name: AT3 gitleaks over the rendered compose configuration (with a seeded negative control)
+        run: |
+          set -euo pipefail
+          # Render with every variable set to a marker, so any finding is a literal written in the file.
+          render() {
+            env -i PATH="$PATH" HOME="$HOME" DEVOS_BIND_IP=127.0.0.1 POSTGRES_PASSWORD=set-in-coolify \
+              DEVOS_KK_LOGIN=set-in-coolify DEVOS_SESSION_KEY=set-in-coolify DEVOS_ALLOWED_ORIGINS=https://set.in.coolify \
+              "$@" docker compose -f deploy/compose.yaml config > "$out/compose.rendered.yaml"
+          }
+          scan() { gitleaks dir --no-banner --redact --exit-code 1 "$out" > /dev/null 2>&1; }
+          out="$RUNNER_TEMP/rendered-clean"; mkdir -p "$out"; render env
+          if ! scan; then echo "gitleaks found a secret in the rendered compose configuration"; exit 1; fi
+          echo "rendered config: clean"
+          # Negative control: a seeded token (built at run time) in the rendered config must be found.
+          out="$RUNNER_TEMP/rendered-seeded"; mkdir -p "$out"
+          seed="ghp_$(openssl rand -hex 18 | head -c 36)"; echo "::add-mask::$seed"
+          render env DEVOS_SMTP_USER="$seed"
+          if scan; then echo "negative control: gitleaks missed a seeded token"; exit 1; fi
+          echo "negative control: seeded token detected (ok)"
+      - name: AT1 build every image
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: docker compose build
+      - name: AT2 boot the stack
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: docker compose up -d --wait --wait-timeout 240 api dashboard worker
+      - name: AT2 migrate ran once and exited 0; health reports this SHA; ready; dashboard answers
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: |
+          set -euo pipefail
+          test "$(docker compose ps -a migrate --format '{{.ExitCode}}')" = "0"
+          health="$(curl -fsS --max-time 10 http://127.0.0.1:3001/health)"; echo "$health"
+          test "$(jq -r .sha <<<"$health")" = "$GIT_SHA"
+          test "$(curl -fsS --max-time 10 http://127.0.0.1:3001/ready | jq -r .status)" = "ready"
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://127.0.0.1:3000/)"; echo "dashboard HTTP $code"
+          [[ "$code" =~ ^(200|30[1278])$ ]]
+          test "$(docker compose ps worker --format '{{.State}}')" = "running"
+      - name: AT3 ports are bound to DEVOS_BIND_IP only; no secret in any image
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: |
+          set -euo pipefail
+          docker compose ps --format json | jq -c 'if type == "array" then .[] else . end | .Publishers // [] | .[] | select(.PublishedPort > 0)' | tee pubs.txt
+          test -s pubs.txt
+          if jq -e 'select(.URL != "127.0.0.1")' pubs.txt >/dev/null; then echo "a port is published beyond DEVOS_BIND_IP"; exit 1; fi
+          for img in $(docker compose images -q | sort -u); do
+            docker history --no-trunc "$img" > layers.txt; docker image inspect "$img" > inspect.txt
+            for v in "$POSTGRES_PASSWORD" "$DEVOS_SESSION_KEY" "$DEVOS_POLICY_HMAC_KEY"; do
+              if grep -qF "$v" layers.txt inspect.txt; then echo "a secret value is baked into image $img"; exit 1; fi
+            done
+          done
+      - name: Logs on failure (values are per-run throwaways and masked)
+        if: failure()
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: docker compose logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: docker compose down -v --remove-orphans

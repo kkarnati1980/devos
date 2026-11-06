@@ -1,0 +1,14 @@
+# R1-a: nothing secret or host-local reaches the build context.
+.git
+.github
+**/node_modules
+**/dist
+**/.next
+**/coverage
+**/*.log
+.env
+.env.*
+**/.env
+**/.env.*
+docs
+scripts/phase0
