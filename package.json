@@ -3,14 +3,22 @@
   "version": "0.0.0",
   "private": true,
   "packageManager": "pnpm@9.12.0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "pnpm -r --if-present build",
     "typecheck": "pnpm -r --if-present typecheck",
     "lint": "pnpm -r --if-present lint",
     "test": "pnpm -r --if-present test && node --test \"scripts/test/*.test.mjs\"",
     "gen:rules": "node scripts/gen-rules.mjs",
-    "check:rules": "node scripts/gen-rules.mjs --check"
+    "check:rules": "node scripts/gen-rules.mjs --check",
+    "gen:standard": "node scripts/standards/gen-standard.mjs",
+    "check:standard": "node scripts/standards/gen-standard.mjs --check"
   },
-  "devDependencies": { "typescript": "^5.6.3" }
+  "devDependencies": {
+    "ajv": "8.17.1",
+    "typescript": "^5.6.3",
+    "yaml": "2.8.1"
+  }
 }
