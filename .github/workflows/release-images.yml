@@ -22,9 +22,12 @@ jobs:
         run: |
           set -euo pipefail
           gen() { openssl rand -hex "$1"; }
-          for n in POSTGRES_PASSWORD:16 DEVOS_SESSION_KEY:32 DEVOS_POLICY_HMAC_KEY:32; do
+          for n in DEVOS_SESSION_KEY:32 DEVOS_POLICY_HMAC_KEY:32; do
             v="$(gen "${n#*:}")"; echo "::add-mask::$v"; echo "${n%%:*}=$v" >> "$GITHUB_ENV"
           done
+          # PR20-r1: the Postgres password carries URL-reserved characters, so the smoke test proves
+          # with-db-url.mjs encodes them (a raw interpolation would break migrate and the api).
+          v="$(gen 16)#/@:%?&"; echo "::add-mask::$v"; echo "POSTGRES_PASSWORD=$v" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/tls" && touch "$RUNNER_TEMP/tailscaled.sock"
           {
             echo "DEVOS_KK_LOGIN=ci@example.com"
@@ -37,6 +40,26 @@ jobs:
         run: |
           if docker compose config -q 2>err.txt; then echo "compose accepted a missing DEVOS_BIND_IP"; exit 1; fi
           grep -q "DEVOS_BIND_IP is required" err.txt
+      - uses: ./.github/actions/security-tools
+      - name: AT3 gitleaks over the rendered compose configuration (with a seeded negative control)
+        run: |
+          set -euo pipefail
+          # Render with every variable set to a marker, so any finding is a literal written in the file.
+          render() {
+            env -i PATH="$PATH" HOME="$HOME" DEVOS_BIND_IP=127.0.0.1 POSTGRES_PASSWORD=set-in-coolify \
+              DEVOS_KK_LOGIN=set-in-coolify DEVOS_SESSION_KEY=set-in-coolify DEVOS_ALLOWED_ORIGINS=https://set.in.coolify \
+              "$@" docker compose -f deploy/compose.yaml config > "$out/compose.rendered.yaml"
+          }
+          scan() { gitleaks dir --no-banner --redact --exit-code 1 "$out" > /dev/null 2>&1; }
+          out="$RUNNER_TEMP/rendered-clean"; mkdir -p "$out"; render env
+          if ! scan; then echo "gitleaks found a secret in the rendered compose configuration"; exit 1; fi
+          echo "rendered config: clean"
+          # Negative control: a seeded token (built at run time) in the rendered config must be found.
+          out="$RUNNER_TEMP/rendered-seeded"; mkdir -p "$out"
+          seed="ghp_$(openssl rand -hex 18 | head -c 36)"; echo "::add-mask::$seed"
+          render env DEVOS_SMTP_USER="$seed"
+          if scan; then echo "negative control: gitleaks missed a seeded token"; exit 1; fi
+          echo "negative control: seeded token detected (ok)"
       - name: AT1 build every image
         env: { DEVOS_BIND_IP: 127.0.0.1 }
         run: docker compose build

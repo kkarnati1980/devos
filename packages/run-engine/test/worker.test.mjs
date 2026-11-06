@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { MemoryRunStore, RunEngine } from "../dist/index.js";
-import { UnconfiguredAdapter, adapterFor, loadWorkerConfig, workerStartupCode } from "../dist/worker-main.js";
+import { DRAIN_TIMEOUT_MS, UnconfiguredAdapter, adapterFor, drain, loadWorkerConfig, workerStartupCode } from "../dist/worker-main.js";
 
 const WORKER = fileURLToPath(new URL("../dist/worker-main.js", import.meta.url));
 const GOOD = { DATABASE_URL: "postgresql://devos@localhost/devos", REDIS_URL: "redis://localhost:6379", DEVOS_POLICY_HMAC_KEY: "k".repeat(32) };
@@ -62,4 +62,23 @@ test("AT4 the registry is used when a provider is configured", () => {
   assert.equal(pick("openai"), fake);
   assert.ok(pick("anthropic") instanceof UnconfiguredAdapter);
   assert.equal(new UnconfiguredAdapter("openai").name, "codex-exec");
+});
+
+test("AT4 PR20-r1: a graceful stop waits for the active job before closing the database", async () => {
+  const order = [];
+  const queue = { close: async () => { await new Promise((r) => setTimeout(r, 300)); order.push("queue-closed"); } };
+  const db = { $disconnect: async () => { order.push("db-closed"); } };
+  assert.equal(await drain(queue, db), true);
+  assert.deepEqual(order, ["queue-closed", "db-closed"]);
+});
+
+test("AT4 PR20-r1: a drain that times out is reported (exit 1), never hidden", async () => {
+  let dbClosed = false;
+  const queue = { close: async () => { throw new Error("queue-close-timeout"); } };
+  assert.equal(await drain(queue, { $disconnect: async () => { dbClosed = true; } }), false);
+  assert.ok(dbClosed, "the database is still released");
+});
+
+test("AT4 PR20-r1: the drain budget is longer than a 10 s operation deadline and ends before compose's 60 s SIGKILL", () => {
+  assert.ok(DRAIN_TIMEOUT_MS > 10_000 && DRAIN_TIMEOUT_MS < 60_000);
 });

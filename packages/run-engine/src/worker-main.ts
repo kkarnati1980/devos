@@ -9,6 +9,12 @@ import { RunQueue } from "./queue.js";
 import { RunFailure, type AdapterEvent, type RunAdapter, type RunResult, type RunTask } from "./types.js";
 
 export const MIN_HMAC_KEY_BYTES = 32;
+/**
+ * PR20-r1: how long a graceful stop waits for the active job (ms). The worker's RunQueue only starts and
+ * closes, so its per-operation deadline is this drain budget. It stays under compose's
+ * `stop_grace_period: 60s`, so the drain ends before Docker sends SIGKILL.
+ */
+export const DRAIN_TIMEOUT_MS = 50_000;
 
 export interface WorkerConfig {
   databaseUrl: string;
@@ -77,7 +83,7 @@ function log(level: "info" | "error", msg: string, extra: Record<string, unknown
   process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...extra }) + "\n");
 }
 
-export async function main(env: NodeJS.ProcessEnv = process.env): Promise<{ stop: () => Promise<void> }> {
+export async function main(env: NodeJS.ProcessEnv = process.env): Promise<{ stop: () => Promise<boolean> }> {
   const cfg = loadWorkerConfig(env);
   // @devos/db is imported at run time so this package typechecks without the generated Prisma client.
   const dbModuleName = "@devos/db";
@@ -85,26 +91,39 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<{ stop
   const db = createDb(cfg.databaseUrl);
   const policy = new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: cfg.hmacKey }) as unknown as PolicyLike;
   const engine = new RunEngine({ store: new PrismaRunStore(db), policy, adapterFor: adapterFor({}) });
-  const queue = new RunQueue({ redisUrl: cfg.redisUrl, concurrency: cfg.concurrency });
+  const queue = new RunQueue({ redisUrl: cfg.redisUrl, concurrency: cfg.concurrency, opTimeoutMs: DRAIN_TIMEOUT_MS });
   queue.start(engine);
   log("info", "worker-started", { concurrency: cfg.concurrency });
 
-  let stopping: Promise<void> | null = null;
+  let stopping: Promise<boolean> | null = null;
+  /** Graceful stop. true = the active job settled; false = the drain timed out or failed (exit non-zero). */
   const stop = () =>
-    (stopping ??= (async () => {
-      // BullMQ's close waits for the active job; the engine checkpoints as it goes (M1.5), so a job cut
-      // short by the grace period resumes from its checkpoint on the next start.
-      await queue.close().catch(() => undefined);
-      await db.$disconnect().catch(() => undefined);
-      log("info", "worker-stopped");
-    })());
+    (stopping ??= drain(queue, db));
   return { stop };
+}
+
+/**
+ * PR20-r1: stop taking jobs and wait for the active one (BullMQ `Worker.close()`). A drain that times out
+ * or fails is reported, never hidden: the caller exits 1, and the cut-short job resumes from its M1.5
+ * checkpoint on the next start.
+ */
+export async function drain(queue: { close(): Promise<void> }, db: { $disconnect(): Promise<void> }): Promise<boolean> {
+  let drained = true;
+  try {
+    await queue.close();
+  } catch (e) {
+    drained = false;
+    log("error", "worker-drain-failed", { code: e instanceof Error && /^queue-[a-z-]+$/.test(e.message) ? e.message : "drain-failed" });
+  }
+  await db.$disconnect().catch(() => undefined);
+  log("info", "worker-stopped", { drained });
+  return drained;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().then(
     ({ stop }) => {
-      for (const sig of ["SIGTERM", "SIGINT"] as const) process.once(sig, () => void stop().then(() => process.exit(0)));
+      for (const sig of ["SIGTERM", "SIGINT"] as const) process.once(sig, () => void stop().then((drained) => process.exit(drained ? 0 : 1)));
     },
     (e: unknown) => {
       log("error", "worker-start-failed", { code: workerStartupCode(e) });

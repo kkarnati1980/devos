@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
+import { databaseUrl } from "../../deploy/with-db-url.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const composeText = readFileSync(`${root}deploy/compose.yaml`, "utf8");
@@ -57,7 +58,8 @@ test("AT3 no secret value is written in the compose file: every secret is a requ
     if (!secretish.test(k)) continue;
     assert.match(String(v), /^\$\{[A-Z0-9_]+(:\?[^}]*|:-)?\}$/, `${k} comes from the environment by name`);
   }
-  assert.match(compose["x-db-env"].DATABASE_URL, /^postgresql:\/\/devos:\$\{POSTGRES_PASSWORD:\?[^}]*\}@postgres:5432\/devos$/);
+  assert.match(compose["x-db-env"].POSTGRES_PASSWORD, /^\$\{POSTGRES_PASSWORD:\?[^}]*\}$/);
+  assert.doesNotMatch(composeText, /^\s*DATABASE_URL:/m, "DATABASE_URL is built in the container (PR20-r1), never interpolated");
   assert.doesNotMatch(composeText, /sk-[A-Za-z0-9]|ghp_|github_pat_|BEGIN [A-Z ]*PRIVATE KEY/);
 });
 
@@ -101,4 +103,35 @@ test("AT5 health-sha: fail on another SHA, a non-200, no tailnet IP or a bad DEV
   assert.equal(runCheck({ code: "503", body: "{}" }).status, 1);
   assert.equal(runCheck({ code: "200", body: JSON.stringify({ sha: SHA }), tsIp: "203.0.113.9" }).status, 1);
   assert.equal(runCheck({ code: "200", body: JSON.stringify({ sha: SHA }), sha: "abc" }).status, 1);
+});
+
+// PR20-r1: a password with URL-reserved characters still gives a valid DATABASE_URL.
+test("AT3 PR20-r1: with-db-url encodes every reserved character and round-trips the password", () => {
+  const password = "p#a/s@s:w%o?r&d= +[x]";
+  const url = new URL(databaseUrl({ POSTGRES_PASSWORD: password, POSTGRES_HOST: "postgres" }));
+  assert.equal(url.protocol, "postgresql:");
+  assert.equal(url.hostname, "postgres");
+  assert.equal(url.port, "5432");
+  assert.equal(url.pathname, "/devos");
+  assert.equal(decodeURIComponent(url.password), password);
+  assert.throws(() => databaseUrl({}), /^Error: config-postgres-password-required$/);
+  assert.throws(() => databaseUrl({ POSTGRES_PASSWORD: "x", POSTGRES_HOST: "a/b" }), /^Error: config-postgres-host-invalid$/);
+});
+
+test("AT3 PR20-r1: with-db-url passes DATABASE_URL to the command, drops the raw password, prints no value", () => {
+  const password = "r1#/@:%-" + "z".repeat(12);
+  const r = spawnSync(process.execPath, [`${root}deploy/with-db-url.mjs`, process.execPath, "-e",
+    "const u=new URL(process.env.DATABASE_URL);process.stdout.write(JSON.stringify({pw:decodeURIComponent(u.password),raw:process.env.POSTGRES_PASSWORD??null}))"],
+    { env: { PATH: process.env.PATH, POSTGRES_PASSWORD: password }, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.pw, password);
+  assert.equal(out.raw, null);
+  const bad = spawnSync(process.execPath, [`${root}deploy/with-db-url.mjs`, "true"], { env: { PATH: process.env.PATH }, encoding: "utf8" });
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /config-postgres-password-required/);
+});
+
+test("AT4 PR20-r1: the worker's stop grace period covers the drain budget", () => {
+  assert.equal(compose.services.worker.stop_grace_period, "60s");
 });

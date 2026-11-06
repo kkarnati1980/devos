@@ -10,8 +10,11 @@ x-build: &build
   args:
     GIT_SHA: ${GIT_SHA:-${SOURCE_COMMIT:-unknown}}
 
+# PR20-r1: the password reaches the services as POSTGRES_PASSWORD; deploy/with-db-url.mjs builds
+# DATABASE_URL inside each container with the password URL-encoded, so any character is safe.
 x-db-env: &db-env
-  DATABASE_URL: postgresql://devos:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/devos
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  POSTGRES_HOST: postgres
 
 services:
   postgres:

@@ -26,6 +26,7 @@ FROM base AS runtime
 ARG GIT_SHA=unknown
 ENV NODE_ENV=production GIT_SHA=${GIT_SHA}
 COPY --from=build --chown=node:node /app /app
+COPY --chown=node:node deploy/with-db-url.mjs /app/deploy/with-db-url.mjs
 USER node
 
 FROM runtime AS api
@@ -33,7 +34,7 @@ ENV HOST=0.0.0.0 PORT=3001
 EXPOSE 3001
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
-CMD ["node", "apps/api/dist/main.js"]
+CMD ["node", "deploy/with-db-url.mjs", "node", "apps/api/dist/main.js"]
 
 FROM runtime AS dashboard
 WORKDIR /app/apps/dashboard
@@ -42,8 +43,8 @@ EXPOSE 3000
 CMD ["node", "server.mjs"]
 
 FROM runtime AS worker
-CMD ["node", "packages/run-engine/dist/worker-main.js"]
+CMD ["node", "deploy/with-db-url.mjs", "node", "packages/run-engine/dist/worker-main.js"]
 
 FROM runtime AS migrate
 WORKDIR /app/packages/db
-CMD ["node_modules/.bin/prisma", "migrate", "deploy"]
+CMD ["node", "/app/deploy/with-db-url.mjs", "node", "node_modules/prisma/build/index.js", "migrate", "deploy"]
