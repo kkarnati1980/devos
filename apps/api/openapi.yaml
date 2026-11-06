@@ -40,6 +40,56 @@ components:
         sha: { type: [string, "null"], pattern: "^[0-9a-f]{40}$" }
         expiresAt: { type: string, format: date-time, description: "Future, at most 90 days away (M1.7)." }
         maxUses: { type: integer, minimum: 1, maximum: 1000 }
+    Usd:
+      description: "USD 0.01–10,000, at most 2 decimals; returned as a string such as \"15.00\" (M1.4)."
+      type: [string, number]
+    Caps:
+      type: object
+      additionalProperties: false
+      required: [anthropicCapUsd, openaiCapUsd, defaultProjectCapUsd]
+      properties:
+        anthropicCapUsd: { $ref: "#/components/schemas/Usd" }
+        openaiCapUsd: { $ref: "#/components/schemas/Usd" }
+        defaultProjectCapUsd: { $ref: "#/components/schemas/Usd" }
+        defaultLanes: { type: integer, minimum: 1, maximum: 3 }
+        deadlockAttempts: { type: integer, minimum: 1, maximum: 5 }
+    SettingsPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        anthropicCapUsd: { $ref: "#/components/schemas/Usd" }
+        openaiCapUsd: { $ref: "#/components/schemas/Usd" }
+        defaultProjectCapUsd: { $ref: "#/components/schemas/Usd" }
+        defaultLanes: { type: integer, minimum: 1, maximum: 3 }
+        deadlockAttempts: { type: integer, minimum: 1, maximum: 5 }
+    ProjectSettingsPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        capUsd: { $ref: "#/components/schemas/Usd" }
+        lanes: { type: integer, minimum: 1, maximum: 3 }
+    SecretName:
+      type: string
+      enum: [anthropic_api_key, openai_api_key, github_token, linear_api_key, r2_access_key_id, r2_secret_access_key, coolify_api_token]
+    SecretValue:
+      type: object
+      additionalProperties: false
+      required: [value]
+      properties:
+        value: { type: string, minLength: 16, maxLength: 4096, pattern: "^[\\x21-\\x7e]+$", writeOnly: true }
+    SecretMeta:
+      description: Never the value; only the last 4 characters (`hint`) and dates.
+      type: object
+      required: [name, set, hint, keyVersion, createdAt, updatedAt]
+      properties:
+        name: { $ref: "#/components/schemas/SecretName" }
+        set: { type: boolean }
+        hint: { type: [string, "null"], minLength: 4, maxLength: 4 }
+        keyVersion: { type: [integer, "null"] }
+        createdAt: { type: [string, "null"], format: date-time }
+        updatedAt: { type: [string, "null"], format: date-time }
   responses:
     Unauthorized: { description: No valid session for this tailnet identity, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     Forbidden: { description: Not KK, or a CSRF check failed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
@@ -111,6 +161,94 @@ paths:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         "200": { description: "`{ revoked: boolean }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /setup:
+    get:
+      operationId: setupStatus
+      x-devos-access: session
+      responses:
+        "200": { description: "`{ capsConfirmed, vaultConfigured, secrets: [{ name, set }], complete }` (M1.4)" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /setup/caps:
+    put:
+      operationId: confirmCaps
+      x-devos-access: session
+      x-devos-state-changing: true
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Caps" } } }
+      responses:
+        "200": { description: Caps saved and confirmed (wizard step 1) }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /settings:
+    get:
+      operationId: getSettings
+      x-devos-access: session
+      responses:
+        "200": { description: Caps, lanes and deadlock attempts }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    put:
+      operationId: updateSettings
+      x-devos-access: session
+      x-devos-state-changing: true
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/SettingsPatch" } } }
+      responses:
+        "200": { description: Settings saved }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/{id}/settings:
+    put:
+      operationId: updateProjectSettings
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProjectSettingsPatch" } } }
+      responses:
+        "200": { description: Project cap and lanes saved }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "409": { description: "`project-archived`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /vault/secrets:
+    get:
+      operationId: listSecrets
+      x-devos-access: session
+      responses:
+        "200": { description: "`{ secrets: SecretMeta[] }`, one per wizard secret; never a value" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /vault/secrets/{name}:
+    put:
+      operationId: saveSecret
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: name, in: path, required: true, schema: { $ref: "#/components/schemas/SecretName" } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/SecretValue" } } }
+      responses:
+        "200": { description: "Saved or rotated: `{ secret: SecretMeta, rotated }`; the value is never returned" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }

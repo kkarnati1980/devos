@@ -29,6 +29,7 @@ export const SESSIONS = Symbol("devos:sessions");
 export const GRANTS = Symbol("devos:grants");
 export const READINESS = Symbol("devos:readiness");
 export const KK_SESSIONS = Symbol("devos:kk-sessions");
+export const SETUP = Symbol("devos:setup");
 
 export const CSRF_HEADER = "x-devos-csrf";
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
