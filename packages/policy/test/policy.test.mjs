@@ -228,6 +228,37 @@ test("AT9: gates and envelope violations are enforced in observe mode", async ()
   assert.deepEqual([expired.enforcedOutcome, expired.reason], ["deny", "envelope-expired"]);
 });
 
+test("AT9 (PR13-r1): a non-gate rule cannot mask a gate in observe mode", async () => {
+  const { engine } = setup({ mode: "observe", rules: [
+    rule("plain-deny", "deny", { actions: ["deploy.production"], priority: 10 }),
+    rule("g4-approval", "require_approval", { actions: ["deploy.production"], constraints: { gate: true } }),
+    rule("plain-deny-hi", "deny", { actions: ["tool.bash"], priority: 10 }),
+    rule("hook-deny", "deny", { actions: ["tool.bash"], constraints: { gate: true } }),
+  ] });
+  const masked = await engine.decide({ identity: AGENT, action: { type: "deploy.production" } });
+  assert.deepEqual([masked.outcome, masked.enforcedOutcome], ["deny", "require_approval"]);
+  assert.match(masked.reason, /gate-approval-required-by:g4-approval/);
+  const grant = await engine.issueGrant(KK, { scopeAction: "deploy.production", expiresAt: new Date(T0 + HOUR) });
+  const lifted = await engine.decide({ identity: AGENT, action: { type: "deploy.production" }, approvalGrantId: grant.id });
+  assert.deepEqual([lifted.outcome, lifted.enforcedOutcome, lifted.wouldBlock, lifted.approvalGrantId], ["deny", "allow", true, grant.id]);
+  const hook = await engine.decide({ identity: AGENT, action: { type: "tool.bash" } });
+  assert.deepEqual([hook.outcome, hook.enforcedOutcome, hook.stop], ["deny", "deny", "policy_denied"]);
+  assert.match(hook.reason, /gate-denied-by:hook-deny/);
+});
+
+test("AT6 (PR13-r1): sub-micro-dollar costs round up, so repeated calls cannot pass a ceiling at zero", async () => {
+  const { engine, store } = setup({ rules: [rule("llm", "allow", { actions: ["llm.call"] })], budgets: [{ id: "tiny", provider: "openai", maxCostUsd: 0.000001, maxTokens: 1e9 }] });
+  const call = () => engine.decide({ identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", costUsd: 0.0000004, tokens: 0 } });
+  assert.equal((await call()).enforcedOutcome, "allow");
+  assert.equal(store.reservations[0].reservedUsd, 0.000001);
+  const second = await call();
+  assert.deepEqual([second.enforcedOutcome, second.reason], ["deny", "budget-exceeded:tiny"]);
+  await engine.reconcile(store.reservations[0].id, 0.0000001, 0);
+  assert.equal(store.reservations[0].actualUsd, 0.000001, "actuals round up too");
+  assert.equal((await call()).enforcedOutcome, "deny");
+  await assert.rejects(engine.decide({ identity: AGENT, action: { type: "llm.call", budgeted: true, provider: "openai", costUsd: 0, tokens: 1.5 } }), /invalid-policy-action-tokens/);
+});
+
 test("AT10: THIRD_PARTY_NOTICES.md and the per-file headers are present", () => {
   const repo = new URL("../../../", import.meta.url);
   const notices = new URL("THIRD_PARTY_NOTICES.md", repo);

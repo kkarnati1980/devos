@@ -69,10 +69,20 @@ export function evaluateRules(
   const allow = matched.find((r) => r.effect === "allow");
   const decider = deny ?? approval ?? allow;
   const outcome: PolicyEffect = decider ? decider.effect : "deny";
-  const reason = decider
+  let reason = decider
     ? `${outcome === "allow" ? "allowed" : outcome === "deny" ? "denied" : "approval-required"}-by:${decider.id}`
     : "default-deny";
-  const gate = decider?.constraints?.gate === true && decider.effect !== "allow";
-  const enforcedOutcome: PolicyEffect = mode === "enforce" || gate ? outcome : "allow";
-  return { outcome, enforcedOutcome, reason, matchedRuleIds: matched.map((r) => r.id), gate };
+  // Every matching gate binds, whichever rule decides the outcome (PR13-r1): a non-gate rule can
+  // never mask a gate deny or a gate approval requirement in observe mode.
+  const isGate = (r: PolicyRule) => r.constraints?.gate === true;
+  const gateDeny = matched.find((r) => r.effect === "deny" && isGate(r));
+  const gateApproval = matched.find((r) => r.effect === "require_approval" && isGate(r));
+  let enforcedOutcome: PolicyEffect;
+  if (mode === "enforce") enforcedOutcome = outcome;
+  else enforcedOutcome = gateDeny ? "deny" : gateApproval ? "require_approval" : "allow";
+  if (mode === "observe" && gateDeny && gateDeny !== decider) reason = `${reason};gate-denied-by:${gateDeny.id}`;
+  else if (mode === "observe" && !gateDeny && gateApproval && gateApproval !== decider) {
+    reason = `${reason};gate-approval-required-by:${gateApproval.id}`;
+  }
+  return { outcome, enforcedOutcome, reason, matchedRuleIds: matched.map((r) => r.id), gate: Boolean(gateDeny ?? gateApproval) };
 }

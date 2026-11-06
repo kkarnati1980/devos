@@ -26,10 +26,11 @@ async function rule(name, effect, actions, constraints = {}) {
   });
 }
 
-const engineFor = (budgets = []) => new PolicyEngine({
+const engineFor = (budgets = [], now = Date.now) => new PolicyEngine({
   store: new PrismaPolicyStore(db),
   hmacKey: KEY,
   budgets,
+  now,
   verifyKkSession: (s) => s.tailscaleLogin === "kk@kiot.io",
 });
 
@@ -100,4 +101,36 @@ test("AT4 (db): grants are KK-only, limited-use and revocable", async () => {
   assert.equal(await engine.revokeGrant(KK, g2.id), true);
   assert.equal(await engine.revokeGrant(KK, g2.id), false);
   assert.match((await engine.decide({ chain, identity: AGENT, action: { type: action }, approvalGrantId: g2.id })).reason, /grant-revoked/);
+});
+
+test("AT4 (db, PR13-r1): self-approval, expiry, scope and issuer checks against PrismaPolicyStore", async () => {
+  const action = `release-${randomUUID()}`;
+  await rule("needs-kk", "require_approval", [action]);
+  let now = Date.now();
+  const engine = engineFor([], () => now);
+  const chain = `at4b-${randomUUID()}`;
+  const ask = (identity, grant, extra = {}) => engine.decide({ chain, identity, action: { type: action, ...extra }, approvalGrantId: grant.id });
+  const hour = 3_600_000;
+  const before = await db.approvalGrant.count();
+  await assert.rejects(engine.issueGrant({ identity: AGENT, tailscaleLogin: "kk@kiot.io" }, { scopeAction: action, expiresAt: new Date(now + hour) }), /grant-issuer-not-kk/);
+  await assert.rejects(engine.issueGrant({ ...KK, tailscaleLogin: "mallory@example.com" }, { scopeAction: action, expiresAt: new Date(now + hour) }), /unverified/);
+  await assert.rejects(engine.issueGrant(KK, { scopeAction: action, expiresAt: new Date(now + 91 * 24 * hour) }), /grant-expiry-invalid/);
+  assert.equal(await db.approvalGrant.count(), before, "refused issuances write nothing");
+
+  const self = await engine.issueGrant(KK, { scopeAction: action, expiresAt: new Date(now + hour) });
+  const dSelf = await ask(KK.identity, self);
+  assert.equal(dSelf.outcome, "require_approval");
+  assert.match(dSelf.reason, /grant-self-approval/);
+
+  const projectId = await project();
+  const scoped = await engine.issueGrant(KK, { scopeAction: action, projectId, sha: "a".repeat(40), expiresAt: new Date(now + hour) });
+  assert.match((await ask(AGENT, scoped)).reason, /grant-scope-project/);
+  assert.match((await ask(AGENT, scoped, { projectId, sha: "b".repeat(40) })).reason, /grant-scope-sha/);
+  assert.equal((await ask(AGENT, scoped, { projectId, sha: "a".repeat(40) })).outcome, "allow");
+
+  const expiring = await engine.issueGrant(KK, { scopeAction: action, expiresAt: new Date(now + hour) });
+  now += hour;
+  assert.match((await ask(AGENT, expiring)).reason, /grant-expired/);
+  const unused = await db.approvalGrant.findUnique({ where: { id: expiring.id } });
+  assert.equal(unused.uses, 0, "a rejected grant is not consumed");
 });

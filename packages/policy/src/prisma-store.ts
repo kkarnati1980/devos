@@ -19,6 +19,13 @@ export interface PrismaLike {
 /** Key for pg_advisory_xact_lock: hashtext('devos:policy-engine'). */
 const LOCK_KEY = "devos:policy-engine";
 
+/** Exact Decimal(12, 6) text; the engine has already rounded up, so any other value is a bug. */
+function usd6(v: number): string {
+  const text = v.toFixed(6);
+  if (Number(text) !== v) throw new Error("budget-amount-not-micro-usd");
+  return text;
+}
+
 const num = (v: unknown): number => (v === null || v === undefined ? 0 : Number(String(v)));
 
 function toGrant(g: any): ApprovalGrant {
@@ -87,7 +94,7 @@ export class PrismaPolicyStore implements PolicyStore {
                 projectId: r.projectId,
                 runId: r.runId,
                 provider: r.provider,
-                reservedUsd: r.reservedUsd.toFixed(6),
+                reservedUsd: usd6(r.reservedUsd),
                 reservedTokens: r.reservedTokens,
               },
               select: { id: true },
@@ -136,7 +143,7 @@ export class PrismaPolicyStore implements PolicyStore {
   async reconcile(id: string, actualUsd: number, actualTokens: number): Promise<void> {
     const res = await this.db.budgetReservation.updateMany({
       where: { id, status: "reserved" },
-      data: { status: "reconciled", actualUsd: actualUsd.toFixed(6), actualTokens },
+      data: { status: "reconciled", actualUsd: usd6(actualUsd), actualTokens },
     });
     if (res.count !== 1) throw new Error("reservation-not-open");
   }

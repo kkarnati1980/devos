@@ -26,6 +26,17 @@ import { verifyLedger } from "./receipts.js";
 export const MAX_GRANT_MS = 90 * 24 * 60 * 60 * 1000;
 export const MIN_HMAC_KEY_BYTES = 32;
 
+/**
+ * USD amounts are stored as Decimal(12, 6). Round UP to the micro-dollar so what is checked equals
+ * what is stored and rounding can never undercount spend (PR13-r1).
+ */
+export function ceilMicroUsd(usd: number): number {
+  return Math.ceil(Number((usd * 1e6).toFixed(3))) / 1e6;
+}
+const micros = (usd: number): number => Math.round(usd * 1e6);
+/** A ceiling rounds DOWN to the micro-dollar (never grants more than configured). */
+const ceilingMicros = (usd: number): number => Math.floor(Number((usd * 1e6).toFixed(3)));
+
 /** The dashboard session presenting KK's Tailscale identity (O4). Verified by the caller's hook. */
 export interface KkSession {
   identity: PolicyIdentity;
@@ -86,6 +97,9 @@ function validateRequest(request: PolicyRequest): void {
     if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
       throw new Error(`invalid-policy-action-${name}`);
     }
+    if (value !== undefined && name !== "costUsd" && !Number.isSafeInteger(value)) {
+      throw new Error(`invalid-policy-action-${name}`);
+    }
   }
 }
 
@@ -131,16 +145,19 @@ export class PolicyEngine {
       let grantId: string | null = null;
       let reservationId: string | null = null;
 
-      // Approval: only a require_approval outcome can be lifted. Deny always wins (AT1).
-      if (outcome === "require_approval" && request.approvalGrantId) {
+      // Approval lifts only a require_approval requirement, never a deny (AT1). In observe mode a
+      // gate approval can bind while a non-gate deny is merely recorded: the grant then lifts the
+      // enforced requirement and the outcome stays a recorded would-deny.
+      const needsApproval = outcome === "require_approval" || enforced === "require_approval";
+      if (needsApproval && enforced !== "deny" && request.approvalGrantId) {
         const grant = await tx.getGrant(request.approvalGrantId);
         const problem = grantProblem(grant, request, nowMs);
         if (problem) {
           reason = `${reason};${problem}`;
         } else {
-          outcome = "allow";
+          if (outcome === "require_approval") outcome = "allow";
           enforced = "allow";
-          reason = `approved-by:${grant!.id}`;
+          reason = outcome === "allow" ? `approved-by:${grant!.id}` : `${reason};approved-by:${grant!.id}`;
           grantId = grant!.id;
         }
       }
@@ -160,6 +177,7 @@ export class PolicyEngine {
         } else if (!a.provider) {
           budgetDeny("budget-provider-required");
         } else {
+          const costUsd = ceilMicroUsd(a.costUsd);
           for (const c of this.budgets) {
             if (c.provider && c.provider !== a.provider) continue;
             if (c.projectId && c.projectId !== a.projectId) continue;
@@ -170,7 +188,7 @@ export class PolicyEngine {
               runId: c.runId,
               since: c.periodMs ? new Date(nowMs - c.periodMs) : undefined,
             });
-            if (used.usd + a.costUsd > c.maxCostUsd + 1e-9 || used.tokens + a.tokens > c.maxTokens) {
+            if (micros(used.usd) + micros(costUsd) > ceilingMicros(c.maxCostUsd) || used.tokens + a.tokens > c.maxTokens) {
               budgetDeny(`budget-exceeded:${c.id}`);
               break;
             }
@@ -180,7 +198,7 @@ export class PolicyEngine {
               projectId: a.projectId ?? null,
               runId: a.runId ?? null,
               provider: a.provider,
-              reservedUsd: a.costUsd,
+              reservedUsd: costUsd,
               reservedTokens: a.tokens,
             });
           }
@@ -262,7 +280,8 @@ export class PolicyEngine {
   /** After the call: record what it really cost. */
   async reconcile(reservationId: string, actualUsd: number, actualTokens: number): Promise<void> {
     if (![actualUsd, actualTokens].every((v) => Number.isFinite(v) && v >= 0)) throw new Error("invalid-budget-actuals");
-    await this.store.reconcile(reservationId, actualUsd, actualTokens);
+    if (!Number.isSafeInteger(actualTokens)) throw new Error("invalid-budget-actuals");
+    await this.store.reconcile(reservationId, ceilMicroUsd(actualUsd), actualTokens);
   }
 
   /** The call never happened: free the reservation. */

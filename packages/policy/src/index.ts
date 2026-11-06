@@ -8,5 +8,5 @@ export { MemoryPolicyStore, sumUsage } from "./store.js";
 export type { PolicyStore, PolicyTx, UsageFilter } from "./store.js";
 export { PrismaPolicyStore } from "./prisma-store.js";
 export type { PrismaLike } from "./prisma-store.js";
-export { PolicyEngine, bundleHashOf, grantProblem, MAX_GRANT_MS, MIN_HMAC_KEY_BYTES } from "./engine.js";
+export { PolicyEngine, bundleHashOf, grantProblem, ceilMicroUsd, MAX_GRANT_MS, MIN_HMAC_KEY_BYTES } from "./engine.js";
 export type { KkSession, GrantScope, PolicyEngineOptions } from "./engine.js";
