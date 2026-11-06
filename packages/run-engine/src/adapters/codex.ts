@@ -50,6 +50,7 @@ export class CodexExecAdapter implements RunAdapter {
 
   async start(task: RunTask, envelope: CapabilityEnvelope | null): Promise<void> {
     if (this.child) throw new RunFailure("internal", "adapter already started", false);
+    if (this.cancelled) this.refuse(new RunFailure("cancelled", "cancelled-before-start", false));
     // D1: Codex reviews read-only. The sandbox is fixed here, whatever the installed CLI config says,
     // and no caller argument may change it or the approval policy.
     const extra = this.opts.args ?? [];
@@ -69,7 +70,16 @@ export class CodexExecAdapter implements RunAdapter {
       child.once("error", (e) => reject(new RunFailure("sandbox_error", `spawn-failed:${(e as NodeJS.ErrnoException).code ?? "error"}`, false)));
     });
     await spawned.catch((e: RunFailure) => this.refuse(e));
+    // A child that exits before reading the prompt makes the pipe fail (EPIPE): that is the
+    // child's failure (non-zero exit, handled in pump), never an unhandled worker error.
+    child.stdin?.on("error", () => undefined);
     child.stdin?.end(task.prompt);
+    if (this.cancelled) {
+      // cancel() arrived while the process was being spawned: stop it now.
+      this.killGroup("SIGTERM");
+      this.killTimer = setTimeout(() => this.killGroup("SIGKILL"), this.opts.killGraceMs ?? 5000);
+      this.killTimer.unref();
+    }
     child.stderr?.resume(); // stderr is not parsed (may hold provider text); drained so the child never blocks.
     void this.pump(child, task);
   }

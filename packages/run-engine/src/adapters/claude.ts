@@ -45,6 +45,13 @@ export class ClaudeAgentSdkAdapter implements RunAdapter {
   async start(task: RunTask, envelope: CapabilityEnvelope | null): Promise<void> {
     if (this.started) throw new RunFailure("internal", "adapter already started", false);
     this.started = true;
+    if (this.cancelled) {
+      // cancel() arrived before the runtime started: never start it.
+      const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+      this.queue.end();
+      this.done.resolve(this.cancelledResult(usage, 0));
+      throw new RunFailure("cancelled", "cancelled-before-start", false);
+    }
     const sessionId = typeof task.resume?.state?.sessionId === "string" ? task.resume.state.sessionId : undefined;
     const gate = this.opts.toolGate;
     const stream = this.opts.query({

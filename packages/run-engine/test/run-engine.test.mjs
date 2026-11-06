@@ -519,3 +519,51 @@ test("r4-1 a failure during orphan recovery never loses the orphan's charge", as
     assert.equal(s.pstore.reservations.length, 1, failAt);
   }
 });
+
+// ---- Codex PR16-r5 regressions ----
+
+test("r5-1 a cancel that arrives before the runtime starts means it never starts", async () => {
+  for (const kind of ["codex", "claude"]) {
+    const s = setup();
+    s.store.runs.get(s.runId).model = "gpt-codex";
+    const argvfile = join(mkdtempSync(join(tmpdir(), "m15-")), "argv.json");
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const realMark = s.store.markRunning.bind(s.store);
+    s.store.markRunning = async (id) => { await gate; return realMark(id); };
+    const calls = [];
+    const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => (kind === "codex" ? fakeCodexAdapter("ok", { FAKE_CODEX_ARGVFILE: argvfile }) : new ClaudeAgentSdkAdapter({ query: fakeQuery({ calls }) })) });
+    const p = engine.execute({ runId: s.runId, provider: kind === "codex" ? "openai" : "anthropic", prompt: "x", cwd: ".", reserveUsd: 0.4 });
+    for (let i = 0; i < 50 && !(await engine.cancel(s.runId)); i++) await new Promise((r) => setTimeout(r, 10));
+    release();
+    const out = await p;
+    assert.equal(out.status, "cancelled", kind);
+    assert.equal(existsSync(argvfile), false, `${kind}: codex never spawned`);
+    assert.equal(calls.length, 0, `${kind}: SDK query never called`);
+  }
+});
+
+test("r5-2 a Codex child that exits before reading a large prompt is a typed failure, not a worker crash", async () => {
+  const s = setup();
+  s.store.runs.get(s.runId).model = "gpt-codex";
+  const out = await new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => fakeCodexAdapter("exit-early") }).execute({ runId: s.runId, provider: "openai", prompt: "p".repeat(8 * 1024 * 1024), cwd: ".", reserveUsd: 0.4 });
+  assert.equal(out.status, "failed");
+  assert.equal(out.errorType, "provider_error");
+  assert.equal(assertGapless(s.store, s.runId).at(-1).type, "error");
+});
+
+test("r5-3 a failed finishRun is retried as bookkeeping; only a fully finished retryable failure is rerun", async () => {
+  const s = setup();
+  const calls = [];
+  const engine = new RunEngine({ store: s.store, policy: s.policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: fakeQuery({ calls, failFirst: 1 }) }) });
+  s.store.failFinishTimes = 1;
+  await assert.rejects(engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." }), /store-down/);
+  const again = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(again.status, "failed");
+  assert.equal(again.errorType, "rate_limited");
+  assert.equal(calls.length, 1, "finishRun retried, runtime not started");
+  assert.equal(s.store.finished.get(s.runId).status, "failed");
+  const third = await engine.execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+  assert.equal(third.status, "succeeded");
+  assert.equal(calls.length, 2, "now the retryable failure is rerun");
+});

@@ -58,7 +58,7 @@ class Timeout extends Error {}
 
 /** The recorded outcome of an attempt and how far its bookkeeping got (checkpointed per step). */
 interface Ending {
-  step: "settle" | "cost" | "record" | "event" | "finish";
+  step: "settle" | "cost" | "record" | "event" | "finish" | "done";
   status: RunStatus;
   errorType?: RunErrorType;
   message: string;
@@ -156,7 +156,7 @@ export class RunEngine {
     // KK re-queued from the dead-letter view (`rerun`): then this execute is a new attempt.
     const prior = state.state.ending as Ending | undefined;
     if (prior) {
-      const done = prior.step === "finish";
+      const done = prior.step === "done";
       const again = done && prior.status === "failed" && (prior.retryable || input.rerun === true);
       if (!again) return this.finalize(run, state, prior, emit, checkpoint, () => seq);
       delete state.state.ending;
@@ -445,7 +445,10 @@ export class RunEngine {
       }
       await advance("finish");
     }
-    await store.finishRun(run.id, e.status, state.turn, e.status === "succeeded" ? undefined : `${e.errorType}:${e.message}`);
+    if (e.step === "finish") {
+      await store.finishRun(run.id, e.status, state.turn, e.status === "succeeded" ? undefined : `${e.errorType}:${e.message}`);
+      await advance("done");
+    }
     return {
       runId: run.id, status: e.status, errorType: e.errorType, retryable: e.retryable, countsAsAttempt: e.countsAsAttempt, costUsd: e.usd,
       costEstimated: e.costEstimated, turns: state.turn, lastSeq: seqNow(), ...(e.cardId ? { cardId: e.cardId } : {}),

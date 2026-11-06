@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 const mode = process.env.FAKE_CODEX_MODE ?? "ok";
 if (process.env.FAKE_CODEX_ARGVFILE) writeFileSync(process.env.FAKE_CODEX_ARGVFILE, JSON.stringify(process.argv.slice(2)));
+if (mode === "exit-early") process.exit(2); // never reads stdin
 let prompt = "";
 process.stdin.on("data", (c) => (prompt += c));
 process.stdin.on("end", () => {
