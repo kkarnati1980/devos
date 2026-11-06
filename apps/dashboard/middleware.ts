@@ -22,14 +22,10 @@ export function middleware(request: NextRequest) {
   requestHeaders.set("content-security-policy", csp);
   const response = NextResponse.next({ request: { headers: requestHeaders } });
   response.headers.set("Content-Security-Policy", csp);
-  response.headers.set("Cache-Control", "no-store");
+  // Hashed build assets may be cached; everything else (pages, 404s) is no-store.
+  if (!request.nextUrl.pathname.startsWith("/_next/static/")) response.headers.set("Cache-Control", "no-store");
   return response;
 }
 
-export const config = {
-  matcher: [
-    {
-      source: "/((?!_next/static|_next/image|favicon.ico).*)",
-    },
-  ],
-};
+// No matcher: middleware runs on every path, so every response — pages, HTML
+// 404s and error pages, and static assets — carries the strict CSP (PR15-r1).

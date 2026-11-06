@@ -109,6 +109,20 @@ test("AT5 (PS) security headers on pages, 404s and static assets; no X-Powered-B
   assert.equal(home.headers.get("cache-control"), "no-store");
 });
 
+test("AT4b (PS, PR15-r1) every path gets the strict CSP, including HTML 404s near asset paths", async () => {
+  for (const path of ["/favicon.ico-probe", "/favicon.ico", "/_next/image-probe", "/_next/static-probe", "/_next/static/missing-probe.js", "/projects/no-such-project", "/no/such/page"]) {
+    const res = await get(path);
+    const body = await res.text();
+    const csp = res.headers.get("content-security-policy");
+    assert.ok(csp && csp.includes("default-src 'none'") && /'nonce-[^']+'/.test(csp), `${path}: no strict CSP`);
+    if (/text\/html/.test(res.headers.get("content-type") ?? "")) {
+      const nonce = csp.match(/'nonce-([^']+)'/)[1];
+      for (const tag of scriptTags(body)) assert.ok(tag.includes(`nonce="${nonce}"`), `${path}: ${tag}`);
+      assert.match(res.headers.get("cache-control") ?? "", /no-store/, path);
+    }
+  }
+});
+
 test("AT7 lint: raw-HTML sinks and inline styles are found; dashboard source has none", () => {
   assert.deepEqual(findSinks(), []);
   const dir = mkdtempSync(join(tmpdir(), "m13-lint-"));
