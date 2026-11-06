@@ -1,0 +1,33 @@
+# M1.3 — dashboard browser acceptance tests (XSS never executes under the CSP; 390×844 layout; < 2 s) in Chromium (docs/modules/M1.3.md).
+name: dashboard-e2e
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: dashboard-e2e-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  dashboard-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Install Chromium (version pinned by the playwright devDependency)
+        run: pnpm --filter @devos/dashboard exec playwright install --with-deps chromium
+      - name: Browser acceptance tests
+        run: pnpm --filter @devos/dashboard run test:e2e

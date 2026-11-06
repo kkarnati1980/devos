@@ -1,0 +1,6 @@
+{
+  "spec": "<script>window.__devosXss = \"spec\"</script><img src=x onerror=\"window.__devosXss='spec-img'\">",
+  "summary": "</p><script>window.__devosXss = \"summary\"</script><a href=\"javascript:window.__devosXss='summary-link'\">x</a>",
+  "log": "<svg onload=\"window.__devosXss='log'\"></svg><iframe srcdoc=\"<script>parent.__devosXss='log-frame'</script>\"></iframe>",
+  "name": "XSS probe <b onmouseover=\"window.__devosXss='name'\">bold</b>"
+}

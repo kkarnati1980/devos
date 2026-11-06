@@ -1,6 +1,27 @@
 {
   "name": "@devos/dashboard",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "DevOS dashboard (Next.js). Built in M1.3."
+  "type": "module",
+  "description": "DevOS dashboard shell (M1.3): Next.js home and project page with module board, mock data first; escaped output, strict nonce CSP, phone layout, in-process HTTPS from tailscale cert.",
+  "scripts": {
+    "build": "next build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node scripts/no-raw-html.mjs",
+    "test": "next build && node --test \"test/*.test.mjs\"",
+    "test:e2e": "next build && node --test \"test/e2e/*.e2e.mjs\"",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "next": "15.5.28",
+    "react": "19.2.9",
+    "react-dom": "19.2.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "playwright": "1.63.0",
+    "typescript": "^5.6.3"
+  }
 }
