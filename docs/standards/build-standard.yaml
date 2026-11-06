@@ -1,0 +1,562 @@
+# DevOS build standard — machine-readable catalogue (ADR-0010; Phase PS v1.1.0 §3)
+# Single source of truth. `pnpm gen:standard` writes docs/standards/index.md and docs/standards/modules/*.md
+# from this file; `pnpm check:standard` fails CI if they drift or if this file breaks the schema
+# (docs/standards/build-standard.schema.json).
+#
+# kinds:   floor      always on for every app (protects the server and other apps)
+#          selectable chosen per app by the selector (S5), at level lite or full
+#          opt_in     only when KK asks on a card
+# checks:  how = auto (tool or test run by the readiness runner, S6) | review (Codex, S9) | both
+# signals: hints for the mid-build detector (S5); each `any_of` entry is a regular expression matched
+#          against changed file paths (`paths`) or added lines (`code`). S5 tunes them; no model call.
+version: 1.0.0
+adr: ADR-0010
+modules:
+  # ---------------------------------------------------------------- fixed floor
+  - id: F1
+    name: Secret exposure
+    kind: floor
+    blocks: [preview, live]
+    purpose: No secret ever leaves the server side of an app.
+    applies_when: Always (every app).
+    checks:
+      - id: F1-1
+        how: auto
+        check: Secret scan of the repository history and working tree finds nothing.
+        evidence: scan_report
+      - id: F1-2
+        how: auto
+        check: Secret scan of the built container image finds nothing.
+        evidence: scan_report
+      - id: F1-3
+        how: auto
+        check: Secret scan of the built frontend bundle finds nothing; no server-only env var name appears in it.
+        evidence: scan_report
+      - id: F1-4
+        how: review
+        check: Server env vars are read only in server code; configuration exposed to the client is an explicit allow-list.
+        evidence: review_verdict
+    signals: []
+
+  - id: F2
+    name: Internal-URL block
+    kind: floor
+    blocks: [preview, live]
+    purpose: Server-side code cannot be used to reach DevOS, the host, the tailnet or cloud metadata.
+    applies_when: Always (every app).
+    checks:
+      - id: F2-1
+        how: auto
+        check: >-
+          Every server-side fetch goes through the template's safeFetch. Static check: no raw HTTP client
+          (fetch, http/https.request, axios, undici, got, requests, httpx) outside safeFetch itself.
+        evidence: scan_report
+      - id: F2-2
+        how: auto
+        check: >-
+          A 10-case test refuses loopback, RFC 1918 private ranges, link-local, CGNAT/tailnet 100.64.0.0/10,
+          Docker ranges, 169.254.169.254, IPv6 loopback and ULA, non-HTTP(S) schemes, and an address that
+          becomes internal after DNS resolution or a redirect.
+        evidence: test_report
+    signals: []
+
+  - id: F3
+    name: Network and resource isolation
+    kind: floor
+    blocks: [preview, live]
+    purpose: A project container cannot reach anything it was not given, and cannot starve the server.
+    applies_when: Always (every app). Enforced by the host (S4), not only by app code.
+    checks:
+      - id: F3-1
+        how: auto
+        check: >-
+          Probe from inside the project container: Coolify (8000/6001/6002), SSH, the DevOS API, other
+          projects' networks, undeclared tailnet addresses and 169.254.169.254 are unreachable; internet
+          egress works only if declared.
+        evidence: probe_log
+      - id: F3-2
+        how: auto
+        check: docker inspect shows CPU, memory and pid limits on every project container (DV-NFR-05).
+        evidence: probe_log
+    signals: []
+
+  # ---------------------------------------------------------------- selectable
+  - id: SM-01
+    name: API input and contracts
+    kind: selectable
+    applies_when: The app has an API or forms.
+    lite:
+      summary: Schema validation on every input; invalid input returns 4xx and never reaches the database.
+      checks:
+        - id: SM-01-L1
+          how: both
+          check: Each route validates body, query and params against a schema; contract tests send invalid payloads and get 4xx.
+          evidence: test_report
+    full:
+      summary: Lite, plus contract tests generated from the API schema when frontend and backend are separate.
+      checks:
+        - id: SM-01-F1
+          how: auto
+          check: Contract tests generated from the API schema pass against the running service.
+          evidence: test_report
+    signals:
+      - description: Route handlers or form posts
+        code: ['\b(app|router)\.(get|post|put|patch|delete)\(', '\bexport (async )?function (GET|POST|PUT|PATCH|DELETE)\b', '<form\b']
+
+  - id: SM-02
+    name: Access control
+    kind: selectable
+    applies_when: Always, unless the app is a static page.
+    lite:
+      summary: >-
+        Deny by default; only /health and /ready are open; callers are KK's tailnet identity or a service
+        token; no IDOR on routes that take an ID.
+      checks:
+        - id: SM-02-L1
+          how: both
+          check: Route inventory shows every route behind the auth guard except /health and /ready.
+          evidence: route_list
+        - id: SM-02-L2
+          how: auto
+          check: For each route with an ID, changing the ID to another owner's resource returns 403/404.
+          evidence: test_report
+    full:
+      summary: >-
+        Lite, plus: an app with its own login has sessions of 12 h at most, rotated at sign-in and revocable;
+        an app with more than one user has row-level security or tenant scoping and two-user IDOR tests.
+      checks:
+        - id: SM-02-F1
+          how: both
+          check: Session absolute lifetime ≤ 12 h, HttpOnly, SameSite, rotated at sign-in, server-side revoke.
+          evidence: test_report
+        - id: SM-02-F2
+          how: auto
+          check: Two-user tests show neither user can read or change the other's rows on any route.
+          evidence: test_report
+    signals:
+      - description: Routes with ID parameters, auth libraries or user tables
+        code: ['/:[a-zA-Z]+Id\b', '\[id\]', 'next-auth|passport|lucia|@auth/', '\bmodel User\b']
+
+  - id: SM-03
+    name: Browser safety
+    kind: selectable
+    applies_when: The app has a web UI.
+    lite:
+      summary: CSRF protection on state-changing routes; escaped output; no raw-HTML sinks.
+      checks:
+        - id: SM-03-L1
+          how: auto
+          check: A cross-origin state-changing request is refused.
+          evidence: test_report
+        - id: SM-03-L2
+          how: both
+          check: No raw-HTML sinks (dangerouslySetInnerHTML, innerHTML, v-html, |safe) on untrusted data.
+          evidence: review_verdict
+    full:
+      summary: Lite, plus a strict CSP, the full security-header set and a seeded-XSS E2E test.
+      checks:
+        - id: SM-03-F1
+          how: auto
+          check: Header scan of the preview shows CSP, nosniff, Referrer-Policy, Permissions-Policy, frame-ancestors per SM-13, HSTS when HTTPS.
+          evidence: scan_report
+        - id: SM-03-F2
+          how: auto
+          check: A seeded XSS payload in every rendered input never executes in E2E.
+          evidence: e2e_report
+    signals:
+      - description: Frontend framework or cookies
+        paths: ['\.(tsx|jsx|vue|svelte)$']
+        code: ['\bdocument\.cookie\b', 'set-cookie', 'cookies\(\)']
+
+  - id: SM-04
+    name: Outbound resilience
+    kind: selectable
+    applies_when: The app calls any external service.
+    lite:
+      summary: A timeout on every outbound call.
+      checks:
+        - id: SM-04-L1
+          how: both
+          check: Every outbound call has an explicit timeout; a stubbed hanging dependency fails within it.
+          evidence: test_report
+    full:
+      summary: Lite, plus retries only for safe operations, with exponential backoff, jitter, a cap and a maximum attempt count.
+      checks:
+        - id: SM-04-F1
+          how: auto
+          check: With a stubbed failing dependency, safe calls retry with backoff and stop at the cap; unsafe calls never retry.
+          evidence: test_report
+    signals:
+      - description: HTTP clients or service SDKs
+        code: ['\bfrom [''"](axios|undici|got|node-fetch|openai|@anthropic-ai/sdk|stripe)[''"]', '\bimport (requests|httpx)\b']
+
+  - id: SM-05
+    name: Background work
+    kind: selectable
+    applies_when: Any task over about 2 s, or scheduled work.
+    lite:
+      summary: A queue with a retry policy and a visible, retryable dead-letter queue.
+      checks:
+        - id: SM-05-L1
+          how: both
+          check: Work over about 2 s runs from a queue; a poisoned job lands in the dead-letter queue and can be retried.
+          evidence: test_report
+    full:
+      summary: Lite, plus for heavy compute a concurrency limit and a load check that keeps DevOS headroom (DV-NFR-10).
+      checks:
+        - id: SM-05-F1
+          how: auto
+          check: N parallel heavy jobs respect the concurrency limit and DevOS stays within its headroom alert.
+          evidence: load_report
+    signals:
+      - description: Queue libraries, media or OCR tools, cron
+        code: ['bullmq|pg-boss|bee-queue|celery|\brq\b', 'ffmpeg|whisper|tesseract|\bocr\b', 'node-cron|croner|@Cron\(']
+
+  - id: SM-06
+    name: Data layer
+    kind: selectable
+    applies_when: The app stores data.
+    lite:
+      summary: >-
+        Transactions for related writes; indexes on foreign keys and filtered columns; a per-project pool
+        limit; backward-compatible migrations only.
+      checks:
+        - id: SM-06-L1
+          how: review
+          check: Related writes share a transaction; FK and filter columns are indexed; the pool limit is set.
+          evidence: review_verdict
+        - id: SM-06-L2
+          how: auto
+          check: Each migration is backward-compatible with the previous release (expand now, contract later; M4.3).
+          evidence: migration_review
+    full:
+      summary: Lite, plus query-count (N+1) tests on list endpoints and concurrency tests on colliding writes.
+      checks:
+        - id: SM-06-F1
+          how: auto
+          check: List endpoints run a bounded number of queries regardless of row count.
+          evidence: test_report
+        - id: SM-06-F2
+          how: auto
+          check: Concurrent colliding writes on the main write path keep the data consistent (unique constraint or optimistic lock).
+          evidence: test_report
+    signals:
+      - description: ORM or migrations
+        paths: ['(^|/)migrations?/', 'schema\.prisma$']
+        code: ['@prisma/client|drizzle-orm|typeorm|sequelize|sqlalchemy|knex']
+
+  - id: SM-07
+    name: Idempotency
+    kind: selectable
+    applies_when: The app creates records or triggers effects that must not repeat.
+    lite:
+      summary: An idempotency key on create endpoints and job handlers.
+      checks:
+        - id: SM-07-L1
+          how: both
+          check: Create endpoints and job handlers accept an idempotency key and store it with a unique constraint.
+          evidence: test_report
+    full:
+      summary: Lite, plus double-submit and replay tests.
+      checks:
+        - id: SM-07-F1
+          how: auto
+          check: A double submit and a replayed job cause no duplicate effect.
+          evidence: test_report
+    signals:
+      - description: Create endpoints or job handlers
+        code: ['\.(post|create)\(', 'export (async )?function POST\b', '\.process\(|\bworker\b']
+
+  - id: SM-08
+    name: Data retention
+    kind: selectable
+    applies_when: The app stores personal or growing data.
+    lite:
+      summary: A retention period per data class, plus a purge job.
+      checks:
+        - id: SM-08-L1
+          how: review
+          check: Each data class has a declared retention period and a purge job that enforces it.
+          evidence: review_verdict
+    full:
+      summary: Lite, plus a purge test, and the project's data included in the weekly test-restore.
+      checks:
+        - id: SM-08-F1
+          how: auto
+          check: The purge test removes expired rows only; the weekly test-restore lists this project.
+          evidence: test_report
+    signals:
+      - description: Growing tables or media storage
+        code: ['\b(logs?|events?|history|uploads?|media)\b.*\bmodel\b|\bmodel (Log|Event|History|Media|Upload)\w*\b', '@aws-sdk/client-s3|minio|@google-cloud/storage']
+
+  - id: SM-09
+    name: Ops and observability
+    kind: selectable
+    applies_when: The app runs as a service (nearly always).
+    lite:
+      summary: /health and /ready; JSON logs with a request ID; error monitoring wired.
+      checks:
+        - id: SM-09-L1
+          how: auto
+          check: /health answers liveness; /ready checks the database, queue and critical dependencies.
+          evidence: probe_log
+        - id: SM-09-L2
+          how: both
+          check: Logs are JSON with a request or job ID and contain no secrets or personal data; errors reach monitoring.
+          evidence: sample_log
+    full:
+      summary: Lite, plus alert rules, a health-gated rollout and a rollback test across one migration.
+      checks:
+        - id: SM-09-F1
+          how: auto
+          check: Deploy N, then N+1 with a migration, then roll back to N on preview; the app stays healthy.
+          evidence: deploy_log
+    signals:
+      - description: Server entrypoint
+        paths: ['(^|/)(server|main|index|app)\.(ts|js|py)$', '(^|/)Dockerfile$']
+
+  - id: SM-10
+    name: Feature flags
+    kind: selectable
+    applies_when: The app has user-visible features across spec phases.
+    lite:
+      summary: One kill switch per spec phase, working without a redeploy.
+      checks:
+        - id: SM-10-L1
+          how: auto
+          check: Turning a phase's kill switch off hides its features without a redeploy.
+          evidence: test_report
+    full:
+      summary: Lite, plus a flag per feature, each toggled in a test.
+      checks:
+        - id: SM-10-F1
+          how: auto
+          check: Every user-visible feature has a flag, and a test toggles each one.
+          evidence: test_report
+    signals:
+      - description: A multi-phase spec (set by the Analyst, not by code)
+        code: []
+
+  - id: SM-11
+    name: UI quality
+    kind: selectable
+    applies_when: The app has a web UI KK uses.
+    lite:
+      summary: E2E for the main journey at desktop (1440×900) and phone (390×844) widths.
+      checks:
+        - id: SM-11-L1
+          how: auto
+          check: The main journey passes E2E at both widths, with screenshots stored.
+          evidence: e2e_report
+    full:
+      summary: Lite, plus every journey; axe with no serious or critical issues; the main journey works by keyboard alone.
+      checks:
+        - id: SM-11-F1
+          how: auto
+          check: Every journey in the requirements file passes E2E at both widths.
+          evidence: e2e_report
+        - id: SM-11-F2
+          how: auto
+          check: axe reports no serious or critical issues; the main journey completes keyboard-only.
+          evidence: a11y_report
+    signals:
+      - description: Frontend framework
+        paths: ['\.(tsx|jsx|vue|svelte)$']
+
+  - id: SM-12
+    name: Cost and rate
+    kind: selectable
+    applies_when: The app starts paid or heavy work.
+    lite:
+      summary: Paid services declared with a monthly cap; usage metered to the project budget.
+      checks:
+        - id: SM-12-L1
+          how: both
+          check: Each paid service is declared with a monthly cap, and its usage appears in the project budget.
+          evidence: budget_record
+    full:
+      summary: Lite, plus per-caller rate limits on paid or heavy endpoints.
+      checks:
+        - id: SM-12-F1
+          how: auto
+          check: A caller exceeding the limit on a paid or heavy endpoint gets 429 and causes no spend.
+          evidence: test_report
+    signals:
+      - description: Paid API SDKs or heavy jobs
+        code: ['openai|@anthropic-ai/sdk|replicate|elevenlabs|assemblyai|deepgram|stripe', 'ffmpeg|whisper']
+
+  - id: SM-13
+    name: MyBrain integration
+    kind: selectable
+    applies_when: The app is opened from MyBrain (expected for every app).
+    lite:
+      summary: "Link-out profile: frame-ancestors 'none', no CORS, KK's Tailscale identity is the login, no MyBrain tokens in the app."
+      checks:
+        - id: SM-13-L1
+          how: auto
+          check: "Responses carry frame-ancestors 'none' and no Access-Control-Allow-Origin."
+          evidence: scan_report
+    full:
+      summary: >-
+        Lite, plus the embed or API mode KK picked on a card. Embed: frame-ancestors is MyBrain's exact origin,
+        HTTPS both sides, origin-checked postMessage, CSRF inside the frame. API: per-app service token (vault,
+        90-day rotation), HMAC-signed requests with a timestamp, no CORS, tailnet ACL for that port only.
+      checks:
+        - id: SM-13-F1
+          how: auto
+          check: The chosen mode's precautions hold (frame origin, postMessage origin check, or signed and scoped API calls).
+          evidence: test_report
+    signals:
+      - description: MyBrain link, iframe or API mode
+        code: ['mybrain', 'postMessage\(', '<iframe\b']
+
+  - id: SM-14
+    name: Dependencies
+    kind: selectable
+    applies_when: The app uses third-party packages (nearly always).
+    lite:
+      summary: A lockfile; no high or critical vulnerabilities.
+      checks:
+        - id: SM-14-L1
+          how: auto
+          check: A lockfile is committed and the dependency scan finds no high or critical vulnerability.
+          evidence: scan_report
+    full:
+      summary: Lite, plus a licence report; copyleft that would bind KK's project goes to a card first (D13).
+      checks:
+        - id: SM-14-F1
+          how: auto
+          check: A licence report is stored and lists no unapproved copyleft licence.
+          evidence: scan_report
+    signals:
+      - description: Package manifests
+        paths: ['(^|/)(package\.json|requirements\.txt|pyproject\.toml|go\.mod|Cargo\.toml)$']
+
+  - id: SM-15
+    name: User-supplied URL fetching
+    kind: selectable
+    applies_when: The app fetches URLs a user provides (the pilot does).
+    lite:
+      summary: >-
+        The full SSRF corpus on top of F2 (DNS rebinding, redirects to internal, IPv6 and encoded IPs,
+        file:// and gopher://); response size and time caps.
+      checks:
+        - id: SM-15-L1
+          how: auto
+          check: Every case in the SSRF corpus is refused; oversized or slow responses are cut at the caps.
+          evidence: test_report
+    full:
+      summary: Lite, plus per-domain rate limits for the platforms fetched.
+      checks:
+        - id: SM-15-F1
+          how: auto
+          check: Fetches to one platform are limited per domain; the limit holds under parallel requests.
+          evidence: test_report
+    signals:
+      - description: An HTTP client called with a URL from the request
+        code: ['safeFetch\((req|request|body|input|params)\.', 'fetch\((req|request|body|input|params)\.', '\burl\s*=\s*(req|request)\.(body|query)']
+
+  - id: SM-16
+    name: AI on untrusted content
+    kind: selectable
+    applies_when: An LLM processes content from users or the web.
+    lite:
+      summary: >-
+        Content delimited and treated as data; no side-effect tools unless allow-listed; model output never
+        executed or rendered as raw HTML.
+      checks:
+        - id: SM-16-L1
+          how: both
+          check: Untrusted content is passed in delimited data blocks; the model has no side-effect tools outside the allow-list; output is escaped.
+          evidence: review_verdict
+    full:
+      summary: Lite, plus an injection test corpus and a per-request token cap.
+      checks:
+        - id: SM-16-F1
+          how: auto
+          check: The injection corpus causes no tool call, data leak or rendered script; requests over the token cap are refused.
+          evidence: test_report
+    signals:
+      - description: LLM SDK imports
+        code: ['openai|@anthropic-ai/sdk|@google/generative-ai|langchain|llamaindex|ollama']
+
+  - id: SM-17
+    name: Files and uploads
+    kind: selectable
+    applies_when: The app accepts uploads or serves stored files.
+    lite:
+      summary: Magic-byte type check; size cap; storage outside the web root under random names.
+      checks:
+        - id: SM-17-L1
+          how: auto
+          check: A renamed binary is rejected; an oversize file is rejected; stored names are random and outside the web root.
+          evidence: test_report
+    full:
+      summary: Lite, plus archive-bomb limits and signed download URLs that expire in 15 minutes or less.
+      checks:
+        - id: SM-17-F1
+          how: auto
+          check: An archive bomb is refused; a download URL stops working after its expiry (≤ 15 min).
+          evidence: test_report
+    signals:
+      - description: Upload middleware or object storage
+        code: ['multer|busboy|formidable|@fastify/multipart|UploadFile', 'type=["'']file["'']', '@aws-sdk/client-s3|minio|@google-cloud/storage']
+
+  - id: SM-18
+    name: Integrations
+    kind: selectable
+    applies_when: The app takes payments, receives webhooks, caches data, or stores third-party tokens.
+    lite:
+      summary: >-
+        Only the sub-parts that apply: webhook HMAC with timestamp and replay protection; payment event dedupe
+        and out-of-order handling; cache TTL with invalidation on write; third-party tokens encrypted with
+        least scope.
+      checks:
+        - id: SM-18-L1
+          how: both
+          check: Each applicable sub-part is implemented (signature check, event dedupe, TTL plus invalidation, encrypted least-scope tokens).
+          evidence: test_report
+    full:
+      summary: Lite, plus replay, out-of-order and stale-read tests.
+      checks:
+        - id: SM-18-F1
+          how: auto
+          check: A replayed webhook, out-of-order payment events and a read after a write all behave correctly.
+          evidence: test_report
+    signals:
+      - description: Payment SDKs, webhook routes, cache libraries or OAuth libraries
+        code: ['stripe|razorpay|paypal', '/webhooks?\b', 'ioredis|redis|node-cache|lru-cache', 'oauth|simple-oauth2|openid-client|refresh_token']
+
+  # ---------------------------------------------------------------- opt-in (KK card only)
+  - id: SM-C1
+    name: Load testing at public scale
+    kind: opt_in
+    applies_when: Only when KK asks on a card.
+    checks:
+      - id: SM-C1-1
+        how: auto
+        check: A load test at the volume KK names meets the latency and error targets on the card.
+        evidence: load_report
+    signals: []
+
+  - id: SM-C2
+    name: Multi-region disaster recovery
+    kind: opt_in
+    applies_when: Only when KK asks on a card.
+    checks:
+      - id: SM-C2-1
+        how: auto
+        check: A restore into a second region meets the RTO and RPO on the card.
+        evidence: drill_report
+    signals: []
+
+  - id: SM-C3
+    name: Public URL
+    kind: opt_in
+    applies_when: Only when KK approves a public URL for the project (a per-project card under O3).
+    checks:
+      - id: SM-C3-1
+        how: both
+        check: The public route exposes only what the card lists; everything else stays tailnet-only.
+        evidence: scan_report
+    signals: []

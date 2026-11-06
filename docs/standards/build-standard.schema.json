@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://devos.local/standards/build-standard.schema.json",
+  "title": "DevOS build standard catalogue (ADR-0010)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "adr", "modules"],
+  "properties": {
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "adr": { "const": "ADR-0010" },
+    "modules": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/module" } }
+  },
+  "definitions": {
+    "evidence": {
+      "enum": ["scan_report", "test_report", "e2e_report", "a11y_report", "load_report", "drill_report", "probe_log",
+               "sample_log", "deploy_log", "route_list", "budget_record", "migration_review", "review_verdict"]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "how", "check", "evidence"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^(F[1-3]|SM-(0[1-9]|1[0-8])|SM-C[1-3])-(L|F)?[0-9]+$" },
+        "how": { "enum": ["auto", "review", "both"] },
+        "check": { "type": "string", "minLength": 10 },
+        "evidence": { "$ref": "#/definitions/evidence" }
+      }
+    },
+    "level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "checks"],
+      "properties": {
+        "summary": { "type": "string", "minLength": 10 },
+        "checks": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/check" } }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description"],
+      "properties": {
+        "description": { "type": "string" },
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "code": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "module": {
+      "type": "object",
+      "required": ["id", "name", "kind", "applies_when", "signals"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^(F[1-3]|SM-(0[1-9]|1[0-8])|SM-C[1-3])$" },
+        "name": { "type": "string", "minLength": 3 },
+        "kind": { "enum": ["floor", "selectable", "opt_in"] },
+        "purpose": { "type": "string" },
+        "applies_when": { "type": "string", "minLength": 5 },
+        "blocks": { "type": "array", "items": { "enum": ["preview", "live"] }, "uniqueItems": true },
+        "checks": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/check" } },
+        "lite": { "$ref": "#/definitions/level" },
+        "full": { "$ref": "#/definitions/level" },
+        "signals": { "type": "array", "items": { "$ref": "#/definitions/signal" } }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "selectable" } } },
+          "then": { "required": ["lite", "full"], "not": { "anyOf": [{ "required": ["checks"] }, { "required": ["blocks"] }] } } },
+        { "if": { "properties": { "kind": { "const": "floor" } } },
+          "then": { "required": ["checks", "blocks", "purpose"], "not": { "anyOf": [{ "required": ["lite"] }, { "required": ["full"] }] } } },
+        { "if": { "properties": { "kind": { "const": "opt_in" } } },
+          "then": { "required": ["checks"], "not": { "anyOf": [{ "required": ["lite"] }, { "required": ["full"] }, { "required": ["blocks"] }] } } }
+      ]
+    }
+  }
+}

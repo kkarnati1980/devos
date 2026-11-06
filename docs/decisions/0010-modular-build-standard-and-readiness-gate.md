@@ -1,0 +1,15 @@
+# ADR-0010 — Modular build standard, per-app selection and readiness gate
+
+- **Status:** accepted (5 Nov 2026, KK approval; Architect under D10). Applies to S1–S9, M2.2, M2.4, M3.2–M3.5, M4.1, M4.2.
+- **Context:** The only rule every project had to meet was the deploy contract (DV-FR-021). A single all-rules standard would spend tokens and server time on rules most of KK's private, single-user apps do not need. Some protections, though, guard the DevOS server and other apps and must always run.
+- **Decision:**
+  1. `docs/standards/` holds an index, one file per rule module, and a machine-readable `build-standard.yaml`. Modules are: a **fixed floor** (F1–F3, always on), **selectable modules** (SM-01–SM-18) and **opt-in modules** (SM-C1–C3, only when KK asks).
+  2. **Selection per app:** after the Analyst writes the requirements file, the Architect (Claude) evaluates the spec, whether or not it mentions security, and writes `docs/standards/selection.md`: each module selected (with level Lite or Full and the requirement IDs that justify it) or not selected (with a one-line reason).
+  3. **Challenge loop:** Codex challenges the selection (read-only, JSON schema); Claude responds. At most 3 iterations; it stops early when Codex has no objection. Claude then summarises and takes the final call, and KK is informed with the reasons (dashboard, MyBrain bell, morning report). This is not a gate; KK can override at any time, which re-runs the selection.
+  4. **Only selected modules** are loaded into agent context, scaffolded from the template, tested, reviewed and checked by the readiness runner. Unselected modules appear in the report as "not applicable" with their reason.
+  5. **Mid-build auto-add:** a deterministic detector (no model call) scans each PR for code signals. A signal for an unselected module adds it at Lite level, triggers its tests, and is reported to KK in the next morning report and on the dashboard. Modules are removed only at a milestone-start re-selection, through the same challenge loop.
+  6. **Readiness gate:** Release deploys live only with a green report for floor + selected modules **and** a Codex PASS **and** green CI for the same SHA, enforced as an M1.7 policy rule (`deploy.live` requires `readiness_report` evidence with provenance `tool_result`). Floor failures (F1 secrets, F2 internal-URL fetch) block the preview copy as well.
+  7. **Waivers:** only KK, through a card that issues an `approval_grant` scoped to project + rule, expiring in at most 90 days.
+- **Consequences:** the standard's overhead scales with what the app does. The selection loop costs a small, capped amount per project (§4.3). A wrong "not selected" call is the main risk; it is mitigated by the Codex challenge, the mid-build detector and the floor.
+
+**Note (build plan v1.0.2 §2.2):** the S5 selector blocks M3.5 and G3; "no app build without a selection" is a runtime rule in the M3.2 contract rather than a build dependency of M3.2. §4.3 above refers to Phase PS v1.1.0 §4.3 (selection budget USD 0.50 per project, editable).

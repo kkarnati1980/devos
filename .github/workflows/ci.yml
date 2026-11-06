@@ -23,6 +23,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Rules drift check
         run: pnpm check:rules
+      - name: Build standard check
+        run: pnpm check:standard
       - name: Typecheck
         run: pnpm typecheck
       - name: Lint
