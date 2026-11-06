@@ -1,6 +1,29 @@
 {
   "name": "@devos/api",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "DevOS orchestrator + API (NestJS + Prisma). Built in M1.2."
+  "type": "module",
+  "description": "DevOS API (M1.2): NestJS, Tailscale identity, 12-hour session, CSRF, security headers, request-ID JSON logs, OpenAPI contract.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "pnpm --filter @devos/policy run build && tsc -p tsconfig.json",
+    "typecheck": "pnpm --filter @devos/policy run build && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @devos/policy run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@devos/db": "workspace:*",
+    "@devos/policy": "workspace:*",
+    "@nestjs/common": "11.2.8",
+    "@nestjs/core": "11.2.8",
+    "@nestjs/platform-express": "11.2.8",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "^22.7.0",
+    "typescript": "^5.6.3",
+    "yaml": "2.8.1"
+  }
 }
