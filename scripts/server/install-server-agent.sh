@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — install the server agent on the DevOS server (DEVOS-74). Contract: docs/modules/server-agent.md
-# Version: 1.1.2
+# Version: 1.2.1
+# v1.2.1 (Codex PR12-r1): running the installed copy (ROTATE_COOLIFY=1 bash /root/.devos/bin/...) skips the copy
+# step instead of failing on install's same-file check.
+# v1.2.0: the Coolify token is optional (Enter skips it) until a DevOS app exists in Coolify (M1.2);
+# without it deploy-on-PASS cannot be turned on, and self-update + server checks still run.
 # v1.1.2 (Codex PR11-r4): --deploy-on and --deploy-off change the switch under the agent's lock.
 # v1.1.1 (Codex PR11-r2): RETRY_DEPLOY=1 clears only a recorded failure, under the agent's lock.
 # v1.1.0 (Codex PR11-r1): --uninstall also stops a running tick; RETRY_DEPLOY=1 clears a failed deploy of the
@@ -49,28 +53,44 @@ if [[ "${1:-}" != --deploy-on ]]; then
 
   echo "==> 1/4 scripts"
   install -d -m 700 "$DIR" "$DIR/bin" "$DIR/bin/checks" "$ST"
-  bash -n "$SRC/server-agent.sh"
-  install -m 700 "$SRC/server-agent.sh" "$DIR/bin/server-agent.sh"
-  install -m 700 "$SRC/install-server-agent.sh" "$DIR/bin/install-server-agent.sh"
-  for f in "$SRC"/checks/*.sh; do [[ -e "$f" ]] && bash -n "$f" && install -m 700 "$f" "$DIR/bin/checks/"; done
-  pass "installed to $DIR/bin ($(ls "$DIR"/bin/checks/*.sh 2>/dev/null | wc -l) checks)"
+  if [[ "$SRC" -ef "$DIR/bin" ]]; then
+    # Run from the installed copy (e.g. ROTATE_COOLIFY=1 later): the scripts are already in place and the agent
+    # keeps them current from main, so nothing is copied.
+    pass "running from $DIR/bin: scripts already installed (kept current by the agent's self-update)"
+  else
+    bash -n "$SRC/server-agent.sh"
+    install -m 700 "$SRC/server-agent.sh" "$DIR/bin/server-agent.sh"
+    install -m 700 "$SRC/install-server-agent.sh" "$DIR/bin/install-server-agent.sh"
+    for f in "$SRC"/checks/*.sh; do [[ -e "$f" ]] && bash -n "$f" && install -m 700 "$f" "$DIR/bin/checks/"; done
+    pass "installed to $DIR/bin ($(ls "$DIR"/bin/checks/*.sh 2>/dev/null | wc -l) checks)"
+  fi
 
   echo "==> 2/4 Coolify API token (hidden)"
   if [[ ! -s "$CF_ENV" || "${ROTATE_COOLIFY:-0}" == 1 ]]; then
-    echo "  Coolify → Keys & Tokens → API tokens → Create (permission: deploy + read). Copy it."
-    read -rsp "  Paste the Coolify API token (input hidden), then Enter: " T; echo
-    [[ "$T" =~ ^[A-Za-z0-9|._-]{20,}$ ]] || { unset T; fail "that does not look like a Coolify API token"; }
-    read -rp "  DevOS application UUID (Coolify → DevOS app → the id in the URL): " U
-    [[ "$U" =~ ^[A-Za-z0-9-]{8,64}$ ]] || { unset T; fail "that does not look like an application UUID"; }
-    ( umask 077; printf 'COOLIFY_TOKEN=%s\nCOOLIFY_APP_UUID=%s\n' "$T" "$U" > "$CF_ENV" ); unset T
+    echo "  Needed only once a DevOS application exists in Coolify (it ships with M1.2)."
+    echo "  No DevOS app yet? Just press Enter: deploy-on-PASS stays off; self-update and checks still run."
+    echo "  Otherwise: Coolify → Keys & Tokens → API tokens → Create (permission: deploy + read). Copy it."
+    read -rsp "  Paste the Coolify API token (input hidden), or press Enter to skip: " T; echo
+    if [[ -z "$T" ]]; then
+      echo "  Coolify skipped. Add it later: ROTATE_COOLIFY=1 bash $DIR/bin/install-server-agent.sh"
+    else
+      [[ "$T" =~ ^[A-Za-z0-9|._-]{20,}$ ]] || { unset T; fail "that does not look like a Coolify API token"; }
+      read -rp "  DevOS application UUID (Coolify → DevOS app → the id in the URL): " U
+      [[ "$U" =~ ^[A-Za-z0-9-]{8,64}$ ]] || { unset T; fail "that does not look like an application UUID"; }
+      ( umask 077; printf 'COOLIFY_TOKEN=%s\nCOOLIFY_APP_UUID=%s\n' "$T" "$U" > "$CF_ENV" ); unset T
+    fi
   fi
-  chmod 600 "$CF_ENV"
-  TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
-  ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^COOLIFY_TOKEN=//p' "$CF_ENV" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
-  U="$(sed -n 's/^COOLIFY_APP_UUID=//p' "$CF_ENV" | head -n1 | tr -d '\r\n')"
-  c="$(curl -sS --connect-timeout 10 --max-time 30 -o "$TMP/r" -w '%{http_code}' -H @"$TMP/auth" -H 'Accept: application/json' "http://localhost:8000/api/v1/applications/$U" || true)"
-  if [[ "$c" == 200 ]]; then pass "token reads the app '$(jq -r '.name // "?"' "$TMP/r")'; file mode $(stat -c %a "$CF_ENV")"
-  else fail "Coolify API answered HTTP $c for that app - check the token and UUID, then rerun with ROTATE_COOLIFY=1"; fi
+  if [[ -s "$CF_ENV" ]]; then
+    chmod 600 "$CF_ENV"
+    TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
+    ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^COOLIFY_TOKEN=//p' "$CF_ENV" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
+    U="$(sed -n 's/^COOLIFY_APP_UUID=//p' "$CF_ENV" | head -n1 | tr -d '\r\n')"
+    c="$(curl -sS --connect-timeout 10 --max-time 30 -o "$TMP/r" -w '%{http_code}' -H @"$TMP/auth" -H 'Accept: application/json' "http://localhost:8000/api/v1/applications/$U" || true)"
+    if [[ "$c" == 200 ]]; then pass "token reads the app '$(jq -r '.name // "?"' "$TMP/r")'; file mode $(stat -c %a "$CF_ENV")"
+    else fail "Coolify API answered HTTP $c for that app - check the token and UUID, then rerun with ROTATE_COOLIFY=1"; fi
+  else
+    pass "no Coolify token stored: deploy-on-PASS cannot be turned on yet"
+  fi
 
   echo "==> 3/4 dry run"
   "$DIR/bin/server-agent.sh" --dry-run 2>&1 | sed 's/^/  /'
@@ -104,7 +124,11 @@ UNITF
   pass "timer enabled; logs: journalctl -u $UNIT -n 50"
 fi
 
-if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" ]]; then
+if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" && ! -s "$CF_ENV" ]]; then
+  echo "  deploy-on-PASS stays OFF: no Coolify token stored (add it with ROTATE_COOLIFY=1 once the DevOS app exists)."
+  [[ "${1:-}" == --deploy-on ]] && exit 1
+fi
+if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" && -s "$CF_ENV" ]]; then
   echo "==> First launch: deploy-on-PASS redeploys DevOS through Coolify for every main SHA with green CI + Codex PASS."
   read -rp "  Approve deploy-on-PASS now? Type yes or no: " A
   if [[ "$A" == yes ]]; then
