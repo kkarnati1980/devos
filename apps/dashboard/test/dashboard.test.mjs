@@ -151,3 +151,17 @@ test("AT8 contract: view-model enums equal the M1.1 schema enums; readiness pane
   assert.deepEqual(tsValues("RUN_ROLES"), enumValues("Role"));
   for (const path of ["/", "/projects/xss-probe"]) assert.match(await (await get(path)).text(), /data-testid="readiness-panel"/);
 });
+
+test("M1.4: DEVOS_API_ORIGIN must be an exact origin; it widens connect-src only", async () => {
+  const { parseApiOrigin } = await import("../lib/headers.mjs");
+  assert.equal(parseApiOrigin("https://devos.tail1234.ts.net:8443"), "https://devos.tail1234.ts.net:8443");
+  assert.equal(parseApiOrigin("http://127.0.0.1:4000"), "http://127.0.0.1:4000");
+  for (const bad of [undefined, "", "*", "https://a.example/", "https://a.example/path", "https://u@a.example", "javascript:alert(1)", "https://a.example; script-src *", "ftp://a.example"]) {
+    assert.equal(parseApiOrigin(bad), null, String(bad));
+  }
+  const nonce = "AAAAAAAAAAAAAAAAAAAAAAAA";
+  const csp = buildCsp(nonce, "https://api.example:8443");
+  assert.match(csp, /connect-src 'self' https:\/\/api\.example:8443;/);
+  assert.match(csp, /script-src 'nonce-AAAAAAAAAAAAAAAAAAAAAAAA' 'strict-dynamic';/);
+  assert.throws(() => buildCsp(nonce, "https://a.example; script-src *"), /csp-api-origin-invalid/);
+});

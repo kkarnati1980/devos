@@ -9,6 +9,7 @@
     "build": "pnpm --filter @devos/policy run build && tsc -p tsconfig.json",
     "typecheck": "pnpm --filter @devos/policy run build && tsc -p tsconfig.json --noEmit",
     "test": "pnpm --filter @devos/policy run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
+    "test:db": "pnpm --filter @devos/policy run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
     "start": "node dist/main.js"
   },
   "dependencies": {

@@ -1,0 +1,43 @@
+# M1.4 — settings and vault stores against a real Postgres 17 through the M1.1 Prisma client (docs/modules/M1.4.md).
+name: api-db
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: api-db-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  api-db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: devos
+          POSTGRES_PASSWORD: devos_ci_only
+          POSTGRES_DB: devos
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U devos" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # CI-only throwaway database in the job's service container; not a real credential.
+      DATABASE_URL: postgresql://devos:devos_ci_only@localhost:5432/devos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Apply migrations
+        run: pnpm --filter @devos/db exec prisma migrate deploy
+      - name: Build the db client
+        run: pnpm --filter @devos/db run build
+      - name: M1.4 AT14 settings and vault stores against Postgres
+        run: pnpm --filter @devos/api run test:db
