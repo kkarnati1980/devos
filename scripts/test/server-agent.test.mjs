@@ -310,3 +310,34 @@ test("AT6: --dry-run on a fresh server creates no directories or lock file", asy
   assert.equal(writes().length, 0);
   assert.match(r.out, /WOULD install/);
 });
+
+test("AT4: an earlier deployment's status must post before the newer SHA deploys", async () => {
+  resetMock(); freshState({ deploy: true });
+  const a = commit({ "o.txt": "a" }, "order a");
+  M.main = a; green(a); pass(a); M.deployStatus = "in_progress";
+  await runAgent({ DEPLOY_TIMEOUT: "0" });
+  const b = commit({ "o.txt": "b" }, "order b");
+  M.main = b; green(b); pass(b); M.deployStatus = "finished"; M.failStatus = 1;
+  await runAgent();
+  assert.equal(M.deployPosts, 1, "b not submitted while a's status is unposted");
+  assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-statused.${a}`)));
+  await runAgent();
+  assert.ok(fs.existsSync(path.join(D(), `agent/deploy-statused.${a}`)));
+  assert.equal(M.deployPosts, 2, "then b submitted once");
+});
+
+test("AT4: a running deployment is reconciled after deploy is turned off; nothing new is submitted", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ "off.txt": "x" }, "deploy then off");
+  M.main = sha; green(sha); pass(sha); M.deployStatus = "in_progress";
+  await runAgent({ DEPLOY_TIMEOUT: "0" });
+  fs.rmSync(path.join(D(), "agent/deploy.enabled"));
+  reqs.length = 0; await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.equal(statusPosts("server-check").length, 0, "no checks while the deployment runs");
+  assert.ok(!fs.existsSync(path.join(D(), `agent/done.${sha}`)));
+  M.deployStatus = "finished";
+  reqs.length = 0; await runAgent();
+  assert.equal(M.deployPosts, 1, "never resubmitted");
+  assert.equal(statusPosts("devos-deploy")[0].state, "success");
+  assert.equal(statusPosts("server-check").length, 1, "checks after the deployment finished");
+});

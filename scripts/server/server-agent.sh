@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.1.1
+# Version: 1.1.2
+# v1.1.2 (Codex PR11-r3): an earlier deployment's status must post before a newer deploy or check; a submitted
+# deployment is reconciled even after --deploy-off.
 # v1.1.0 (Codex PR11-r1): GitHub read errors (trees, statuses, PRs) mean "wait", never "ok"; every install step
 # propagates failure; a deploy is never submitted twice (start + deployment-id markers, wall-clock budget, resume);
 # a drain publishes results of earlier SHAs; markers are <name>.<sha> throughout; --dry-run never posts;
@@ -296,6 +298,15 @@ for f in "$ST"/deploy-started.*; do
   esac
   touch "$ST/superseded.$s"
 done
+# An earlier deployment's result must be posted before anything newer is deployed or checked.
+for f in "$ST"/deployed.*; do
+  [[ -e "$f" ]] || continue
+  s="${f##*/deployed.}"
+  [[ "$s" =~ ^[0-9a-f]{40}$ && "$s" != "$sha" && ! -e "$ST/deploy-statused.$s" ]] || continue
+  if [[ $DRY -eq 1 ]]; then log "${s:0:7}: WOULD post the earlier deployment's status first"; exit 0; fi
+  publish "$s"
+  [[ -e "$ST/deploy-statused.$s" ]] || { log "${s:0:7}: earlier deployment status not posted yet; main ${sha:0:7} waits"; exit 0; }
+done
 # Drain 2: earlier SHAs with stored results whose publication is incomplete (main has moved on since).
 for f in "$ST"/refused.* "$ST"/deployed.* "$ST"/*.checks.state; do
   [[ -e "$f" ]] || continue
@@ -331,7 +342,9 @@ if [[ ! -e "$ST/installed.$sha" ]]; then
 fi
 [[ $DRY -eq 1 ]] && { log "main ${sha:0:7}: installed; WOULD continue deploy/checks/publication"; exit 0; }
 
-if [[ $deploy_on -eq 1 ]]; then
+# A deployment already submitted for this SHA is always reconciled, even if deploy was turned off since
+# (deploy() only resumes or records it then; it submits only when no start marker exists).
+if [[ $deploy_on -eq 1 || -e "$ST/deploy-started.$sha" ]]; then
   if [[ ! -s "$ST/deployed.$sha" ]]; then
     set +e; deploy "$sha"; rc=$?; set -e
     case "$rc" in
