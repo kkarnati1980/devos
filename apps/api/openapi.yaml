@@ -1,0 +1,117 @@
+openapi: 3.1.0
+info:
+  title: DevOS API
+  version: 1.0.0
+  description: >
+    M1.2 contract (docs/modules/M1.2.md). Deny by default: every operation needs KK's live
+    Tailscale identity and a session bound to it, except those marked `x-devos-access: open`
+    (`/health`, `/ready`) or `tailnet` (sign-in). State-changing operations also need an allowed
+    Origin (or Referer) and the per-session CSRF token in `X-Devos-Csrf`.
+components:
+  securitySchemes:
+    tailnetSession:
+      type: apiKey
+      in: cookie
+      name: devos_session
+      description: 12-hour absolute session; `__Host-devos_session` when served over HTTPS.
+  schemas:
+    Error:
+      type: object
+      required: [statusCode, code]
+      properties:
+        statusCode: { type: integer }
+        code: { type: string }
+    Session:
+      type: object
+      required: [login, expiresAt, csrfToken]
+      properties:
+        login: { type: string }
+        expiresAt: { type: string, format: date-time }
+        csrfToken: { type: string }
+    GrantScope:
+      type: object
+      additionalProperties: false
+      required: [scopeAction, expiresAt]
+      properties:
+        scopeAction: { type: string, minLength: 1, maxLength: 200 }
+        scopeResource: { type: [string, "null"], minLength: 1, maxLength: 500 }
+        projectId: { type: [string, "null"], format: uuid }
+        approvalId: { type: [string, "null"], format: uuid }
+        sha: { type: [string, "null"], pattern: "^[0-9a-f]{40}$" }
+        expiresAt: { type: string, format: date-time, description: "Future, at most 90 days away (M1.7)." }
+        maxUses: { type: integer, minimum: 1, maximum: 1000 }
+  responses:
+    Unauthorized: { description: No valid session for this tailnet identity, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Forbidden: { description: Not KK, or a CSRF check failed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    BadRequest: { description: Invalid input, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Unavailable: { description: Identity service or policy engine unavailable (fail closed), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+security:
+  - tailnetSession: []
+paths:
+  /health:
+    get:
+      operationId: health
+      x-devos-access: open
+      security: []
+      responses:
+        "200": { description: Process is up; reports the deployed SHA }
+  /ready:
+    get:
+      operationId: ready
+      x-devos-access: open
+      security: []
+      responses:
+        "200": { description: Database reachable }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /auth/session:
+    post:
+      operationId: signIn
+      x-devos-access: tailnet
+      x-devos-state-changing: true
+      security: []
+      responses:
+        "201": { description: New session (cookie set), content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    get:
+      operationId: currentSession
+      x-devos-access: session
+      responses:
+        "200": { description: Current session, content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    delete:
+      operationId: signOut
+      x-devos-access: session
+      x-devos-state-changing: true
+      responses:
+        "204": { description: Cookie cleared }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /grants:
+    post:
+      operationId: issueGrant
+      x-devos-access: session
+      x-devos-state-changing: true
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/GrantScope" } } }
+      responses:
+        "201": { description: Grant issued by KK through the M1.7 engine }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /grants/{id}/revoke:
+    post:
+      operationId: revokeGrant
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ revoked: boolean }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
