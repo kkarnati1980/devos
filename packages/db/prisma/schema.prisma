@@ -1128,11 +1128,14 @@ model RunTelemetry {
   toolName         String?  @map("tool_name")
   toolResultBytes  Int?     @map("tool_result_bytes")
   repeatedCall     Boolean  @default(false) @map("repeated_call")
+  /// M1.5: e.g. `standard_selection` for selection-loop tokens (ADR-0011 S5).
+  tag              String?
   createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   run Run @relation(fields: [runId], references: [id], onDelete: Restrict)
 
   @@index([runId, turn])
+  @@index([tag])
   @@map("run_telemetry")
 }
 
