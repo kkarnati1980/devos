@@ -47,6 +47,8 @@ test("AT3 the tailscaled socket and the cert directory are read-only bind mounts
 
 test("AT3 M1.3-a: secure cookies are on by default; migrate gates the api and the worker", () => {
   assert.equal(compose.services.api.environment.DEVOS_COOKIE_SECURE, "${DEVOS_COOKIE_SECURE:-1}");
+  // DEVOS-86: the dashboard needs the same flag, or DEVOS-84's config-tls-required never fires on the server.
+  assert.equal(compose.services.dashboard.environment.DEVOS_COOKIE_SECURE, "${DEVOS_COOKIE_SECURE:-1}");
   for (const s of ["api", "worker"]) assert.equal(compose.services[s].depends_on.migrate.condition, "service_completed_successfully");
   assert.equal(compose.services.migrate.depends_on.postgres.condition, "service_healthy");
 });
