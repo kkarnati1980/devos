@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.2.0
+# Version: 1.2.1
+# v1.2.1 (Codex PR22-r1): the GIT_SHA read-back treats an explicit is_runtime/is_buildtime false as a failure.
 # v1.2.0 (DEVOS-83): before a deploy is submitted, the app's git_commit_sha and its GIT_SHA env (build-time and
 # runtime) are set to the exact SHA, so the image reports the code it was built from; either failing submits
 # nothing and the next tick retries (both writes are idempotent).
@@ -216,10 +217,12 @@ set_git_sha_env() {
   cf PATCH "/applications/$CF_APP/envs/bulk" "$TMP/env.json" >/dev/null || return 1
   envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
   # Read back: the non-preview GIT_SHA exists, is build-time (and runtime where Coolify has that flag), and its
-  # value is this SHA (a token without read:sensitive gets no values back; then presence and flags are checked).
+  # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
+  # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).
   jq -e --arg v "$sha" '[.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
     | ($g | length) > 0
-      and all($g[]; (.is_buildtime // .is_build_time // false) == true and (.is_runtime // true) == true
+      and all($g[]; (if has("is_buildtime") then .is_buildtime else .is_build_time end) == true
+                    and ((has("is_runtime") | not) or .is_runtime == true)
                     and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
     || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
 }

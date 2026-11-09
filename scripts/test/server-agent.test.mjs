@@ -19,7 +19,7 @@ const reqs = [];
 
 function resetMock() {
   M = { main: null, runs: {}, statuses: {}, pulls: {}, trees: {}, failStatus: 0, deployPatch: [], deployStatus: "finished",
-    envs: [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_buildtime: true, is_runtime: true }], failEnv: 0, runtimeOnly: false };
+    envs: [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_buildtime: true, is_runtime: true }], failEnv: 0, runtimeOnly: false, envPatch: null };
   reqs.length = 0;
 }
 
@@ -82,7 +82,10 @@ function handler(req, res) {
     }
     if (p.match(/^\/gh\/repos\/kkarnati1980\/devos\/(issues\/\d+|commits\/[0-9a-f]{40})\/comments$/)) return json(201, {});
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs$/)) && req.method === "GET") {
-      return json(200, M.runtimeOnly ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, is_buildtime: false } : e)) : M.envs);
+      {
+        const patch = M.envPatch || (M.runtimeOnly ? { is_buildtime: false } : null);
+        return json(200, patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs);
+      }
     }
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs\/bulk$/)) && req.method === "PATCH") {
       if (M.failEnv > 0) { M.failEnv--; return json(403, { message: "forbidden" }); }
@@ -416,6 +419,24 @@ test("DEVOS-83: a GIT_SHA that does not read back as build-time starts no deploy
   assert.match(r.out, /did not read back/);
   assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)));
 });
+
+// Codex PR22-r1: jq's // replaced an explicit false, so is_runtime:false read back as runtime.
+for (const [name, patch] of [
+  ["is_runtime: false", { is_runtime: false }],
+  ["is_buildtime: false with a stale is_build_time: true", { is_buildtime: false, is_build_time: true }],
+]) {
+  test(`DEVOS-83 (PR22-r1): a GIT_SHA read back with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    const sha = commit({ ...baseFiles(), [`x83r-${name.length}`]: "1" }, `devos-83 r1 ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    M.envPatch = patch;
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /did not read back/);
+    assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
+  });
+}
 
 // DEVOS-83: dashboard-tailnet-only requires a verified HTTPS handshake on the MagicDNS name; plain HTTP fails.
 // Fakes on PATH: tailscale (ip / status --json), hostname -I, curl (handshake result), and timeout, which
