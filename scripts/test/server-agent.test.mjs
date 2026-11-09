@@ -51,6 +51,7 @@ const baseFiles = () => ({
   "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
   "scripts/review/review-commit.sh": real("scripts/review/review-commit.sh"),
   "scripts/server/server-agent.sh": real("scripts/server/server-agent.sh"),
+  "scripts/server/cert-renew.sh": real("scripts/server/cert-renew.sh"),
   "scripts/server/install-server-agent.sh": real("scripts/server/install-server-agent.sh"),
   "scripts/server/checks/ok.sh": "#!/usr/bin/env bash\necho fine\n",
   "scripts/server/checks/leaky.sh": `#!/usr/bin/env bash\necho "key ${SK} token ${GH_TOKEN} cf ${CF_TOKEN}"\nexit 1\n`,
@@ -158,7 +159,7 @@ test("AT1/AT9: passing SHA installs the allow-list only; a second tick makes no 
   M.main = sha; green(sha); pass(sha);
   const r = await runAgent();
   assert.equal(r.code, 0, r.out);
-  for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
+  for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "cert-renew.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
   assert.ok(!fs.existsSync(path.join(D(), "bin/install-server-agent.sh")), "installer is not on the allow-list");
   assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), sha);
   assert.ok(fs.existsSync(path.join(D(), `agent/done.${sha}`)), "SHA reaches done");
@@ -567,4 +568,70 @@ test("DEVOS-82 AT16 (Codex PR26-r1): the token check runs under the agent's lock
   holder.kill(); await new Promise((r) => holder.on("close", r));
   const ok = await runTokenCheck({ LOCK_WAIT: "1" });
   assert.equal(ok.code, 0, ok.out);
+});
+
+// DEVOS-87 (R3-d): the agent runs the allow-listed cert renewal once a day, never during a deployment, and
+// installs a newly allow-listed file that the older agent (shorter list) did not install.
+const fakeRenew = '#!/usr/bin/env bash\necho "renew run ' + SK + '" ; echo x >> "$DEVOS_DIR/renew.count"; exit "${FAKE_RENEW_RC:-0}"\n';
+const renewCount = () => (fs.existsSync(path.join(D(), "renew.count")) ? fs.readFileSync(path.join(D(), "renew.count"), "utf8").split("\n").filter(Boolean).length : 0);
+
+test("DEVOS-87 AT11: the cert renewal runs once a day; a failure is retried after an hour; its output is redacted", async () => {
+  resetMock(); freshState();
+  const sha = commit({ ...baseFiles(), "scripts/server/cert-renew.sh": fakeRenew }, "devos-87 daily");
+  M.main = sha; green(sha); pass(sha);
+  const r1 = await runAgent();
+  assert.equal(r1.code, 0, r1.out);
+  assert.equal(renewCount(), 0, "not installed yet at the start of the first tick");
+  const r2 = await runAgent();
+  assert.equal(renewCount(), 1, r2.out);
+  assert.match(r2.out, /cert renewal: ok/);
+  assert.doesNotMatch(r2.out, /abcdefghijklmnop1234/, "renewal output is redacted");
+  await runAgent();
+  assert.equal(renewCount(), 1, "not again within a day");
+  const st = path.join(D(), "agent/cert-renew.state");
+  fs.writeFileSync(st, `${Math.floor(Date.now() / 1000) - 86401} ok\n`);
+  const r4 = await runAgent({ FAKE_RENEW_RC: "1" });
+  assert.equal(renewCount(), 2, r4.out);
+  assert.match(fs.readFileSync(st, "utf8"), /fail \(exit 1\)/);
+  await runAgent();
+  assert.equal(renewCount(), 2, "a failure waits an hour, not one tick");
+  fs.writeFileSync(st, `${Math.floor(Date.now() / 1000) - 3601} fail (exit 1)\n`);
+  await runAgent();
+  assert.equal(renewCount(), 3, "retried after an hour");
+});
+
+test("DEVOS-87 AT12: no renewal while a deployment is in flight", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ ...baseFiles(), "scripts/server/cert-renew.sh": fakeRenew, "x87b": "1" }, "devos-87 inflight");
+  M.main = sha; green(sha); pass(sha);
+  M.deployStatus = "in_progress";
+  const r1 = await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.equal(r1.code, 0, r1.out);
+  assert.ok(fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)));
+  const r2 = await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.match(r2.out, /cert renewal deferred: a deployment is in flight/);
+  assert.equal(renewCount(), 0);
+  M.deployStatus = "finished";
+  await runAgent();
+  const r4 = await runAgent();
+  assert.equal(renewCount(), 1, r4.out);
+});
+
+test("DEVOS-87 AT13: an allow-listed file missing from bin/ is installed again from the recorded, D1-passed SHA", async () => {
+  resetMock(); freshState();
+  const sha = commit({ ...baseFiles(), "scripts/server/cert-renew.sh": fakeRenew, "x87c": "1" }, "devos-87 repair");
+  M.main = sha; green(sha); pass(sha);
+  await runAgent();
+  fs.rmSync(path.join(D(), "bin/cert-renew.sh"));   // as after an older agent with the shorter allow-list
+  reqs.length = 0;
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /cert-renew\.sh missing from bin\/; installing again from/);
+  assert.ok(fs.existsSync(path.join(D(), "bin/cert-renew.sh")));
+  assert.equal(renewCount(), 1, "renewal runs in the same tick");
+  assert.equal(writes().length, 0, "no GitHub or Coolify writes");
+  // a recorded SHA without its installed marker is never used
+  fs.rmSync(path.join(D(), "bin/cert-renew.sh")); fs.rmSync(path.join(D(), `agent/installed.${sha}`));
+  const r2 = await runAgent();
+  assert.ok(!fs.existsSync(path.join(D(), "bin/cert-renew.sh")), r2.out);
 });

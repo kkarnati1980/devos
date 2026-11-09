@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.2.1
+# Version: 1.3.0
+# v1.3.0 (DEVOS-87, R3-d): the allow-list gains scripts/server/cert-renew.sh, run once a day at the start of a
+# tick (never while a deployment is in flight); a failure is retried after an hour. An allow-listed file missing
+# from bin/ (the list grew) is installed again from the already-installed, D1-passed SHA.
 # v1.2.1 (Codex PR22-r1): the GIT_SHA read-back treats an explicit is_runtime/is_buildtime false as a failure.
 # v1.2.0 (DEVOS-83): before a deploy is submitted, the app's git_commit_sha and its GIT_SHA env (build-time and
 # runtime) are set to the exact SHA, so the image reports the code it was built from; either failing submits
@@ -35,7 +38,9 @@ CHECK_TIMEOUT="${CHECK_TIMEOUT:-120}"
 GH_ENV="$DIR/github-review.env"
 CF_ENV="$DIR/coolify-deploy.env"
 # The allow-list: the only files ever installed (checks are added from scripts/server/checks/*.sh).
-ALLOW=(scripts/review/review-watch.sh scripts/review/review-commit.sh scripts/server/server-agent.sh)
+ALLOW=(scripts/review/review-watch.sh scripts/review/review-commit.sh scripts/server/server-agent.sh scripts/server/cert-renew.sh)
+CERT_EVERY="${CERT_EVERY:-86400}"       # R3-d: renew once a day
+CERT_RETRY="${CERT_RETRY:-3600}"        # after a failed renewal, try again after an hour
 DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
@@ -311,7 +316,46 @@ publish() {
   fi
 }
 
+# R3-d (DEVOS-87): the daily certificate renewal. Runs before anything that needs GitHub, so it also runs while
+# GitHub is unreachable; skipped while any deployment is in flight (it restarts the api and the dashboard).
+# Its output is redacted into the agent log; the last result is kept in cert-renew.state.
+cert_renewal() {
+  local now last f rc next st
+  now="$(date +%s)"
+  last="$(sed -n '1s/^\([0-9]\{1,12\}\) .*/\1/p' "$ST/cert-renew.state" 2>/dev/null || true)"; last="${last:-0}"
+  next="$CERT_EVERY"; grep -q '^[0-9]* fail' "$ST/cert-renew.state" 2>/dev/null && next="$CERT_RETRY"
+  (( now - last >= next )) || return 0
+  [[ -f "$BIN/cert-renew.sh" ]] || { log "cert renewal not installed yet"; return 0; }
+  for f in "$ST"/deploy-started.*; do
+    [[ -e "$f" ]] || continue
+    [[ -s "$ST/deployed.${f##*/deploy-started.}" ]] || { log "cert renewal deferred: a deployment is in flight"; return 0; }
+  done
+  if [[ $DRY -eq 1 ]]; then log "WOULD run the daily cert renewal"; return 0; fi
+  set +e; DEVOS_DIR="$DIR" timeout 300 bash "$BIN/cert-renew.sh" > "$TMP/cert.out" 2>&1 </dev/null; rc=$?; set -e
+  redact < "$TMP/cert.out" | tail -n 20 | while IFS= read -r l; do log "cert-renew: $l"; done
+  case "$rc" in 0) st=ok;; 3) st=skipped;; *) st="fail (exit $rc)";; esac
+  printf '%s %s\n' "$now" "$st" > "$ST/cert-renew.state.new" && mv -f "$ST/cert-renew.state.new" "$ST/cert-renew.state"
+  log "cert renewal: $st"
+}
+
+# The allow-list grew (v1.3.0): the SHA that installed it ran an older agent with the shorter list, so a new
+# allow-listed file is missing from bin/. Install again from the recorded SHA (it already passed D1).
+repair_allowlist() {
+  local f sha
+  [[ $DRY -eq 0 && -s "$ST/installed.sha" ]] || return 0
+  for f in "${ALLOW[@]}"; do
+    [[ -f "$BIN/$(basename "$f")" ]] && continue
+    sha="$(head -n1 "$ST/installed.sha")"
+    [[ "$sha" =~ ^[0-9a-f]{40}$ && -e "$ST/installed.$sha" ]] || return 0
+    log "allow-listed $(basename "$f") missing from bin/; installing again from ${sha:0:7}"
+    self_update "$sha" || log "re-install from ${sha:0:7} failed; next tick retries"
+    return 0
+  done
+}
+
 # ---- tick ----
+repair_allowlist
+cert_renewal
 sha="$(gh GET "/repos/$REPO/commits/main" | jq -r '.sha')" || die "cannot read main"
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "bad main sha"
 deploy_on=0; [[ -e "$ST/deploy.enabled" ]] && deploy_on=1

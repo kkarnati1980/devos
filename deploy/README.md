@@ -49,7 +49,7 @@ f="/data/coolify/applications/$(sed -n 's/^COOLIFY_APP_UUID=//p' /root/.devos/co
 ```
 
 ## TLS certificate
-The api and the dashboard each terminate HTTPS themselves with the same `tailscale cert` files (M1.3-a, R3-a), mounted read-only at `/certs`. An HTTPS dashboard page cannot call a plain-HTTP API (browsers block mixed content). The files must be readable by the container user (uid 1000). Automatic renewal (90-day certificates) is R3-d (DEVOS-87).
+The api and the dashboard each terminate HTTPS themselves with the same `tailscale cert` files (M1.3-a, R3-a), mounted read-only at `/certs`. An HTTPS dashboard page cannot call a plain-HTTP API (browsers block mixed content). The files must be readable by the container user (uid 1000). Renewal is automatic (R3-d, DEVOS-87): the server agent runs `tailscale cert` once a day and, only when the files change, keeps their owner and mode and restarts the api and dashboard containers. It finds the files as the single `*.crt` and `*.key` in `DEVOS_TLS_DIR`; if there are more, set `TLS_CERT_NAME=` and `TLS_KEY_NAME=` (file names) in `/root/.devos/server-agent.conf`. The result is in `/root/.devos/agent/cert-renew.state`.
 
 ## Server checks
 `scripts/server/checks/health-sha.sh` (this module; since R3 it calls `https://<MagicDNS name>:<API_PORT>/health` with the certificate verified) and `dashboard-tailnet-only.sh` (server agent) run after each deploy and post `server-check` on the SHA.

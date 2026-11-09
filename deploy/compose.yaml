@@ -57,6 +57,9 @@ services:
   api:
     build: { <<: *build, target: api }
     restart: unless-stopped
+    # R3-d (DEVOS-87): the server agent's cert renewal restarts this container by label after a renewal.
+    labels:
+      io.devos.service: api
     environment:
       <<: *db-env
       PORT: "3001"
@@ -103,6 +106,9 @@ services:
   dashboard:
     build: { <<: *build, target: dashboard }
     restart: unless-stopped
+    # R3-d (DEVOS-87): the server agent's cert renewal restarts this container by label after a renewal.
+    labels:
+      io.devos.service: dashboard
     environment:
       PORT: "3000"
       HOST: 0.0.0.0
