@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.1.2
+# Version: 1.2.1
+# v1.2.1 (Codex PR22-r1): the GIT_SHA read-back treats an explicit is_runtime/is_buildtime false as a failure.
+# v1.2.0 (DEVOS-83): before a deploy is submitted, the app's git_commit_sha and its GIT_SHA env (build-time and
+# runtime) are set to the exact SHA, so the image reports the code it was built from; either failing submits
+# nothing and the next tick retries (both writes are idempotent).
 # v1.1.2 (Codex PR11-r3): an earlier deployment's status must post before a newer deploy or check; a submitted
 # deployment is reconciled even after --deploy-off.
 # v1.1.0 (Codex PR11-r1): GitHub read errors (trees, statuses, PRs) mean "wait", never "ok"; every install step
@@ -197,6 +201,32 @@ self_update() {  # sha -> installs the allow-list at sha; 0 only if every step s
   return 0
 }
 
+# set_git_sha_env sha -> upserts the app env GIT_SHA=<sha> as build-time AND runtime, then reads it back.
+# deploy/compose.yaml passes GIT_SHA as a build arg; Coolify passes only build-time variables to the build, so
+# without this the image reports "unknown" (DEVOS-83). Coolify renamed is_build_time to is_buildtime (with a
+# separate is_runtime); the flag names are taken from the variables this Coolify already returns.
+set_git_sha_env() {
+  local sha="$1" envs
+  envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
+  jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs: unexpected response"; return 1; }
+  if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
+    jq -n --arg v "$sha" '{data: [{key: "GIT_SHA", value: $v, is_preview: false, is_buildtime: true, is_runtime: true}]}'
+  else
+    jq -n --arg v "$sha" '{data: [{key: "GIT_SHA", value: $v, is_preview: false, is_build_time: true}]}'
+  fi > "$TMP/env.json"
+  cf PATCH "/applications/$CF_APP/envs/bulk" "$TMP/env.json" >/dev/null || return 1
+  envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
+  # Read back: the non-preview GIT_SHA exists, is build-time (and runtime where Coolify has that flag), and its
+  # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
+  # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).
+  jq -e --arg v "$sha" '[.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
+    | ($g | length) > 0
+      and all($g[]; (if has("is_buildtime") then .is_buildtime else .is_build_time end) == true
+                    and ((has("is_runtime") | not) or .is_runtime == true)
+                    and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
+    || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
+}
+
 # Deploy is never submitted twice for a SHA. deploy-started.<sha> is written before the first Coolify call;
 # deploy-uuid.<sha> holds the deployment id once Coolify returns it. A later tick resumes polling that id; a
 # start marker without an id (interrupted mid-submit) is recorded as an unknown outcome, never resubmitted.
@@ -208,9 +238,13 @@ deploy() {  # sha -> 0 when Coolify finished deploying exactly this sha
   elif [[ -e "$ST/deploy-started.$sha" ]]; then
     log "${sha:0:7}: an earlier tick was interrupted while submitting; outcome unknown, not resubmitted"; return 1
   else
-    touch "$ST/deploy-started.$sha" || return 1
+    # Idempotent preparation first: a failure here has submitted nothing, so the next tick simply retries.
     jq -n --arg s "$sha" '{git_commit_sha: $s}' > "$TMP/patch.json"
-    cf PATCH "/applications/$CF_APP" "$TMP/patch.json" >/dev/null || return 1
+    cf PATCH "/applications/$CF_APP" "$TMP/patch.json" >/dev/null \
+      || { log "${sha:0:7}: could not set git_commit_sha; deploy not started, next tick retries"; return 2; }
+    set_git_sha_env "$sha" \
+      || { log "${sha:0:7}: could not set GIT_SHA in the Coolify env; deploy not started, next tick retries"; return 2; }
+    touch "$ST/deploy-started.$sha" || return 1
     dep="$(cf POST "/deploy?uuid=$CF_APP&force=false" | jq -r '[.. | objects | .deployment_uuid? // empty] | first // empty')" || return 1
     [[ "$dep" =~ ^[A-Za-z0-9-]+$ ]] || { log "deploy returned no deployment uuid"; return 1; }
     printf '%s\n' "$dep" > "$ST/deploy-uuid.$sha"
