@@ -47,6 +47,17 @@ esac`);
   fs.writeFileSync(path.join(bad, "c"), "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n");
   fs.copyFileSync(pairs.new.k, path.join(bad, "k"));
   pairs.bad = { c: path.join(bad, "c"), k: path.join(bad, "k") };
+  // a matching, unexpired certificate whose notBefore is tomorrow (openssl 3.0 req cannot set it; ca can)
+  const fut = path.join(tmp, "pairs", "future"); fs.mkdirSync(fut, { recursive: true });
+  fs.writeFileSync(path.join(fut, "index.txt"), "");
+  fs.writeFileSync(path.join(fut, "ca.cnf"), `[ca]\ndefault_ca=d\n[d]\ndatabase=${fut}/index.txt\nnew_certs_dir=${fut}\nserial=${fut}/serial\ndefault_md=sha256\npolicy=p\ncopy_extensions=copy\nunique_subject=no\n[p]\ncommonName=supplied\n`);
+  fs.writeFileSync(path.join(fut, "serial"), "01\n");
+  execFileSync("openssl", ["req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", path.join(fut, "k"),
+    "-out", path.join(fut, "csr"), "-subj", `/CN=${HOST}`, "-addext", `subjectAltName=DNS:${HOST}`], { stdio: "ignore" });
+  const ts = (d) => d.toISOString().replace(/[-:T]/g, "").slice(0, 14) + "Z";
+  execFileSync("openssl", ["ca", "-batch", "-selfsign", "-config", path.join(fut, "ca.cnf"), "-keyfile", path.join(fut, "k"), "-in", path.join(fut, "csr"),
+    "-out", path.join(fut, "c"), "-notext", "-startdate", ts(new Date(Date.now() + 86400e3)), "-enddate", ts(new Date(Date.now() + 90 * 86400e3))], { stdio: "ignore" });
+  pairs.future = { c: path.join(fut, "c"), k: path.join(fut, "k") };
 });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -96,8 +107,8 @@ test("R3-d AT7: unchanged files restart nothing", () => {
   assert.equal(r.docker, "", "no restart");
 });
 
-test("R3-d AT8: a failed `tailscale cert`, or a bad new pair, changes nothing and restarts nothing", () => {
-  for (const [opts, re] of [[{ tsRc: 1 }, /tailscale cert failed/], [{ from: "other" }, /does not name/], [{ from: "bad" }, /does not parse or is expired/]]) {
+test("R3-d AT8: a failed `tailscale cert`, or a bad new pair (incl. not valid yet), changes nothing and restarts nothing", () => {
+  for (const [opts, re] of [[{ tsRc: 1 }, /tailscale cert failed/], [{ from: "other" }, /does not name/], [{ from: "bad" }, /does not parse or is expired/], [{ from: "future" }, /not valid yet/]]) {
     const d = setup();
     const r = run(d, opts);
     assert.equal(r.code, 1, r.out);

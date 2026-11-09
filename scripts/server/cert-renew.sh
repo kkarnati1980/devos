@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — daily `tailscale cert` renewal for the certificate the api and the dashboard share (R3-d, DEVOS-87)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1 (Codex PR28-r1): "valid now" also checks notBefore; a certificate that is not valid yet changes nothing.
 # Contract: docs/modules/R3.md (R3-d) and docs/modules/server-agent.md (allow-list). Run by server-agent.sh
 # once a day (root); never run with arguments taken from GitHub content.
 # 1. Asks `tailscale cert` for this node's MagicDNS name, writing to a temp dir inside the TLS dir.
@@ -67,6 +68,10 @@ fi
 [[ -s "$NEW/c" && -s "$NEW/k" ]] || { echo "tailscale cert wrote an empty file; the current files are unchanged"; exit 1; }
 openssl x509 -in "$NEW/c" -noout -checkend 0 >/dev/null 2>&1 \
   || { echo "new certificate does not parse or is expired; the current files are unchanged"; exit 1; }
+NB="$(openssl x509 -in "$NEW/c" -noout -startdate 2>/dev/null | cut -d= -f2)"
+nbs="$(date -d "$NB" +%s 2>/dev/null)"
+[[ "$nbs" =~ ^[0-9]+$ ]] && (( nbs <= $(date +%s) )) \
+  || { echo "new certificate is not valid yet (notBefore $NB); the current files are unchanged"; exit 1; }
 openssl x509 -in "$NEW/c" -noout -checkhost "$NAME" 2>/dev/null | grep -q 'does match' \
   || { echo "new certificate does not name $NAME; the current files are unchanged"; exit 1; }
 cpub="$(openssl x509 -in "$NEW/c" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null)"
