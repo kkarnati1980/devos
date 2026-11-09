@@ -2,8 +2,9 @@
 
 One Coolify **Docker Compose** application built from this repo:
 
-- In Coolify: **Base Directory** `/deploy` and **Docker Compose Location** `/compose.yaml` (the build context `..` is then the repo root).
+- Coolify settings (as used at first launch, 9 Nov 2026): **Base Directory** `/deploy`, **Docker Compose Location** `/compose.yaml`. Coolify runs compose with `--project-directory` set to the Base Directory, so `context: ..` in `compose.yaml` resolves to the repo root.
 - Branch `main`. The server agent (DEVOS-74) sets the exact commit (`git_commit_sha`) and deploys only a SHA with green CI and a Codex PASS (D1).
+- **`GIT_SHA` is set by the server agent** (DEVOS-83), as a build-time and runtime variable, before each deploy. Coolify passes only build-time variables to the build, and `/health` reports this value. Do not set or edit `GIT_SHA` by hand.
 
 ## Environment (names only; values live in Coolify env, never in the repo or in chat)
 
@@ -25,6 +26,16 @@ One Coolify **Docker Compose** application built from this repo:
 | `DEVOS_COOKIE_SECURE` | default `1` | api and dashboard; keep `1` on the server (M1.3-a). With `1` the api and the dashboard each refuse to start (`config-tls-required`) unless both TLS files are readable |
 | `DEVOS_API_PORT`, `DASHBOARD_PORT` | default `3001`, `3000` | host ports on `DEVOS_BIND_IP` |
 | `DEVOS_TAILSCALE_SOCKET_HOST` | default `/var/run/tailscale/tailscaled.sock` | mounted read-only into the api |
+
+### What `/ready` reports
+The API's `GET /ready` answers 503 with code `not-ready` until its configuration is complete; the response never says which part is missing. The two causes are internal codes in `apps/api/src/runtime.ts`:
+
+| Internal code | Cause | Fix |
+|---|---|---|
+| `database-not-configured` | `DATABASE_URL` is empty (`with-db-url.mjs` builds it from `POSTGRES_PASSWORD`) | set `POSTGRES_PASSWORD` |
+| `policy-not-configured` | `DEVOS_POLICY_HMAC_KEY` is empty | set `DEVOS_POLICY_HMAC_KEY` |
+
+To tell them apart, read the api's `api-started` log line: `"policyEngine":false` means one of the two is missing (check both with the length command below). A malformed value does not reach `/ready`: start-up stops with an `api-start-failed` line carrying a `config-*` code (for example `config-vault-key-invalid`, `config-tls-required`), never the value.
 
 Provider keys and spending caps are **not** env: they are entered in the setup wizard (M1.4, H9).
 
