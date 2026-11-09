@@ -20,7 +20,7 @@ One Coolify **Docker Compose** application built from this repo:
 | `DEVOS_SMTP_HOST`, `_PORT`, `_SECURITY`, `_USER`, `_FROM` | optional | M1.6 email; the password is a vault secret |
 | `DEVOS_TLS_DIR` | default `/root/.devos/tls` | host directory with the `tailscale cert` files (mounted read-only) |
 | `DEVOS_TLS_CERT_FILE`, `DEVOS_TLS_KEY_FILE` | yes on the server | paths **inside** the container, e.g. `/certs/dashboard.crt`, `/certs/dashboard.key` |
-| `DEVOS_COOKIE_SECURE` | default `1` | keep `1` on the server (M1.3-a) |
+| `DEVOS_COOKIE_SECURE` | default `1` | api and dashboard; keep `1` on the server (M1.3-a). With `1` the dashboard refuses to start (`config-tls-required`) unless both TLS files are readable; `0` only for the CI smoke test |
 | `DEVOS_API_PORT`, `DASHBOARD_PORT` | default `3001`, `3000` | host ports on `DEVOS_BIND_IP` |
 | `DEVOS_TAILSCALE_SOCKET_HOST` | default `/var/run/tailscale/tailscaled.sock` | mounted read-only into the api |
 

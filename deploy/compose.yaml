@@ -98,6 +98,8 @@ services:
       # M1.3-a: in-process HTTPS from `tailscale cert`; both empty = plain HTTP (CI only).
       DEVOS_TLS_CERT_FILE: ${DEVOS_TLS_CERT_FILE:-}
       DEVOS_TLS_KEY_FILE: ${DEVOS_TLS_KEY_FILE:-}
+      # DEVOS-86: same default as the api; with 1 the dashboard refuses to start without TLS files (DEVOS-84).
+      DEVOS_COOKIE_SECURE: ${DEVOS_COOKIE_SECURE:-1}
     ports:
       - "${DEVOS_BIND_IP:?DEVOS_BIND_IP is required}:${DASHBOARD_PORT:-3000}:3000"
     volumes:
