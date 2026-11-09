@@ -37,7 +37,10 @@ test("AT3 only api and dashboard publish ports, each on the required DEVOS_BIND_
 test("AT3 the tailscaled socket and the cert directory are read-only bind mounts that are never created", () => {
   const sock = compose.services.api.volumes.find((v) => v.target === "/var/run/tailscale/tailscaled.sock");
   const certs = compose.services.dashboard.volumes.find((v) => v.target === "/certs");
-  for (const m of [sock, certs]) {
+  // R3-a (DEVOS-81): the api mounts the same certificate directory, read-only.
+  const apiCerts = compose.services.api.volumes.find((v) => v.target === "/certs");
+  assert.equal(apiCerts?.source, certs?.source, "api and dashboard share one cert directory");
+  for (const m of [sock, certs, apiCerts]) {
     assert.ok(m, "mount present");
     assert.equal(m.type, "bind");
     assert.equal(m.read_only, true);
@@ -51,6 +54,21 @@ test("AT3 M1.3-a: secure cookies are on by default; migrate gates the api and th
   assert.equal(compose.services.dashboard.environment.DEVOS_COOKIE_SECURE, "${DEVOS_COOKIE_SECURE:-1}");
   for (const s of ["api", "worker"]) assert.equal(compose.services[s].depends_on.migrate.condition, "service_completed_successfully");
   assert.equal(compose.services.migrate.depends_on.postgres.condition, "service_healthy");
+});
+
+// DEVOS-81: Coolify dropped the values of optional variables on 9 Nov; every one the server needs is required.
+test("R3 AT3 every server-required variable is required (:?) in compose; the dashboard gets DEVOS_API_ORIGIN", () => {
+  const req = (svc, name) => assert.equal(compose.services[svc].environment[name], `\${${name}:?${name} is required}`, `${svc}.${name}`);
+  for (const n of ["DEVOS_POLICY_HMAC_KEY", "DEVOS_VAULT_KEY", "DEVOS_TLS_CERT_FILE", "DEVOS_TLS_KEY_FILE"]) req("api", n);
+  for (const n of ["DEVOS_TLS_CERT_FILE", "DEVOS_TLS_KEY_FILE", "DEVOS_API_ORIGIN"]) req("dashboard", n);
+  req("worker", "DEVOS_POLICY_HMAC_KEY");
+});
+
+test("R3 AT1 the api image healthcheck follows the api's protocol (HTTPS whenever a certificate file is set)", () => {
+  const hc = dockerfile.match(/FROM runtime AS api[\s\S]*?HEALTHCHECK[^\n]*\n\s*CMD ([^\n]*)/)?.[1] ?? "";
+  assert.match(hc, /DEVOS_TLS_CERT_FILE/);
+  assert.match(hc, /node:https/);
+  assert.doesNotMatch(hc, /fetch\('http:/);
 });
 
 test("AT3 no secret value is written in the compose file: every secret is a required or empty ${NAME}", () => {
@@ -78,16 +96,21 @@ test("AT3 images: four targets, unprivileged runtime, no secret build argument, 
 const CHECK = `${root}scripts/server/checks/health-sha.sh`;
 const SHA = "a".repeat(40);
 
-function runCheck({ code, body = "", tsIp = "100.64.0.7", sha = SHA }) {
+function runCheck({ code, body = "", tsIp = "100.64.0.7", sha = SHA, rc = 0, dns = "devos.tail1234.ts.net." }) {
   const bin = mkdtempSync(join(tmpdir(), "r1-check-"));
-  writeFileSync(join(bin, "tailscale"), `#!/usr/bin/env bash\necho ${tsIp}\n`);
-  // Fake curl: prints the body, a newline and the HTTP code (what -w '\n%{http_code}' produces).
-  writeFileSync(join(bin, "curl"), `#!/usr/bin/env bash\nprintf '%s\\n%s' "$FAKE_BODY" "$FAKE_CODE"\n`);
+  writeFileSync(join(bin, "tailscale"), `#!/usr/bin/env bash\nif [[ "$1" == ip ]]; then echo ${tsIp}; else printf '%s' "$FAKE_TS_JSON"; fi\n`);
+  // Fake curl: records its arguments, prints the body, a newline and the HTTP code (what -w '\n%{http_code}'
+  // produces) and exits with FAKE_RC (7 = connection refused, 35/60 = TLS failure).
+  writeFileSync(join(bin, "curl"), `#!/usr/bin/env bash\necho "$*" > "$FAKE_DIR/curl.args"\nprintf '%s\\n%s' "$FAKE_BODY" "$FAKE_CODE"\nexit "$FAKE_RC"\n`);
   for (const f of ["tailscale", "curl"]) chmodSync(join(bin, f), 0o755);
-  return spawnSync("bash", [CHECK], {
-    env: { PATH: `${bin}:${process.env.PATH}`, DEVOS_DIR: bin, DEVOS_SHA: sha, FAKE_BODY: body, FAKE_CODE: code },
+  const r = spawnSync("bash", [CHECK], {
+    env: { PATH: `${bin}:${process.env.PATH}`, DEVOS_DIR: bin, FAKE_DIR: bin, DEVOS_SHA: sha, FAKE_BODY: body, FAKE_CODE: code,
+           FAKE_RC: String(rc), FAKE_TS_JSON: JSON.stringify({ Self: { DNSName: dns } }) },
     encoding: "utf8",
   });
+  let args = "";
+  try { args = readFileSync(join(bin, "curl.args"), "utf8"); } catch {}
+  return Object.assign(r, { args });
 }
 
 test("AT5 health-sha: pass when /health reports the deployed SHA", () => {
@@ -95,8 +118,27 @@ test("AT5 health-sha: pass when /health reports the deployed SHA", () => {
   assert.equal(r.status, 0, r.stdout);
 });
 
-test("AT5 health-sha: skipped (3) while nothing answers, never counted as a pass", () => {
-  assert.equal(runCheck({ code: "000" }).status, 3);
+// R3-c (DEVOS-81): HTTPS on the MagicDNS name, pinned to the tailnet IP, with the certificate verified.
+test("R3 AT4 health-sha: calls https://<MagicDNS name>:<port>/health pinned to the tailnet IP, never with -k", () => {
+  const r = runCheck({ code: "200", body: JSON.stringify({ sha: SHA }) });
+  assert.equal(r.status, 0, r.stdout);
+  assert.match(r.args, /https:\/\/devos\.tail1234\.ts\.net:3001\/health/);
+  assert.match(r.args, /--resolve devos\.tail1234\.ts\.net:3001:100\.64\.0\.7/);
+  assert.doesNotMatch(r.args, /(^|\s)(-k|--insecure)(\s|$)|http:\/\//, "no plain HTTP, verification never off");
+  assert.match(r.stdout, /certificate verified/);
+});
+
+test("R3 AT4 health-sha: plain HTTP, a bad certificate or a timeout fails; no MagicDNS name fails", () => {
+  for (const rc of [35, 60, 28]) {
+    const r = runCheck({ code: "000", rc });
+    assert.equal(r.status, 1, `curl exit ${rc}: ${r.stdout}`);
+  }
+  assert.match(runCheck({ code: "000", rc: 60 }).stdout, /no valid HTTPS \(curl exit 60\)/);
+  assert.equal(runCheck({ code: "200", body: JSON.stringify({ sha: SHA }), dns: "" }).status, 1);
+});
+
+test("AT5 health-sha: skipped (3) only while the connection is refused, never counted as a pass", () => {
+  assert.equal(runCheck({ code: "000", rc: 7 }).status, 3);
 });
 
 test("AT5 health-sha: fail on another SHA, a non-200, no tailnet IP or a bad DEVOS_SHA", () => {

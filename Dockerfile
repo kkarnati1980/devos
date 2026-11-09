@@ -32,8 +32,11 @@ USER node
 FROM runtime AS api
 ENV HOST=0.0.0.0 PORT=3001
 EXPOSE 3001
+# R3-a (DEVOS-81): the api speaks HTTPS whenever a certificate file is set. This loopback liveness probe
+# skips name verification (the certificate names the MagicDNS host, not 127.0.0.1); it sends nothing and
+# reads only the status code. Real clients and the server checks always verify the certificate.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+  CMD node -e "const t=!!process.env.DEVOS_TLS_CERT_FILE;require(t?'node:https':'node:http').get({host:'127.0.0.1',port:process.env.PORT||3001,path:'/health',timeout:4000,rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1)).on('timeout',()=>process.exit(1))"
 CMD ["node", "deploy/with-db-url.mjs", "node", "apps/api/dist/main.js"]
 
 FROM runtime AS dashboard
