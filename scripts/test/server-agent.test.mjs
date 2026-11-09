@@ -18,7 +18,8 @@ let M; // mock state
 const reqs = [];
 
 function resetMock() {
-  M = { main: null, runs: {}, statuses: {}, pulls: {}, trees: {}, failStatus: 0, deployPatch: [], deployStatus: "finished" };
+  M = { main: null, runs: {}, statuses: {}, pulls: {}, trees: {}, failStatus: 0, deployPatch: [], deployStatus: "finished",
+    envs: [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_buildtime: true, is_runtime: true }], failEnv: 0, runtimeOnly: false };
   reqs.length = 0;
 }
 
@@ -80,6 +81,18 @@ function handler(req, res) {
       return json(201, {});
     }
     if (p.match(/^\/gh\/repos\/kkarnati1980\/devos\/(issues\/\d+|commits\/[0-9a-f]{40})\/comments$/)) return json(201, {});
+    if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs$/)) && req.method === "GET") {
+      return json(200, M.runtimeOnly ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, is_buildtime: false } : e)) : M.envs);
+    }
+    if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs\/bulk$/)) && req.method === "PATCH") {
+      if (M.failEnv > 0) { M.failEnv--; return json(403, { message: "forbidden" }); }
+      // Mock Coolify bulk upsert: update the non-preview variable with this key, or create it.
+      for (const e of JSON.parse(body).data) {
+        const i = M.envs.findIndex((x) => x.key === e.key && !x.is_preview);
+        if (i >= 0) M.envs[i] = { ...M.envs[i], ...e }; else M.envs.push(e);
+      }
+      return json(201, {});
+    }
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "PATCH") { M.deployPatch.push(JSON.parse(body)); return json(200, {}); }
     if (p === "/cf/deploy") M.deployPosts = (M.deployPosts || 0) + 1;
     if (p === "/cf/deploy") return json(200, { deployments: [{ deployment_uuid: "dep-1234abcd" }] });
@@ -340,4 +353,110 @@ test("AT4: a running deployment is reconciled after deploy is turned off; nothin
   assert.equal(M.deployPosts, 1, "never resubmitted");
   assert.equal(statusPosts("devos-deploy")[0].state, "success");
   assert.equal(statusPosts("server-check").length, 1, "checks after the deployment finished");
+});
+
+// DEVOS-83: GIT_SHA reaches the Coolify build. The env upsert happens before the deploy is submitted, holds
+// the exact SHA as build-time and runtime, and a failed upsert submits nothing (retried next tick).
+const cfOrder = () => reqs.filter((q) => q.path.startsWith("/cf/") && q.method !== "GET").map((q) => `${q.method} ${q.path}`);
+const gitSha = () => M.envs.filter((e) => e.key === "GIT_SHA");
+
+test("DEVOS-83: GIT_SHA=<sha> is upserted build-time + runtime after git_commit_sha and before the deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "GIT_SHA", value: "old", is_preview: false, is_buildtime: false, is_runtime: true });
+  const sha = commit({ ...baseFiles(), "x83a": "1" }, "devos-83 a");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(cfOrder(), ["PATCH /cf/applications/app-uuid-1234", "PATCH /cf/applications/app-uuid-1234/envs/bulk", "POST /cf/deploy"]);
+  assert.equal(gitSha().length, 1, "updated in place, not duplicated");
+  assert.equal(gitSha()[0].value, sha);
+  assert.equal(gitSha()[0].is_buildtime, true);
+  assert.equal(gitSha()[0].is_runtime, true);
+  assert.equal(statusPosts("devos-deploy")[0].state, "success");
+  assert.ok(!r.out.includes(CF_TOKEN));
+});
+
+test("DEVOS-83: an older Coolify (is_build_time) gets that flag name", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true }];
+  const sha = commit({ ...baseFiles(), "x83b": "1" }, "devos-83 b");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(gitSha(), [{ key: "GIT_SHA", value: sha, is_preview: false, is_build_time: true }]);
+  assert.equal(M.deployPosts, 1);
+});
+
+test("DEVOS-83: a failed GIT_SHA upsert starts no deploy; the next tick retries and deploys once", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.failEnv = 1;
+  const sha = commit({ ...baseFiles(), "x83c": "1" }, "devos-83 c");
+  M.main = sha; green(sha); pass(sha);
+  let r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker, so it is not an unknown outcome");
+  assert.equal(statusPosts("devos-deploy").length, 0, "no failure recorded");
+  assert.match(r.out, /could not set GIT_SHA/);
+  r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.deployPosts, 1, "deployed once on the retry");
+  assert.equal(gitSha()[0].value, sha);
+  assert.equal(statusPosts("devos-deploy")[0].state, "success");
+});
+
+test("DEVOS-83: a GIT_SHA that does not read back as build-time starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ ...baseFiles(), "x83d": "1" }, "devos-83 d");
+  M.main = sha; green(sha); pass(sha);
+  M.runtimeOnly = true; // a Coolify that accepts the write but keeps the variable runtime-only
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.deployPosts || 0, 0);
+  assert.match(r.out, /did not read back/);
+  assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)));
+});
+
+// DEVOS-83: dashboard-tailnet-only requires a verified HTTPS handshake on the MagicDNS name; plain HTTP fails.
+// Fakes on PATH: tailscale (ip / status --json), hostname -I, curl (handshake result), and timeout, which
+// answers the check's TCP connect probes from FAKE_OPEN and runs every other command unchanged.
+const TCHECK = path.join(ROOT, "scripts/server/checks/dashboard-tailnet-only.sh");
+function runTailnetCheck({ open = "100.64.0.7", curlRc = 0, curlOut = "200", dns = "devos.tail1234.ts.net." } = {}) {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-tcheck-"));
+  const w = (n, body) => { fs.writeFileSync(path.join(bin, n), `#!/usr/bin/env bash\n${body}\n`); fs.chmodSync(path.join(bin, n), 0o755); };
+  w("tailscale", `if [[ "$1" == ip ]]; then echo 100.64.0.7; else printf '%s' "$FAKE_TS_JSON"; fi`);
+  w("hostname", "echo 100.64.0.7 10.0.0.5 203.0.113.9");
+  w("curl", `echo "$*" > "$FAKE_DIR/curl.args"; printf '%s' "$FAKE_CURL_OUT"; exit "$FAKE_CURL_RC"`);
+  w("timeout", `shift; if [[ "$1" == bash && "$2" == -c ]]; then [[ " $FAKE_OPEN " == *" $4 "* ]]; exit $?; fi; exec "$@"`);
+  const r = execFileSync("bash", ["-c", `bash "${TCHECK}"; echo "rc=$?"`], {
+    env: { PATH: `${bin}:${process.env.PATH}`, DEVOS_DIR: bin, FAKE_DIR: bin, FAKE_OPEN: open, FAKE_CURL_RC: String(curlRc),
+           FAKE_CURL_OUT: curlOut, FAKE_TS_JSON: JSON.stringify({ Self: { DNSName: dns } }) },
+    encoding: "utf8",
+  });
+  const args = fs.existsSync(path.join(bin, "curl.args")) ? fs.readFileSync(path.join(bin, "curl.args"), "utf8") : "";
+  return { code: Number(r.match(/rc=(\d+)\s*$/)[1]), out: r, args };
+}
+
+test("DEVOS-83 dashboard-tailnet-only: pass on a verified HTTPS handshake on the MagicDNS name, pinned to the tailnet IP", () => {
+  const r = runTailnetCheck();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.args, /https:\/\/devos\.tail1234\.ts\.net:3000\//);
+  assert.match(r.args, /--resolve devos\.tail1234\.ts\.net:3000:100\.64\.0\.7/);
+  assert.doesNotMatch(r.args, /(^|\s)(-k|--insecure)(\s|$)/, "certificate verification is never turned off");
+  assert.match(r.out, /203\.0\.113\.9:3000 -> refused \(ok\)/);
+});
+
+test("DEVOS-83 dashboard-tailnet-only: plain HTTP or a bad certificate fails", () => {
+  const plain = runTailnetCheck({ curlRc: 35, curlOut: "000curl: (35) OpenSSL/3.0: error:0A00010B:SSL routines::wrong version number" });
+  assert.equal(plain.code, 1, plain.out);
+  assert.match(plain.out, /no valid HTTPS \(curl exit 35/);
+  assert.equal(runTailnetCheck({ curlRc: 60, curlOut: "000curl: (60) SSL certificate problem" }).code, 1);
+});
+
+test("DEVOS-83 dashboard-tailnet-only: skipped while nothing answers; fails without a MagicDNS name or when a public IP accepts", () => {
+  assert.equal(runTailnetCheck({ open: "" }).code, 3);
+  assert.equal(runTailnetCheck({ dns: "" }).code, 1);
+  const exposed = runTailnetCheck({ open: "100.64.0.7 203.0.113.9" });
+  assert.equal(exposed.code, 1);
+  assert.match(exposed.out, /EXPOSED/);
 });

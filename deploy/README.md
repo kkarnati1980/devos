@@ -2,8 +2,9 @@
 
 One Coolify **Docker Compose** application built from this repo:
 
-- Compose file: `deploy/compose.yaml`; base directory: the repo root (the build context is `..`).
+- Coolify settings (as used at first launch, 9 Nov 2026): **Base Directory** `/deploy`, **Docker Compose Location** `/compose.yaml`. Coolify runs compose with `--project-directory` set to the Base Directory, so `context: ..` in `compose.yaml` resolves to the repo root.
 - Branch `main`. The server agent (DEVOS-74) sets the exact commit (`git_commit_sha`) and deploys only a SHA with green CI and a Codex PASS (D1).
+- **`GIT_SHA` is set by the server agent** (DEVOS-83), as a build-time and runtime variable, before each deploy. Coolify passes only build-time variables to the build, and `/health` reports this value. Do not set or edit `GIT_SHA` by hand.
 
 ## Environment (names only; values live in Coolify env, never in the repo or in chat)
 
@@ -23,6 +24,23 @@ One Coolify **Docker Compose** application built from this repo:
 | `DEVOS_COOKIE_SECURE` | default `1` | keep `1` on the server (M1.3-a) |
 | `DEVOS_API_PORT`, `DASHBOARD_PORT` | default `3001`, `3000` | host ports on `DEVOS_BIND_IP` |
 | `DEVOS_TAILSCALE_SOCKET_HOST` | default `/var/run/tailscale/tailscaled.sock` | mounted read-only into the api |
+
+### Verify the values are really set (prints lengths, never values)
+Coolify once dropped the values of variables that were not marked Required (`DEVOS_POLICY_HMAC_KEY`, `DEVOS_VAULT_KEY`). After changing env, run this on the server (it prints each name and its value's length only; `0` means empty):
+
+```
+for s in api worker; do c="$(docker ps -q --filter label=com.docker.compose.service=$s | head -n1)"; echo "== $s"; docker exec "$c" sh -c 'for n in DATABASE_URL DEVOS_POLICY_HMAC_KEY DEVOS_VAULT_KEY DEVOS_SESSION_KEY DEVOS_KK_LOGIN DEVOS_TLS_CERT_FILE DEVOS_TLS_KEY_FILE GIT_SHA; do v="$(printenv "$n")"; echo "$n ${#v}"; done'; done
+```
+
+### What `/ready` reports
+The API's `GET /ready` is 503 with one of these reasons until its configuration is complete (the same codes it logs at start-up):
+
+| Reason | Fix |
+|---|---|
+| `database-not-configured` | `DATABASE_URL` is empty (it is built from `POSTGRES_PASSWORD` by `with-db-url.mjs`) |
+| `policy-not-configured` | `DEVOS_POLICY_HMAC_KEY` is empty |
+
+A malformed value stops start-up instead, with a `config-*` code (for example `config-vault-key-invalid`), never the value.
 
 Provider keys and spending caps are **not** env: they are entered in the setup wizard (M1.4, H9).
 
