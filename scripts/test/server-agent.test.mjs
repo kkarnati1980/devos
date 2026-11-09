@@ -19,7 +19,8 @@ const reqs = [];
 
 function resetMock() {
   M = { main: null, runs: {}, statuses: {}, pulls: {}, trees: {}, failStatus: 0, deployPatch: [], deployStatus: "finished",
-    envs: [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_buildtime: true, is_runtime: true }], failEnv: 0, runtimeOnly: false, envPatch: null };
+    envs: [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_buildtime: true, is_runtime: true }], failEnv: 0, runtimeOnly: false, envPatch: null,
+    cfPerms: "read write deploy", appSha: "HEAD" };
   reqs.length = 0;
 }
 
@@ -96,7 +97,17 @@ function handler(req, res) {
       }
       return json(201, {});
     }
-    if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "PATCH") { M.deployPatch.push(JSON.parse(body)); return json(200, {}); }
+    if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "GET") {
+      if (!M.cfPerms.split(" ").includes("read")) return json(403, { message: "forbidden" });
+      return json(200, { uuid: m[1], name: "devos", git_commit_sha: M.appSha });
+    }
+    if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "PATCH") {
+      // Mock Coolify: PATCH on an application needs the token's write permission (DEVOS-82).
+      if (!M.cfPerms.split(" ").includes("write")) return json(403, { message: "This action is unauthorized." });
+      const b = JSON.parse(body); M.deployPatch.push(b);
+      if (typeof b.git_commit_sha === "string") M.appSha = b.git_commit_sha;
+      return json(200, {});
+    }
     if (p === "/cf/deploy") M.deployPosts = (M.deployPosts || 0) + 1;
     if (p === "/cf/deploy") return json(200, { deployments: [{ deployment_uuid: "dep-1234abcd" }] });
     if (p === "/cf/deployments/dep-1234abcd") return json(200, { status: M.deployStatus });
@@ -480,4 +491,80 @@ test("DEVOS-83 dashboard-tailnet-only: skipped while nothing answers; fails with
   const exposed = runTailnetCheck({ open: "100.64.0.7 203.0.113.9" });
   assert.equal(exposed.code, 1);
   assert.match(exposed.out, /EXPOSED/);
+});
+
+// DEVOS-82: the installer refuses a Coolify token without write permission at install time, not at the first deploy.
+const TOKEN_CHECK = path.join(ROOT, "scripts/server/coolify-token-check.sh");
+const INSTALLER = path.join(ROOT, "scripts/server/install-server-agent.sh");
+function runTokenCheck(extra = {}) {
+  const envf = path.join(tmp, "cf-check.env");
+  fs.writeFileSync(envf, `COOLIFY_TOKEN=${CF_TOKEN}\nCOOLIFY_APP_UUID=app-uuid-1234\n`, { mode: 0o600 });
+  return new Promise((resolve) => {
+    const ch = spawn("bash", [TOKEN_CHECK, envf], { env: { ...process.env, COOLIFY_API: `http://127.0.0.1:${port}/cf`, AGENT_LOCK: path.join(tmp, "lock/agent.lock"), ...extra } });
+    let out = "";
+    ch.stdout.on("data", (d) => (out += d));
+    ch.stderr.on("data", (d) => (out += d));
+    ch.on("close", (code) => resolve({ code, out }));
+  });
+}
+
+test("DEVOS-82 AT13: a read + deploy token is refused with \"missing write permission\"; nothing changes", async () => {
+  resetMock(); M.cfPerms = "read deploy"; M.appSha = "0123456789abcdef0123456789abcdef01234567";
+  const r = await runTokenCheck();
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /missing write permission/);
+  assert.match(r.out, /read \+ write \+ deploy/);
+  assert.equal(M.appSha, "0123456789abcdef0123456789abcdef01234567", "the app is unchanged");
+  assert.ok(!reqs.some((q) => q.path === "/cf/deploy"), "no deployment started");
+  assert.ok(!r.out.includes(CF_TOKEN), "the token is never printed");
+  assert.ok(reqs.every((q) => q.auth === `Bearer ${CF_TOKEN}`), "the token reaches Coolify as a Bearer header");
+});
+
+test("DEVOS-82 AT13: a read-only token fails the read or write check; a token that cannot read fails with missing read permission", async () => {
+  resetMock(); M.cfPerms = "read";
+  let r = await runTokenCheck();
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /missing write permission/);
+  resetMock(); M.cfPerms = "deploy";
+  r = await runTokenCheck();
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /missing read permission/);
+  assert.equal(writes().length, 0, "no write is attempted without read");
+});
+
+test("DEVOS-82 AT14: a read + write + deploy token passes with an idempotent no-op PATCH (same git_commit_sha)", async () => {
+  resetMock(); M.appSha = "fedcba9876543210fedcba9876543210fedcba98";
+  const r = await runTokenCheck();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /token can write/);
+  assert.deepEqual(M.deployPatch, [{ git_commit_sha: "fedcba9876543210fedcba9876543210fedcba98" }], "only its current value is written back");
+  assert.equal(M.appSha, "fedcba9876543210fedcba9876543210fedcba98");
+  assert.ok(!reqs.some((q) => q.path === "/cf/deploy"), "no deployment started");
+  assert.ok(!r.out.includes(CF_TOKEN));
+});
+
+test("DEVOS-82 AT15: the installer asks for read + write + deploy and checks a new token before storing it", () => {
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  assert.match(src, /read \+ write \+ deploy/);
+  assert.doesNotMatch(src, /permission: deploy \+ read/);
+  assert.match(src, /install -m 700 "\$SRC\/coolify-token-check\.sh"/, "the check is installed next to the installer");
+  const check = src.indexOf('bash "$CHECK" "$CF_ENV.new"'), store = src.indexOf('mv -f "$CF_ENV.new" "$CF_ENV"');
+  assert.ok(check > 0 && store > check, "a new token is checked before it replaces the stored one");
+  assert.match(src, /--deploy-on && -s "\$CF_ENV"[\s\S]*?coolify-token-check\.sh" "\$CF_ENV"/, "--deploy-on re-checks the stored token");
+  execFileSync("bash", ["-n", INSTALLER]); execFileSync("bash", ["-n", TOKEN_CHECK]);
+});
+
+test("DEVOS-82 AT16 (Codex PR26-r1): the token check runs under the agent's lock; while a tick holds it, nothing is read or written", async () => {
+  resetMock();
+  const lock = path.join(tmp, "lock/agent.lock");
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  const holder = spawn("flock", [lock, "sleep", "5"]);
+  await new Promise((r) => setTimeout(r, 300));
+  const busy = await runTokenCheck({ LOCK_WAIT: "1" });
+  assert.equal(busy.code, 1, busy.out);
+  assert.match(busy.out, /agent tick did not finish/);
+  assert.equal(reqs.length, 0, "no Coolify call while the agent holds the lock");
+  holder.kill(); await new Promise((r) => holder.on("close", r));
+  const ok = await runTokenCheck({ LOCK_WAIT: "1" });
+  assert.equal(ok.code, 0, ok.out);
 });

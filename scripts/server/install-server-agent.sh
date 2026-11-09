@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — install the server agent on the DevOS server (DEVOS-74). Contract: docs/modules/server-agent.md
-# Version: 1.2.1
+# Version: 1.3.0
+# v1.3.0 (DEVOS-82): the Coolify token needs read + write + deploy (write: the agent PATCHes git_commit_sha and the
+# GIT_SHA env). coolify-token-check.sh tests read and write with an idempotent no-op PATCH; a new token is stored
+# only after it passes (a rejected token never replaces the stored one).
 # v1.2.1 (Codex PR12-r1): running the installed copy (ROTATE_COOLIFY=1 bash /root/.devos/bin/...) skips the copy
 # step instead of failing on install's same-file check.
 # v1.2.0: the Coolify token is optional (Enter skips it) until a DevOS app exists in Coolify (M1.2);
@@ -58,18 +61,22 @@ if [[ "${1:-}" != --deploy-on ]]; then
     # keeps them current from main, so nothing is copied.
     pass "running from $DIR/bin: scripts already installed (kept current by the agent's self-update)"
   else
-    bash -n "$SRC/server-agent.sh"
+    bash -n "$SRC/server-agent.sh"; bash -n "$SRC/coolify-token-check.sh"
     install -m 700 "$SRC/server-agent.sh" "$DIR/bin/server-agent.sh"
+    install -m 700 "$SRC/coolify-token-check.sh" "$DIR/bin/coolify-token-check.sh"
     install -m 700 "$SRC/install-server-agent.sh" "$DIR/bin/install-server-agent.sh"
     for f in "$SRC"/checks/*.sh; do [[ -e "$f" ]] && bash -n "$f" && install -m 700 "$f" "$DIR/bin/checks/"; done
     pass "installed to $DIR/bin ($(ls "$DIR"/bin/checks/*.sh 2>/dev/null | wc -l) checks)"
   fi
 
   echo "==> 2/4 Coolify API token (hidden)"
+  CHECK="$SRC/coolify-token-check.sh"
+  [[ -f "$CHECK" ]] || fail "$CHECK missing - run the installer from a repo checkout (scripts/server/)"
   if [[ ! -s "$CF_ENV" || "${ROTATE_COOLIFY:-0}" == 1 ]]; then
     echo "  Needed only once a DevOS application exists in Coolify (it ships with M1.2)."
     echo "  No DevOS app yet? Just press Enter: deploy-on-PASS stays off; self-update and checks still run."
-    echo "  Otherwise: Coolify → Keys & Tokens → API tokens → Create (permission: deploy + read). Copy it."
+    echo "  Otherwise: Coolify → Keys & Tokens → API tokens → Create with permissions read + write + deploy"
+    echo "  (never root, never read:sensitive). Copy it."
     read -rsp "  Paste the Coolify API token (input hidden), or press Enter to skip: " T; echo
     if [[ -z "$T" ]]; then
       echo "  Coolify skipped. Add it later: ROTATE_COOLIFY=1 bash $DIR/bin/install-server-agent.sh"
@@ -77,17 +84,19 @@ if [[ "${1:-}" != --deploy-on ]]; then
       [[ "$T" =~ ^[A-Za-z0-9|._-]{20,}$ ]] || { unset T; fail "that does not look like a Coolify API token"; }
       read -rp "  DevOS application UUID (Coolify → DevOS app → the id in the URL): " U
       [[ "$U" =~ ^[A-Za-z0-9-]{8,64}$ ]] || { unset T; fail "that does not look like an application UUID"; }
-      ( umask 077; printf 'COOLIFY_TOKEN=%s\nCOOLIFY_APP_UUID=%s\n' "$T" "$U" > "$CF_ENV" ); unset T
+      # Check the new token before storing it: a rejected token never replaces a working one.
+      rm -f "$CF_ENV.new"; ( umask 077; printf 'COOLIFY_TOKEN=%s\nCOOLIFY_APP_UUID=%s\n' "$T" "$U" > "$CF_ENV.new" ); unset T
+      if ! bash "$CHECK" "$CF_ENV.new"; then
+        rm -f "$CF_ENV.new"
+        fail "token not stored - create one with read + write + deploy, then rerun with ROTATE_COOLIFY=1"
+      fi
+      mv -f "$CF_ENV.new" "$CF_ENV"
     fi
+  elif ! bash "$CHECK" "$CF_ENV"; then
+    fail "the stored Coolify token failed - replace it (read + write + deploy) with ROTATE_COOLIFY=1"
   fi
   if [[ -s "$CF_ENV" ]]; then
-    chmod 600 "$CF_ENV"
-    TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
-    ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^COOLIFY_TOKEN=//p' "$CF_ENV" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
-    U="$(sed -n 's/^COOLIFY_APP_UUID=//p' "$CF_ENV" | head -n1 | tr -d '\r\n')"
-    c="$(curl -sS --connect-timeout 10 --max-time 30 -o "$TMP/r" -w '%{http_code}' -H @"$TMP/auth" -H 'Accept: application/json' "http://localhost:8000/api/v1/applications/$U" || true)"
-    if [[ "$c" == 200 ]]; then pass "token reads the app '$(jq -r '.name // "?"' "$TMP/r")'; file mode $(stat -c %a "$CF_ENV")"
-    else fail "Coolify API answered HTTP $c for that app - check the token and UUID, then rerun with ROTATE_COOLIFY=1"; fi
+    chmod 600 "$CF_ENV"; pass "Coolify token stored; file mode $(stat -c %a "$CF_ENV")"
   else
     pass "no Coolify token stored: deploy-on-PASS cannot be turned on yet"
   fi
@@ -127,6 +136,13 @@ fi
 if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" && ! -s "$CF_ENV" ]]; then
   echo "  deploy-on-PASS stays OFF: no Coolify token stored (add it with ROTATE_COOLIFY=1 once the DevOS app exists)."
   [[ "${1:-}" == --deploy-on ]] && exit 1
+fi
+if [[ "${1:-}" == --deploy-on && -s "$CF_ENV" ]]; then
+  # Turning deploy on (or retrying a deploy) re-checks the stored token, so a read + deploy token is refused now,
+  # not at the first deploy.
+  [[ -f "$SRC/coolify-token-check.sh" ]] || fail "coolify-token-check.sh missing in $SRC - rerun the installer from a repo checkout first"
+  bash "$SRC/coolify-token-check.sh" "$CF_ENV" \
+    || fail "deploy-on-PASS not changed: the stored Coolify token failed - replace it (read + write + deploy) with ROTATE_COOLIFY=1"
 fi
 if [[ "${ASK_DEPLOY:-0}" == 1 && ! -e "$ST/deploy.enabled" && -s "$CF_ENV" ]]; then
   echo "==> First launch: deploy-on-PASS redeploys DevOS through Coolify for every main SHA with green CI + Codex PASS."
