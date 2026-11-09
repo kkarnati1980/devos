@@ -29,7 +29,7 @@ One Coolify **Docker Compose** application built from this repo:
 Coolify once dropped the values of variables that were not marked Required (`DEVOS_POLICY_HMAC_KEY`, `DEVOS_VAULT_KEY`). After changing env, run this on the server (it prints each name and its value's length only; `0` means empty):
 
 ```
-for s in api worker; do c="$(docker ps -q --filter label=com.docker.compose.service=$s | head -n1)"; echo "== $s"; docker exec "$c" sh -c 'for n in DATABASE_URL DEVOS_POLICY_HMAC_KEY DEVOS_VAULT_KEY DEVOS_SESSION_KEY DEVOS_KK_LOGIN DEVOS_TLS_CERT_FILE DEVOS_TLS_KEY_FILE GIT_SHA; do v="$(printenv "$n")"; echo "$n ${#v}"; done'; done
+for s in api worker; do c="$(docker ps -q --filter label=com.docker.compose.service=$s | head -n1)"; echo "== $s"; docker exec "$c" sh -c 'for n in POSTGRES_PASSWORD DEVOS_POLICY_HMAC_KEY DEVOS_VAULT_KEY DEVOS_SESSION_KEY DEVOS_KK_LOGIN DEVOS_TLS_CERT_FILE DEVOS_TLS_KEY_FILE GIT_SHA; do v="$(printenv "$n")"; echo "$n ${#v}"; done'; done
 ```
 
 ### What `/ready` reports
