@@ -2,8 +2,9 @@ import "reflect-metadata";
 import { Module, type DynamicModule } from "@nestjs/common";
 import { APP_GUARD, NestFactory } from "@nestjs/core";
 import type { NestExpressApplication } from "@nestjs/platform-express";
+import type { HttpsOptions } from "@nestjs/common/interfaces/external/https-options.interface.js";
 import { AccessGuard, CONFIG, GRANTS, IDENTITY, KK_SESSIONS, KkSessionRegistry, READINESS, SESSIONS, SETUP } from "./auth.js";
-import type { ApiConfig } from "./config.js";
+import type { ApiConfig, ApiTls } from "./config.js";
 import { cors } from "./cors.js";
 import { requestContext, securityHeaders, stdoutSink, type LogSink } from "./http.js";
 import type { IdentityResolver } from "./identity.js";
@@ -37,11 +38,13 @@ export interface AppDeps {
   setup?: SetupServices;
   /** M1.6 notifier (null → notification routes answer 503 `notifications-not-configured`). */
   notify?: NotifyServices;
+  /** R3-a: certificate + key → the API listens on HTTPS (TLS 1.2+); null/absent → plain HTTP (tests, CI). */
+  tls?: ApiTls | null;
 }
 
 @Module({})
 class ApiModule {
-  static register(deps: Required<Omit<AppDeps, "now" | "log">> & { sessions: SessionService }): DynamicModule {
+  static register(deps: Required<Omit<AppDeps, "now" | "log" | "tls">> & { sessions: SessionService }): DynamicModule {
     return {
       module: ApiModule,
       controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController],
@@ -74,7 +77,12 @@ export async function createApp(deps: AppDeps): Promise<NestExpressApplication> 
       notify: deps.notify ?? { notifier: null },
       sessions,
     }),
-    { logger: false, bodyParser: false },
+    {
+      logger: false,
+      bodyParser: false,
+      // Nest passes httpsOptions to node:https createServer unchanged; its type omits minVersion.
+      ...(deps.tls ? { httpsOptions: { cert: deps.tls.cert, key: deps.tls.key, minVersion: "TLSv1.2" } as HttpsOptions } : {}),
+    },
   );
   app.disable("x-powered-by");
   // Proxies are not trusted: identity comes from the TCP peer only (ADR-0005: no Serve, no proxy).

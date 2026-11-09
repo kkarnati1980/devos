@@ -65,8 +65,9 @@ services:
       DEVOS_ALLOWED_ORIGINS: ${DEVOS_ALLOWED_ORIGINS:?DEVOS_ALLOWED_ORIGINS is required}
       DEVOS_COOKIE_SECURE: ${DEVOS_COOKIE_SECURE:-1}
       DEVOS_DASHBOARD_URL: ${DEVOS_DASHBOARD_URL:-}
-      DEVOS_POLICY_HMAC_KEY: ${DEVOS_POLICY_HMAC_KEY:-}
-      DEVOS_VAULT_KEY: ${DEVOS_VAULT_KEY:-}
+      # DEVOS-81: required (:?), so Coolify keeps the values (on 9 Nov it dropped optional ones).
+      DEVOS_POLICY_HMAC_KEY: ${DEVOS_POLICY_HMAC_KEY:?DEVOS_POLICY_HMAC_KEY is required}
+      DEVOS_VAULT_KEY: ${DEVOS_VAULT_KEY:?DEVOS_VAULT_KEY is required}
       DEVOS_VAULT_KEY_VERSION: ${DEVOS_VAULT_KEY_VERSION:-}
       DEVOS_SMTP_HOST: ${DEVOS_SMTP_HOST:-}
       DEVOS_SMTP_PORT: ${DEVOS_SMTP_PORT:-}
@@ -74,6 +75,11 @@ services:
       DEVOS_SMTP_USER: ${DEVOS_SMTP_USER:-}
       DEVOS_SMTP_FROM: ${DEVOS_SMTP_FROM:-}
       DEVOS_TAILSCALE_SOCKET: /var/run/tailscale/tailscaled.sock
+      # R3-a (DEVOS-81): in-process HTTPS with the same `tailscale cert` files as the dashboard. An HTTPS
+      # dashboard page cannot call a plain-HTTP API (mixed content); with DEVOS_COOKIE_SECURE=1 the api
+      # refuses to start without both files (config-tls-required).
+      DEVOS_TLS_CERT_FILE: ${DEVOS_TLS_CERT_FILE:?DEVOS_TLS_CERT_FILE is required}
+      DEVOS_TLS_KEY_FILE: ${DEVOS_TLS_KEY_FILE:?DEVOS_TLS_KEY_FILE is required}
     ports:
       # M1.2 deploy requirement: published on the host directly (no proxy), so the tailnet peer
       # address reaches the whois identity check.
@@ -82,6 +88,11 @@ services:
       - type: bind
         source: ${DEVOS_TAILSCALE_SOCKET_HOST:-/var/run/tailscale/tailscaled.sock}
         target: /var/run/tailscale/tailscaled.sock
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${DEVOS_TLS_DIR:-/root/.devos/tls}
+        target: /certs
         read_only: true
         bind: { create_host_path: false }
     depends_on:
@@ -95,9 +106,11 @@ services:
     environment:
       PORT: "3000"
       HOST: 0.0.0.0
-      # M1.3-a: in-process HTTPS from `tailscale cert`; both empty = plain HTTP (CI only).
-      DEVOS_TLS_CERT_FILE: ${DEVOS_TLS_CERT_FILE:-}
-      DEVOS_TLS_KEY_FILE: ${DEVOS_TLS_KEY_FILE:-}
+      # M1.3-a: in-process HTTPS from `tailscale cert`. DEVOS-81: required, so Coolify keeps them.
+      DEVOS_TLS_CERT_FILE: ${DEVOS_TLS_CERT_FILE:?DEVOS_TLS_CERT_FILE is required}
+      DEVOS_TLS_KEY_FILE: ${DEVOS_TLS_KEY_FILE:?DEVOS_TLS_KEY_FILE is required}
+      # DEVOS-81: the API origin the dashboard pages call (https://<MagicDNS name>:3001); widens connect-src only.
+      DEVOS_API_ORIGIN: ${DEVOS_API_ORIGIN:?DEVOS_API_ORIGIN is required}
       # DEVOS-86: same default as the api; with 1 the dashboard refuses to start without TLS files (DEVOS-84).
       DEVOS_COOKIE_SECURE: ${DEVOS_COOKIE_SECURE:-1}
     ports:
@@ -119,7 +132,7 @@ services:
     environment:
       <<: *db-env
       REDIS_URL: redis://redis:6379
-      DEVOS_POLICY_HMAC_KEY: ${DEVOS_POLICY_HMAC_KEY:-}
+      DEVOS_POLICY_HMAC_KEY: ${DEVOS_POLICY_HMAC_KEY:?DEVOS_POLICY_HMAC_KEY is required}
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }

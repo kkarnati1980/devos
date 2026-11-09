@@ -1,5 +1,6 @@
 // M1.2 configuration. Every value comes from the environment (Coolify env / server vault);
 // nothing secret is defaulted or logged. docs/modules/M1.2.md "Configuration".
+import { readFileSync } from "node:fs";
 
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // ADR-0011 §3: 12-hour absolute lifetime.
 export const MIN_SESSION_KEY_BYTES = 32;
@@ -91,4 +92,44 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     host: env.HOST ?? "0.0.0.0",
     port,
   };
+}
+
+/** PEM bytes of the certificate and key for in-process HTTPS (R3-a). */
+export interface ApiTls {
+  cert: Buffer;
+  key: Buffer;
+}
+
+/** File contents, or null when the path cannot be read as a non-empty file. Never logs the path. */
+function readPem(path: string, read: (p: string) => Buffer): Buffer | null {
+  try {
+    const buf = read(path);
+    return buf.length > 0 ? buf : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * R3-a (DEVOS-81): in-process HTTPS with the `tailscale cert` files, same rules as the dashboard (M1.3-a,
+ * DEVOS-84). An HTTPS dashboard page cannot call a plain-HTTP API (mixed content), so with
+ * `DEVOS_COOKIE_SECURE=1` the API never falls back to plain HTTP: both files must be readable, or start-up
+ * stops with `config-tls-required`. With 0/unset, no files = plain HTTP (local tests, CI); half a pair or an
+ * unreadable file stops start-up. Errors carry a code only, never a path or file content.
+ */
+export function loadTls(env: NodeJS.ProcessEnv, secure: boolean, read: (p: string) => Buffer = readFileSync): ApiTls | null {
+  const certPath = env.DEVOS_TLS_CERT_FILE ?? "";
+  const keyPath = env.DEVOS_TLS_KEY_FILE ?? "";
+  if (secure) {
+    const cert = certPath ? readPem(certPath, read) : null;
+    const key = keyPath ? readPem(keyPath, read) : null;
+    if (!cert || !key) throw new Error("config-tls-required");
+    return { cert, key };
+  }
+  if (Boolean(certPath) !== Boolean(keyPath)) throw new Error("config-tls-incomplete");
+  if (!certPath) return null;
+  const cert = readPem(certPath, read);
+  const key = readPem(keyPath, read);
+  if (!cert || !key) throw new Error("config-tls-unreadable");
+  return { cert, key };
 }
