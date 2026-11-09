@@ -496,11 +496,11 @@ test("DEVOS-83 dashboard-tailnet-only: skipped while nothing answers; fails with
 // DEVOS-82: the installer refuses a Coolify token without write permission at install time, not at the first deploy.
 const TOKEN_CHECK = path.join(ROOT, "scripts/server/coolify-token-check.sh");
 const INSTALLER = path.join(ROOT, "scripts/server/install-server-agent.sh");
-function runTokenCheck() {
+function runTokenCheck(extra = {}) {
   const envf = path.join(tmp, "cf-check.env");
   fs.writeFileSync(envf, `COOLIFY_TOKEN=${CF_TOKEN}\nCOOLIFY_APP_UUID=app-uuid-1234\n`, { mode: 0o600 });
   return new Promise((resolve) => {
-    const ch = spawn("bash", [TOKEN_CHECK, envf], { env: { ...process.env, COOLIFY_API: `http://127.0.0.1:${port}/cf` } });
+    const ch = spawn("bash", [TOKEN_CHECK, envf], { env: { ...process.env, COOLIFY_API: `http://127.0.0.1:${port}/cf`, AGENT_LOCK: path.join(tmp, "lock/agent.lock"), ...extra } });
     let out = "";
     ch.stdout.on("data", (d) => (out += d));
     ch.stderr.on("data", (d) => (out += d));
@@ -552,4 +552,19 @@ test("DEVOS-82 AT15: the installer asks for read + write + deploy and checks a n
   assert.ok(check > 0 && store > check, "a new token is checked before it replaces the stored one");
   assert.match(src, /--deploy-on && -s "\$CF_ENV"[\s\S]*?coolify-token-check\.sh" "\$CF_ENV"/, "--deploy-on re-checks the stored token");
   execFileSync("bash", ["-n", INSTALLER]); execFileSync("bash", ["-n", TOKEN_CHECK]);
+});
+
+test("DEVOS-82 AT16 (Codex PR26-r1): the token check runs under the agent's lock; while a tick holds it, nothing is read or written", async () => {
+  resetMock();
+  const lock = path.join(tmp, "lock/agent.lock");
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  const holder = spawn("flock", [lock, "sleep", "5"]);
+  await new Promise((r) => setTimeout(r, 300));
+  const busy = await runTokenCheck({ LOCK_WAIT: "1" });
+  assert.equal(busy.code, 1, busy.out);
+  assert.match(busy.out, /agent tick did not finish/);
+  assert.equal(reqs.length, 0, "no Coolify call while the agent holds the lock");
+  holder.kill(); await new Promise((r) => holder.on("close", r));
+  const ok = await runTokenCheck({ LOCK_WAIT: "1" });
+  assert.equal(ok.code, 0, ok.out);
 });

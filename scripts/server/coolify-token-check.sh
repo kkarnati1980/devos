@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — check that a Coolify API token can do what the server agent needs (DEVOS-82).
-# Contract: docs/modules/server-agent.md · Version: 1.0.0
+# Contract: docs/modules/server-agent.md · Version: 1.0.1
+# v1.0.1 (Codex PR26-r1): the whole read / PATCH / read-back runs under the server agent's lock, so a running tick
+# cannot set a new git_commit_sha between our read and our write-back (which would deploy the older revision).
 # Usage: coolify-token-check.sh <env-file with COOLIFY_TOKEN= and COOLIFY_APP_UUID=>
 # The agent needs read + write + deploy (write: it PATCHes the app's git_commit_sha and GIT_SHA env before each
 # deploy). Never root, never read:sensitive.
@@ -17,6 +19,15 @@ pass() { printf '  \033[1;32mPASS\033[0m %s\n' "$*"; }
 fail() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
 [[ -r "$ENVF" ]] || fail "cannot read $ENVF"
 command -v jq >/dev/null || fail "jq is required"
+
+# Hold the agent's lock (the same file the agent's tick holds) for the whole check.
+AGENT_LOCK="${AGENT_LOCK:-/root/.devos/agent/agent.lock}"
+install -d -m 700 "$(dirname "$AGENT_LOCK")"
+exec 9>>"$AGENT_LOCK"
+if ! flock -n 9; then
+  echo "  waiting for the running agent tick to finish (up to $(( ${LOCK_WAIT:-1600} / 60 )) minutes)..."
+  flock -w "${LOCK_WAIT:-1600}" 9 || fail "the agent tick did not finish; nothing was checked or changed - rerun the installer"
+fi
 
 TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
 ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^COOLIFY_TOKEN=//p' "$ENVF" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
