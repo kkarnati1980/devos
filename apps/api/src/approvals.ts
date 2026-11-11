@@ -473,3 +473,190 @@ export class MemoryApprovalStore implements ApprovalStore {
     });
   }
 }
+
+const ACTOR_OF: Record<string, "kk" | "system"> = { "approval.approved": "kk", "approval.rejected": "kk", "approval.comment": "kk" };
+
+function toCard(r: any): Card {
+  return {
+    id: r.id,
+    gate: r.gate,
+    action: r.action,
+    target: r.target,
+    reason: r.reason,
+    costUsd: r.costUsd == null ? null : String(r.costUsd),
+    consequence: r.consequence ?? null,
+    projectId: r.projectId ?? null,
+    status: r.status,
+    decidedAt: r.decidedAt ?? null,
+    decidedBy: r.decidedBy ?? null,
+    confirmationHash: r.confirmationHash ?? null,
+    createdAt: r.createdAt,
+  };
+}
+
+async function audit(tx: any, a: AuditEntry, projectId: string | null): Promise<void> {
+  await tx.auditEvent.create({
+    data: { actor: ACTOR_OF[a.action] ?? "system", action: a.action, summary: a.summary.slice(0, 500), details: a.details, projectId },
+  });
+}
+
+/**
+ * Postgres store. Every operation runs in one transaction bounded by `timeout`, `maxWait` and a transaction-local
+ * `statement_timeout` (ADR-0011 timeouts). `raise` serialises on an advisory lock per dedupe key so two raises of the
+ * same card cannot both create it; `decide` locks the card row (`SELECT … FOR UPDATE`) and then the blocked task rows
+ * in id order, so concurrent decisions serialise and a task blocked by two cards approved at once still becomes ready.
+ */
+export class PrismaApprovalStore implements ApprovalStore {
+  constructor(
+    private readonly db: { $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T> },
+    private readonly timeoutMs = 10_000,
+  ) {}
+
+  private tx<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+    return this.db.$transaction(
+      async (t: any) => {
+        await t.$queryRaw`SELECT set_config('statement_timeout', ${String(this.timeoutMs)}, true) AS statement_timeout`;
+        return fn(t);
+      },
+      { timeout: this.timeoutMs, maxWait: this.timeoutMs },
+    );
+  }
+
+  raise(input: CardInput, blocks: readonly string[], a: AuditEntry, now: Date) {
+    return this.tx(async (tx) => {
+      const projectId = input.projectId ?? null;
+      const key = `devos:approval:${projectId ?? "-"}:${input.gate}:${input.action}:${input.target}`;
+      await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${key}))) AS l`;
+      const ids = [...new Set(blocks)];
+      if (ids.length) {
+        const found = await tx.task.findMany({ where: { id: { in: ids } }, select: { id: true } });
+        if (found.length !== ids.length) throw new ApprovalError("task-not-found", 404);
+      }
+      let row = await tx.approval.findFirst({
+        where: { status: "pending", projectId, gate: input.gate, action: input.action, target: input.target },
+        orderBy: { createdAt: "asc" },
+      });
+      const created = !row;
+      if (!row) {
+        row = await tx.approval.create({
+          data: {
+            gate: input.gate,
+            action: input.action,
+            target: input.target,
+            reason: input.reason,
+            costUsd: input.costUsd ?? null,
+            consequence: input.consequence ?? null,
+            projectId,
+            createdAt: now,
+          },
+        });
+      }
+      if (ids.length) {
+        await tx.taskBlocker.createMany({ data: ids.map((taskId) => ({ taskId, approvalId: row.id })), skipDuplicates: true });
+        await tx.task.updateMany({ where: { id: { in: ids }, status: { in: ["ready", "blocked"] } }, data: { status: "blocked" } });
+      }
+      await audit(tx, { ...a, details: { ...a.details, approvalId: row.id } }, projectId);
+      return { card: toCard(row), created };
+    });
+  }
+
+  get(id: string) {
+    return this.tx(async (tx) => {
+      const r = await tx.approval.findUnique({ where: { id } });
+      return r ? toCard(r) : null;
+    });
+  }
+
+  list(f: { status?: CardStatus; projectId?: string; cursor?: string; limit: number }) {
+    return this.tx(async (tx) => {
+      const where: Record<string, unknown> = {};
+      if (f.status) where.status = f.status;
+      if (f.projectId) where.projectId = f.projectId;
+      if (f.cursor) {
+        const c = await tx.approval.findUnique({ where: { id: f.cursor }, select: { id: true, createdAt: true } });
+        if (!c) return [];
+        where.OR = [{ createdAt: { lt: c.createdAt } }, { createdAt: c.createdAt, id: { lt: c.id } }];
+      }
+      const rows = await tx.approval.findMany({ where, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: f.limit });
+      return rows.map(toCard);
+    });
+  }
+
+  blockedTasks(approvalId: string) {
+    return this.tx(async (tx) => {
+      const rows = await tx.taskBlocker.findMany({
+        where: { approvalId },
+        select: { task: { select: { id: true, title: true, status: true } } },
+        orderBy: { taskId: "asc" },
+      });
+      return rows.map((r: any) => ({ id: r.task.id, title: r.task.title, status: r.task.status as TaskState }));
+    });
+  }
+
+  comments(approvalId: string) {
+    return this.tx(async (tx) => {
+      const rows = await tx.approvalComment.findMany({ where: { approvalId }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
+      return rows.map((c: any) => ({ id: c.id, approvalId: c.approvalId, author: c.author, body: c.body, createdAt: c.createdAt }));
+    });
+  }
+
+  decide(
+    id: string,
+    d: { status: "approved" | "rejected"; by: string; at: Date; confirmationHash?: string | null; comment?: string | null },
+    a: AuditEntry,
+  ) {
+    return this.tx(async (tx) => {
+      const locked: { id: string }[] = await tx.$queryRaw`SELECT id::text AS id FROM approval WHERE id = ${id}::uuid FOR UPDATE`;
+      if (!locked.length) return null;
+      const cur = await tx.approval.findUnique({ where: { id } });
+      if (!cur || cur.status !== "pending") return null;
+      const row = await tx.approval.update({
+        where: { id },
+        data: { status: d.status, decidedAt: d.at, decidedBy: d.by, ...(d.confirmationHash ? { confirmationHash: d.confirmationHash } : {}) },
+      });
+      if (d.comment) await tx.approvalComment.create({ data: { approvalId: id, author: d.by, body: d.comment, createdAt: d.at } });
+      if (d.status === "approved") {
+        const blocked: { taskId: string }[] = await tx.taskBlocker.findMany({ where: { approvalId: id }, select: { taskId: true }, orderBy: { taskId: "asc" } });
+        const taskIds = blocked.map((b) => b.taskId);
+        if (taskIds.length) {
+          // Lock the tasks (id order), then read the other blockers: a concurrent approval of another blocker of the
+          // same task has either committed (we see `approved`) or waits for us (and then sees ours).
+          await tx.$queryRaw`SELECT id FROM task WHERE id = ANY(${taskIds}::uuid[]) ORDER BY id FOR UPDATE`;
+          const waiting: { taskId: string }[] = await tx.taskBlocker.findMany({
+            where: { taskId: { in: taskIds }, approvalId: { not: id }, approval: { status: { not: "approved" } } },
+            select: { taskId: true },
+          });
+          const still = new Set(waiting.map((w) => w.taskId));
+          const free = taskIds.filter((t) => !still.has(t));
+          if (free.length) await tx.task.updateMany({ where: { id: { in: free }, status: "blocked" }, data: { status: "ready" } });
+        }
+      }
+      await audit(tx, { ...a, details: { ...a.details, approvalId: id } }, row.projectId ?? null);
+      return toCard(row);
+    });
+  }
+
+  comment(approvalId: string, author: string, body: string, at: Date) {
+    return this.tx(async (tx) => {
+      const card = await tx.approval.findUnique({ where: { id: approvalId }, select: { id: true, projectId: true } });
+      if (!card) return null;
+      const c = await tx.approvalComment.create({ data: { approvalId, author, body, createdAt: at } });
+      await audit(tx, { action: "approval.comment", summary: "Comment on decision card", details: { approvalId } }, card.projectId ?? null);
+      return { id: c.id, approvalId: c.approvalId, author: c.author, body: c.body, createdAt: c.createdAt };
+    });
+  }
+
+  expire(before: Date, at: Date) {
+    return this.tx(async (tx) => {
+      const rows: { id: string }[] = await tx.$queryRaw`
+        SELECT id::text AS id FROM approval WHERE status = 'pending' AND created_at < ${before} ORDER BY id FOR UPDATE SKIP LOCKED`;
+      const ids: string[] = [];
+      for (const { id } of rows) {
+        const r = await tx.approval.update({ where: { id }, data: { status: "expired", decidedAt: at, decidedBy: "system:expiry" } });
+        await audit(tx, { action: "approval.expired", summary: `Expired: ${r.action}`.slice(0, 500), details: { gate: r.gate, approvalId: id } }, r.projectId ?? null);
+        ids.push(id);
+      }
+      return ids;
+    });
+  }
+}

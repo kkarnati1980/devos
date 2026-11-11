@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { Approvals, ApprovalError, MemoryApprovalStore, parseApproveOptions, parseCard, purgeConfirmationHash } from "../dist/approvals.js";
+import { GateEngine, MemoryGateStore } from "../dist/gates.js";
 
 const KEY = Buffer.alloc(32, 7);
 const T1 = "11111111-1111-4111-8111-111111111111";
@@ -186,4 +187,38 @@ test("AT11 input validation and secret-shaped text are refused with fixed codes"
   assert.equal(parseApproveOptions({ sha: "abc" }), "invalid-input");
   assert.equal(parseApproveOptions({ other: true }), "invalid-input");
   assert.deepEqual(parseApproveOptions({ maxUses: 2, expiresInHours: 48 }), { maxUses: 2, expiresInHours: 48 });
+});
+
+test("AT10 closeMilestone needs an approved, same-project, same-gate approval and a policy allow", async () => {
+  const M = "55555555-5555-4555-8555-555555555555";
+  const A_OK = "66666666-6666-4666-8666-666666666666";
+  const A_PENDING = "77777777-7777-4777-8777-777777777777";
+  const A_OTHER_PROJECT = "88888888-8888-4888-8888-888888888888";
+  const A_OTHER_GATE = "99999999-9999-4999-8999-999999999999";
+  const OTHER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const allowGate = { ...approvalRule, id: "r-gate", name: "gate transitions", actions: ["gate.transition"], principals: [], effect: "allow" };
+  const policy = new PolicyEngine({ store: new MemoryPolicyStore({ mode: "enforce", rules: [allowGate] }), hmacKey: KEY });
+  const store = new MemoryGateStore();
+  store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
+  store.approvals.set(A_OK, { id: A_OK, projectId: PROJECT, gate: "requirements", status: "approved" });
+  store.approvals.set(A_PENDING, { id: A_PENDING, projectId: PROJECT, gate: "requirements", status: "pending" });
+  store.approvals.set(A_OTHER_PROJECT, { id: A_OTHER_PROJECT, projectId: OTHER, gate: "requirements", status: "approved" });
+  store.approvals.set(A_OTHER_GATE, { id: A_OTHER_GATE, projectId: PROJECT, gate: "decision", status: "approved" });
+  const gates = new GateEngine({ store, policy });
+  const kkId = { id: "kk:kk@example.com", type: "kk" };
+  for (const a of [A_PENDING, A_OTHER_PROJECT, A_OTHER_GATE, OTHER]) {
+    await assert.rejects(gates.closeMilestone(kkId, M, a), (e) => e instanceof ApprovalError && e.code === "gate-evidence-missing" && e.status === 409, a);
+  }
+  assert.equal(store.milestones.get(M).closedAt, null);
+
+  // A policy deny stops the transition with the policy's reason code, even with evidence.
+  const denied = new GateEngine({ store, policy: new PolicyEngine({ store: new MemoryPolicyStore({ mode: "enforce", rules: [] }), hmacKey: KEY }) });
+  await assert.rejects(denied.closeMilestone(kkId, M, A_OK), (e) => e.code === "default-deny" && e.status === 403);
+  assert.equal(store.milestones.get(M).closedAt, null);
+
+  const closed = await gates.closeMilestone(kkId, M, A_OK);
+  assert.equal(closed.approvalId, A_OK);
+  assert.ok(store.milestones.get(M).closedAt);
+  assert.equal(store.audit.at(-1).action, "milestone.closed");
+  await assert.rejects(gates.closeMilestone(kkId, M, A_OK), (e) => e.code === "milestone-closed");
 });

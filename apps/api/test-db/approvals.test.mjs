@@ -1,0 +1,177 @@
+// M2.3 AT2–AT5, AT7 and AT10 against real Postgres (api-db workflow): the Prisma approval and gate stores with the
+// M1.1 constraints and triggers, and the real M1.7 engine on PrismaPolicyStore for grants.
+// Rows are committed, so every test uses its own project, tasks and a unique policy action.
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes, randomUUID } from "node:crypto";
+import { createDb } from "@devos/db";
+import { PolicyEngine, PrismaPolicyStore } from "@devos/policy";
+import { Approvals, PrismaApprovalStore } from "../dist/approvals.js";
+import { GateEngine, PrismaGateStore } from "../dist/gates.js";
+
+const url = process.env.DATABASE_URL;
+if (!url) throw new Error("DATABASE_URL is required for test:db");
+const db = createDb(url);
+after(() => db.$disconnect());
+
+const KEY = randomBytes(32);
+const KK = { identity: { id: "kk:kk@kiot.io", type: "kk" }, tailscaleLogin: "kk@kiot.io" };
+const AGENT = { id: "agent:builder:run-1", type: "agent", roles: ["builder"] };
+const verifyKkSession = (s) => s?.tailscaleLogin === "kk@kiot.io";
+
+async function fixture(taskCount = 3) {
+  const slug = `m23-${randomBytes(8).toString("hex")}`;
+  const project = await db.project.create({ data: { slug, name: slug } });
+  const tasks = [];
+  for (let i = 0; i < taskCount; i++) {
+    tasks.push((await db.task.create({ data: { projectId: project.id, kind: "build", title: `task ${i}` } })).id);
+  }
+  return { projectId: project.id, tasks };
+}
+
+function setup(now = Date.now) {
+  const store = new PrismaApprovalStore(db, 5000);
+  const engine = new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: KEY, now, verifyKkSession });
+  const approvals = new Approvals({ store, grants: engine, notifier: null, verifyKkSession, now });
+  return { store, engine, approvals };
+}
+
+const status = async (id) => (await db.task.findUnique({ where: { id }, select: { status: true } })).status;
+const card = (projectId, over = {}) => ({ gate: "decision", action: `deploy.preview.${randomUUID()}`, target: "repo:devos-app", reason: "First preview deploy", projectId, ...over });
+
+test("AT2 (db): approve stores the decision, issues one scoped grant and unblocks only free tasks", async () => {
+  const { projectId, tasks: [t1, t2, t3] } = await fixture();
+  const { approvals } = setup();
+  const a = await approvals.raiseCard(card(projectId), [t1, t2]);
+  const b = await approvals.raiseCard(card(projectId), [t2]);
+  assert.equal(await status(t1), "blocked");
+  assert.equal(await status(t3), "ready");
+  const sha = "a".repeat(40);
+  const { card: decided, grantId } = await approvals.approve(KK, a.id, { sha });
+  assert.equal(decided.status, "approved");
+  assert.equal(decided.decidedBy, "kk:kk@kiot.io");
+  const grants = await db.approvalGrant.findMany({ where: { approvalId: a.id } });
+  assert.equal(grants.length, 1);
+  assert.equal(grants[0].id, grantId);
+  assert.deepEqual([grants[0].scopeAction, grants[0].scopeResource, grants[0].projectId, grants[0].sha, grants[0].maxUses], [a.action, a.target, projectId, sha, 1]);
+  assert.equal(await status(t1), "ready", "only blocker approved");
+  assert.equal(await status(t2), "blocked", "another blocker still pending");
+  assert.equal(await status(t3), "ready", "unrelated task untouched");
+  assert.equal(await db.auditEvent.count({ where: { projectId, action: "approval.approved", actor: "kk" } }), 1);
+  await approvals.approve(KK, b.id);
+  assert.equal(await status(t2), "ready");
+});
+
+test("AT3 (db): reject stores the comment, issues no grant, tasks stay blocked", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, store } = setup();
+  const c = await approvals.raiseCard(card(projectId), [t1]);
+  const r = await approvals.reject(KK, c.id, "Not yet: budget");
+  assert.equal(r.status, "rejected");
+  assert.equal(await db.approvalGrant.count({ where: { approvalId: c.id } }), 0);
+  assert.equal(await status(t1), "blocked");
+  const comments = await store.comments(c.id);
+  assert.deepEqual(comments.map((x) => [x.author, x.body]), [["kk:kk@kiot.io", "Not yet: budget"]]);
+  await assert.rejects(approvals.approve(KK, c.id), (e) => e.code === "card-not-pending");
+});
+
+test("AT4 (db): an approval's grant is consumed once; a second use is refused grant-used-up", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, engine } = setup();
+  const c = await approvals.raiseCard(card(projectId), [t1]);
+  await db.policyRule.create({
+    data: { name: `m23-at4-${randomUUID()}`, version: 1, priority: 0, actions: [c.action], resources: [], principals: [], roles: [], environments: [], effect: "require_approval", constraints: {}, createdBy: "kk:kk@kiot.io" },
+  });
+  const { grantId } = await approvals.approve(KK, c.id);
+  const chain = `m23-at4-${randomUUID()}`;
+  const ask = () => engine.decide({ chain, identity: AGENT, action: { type: c.action, resource: c.target, projectId }, approvalGrantId: grantId });
+  assert.equal((await ask()).outcome, "allow");
+  assert.match((await ask()).reason, /grant-used-up/);
+  assert.equal((await db.approvalGrant.findUnique({ where: { id: grantId } })).uses, 1);
+});
+
+test("AT5 (db): an expired card keeps its task blocked; an expired grant is refused grant-expired", async () => {
+  const { projectId, tasks: [t1, t2] } = await fixture(2);
+  let now = Date.now();
+  const { approvals, engine, store } = setup(() => now);
+  const old = await approvals.raiseCard(card(projectId), [t1]);
+  await db.approval.update({ where: { id: old.id }, data: { createdAt: new Date(now - 8 * 24 * 3600 * 1000) } });
+  const expired = await approvals.expireCards();
+  assert.ok(expired.includes(old.id));
+  assert.equal((await store.get(old.id)).status, "expired");
+  assert.equal(await status(t1), "blocked");
+  await assert.rejects(approvals.approve(KK, old.id), (e) => e.code === "card-not-pending");
+
+  const c = await approvals.raiseCard(card(projectId), [t2]);
+  await db.policyRule.create({
+    data: { name: `m23-at5-${randomUUID()}`, version: 1, priority: 0, actions: [c.action], resources: [], principals: [], roles: [], environments: [], effect: "require_approval", constraints: {}, createdBy: "kk:kk@kiot.io" },
+  });
+  const { grantId } = await approvals.approve(KK, c.id, { expiresInHours: 1 });
+  now += 2 * 3600 * 1000;
+  const d = await engine.decide({ chain: `m23-at5-${randomUUID()}`, identity: AGENT, action: { type: c.action, resource: c.target, projectId }, approvalGrantId: grantId });
+  assert.match(d.reason, /grant-expired/);
+  assert.notEqual(d.outcome, "allow");
+  assert.equal((await db.approvalGrant.findUnique({ where: { id: grantId } })).uses, 0);
+});
+
+test("AT7 (db): two concurrent approvals of one card: one wins, one card-not-pending, one live grant", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals } = setup();
+  const c = await approvals.raiseCard(card(projectId), [t1]);
+  const results = await Promise.allSettled([approvals.approve(KK, c.id), approvals.approve(KK, c.id)]);
+  const won = results.filter((r) => r.status === "fulfilled");
+  const lost = results.filter((r) => r.status === "rejected");
+  assert.equal(won.length, 1);
+  assert.equal(lost.length, 1);
+  assert.equal(lost[0].reason.code, "card-not-pending");
+  const live = await db.approvalGrant.findMany({ where: { approvalId: c.id, revokedAt: null } });
+  assert.equal(live.length, 1);
+  assert.equal(live[0].id, won[0].value.grantId);
+  assert.equal(await db.auditEvent.count({ where: { action: "approval.approved", details: { path: ["approvalId"], equals: c.id } } }), 1);
+});
+
+test("AT7b (db): a task blocked by two cards approved at once becomes ready", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals } = setup();
+  const a = await approvals.raiseCard(card(projectId), [t1]);
+  const b = await approvals.raiseCard(card(projectId), [t1]);
+  await Promise.all([approvals.approve(KK, a.id), approvals.approve(KK, b.id)]);
+  assert.equal(await status(t1), "ready");
+});
+
+test("AT8 (db): raising the same card twice at once creates one card with both blockers", async () => {
+  const { projectId, tasks: [t1, t2] } = await fixture(2);
+  const { approvals, store } = setup();
+  const input = card(projectId);
+  const [x, y] = await Promise.all([approvals.raiseCard(input, [t1]), approvals.raiseCard(input, [t2])]);
+  assert.equal(x.id, y.id);
+  assert.equal(await db.approval.count({ where: { projectId, action: input.action } }), 1);
+  assert.deepEqual((await store.blockedTasks(x.id)).map((t) => t.id).sort(), [t1, t2].sort());
+});
+
+test("AT10 (db): closeMilestone needs an approved, same-project, same-gate approval", async () => {
+  const { projectId } = await fixture(0);
+  const other = await fixture(0);
+  const ms = await db.milestone.create({ data: { projectId, ordinal: 1, name: "P1", gateName: "requirements" } });
+  const { approvals } = setup();
+  const pending = await approvals.raiseCard(card(projectId, { gate: "requirements" }), []);
+  const otherProject = await approvals.raiseCard(card(other.projectId, { gate: "requirements" }), []);
+  const otherGate = await approvals.raiseCard(card(projectId, { gate: "decision" }), []);
+  await approvals.approve(KK, otherProject.id);
+  await approvals.approve(KK, otherGate.id);
+  await db.policyRule.create({
+    data: { name: `m23-at10-${randomUUID()}`, version: 1, priority: 0, actions: ["gate.transition"], resources: [], principals: [], roles: [], environments: [], effect: "allow", constraints: {}, createdBy: "kk:kk@kiot.io" },
+  });
+  const gates = new GateEngine({ store: new PrismaGateStore(db, 5000), policy: new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: KEY }) });
+  for (const a of [pending.id, otherProject.id, otherGate.id]) {
+    await assert.rejects(gates.closeMilestone(KK.identity, ms.id, a), (e) => e.code === "gate-evidence-missing");
+  }
+  assert.equal((await db.milestone.findUnique({ where: { id: ms.id } })).closedAt, null);
+  await approvals.approve(KK, pending.id);
+  const closed = await gates.closeMilestone(KK.identity, ms.id, pending.id);
+  const row = await db.milestone.findUnique({ where: { id: ms.id } });
+  assert.equal(row.gateApprovalId, pending.id);
+  assert.equal(row.closedAt.toISOString(), closed.closedAt.toISOString());
+  assert.equal(await db.auditEvent.count({ where: { projectId, action: "milestone.closed" } }), 1);
+  await assert.rejects(gates.closeMilestone(KK.identity, ms.id, pending.id), (e) => e.code === "milestone-closed");
+});
