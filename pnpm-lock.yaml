@@ -111,6 +111,9 @@ importers:
 
   packages/linear-sync:
     devDependencies:
+      '@devos/db':
+        specifier: workspace:*
+        version: link:../db
       '@types/node':
         specifier: ^22.7.0
         version: 22.20.5
