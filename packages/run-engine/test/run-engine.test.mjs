@@ -603,6 +603,34 @@ test("r6-2 max_seconds bounds start and result too: a slow start then a clean en
   }
 });
 
+// ---- DEVOS-88 regression: a deadline timer that fires before now() reaches the deadline ----
+
+test("devos-88 max_seconds is limit_hit even when the timer fires before now() reaches the deadline (start and result)", async () => {
+  for (const slow of ["start", "result"]) {
+    const s = setup({ maxSeconds: 1 });
+    let cancelled = false;
+    const adapter = {
+      name: "claude-agent-sdk",
+      async start() { if (slow === "start") await new Promise((r) => setTimeout(r, 1300)); },
+      events() { return (async function* () {})(); },
+      async cancel() { cancelled = true; },
+      async result() {
+        if (slow === "result" && !cancelled) await new Promise((r) => setTimeout(r, 1300));
+        return { status: "succeeded", costUsd: 0.01, costEstimated: false, usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+      },
+    };
+    // The engine's clock lags the timers by 50 ms: when the deadline-capped timer fires,
+    // now() still reads deadline - 50 ms after the first 500 ms (the early-timer race, made deterministic).
+    const t0 = Date.now();
+    const lagging = () => { const t = Date.now(); return t - t0 > 500 ? t - 50 : t; };
+    const out = await new RunEngine({ store: s.store, policy: s.policy, now: lagging, adapterFor: () => adapter }).execute({ runId: s.runId, provider: "anthropic", prompt: "x", cwd: "." });
+    assert.equal(out.status, "limit_hit", slow);
+    assert.equal(out.errorType, "timeout", slow);
+    assert.equal(s.store.errors.at(-1)?.message, "max-seconds", `${slow}: recorded as max-seconds, not adapter-${slow}-timeout`);
+    assert.equal(cancelled, true, `${slow}: the runtime was cancelled`);
+  }
+});
+
 // ---- Codex PR16-r7 regression ----
 
 test("r7-1 a resumed run that already used max_turns ends limit_hit without starting the runtime or reserving", async () => {
