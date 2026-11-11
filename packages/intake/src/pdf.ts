@@ -509,18 +509,148 @@ function pageContents(file: PdfFile): number[][] | null {
   return pages;
 }
 
+/**
+ * Object offsets from the cross-reference data (PR30-r14): the last `startxref`, then each section's /Prev chain,
+ * newest entry first. Handles classic `xref` tables and cross-reference streams (/W, /Index, FlateDecode with the
+ * PNG predictors). Returns type-1 entries (object number → byte offset); an unusable chain returns what was read.
+ */
+function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, number> {
+  const offsets = new Map<number, number>();
+  const last = [...text.slice(Math.max(0, text.length - 4096)).matchAll(/startxref\s+(\d{1,12})/g)].pop();
+  let at = last ? Number(last[1]) : -1;
+  const seen = new Set<number>();
+  const budget = { total: 0 };
+  for (let hops = 0; at >= 0 && at < text.length && !seen.has(at) && hops < 64; hops++) {
+    seen.add(at);
+    let prev = -1;
+    if (text.startsWith("xref", at)) {
+      const trailerAt = text.indexOf("trailer", at);
+      if (trailerAt < 0) break;
+      const table = text.slice(at + 4, trailerAt);
+      const re = /(\d{1,10})\s+(\d{1,10})\s*[\r\n]+((?:\s*\d{10}\s+\d{5}\s+[nf][ \t]*[\r\n]*)*)/g;
+      for (const sec of table.matchAll(re)) {
+        let num = Number(sec[1]);
+        for (const e of (sec[3] ?? "").matchAll(/(\d{10})\s+\d{5}\s+([nf])/g)) {
+          if (e[2] === "n" && !offsets.has(num)) offsets.set(num, Number(e[1]));
+          num++;
+        }
+      }
+      const tdict = /<<([\s\S]{0,4096}?)>>/.exec(text.slice(trailerAt, trailerAt + 4200))?.[1] ?? "";
+      const prevM = /\/Prev\s+(\d{1,12})/.exec(tdict);
+      const stm = /\/XRefStm\s+(\d{1,12})/.exec(tdict);
+      if (stm) readXrefStream(Number(stm[1]));
+      prev = prevM ? Number(prevM[1]) : -1;
+    } else {
+      prev = readXrefStream(at);
+    }
+    at = prev;
+  }
+  return offsets;
+
+  function readXrefStream(pos: number): number {
+    const head = new RegExp(String.raw`^(\d{1,10})${WS}\d{1,5}${WS}obj\b`).exec(text.slice(pos, pos + 64));
+    if (!head) return -1;
+    const body = scanObjectBody(text, pos + head[0].length);
+    if (body.kind !== "stream") return -1;
+    const dict = stripStrings(text.slice(pos + head[0].length, body.keyword));
+    if (!/\/Type\s*\/XRef\b/.test(dict)) return -1;
+    const len = /\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R)/.exec(dict);
+    if (!len) return -1;
+    const raw = buf.subarray(body.dataStart, body.dataStart + Number(len[1]));
+    let data: Uint8Array | undefined;
+    try {
+      data = decodeStream(dict, raw, limits, new Set(), budget);
+    } catch {
+      return -1;
+    }
+    if (!data) return -1;
+    const pred = Number(/\/Predictor\s+(\d+)/.exec(dict)?.[1] ?? 1);
+    const w = (/\/W\s*\[([^\]]*)\]/.exec(dict)?.[1] ?? "").trim().split(/\s+/).map(Number);
+    if (w.length !== 3 || w.some((x) => !Number.isInteger(x) || x < 0 || x > 8)) return -1;
+    const rowLen = (w[0] ?? 0) + (w[1] ?? 0) + (w[2] ?? 0);
+    if (rowLen === 0) return -1;
+    if (pred >= 10) data = unPng(data, Number(/\/Columns\s+(\d+)/.exec(dict)?.[1] ?? rowLen));
+    const size = Number(/\/Size\s+(\d+)/.exec(dict)?.[1] ?? 0);
+    const index = (/\/Index\s*\[([^\]]*)\]/.exec(dict)?.[1] ?? `0 ${size}`).trim().split(/\s+/).map(Number);
+    let row = 0;
+    const field = (off: number, width: number, dflt: number) => {
+      if (width === 0) return dflt;
+      let v = 0;
+      for (let k = 0; k < width; k++) v = v * 256 + (data?.[off + k] ?? 0);
+      return v;
+    };
+    for (let k = 0; k + 1 < index.length; k += 2) {
+      const first = index[k] ?? 0;
+      const count = index[k + 1] ?? 0;
+      for (let j = 0; j < count && (row + 1) * rowLen <= data.length; j++, row++) {
+        const o = row * rowLen;
+        const type = field(o, w[0] ?? 0, 1);
+        const f2 = field(o + (w[0] ?? 0), w[1] ?? 0, 0);
+        if (type === 1 && !offsets.has(first + j)) offsets.set(first + j, f2);
+      }
+    }
+    const prevM = /\/Prev\s+(\d{1,12})/.exec(dict);
+    return prevM ? Number(prevM[1]) : -1;
+  }
+}
+
+/** Undo the PNG row predictors (Predictor ≥ 10) used by cross-reference streams. */
+function unPng(data: Uint8Array, columns: number): Uint8Array {
+  const stride = columns + 1;
+  const rows = Math.floor(data.length / stride);
+  const out = new Uint8Array(rows * columns);
+  for (let r = 0; r < rows; r++) {
+    const ft = data[r * stride] ?? 0;
+    for (let c = 0; c < columns; c++) {
+      const x = data[r * stride + 1 + c] ?? 0;
+      const a = c > 0 ? (out[r * columns + c - 1] ?? 0) : 0;
+      const b = r > 0 ? (out[(r - 1) * columns + c] ?? 0) : 0;
+      const d = r > 0 && c > 0 ? (out[(r - 1) * columns + c - 1] ?? 0) : 0;
+      let v = x;
+      if (ft === 1) v = x + a;
+      else if (ft === 2) v = x + b;
+      else if (ft === 3) v = x + ((a + b) >> 1);
+      else if (ft === 4) {
+        const p = a + b - d;
+        const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - d);
+        v = x + (pa <= pb && pa <= pc ? a : pb <= pc ? b : d);
+      }
+      out[r * columns + c] = v & 0xff;
+    }
+  }
+  return out;
+}
+
+/** Integer objects at the offsets the cross-reference data names (the authoritative length source). */
+function xrefIntegers(text: string, offsets: ReadonlyMap<number, number>): Map<number, number> {
+  const ints = new Map<number, number>();
+  const re = new RegExp(String.raw`^(\d{1,10})${WS}\d{1,5}${WS}obj${WS}(\d{1,12})${WS}endobj\b`);
+  for (const [num, off] of offsets) {
+    const m = re.exec(text.slice(off, off + 256));
+    if (m && Number(m[1]) === num) ints.set(num, Number(m[2]));
+  }
+  return ints;
+}
+
 export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<string>): Block[] {
   const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const budget = { total: 0 };
-  // Two passes (PR30-r13): the first uses raw integer candidates (each still checked against `endstream`); the
+  // Two passes (PR30-r13), anchored on the cross-reference data when it is usable (PR30-r14): the first uses raw integer candidates (each still checked against `endstream`); the
   // second resolves indirect /Length only from integer objects the structural scan really found, so text inside
   // strings, comments or stream data can never supply a length.
-  const firstPass = collectObjects(buf, limits, new Set(), { total: 0 }, integerCandidates(buf.toString("latin1")));
+  // Integer objects named by the cross-reference data are authoritative (PR30-r14); decoys elsewhere in the file
+  // (strings, comments, stream bytes) can never replace them. Only numbers the xref does not cover fall back.
+  const text = buf.toString("latin1");
+  const xrefInts = xrefIntegers(text, readXref(buf, text, limits));
+  const candidates = integerCandidates(text);
+  for (const [num, len] of xrefInts) candidates.set(num, [len]);
+  const firstPass = collectObjects(buf, limits, new Set(), { total: 0 }, candidates);
   const structuralInts = new Map<number, number[]>();
   for (const [num, o] of firstPass.objs) {
     const m = /^\s*(\d{1,12})\s*$/.exec(o.dict);
     if (!o.data && m) structuralInts.set(num, [Number(m[1])]);
   }
+  for (const [num, len] of xrefInts) structuralInts.set(num, [len]);
   const file = collectObjects(buf, limits, warnings, budget, structuralInts);
   const objs = file.objs;
   const blocks: Block[] = [];

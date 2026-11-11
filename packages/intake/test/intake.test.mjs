@@ -693,3 +693,63 @@ test("AT4n indirect /Length comes from a real integer object, never from a decoy
     assert.ok(!r.warnings.includes("pdf-stream-damaged"), decoys);
   }
 });
+
+// ---------- PR30-r14 ----------
+/** Append a classic xref table (or an xref stream with PNG predictor 12) with the real object offsets. */
+function withXref(body, { stream = false } = {}) {
+  const text = body.toString("latin1");
+  const offsets = new Map();
+  for (const m of text.matchAll(/(?:^|\n)(\d+) 0 obj\n/g)) offsets.set(Number(m[1]), m.index + (m[0].startsWith("\n") ? 1 : 0));
+  const max = Math.max(...offsets.keys());
+  const xrefAt = body.length;
+  if (!stream) {
+    let t = `xref\n0 ${max + 1}\n0000000000 65535 f \n`;
+    for (let n = 1; n <= max; n++) t += offsets.has(n) ? `${String(offsets.get(n)).padStart(10, "0")} 00000 n \n` : "0000000000 00000 f \n";
+    t += `trailer\n<< /Size ${max + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF\n`;
+    return Buffer.concat([body, Buffer.from(t, "latin1")]);
+  }
+  const num = max + 1;
+  const rows = [];
+  for (let n = 0; n <= num; n++) {
+    const off = n === num ? xrefAt : offsets.get(n);
+    const row = Buffer.alloc(1 + 7);
+    row[0] = 2; // PNG "Up" filter
+    const vals = Buffer.alloc(7);
+    vals[0] = off === undefined ? 0 : 1;
+    vals.writeUInt32BE(off ?? 0, 1);
+    rows.push(vals);
+  }
+  const enc = [];
+  rows.forEach((r, i) => {
+    const prevRow = rows[i - 1] ?? Buffer.alloc(7);
+    enc.push(Buffer.from([2]), Buffer.from(r.map((b, k) => (b - prevRow[k] + 256) & 0xff)));
+  });
+  const data = deflateSync(Buffer.concat(enc));
+  const head = `${num} 0 obj\n<< /Type /XRef /Size ${num + 1} /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >> /Length ${data.length} >>\nstream\n`;
+  return Buffer.concat([body, Buffer.from(head, "latin1"), data, Buffer.from(`\nendstream\nendobj\nstartxref\n${xrefAt}\n%%EOF\n`, "latin1")]);
+}
+
+test("AT4o the cross-reference data decides indirect /Length; a later metadata decoy cannot", () => {
+  const content = "BT (FR-001 before) Tj T* (text: endstream endobj) Tj T* (FR-002 after) Tj ET";
+  const data = deflateSync(Buffer.from(content, "latin1"), { level: 0 });
+  const head =
+    "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" +
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] >>\nendobj\n" +
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" +
+    "4 0 obj\n<< /Length 19 0 R /Filter /FlateDecode >>\nstream\n";
+  const dataStart = Buffer.byteLength(head, "latin1");
+  const afterData = `\nendstream\nendobj\n19 0 obj\n${data.length}\nendobj\n`;
+  // The decoy names a length that runs from stream 4's data start to an "endstream" inside the metadata string.
+  const prefix = "5 0 obj\n<< /Note (19 0 obj ";
+  const decoyEndstreamAt = (n) => dataStart + data.length + afterData.length + prefix.length + String(n).length + " endobj ".length;
+  let n = 0;
+  for (let i = 0; i < 3; i++) n = decoyEndstreamAt(n) - dataStart; // fixed point for the digit count
+  const decoy = `${prefix}${n} endobj endstream) >>\nendobj\n`;
+  const body = Buffer.concat([Buffer.from(head, "latin1"), data, Buffer.from(afterData + decoy, "latin1")]);
+  assert.equal(body.toString("latin1").slice(dataStart + n, dataStart + n + 9), "endstream", "decoy really points at an endstream");
+  for (const variant of [{}, { stream: true }]) {
+    const r = parseSpec(withXref(body, variant), "xref.pdf");
+    assert.deepEqual(ids(r), ["FR-001", "FR-002"], JSON.stringify(variant));
+    assert.ok(!r.warnings.includes("pdf-stream-damaged"));
+  }
+});
