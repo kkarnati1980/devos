@@ -80,6 +80,15 @@ test("markers: written once, read back by kind, other text ignored", () => {
   assert.equal(readMarker(t, "task"), null);
   assert.equal(withMarker(t, "module", id), t, "idempotent");
   assert.equal(stripMarkers(t), "Contract: docs/modules/M2.6.md");
-  assert.equal(readMarker("<!-- devos:module:not-a-uuid-at-all-xxxxxxxxxxxxxxxxxxxx -->", "module"), null);
+  assert.equal(readMarker("devos-ref: module/not-a-uuid-at-all-xxxxxxxxxxxxxxxxxxxxx", "module"), null);
   assert.throws(() => withMarker("x", "task", "1; drop"), /not a uuid/);
+});
+
+test("a rate-limit error on a 4xx is retried as 429; Retry-After is capped; a vault failure is not a network error", async () => {
+  const rl = res(400, { errors: [{ message: "x", extensions: { code: "RATELIMITED" } }] }, { "retry-after": "3600" });
+  const { c, calls, sleeps } = client([rl, res(200, { data: { ok: 1 } })]);
+  assert.deepEqual(await c.query("query { ok }"), { ok: 1 });
+  assert.equal(calls.length, 2); assert.ok(sleeps[0] <= 60_000);
+  const v = new LinearClient({ apiKey: () => { throw new Error(KEY); }, fetchImpl: async () => res(200, { data: {} }), sleep: async () => {} });
+  await assert.rejects(v.query("query { x }"), (e) => e.code === "bad-response" && !e.message.includes(KEY));
 });

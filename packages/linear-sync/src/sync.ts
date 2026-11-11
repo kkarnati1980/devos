@@ -1,7 +1,7 @@
 // M2.6-a outbound sync (DevOS -> Linear), docs/modules/M2.6.md. Idempotent: every object is found by its stored
 // id or, failing that, by its marker before anything is created; an unchanged plan makes no Linear write.
 import type { DevosPlan, LinearApi, LinearIssue, StateType, SyncStore, ModuleStatus, TaskStatus } from "./types.js";
-import { readMarker, withMarker } from "./markers.js";
+import { readMarker, sameText, withMarker } from "./markers.js";
 
 export const LANE_LABEL = (lane: number) => `Lane ${String.fromCharCode(64 + Math.min(Math.max(lane, 1), 3))}`;
 
@@ -47,6 +47,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   // Project: stored id, else marker search, else create.
   const projDesc = withMarker(`DevOS project **${plan.project.name}**. Mirrored by DevOS (M2.6); DevOS is the source of truth.`, "project", plan.project.id);
   let projectId = plan.project.linearProjectId;
+  if (projectId && !(await api.projectExists(projectId))) { r.log.push("stored Linear project id not found; searching by marker"); projectId = null; }
   if (!projectId) {
     const found = await api.findProject(team.id, plan.project.id);
     if (found) { projectId = found.id; r.log.push("project adopted by marker"); }
@@ -60,10 +61,12 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   for (const m of [...plan.milestones].sort((a, b) => a.ordinal - b.ordinal)) {
     const name = `P${m.ordinal} ${m.name}`;
     const desc = withMarker(`Gate: ${m.gateName}`, "milestone", m.id);
-    let id = m.linearMilestoneId ?? existingMs.find((x) => readMarker(x.description, "milestone") === m.id)?.id ?? null;
+    // A stored id that no longer exists in Linear is treated as unknown (search by marker, else create).
+    const stored = m.linearMilestoneId && existingMs.some((x) => x.id === m.linearMilestoneId) ? m.linearMilestoneId : null;
+    let id = stored ?? existingMs.find((x) => readMarker(x.description, "milestone") === m.id)?.id ?? null;
     const cur = id ? existingMs.find((x) => x.id === id) : undefined;
     if (!id) { id = await api.createMilestone({ projectId, name, description: desc, sortOrder: m.ordinal }); r.writes++; r.created.push(`milestone ${name}`); }
-    else if (cur && (cur.name !== name || (cur.description ?? "") !== desc)) { await api.updateMilestone(id, { name, description: desc }); r.writes++; r.updated.push(`milestone ${name}`); }
+    else if (cur && (cur.name !== name || !sameText(cur.description, desc))) { await api.updateMilestone(id, { name, description: desc }); r.writes++; r.updated.push(`milestone ${name}`); }
     if (id !== m.linearMilestoneId) await store.setMilestoneId(m.id, id);
     msId.set(m.id, id);
   }
@@ -75,7 +78,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     (stored ? byId.get(stored) : undefined) ?? issues.find((i) => readMarker(i.description, kind) === id);
 
   const upsert = async (what: string, existing: LinearIssue | undefined, want: { title: string; description: string; state: StateType;
-    labels: string[]; parentId: string | null; milestoneId: string | null; assigneeId: string | null }) => {
+    labels: string[]; parentId: string | null; milestoneId: string | null; assigneeId: string | null; keepLinearState?: boolean }) => {
     const lids = await Promise.all(want.labels.map(label));
     if (!existing) {
       const id = await api.createIssue({ teamId: team.id, projectId: projectId!, milestoneId: want.milestoneId, parentId: want.parentId, title: want.title,
@@ -85,8 +88,9 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     }
     const patch: Record<string, unknown> = {};
     if (existing.title !== want.title) patch.title = want.title;
-    if ((existing.description ?? "") !== want.description) patch.description = want.description;
-    if (existing.stateType !== want.state) { patch.stateId = stateId(want.state); r.log.push(`${what}: state ${existing.stateType} -> ${want.state}`); }
+    if (!sameText(existing.description, want.description)) patch.description = want.description;
+    // Human tasks: Linear owns their state after creation (KK completes them there; M2.6-b reads it back).
+    if (!want.keepLinearState && existing.stateType !== want.state) { patch.stateId = stateId(want.state); r.log.push(`${what}: state ${existing.stateType} -> ${want.state}`); }
     if (!sameSet(existing.labelNames, want.labels)) patch.labelIds = lids;
     if (existing.parentId !== want.parentId) patch.parentId = want.parentId;
     if (existing.milestoneId !== want.milestoneId) patch.milestoneId = want.milestoneId;
@@ -119,7 +123,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
       state: st.type, labels: [human ? "Human" : "Task", ...(st.deadlocked ? ["deadlocked"] : [])],
       parentId: t.moduleId ? modIssue.get(t.moduleId) ?? null : null,
       milestoneId: mod ? msId.get(mod.milestoneId) ?? null : null,
-      assigneeId: human ? kk : null,
+      assigneeId: human ? kk : null, keepLinearState: human,
     });
     if (id !== t.linearIssue) await store.setTaskIssue(t.id, id);
   }

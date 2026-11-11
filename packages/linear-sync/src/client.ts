@@ -68,7 +68,8 @@ export class LinearClient {
   }
 
   private async once<T>(query: string, variables: Record<string, unknown>): Promise<T> {
-    const key = await this.o.apiKey();
+    let key: string;
+    try { key = await this.o.apiKey(); } catch { throw new LinearError("bad-response", "Linear API key is not available from the vault"); }
     let res: Response;
     try {
       res = await this.o.fetchImpl(this.o.endpoint, {
@@ -88,7 +89,12 @@ export class LinearClient {
     }
     if (!res.ok) {
       const ra = Number(res.headers.get("retry-after"));
-      throw new LinearError("http", `Linear answered HTTP ${res.status}`, res.status, Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined);
+      // Linear reports rate limiting as a GraphQL error code, possibly on a 4xx: read the code before deciding.
+      let code: unknown;
+      try { code = ((await res.json()) as { errors?: { extensions?: { code?: string } }[] })?.errors?.[0]?.extensions?.code; } catch { /* not JSON */ }
+      const status = code === "RATELIMITED" ? 429 : res.status;
+      const retryMs = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 60_000) : undefined;   // bounded
+      throw new LinearError("http", `Linear answered HTTP ${res.status}${code === "RATELIMITED" ? " (rate limited)" : ""}`, status, retryMs);
     }
     let body: { data?: T; errors?: { message?: string; extensions?: { code?: string } }[] };
     try { body = (await res.json()) as typeof body; } catch { throw new LinearError("bad-response", "Linear answered with invalid JSON"); }

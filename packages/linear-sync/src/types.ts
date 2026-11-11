@@ -21,6 +21,7 @@ export interface LinearApi {
   createLabel(teamId: string, name: string): Promise<string>;
   findProject(teamId: string, devosProjectId: string): Promise<{ id: string; name: string; description: string } | null>;
   createProject(input: { teamId: string; name: string; description: string }): Promise<string>;
+  projectExists(id: string): Promise<boolean>;
   updateProject(id: string, input: { name?: string; description?: string }): Promise<void>;
   milestones(projectId: string): Promise<{ id: string; name: string; description: string | null }[]>;
   createMilestone(input: { projectId: string; name: string; description: string; sortOrder: number }): Promise<string>;

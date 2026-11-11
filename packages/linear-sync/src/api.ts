@@ -49,6 +49,10 @@ export function graphqlApi(client: LinearClient): LinearApi {
         `mutation($i: ProjectCreateInput!) { projectCreate(input: $i) { success project { id } } }`, { i: { teamIds: [teamId], name, description } });
       return ok(d.projectCreate, "project create").project.id;
     },
+    async projectExists(id) {
+      try { return Boolean((await client.query<{ project: { id: string } | null }>(`query($id: String!) { project(id: $id) { id } }`, { id })).project); }
+      catch (e) { if (e instanceof LinearError && e.code === "graphql") return false; throw e; }
+    },
     async updateProject(id, input) {
       ok((await client.mutate<{ projectUpdate: { success: boolean } }>(
         `mutation($id: String!, $i: ProjectUpdateInput!) { projectUpdate(id: $id, input: $i) { success } }`, { id, i: input })).projectUpdate, "project update");

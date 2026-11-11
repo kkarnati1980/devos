@@ -27,7 +27,7 @@ function throwaway() {
 test("AT1: a throwaway project mirrors to one project, milestones, module issues, sub-issues, a human task for KK and a blocked-by link", async () => {
   const L = fakeLinear(); const plan = throwaway();
   await syncProject(plan, L.api, memoryStore(plan));
-  assert.equal(L.projects.length, 1); assert.match(L.projects[0].description, /devos:project:00000000-0000-4000-8000-000000000001/);
+  assert.equal(L.projects.length, 1); assert.match(L.projects[0].description, /devos-ref: project\/00000000-0000-4000-8000-000000000001/);
   assert.deepEqual(L.milestones.map((m) => m.name), ["P1 Intake", "P2 Build"]);
   const mod = (k) => L.issues.find((i) => i.title.startsWith(k));
   const names = (i) => i.labelIds.map((x) => L.team.labels.find((l) => l.id === x).name).sort();
@@ -70,4 +70,24 @@ test("AT3: a crash after Linear created an issue is recovered by marker on the n
   assert.ok(r.log.includes("project adopted by marker"));
   assert.equal(L.projects.length, 1); assert.equal(L.milestones.length, 2); assert.equal(L.issues.length, 7);
   assert.equal(new Set(L.issues.map((i) => i.title)).size, 7);
+});
+
+test("human tasks: Linear owns their state after creation (KK's completion is never reverted)", async () => {
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const human = L.issues.find((i) => i.title === "Create the API key");
+  human.stateId = "s-c"; L.writes.length = 0;
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(r.writes, 0); assert.equal(human.stateId, "s-c");
+});
+test("descriptions re-rendered by Linear (escapes, marks, whitespace) are not rewritten; stale stored ids recover", async () => {
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  for (const i of L.issues) i.description = i.description.replace(/`/g, "").replace("devos-ref: module/", "devos-ref: module\\/").replace(/\n\n/g, "\n");
+  L.writes.length = 0;
+  assert.equal((await syncProject(plan, L.api, store)).writes, 0, JSON.stringify(L.writes));
+  plan.milestones[0].linearMilestoneId = "m-gone"; plan.project.linearProjectId = "p-gone";
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(L.projects.length, 1); assert.equal(L.milestones.length, 2); assert.ok(r.log.some((l) => /not found/.test(l)));
+  assert.equal(plan.milestones[0].linearMilestoneId, L.milestones[0].id);
 });

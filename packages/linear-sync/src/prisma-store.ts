@@ -40,6 +40,13 @@ export class PrismaSyncStore implements SyncStore {
   private async upsertResource(kind: "project" | "milestone", name: string, externalId: string) {
     const existing = await this.db.resource.findFirst({ where: { projectId: this.projectId, ...RES(kind), name, status: "active" }, select: { id: true, externalId: true } });
     if (existing?.externalId === externalId) return;
+    // The same Linear object may have a soft-deleted row (resource is unique on provider + kind + external id): reuse it.
+    const prior = await this.db.resource.findFirst({ where: { ...RES(kind), externalId }, select: { id: true, projectId: true } });
+    if (prior && prior.projectId === this.projectId) {
+      if (existing) await this.db.resource.update({ where: { id: existing.id }, data: { status: "deleted", deletedAt: new Date() } });
+      await this.db.resource.update({ where: { id: prior.id }, data: { status: "active", deletedAt: null, name } });
+      return;
+    }
     if (existing) await this.db.resource.update({ where: { id: existing.id }, data: { externalId } });
     else await this.db.resource.create({ data: { projectId: this.projectId, ...RES(kind), name, externalId } });
   }
