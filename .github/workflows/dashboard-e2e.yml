@@ -33,10 +33,10 @@ jobs:
         # No apt (DEVOS-99): the ubuntu-24.04 runner image already ships the shared libraries Chromium needs
         # (it has Google Chrome preinstalled), and apt was the step failing to resolve the Ubuntu archives.
         # Only the browser download is retried (idempotent); a missing library still fails the tests below.
-        timeout-minutes: 6
+        timeout-minutes: 9
         run: |
           for i in 1 2 3; do
-            pnpm --filter @devos/dashboard exec playwright install chromium && exit 0
+            timeout 150 pnpm --filter @devos/dashboard exec playwright install chromium && exit 0
             echo "browser download failed (attempt $i/3)"
             if [ "$i" -lt 3 ]; then sleep 20; fi
           done
