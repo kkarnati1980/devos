@@ -1,6 +1,8 @@
 // In-memory Linear for the sync tests: records every write so "no change = no write" can be asserted.
 export function fakeLinear({ failCreateIssueAfterWrite = null } = {}) {
-  let n = 0; const id = (p) => `${p}-${++n}`;
+  // Ids are unique across fake instances, like real Linear ids (resource rows are unique on provider+kind+id).
+  const run = Math.random().toString(36).slice(2, 10);
+  let n = 0; const id = (p) => `${p}-${run}-${++n}`;
   const L = {
     writes: [], viewer: "user-kk",
     team: { id: "team-1", states: [["s-b", "backlog"], ["s-u", "unstarted"], ["s-s", "started"], ["s-c", "completed"], ["s-x", "canceled"]].map(([id, type]) => ({ id, type })), labels: [{ id: "l-mod", name: "Module" }] },
