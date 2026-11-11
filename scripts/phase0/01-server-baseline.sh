@@ -154,7 +154,7 @@ cat <<'EOF_NEXT'
 
 NEXT STEPS
 1. From YOUR LAPTOP (not the server; a request from the server to itself proves nothing), confirm
-   nothing is public over IPv4 or IPv6 — every line should say "blocked":
+   nothing is public over IPv4 or IPv6 — every port should end in "blocked" (after "HTTP 000"):
        for h in 200.234.41.176 '[2a02:4780:63:89c2::1]'; do for p in 8000 8080 6001 6002 80 443; do curl -sS -g -m 5 -o /dev/null -w "$h:$p HTTP %{http_code}\n" "http://$h:$p" 2>/dev/null || echo "$h:$p blocked"; done; done
    If your network has no IPv6, the IPv6 lines fail either way; then the server's
    ufw6-docker-logging-deny packet counter is the evidence (docs/modules/M0.1.md).
