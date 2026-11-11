@@ -4,13 +4,14 @@ export type Token =
   | { kind: "open"; name: string; attrs: string; selfClosing: boolean }
   | { kind: "close"; name: string };
 
-const NAMED: Record<string, string> = {
+/** A Map, so `&constructor;` and friends are never resolved through Object.prototype (PR30-r12). */
+const NAMED: ReadonlyMap<string, string> = new Map(Object.entries({
   amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—",
   lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”", hellip: "…", bull: "•",
   middot: "·", copy: "©", reg: "®", trade: "™", deg: "°", times: "×",
   le: "≤", ge: "≥", ne: "≠", rarr: "→", larr: "←", euro: "€", pound: "£",
   rupee: "₹", shy: "", zwj: "", zwnj: "", ensp: " ", emsp: " ", thinsp: " ",
-};
+}));
 
 export function decodeEntities(s: string): string {
   if (!s.includes("&")) return s;
@@ -20,7 +21,7 @@ export function decodeEntities(s: string): string {
       if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return "�";
       return String.fromCodePoint(cp);
     }
-    const v = NAMED[ent.toLowerCase()];
+    const v = NAMED.get(ent.toLowerCase());
     return v === undefined ? whole : v;
   });
 }

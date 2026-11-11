@@ -2,7 +2,8 @@ import { IngestError } from "./errors.js";
 
 export type SpecFileFormat = "docx" | "pdf" | "md" | "html";
 
-const EXT: Record<string, SpecFileFormat> = {
+/** Own entries only: a Map, so names like `spec.constructor` can never hit an inherited property (PR30-r12). */
+const EXT: ReadonlyMap<string, SpecFileFormat> = new Map(Object.entries({
   docx: "docx",
   pdf: "pdf",
   md: "md",
@@ -10,7 +11,7 @@ const EXT: Record<string, SpecFileFormat> = {
   txt: "md",
   html: "html",
   htm: "html",
-};
+}) as [string, SpecFileFormat][]);
 
 /** Base name only, no control characters, at most 255 characters. Never used as a path. */
 export function sanitizeName(name: string): string {
@@ -28,7 +29,7 @@ export function formatFromName(name: string): SpecFileFormat {
   const base = sanitizeName(name);
   const dot = base.lastIndexOf(".");
   const ext = dot >= 0 ? base.slice(dot + 1).toLowerCase() : "";
-  const f = EXT[ext];
+  const f = EXT.get(ext);
   if (!f) throw new IngestError("type-unknown");
   return f;
 }

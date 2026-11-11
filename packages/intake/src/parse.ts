@@ -62,6 +62,8 @@ export function parseSpec(bytes: Uint8Array, originalName: string, options: Inge
     case "pdf":
       blocks = parsePdf(bytes, limits, warnings);
       break;
+    default:
+      throw new IngestError("type-unknown"); // unreachable by type; a guard so a bad format is never a native error
   }
   if (blocks.length > limits.maxBlocks) throw new IngestError("too-many-blocks");
   const text = renderMarkdown(blocks);

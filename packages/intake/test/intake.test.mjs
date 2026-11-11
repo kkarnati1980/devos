@@ -654,3 +654,13 @@ test("AT4m many comment lines between tokens cannot cause catastrophic backtrack
   assert.equal(code(() => parseSpec(Buffer.from("%PDF-1.4\n" + junk + "%%EOF\n", "latin1"), "slow.pdf")), "pdf-no-text");
   assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
 });
+
+// ---------- PR30-r12 ----------
+test("AT5b inherited property names are never a format or an entity", async () => {
+  for (const n of ["spec.constructor", "spec.toString", "spec.__proto__", "spec.hasOwnProperty", "spec.valueOf"]) {
+    assert.equal(code(() => parseSpec(enc("# FR-1"), n)), "type-unknown", n);
+    await assert.rejects(ingest(enc("# FR-1"), n), (e) => e instanceof IngestError && e.code === "type-unknown");
+  }
+  const r = parseSpec(enc("<p>&constructor; &toString; &amp; FR-1</p>"), "e.html");
+  assert.equal(r.blocks[0].text, "&constructor; &toString; & FR-1");
+});
