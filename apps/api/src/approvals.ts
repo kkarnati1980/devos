@@ -58,8 +58,10 @@ export interface AuditEntry {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const ONE_LINE = /^[^\u0000-\u001f\u007f]+$/;
-const MULTI_LINE = /^[^\u0000-\u0009\u000b-\u001f\u007f]*$/;
+// C0/C1 controls, Unicode line/paragraph separators and bidi overrides/isolates are refused, so the card KK
+// reads is the card that is stored (pre-review finding 9).
+const ONE_LINE = /^[^\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+$/;
+const MULTI_LINE = /^[^\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]*$/;
 
 function text(v: unknown, max: number, multiLine: boolean): string | null {
   if (typeof v !== "string") return null;
@@ -79,6 +81,9 @@ export function parseCard(v: unknown): CardInput | string {
   const target = text(b.target, ACTION_MAX, false);
   const reason = text(b.reason, REASON_MAX, true);
   if (!action || !target || !reason) return "invalid-input";
+  // ADR-0006 "scoped": action and target become the grant's scope, which M1.7 matches with `*` wildcards, so a
+  // card may never carry one (pre-review finding 2).
+  if (action.includes("*") || target.includes("*")) return "invalid-input";
   let consequence: string | null = null;
   if (b.consequence != null) {
     consequence = text(b.consequence, REASON_MAX, true);
@@ -127,6 +132,8 @@ export interface ApprovalStore {
   comment(approvalId: string, author: string, body: string, at: Date): Promise<CardComment | null>;
   /** Pending cards created before `before` become expired (audited); their tasks stay blocked. */
   expire(before: Date, at: Date): Promise<string[]>;
+  /** One audit_event outside any decision (e.g. a grant that could not be revoked). */
+  recordAudit(a: AuditEntry): Promise<void>;
 }
 
 /** The M1.7 engine surface M2.3 needs (structural; `@devos/policy` PolicyEngine). */
@@ -189,13 +196,24 @@ export interface ApprovalsDeps {
   notifier: CardNotifier | null;
   /** M1.7 `verifyKkSession`: true only for a session this process minted for KK. */
   verifyKkSession: (s: unknown) => boolean;
+  /**
+   * Maps the matched M1.7 rule ids of a `require_approval` decision to the card's gate (null = no gate rule).
+   * Wired in M2.3-b; without it every policy card is a `decision` card (purge actions excepted, see below).
+   */
+  gateForRules?: (ruleIds: readonly string[]) => Promise<GateName | null>;
   now?: () => number;
+}
+
+/** Actions that destroy data always go through gate 5 (typed confirmation), whatever the rule says. */
+export function isPurgeAction(action: string): boolean {
+  return /(^|[.:/_-])purge($|[.:/_-])/i.test(action);
 }
 
 /** The policy decision shape `cardForDecision` reads (structural; `@devos/policy` PolicyDecision). */
 export interface DecisionLike {
   enforcedOutcome: "allow" | "deny" | "require_approval";
   reason: string;
+  matchedRuleIds?: readonly string[];
 }
 
 export class Approvals {
@@ -242,12 +260,16 @@ export class Approvals {
   /** ADR-0006: a card only from an enforced `require_approval` outcome; the requesting task waits on it. */
   async cardForDecision(
     decision: DecisionLike,
-    request: { action: string; resource: string; projectId?: string | null; gate?: GateName; taskId?: string | null },
+    request: { action: string; resource: string; projectId?: string | null; taskId?: string | null },
   ): Promise<Card> {
     if (decision.enforcedOutcome !== "require_approval") throw new ApprovalError("card-not-required");
+    // The gate comes from the matched rule, never from the caller (pre-review finding 3); a purge action is always
+    // gate 5, so its typed confirmation cannot be dodged.
+    let gate: GateName = (this.deps.gateForRules ? await this.deps.gateForRules(decision.matchedRuleIds ?? []) : null) ?? "decision";
+    if (typeof request.action === "string" && isPurgeAction(request.action)) gate = "purge";
     return this.raiseCard(
       {
-        gate: request.gate ?? "decision",
+        gate,
         action: request.action,
         target: request.resource,
         reason: decision.reason || "Policy requires approval",
@@ -261,8 +283,11 @@ export class Approvals {
    * KK approves: the grant is issued first, then the card is decided under its row lock. If the card is no longer
    * pending (a concurrent decision won), the grant just issued is revoked, so at most one live grant exists.
    */
-  async approve(session: unknown, id: string, options: ApproveOptions = {}): Promise<{ card: Card; grantId: string }> {
+  async approve(session: unknown, id: string, rawOptions: unknown = {}): Promise<{ card: Card; grantId: string }> {
     const by = this.requireKk(session);
+    // Limits are enforced here, not only at the route, because services call this directly (pre-review finding 4).
+    const options = parseApproveOptions(rawOptions);
+    if (typeof options === "string") throw new ApprovalError(options);
     if (!UUID.test(id)) throw new ApprovalError("card-not-found", 404);
     const card = await this.deps.store.get(id);
     if (!card) throw new ApprovalError("card-not-found", 404);
@@ -292,14 +317,33 @@ export class Approvals {
         { action: "approval.approved", summary: `Approved: ${card.action}`, details: { gate: card.gate, grantId: grant.id } },
       )
       .catch(async (e: unknown) => {
-        await this.deps.grants.revokeGrant(session as KkSession, grant.id).catch(() => undefined);
+        await this.revokeOrFail(session as KkSession, grant.id, card.id);
         throw e;
       });
     if (!decided) {
-      await this.deps.grants.revokeGrant(session as KkSession, grant.id).catch(() => undefined);
+      await this.revokeOrFail(session as KkSession, grant.id, card.id);
       throw new ApprovalError("card-not-pending", 409);
     }
     return { card: decided, grantId: grant.id };
+  }
+
+  /**
+   * Revokes a grant whose card this call did not approve. Revoke is idempotent, so one retry is safe (ADR-0011 §9).
+   * If both attempts fail, the failure is audited and surfaced; it is never swallowed (pre-review finding 5).
+   */
+  private async revokeOrFail(session: KkSession, grantId: string, approvalId: string): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await this.deps.grants.revokeGrant(session, grantId);
+        return;
+      } catch {
+        /* retried once below */
+      }
+    }
+    await this.deps.store
+      .recordAudit({ action: "approval.grant_revoke_failed", summary: "Grant of a card not approved by this call could not be revoked", details: { approvalId, grantId } })
+      .catch(() => undefined);
+    throw new ApprovalError("approvals-store-error", 500);
   }
 
   async reject(session: unknown, id: string, comment?: unknown): Promise<Card> {
@@ -309,6 +353,7 @@ export class Approvals {
     if (comment != null) {
       body = text(comment, COMMENT_MAX, true);
       if (!body) throw new ApprovalError("invalid-input");
+      if (looksSecret(body)) throw new ApprovalError("card-contains-secret");
     }
     const card = await this.deps.store.get(id);
     if (!card) throw new ApprovalError("card-not-found", 404);
@@ -326,6 +371,7 @@ export class Approvals {
     if (!UUID.test(id)) throw new ApprovalError("card-not-found", 404);
     const b = text(body, COMMENT_MAX, true);
     if (!b) throw new ApprovalError("invalid-input");
+    if (looksSecret(b)) throw new ApprovalError("card-contains-secret");
     const c = await this.deps.store.comment(id, by, b, new Date(this.now()));
     if (!c) throw new ApprovalError("card-not-found", 404);
     return c;
@@ -342,7 +388,7 @@ export class Approvals {
 export class MemoryApprovalStore implements ApprovalStore {
   readonly cards = new Map<string, Card>();
   readonly blockers: { taskId: string; approvalId: string }[] = [];
-  readonly tasks = new Map<string, { id: string; title: string; status: TaskState }>();
+  readonly tasks = new Map<string, { id: string; title: string; status: TaskState; projectId?: string | null }>();
   readonly commentsList: CardComment[] = [];
   readonly audit: AuditEntry[] = [];
   private seq = 0;
@@ -359,13 +405,22 @@ export class MemoryApprovalStore implements ApprovalStore {
     return `00000000-0000-4000-8000-${this.seq.toString(16).padStart(12, "0")}`;
   }
 
-  addTask(id: string, title: string, status: TaskState = "ready"): void {
-    this.tasks.set(id, { id, title, status });
+  addTask(id: string, title: string, status: TaskState = "ready", projectId: string | null = null): void {
+    this.tasks.set(id, { id, title, status, projectId });
+  }
+
+  recordAudit(a: AuditEntry) {
+    return this.serial(() => {
+      this.audit.push(a);
+    });
   }
 
   raise(input: CardInput, blocks: readonly string[], audit: AuditEntry, now: Date) {
     return this.serial(() => {
       for (const t of blocks) if (!this.tasks.has(t)) throw new ApprovalError("task-not-found", 404);
+      if (input.projectId && blocks.some((t) => (this.tasks.get(t)?.projectId ?? null) !== input.projectId)) {
+        throw new ApprovalError("task-other-project", 409);
+      }
       let card = [...this.cards.values()].find(
         (c) => c.status === "pending" && c.projectId === (input.projectId ?? null) && c.gate === input.gate && c.action === input.action && c.target === input.target,
       );
@@ -529,13 +584,22 @@ export class PrismaApprovalStore implements ApprovalStore {
       await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${key}))) AS l`;
       const ids = [...new Set(blocks)];
       if (ids.length) {
-        const found = await tx.task.findMany({ where: { id: { in: ids } }, select: { id: true } });
+        const found = await tx.task.findMany({ where: { id: { in: ids } }, select: { id: true, projectId: true } });
         if (found.length !== ids.length) throw new ApprovalError("task-not-found", 404);
+        // A project card blocks only that project's tasks (pre-review finding 8).
+        if (projectId && found.some((t: { projectId: string | null }) => t.projectId !== projectId)) {
+          throw new ApprovalError("task-other-project", 409);
+        }
       }
-      let row = await tx.approval.findFirst({
-        where: { status: "pending", projectId, gate: input.gate, action: input.action, target: input.target },
-        orderBy: { createdAt: "asc" },
-      });
+      // Lock the pending twin before any task row, the same order `decide` uses, and re-check it under the lock: a
+      // concurrent approve that committed first leaves it decided, and then a fresh card is created, so a new
+      // blocker never lands on an already-approved card (pre-review finding 1).
+      const twins: { id: string }[] = await tx.$queryRaw`
+        SELECT id::text AS id FROM approval
+        WHERE status = 'pending' AND project_id IS NOT DISTINCT FROM ${projectId}::uuid AND gate = ${input.gate}::gate
+          AND action = ${input.action} AND target = ${input.target}
+        ORDER BY created_at, id LIMIT 1 FOR UPDATE`;
+      let row = twins.length ? await tx.approval.findFirst({ where: { id: twins[0]!.id, status: "pending" } }) : null;
       const created = !row;
       if (!row) {
         row = await tx.approval.create({
@@ -643,6 +707,12 @@ export class PrismaApprovalStore implements ApprovalStore {
       const c = await tx.approvalComment.create({ data: { approvalId, author, body, createdAt: at } });
       await audit(tx, { action: "approval.comment", summary: "Comment on decision card", details: { approvalId } }, card.projectId ?? null);
       return { id: c.id, approvalId: c.approvalId, author: c.author, body: c.body, createdAt: c.createdAt };
+    });
+  }
+
+  recordAudit(a: AuditEntry) {
+    return this.tx(async (tx) => {
+      await audit(tx, a, null);
     });
   }
 

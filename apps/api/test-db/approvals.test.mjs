@@ -149,6 +149,34 @@ test("AT8 (db): raising the same card twice at once creates one card with both b
   assert.deepEqual((await store.blockedTasks(x.id)).map((t) => t.id).sort(), [t1, t2].sort());
 });
 
+test("AT8b (db): a dedupe raise racing an approve never leaves a task blocked by an approved card", async () => {
+  for (let round = 0; round < 5; round++) {
+    const { projectId, tasks: [t1, t2] } = await fixture(2);
+    const { approvals } = setup();
+    const c = card(projectId);
+    const first = await approvals.raiseCard(c, [t1]);
+    const [, raised] = await Promise.all([approvals.approve(KK, first.id), approvals.raiseCard(c, [t2])]);
+    const blockers = await db.taskBlocker.findMany({ where: { taskId: t2 }, include: { approval: { select: { status: true } } } });
+    assert.equal(blockers.length, 1);
+    if (raised.id === first.id) {
+      // The raise won the card lock: t2 was blocked first and the approve then freed it.
+      assert.equal(await status(t2), "ready");
+    } else {
+      // The approve won: the raise saw the card decided and made a fresh pending card for t2.
+      assert.equal(blockers[0].approval.status, "pending");
+      assert.equal(await status(t2), "blocked");
+    }
+  }
+});
+
+test("pre-review (db): a project card cannot block another project's task", async () => {
+  const { projectId } = await fixture(0);
+  const other = await fixture(1);
+  const { approvals } = setup();
+  await assert.rejects(approvals.raiseCard(card(projectId), [other.tasks[0]]), (e) => e.code === "task-other-project");
+  assert.equal(await status(other.tasks[0]), "ready");
+});
+
 test("AT10 (db): closeMilestone needs an approved, same-project, same-gate approval", async () => {
   const { projectId } = await fixture(0);
   const other = await fixture(0);

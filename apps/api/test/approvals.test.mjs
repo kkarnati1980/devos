@@ -18,9 +18,9 @@ function setup({ notifier = null, rules = [] } = {}) {
   const policyStore = new MemoryPolicyStore({ mode: "enforce", rules });
   const engine = new PolicyEngine({ store: policyStore, hmacKey: KEY, now: () => now, verifyKkSession: kk.verify });
   const store = new MemoryApprovalStore();
-  store.addTask(T1, "deploy preview");
-  store.addTask(T2, "provision repo");
-  store.addTask(T3, "unrelated work");
+  store.addTask(T1, "deploy preview", "ready", PROJECT);
+  store.addTask(T2, "provision repo", "ready", PROJECT);
+  store.addTask(T3, "unrelated work", "ready", PROJECT);
   const approvals = new Approvals({ store, grants: engine, notifier, verifyKkSession: kk.verify, now: () => now });
   return { approvals, store, engine, policyStore, session: kk.mint("kk@example.com"), advance: (ms) => (now += ms) };
 }
@@ -122,6 +122,11 @@ test("AT5 an expired card or grant leaves the task blocked", async () => {
   const late = await engine.decide({ identity: agent, action: { type: "deploy.preview", resource: "repo:other", projectId: PROJECT }, approvalGrantId: grantId });
   assert.equal(late.enforcedOutcome, "require_approval");
   assert.match(late.reason, /grant-expired/);
+  // The refused attempt raises a fresh card and the task waits on it again (contract AT5 wording).
+  const again = await approvals.cardForDecision(late, { action: "deploy.preview", resource: "repo:other", projectId: PROJECT, taskId: T2 });
+  assert.notEqual(again.id, c2.id);
+  assert.equal(again.status, "pending");
+  assert.equal(store.tasks.get(T2).status, "blocked");
 });
 
 test("AT6 only KK decides: agents, copied or unminted sessions are refused and nothing changes", async () => {
@@ -221,4 +226,55 @@ test("AT10 closeMilestone needs an approved, same-project, same-gate approval an
   assert.ok(store.milestones.get(M).closedAt);
   assert.equal(store.audit.at(-1).action, "milestone.closed");
   await assert.rejects(gates.closeMilestone(kkId, M, A_OK), (e) => e.code === "milestone-closed");
+});
+
+test("pre-review: approve enforces option limits itself; a failed loser revoke is audited, not swallowed", async () => {
+  const { approvals, policyStore, session } = setup();
+  const c = await approvals.raiseCard(card(), [T1]);
+  for (const bad of [{ maxUses: 10000 }, { expiresInHours: 0.5 }, { expiresInHours: Number.NaN }, { other: 1 }]) {
+    await assert.rejects(approvals.approve(session, c.id, bad), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  }
+  assert.equal(policyStore.grants.length, 0);
+
+  const s2 = setup();
+  const c2 = await s2.approvals.raiseCard(card(), [T1]);
+  let revokes = 0;
+  const grants = { issueGrant: (sess, scope) => s2.engine.issueGrant(sess, scope), revokeGrant: async () => { revokes++; throw new Error("db blip"); } };
+  const racing = new Approvals({ store: s2.store, grants, notifier: null, verifyKkSession: () => true });
+  await s2.approvals.approve(s2.session, c2.id).catch(() => undefined); // wins first
+  s2.store.cards.get(c2.id).status = "pending"; // the racing call reads it as pending, then loses inside decide
+  const decideOrig = s2.store.decide.bind(s2.store);
+  s2.store.decide = async () => null;
+  await assert.rejects(racing.approve(s2.session, c2.id), (e) => e.code === "approvals-store-error");
+  assert.equal(revokes, 2);
+  assert.equal(s2.store.audit.at(-1).action, "approval.grant_revoke_failed");
+  s2.store.decide = decideOrig;
+});
+
+test("pre-review: the gate comes from the matched rule; purge actions are always gate 5; projects do not mix", async () => {
+  const { approvals, store } = setup();
+  const d = { enforcedOutcome: "require_approval", reason: "r", matchedRuleIds: ["r-approve"] };
+  const plain = await approvals.cardForDecision(d, { action: "deploy.preview", resource: "repo:x", projectId: PROJECT, gate: "first_launch" });
+  assert.equal(plain.gate, "decision"); // a caller-supplied gate is ignored
+  const purge = await approvals.cardForDecision(d, { action: "project.purge", resource: "project:demo", projectId: PROJECT });
+  assert.equal(purge.gate, "purge");
+  const mapped = new Approvals({ store, grants: { issueGrant: async () => ({}), revokeGrant: async () => true }, notifier: null, verifyKkSession: () => false, gateForRules: async (ids) => (ids.includes("r-launch") ? "first_launch" : null) });
+  assert.equal((await mapped.cardForDecision({ ...d, matchedRuleIds: ["r-launch"] }, { action: "app.launch", resource: "app:x", projectId: PROJECT })).gate, "first_launch");
+  const OTHER = "55555555-5555-4555-8555-555555555555";
+  store.addTask(OTHER, "other project task", "ready", "66666666-6666-4666-8666-666666666666");
+  await assert.rejects(approvals.raiseCard(card({ action: "x.y" }), [OTHER]), (e) => e.code === "task-other-project");
+  assert.equal(store.tasks.get(OTHER).status, "ready");
+});
+
+test("pre-review AT11: wildcards, Unicode line breaks, bidi overrides and secret-shaped comments are refused", async () => {
+  assert.equal(parseCard({ ...card(), action: "deploy.*" }), "invalid-input");
+  assert.equal(parseCard({ ...card(), target: "*" }), "invalid-input");
+  assert.equal(parseCard({ ...card(), action: "deploy\u2028preview" }), "invalid-input");
+  assert.equal(parseCard({ ...card(), target: "repo:\u202eppa" }), "invalid-input");
+  assert.equal(parseCard({ ...card(), reason: "a\u0085b" }), "invalid-input");
+  const { approvals, session } = setup();
+  const c = await approvals.raiseCard(card(), [T1]);
+  const secret = `token ${["sk", "live", "abcdef123456"].join("-")}`;
+  await assert.rejects(approvals.comment(session, c.id, secret), (e) => e.code === "card-contains-secret");
+  await assert.rejects(approvals.reject(session, c.id, secret), (e) => e.code === "card-contains-secret");
 });
