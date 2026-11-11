@@ -23,9 +23,14 @@ const OBJECT_HEADER = new RegExp(String.raw`(?<![0-9])(\d{1,10})${WS}(\d{1,5})${
 const STREAM_TERMINATOR = new RegExp(String.raw`(\r\n|\n|\r)?endstream${WS}endobj\b`, "g");
 
 /** Integer-valued indirect objects (`n g obj 123 endobj`, comments allowed between tokens), for indirect /Length. */
-function integerObjects(text: string): Map<number, number> {
-  const ints = new Map<number, number>();
-  for (const m of text.matchAll(INT_OBJECT)) ints.set(Number(m[1]), Number(m[2]));
+function integerCandidates(text: string): Map<number, number[]> {
+  // Raw matches are only candidates (a string such as "(19 0 obj 1 endobj)" also matches); latest first.
+  const ints = new Map<number, number[]>();
+  for (const m of text.matchAll(INT_OBJECT)) {
+    const list = ints.get(Number(m[1])) ?? [];
+    list.unshift(Number(m[2]));
+    ints.set(Number(m[1]), list);
+  }
   return ints;
 }
 
@@ -71,14 +76,15 @@ function scanPlainStreamEnd(text: string, start: number): number {
  * token by token so `endstream` inside a string or comment is skipped; a filtered (binary) stream ends at the first
  * `endstream` that is followed by `endobj`.
  */
-function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints: ReadonlyMap<number, number>): number {
+function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints: ReadonlyMap<number, readonly number[]>): number {
   // The indirect form is tried first, and the direct number must be a whole integer token that is not followed by
   // a generation number and R, so "/Length 19 0 R" can never read as a direct length of 1 (PR30-r10).
   const indirect = /\/Length\s+(\d{1,10})\s+\d{1,5}\s+R(?![A-Za-z0-9])/.exec(dict);
   const direct = indirect ? null : /\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R(?![A-Za-z0-9]))/.exec(dict);
-  const len = direct ? Number(direct[1]) : indirect ? ints.get(Number(indirect[1])) : undefined;
-  if (len !== undefined && start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) {
-    return start + len;
+  const lens = direct ? [Number(direct[1])] : indirect ? ints.get(Number(indirect[1])) ?? [] : [];
+  // A length is used only when `endstream` really follows it (PR30-r13: a decoy candidate never passes this).
+  for (const len of lens) {
+    if (start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) return start + len;
   }
   // An unfiltered (text) stream is scanned token by token, skipping strings and comments, to its real endstream.
   if (!/\/Filter\b/.test(dict)) {
@@ -380,9 +386,14 @@ function stripStrings(s: string): string {
  * Every indirect object, later definitions replacing earlier ones (incremental updates), including objects
  * packed in object streams (/Type /ObjStm).
  */
-function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>, budget: { total: number }): PdfFile {
+function collectObjects(
+  buf: Buffer,
+  limits: IngestLimits,
+  warnings: Set<string>,
+  budget: { total: number },
+  ints: ReadonlyMap<number, readonly number[]>,
+): PdfFile {
   const text = buf.toString("latin1");
-  const ints = integerObjects(text);
   const objs = new Map<number, PdfObject>();
   const trailers: { pos: number; dict: string }[] = [];
   let gapStart = 0;
@@ -501,7 +512,16 @@ function pageContents(file: PdfFile): number[][] | null {
 export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<string>): Block[] {
   const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const budget = { total: 0 };
-  const file = collectObjects(buf, limits, warnings, budget);
+  // Two passes (PR30-r13): the first uses raw integer candidates (each still checked against `endstream`); the
+  // second resolves indirect /Length only from integer objects the structural scan really found, so text inside
+  // strings, comments or stream data can never supply a length.
+  const firstPass = collectObjects(buf, limits, new Set(), { total: 0 }, integerCandidates(buf.toString("latin1")));
+  const structuralInts = new Map<number, number[]>();
+  for (const [num, o] of firstPass.objs) {
+    const m = /^\s*(\d{1,12})\s*$/.exec(o.dict);
+    if (!o.data && m) structuralInts.set(num, [Number(m[1])]);
+  }
+  const file = collectObjects(buf, limits, warnings, budget, structuralInts);
   const objs = file.objs;
   const blocks: Block[] = [];
   const emit = (content: string) => {

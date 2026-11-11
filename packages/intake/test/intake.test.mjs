@@ -664,3 +664,32 @@ test("AT5b inherited property names are never a format or an entity", async () =
   const r = parseSpec(enc("<p>&constructor; &toString; &amp; FR-1</p>"), "e.html");
   assert.equal(r.blocks[0].text, "&constructor; &toString; & FR-1");
 });
+
+// ---------- PR30-r13 ----------
+test("AT4n indirect /Length comes from a real integer object, never from a decoy in a string or comment", () => {
+  const content = "BT (FR-001 before) Tj T* (text: endstream endobj) Tj T* (FR-002 after) Tj ET";
+  const data = deflateSync(Buffer.from(content, "latin1"), { level: 0 });
+  // A decoy length that lands exactly on the "endstream" inside the stored bytes (it would pass the endstream check).
+  const tricky = data.indexOf(Buffer.from("endstream"));
+  const build = (decoys) =>
+    Buffer.concat([
+      Buffer.from(
+        "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" +
+          "2 0 obj\n<< /Type /Pages /Kids [3 0 R] >>\nendobj\n" +
+          "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" +
+          "4 0 obj\n<< /Length 19 0 R /Filter /FlateDecode >>\nstream\n",
+        "latin1",
+      ),
+      data,
+      Buffer.from(`\nendstream\nendobj\n19 0 obj\n${data.length}\nendobj\n${decoys}trailer\n<< /Root 1 0 R >>\n%%EOF\n`, "latin1"),
+    ]);
+  for (const decoys of [
+    "5 0 obj\n<< /Note (19 0 obj 1 endobj) >>\nendobj\n",
+    `5 0 obj\n<< /Note (19 0 obj ${tricky} endobj) >>\nendobj\n`,
+    `% 19 0 obj ${tricky} endobj\n`,
+  ]) {
+    const r = parseSpec(build(decoys), "decoy.pdf");
+    assert.deepEqual(ids(r), ["FR-001", "FR-002"], decoys);
+    assert.ok(!r.warnings.includes("pdf-stream-damaged"), decoys);
+  }
+});
