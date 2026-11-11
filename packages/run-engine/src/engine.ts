@@ -54,7 +54,12 @@ export interface RunOutcome {
   cardId?: string;
 }
 
-class Timeout extends Error {}
+class Timeout extends Error {
+  /** True when the run's max_seconds deadline, not the call's own timeout, set this wait's cap (DEVOS-88). */
+  constructor(label: string, readonly deadlineCap = false) {
+    super(label);
+  }
+}
 
 /** The recorded outcome of an attempt and how far its bookkeeping got (checkpointed per step). */
 interface Ending {
@@ -102,14 +107,23 @@ function failClosedUsd(result: { costUsd: number; costEstimated: boolean } | nul
   return usd;
 }
 
-function within<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+function within<T>(p: Promise<T>, ms: number, label: string, deadlineCap = false): Promise<T> {
   let t: NodeJS.Timeout;
   return Promise.race([
     p.finally(() => clearTimeout(t)),
     new Promise<T>((_, reject) => {
-      t = setTimeout(() => reject(new Timeout(label)), ms);
+      t = setTimeout(() => reject(new Timeout(label, deadlineCap)), ms);
     }),
   ]);
+}
+
+/**
+ * Wait at most `ownMs` and at most `leftMs` (time to the max_seconds deadline). Which cap fired is decided
+ * when the wait is set up, not by re-reading the clock afterwards: a timer can fire a little before
+ * `now()` reaches the deadline, and that must still count as max_seconds (DEVOS-88).
+ */
+function withinDeadline<T>(p: Promise<T>, ownMs: number, leftMs: number, label: string): Promise<T> {
+  return within(p, Math.min(ownMs, leftMs), label, leftMs <= ownMs);
 }
 
 export class RunEngine {
@@ -260,7 +274,7 @@ export class RunEngine {
       await emit("status", { state: cp ? "resumed" : "started", fromTurn: state.turn, adapter: adapter.name });
       // Every wait is bounded by the run's max_seconds deadline as well as its own timeout.
       const left = () => Math.max(1, deadline - this.now());
-      await within(adapter.start(task, envelope), Math.min(this.opts.startTimeoutMs ?? 30_000, left()), "start");
+      await withinDeadline(adapter.start(task, envelope), this.opts.startTimeoutMs ?? 30_000, left(), "start");
 
       const it = adapter.events()[Symbol.asyncIterator]();
       for (;;) {
@@ -305,9 +319,9 @@ export class RunEngine {
           await adapter.cancel(run.id);
         }
       }
-      result = await within(adapter.result(), limit ? (this.opts.resultTimeoutMs ?? 15_000) : Math.min(this.opts.resultTimeoutMs ?? 15_000, left()), "result").catch(
+      result = await (limit ? within(adapter.result(), this.opts.resultTimeoutMs ?? 15_000, "result") : withinDeadline(adapter.result(), this.opts.resultTimeoutMs ?? 15_000, left(), "result")).catch(
         async (e) => {
-          if (!(e instanceof Timeout) || limit || this.now() < deadline) throw e;
+          if (!(e instanceof Timeout) || limit || !(e.deadlineCap || this.now() >= deadline)) throw e;
           limit = "timeout"; // max_seconds ran out while waiting for the result
           slot.reason = "limit";
           await adapter.cancel(run.id);
@@ -320,7 +334,7 @@ export class RunEngine {
       }
     } catch (e) {
       streamError = e instanceof RunFailure ? { type: e.type, message: e.message } : e instanceof Timeout ? { type: "timeout", message: `adapter-${e.message}-timeout` } : { type: "internal", message: "engine-error" };
-      if (e instanceof Timeout && this.now() >= deadline && !limit) {
+      if (e instanceof Timeout && (e.deadlineCap || this.now() >= deadline) && !limit) {
         limit = "timeout"; // the run's max_seconds, not just an adapter call, ran out
         slot.reason = "limit";
       }
