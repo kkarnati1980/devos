@@ -10,13 +10,26 @@ export function cleanText(s: string): string {
   return s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").replace(/[ \t\r\n ]+/g, " ").trim();
 }
 
-/** Escape the three HTML-significant characters so spec text can never become markup. */
-export function escapeInert(s: string): string {
+/** Escape the three HTML-significant characters so spec text can never become HTML. */
+export function escapeHtmlChars(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/**
+ * Make spec text inert as Markdown and as HTML (PR30-r1): HTML characters become entities, and every character
+ * that can open a Markdown construct (links, images, reference definitions, footnotes, emphasis, code spans,
+ * strikethrough, tables, math, heading/list/quote/thematic-break markers at the start) is backslash-escaped.
+ * CommonMark renders an escaped character as itself, so the reader sees the original text.
+ */
+export function escapeInert(s: string): string {
+  let out = escapeHtmlChars(s).replace(/[\\`*_[\]()!|~{}$^]/g, (c) => `\\${c}`);
+  // Block markers only matter at the start of a line.
+  out = out.replace(/^(\s*)([#+\-=:])/, "$1\\$2").replace(/^(\s*\d+)([.)])/, "$1\\$2");
+  return out;
+}
+
 function cell(s: string): string {
-  return escapeInert(s).replace(/\|/g, "\\|").replace(/\n/g, " ");
+  return escapeInert(s).replace(/\n/g, " ");
 }
 
 /** Render blocks as inert Markdown. */
@@ -45,8 +58,10 @@ export function renderMarkdown(blocks: readonly Block[]): string {
         break;
       }
       case "code": {
-        const fence = b.text.includes("```") ? "~~~~" : "```";
-        out.push(`${fence}\n${escapeInert(b.text)}\n${fence}`);
+        // Code is literal inside a fence; the fence is longer than any backtick run so the text cannot close it.
+        const longest = Math.max(0, ...(b.text.match(/`+/g) ?? []).map((r) => r.length));
+        const fence = "`".repeat(Math.max(3, longest + 1));
+        out.push(`${fence}\n${escapeHtmlChars(b.text)}\n${fence}`);
         break;
       }
     }

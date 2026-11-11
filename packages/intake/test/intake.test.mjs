@@ -148,7 +148,7 @@ test("AT2 HTML with a script is stored inert", () => {
   for (const bad of ["<script", "<SCRIPT", "onclick", "onerror", "onload", "javascript:", "steal()", "alert(1)", "alert(3)", "alert(4)", "alert(5)", "<img", "<a "]) {
     assert.ok(!r.text.includes(bad), `output contains ${bad}`);
   }
-  assert.ok(r.text.includes("&lt;script&gt;alert(2)&lt;/script&gt;"), "literal text is escaped, not markup");
+  assert.ok(r.text.includes("&lt;script&gt;alert\\(2\\)&lt;/script&gt;"), "literal text is escaped, not markup");
   assert.deepEqual(r.blocks[0], { type: "heading", level: 1, text: "Spec" });
   assert.deepEqual(r.blocks[1], { type: "heading", level: 2, text: "FR-001 Login" });
   assert.deepEqual(r.blocks.find((b) => b.type === "table").rows, [["ID", "Req"], ["FR-002", "Export"], ["NFR-2.1", "Up"]]);
@@ -278,6 +278,11 @@ test("AT8 ingest parses in a worker; timeout terminates it", async () => {
 test("AT9 requirement ID rules, and the same IDs from all four formats", () => {
   const found = extractRequirementIds("FR-001, NFR-2.1; FR12 and REQ-7. Also FR-001 again (FR-3.10).").map((x) => x.id);
   assert.deepEqual(found, ["FR-001", "NFR-2.1", "FR12", "REQ-7", "FR-3.10"]);
+  // PR30-r1: no digit-count limit; a long dotted run is matched without backtracking blow-up.
+  assert.deepEqual(extractRequirementIds("FR-123456 and NFR-1.12345.").map((x) => x.id), ["FR-123456", "NFR-1.12345"]);
+  const t0 = Date.now();
+  assert.deepEqual(extractRequirementIds("FR-" + "1.".repeat(20000) + "1a").length, 0);
+  assert.ok(Date.now() - t0 < 2000, "no catastrophic backtracking");
   assert.equal(extractRequirementIds("FR-001 FR-001").find((x) => x.id === "FR-001").count, 2);
   for (const not of ["SHA-256", "UTF-8", "ISO-8601", "XFR-1", "FRX-1", "fr-1", "FR-", "FR-1a", "v.FR-1", "AFR12"]) {
     assert.deepEqual(extractRequirementIds(not), [], not);
@@ -312,4 +317,75 @@ test("AT10 specRow and error hygiene", () => {
       assert.ok(!String(e.stack ?? "").includes("TOPSECRET"));
     }
   }
+});
+
+// ---------- PR30-r1: Markdown-inert output ----------
+test("AT2b output is inert as Markdown: no image, link, reference or emphasis can form", () => {
+  const html = `<p>![tracking](https://example.com/pixel)</p><p>[click](javascript:alert%281%29)</p>
+  <p>[ref]: https://evil.example</p><p>**bold** _em_ ~~s~~ \`code\` $x$ [^1]</p><p># not a heading</p><p>- not a list</p><p>1. not a list</p>
+  <pre>\`\`\`\nbreak out?\n\`\`\`\n![x](y)</pre>`;
+  const r = parseSpec(enc(html), "s.html");
+  for (const bad of ["![tracking](", "[click](", "\n[ref]:", "**bold**", "_em_", "~~s~~", "`code`", "$x$", "[^1]", "\n# not", "\n- not", "\n1. not"]) {
+    assert.ok(!r.text.includes(bad), `Markdown construct survives: ${JSON.stringify(bad)}`);
+  }
+  assert.ok(r.text.includes("\\!\\[tracking\\]\\(https://example.com/pixel\\)"));
+  // The code block cannot be closed from inside: its fence is longer than any backtick run in it.
+  const code = r.blocks.find((b) => b.type === "code");
+  assert.ok(code && code.text.includes("![x](y)"));
+  assert.ok(r.text.includes("````\n```"), "fence longer than the content's backtick runs");
+  // Plain blocks keep their text (only the rendered Markdown is escaped).
+  assert.equal(r.blocks[0].text, "![tracking](https://example.com/pixel)");
+});
+
+// ---------- PR30-r1: PDF page order from the page tree ----------
+function pdfObjects(objs, rootNum) {
+  let out = Buffer.from("%PDF-1.7\n", "latin1");
+  for (const [num, body] of objs) {
+    const part = typeof body === "string" ? `${num} 0 obj\n${body}\nendobj\n` : null;
+    if (part) out = Buffer.concat([out, Buffer.from(part, "latin1")]);
+    else {
+      const data = deflateSync(Buffer.from(body.stream, "latin1"));
+      out = Buffer.concat([out, Buffer.from(`${num} 0 obj\n<< ${body.dict ?? ""} /Length ${data.length} /Filter /FlateDecode >>\nstream\n`, "latin1"), data, Buffer.from("\nendstream\nendobj\n", "latin1")]);
+    }
+  }
+  return Buffer.concat([out, Buffer.from(`trailer\n<< /Root ${rootNum} 0 R >>\n%%EOF\n`, "latin1")]);
+}
+
+test("AT4b pdf follows the page tree: physical order and unused or obsolete streams do not matter", () => {
+  const doc = pdfObjects(
+    [
+      [9, { stream: "BT (FR-002 page two) Tj ET" }], // page 2's content first in the file
+      [8, { stream: "BT (FR-999 obsolete) Tj ET" }], // referenced by nothing
+      [7, { stream: "BT (FR-001 page one) Tj ET" }],
+      [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"],
+      [3, "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>"],
+      [4, "<< /Type /Page /Parent 2 0 R /Contents [9 0 R] >>"],
+    ],
+    1,
+  );
+  const r = parseSpec(doc, "tree.pdf");
+  assert.deepEqual(r.blocks.map((b) => b.text), ["FR-001 page one", "FR-002 page two"]);
+  assert.deepEqual(ids(r), ["FR-001", "FR-002"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+
+  // Incremental update: object 7 redefined later; the newer text wins.
+  const updated = Buffer.concat([doc, pdfObjects([[7, { stream: "BT (FR-001 revised) Tj ET" }]], 1).subarray(9)]);
+  assert.deepEqual(parseSpec(updated, "upd.pdf").blocks.map((b) => b.text), ["FR-001 revised", "FR-002 page two"]);
+
+  // Page dictionaries inside an object stream (/Type /ObjStm).
+  const packed = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>"];
+  let off = 0;
+  const head = [];
+  for (const [i, body] of packed.entries()) {
+    head.push(`${i + 1} ${off}`);
+    off += body.length + 1;
+  }
+  const headStr = head.join(" ") + " ";
+  const objStm = { dict: `/Type /ObjStm /N 3 /First ${headStr.length}`, stream: headStr + packed.join("\n") + "\n" };
+  const viaObjStm = pdfObjects([[7, { stream: "BT (FR-005 packed) Tj ET" }], [10, objStm]], 1);
+  assert.deepEqual(ids(parseSpec(viaObjStm, "objstm.pdf")), ["FR-005"]);
+
+  // Without a resolvable page tree, file order is used and the result says so.
+  assert.ok(parseSpec(pdf(["BT (FR-1) Tj ET"]), "flat.pdf").warnings.includes("pdf-page-order-unknown"));
 });

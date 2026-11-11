@@ -9,9 +9,10 @@ export interface RequirementId {
 
 function buildPattern(prefixes: readonly string[]): RegExp {
   for (const p of prefixes) if (!/^[A-Z][A-Z0-9]{0,9}$/.test(p)) throw new TypeError("requirement ID prefixes must be 1-10 upper-case letters/digits");
-  // Longest first so NFR wins over FR; word boundary on both sides; no letter/digit/hyphen/dot before.
+  // Longest first so NFR wins over FR; no letter/digit/hyphen/dot before. Any number of digits per part; the
+  // number is matched atomically ((?=(…))\1) so a long dotted run cannot cause backtracking.
   const alt = [...prefixes].sort((a, b) => b.length - a.length).join("|");
-  return new RegExp(`(?<![A-Za-z0-9_.\\-])(?:${alt})(?:-(?=\\d))?\\d{1,5}(?:\\.\\d{1,4})*(?![A-Za-z0-9_]|\\.\\d)`, "g");
+  return new RegExp(`(?<![A-Za-z0-9_.\\-])(?:${alt})(?:-(?=\\d))?(?=(\\d+(?:\\.\\d+)*))\\1(?![A-Za-z0-9_]|\\.\\d)`, "g");
 }
 
 /** Unique requirement IDs in first-seen order, with how often each occurs. */

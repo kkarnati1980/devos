@@ -214,34 +214,156 @@ function textFromContent(content: string, warnings: Set<string>): string[] {
   return lines;
 }
 
+interface PdfObject {
+  dict: string;
+  data?: Uint8Array;
+}
+
+/** Inflate one stream under the limits; undefined (with a warning) when its filter is unsupported or it is damaged. */
+function decodeStream(dict: string, raw: Uint8Array, limits: IngestLimits, warnings: Set<string>, budget: { total: number }): Uint8Array | undefined {
+  const filterM = /\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/.exec(dict);
+  const filters = filterM ? (filterM[1] ?? "").match(/\/[A-Za-z0-9]+/g) ?? [] : [];
+  if (filters.length > 1 || (filters.length === 1 && filters[0] !== "/FlateDecode")) {
+    warnings.add("pdf-filter-unsupported");
+    return undefined;
+  }
+  let data = raw;
+  if (filters[0] === "/FlateDecode") {
+    try {
+      data = inflateSync(raw, { maxOutputLength: limits.maxPdfStreamBytes });
+    } catch (err) {
+      if ((err as { code?: string }).code === "ERR_BUFFER_TOO_LARGE") throw new IngestError("pdf-invalid");
+      warnings.add("pdf-stream-damaged");
+      return undefined;
+    }
+  }
+  budget.total += data.byteLength;
+  if (budget.total > limits.maxPdfTotalBytes) throw new IngestError("pdf-invalid");
+  return data;
+}
+
+/**
+ * Every indirect object, later definitions replacing earlier ones (incremental updates), including objects
+ * packed in object streams (/Type /ObjStm).
+ */
+function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>, budget: { total: number }): Map<number, PdfObject> {
+  const text = buf.toString("latin1");
+  const objs = new Map<number, PdfObject>();
+  const re = /(?<![0-9])(\d{1,10})\s+(\d{1,5})\s+obj\b/g;
+  let m: RegExpExecArray | null;
+  let count = 0;
+  while ((m = re.exec(text))) {
+    if (++count > limits.maxPdfStreams * 4) throw new IngestError("pdf-invalid");
+    const num = Number(m[1]);
+    const bodyStart = m.index + m[0].length;
+    const streamM = /\bstream(\r\n|\n|\r)/.exec(text.slice(bodyStart, bodyStart + 1_000_000));
+    const endObj = text.indexOf("endobj", bodyStart);
+    if (streamM && (endObj < 0 || bodyStart + streamM.index < endObj)) {
+      const dict = text.slice(bodyStart, bodyStart + streamM.index);
+      const start = bodyStart + streamM.index + streamM[0].length;
+      let end = -1;
+      const lenM = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict);
+      if (lenM) {
+        const len = Number(lenM[1]);
+        if (start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) end = start + len;
+      }
+      if (end < 0) {
+        end = text.indexOf("endstream", start);
+        if (end < 0) break;
+        while (end > start && (text[end - 1] === "\n" || text[end - 1] === "\r")) end--;
+      }
+      const data = buf.subarray(start, end);
+      objs.set(num, { dict, data });
+      re.lastIndex = end;
+      if (/\/Type\s*\/ObjStm\b/.test(dict)) {
+        const dec = decodeStream(dict, data, limits, warnings, budget);
+        if (dec) {
+          const s = latin1(dec);
+          const n = Number(/\/N\s+(\d+)/.exec(dict)?.[1] ?? 0);
+          const first = Number(/\/First\s+(\d+)/.exec(dict)?.[1] ?? 0);
+          const head = s.slice(0, first).trim().split(/\s+/).map(Number);
+          for (let k = 0; k < Math.min(n, head.length / 2); k++) {
+            const on = head[2 * k] ?? NaN;
+            const off = head[2 * k + 1] ?? NaN;
+            const next = k + 1 < n ? (head[2 * k + 3] ?? s.length - first) : s.length - first;
+            if (Number.isFinite(on) && Number.isFinite(off)) objs.set(on, { dict: s.slice(first + off, first + next) });
+          }
+        }
+      }
+    } else {
+      objs.set(num, { dict: text.slice(bodyStart, endObj < 0 ? text.length : endObj) });
+      if (endObj >= 0) re.lastIndex = endObj;
+    }
+  }
+  return objs;
+}
+
+function refs(s: string): number[] {
+  return [...s.matchAll(/(\d{1,10})\s+\d{1,5}\s+R\b/g)].map((x) => Number(x[1]));
+}
+
+/** The page tree's content-stream object numbers, page by page, or null when the tree cannot be resolved. */
+function pageContents(text: string, objs: Map<number, PdfObject>): number[][] | null {
+  const roots = [...text.matchAll(/\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/g)];
+  const rootNum = roots.length ? Number(roots[roots.length - 1]?.[1]) : NaN;
+  const catalog = objs.get(rootNum)?.dict;
+  const pagesRef = catalog ? /\/Pages\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(catalog) : null;
+  if (!pagesRef) return null;
+  const pages: number[][] = [];
+  const seen = new Set<number>();
+  const walk = (num: number, depth: number): boolean => {
+    if (depth > 64 || seen.has(num)) return false;
+    seen.add(num);
+    const d = objs.get(num)?.dict;
+    if (d === undefined) return false;
+    const kids = /\/Kids\s*\[([^\]]*)\]/.exec(d);
+    if (kids) {
+      for (const k of refs(kids[1] ?? "")) if (!walk(k, depth + 1)) return false;
+      return true;
+    }
+    const c = /\/Contents\s*(\[[^\]]*\]|\d{1,10}\s+\d{1,5}\s+R\b)/.exec(d);
+    let list = c ? refs(c[1] ?? "") : [];
+    // /Contents may point to an indirect array of streams.
+    if (list.length === 1 && objs.get(list[0] as number) && !objs.get(list[0] as number)?.data) {
+      list = refs(objs.get(list[0] as number)?.dict ?? "");
+    }
+    pages.push(list);
+    return true;
+  };
+  if (!walk(Number(pagesRef[1]), 0) || pages.length === 0) return null;
+  return pages;
+}
+
 export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<string>): Block[] {
   const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const streams = findStreams(buf, limits);
-  let total = 0;
+  const budget = { total: 0 };
+  const objs = collectObjects(buf, limits, warnings, budget);
   const blocks: Block[] = [];
-  for (const st of streams) {
-    const filterM = /\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/.exec(st.dict);
-    const filters = filterM ? (filterM[1] ?? "").match(/\/[A-Za-z0-9]+/g) ?? [] : [];
-    if (/\/(Type\s*\/XObject|Subtype\s*\/Image|Type\s*\/XRef|Type\s*\/ObjStm|Subtype\s*\/Type1C|Length1|Length2)/.test(st.dict)) continue;
-    let data: Uint8Array = st.data;
-    if (filters.length > 1 || (filters.length === 1 && filters[0] !== "/FlateDecode")) {
-      warnings.add("pdf-filter-unsupported");
-      continue;
-    }
-    if (filters[0] === "/FlateDecode") {
-      try {
-        data = inflateSync(st.data, { maxOutputLength: limits.maxPdfStreamBytes });
-      } catch (err) {
-        if ((err as { code?: string }).code === "ERR_BUFFER_TOO_LARGE") throw new IngestError("pdf-invalid");
-        warnings.add("pdf-stream-damaged");
-        continue;
-      }
-    }
-    total += data.byteLength;
-    if (total > limits.maxPdfTotalBytes) throw new IngestError("pdf-invalid");
-    const content = latin1(data);
-    if (!/\bBT\b/.test(content) || /begincmap/.test(content)) continue;
+  const emit = (content: string) => {
+    if (!/\bBT\b/.test(content) || /begincmap/.test(content)) return;
     for (const line of textFromContent(content, warnings)) blocks.push({ type: "paragraph", text: line });
+  };
+  const pages = pageContents(buf.toString("latin1"), objs);
+  if (pages) {
+    // Page order from the page tree; only streams a page references (obsolete or unused streams are ignored).
+    for (const list of pages) {
+      const parts: string[] = [];
+      for (const num of list) {
+        const o = objs.get(num);
+        if (!o?.data) continue;
+        const dec = decodeStream(o.dict, o.data, limits, warnings, budget);
+        if (dec) parts.push(latin1(dec));
+      }
+      emit(parts.join("\n"));
+    }
+  } else {
+    // No resolvable page tree: fall back to file order and say so.
+    warnings.add("pdf-page-order-unknown");
+    for (const st of findStreams(buf, limits)) {
+      if (/\/(Type\s*\/XObject|Subtype\s*\/Image|Type\s*\/XRef|Type\s*\/ObjStm|Subtype\s*\/Type1C|Length1|Length2)/.test(st.dict)) continue;
+      const dec = decodeStream(st.dict, st.data, limits, warnings, budget);
+      if (dec) emit(latin1(dec));
+    }
   }
   if (!blocks.length) throw new IngestError("pdf-no-text");
   return blocks;
