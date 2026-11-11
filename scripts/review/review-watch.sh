@@ -5,6 +5,7 @@
 # a completed tick sets the commit status `codex-review-watch` = success on the head of main, with the time, the
 # open-PR count and how many wait for green CI. A heartbeat older than 2 hours means the watcher is down, which the
 # runners can see without server access. A failed heartbeat post never fails the tick; --dry-run posts nothing.
+# Every GitHub call now has a timeout (ADR-0011: connect 10 s, total GH_TIMEOUT, default 30 s).
 # v1.1.2 (Codex PR9-r4): a stored manual verdict records its PR number before publishing, so the drain can
 # complete it after the PR moves on.
 # v1.1.1 (Codex PR9-r3): pending publications are drained for every stored SHA, including ones a PR has
@@ -54,7 +55,7 @@ TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
 ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^GITHUB_REVIEW_TOKEN=//p' "$ENVF" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
 gh_api() {  # method path [json-body-file] -> body on stdout; non-2xx is an error
   local method="$1" path="$2" body="${3:-}" code
-  local args=(-sS -o "$TMP/resp" -w '%{http_code}' -X "$method" -H @"$TMP/auth"
+  local args=(-sS --connect-timeout 10 --max-time "${GH_TIMEOUT:-30}" -o "$TMP/resp" -w '%{http_code}' -X "$method" -H @"$TMP/auth"
               -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
   [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data-binary @"$body")
   code="$(curl "${args[@]}" "$API$path")" || { log "curl failed: $method $path"; return 1; }
@@ -137,6 +138,7 @@ verdict_msg() {  # sha label contract -> writes <sha>.msg and <sha>.state from t
 }
 
 waiting=0           # PRs whose CI is not green yet (heartbeat)
+unreadable=0        # PRs whose workflow runs could not be read (heartbeat)
 reviewed=0          # reviews run this tick (max 1: runner limit 900 s < service limit 1200 s)
 declare -A tried=() # SHAs whose publication was attempted this tick
 prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
@@ -179,7 +181,7 @@ for i in $(seq 0 $((count - 1))); do
     continue
   fi
   set +e; ci_green "$sha"; ci=$?; set -e
-  if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; continue; fi
+  if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; unreadable=$((unreadable + 1)); continue; fi
   if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; waiting=$((waiting + 1)); continue; fi
 
   round=1
@@ -240,14 +242,17 @@ heartbeat() {
   now="$(date -u +%s)"
   last="$(cat "$STATE/heartbeat.last" 2>/dev/null || echo 0)"
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( last <= now )) || last=0   # a clock step back or a bad value never silences the heartbeat
   (( now - last >= every )) || return 0
   if [[ $DRY -eq 1 ]]; then log "WOULD post heartbeat"; return 0; fi
   main="$(gh_api GET "/repos/$REPO/commits/main" | jq -r '.sha // empty')" || { log "heartbeat: cannot read main"; return 1; }
   [[ "$main" =~ ^[0-9a-f]{40}$ ]] || { log "heartbeat: bad main sha"; return 1; }
-  jq -n --arg d "alive at $(date -u +%FT%TZ), $count open PRs, $waiting waiting for green CI" \
+  local d; d="alive at $(date -u +%FT%TZ), $count open PRs, $waiting waiting for green CI"
+  (( unreadable == 0 )) || d="$d, $unreadable CI unreadable (token)"
+  jq -n --arg d "$d" \
     '{state: "success", context: "codex-review-watch", description: $d}' > "$TMP/heartbeat.json"
   gh_api POST "/repos/$REPO/statuses/$main" "$TMP/heartbeat.json" >/dev/null || { log "heartbeat: post failed; will retry"; return 1; }
-  echo "$now" > "$STATE/heartbeat.last"
+  echo "$now" > "$STATE/heartbeat.last" || { log "heartbeat: cannot write state"; return 1; }
   log "heartbeat posted on main ${main:0:7}"
 }
 heartbeat || true

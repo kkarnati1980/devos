@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, prs: [] });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [] });
 
 before(async () => {
   reset();
@@ -28,6 +28,7 @@ before(async () => {
       if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { message: "bad credentials" });
       const p = url.pathname;
       if (p === "/repos/kkarnati1980/devos/pulls") return send(200, M.prs);
+      if (p === "/repos/kkarnati1980/devos/commits/main" && M.hangMain) return; // never answers
       if (p === "/repos/kkarnati1980/devos/commits/main") return M.failMain ? send(502, {}) : send(200, { sha: MAIN });
       if (p === "/repos/kkarnati1980/devos/actions/runs") return send(200, { workflow_runs: [{ workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
       const st = p.match(/^\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/);
@@ -54,7 +55,8 @@ function tick(args = [], env = {}) {
   });
 }
 const beats = () => M.statuses.filter((s) => s.context === "codex-review-watch");
-const clear = () => fs.rmSync(path.join(dir, "watch", "heartbeat.last"), { force: true });
+const LAST = () => path.join(dir, "watch", "heartbeat.last");
+const clear = () => fs.rmSync(LAST(), { force: true });
 
 test("HB1 a tick posts one heartbeat on main with counts; the next tick within the interval posts none", async () => {
   reset(); clear();
@@ -65,12 +67,17 @@ test("HB1 a tick posts one heartbeat on main with counts; the next tick within t
   assert.equal(beats()[0].sha, MAIN);
   assert.equal(beats()[0].state, "success");
   assert.match(beats()[0].description, /^alive at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ, 1 open PRs, 1 waiting for green CI$/);
+  assert.ok(!r1.out.includes(TOKEN));
   const r2 = await tick();
   assert.equal(r2.code, 0, r2.out);
   assert.equal(beats().length, 1, "no second heartbeat inside the interval");
-  const r3 = await tick([], { HEARTBEAT_SECONDS: "0" });
+  fs.writeFileSync(LAST(), String(Math.floor(Date.now() / 1000) - 3601));
+  const r3 = await tick();
   assert.equal(r3.code, 0);
-  assert.equal(beats().length, 2, "a new heartbeat once the interval has passed");
+  assert.equal(beats().length, 2, "a new heartbeat once the default interval has passed");
+  fs.writeFileSync(LAST(), "9999999999");
+  await tick();
+  assert.equal(beats().length, 3, "a future timestamp never silences the heartbeat");
 });
 
 test("HB2 a failed heartbeat never fails the tick and is retried on the next one", async () => {
@@ -79,11 +86,20 @@ test("HB2 a failed heartbeat never fails the tick and is retried on the next one
   const r1 = await tick();
   assert.equal(r1.code, 0, r1.out);
   assert.match(r1.out, /heartbeat: post failed; will retry/);
+  assert.equal(fs.existsSync(LAST()), false);
+  assert.ok(!r1.out.includes(TOKEN));
   M.failStatus = false; M.failMain = true;
   const r2 = await tick();
   assert.equal(r2.code, 0, r2.out);
   assert.match(r2.out, /heartbeat: cannot read main/);
-  M.failMain = false;
+  assert.equal(fs.existsSync(LAST()), false);
+  M.failMain = false; M.hangMain = true;
+  const t0 = Date.now();
+  const r3 = await tick([], { GH_TIMEOUT: "2" });
+  assert.equal(r3.code, 0, r3.out);
+  assert.ok(Date.now() - t0 < 15000, "a GitHub call that never answers is cut off");
+  assert.match(r3.out, /heartbeat: cannot read main/);
+  M.hangMain = false;
   await tick();
   assert.equal(beats().length, 1);
 });
