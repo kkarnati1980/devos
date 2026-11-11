@@ -13,7 +13,7 @@ permissions:
 jobs:
   dashboard-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30  # DEVOS-98: room for the bounded package-install retry
     env:
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
