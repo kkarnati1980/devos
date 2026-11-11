@@ -28,6 +28,18 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Install Chromium (version pinned by the playwright devDependency)
-        run: pnpm --filter @devos/dashboard exec playwright install --with-deps chromium
+        timeout-minutes: 5
+        run: pnpm --filter @devos/dashboard exec playwright install chromium
+      # DEVOS-98: the runner's apt mirrors intermittently fail DNS ("Temporary failure resolving").
+      # apt-get install is idempotent, so the system packages are retried: 4 tries, 30/60/90 s apart.
+      - name: Install Chromium system packages (bounded retry)
+        timeout-minutes: 12
+        run: |
+          for i in 1 2 3 4; do
+            if pnpm --filter @devos/dashboard exec playwright install-deps chromium; then exit 0; fi
+            if [ "$i" -lt 4 ]; then echo "::warning::install-deps try $i failed; retrying in $((i * 30)) s"; sleep $((i * 30)); fi
+          done
+          echo "::error::install-deps failed after 4 tries"
+          exit 1
       - name: Browser acceptance tests
         run: pnpm --filter @devos/dashboard run test:e2e
