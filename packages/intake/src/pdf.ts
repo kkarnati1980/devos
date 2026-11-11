@@ -346,7 +346,8 @@ export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<
   const objs = collectObjects(buf, limits, warnings, budget);
   const blocks: Block[] = [];
   const emit = (content: string) => {
-    if (!/\bBT\b/.test(content) || /begincmap/.test(content)) return;
+    // No substring tests on text (PR30-r4): a page without a BT operator simply yields no lines.
+    if (!/\bBT\b/.test(content)) return;
     for (const line of textFromContent(content, warnings)) blocks.push({ type: "paragraph", text: line });
   };
   const pages = pageContents(buf.toString("latin1"), objs);
@@ -368,7 +369,12 @@ export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<
     for (const st of findStreams(buf, limits)) {
       if (/\/(Type\s*\/XObject|Subtype\s*\/Image|Type\s*\/XRef|Type\s*\/ObjStm|Subtype\s*\/Type1C|Length1|Length2)/.test(st.dict)) continue;
       const dec = decodeStream(st.dict, st.data, limits, warnings, budget);
-      if (dec) emit(latin1(dec));
+      if (!dec) continue;
+      const content = latin1(dec);
+      // A CMap program (ToUnicode / embedded CMap) is identified structurally: its dictionary says /Type /CMap
+      // or the program starts with the /CIDInit procset — never by searching page text.
+      if (/\/Type\s*\/CMap\b/.test(st.dict) || /^\s*(%[^\n]*\n\s*)*\/CIDInit\s*\/ProcSet\s+findresource\b/.test(content)) continue;
+      emit(content);
     }
   }
   if (!blocks.length) throw new IngestError("pdf-no-text");

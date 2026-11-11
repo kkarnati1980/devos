@@ -50,7 +50,8 @@ export function renderMarkdown(blocks: readonly Block[]): string {
       }
       case "table": {
         if (b.rows.length === 0) break;
-        const width = Math.max(...b.rows.map((r) => r.length), 1);
+        let width = 1; // computed iteratively: no argument spread over unbounded input (PR30-r4)
+        for (const r of b.rows) if (r.length > width) width = r.length;
         const pad = (r: string[]) => Array.from({ length: width }, (_, i) => cell(r[i] ?? ""));
         const lines = [`| ${pad(b.rows[0] ?? []).join(" | ")} |`, `|${" --- |".repeat(width)}`];
         for (const r of b.rows.slice(1)) lines.push(`| ${pad(r).join(" | ")} |`);
@@ -59,7 +60,8 @@ export function renderMarkdown(blocks: readonly Block[]): string {
       }
       case "code": {
         // Code is literal inside a fence; the fence is longer than any backtick run so the text cannot close it.
-        const longest = Math.max(0, ...(b.text.match(/`+/g) ?? []).map((r) => r.length));
+        let longest = 0;
+        for (const m of b.text.matchAll(/`+/g)) if (m[0].length > longest) longest = m[0].length;
         const fence = "`".repeat(Math.max(3, longest + 1));
         out.push(`${fence}\n${escapeHtmlChars(b.text)}\n${fence}`);
         break;

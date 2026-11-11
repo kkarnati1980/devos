@@ -456,3 +456,30 @@ test("AT4c pdf: an indirect /Kids array resolves; an unknown leaf falls back to 
   assert.deepEqual(ids(o), ["FR-002"]);
   assert.ok(o.warnings.includes("pdf-page-order-unknown"));
 });
+
+// ---------- PR30-r4 ----------
+test("AT4d a page whose text mentions begincmap is kept; a real CMap stream is skipped in file order", () => {
+  const doc = pdfObjects(
+    [
+      [7, { stream: "BT (FR-001 Document the begincmap operator) Tj ET" }],
+      [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Kids [3 0 R] >>"],
+      [3, "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>"],
+    ],
+    1,
+  );
+  assert.deepEqual(ids(parseSpec(doc, "word.pdf")), ["FR-001"]);
+  const cmap = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap 1 beginbfchar <01> <0046> endbfchar endcmap end end BT (FR-998) Tj ET";
+  const flat = parseSpec(pdf(["BT (FR-002 begincmap in text) Tj ET", cmap]), "flat.pdf");
+  assert.deepEqual(ids(flat), ["FR-002"]);
+});
+
+test("AT6b huge single blocks within the limits render (no argument-spread RangeError)", () => {
+  const code = "```\n" + "` ".repeat(500_000) + "\n```";
+  const r = parseSpec(enc(code), "big.md");
+  assert.equal(r.blocks.length, 1);
+  assert.ok(r.text.startsWith("```\n` ` "));
+  const rows = Array.from({ length: 200_000 }, (_, i) => `<tr><td>R${i}</td></tr>`).join("");
+  const t = parseSpec(enc(`<table>${rows}</table>`), "rows.html");
+  assert.equal(t.blocks[0].rows.length, 200_000);
+});
