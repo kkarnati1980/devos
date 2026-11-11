@@ -7,13 +7,18 @@
 // Usage: floor-check.mjs <repo-dir>  -> exit 0 when clean, 1 with one "FAIL <check> <file>: <why>" line per finding.
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
 
+// F2-1 patterns. Network modules are matched by import/require of the module itself (named, namespace,
+// default, dynamic or require), so aliases cannot slip through; only src/safe-fetch.mjs may import them, and
+// src/server.mjs may import node:http to serve (never its client calls).
+const NET_MODULE = /(\bfrom|\bimport|\brequire)\s*\(?\s*["'`](node:)?(https?|http2|net|tls|dgram)["'`]/;
 const RAW_CLIENT = [
-  [/\bfetch\s*\(/, "fetch("], [/\bhttps?\.(request|get)\s*\(/, "http(s).request/get"], [/import\s*\{[^}]*\b(request|get)\b[^}]*\}\s*from\s*["'](node:)?https?["']/, "request/get imported from node:http(s)"],
-  [/\b(net|tls)\.connect\s*\(|\bnew\s+net\.Socket\b/, "raw socket"],
-  [/["'](axios|undici|got|node-fetch|superagent|needle)["']/, "HTTP client package"], [/\bimport\s+(requests|httpx)\b/, "Python HTTP client"],
-  [/\bnew\s+XMLHttpRequest\b/, "XMLHttpRequest"],
+  [/\bfetch\s*\(/, "fetch("],
+  [/["'`](axios|undici|got|node-fetch|superagent|needle|ky|cross-fetch|isomorphic-fetch|ws)["'`]/, "HTTP client package"],
+  [/\bnew\s+(XMLHttpRequest|WebSocket|EventSource)\s*\(/, "XMLHttpRequest/WebSocket/EventSource"],
+  [/^\s*(import|from)\s+(requests|httpx|urllib3?|aiohttp|http\.client|socket)\b/m, "Python HTTP client"],
 ];
 const SECRET_SHAPE = /(SECRET|TOKEN|KEY|PASSWORD|PASSWD|PRIVATE|CREDENTIAL)/i;
 const CODE = /\.(m?js|cjs|ts|tsx|jsx|py)$/;
@@ -21,7 +26,8 @@ const CODE = /\.(m?js|cjs|ts|tsx|jsx|py)$/;
 function walk(dir, rel = "") {
   const out = [];
   for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
-    if ([".git", "node_modules", "dist", "build", "coverage"].includes(e.name)) continue;
+    if (e.name === ".git" || e.name === "node_modules") continue;
+    if (!rel && ["dist", "build", "coverage"].includes(e.name)) continue;   // build output only at the root
     const r = path.join(rel, e.name);
     if (e.isDirectory()) out.push(...walk(dir, r)); else out.push(r);
   }
@@ -33,10 +39,17 @@ export function floorCheck(dir) {
   const files = walk(dir);
   for (const f of files.filter((x) => CODE.test(x))) {
     const posix = f.split(path.sep).join("/");
-    const isTest = /(^|\/)(test|tests|__tests__)\//.test(posix) || /\.test\.[a-z]+$/.test(posix);
+    const isTest = posix.startsWith("test/");   // only the root test/ folder may use fetch against local stubs
     const src = fs.readFileSync(path.join(dir, f), "utf8");
-    if (posix !== "src/safe-fetch.mjs" && !isTest) {
+    // F2 is server-side: browser code under public/ talks to its own origin and is covered by F1-4.
+    if (posix !== "src/safe-fetch.mjs" && !isTest && !posix.startsWith("public/")) {
       for (const [re, what] of RAW_CLIENT) if (re.test(src)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${what}) outside src/safe-fetch.mjs`);
+      const serving = posix === "src/server.mjs";
+      for (const mm of src.matchAll(new RegExp(NET_MODULE.source, "g"))) {
+        if (serving && mm[3] === "http") continue;
+        fails.push(`FAIL F2-1 ${posix}: imports node:${mm[3]} outside src/safe-fetch.mjs`);
+      }
+      if (serving && /\.\s*(request|get)\s*\(/.test(src)) fails.push(`FAIL F2-1 ${posix}: client call on node:http in the server`);
     }
     if (posix.startsWith("public/") && /process\.env/.test(src)) fails.push(`FAIL F1-4 ${posix}: client code reads process.env`);
     const m = src.match(/CLIENT_CONFIG_KEYS\s*=\s*\[([^\]]*)\]/);
@@ -47,7 +60,8 @@ export function floorCheck(dir) {
   for (const f of composeFiles) {
     let doc;
     try { doc = parse(fs.readFileSync(path.join(dir, f), "utf8")); } catch (e) { fails.push(`FAIL F3-2 ${f}: not valid YAML`); continue; }
-    for (const [name, svc] of Object.entries((doc && doc.services) || {})) {
+    for (const [name, raw] of Object.entries((doc && doc.services) || {})) {
+      const svc = raw && typeof raw === "object" ? raw : {};
       const lim = (svc && svc.deploy && svc.deploy.resources && svc.deploy.resources.limits) || {};
       if (!(svc.cpus || lim.cpus)) fails.push(`FAIL F3-2 ${f}: service ${name} has no CPU limit`);
       if (!(svc.mem_limit || lim.memory)) fails.push(`FAIL F3-2 ${f}: service ${name} has no memory limit`);
@@ -58,7 +72,7 @@ export function floorCheck(dir) {
   return fails;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   const dir = process.argv[2];
   if (!dir || !fs.existsSync(dir)) { console.error("usage: floor-check.mjs <repo-dir>"); process.exit(2); }
   const fails = floorCheck(dir);

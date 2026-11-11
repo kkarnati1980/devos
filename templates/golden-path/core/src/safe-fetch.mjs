@@ -43,6 +43,10 @@ export function isBlockedAddress(ip) {
   if (w.slice(0, 5).every((x) => x === 0) && w[5] === 0xffff) return isBlockedAddress(embedded());  // ::ffff:a.b.c.d
   if (w.slice(0, 6).every((x) => x === 0)) return isBlockedAddress(embedded());                    // ::a.b.c.d (deprecated)
   if (w[0] === 0x64 && w[1] === 0xff9b) return isBlockedAddress(embedded());                       // NAT64 64:ff9b::/96
+  if (w.slice(0, 4).every((x) => x === 0) && w[4] === 0xffff && w[5] === 0) return isBlockedAddress(embedded()); // SIIT ::ffff:0:a.b.c.d
+  if (w[0] === 0x2002) return isBlockedAddress(`${w[1] >> 8}.${w[1] & 255}.${w[2] >> 8}.${w[2] & 255}`);         // 6to4 2002:aabb:ccdd::
+  if (w[0] === 0x0100 && w.slice(1, 4).every((x) => x === 0)) return true;                                       // 100::/64 discard
+  if ((w[0] & 0xffc0) === 0xfec0) return true;    // fec0::/10 site-local (deprecated)
   if ((w[0] & 0xfe00) === 0xfc00) return true;    // fc00::/7 ULA
   if ((w[0] & 0xffc0) === 0xfe80) return true;    // fe80::/10 link-local
   if ((w[0] & 0xff00) === 0xff00) return true;    // ff00::/8 multicast
@@ -50,13 +54,12 @@ export function isBlockedAddress(ip) {
   return false;
 }
 
-async function resolveChecked(host, { lookup, allowHosts }) {
+async function resolveChecked(host, { lookup, allowed }) {
   const bare = host.replace(/^\[|\]$/g, "");
-  if (allowHosts.includes(bare.toLowerCase())) {
-    const addrs = net.isIP(bare) ? [{ address: bare, family: net.isIP(bare) }] : await lookup(bare);
-    return addrs[0];
-  }
-  const addrs = net.isIP(bare) ? [{ address: bare, family: net.isIP(bare) }] : await lookup(bare);
+  let addrs;
+  try { addrs = net.isIP(bare) ? [{ address: bare, family: net.isIP(bare) }] : await lookup(bare); }
+  catch (e) { throw new SafeFetchError("dns", `cannot resolve ${bare}: ${e && e.code ? e.code : "error"}`); }
+  if (allowed) { if (!addrs.length) throw new SafeFetchError("dns", `no address for ${bare}`); return addrs[0]; }
   if (!addrs.length) throw new SafeFetchError("dns", `no address for ${bare}`);
   const bad = addrs.find((a) => isBlockedAddress(a.address));
   if (bad) throw new SafeFetchError("blocked-address", `refused: ${bare} resolves to an internal address`);
@@ -64,28 +67,52 @@ async function resolveChecked(host, { lookup, allowHosts }) {
 }
 
 const defaultLookup = async (host) => dns.lookup(host, { all: true, verbatim: true });
+// Headers that carry credentials are never sent to a different origin after a redirect.
+const SENSITIVE = /^(authorization|proxy-authorization|cookie|x-api-key)$|(token|secret|api-?key)/i;
+/** Headers to send on a redirect hop: credentials are dropped once the origin differs from the first one. */
+export function redirectHeaders(headers, fromOrigin, toOrigin) {
+  return fromOrigin === toOrigin ? headers : Object.fromEntries(Object.entries(headers).filter(([k]) => !SENSITIVE.test(k)));
+}
+function checkAllowHosts(list) {
+  return (list || []).map((h) => {
+    const n = String(h).toLowerCase();
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(n) || net.isIP(n) || n === "localhost") {
+      throw new SafeFetchError("allow-hosts", `allowHosts must name exact hostnames, not ${JSON.stringify(String(h))}`);
+    }
+    return n;
+  });
+}
 
 /**
  * safeFetch(url, { method, headers, body, timeoutMs = 10000, maxBytes = 5_000_000, maxRedirects = 5,
  *                  allowHosts = [], lookup }) -> { status, headers, url, body: Buffer, text() }
- * allowHosts names exact hostnames that may be internal (declared services only); lookup is for tests.
+ * allowHosts names exact hostnames that may be internal (declared services only). It applies to the URL the
+ * caller passed and to redirects within that same origin, never to a redirect from another origin, so a public
+ * URL cannot bounce into a declared service.
+ * lookup is for tests. Every failure is a SafeFetchError with a code.
  */
 export async function safeFetch(input, opts = {}) {
   const { method = "GET", headers = {}, body, timeoutMs = 10_000, maxBytes = 5_000_000, maxRedirects = 5 } = opts;
-  const allowHosts = (opts.allowHosts || []).map((h) => String(h).toLowerCase());
+  const allowHosts = checkAllowHosts(opts.allowHosts);
   const lookup = opts.lookup || defaultLookup;
   const deadline = Date.now() + timeoutMs;
-  let url = new URL(String(input));   // WHATWG URL normalises decimal/octal/hex IPv4 literals
+  let url;
+  try { url = new URL(String(input)); } catch { throw new SafeFetchError("url", "invalid URL"); }   // normalises encoded IPv4
+  const origin0 = url.origin;
+  let m = String(method).toUpperCase(), b = body, h = { ...headers };
   for (let hop = 0; ; hop++) {
     if (url.protocol !== "http:" && url.protocol !== "https:") throw new SafeFetchError("scheme", `refused scheme ${url.protocol}`);
     if (url.username || url.password) throw new SafeFetchError("credentials", "refused: credentials in URL");
     const left = deadline - Date.now();
     if (left <= 0) throw new SafeFetchError("timeout", "timed out");
-    const addr = await withTimeout(resolveChecked(url.hostname, { lookup, allowHosts }), left);
-    const res = await request(url, addr, { method: hop === 0 ? method : "GET", headers, body: hop === 0 ? body : undefined, deadline, maxBytes });
+    const allowed = (hop === 0 || url.origin === origin0) && allowHosts.includes(url.hostname.replace(/^\[|\]$/g, "").toLowerCase());
+    const addr = await withTimeout(resolveChecked(url.hostname, { lookup, allowed }), left);
+    const res = await request(url, addr, { method: m, headers: h, body: b, deadline, maxBytes });
     if ([301, 302, 303, 307, 308].includes(res.status) && res.headers.location) {
       if (hop >= maxRedirects) throw new SafeFetchError("redirects", "too many redirects");
-      url = new URL(res.headers.location, url);
+      try { url = new URL(res.headers.location, url); } catch { throw new SafeFetchError("url", "invalid redirect location"); }
+      if (res.status === 303 || ((res.status === 301 || res.status === 302) && m !== "GET" && m !== "HEAD")) { m = "GET"; b = undefined; }
+      h = redirectHeaders(h, origin0, url.origin);
       continue;
     }
     return { ...res, url: url.href, text: () => res.body.toString("utf8") };
@@ -105,7 +132,10 @@ function request(url, addr, { method, headers, body, deadline, maxBytes }) {
     const mod = url.protocol === "https:" ? https : http;
     const host = url.hostname.replace(/^\[|\]$/g, "");
     // The socket connects to the checked address only; Host and SNI keep the original name.
-    req = mod.request({
+    // agent:false: no keep-alive pool keyed by hostname and no environment proxy (NODE_USE_ENV_PROXY),
+    // so the socket always goes to the address checked above and nothing resolves the name a second time.
+    try { req = mod.request({
+      agent: false,
       protocol: url.protocol, hostname: host, port: url.port || undefined, path: url.pathname + url.search, method, headers,
       lookup: (_h, o, cb) => (o && o.all ? cb(null, [{ address: addr.address, family: addr.family }]) : cb(null, addr.address, addr.family)),
       servername: net.isIP(host) ? undefined : host,
@@ -117,10 +147,10 @@ function request(url, addr, { method, headers, body, deadline, maxBytes }) {
         chunks.push(c);
       });
       res.on("end", () => { if (settled) return; settled = true; clearTimeout(timer); resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }); });
-      res.on("error", fail);
-    });
+      res.on("error", () => fail(new SafeFetchError("network", "response failed")));
+    }); } catch (e) { reject(new SafeFetchError("request", `invalid request: ${e && e.code ? e.code : "error"}`)); return; }
     const timer = setTimeout(() => fail(new SafeFetchError("timeout", "timed out")), Math.max(1, deadline - Date.now()));
-    req.on("error", fail);
+    req.on("error", (e) => fail(e instanceof SafeFetchError ? e : new SafeFetchError("network", `request failed: ${e && e.code ? e.code : "error"}`)));
     if (body !== undefined) req.write(body);
     req.end();
   });

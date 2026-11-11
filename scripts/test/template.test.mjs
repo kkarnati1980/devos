@@ -31,7 +31,7 @@ test("AT2/AT4/AT5: the generated core's own tests pass (F2-2 corpus, caps, /heal
   const out = fresh("core-tests");
   const r = spawnSync(process.execPath, ["--test", "test/safe-fetch.test.mjs", "test/server.test.mjs"], { cwd: out, encoding: "utf8", timeout: 60_000, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT")) });
   assert.equal(r.status, 0, r.stdout.slice(-3000) + r.stderr.slice(-2000));
-  assert.match(r.stdout, /# pass 14/);
+  assert.match(r.stdout, /# pass 20/);
   assert.match(r.stdout, /# fail 0/);
 });
 
@@ -59,6 +59,45 @@ test("AT3: floor-check names F2-1, F1-4 and F3-2 violations", () => {
   assert.ok(!f.some((l) => /^FAIL \S+ src\/(server|safe-fetch|config|log)\.mjs:/.test(l)), "the core itself is clean");
   const cli = spawnSync(process.execPath, [path.join(ROOT, "scripts/template/floor-check.mjs"), out], { encoding: "utf8" });
   assert.equal(cli.status, 1);
+});
+
+test("AT3: F2-1 catches aliased, required and socket-level clients anywhere outside the root test/ folder; browser code is F1-4's", () => {
+  const out = fresh("bypass");
+  const cases = {
+    "src/ns.mjs": 'import * as h from "node:http";\nexport const go = (u) => h.request(u);\n',
+    "src/req.cjs": 'const { get } = require("https");\nmodule.exports = get;\n',
+    "src/sock.mjs": 'import { createConnection } from "node:net";\nexport default createConnection;\n',
+    "src/h2.mjs": 'import { connect } from "node:http2";\nexport default connect;\n',
+    "src/dyn.mjs": 'export const m = await import("node:https");\n',
+    "src/ws.mjs": "export const ws = (u) => new WebSocket(u);\n",
+    "src/build/f.mjs": "export const f = (u) => fetch(u);\n",
+    "src/test/g.mjs": "export const g = (u) => fetch(u);\n",
+    "src/util.test.mjs": "export const t = (u) => fetch(u);\n",
+    "worker/fetch.py": "from requests import get\n",
+    "worker/u.py": "import urllib.request\n",
+  };
+  for (const [f, c] of Object.entries(cases)) write(out, f, c);
+  write(out, "public/app.js", 'fetch("/api/items");\n');
+  fs.writeFileSync(path.join(out, "compose.yaml"), "services:\n  app:\n");
+  const f = floorCheck(out);
+  for (const file of Object.keys(cases)) assert.ok(f.some((l) => l.startsWith(`FAIL F2-1 ${file}:`)), `${file} in\n${f.join("\n")}`);
+  assert.ok(!f.some((l) => l.includes("public/app.js")), "same-origin browser fetch is not F2-1");
+  assert.ok(f.some((l) => /F3-2 compose\.yaml: service app has no CPU limit/.test(l)), "a null service is a finding, not a crash");
+});
+
+test("AT6: a trailing slash stages beside the output; the CLIs work from a path with a space", () => {
+  const out = path.join(tmp, "slash") + path.sep;
+  assert.equal(apply({ out, select: [] }).code, 0);
+  assert.ok(fs.existsSync(path.join(out, ".devos/template.json")));
+  assert.ok(!fs.readdirSync(out).some((n) => n.includes("partial")));
+  const spaced = path.join(tmp, "with space");
+  fs.mkdirSync(path.join(spaced, "scripts"), { recursive: true });
+  fs.cpSync(path.join(ROOT, "scripts/template"), path.join(spaced, "scripts/template"), { recursive: true });
+  fs.symlinkSync(path.join(ROOT, "node_modules"), path.join(spaced, "node_modules"));
+  const bad = spawnSync(process.execPath, [path.join(spaced, "scripts/template/floor-check.mjs"), path.join(tmp, "nope")], { encoding: "utf8" });
+  assert.equal(bad.status, 2, "a missing directory is an error, never a silent pass: " + bad.stderr);
+  const m = JSON.parse(fs.readFileSync(path.join(out, ".devos/template.json"), "utf8"));
+  assert.match(m.devosSha, /^[0-9a-f]{40}$/, "the DevOS SHA is recorded by default");
 });
 
 test("AT6: apply refuses unknown, floor or opt-in IDs and a non-empty output, writing nothing; a module with no add-on is pending", () => {

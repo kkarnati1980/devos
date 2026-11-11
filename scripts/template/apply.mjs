@@ -5,6 +5,8 @@
 // Exit 0 written; 2 refused (bad arguments, unknown or non-selectable module, non-empty output) with nothing written.
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
 
 const ROOT = path.resolve(import.meta.dirname, "../..");
@@ -26,8 +28,13 @@ export function selectableIds() {
   return new Set(cat.modules.filter((m) => m.kind === "selectable").map((m) => m.id));
 }
 
-export function apply({ out, select = [], sha = "unknown" }) {
+function devosSha() {
+  try { return execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim(); } catch { return "unknown"; }
+}
+
+export function apply({ out, select = [], sha = devosSha() }) {
   if (!out) return { code: 2, error: "--out is required" };
+  out = path.resolve(out);   // so "dir/" stages beside dir, never inside it
   const ids = [...new Set(select.map((s) => s.trim()).filter(Boolean))];
   const ok = selectableIds();
   const bad = ids.filter((i) => !ok.has(i));
@@ -50,9 +57,9 @@ export function apply({ out, select = [], sha = "unknown" }) {
   return { code: 0, applied, pending };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   const a = process.argv.slice(2); const arg = (k) => { const i = a.indexOf(k); return i >= 0 ? a[i + 1] : undefined; };
-  const r = apply({ out: arg("--out"), select: (arg("--select") || "").split(","), sha: arg("--sha") || "unknown" });
+  const r = apply({ out: arg("--out"), select: (arg("--select") || "").split(","), sha: arg("--sha") || undefined });
   if (r.code) { console.error(`apply: refused: ${r.error}`); process.exit(r.code); }
   console.log(`apply: core + ${r.applied.length} add-on(s)${r.pending.length ? `; pending (no add-on yet): ${r.pending.join(", ")}` : ""}`);
 }

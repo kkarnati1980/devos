@@ -3,7 +3,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { safeFetch, isBlockedAddress } from "../src/safe-fetch.mjs";
+import { safeFetch, isBlockedAddress, redirectHeaders } from "../src/safe-fetch.mjs";
 
 let srv, port;
 before(async () => {
@@ -13,6 +13,10 @@ before(async () => {
     if (req.url === "/slow") { setTimeout(() => res.end("late"), 500); return; }
     if (req.url === "/to-metadata") { res.writeHead(302, { location: "http://169.254.169.254/latest/meta-data/" }); res.end(); return; }
     if (req.url === "/to-internal-name") { res.writeHead(302, { location: "http://evil.test/" }); res.end(); return; }
+    if (req.url === "/to-declared") { res.writeHead(302, { location: `http://stub.test:${port}/ok` }); res.end(); return; }
+    if (req.url === "/to-other-origin") { res.writeHead(307, { location: `http://other.test:${port}/echo` }); res.end(); return; }
+    if (req.url === "/to-same-origin") { res.writeHead(308, { location: "/echo" }); res.end(); return; }
+    if (req.url === "/echo") { let b = ""; req.on("data", (d) => (b += d)); req.on("end", () => res.end(JSON.stringify({ method: req.method, body: b, auth: req.headers.authorization || null, cookie: req.headers.cookie || null, accept: req.headers.accept || null }))); return; }
     res.writeHead(404); res.end();
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
@@ -65,4 +69,43 @@ test("an allowed host is fetched; size and time caps hold", async () => {
   assert.equal(r.status, 200); assert.equal(r.text(), "hello");
   await assert.rejects(safeFetch(`http://stub.test:${port}/big`, { ...stub, maxBytes: 1024 }), (e) => e.code === "too-large");
   await assert.rejects(safeFetch(`http://stub.test:${port}/slow`, { ...stub, timeoutMs: 100 }), (e) => e.code === "timeout");
+});
+
+test("allowHosts applies only to the URL passed in, never to a redirect target", async () => {
+  // public.test is a public name whose stub happens to listen locally; it redirects into the declared service.
+  const lookups = [];
+  const opts = { allowHosts: ["stub.test"], lookup: async (h) => { lookups.push(h); return [{ address: h === "stub.test" ? "127.0.0.1" : "93.184.216.34", family: 4 }]; } };
+  const r = await safeFetch(`http://stub.test:${port}/to-declared`, opts);   // declared -> same origin: allowed
+  assert.equal(r.status, 200, "the declared host itself is reachable");
+  await assert.rejects(safeFetch(`http://stub.test:${port}/to-declared`, { ...opts, maxRedirects: 5, allowHosts: [] }), (e) => e.code === "blocked-address");
+});
+test("credential headers are dropped when a redirect changes origin; 307/308 keep the method and body", async () => {
+  const opts = { allowHosts: ["stub.test", "other.test"], lookup: async () => [{ address: "127.0.0.1", family: 4 }] };
+  const hdr = { authorization: "Bearer app-token", cookie: "s=1", "x-service-token": "t", accept: "application/json" };
+  // other.test is a different origin from the first hop, so its allowance does not apply: refused.
+  await assert.rejects(safeFetch(`http://stub.test:${port}/to-other-origin`, { ...opts, headers: hdr }), (e) => e.code === "blocked-address");
+  const same = JSON.parse((await safeFetch(`http://stub.test:${port}/to-same-origin`, { ...opts, method: "POST", body: "x=1", headers: hdr })).text());
+  assert.deepEqual(same, { method: "POST", body: "x=1", auth: "Bearer app-token", cookie: "s=1", accept: "application/json" });
+});
+test("credentials are dropped when the origin changes, kept within the origin", () => {
+  const h = { authorization: "Bearer x", cookie: "c", "x-api-key": "k", "x-service-token": "t", "proxy-authorization": "p", accept: "a", "user-agent": "u" };
+  assert.deepEqual(redirectHeaders(h, "http://a.test", "http://b.test"), { accept: "a", "user-agent": "u" });
+  assert.deepEqual(redirectHeaders(h, "http://a.test", "https://a.test"), { accept: "a", "user-agent": "u" }, "scheme change is a new origin");
+  assert.equal(redirectHeaders(h, "http://a.test", "http://a.test"), h);
+});
+test("one lookup per hop, and the socket goes to the checked address", async () => {
+  const seen = [];
+  const r = await safeFetch(`http://stub.test:${port}/to-same-origin`, { allowHosts: ["stub.test"], lookup: async (x) => { seen.push(x); return [{ address: "127.0.0.1", family: 4 }]; } });
+  assert.equal(r.status, 200); assert.deepEqual(seen, ["stub.test", "stub.test"]);
+});
+test("allowHosts must be exact hostnames; resolution failures and bad URLs are SafeFetchErrors", async () => {
+  for (const bad of ["127.0.0.1", "localhost", "*.internal", "[::1]", ""]) {
+    await assert.rejects(safeFetch("http://example.com/", { allowHosts: [bad] }), (e) => e.code === "allow-hosts", bad);
+  }
+  await assert.rejects(safeFetch("http://nx.test/", { lookup: async () => { const e = new Error("x"); e.code = "ENOTFOUND"; throw e; } }), (e) => e.code === "dns");
+  await assert.rejects(safeFetch("not a url"), (e) => e.code === "url");
+});
+test("IPv6 forms that embed an internal IPv4 address are refused", () => {
+  for (const a of ["::ffff:0:7f00:1", "::ffff:0:a9fe:a9fe", "2002:7f00:1::1", "2002:a9fe:a9fe::", "fec0::1", "100::1", "::ffff:10.0.0.1"]) assert.equal(isBlockedAddress(a), true, a);
+  assert.equal(isBlockedAddress("2002:5db8:d822::1"), false, "6to4 of a public address");
 });
