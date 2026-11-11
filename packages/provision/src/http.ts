@@ -94,7 +94,7 @@ export class Transport {
     const url = new URL(path, this.origin);
     if (url.origin !== this.origin) throw new Error(`transport-path-invalid: ${this.provider}`);
     let token: string;
-    let timer: NodeJS.Timeout | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       token = await Promise.race([
         Promise.resolve(this.o.token()),

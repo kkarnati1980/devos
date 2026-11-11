@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 // Fake GitHub and Coolify APIs behind a fetch() stub. Every request is recorded; failures can be injected.
 export function fakeProviders() {
   const repos = new Map(); // full_name -> body
@@ -56,7 +57,7 @@ export function fakeProviders() {
     }
     if (method === "POST" && path === "/api/v1/projects") {
       const b = JSON.parse(init.body);
-      const uuid = `cf${String(++n).padStart(6, "0")}`;
+      const uuid = `cf${randomUUID().replace(/-/g, "").slice(0, 20)}`;
       projects.set(uuid, { uuid, name: b.name, description: b.description ?? null });
       return json(201, { uuid });
     }

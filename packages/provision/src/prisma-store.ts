@@ -37,7 +37,7 @@ export interface PrismaStoreOptions {
 }
 
 export function bounded<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  let t: NodeJS.Timeout | undefined;
+  let t: ReturnType<typeof setTimeout> | undefined;
   const timer = new Promise<never>((_, rej) => { t = setTimeout(() => rej(new Error(`${label}_timeout`)), ms); });
   return Promise.race([p, timer]).finally(() => clearTimeout(t));
 }
