@@ -34,7 +34,10 @@ export function parseHtml(src: string): Block[] {
   const tableStack: { table: string[][]; row: string[] | null; cell: string | null }[] = [];
 
   const emit = () => {
-    if (cellBuf !== null) return; // inside a table cell: keep collecting
+    if (cellBuf !== null) {
+      cellBuf += " "; // a block boundary inside a cell separates its text (PR30-r9)
+      return;
+    }
     if (pre) {
       const t = buf.replace(/^\n+|\s+$/g, "");
       if (t) blocks.push({ type: "code", text: t });

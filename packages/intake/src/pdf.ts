@@ -329,6 +329,12 @@ function scanObjectBody(text: string, from: number): { kind: "stream"; keyword: 
       i = skip;
       continue;
     }
+    if (text[i] === "/") {
+      // A name token (/endobj, /stream …) is never a keyword (PR30-r9): skip it whole.
+      i++;
+      while (i < n && !DELIM.test(text[i] ?? " ")) i++;
+      continue;
+    }
     const prevOk = i === 0 || DELIM.test(text[i - 1] ?? " ");
     if (prevOk && text.startsWith("endobj", i) && (i + 6 >= n || DELIM.test(text[i + 6] ?? " "))) return { kind: "obj", end: i };
     if (prevOk && text.startsWith("stream", i)) {

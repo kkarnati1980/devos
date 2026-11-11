@@ -584,3 +584,25 @@ test("AT4i comments between objects never create objects or trailers", () => {
   assert.deepEqual(ids(r), ["FR-001", "FR-002"]);
   assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
 });
+
+// ---------- PR30-r9 ----------
+test("AT2c paragraphs, divs and line breaks inside an HTML table cell keep their text apart", () => {
+  const r = parseSpec(enc("<table><tr><td><p>FR-1</p><p>FR-2</p></td><td><div>FR-3</div><div>FR-4</div>FR-5<br>FR-6</td></tr></table>"), "t.html");
+  assert.deepEqual(ids(r), ["FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-6"]);
+  assert.deepEqual(r.blocks[0].rows, [["FR-1 FR-2", "FR-3 FR-4 FR-5 FR-6"]]);
+});
+
+test("AT4j PDF name tokens such as /endobj and /stream never end an object", () => {
+  const doc = pdfObjects(
+    [
+      [4, { stream: "BT (FR-001 named) Tj ET" }],
+      [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Kids [3 0 R] >>"],
+      [3, "<< /Type /Page /Parent 2 0 R /Custom /endobj /Other /stream\n /Contents 4 0 R >>"],
+    ],
+    1,
+  );
+  const r = parseSpec(doc, "names.pdf");
+  assert.deepEqual(ids(r), ["FR-001"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+});
