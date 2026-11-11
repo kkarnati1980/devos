@@ -32,3 +32,16 @@ test("a success:false payload is an error", async () => {
   const { a } = api(() => ({ issueCreate: { success: false, issue: null } }));
   await assert.rejects(a.createIssue({ teamId: "t", projectId: "p", milestoneId: null, parentId: null, title: "x", description: "", stateId: "s", labelIds: [], assigneeId: null }), /refused issue create/);
 });
+
+test("team: the lowest-position state of a type wins; labels include workspace ones and are read across pages", async () => {
+  const { a, calls } = api((b) => {
+    if (b.query.includes("teams(")) return { teams: { nodes: [{ id: "t1", states: { nodes: [{ id: "review", type: "started", position: 3 }, { id: "doing", type: "started", position: 2 }, { id: "todo", type: "unstarted", position: 1 }] } }] } };
+    return b.variables.after
+      ? { issueLabels: { nodes: [{ id: "l3", name: "Human", team: null }], pageInfo: { hasNextPage: false, endCursor: null } } }
+      : { issueLabels: { nodes: [{ id: "l1", name: "Module", team: { id: "t1" } }, { id: "l2", name: "Other", team: { id: "t9" } }], pageInfo: { hasNextPage: true, endCursor: "x" } } };
+  });
+  const t = await a.team("DEVOS");
+  assert.equal(t.states.find((s) => s.type === "started").id, "doing");
+  assert.deepEqual(t.labels.map((l) => l.name), ["Module", "Human"], "another team's label is not usable");
+  assert.equal(calls.length, 3);
+});

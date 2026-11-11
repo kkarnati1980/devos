@@ -91,3 +91,18 @@ test("descriptions re-rendered by Linear (escapes, marks, whitespace) are not re
   assert.equal(L.projects.length, 1); assert.equal(L.milestones.length, 2); assert.ok(r.log.some((l) => /not found/.test(l)));
   assert.equal(plan.milestones[0].linearMilestoneId, L.milestones[0].id);
 });
+
+test("AT5 (sync level): a Linear failure during sync carries no key, and nothing the sync logs or stores holds it", async () => {
+  const { LinearClient, graphqlApi } = await import("../dist/index.js");
+  const KEY = "lin_api_" + "Seeded0000000000000000000000000000000000";
+  const fetchImpl = async () => new Response(JSON.stringify({ errors: [{ message: `echo ${KEY}` }] }), { status: 200 });
+  const api = graphqlApi(new LinearClient({ apiKey: () => KEY, fetchImpl, sleep: async () => {} }));
+  const plan = throwaway(); const stored = [];
+  const store = { setProjectId: async (...a) => stored.push(a), setMilestoneId: async (...a) => stored.push(a), setModuleIssue: async (...a) => stored.push(a), setTaskIssue: async (...a) => stored.push(a) };
+  const err = await syncProject(plan, api, store).catch((e) => e);
+  assert.ok(err instanceof Error);
+  assert.ok(!JSON.stringify({ m: err.message, s: err.stack, stored, plan }).includes(KEY));
+  // and a successful sync's log never holds descriptions or headers
+  const L = fakeLinear(); const r = await syncProject(throwaway(), L.api, memoryStore(throwaway()));
+  assert.ok(r.log.every((l) => !/devos-ref|Bearer|lin_api_/.test(l)));
+});

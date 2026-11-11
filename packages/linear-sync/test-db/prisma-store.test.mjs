@@ -51,3 +51,16 @@ test("AT3 on Postgres: an id lost before it was saved is adopted by marker; no d
   assert.equal(L.projects.length, 1); assert.equal(L.issues.length, 4);
   assert.equal(await db.resource.count({ where: { projectId: pid, provider: "linear" } }), 3);
 });
+
+test("two concurrent locked syncs of one project: one runs, the other is skipped; one Linear project", async () => {
+  const { syncProjectLocked } = await import("../dist/index.js");
+  const pid = await seed(); const L = fakeLinear();
+  let release; const gate = new Promise((r) => { release = r; });
+  const first = syncProjectLocked(db, pid, async (plan, store) => { await gate; return syncProject(plan, L.api, store); });
+  await new Promise((r) => setTimeout(r, 300));
+  const second = await syncProjectLocked(db, pid, (plan, store) => syncProject(plan, L.api, store));
+  release();
+  assert.deepEqual(await first, { skipped: false });
+  assert.deepEqual(second, { skipped: true });
+  assert.equal(L.projects.length, 1);
+});

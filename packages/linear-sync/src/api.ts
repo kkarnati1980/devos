@@ -20,11 +20,23 @@ export function graphqlApi(client: LinearClient): LinearApi {
       return (await client.query<{ viewer: { id: string } }>("query { viewer { id } }")).viewer.id;
     },
     async team(key) {
-      const d = await client.query<{ teams: Conn<{ id: string; states: Conn<{ id: string; type: StateType }>; labels: Conn<{ id: string; name: string }> }> }>(
-        `query($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id states { nodes { id type } } labels(first: 250) { nodes { id name } } } } }`, { key });
+      const d = await client.query<{ teams: Conn<{ id: string; states: Conn<{ id: string; type: StateType; position: number }> }> }>(
+        `query($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id states { nodes { id type position } } } } }`, { key });
       const t = d.teams.nodes[0];
       if (!t) throw new LinearError("bad-response", `no Linear team with key ${key}`);
-      return { id: t.id, states: t.states.nodes, labels: t.labels.nodes };
+      // Labels usable on the team's issues: the team's own and workspace-wide ones (team null), every page.
+      const labels: { id: string; name: string }[] = [];
+      let after: string | null = null;
+      for (let p = 0; p < MAX_PAGES; p++) {
+        const l: { issueLabels: Conn<{ id: string; name: string; team: { id: string } | null }> } = await client.query(
+          `query($after: String) { issueLabels(first: ${PAGE}, after: $after) { nodes { id name team { id } } pageInfo { hasNextPage endCursor } } }`, { after });
+        labels.push(...l.issueLabels.nodes.filter((x) => !x.team || x.team.id === t.id).map(({ id, name }) => ({ id, name })));
+        if (!l.issueLabels.pageInfo?.hasNextPage) break;
+        after = l.issueLabels.pageInfo.endCursor;
+      }
+      // Several states can share a type (e.g. In Progress and In Review are both "started"): the lowest position wins.
+      const states = [...t.states.nodes].sort((a, b) => a.position - b.position).map(({ id, type }) => ({ id, type }));
+      return { id: t.id, states, labels };
     },
     async createLabel(teamId, name) {
       const d = await client.mutate<{ issueLabelCreate: { success: boolean; issueLabel: { id: string } } }>(
