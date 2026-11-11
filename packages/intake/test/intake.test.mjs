@@ -525,3 +525,42 @@ test("AT4f object boundaries and structure lookups skip strings and comments", (
   assert.deepEqual(r.blocks.map((b) => b.text), ["FR-001 page one", "FR-002 page two"]);
   assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
 });
+
+// ---------- PR30-r7 ----------
+test("AT4g the latest Root wins across trailers and xref streams; fake trailers inside objects are ignored", () => {
+  const base = pdfObjects(
+    [
+      [7, { stream: "BT (FR-001 old catalog) Tj ET" }],
+      [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Kids [3 0 R] >>"],
+      [3, "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>"],
+      [20, "<< /Info (trailer << /Root 30 0 R >>) >>"],
+    ],
+    1,
+  );
+  const update = Buffer.from(
+    "10 0 obj\n<< /Type /Catalog /Pages 12 0 R >>\nendobj\n" +
+      "12 0 obj\n<< /Type /Pages /Kids [13 0 R] >>\nendobj\n" +
+      "13 0 obj\n<< /Type /Page /Parent 12 0 R /Contents 14 0 R >>\nendobj\n" +
+      "14 0 obj\n<< /Length 29 >>\nstream\nBT (FR-010 current one) Tj ET\nendstream\nendobj\n" +
+      "15 0 obj\n<< /Type /XRef /Root 10 0 R /Length 0 >>\nstream\n\nendstream\nendobj\nstartxref\n0\n%%EOF\n",
+    "latin1",
+  );
+  const r = parseSpec(Buffer.concat([base, update]), "incr.pdf");
+  assert.deepEqual(ids(r), ["FR-010"]);
+  // Without the update, the conventional trailer's Root is used and the fake one inside object 20 is not.
+  assert.deepEqual(ids(parseSpec(base, "base.pdf")), ["FR-001"]);
+});
+
+test("AT4h file-order fallback reads only real stream objects, never stream-like text inside strings", () => {
+  const doc = pdfObjects(
+    [
+      [5, "<< /Title (5 0 obj << >> stream\nBT (FR-999) Tj ET\nendstream\nendobj) >>"],
+      [6, { stream: "BT (FR-001 real) Tj ET" }],
+    ],
+    99,
+  );
+  const r = parseSpec(doc, "meta.pdf");
+  assert.deepEqual(ids(r), ["FR-001"]);
+  assert.ok(r.warnings.includes("pdf-page-order-unknown"));
+});

@@ -12,10 +12,6 @@ function latin1(b: Uint8Array): string {
   return Buffer.from(b.buffer, b.byteOffset, b.byteLength).toString("latin1");
 }
 
-interface RawStream {
-  dict: string;
-  data: Uint8Array;
-}
 
 /** Integer-valued indirect objects (`n g obj 123 endobj`), used to resolve indirect stream /Length values. */
 function integerObjects(text: string): Map<number, number> {
@@ -89,29 +85,6 @@ function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints:
   return end;
 }
 
-function findStreams(buf: Buffer, limits: IngestLimits): RawStream[] {
-  const out: RawStream[] = [];
-  const text = buf.toString("latin1");
-  const ints = integerObjects(text);
-  const re = /stream(\r\n|\n|\r)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
-    const kw = m.index;
-    // Must be the keyword after a dictionary, not part of "endstream".
-    if (kw >= 3 && text.slice(kw - 3, kw) === "end") continue;
-    const dictEnd = text.lastIndexOf(">>", kw);
-    const objStart = text.lastIndexOf(" obj", kw);
-    if (dictEnd < 0 || objStart < 0 || dictEnd < objStart) continue;
-    const dict = text.slice(objStart, dictEnd + 2);
-    const start = kw + m[0].length;
-    const end = streamEnd(buf, text, dict, start, ints);
-    if (end < 0) break;
-    out.push({ dict, data: buf.subarray(start, end) });
-    if (out.length > limits.maxPdfStreams) throw new IngestError("pdf-invalid");
-    re.lastIndex = end;
-  }
-  return out;
-}
 
 /** Tokenise a content stream enough to read strings, numbers, arrays and operators. */
 function* contentTokens(s: string): Generator<{ t: "str"; v: string; hex: boolean } | { t: "num"; v: number } | { t: "op"; v: string } | { t: "["} | { t: "]" }> {
@@ -281,6 +254,14 @@ function textFromContent(content: string, warnings: Set<string>): string[] {
 interface PdfObject {
   dict: string;
   data?: Uint8Array;
+  /** Byte offset of the defining `n g obj` (or of its object stream), for file order. */
+  pos: number;
+}
+
+interface PdfFile {
+  objs: Map<number, PdfObject>;
+  /** Trailer dictionaries found between objects (never inside one), with their offsets. */
+  trailers: { pos: number; dict: string }[];
 }
 
 /** Inflate one stream under the limits; undefined (with a warning) when its filter is unsupported or it is damaged. */
@@ -382,16 +363,25 @@ function stripStrings(s: string): string {
  * Every indirect object, later definitions replacing earlier ones (incremental updates), including objects
  * packed in object streams (/Type /ObjStm).
  */
-function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>, budget: { total: number }): Map<number, PdfObject> {
+function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>, budget: { total: number }): PdfFile {
   const text = buf.toString("latin1");
   const ints = integerObjects(text);
   const objs = new Map<number, PdfObject>();
+  const trailers: { pos: number; dict: string }[] = [];
+  let gapStart = 0;
+  // Trailers are looked for only in the text between objects, so a string inside an object cannot fake one.
+  const scanGap = (from: number, to: number) => {
+    const gap = text.slice(from, to);
+    for (const t of gap.matchAll(/\btrailer\s*<<([\s\S]{0,4096}?)>>/g)) trailers.push({ pos: from + (t.index ?? 0), dict: stripStrings(t[1] ?? "") });
+  };
   const re = /(?<![0-9])(\d{1,10})\s+(\d{1,5})\s+obj\b/g;
   let m: RegExpExecArray | null;
   let count = 0;
   while ((m = re.exec(text))) {
     if (++count > limits.maxPdfStreams * 4) throw new IngestError("pdf-invalid");
     const num = Number(m[1]);
+    const pos = m.index;
+    scanGap(gapStart, pos);
     const bodyStart = m.index + m[0].length;
     // Object boundaries come from a token scan that skips strings and comments (PR30-r6), never a substring search.
     const body = scanObjectBody(text, bodyStart);
@@ -401,8 +391,9 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
       const end = streamEnd(buf, text, dict, start, ints);
       if (end < 0) break;
       const data = buf.subarray(start, end);
-      objs.set(num, { dict, data });
+      objs.set(num, { dict, data, pos });
       re.lastIndex = end;
+      gapStart = end;
       if (/\/Type\s*\/ObjStm\b/.test(dict)) {
         const dec = decodeStream(dict, data, limits, warnings, budget);
         if (dec) {
@@ -414,16 +405,18 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
             const on = head[2 * k] ?? NaN;
             const off = head[2 * k + 1] ?? NaN;
             const next = k + 1 < n ? (head[2 * k + 3] ?? s.length - first) : s.length - first;
-            if (Number.isFinite(on) && Number.isFinite(off)) objs.set(on, { dict: stripStrings(s.slice(first + off, first + next)) });
+            if (Number.isFinite(on) && Number.isFinite(off)) objs.set(on, { dict: stripStrings(s.slice(first + off, first + next)), pos });
           }
         }
       }
     } else {
-      objs.set(num, { dict: stripStrings(text.slice(bodyStart, body.end)) });
+      objs.set(num, { dict: stripStrings(text.slice(bodyStart, body.end)), pos });
       re.lastIndex = body.end;
+      gapStart = body.end;
     }
   }
-  return objs;
+  scanGap(gapStart, text.length);
+  return { objs, trailers };
 }
 
 function refs(s: string): number[] {
@@ -431,20 +424,21 @@ function refs(s: string): number[] {
 }
 
 /** The page tree's content-stream object numbers, page by page, or null when the tree cannot be resolved. */
-function pageContents(text: string, objs: Map<number, PdfObject>): number[][] | null {
-  // /Root comes only from trailer dictionaries and cross-reference streams, never from page text (PR30-r6).
+function pageContents(file: PdfFile): number[][] | null {
+  const objs = file.objs;
+  // /Root comes only from trailer dictionaries (outside objects) and cross-reference streams; the one latest in the
+  // file wins, whichever kind it is (PR30-r6/r7), as an incremental update appends its trailer or xref stream.
   let rootNum = NaN;
-  for (const t of text.matchAll(/\btrailer\s*<<([\s\S]{0,4096}?)>>/g)) {
-    const r = /\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(stripStrings(t[1] ?? ""));
-    if (r) rootNum = Number(r[1]);
-  }
-  if (!Number.isFinite(rootNum)) {
-    for (const o of objs.values()) {
-      if (!o.data || !/\/Type\s*\/XRef\b/.test(o.dict)) continue;
-      const r = /\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(o.dict);
-      if (r) rootNum = Number(r[1]);
+  let rootPos = -1;
+  const consider = (pos: number, dict: string) => {
+    const r = /\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(dict);
+    if (r && pos > rootPos) {
+      rootPos = pos;
+      rootNum = Number(r[1]);
     }
-  }
+  };
+  for (const t of file.trailers) consider(t.pos, t.dict);
+  for (const o of objs.values()) if (o.data && /\/Type\s*\/XRef\b/.test(o.dict)) consider(o.pos, o.dict);
   const catalog = objs.get(rootNum)?.dict;
   const pagesRef = catalog ? /\/Pages\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(catalog) : null;
   if (!pagesRef) return null;
@@ -482,14 +476,15 @@ function pageContents(text: string, objs: Map<number, PdfObject>): number[][] | 
 export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<string>): Block[] {
   const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const budget = { total: 0 };
-  const objs = collectObjects(buf, limits, warnings, budget);
+  const file = collectObjects(buf, limits, warnings, budget);
+  const objs = file.objs;
   const blocks: Block[] = [];
   const emit = (content: string) => {
     // No substring tests on text (PR30-r4): a page without a BT operator simply yields no lines.
     if (!/\bBT\b/.test(content)) return;
     for (const line of textFromContent(content, warnings)) blocks.push({ type: "paragraph", text: line });
   };
-  const pages = pageContents(buf.toString("latin1"), objs);
+  const pages = pageContents(file);
   if (pages) {
     // Page order from the page tree; only streams a page references (obsolete or unused streams are ignored).
     for (const list of pages) {
@@ -505,7 +500,9 @@ export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<
   } else {
     // No resolvable page tree: fall back to file order and say so.
     warnings.add("pdf-page-order-unknown");
-    for (const st of findStreams(buf, limits)) {
+    // Only real stream objects found by the structural scan, in file order — never byte patterns (PR30-r7).
+    const streams = [...objs.values()].filter((o): o is PdfObject & { data: Uint8Array } => !!o.data).sort((x, y) => x.pos - y.pos);
+    for (const st of streams) {
       if (/\/(Type\s*\/XObject|Subtype\s*\/Image|Type\s*\/XRef|Type\s*\/ObjStm|Subtype\s*\/Type1C|Length1|Length2)/.test(st.dict)) continue;
       const dec = decodeStream(st.dict, st.data, limits, warnings, budget);
       if (!dec) continue;
