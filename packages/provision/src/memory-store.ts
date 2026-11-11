@@ -15,6 +15,12 @@ export class MemoryStore implements ProvisionStore {
     return run;
   }
 
+  /** Tests can flip this to simulate a lost lock. */
+  lockLost = false;
+  async assertLockHeld(_projectId: string): Promise<void> {
+    if (this.lockLost) throw new Error("provision_lock_lost");
+  }
+
   async getStep(projectId: string, key: string): Promise<StepRecord | null> {
     const s = this.steps.get(`${projectId}/${key}`);
     return s ? { ...s } : null;

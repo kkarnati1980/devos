@@ -55,6 +55,8 @@ export interface ProvisionStore {
   markFailed(projectId: string, spec: Pick<StepSpec, "key" | "provider" | "kind">, error: string): Promise<void>;
   /** Upsert into the inventory by (provider, kind, external id). Throws `resource_owned_elsewhere` if the row belongs to another project. */
   recordResource(projectId: string, r: ResourceRecord): Promise<void>;
+  /** Throws if this run no longer holds the project lock (checked right before every external create). */
+  assertLockHeld(projectId: string): Promise<void>;
 }
 
 export type PolicyDecision = "allow" | "deny" | "require_approval";
@@ -92,8 +94,12 @@ export interface StepResult {
 
 export interface RunOptions {
   store: ProvisionStore;
-  authorize?: Authorize;
+  /** Required (ADR-0006): every external create is checked. Tests that want no policy pass `allowAll` explicitly. */
+  authorize: Authorize;
 }
+
+/** An explicit "no policy" authorizer, for tests and dry runs only. */
+export const allowAll: Authorize = async () => "allow";
 
 /** Ownership marker written into each resource this project creates (decision 3). */
 export const ownershipMarker = (projectId: string): string => `devos:${projectId}`;
@@ -150,28 +156,34 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
   const found = await lookup();
   if (found) return adopt(found);
 
-  if (opts.authorize) {
-    const decision = await opts.authorize(spec.action, `project:${projectId}`);
-    if (decision !== "allow") {
-      const code = decision === "deny" ? "policy_denied" : "approval_required";
-      await store.markFailed(projectId, spec, code);
-      throw new StepError(spec.key, code, false, false, `${spec.action} is ${decision === "deny" ? "denied by policy" : "waiting for approval"}`);
-    }
+  if (typeof opts.authorize !== "function") throw new Error("runStep: authorize is required (ADR-0006)");
+  const decision = await opts.authorize(spec.action, `project:${projectId}`);
+  if (decision !== "allow") {
+    const code = decision === "deny" ? "policy_denied" : "approval_required";
+    await store.markFailed(projectId, spec, code);
+    throw new StepError(spec.key, code, false, false, `${spec.action} is ${decision === "deny" ? "denied by policy" : "waiting for approval"}`);
   }
 
+  await store.assertLockHeld(projectId);
   await store.markPending(projectId, spec);
   let created: Found;
   try {
     created = await spec.create();
   } catch (e) {
-    const unknownOutcome = e instanceof ProviderError && (e.transient || (e.code === "http" && (e.status === 409 || e.status === 422)));
-    if (!unknownOutcome) {
+    const transient = e instanceof ProviderError && e.transient;
+    const nameTaken = e instanceof ProviderError && e.code === "http" && (e.status === 409 || e.status === 422);
+    if (!transient && !nameTaken) {
       await store.markFailed(projectId, spec, errLine("provider_error", e));
       throw new StepError(spec.key, "provider_error", false, true, `create failed for ${spec.provider} ${spec.kind}`);
     }
     // The create may have happened (or the name was taken meanwhile): look again, never create again here.
     const again = await lookup();
     if (again) return adopt(again);
+    if (!transient) {
+      // 409/422 with nothing found under our name: a permanent rejection (e.g. validation), not worth retrying.
+      await store.markFailed(projectId, spec, errLine("provider_error", e));
+      throw new StepError(spec.key, "provider_error", false, true, `create rejected for ${spec.provider} ${spec.kind}`);
+    }
     await store.markFailed(projectId, spec, errLine("create_unconfirmed", e));
     throw new StepError(spec.key, "create_unconfirmed", true, true, `create of ${spec.provider} ${spec.kind} not confirmed; the next run looks it up first`);
   }

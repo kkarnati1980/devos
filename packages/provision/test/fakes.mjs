@@ -6,6 +6,7 @@ export function fakeProviders() {
   let n = 0;
   // inject: list of { match(method, path) -> bool, action: "timeout-after" | "timeout-before" | {status} , once }
   const faults = [];
+  const state = { login: "kkarnati1980" };
   const json = (status, body) => new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
   const timeout = () => { const e = new Error("The operation was aborted due to timeout"); e.name = "TimeoutError"; return e; };
 
@@ -28,8 +29,9 @@ export function fakeProviders() {
     return res;
   }
 
-  function github(method, path, init) {
+  const github = (method, path, init) => {
     let m;
+    if (method === "GET" && path === "/user") return json(200, { login: state.login });
     if (method === "GET" && (m = path.match(/^\/repos\/([^/]+)\/([^/]+)$/))) {
       const r = repos.get(`${m[1]}/${m[2]}`.toLowerCase());
       return r ? json(200, r) : json(404, { message: "Not Found" });
@@ -43,7 +45,7 @@ export function fakeProviders() {
       return json(201, r);
     }
     return json(404, { message: "Not Found" });
-  }
+  };
 
   function coolify(method, path, init) {
     let m;
@@ -62,5 +64,5 @@ export function fakeProviders() {
   }
 
   const creates = () => calls.filter((c) => c.method !== "GET");
-  return { fetchImpl, calls, creates, repos, projects, faults };
+  return { fetchImpl, calls, creates, repos, projects, faults, state };
 }

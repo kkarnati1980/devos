@@ -4,7 +4,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { createDb } from "@devos/db";
-import { PrismaStore, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, runProvision } from "../dist/index.js";
+import { allowAll, PrismaStore, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, runProvision } from "../dist/index.js";
 import { fakeProviders } from "../test/fakes.mjs";
 
 const url = process.env.DATABASE_URL;
@@ -23,27 +23,27 @@ function steps(p, fake) {
 }
 
 test("AT1/AT2 on Postgres: resources and done steps are recorded; a re-run creates nothing", async () => {
-  const p = await seed(); const fake = fakeProviders(); const store = new PrismaStore(db);
-  await runProvision(p.id, steps(p, fake), { store });
+  const p = await seed(); const fake = fakeProviders(); const store = new PrismaStore(db, { databaseUrl: url });
+  await runProvision(p.id, steps(p, fake), { store, authorize: allowAll });
   const res = await db.resource.findMany({ where: { projectId: p.id }, orderBy: { createdAt: "asc" } });
   assert.deepEqual(res.map((r) => `${r.provider}/${r.kind}`), ["github/repo", "coolify/project"]);
   const st = await db.provisionStep.findMany({ where: { projectId: p.id } });
   assert.ok(st.length === 2 && st.every((s) => s.status === "done" && s.externalId && s.attempts === 1));
   const posts = fake.creates().length;
-  const out = await runProvision(p.id, steps(p, fake), { store });
+  const out = await runProvision(p.id, steps(p, fake), { store, authorize: allowAll });
   assert.deepEqual(out.map((o) => o.outcome), ["recorded", "recorded"]);
   assert.equal(fake.creates().length, posts);
   assert.equal(await db.resource.count({ where: { projectId: p.id } }), 2);
 });
 
 test("AT3 on Postgres: a pending step (crash after create) is adopted on re-run, no second create", async () => {
-  const p = await seed(); const fake = fakeProviders(); const store = new PrismaStore(db);
+  const p = await seed(); const fake = fakeProviders(); const store = new PrismaStore(db, { databaseUrl: url });
   const crashing = Object.create(store);
   crashing.recordResource = async () => { throw new Error("process killed"); };
-  await assert.rejects(runProvision(p.id, steps(p, fake), { store: crashing }), /process killed/);
+  await assert.rejects(runProvision(p.id, steps(p, fake), { store: crashing, authorize: allowAll }), /process killed/);
   const s = await db.provisionStep.findUnique({ where: { projectId_key: { projectId: p.id, key: "github/repo" } } });
   assert.equal(s.status, "pending");
-  const out = await runProvision(p.id, steps(p, fake), { store });
+  const out = await runProvision(p.id, steps(p, fake), { store, authorize: allowAll });
   assert.deepEqual(out.map((o) => o.outcome), ["adopted", "created"]);
   assert.equal(fake.creates().filter((c) => c.path === "/user/repos").length, 1);
 });
@@ -51,8 +51,8 @@ test("AT3 on Postgres: a pending step (crash after create) is adopted on re-run,
 test("AT8 on Postgres: two concurrent runs serialize on the advisory lock; each resource is created once", async () => {
   const p = await seed(); const fake = fakeProviders();
   const [a, b] = await Promise.all([
-    runProvision(p.id, steps(p, fake), { store: new PrismaStore(db) }),
-    runProvision(p.id, steps(p, fake), { store: new PrismaStore(db) }),
+    runProvision(p.id, steps(p, fake), { store: new PrismaStore(db, { databaseUrl: url }), authorize: allowAll }),
+    runProvision(p.id, steps(p, fake), { store: new PrismaStore(db, { databaseUrl: url }), authorize: allowAll }),
   ]);
   const outcomes = [a, b].map((r) => r.map((o) => o.outcome).join(",")).sort();
   assert.deepEqual(outcomes, ["created,created", "recorded,recorded"]);
@@ -60,8 +60,22 @@ test("AT8 on Postgres: two concurrent runs serialize on the advisory lock; each 
   assert.equal(fake.creates().filter((c) => c.path === "/api/v1/projects").length, 1);
 });
 
+test("Lock on Postgres: held for as long as the run takes (no timer), and a waiter gives up after lockWaitMs", async () => {
+  const p = await seed();
+  const holder = new PrismaStore(db, { databaseUrl: url });
+  const waiter = new PrismaStore(db, { databaseUrl: url, lockWaitMs: 300 });
+  let release; const gate = new Promise((r) => { release = r; });
+  const running = holder.withProjectLock(p.id, async () => { await gate; await holder.assertLockHeld(p.id); return "done"; });
+  await new Promise((r) => setTimeout(r, 200));
+  await assert.rejects(waiter.withProjectLock(p.id, async () => "should not run"), /lock timeout|canceling statement/);
+  await new Promise((r) => setTimeout(r, 600)); // the holder outlives the waiter's timeout and still holds the lock
+  release();
+  assert.equal(await running, "done");
+  assert.equal(await waiter.withProjectLock(p.id, async () => "after"), "after"); // released at the end
+});
+
 test("Inventory: a row owned by another project is refused; a soft-deleted own row is reactivated", async () => {
-  const p = await seed(); const q = await seed(); const store = new PrismaStore(db);
+  const p = await seed(); const q = await seed(); const store = new PrismaStore(db, { databaseUrl: url });
   const ext = `kkarnati1980/devos-${p.slug}`;
   await store.recordResource(p.id, { provider: "github", kind: "repo", externalId: ext, name: ext });
   await assert.rejects(store.recordResource(q.id, { provider: "github", kind: "repo", externalId: ext, name: ext }), /resource_owned_elsewhere/);

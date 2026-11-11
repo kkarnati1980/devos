@@ -1,7 +1,7 @@
 // M2.4-a acceptance tests on fake providers (docs/modules/M2.4.md: AT1–AT5, AT8, AT9, AT12).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GitHubClient, CoolifyClient, MemoryStore, githubRepoStep, coolifyProjectStep, runProvision, runStep, StepError, ProviderError, Transport } from "../dist/index.js";
+import { allowAll, PrismaStore, GitHubClient, CoolifyClient, MemoryStore, githubRepoStep, coolifyProjectStep, runProvision, runStep, StepError, ProviderError, Transport } from "../dist/index.js";
 import { fakeProviders } from "./fakes.mjs";
 
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
@@ -18,7 +18,7 @@ function setup(fake = fakeProviders()) {
 
 test("AT1 fresh provision creates each resource once and records it with the project id", async () => {
   const { fake, steps, store } = setup();
-  const out = await runProvision(P.id, steps(), { store });
+  const out = await runProvision(P.id, steps(), { store, authorize: allowAll });
   assert.deepEqual(out.map((o) => o.outcome), ["created", "created"]);
   assert.equal(fake.repos.get("kkarnati1980/devos-acme").private, true);
   assert.match(fake.repos.get("kkarnati1980/devos-acme").description, /devos:11111111-2222-4333-8444-555555555555$/);
@@ -30,15 +30,15 @@ test("AT1 fresh provision creates each resource once and records it with the pro
 
 test("AT2 a re-run creates nothing and adds no inventory rows", async () => {
   const { fake, steps, store } = setup();
-  await runProvision(P.id, steps(), { store });
+  await runProvision(P.id, steps(), { store, authorize: allowAll });
   const before = fake.creates().length;
-  const out = await runProvision(P.id, steps(), { store });
+  const out = await runProvision(P.id, steps(), { store, authorize: allowAll });
   assert.deepEqual(out.map((o) => o.outcome), ["recorded", "recorded"]);
   assert.equal(fake.creates().length, before);
   assert.equal(store.resources.length, 2);
   // Even with a fresh journal (DB restored, rows lost) it adopts instead of creating.
   const fresh = new MemoryStore();
-  const out2 = await runProvision(P.id, steps(), { store: fresh });
+  const out2 = await runProvision(P.id, steps(), { store: fresh, authorize: allowAll });
   assert.deepEqual(out2.map((o) => o.outcome), ["adopted", "adopted"]);
   assert.equal(fake.creates().length, before);
 });
@@ -53,9 +53,9 @@ for (const [i, key] of ["github/repo", "coolify/project"].entries()) {
       if (!crashed && `${r.provider}/${r.kind}` === key) { crashed = true; throw new Error("process killed"); }
       return store.recordResource(pid, r);
     };
-    await assert.rejects(runProvision(P.id, steps(), { store: crashing }), /process killed/);
+    await assert.rejects(runProvision(P.id, steps(), { store: crashing, authorize: allowAll }), /process killed/);
     assert.equal(store.steps.get(`${P.id}/${key}`).status, "pending");
-    const out = await runProvision(P.id, steps(), { store });
+    const out = await runProvision(P.id, steps(), { store, authorize: allowAll });
     assert.equal(out[i].outcome, "adopted");
     const posts = fake.creates();
     assert.equal(posts.filter((c) => c.path === "/user/repos").length, 1);
@@ -67,7 +67,7 @@ for (const [i, key] of ["github/repo", "coolify/project"].entries()) {
 test("AT4 a create that succeeds but times out is looked up and adopted, never POSTed again", async () => {
   const { fake, steps, store } = setup();
   fake.faults.push({ match: (m, p) => m === "POST" && p === "/user/repos", action: "timeout-after" });
-  const out = await runProvision(P.id, steps(), { store });
+  const out = await runProvision(P.id, steps(), { store, authorize: allowAll });
   assert.equal(out[0].outcome, "adopted");
   assert.equal(fake.creates().filter((c) => c.path === "/user/repos").length, 1);
 });
@@ -75,18 +75,18 @@ test("AT4 a create that succeeds but times out is looked up and adopted, never P
 test("AT4b a create that fails with 5xx and did not happen ends create_unconfirmed (retryable); the next run creates once", async () => {
   const { fake, steps, store } = setup();
   fake.faults.push({ match: (m, p) => m === "POST" && p === "/user/repos", action: { status: 502 } });
-  await assert.rejects(runProvision(P.id, steps(), { store }), (e) => e instanceof StepError && e.code === "create_unconfirmed" && e.retryable);
+  await assert.rejects(runProvision(P.id, steps(), { store, authorize: allowAll }), (e) => e instanceof StepError && e.code === "create_unconfirmed" && e.retryable);
   assert.equal(store.steps.get(`${P.id}/github/repo`).status, "failed");
-  const out = await runProvision(P.id, steps(), { store });
+  const out = await runProvision(P.id, steps(), { store, authorize: allowAll });
   assert.equal(out[0].outcome, "created");
   assert.equal(fake.repos.size, 1);
 });
 
 test("AT5 a same-named repo without our marker is a non-retryable name_conflict and is not adopted", async () => {
   const { fake, steps, store } = setup();
-  await runProvision(OTHER.id, [steps(OTHER)[0]], { store: new MemoryStore() });
+  await runProvision(OTHER.id, [steps(OTHER)[0]], { store: new MemoryStore(), authorize: allowAll });
   const posts = fake.creates().length;
-  await assert.rejects(runProvision(P.id, steps(), { store }), (e) => e instanceof StepError && e.code === "name_conflict" && !e.retryable);
+  await assert.rejects(runProvision(P.id, steps(), { store, authorize: allowAll }), (e) => e instanceof StepError && e.code === "name_conflict" && !e.retryable);
   assert.equal(fake.creates().length, posts);
   assert.equal(store.resources.length, 0);
   assert.match(store.steps.get(`${P.id}/github/repo`).lastError, /^name_conflict/);
@@ -95,19 +95,19 @@ test("AT5 a same-named repo without our marker is a non-retryable name_conflict 
 test("AT5b a public repo with our marker is not ours either (must be private)", async () => {
   const { fake, steps, store } = setup();
   fake.repos.set("kkarnati1980/devos-acme", { id: 1, name: "devos-acme", full_name: "kkarnati1980/devos-acme", private: false, description: `x devos:${P.id}` });
-  await assert.rejects(runProvision(P.id, steps(), { store }), (e) => e.code === "name_conflict");
+  await assert.rejects(runProvision(P.id, steps(), { store, authorize: allowAll }), (e) => e.code === "name_conflict");
 });
 
 test("AT5c a resource already in another project's inventory is refused", async () => {
   const { steps, store } = setup();
-  await runProvision(P.id, steps(), { store });
+  await runProvision(P.id, steps(), { store, authorize: allowAll });
   store.steps.clear();
   await assert.rejects(store.recordResource(OTHER.id, { ...store.resources[0] }), /resource_owned_elsewhere/);
 });
 
 test("AT8 two runs for the same project at once: one waits; each resource is created once", async () => {
   const { fake, steps, store } = setup();
-  const [a, b] = await Promise.all([runProvision(P.id, steps(), { store }), runProvision(P.id, steps(), { store })]);
+  const [a, b] = await Promise.all([runProvision(P.id, steps(), { store, authorize: allowAll }), runProvision(P.id, steps(), { store, authorize: allowAll })]);
   assert.deepEqual(a.map((o) => o.outcome), ["created", "created"]);
   assert.deepEqual(b.map((o) => o.outcome), ["recorded", "recorded"]);
   assert.equal(fake.creates().filter((c) => c.path === "/user/repos").length, 1);
@@ -153,16 +153,66 @@ test("AT12 a deny rule stops the create step as policy_denied (not an attempt) a
   await assert.rejects(runProvision(P.id, steps(), { store: store2, authorize: async () => "require_approval" }), (e) => e.code === "approval_required");
 });
 
-test("Secrets: the token is sent only in the auth header and never appears in errors or the journal", async () => {
+test("Secrets: the token is sent only in the auth header and never appears in errors or the journal (lookup and create failures)", async () => {
+  for (const fault of [
+    { match: (m, p) => m === "POST" && p === "/user/repos", action: { status: 500 } }, // create fails (unknown outcome)
+    { match: (m, p) => m === "POST" && p === "/user/repos", action: { status: 400 } }, // create rejected
+    { match: (m, p) => m === "GET" && p.startsWith("/repos/"), action: { status: 500 }, once: false }, // lookup fails
+  ]) {
+    const { fake, steps, store } = setup();
+    fake.faults.push(fault);
+    let err;
+    try { await runProvision(P.id, steps(), { store, authorize: allowAll }); } catch (e) { err = e; }
+    assert.ok(err, "the run must fail");
+    if (fault.match("POST", "/user/repos")) assert.equal(fake.calls.filter((c) => c.method === "POST").length, 1);
+    const blob = JSON.stringify({ msg: err.message, stack: err.stack, steps: [...store.steps.values()], res: store.resources });
+    assert.ok(!blob.includes(TOKEN));
+    assert.ok([...store.steps.values()].every((x) => x.lastError && x.lastError.length <= 300));
+    assert.ok(fake.calls.every((c) => c.auth === `Bearer ${TOKEN}` && !JSON.stringify(c.body ?? "").includes(TOKEN)));
+  }
+});
+
+test("A 422 with nothing under our name is a permanent provider_error, not retried", async () => {
   const { fake, steps, store } = setup();
-  fake.faults.push({ match: (m, p) => m === "POST" && p === "/user/repos", action: { status: 500 } });
-  fake.faults.push({ match: (m, p) => m === "GET" && p.startsWith("/repos/"), action: { status: 500 }, once: false, after: false });
-  let err;
-  try { await runProvision(P.id, steps(), { store }); } catch (e) { err = e; }
-  assert.ok(err);
-  const blob = JSON.stringify({ msg: err.message, stack: err.stack, steps: [...store.steps.values()], res: store.resources });
-  assert.ok(!blob.includes(TOKEN));
-  assert.ok(fake.calls.every((c) => c.auth === `Bearer ${TOKEN}` && !JSON.stringify(c.body ?? "").includes(TOKEN)));
+  fake.faults.push({ match: (m, p) => m === "POST" && p === "/user/repos", action: { status: 422 } });
+  await assert.rejects(runProvision(P.id, steps(), { store, authorize: allowAll }), (e) => e.code === "provider_error" && !e.retryable);
+});
+
+test("Owner mismatch is caught before the create: no orphan repo on the token's account", async () => {
+  const { fake, steps, store } = setup();
+  fake.state.login = "someone-else";
+  await assert.rejects(runProvision(P.id, steps(), { store, authorize: allowAll }), (e) => e.code === "provider_error" && !e.retryable);
+  assert.equal(fake.calls.filter((c) => c.method === "POST").length, 0);
+  assert.equal(fake.repos.size, 0);
+});
+
+test("authorize is required (ADR-0006): a run without it fails before any create", async () => {
+  const { fake, steps, store } = setup();
+  await assert.rejects(runProvision(P.id, steps(), { store }), /authorize is required/);
+  assert.equal(fake.creates().length, 0);
+});
+
+test("A lost project lock stops the run before the create", async () => {
+  const { fake, steps, store } = setup();
+  store.lockLost = true;
+  await assert.rejects(runProvision(P.id, steps(), { store, authorize: allowAll }), /provision_lock_lost/);
+  assert.equal(fake.creates().length, 0);
+});
+
+test("PrismaStore lock: session lock with lock_timeout, released at the end, and a dead lock connection stops creates", async () => {
+  const log = []; let pingFails = false;
+  const conn = { query: async (sql, params) => { log.push([sql, params]); if (sql === "SELECT 1" && pingFails) throw new Error("conn gone"); return {}; },
+                 end: async () => { log.push(["end"]); }, on: () => {} };
+  const store = new PrismaStore({ provisionStep: {}, resource: {} }, { connectLock: async () => conn, lockWaitMs: 5000 });
+  await store.withProjectLock(P.id, async () => {
+    await store.assertLockHeld(P.id);
+    pingFails = true;
+    await assert.rejects(store.assertLockHeld(P.id), /provision_lock_lost/);
+  });
+  assert.deepEqual(log.map((l) => l[0]), ["SET lock_timeout = 5000", "SELECT pg_advisory_lock(hashtext('devos:provision'), hashtext($1))", "SELECT 1", "SELECT 1",
+    "SELECT pg_advisory_unlock(hashtext('devos:provision'), hashtext($1))", "end"]);
+  assert.deepEqual(log[1][1], [P.id]);
+  await assert.rejects(store.assertLockHeld(P.id), /provision_lock_lost/); // not held after the run
 });
 
 test("Transport refuses an origin with a path and a path that escapes the origin", async () => {
@@ -174,9 +224,9 @@ test("Transport refuses an origin with a path and a path that escapes the origin
 
 test("runStep on a done step makes no provider calls", async () => {
   const { fake, steps, store } = setup();
-  await runStep(P.id, steps()[0], { store });
+  await runStep(P.id, steps()[0], { store, authorize: allowAll });
   const n = fake.calls.length;
-  const r = await runStep(P.id, steps()[0], { store });
+  const r = await runStep(P.id, steps()[0], { store, authorize: allowAll });
   assert.equal(r.outcome, "recorded");
   assert.equal(fake.calls.length, n);
 });

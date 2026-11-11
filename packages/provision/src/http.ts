@@ -95,7 +95,10 @@ export class Transport {
     if (url.origin !== this.origin) throw new Error(`transport-path-invalid: ${this.provider}`);
     let token: string;
     try {
-      token = await this.o.token();
+      token = await Promise.race([
+        Promise.resolve(this.o.token()),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("token-timeout")), Math.min(this.o.timeoutMs, 10_000)).unref()),
+      ]);
     } catch {
       throw new ProviderError(this.provider, "no-token", `${this.provider} token is not available from the vault`);
     }

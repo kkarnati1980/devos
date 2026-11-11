@@ -37,6 +37,17 @@ export class GitHubClient {
     return r.body;
   }
 
+  /** The token's own login: `POST /user/repos` always creates under it. Read once per client. */
+  private login?: Promise<string>;
+  whoami(): Promise<string> {
+    this.login ??= this.http.get<{ login: string }>("/user").then((r) => {
+      if (!r.body || typeof r.body.login !== "string") throw new Error("github-user-unknown");
+      return r.body.login;
+    });
+    this.login.catch(() => { this.login = undefined; });
+    return this.login;
+  }
+
   /** `POST /user/repos`: a private, empty repo (no auto-init) for the token's own account. */
   async createRepo(name: string, description: string): Promise<RepoBody> {
     if (!NAME_RE.test(name)) throw new Error("github-name-invalid");
@@ -66,6 +77,9 @@ export function githubRepoStep(gh: GitHubClient, p: { id: string; slug: string; 
       return r ? toFound(p.id, r) : null;
     },
     create: async () => {
+      // Check the owner before creating, so a mismatch can never leave an orphan repo on the token's account.
+      const login = await gh.whoami();
+      if (login.toLowerCase() !== owner.toLowerCase()) throw new Error("github-owner-mismatch: the token's account is not the configured owner");
       const r = await gh.createRepo(repo, `${label} (DevOS project) ${ownershipMarker(p.id)}`);
       if (r.full_name.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) throw new Error("github-repo-owner-mismatch");
       return toFound(p.id, r);
