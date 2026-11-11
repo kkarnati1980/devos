@@ -94,13 +94,16 @@ export class Transport {
     const url = new URL(path, this.origin);
     if (url.origin !== this.origin) throw new Error(`transport-path-invalid: ${this.provider}`);
     let token: string;
+    let timer: NodeJS.Timeout | undefined;
     try {
       token = await Promise.race([
         Promise.resolve(this.o.token()),
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("token-timeout")), Math.min(this.o.timeoutMs, 10_000)).unref()),
+        new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("token-timeout")), Math.min(this.o.timeoutMs, 10_000)); }),
       ]);
     } catch {
       throw new ProviderError(this.provider, "no-token", `${this.provider} token is not available from the vault`);
+    } finally {
+      clearTimeout(timer);
     }
     if (!token) throw new ProviderError(this.provider, "no-token", `${this.provider} token is not available from the vault`);
     let res: Response;

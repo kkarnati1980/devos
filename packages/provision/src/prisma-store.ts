@@ -61,15 +61,33 @@ export class PrismaStore implements ProvisionStore {
     return c as unknown as LockConnection;
   }
 
-  async withProjectLock<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
-    if (this.held.has(projectId)) throw new Error("provision_lock_reentry");
+  private readonly queue = new Map<string, Promise<unknown>>();
+
+  /** Runs for the same project in this process queue up first, then take the DB lock (other processes wait there). */
+  withProjectLock<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.queue.get(projectId) ?? Promise.resolve();
+    const run = prev.catch(() => {}).then(() => this.lockAndRun(projectId, fn));
+    const tail = run.catch(() => {});
+    this.queue.set(projectId, tail);
+    void tail.then(() => { if (this.queue.get(projectId) === tail) this.queue.delete(projectId); });
+    return run;
+  }
+
+  private async lockAndRun<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
     const conn = await this.openLock();
     const state = { conn, lost: false };
     conn.on("error", () => { state.lost = true; });
     try {
-      const wait = Math.max(1, Math.floor(this.o.lockWaitMs ?? 15 * 60_000));
+      const wait = Math.max(1, Math.floor(Number(this.o.lockWaitMs ?? 15 * 60_000)));
+      if (!Number.isFinite(wait)) throw new Error("provision_lock_wait_invalid");
       await conn.query(`SET lock_timeout = ${wait}`);
-      await conn.query(LOCK_SQL, [projectId]);
+      try {
+        await conn.query(LOCK_SQL, [projectId]);
+      } catch (e) {
+        // 55P03 lock_not_available: another run holds the project; typed so the caller retries later (not an attempt).
+        if ((e as { code?: string }).code === "55P03") throw new Error("provision_busy");
+        throw e;
+      }
       this.held.set(projectId, state);
       try {
         return await fn();

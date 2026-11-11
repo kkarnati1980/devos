@@ -215,6 +215,16 @@ test("PrismaStore lock: session lock with lock_timeout, released at the end, and
   await assert.rejects(store.assertLockHeld(P.id), /provision_lock_lost/); // not held after the run
 });
 
+test("PrismaStore: two runs for one project on one store queue (no re-entry error); a lock timeout is typed provision_busy", async () => {
+  const order = [];
+  const conn = () => ({ query: async () => ({}), end: async () => {}, on: () => {} });
+  const store = new PrismaStore({ provisionStep: {}, resource: {} }, { connectLock: async () => conn() });
+  await Promise.all([1, 2].map((i) => store.withProjectLock(P.id, async () => { order.push(`start${i}`); await new Promise((r) => setTimeout(r, 20)); order.push(`end${i}`); })));
+  assert.deepEqual(order, ["start1", "end1", "start2", "end2"]);
+  const busy = new PrismaStore({ provisionStep: {}, resource: {} }, { connectLock: async () => ({ query: async (sql) => { if (sql.includes("pg_advisory_lock(")) throw Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" }); return {}; }, end: async () => {}, on: () => {} }) });
+  await assert.rejects(busy.withProjectLock(P.id, async () => "x"), /provision_busy/);
+});
+
 test("Transport refuses an origin with a path and a path that escapes the origin", async () => {
   assert.throws(() => new Transport({ provider: "x", origin: "https://api.github.com/evil", token: () => "t" }), /transport-origin-invalid/);
   const t = new Transport({ provider: "x", origin: "https://api.github.com", token: () => "t", fetchImpl: async () => new Response("{}") });

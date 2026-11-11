@@ -67,7 +67,7 @@ test("Lock on Postgres: held for as long as the run takes (no timer), and a wait
   let release; const gate = new Promise((r) => { release = r; });
   const running = holder.withProjectLock(p.id, async () => { await gate; await holder.assertLockHeld(p.id); return "done"; });
   await new Promise((r) => setTimeout(r, 200));
-  await assert.rejects(waiter.withProjectLock(p.id, async () => "should not run"), /lock timeout|canceling statement/);
+  await assert.rejects(waiter.withProjectLock(p.id, async () => "should not run"), /provision_busy/);
   await new Promise((r) => setTimeout(r, 600)); // the holder outlives the waiter's timeout and still holds the lock
   release();
   assert.equal(await running, "done");
