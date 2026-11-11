@@ -66,7 +66,7 @@ function handler(req, res) {
   req.on("end", () => {
     const u = new URL(req.url, "http://x");
     const p = u.pathname;
-    reqs.push({ method: req.method, path: p, auth: req.headers.authorization || "", body });
+    reqs.push({ method: req.method, path: p, url: req.url, auth: req.headers.authorization || "", body });
     const json = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
     let m;
     if (p === "/gh/repos/kkarnati1980/devos/commits/main") return json(200, { sha: M.main });
@@ -775,7 +775,7 @@ test("DEVOS-90: only comments since the last one seen are read; a post that keep
   M.comments[77].push(cmt(32, "kkarnati1980", "/recheck"));
   M.failStatus = 5;
   const r1 = await runAgent({ RECHECK_MAX_FAILS: "2" });
-  assert.ok(reqs.some((q) => q.path.endsWith("/issues/77/comments")), r1.out);
+  assert.ok(reqs.some((q) => q.path.endsWith("/issues/77/comments") && q.url.includes("since=2026-11-11T10:00:31Z")), "reads only comments since the last one seen " + r1.out);
   assert.equal(checkRuns(), 2); assert.match(r1.out, /will retry \(1\/2\)/);
   const r2 = await runAgent({ RECHECK_MAX_FAILS: "2" });
   assert.match(r2.out, /gave up after 2 attempts, result dropped/);
@@ -790,4 +790,18 @@ test("DEVOS-90: only comments since the last one seen are read; a post that keep
   fs.writeFileSync(path.join(D(), "agent/recheck.result"), "garbage\n");
   const r4 = await runAgent();
   assert.match(r4.out, /stored result is unreadable; dropped/);
+});
+
+test("DEVOS-90: the 6-hour clock restarts when a new SHA's normal checks run", async () => {
+  resetMock(); freshState();
+  const a = commit(recheckFiles("clock-a"), "devos-90 clock a");
+  M.main = a; green(a); pass(a);
+  await runAgent();
+  fs.writeFileSync(path.join(D(), "agent/recheck.state"), `${Math.floor(Date.now() / 1000) - 21601} baseline\n`);
+  const b = commit(recheckFiles("clock-b"), "devos-90 clock b");
+  M.main = b; green(b); pass(b);
+  const r1 = await runAgent();
+  assert.equal(checkRuns(), 2, "normal checks for the new SHA " + r1.out);
+  const r2 = await runAgent();
+  assert.equal(checkRuns(), 2, "no timed re-check right after the normal checks " + r2.out);
 });

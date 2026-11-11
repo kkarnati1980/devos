@@ -388,7 +388,7 @@ scan_requests() {  # sets recheck.requested when an allowed /recheck is new; nev
     if (( n < 100 )) || (( page >= 30 )); then break; fi
     page=$((page + 1))
   done
-  if (( n >= 100 && page >= 30 )); then log "re-check: more than 3000 new comments on PR #$pr; only the first 3000 were read"; fi
+  if (( n >= 100 && page >= 30 )) && [[ "$(jq length <<<"$chunk")" -ge 100 ]]; then log "re-check: more than 3000 new comments on PR #$pr; only the first 3000 were read"; fi
   max="$(jq -r 'max_by(.id) // {id: 0, at: ""} | "\(.id) \(.at)"' <<<"$acc")"
   [[ "$max" =~ ^[0-9]+\ ([0-9TZ:-]{20})?$ ]] || return 0
   if [[ ! -s "$ST/recheck.last-id" ]]; then
@@ -420,8 +420,8 @@ recheck_target() {  # -> the SHA that is live now: the last successful deploy, e
   printf '%s' "$s"
 }
 # A post that keeps failing (e.g. the tracking PR was closed) must not block re-checks for good: after
-# RECHECK_MAX_FAILS failed attempts in a row the stored result is dropped, logged, and re-checks carry on.
-RECHECK_MAX_FAILS="${RECHECK_MAX_FAILS:-20}"
+# RECHECK_MAX_FAILS failed attempts in a row (about a day) the stored result is dropped, logged, and re-checks carry on.
+RECHECK_MAX_FAILS="${RECHECK_MAX_FAILS:-480}"   # 480 ticks of 3 min = about a day
 recheck_failed() {
   local n; n="$(cat "$ST/recheck.fails" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$((n + 1))
   if (( n >= RECHECK_MAX_FAILS )); then
