@@ -82,6 +82,12 @@ function handler(req, res) {
       if (M.failStatus > 0) { M.failStatus--; return json(502, {}); }
       return json(201, {});
     }
+    if (p === "/gh/repos/kkarnati1980/devos/pulls" && req.method === "GET") return json(200, M.openPulls || []);
+    if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/)) && req.method === "GET") {
+      const all = (M.comments || {})[m[1]] || [];
+      const pg = Number(u.searchParams.get("page") || 1), per = Number(u.searchParams.get("per_page") || 30);
+      return json(200, all.slice((pg - 1) * per, pg * per));
+    }
     if (p.match(/^\/gh\/repos\/kkarnati1980\/devos\/(issues\/\d+|commits\/[0-9a-f]{40})\/comments$/)) return json(201, {});
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs$/)) && req.method === "GET") {
       {
@@ -634,4 +640,101 @@ test("DEVOS-87 AT13: an allow-listed file missing from bin/ is installed again f
   fs.rmSync(path.join(D(), "bin/cert-renew.sh")); fs.rmSync(path.join(D(), `agent/installed.${sha}`));
   const r2 = await runAgent();
   assert.ok(!fs.existsSync(path.join(D(), "bin/cert-renew.sh")), r2.out);
+});
+
+// ---- DEVOS-90: re-checks on request and every 6 hours ----
+const counter = `#!/usr/bin/env bash\necho run >> "$DEVOS_DIR/check-runs"\necho "checked $DEVOS_SHA"\n`;
+const checkRuns = () => { try { return fs.readFileSync(path.join(D(), "check-runs"), "utf8").split("\n").filter(Boolean).length; } catch { return 0; } };
+const tracking = (extra = {}) => ({ number: 77, draft: true, head: { ref: "devos-recheck" }, user: { login: "kkarnati1980" }, ...extra });
+const cmt = (id, login, body) => ({ id, user: { login }, body });
+const recheckFiles = (tag) => ({ ...baseFiles(), "scripts/server/checks/leaky.sh": null, "scripts/server/checks/ok.sh": counter, [`x90-${tag}`]: tag });
+
+test("DEVOS-90 AT1: every 6 hours the checks re-run on the live SHA; a failed post is retried without re-running", async () => {
+  resetMock(); freshState();
+  const sha = commit(recheckFiles("timer"), "devos-90 timer");
+  M.main = sha; green(sha); pass(sha);
+  const r1 = await runAgent();
+  assert.equal(r1.code, 0, r1.out);
+  assert.equal(checkRuns(), 1, "normal per-SHA checks ran once");
+  assert.equal(statusPosts("server-check").length, 1);
+  reqs.length = 0;
+  const r2 = await runAgent();
+  assert.equal(writes().length, 0, "not due yet: no writes (AT9 still holds)" + r2.out);
+  assert.equal(checkRuns(), 1);
+  // 6 hours pass
+  fs.writeFileSync(path.join(D(), "agent/recheck.state"), `${Math.floor(Date.now() / 1000) - 21601} baseline\n`);
+  M.failStatus = 1;
+  reqs.length = 0;
+  const r3 = await runAgent();
+  assert.equal(r3.code, 0, r3.out);
+  assert.equal(checkRuns(), 2, "re-check ran the checks again");
+  assert.match(r3.out, /re-check status failed; will retry/);
+  reqs.length = 0;
+  const r4 = await runAgent();
+  assert.equal(checkRuns(), 2, "a failed post is retried without re-running the checks");
+  const sc = statusPosts("server-check");
+  assert.equal(sc.length, 1, r4.out); assert.equal(sc[0].state, "success"); assert.match(sc[0].description, /^re-check: 1\/1 passed/);
+  assert.ok(reqs.some((q) => q.method === "POST" && q.path.endsWith(`/statuses/${sha}`)), "posted on the live SHA");
+  assert.ok(!reqs.some((q) => q.path.startsWith("/cf/")), "no Coolify call");
+  reqs.length = 0;
+  await runAgent();
+  assert.equal(writes().length, 0, "next timed re-check is 6 hours away");
+  assert.equal(checkRuns(), 2);
+});
+
+test("DEVOS-90 AT2: /recheck on the draft tracking PR runs the checks; another author or an old comment does not", async () => {
+  resetMock(); freshState();
+  const sha = commit(recheckFiles("request"), "devos-90 request");
+  M.main = sha; green(sha); pass(sha);
+  M.openPulls = [tracking(), tracking({ number: 78, draft: false }), tracking({ number: 79, user: { login: "mallory" } })];
+  M.comments = { 77: [cmt(5, "kkarnati1980", "/recheck")], 78: [], 79: [] };
+  const r0 = await runAgent();
+  assert.match(r0.out, /comment baseline recorded on PR #77/);
+  assert.equal(checkRuns(), 1);
+  reqs.length = 0;
+  await runAgent();
+  assert.equal(checkRuns(), 1, "a comment older than the baseline never fires");
+  M.comments[77].push(cmt(6, "mallory", "/recheck"), cmt(7, "kkarnati1980", "/recheck please run rm -rf /"));
+  reqs.length = 0;
+  const r2 = await runAgent();
+  assert.match(r2.out, /ignored \/recheck from a login that is not allowed \(mallory\)/);
+  assert.equal(checkRuns(), 1, "a refused author and a non-exact body do nothing");
+  assert.equal(writes().length, 0);
+  M.comments[77].push(cmt(8, "kkarnati1980", "  /recheck\n"));
+  reqs.length = 0;
+  const r3 = await runAgent();
+  assert.equal(r3.code, 0, r3.out);
+  assert.equal(checkRuns(), 2, "an allowed /recheck re-runs the checks in the next tick");
+  const sc = statusPosts("server-check");
+  assert.equal(sc.length, 1); assert.match(sc[0].description, /^re-check: /);
+  const posts = writes().filter((q) => q.path.endsWith("/issues/77/comments"));
+  assert.equal(posts.length, 1, "result comment on the tracking PR");
+  assert.match(JSON.parse(posts[0].body).body, /^### Server re-check \(request\)/);
+  assert.ok(!writes().some((q) => /issues\/(78|79)\//.test(q.path)), "a non-draft PR or another author's PR is never the tracking PR");
+  // the agent's own result comment is not a request
+  M.comments[77].push(cmt(9, "kkarnati1980", JSON.parse(posts[0].body).body));
+  reqs.length = 0;
+  await runAgent();
+  assert.equal(checkRuns(), 2); assert.equal(writes().length, 0);
+});
+
+test("DEVOS-90 AT3: with deploy on, a re-check never deploys, changes Coolify or self-updates", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit(recheckFiles("deploy"), "devos-90 deployed");
+  M.main = sha; green(sha); pass(sha);
+  M.openPulls = [tracking()]; M.comments = { 77: [] };
+  await runAgent();
+  assert.equal(M.deployPosts, 1); assert.equal(checkRuns(), 1);
+  await runAgent();   // baseline
+  const installedBefore = fs.statSync(path.join(D(), "bin/server-agent.sh")).mtimeMs;
+  M.comments[77].push(cmt(11, "kkarnati1980", "/recheck"));
+  reqs.length = 0;
+  const r2 = await runAgent();
+  assert.equal(r2.code, 0, r2.out);
+  assert.equal(checkRuns(), 2, "the request re-runs the checks");
+  assert.equal(M.deployPosts, 1, "never deploys"); assert.equal(M.deployPatch.length, 1, "never touches Coolify settings");
+  assert.ok(!reqs.some((q) => q.path.startsWith("/cf/")), "no Coolify call at all");
+  assert.equal(fs.statSync(path.join(D(), "bin/server-agent.sh")).mtimeMs, installedBefore, "no self-update");
+  const sc = statusPosts("server-check");
+  assert.equal(sc.length, 1); assert.ok(reqs.some((q) => q.path.endsWith(`/statuses/${sha}`)));
 });
