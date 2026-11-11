@@ -63,8 +63,10 @@ function scanPlainStreamEnd(text: string, start: number): number {
  * `endstream` that is followed by `endobj`.
  */
 function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints: ReadonlyMap<number, number>): number {
-  const direct = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict);
-  const indirect = direct ? null : /\/Length\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(dict);
+  // The indirect form is tried first, and the direct number must be a whole integer token that is not followed by
+  // a generation number and R, so "/Length 19 0 R" can never read as a direct length of 1 (PR30-r10).
+  const indirect = /\/Length\s+(\d{1,10})\s+\d{1,5}\s+R(?![A-Za-z0-9])/.exec(dict);
+  const direct = indirect ? null : /\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R(?![A-Za-z0-9]))/.exec(dict);
   const len = direct ? Number(direct[1]) : indirect ? ints.get(Number(indirect[1])) : undefined;
   if (len !== undefined && start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) {
     return start + len;

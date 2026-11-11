@@ -606,3 +606,24 @@ test("AT4j PDF name tokens such as /endobj and /stream never end an object", () 
   assert.deepEqual(ids(r), ["FR-001"]);
   assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
 });
+
+// ---------- PR30-r10 ----------
+test("AT4k a multi-digit indirect /Length is resolved, also for a Flate stream whose bytes contain 'endstream endobj'", () => {
+  const content = "BT (FR-001 before) Tj T* (text: endstream endobj) Tj T* (FR-002 after) Tj ET";
+  const data = deflateSync(Buffer.from(content, "latin1"), { level: 0 }); // stored blocks: the text appears verbatim
+  assert.ok(data.includes(Buffer.from("endstream endobj")), "fixture really contains the delimiter text");
+  const doc = Buffer.concat([
+    Buffer.from(
+      "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" +
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] >>\nendobj\n" +
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" +
+        "4 0 obj\n<< /Length 19 0 R /Filter /FlateDecode >>\nstream\n",
+      "latin1",
+    ),
+    data,
+    Buffer.from(`\nendstream\nendobj\n19 0 obj\n${data.length}\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n`, "latin1"),
+  ]);
+  const r = parseSpec(doc, "len19.pdf");
+  assert.deepEqual(ids(r), ["FR-001", "FR-002"]);
+  assert.ok(!r.warnings.includes("pdf-stream-damaged"));
+});
