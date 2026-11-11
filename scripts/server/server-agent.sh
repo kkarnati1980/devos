@@ -374,24 +374,28 @@ recheck_pr() {  # -> number of the tracking PR (empty if none); 1 on read error
       and ((.user.login // "") as $u | $u != "" and ($a | contains(" " + $u + " "))))] | min_by(.number) // empty | .number' <<<"$p"
 }
 scan_requests() {  # sets recheck.requested when an allowed /recheck is new; never fatal
-  local pr page=1 chunk acc='[]' n last max
+  local pr page=1 chunk acc='[]' n last max since="" q=""
   pr="$(recheck_pr)" || { log "re-check: cannot read the tracking PR; next tick"; return 0; }
   [[ "$pr" =~ ^[0-9]+$ ]] || return 0
+  # Only comments updated since the last one seen are read (GitHub's since= filter), so a long thread stays cheap.
+  since="$(sed -n '1s/^[0-9]\{1,20\} \([0-9TZ:-]\{20\}\)$/\1/p' "$ST/recheck.last-id" 2>/dev/null || true)"
+  [[ -n "$since" ]] && q="&since=$since"
   while :; do
-    chunk="$(gh GET "/repos/$REPO/issues/$pr/comments?per_page=100&page=$page")" || { log "re-check: cannot read PR #$pr comments; next tick"; return 0; }
-    chunk="$(jq -c '[.[]? | {id, login: .user.login, body}]' <<<"$chunk")" || return 0
+    chunk="$(gh GET "/repos/$REPO/issues/$pr/comments?per_page=100&page=$page$q")" || { log "re-check: cannot read PR #$pr comments; next tick"; return 0; }
+    chunk="$(jq -c '[.[]? | {id, login: .user.login, body, at: (.updated_at // "")}]' <<<"$chunk")" || return 0
     acc="$(jq -c --argjson c "$chunk" '. + $c' <<<"$acc")"
     n="$(jq 'length' <<<"$chunk")"
     if (( n < 100 )) || (( page >= 30 )); then break; fi
     page=$((page + 1))
   done
-  max="$(jq -r '[.[].id] | max // 0' <<<"$acc")"
-  [[ "$max" =~ ^[0-9]+$ ]] || return 0
+  if (( n >= 100 && page >= 30 )); then log "re-check: more than 3000 new comments on PR #$pr; only the first 3000 were read"; fi
+  max="$(jq -r 'max_by(.id) // {id: 0, at: ""} | "\(.id) \(.at)"' <<<"$acc")"
+  [[ "$max" =~ ^[0-9]+\ ([0-9TZ:-]{20})?$ ]] || return 0
   if [[ ! -s "$ST/recheck.last-id" ]]; then
     [[ $DRY -eq 1 ]] && { log "re-check: WOULD record the comment baseline on PR #$pr"; return 0; }
     echo "$max" > "$ST/recheck.last-id"; log "re-check: comment baseline recorded on PR #$pr"; return 0
   fi
-  last="$(head -n1 "$ST/recheck.last-id")"; [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  last="$(head -n1 "$ST/recheck.last-id" | cut -d' ' -f1)"; [[ "$last" =~ ^[0-9]+$ ]] || last=0
   local id login body hit=""
   while IFS=$'\t' read -r id login body; do
     [[ "$id" =~ ^[0-9]+$ ]] || continue
@@ -401,7 +405,7 @@ scan_requests() {  # sets recheck.requested when an allowed /recheck is new; nev
              | [.id, (.login // ""), "x"] | @tsv' <<<"$acc")
   [[ $DRY -eq 1 ]] && { [[ -n "$hit" ]] && log "re-check: WOULD act on the /recheck request on PR #$pr"; return 0; }
   [[ -n "$hit" ]] && { echo "$pr $hit" > "$ST/recheck.requested"; log "re-check requested on PR #$pr"; }
-  (( max > last )) && echo "$max" > "$ST/recheck.last-id"
+  (( ${max%% *} > last )) && echo "$max" > "$ST/recheck.last-id"
   return 0
 }
 recheck_target() {  # -> the SHA that is live now: the last successful deploy, else (deploy off) the installed SHA
@@ -415,19 +419,31 @@ recheck_target() {  # -> the SHA that is live now: the last successful deploy, e
   [[ "$s" =~ ^[0-9a-f]{40}$ && -e "$ST/done.$s" && -e "$ST/installed.$s" ]] || return 0
   printf '%s' "$s"
 }
+# A post that keeps failing (e.g. the tracking PR was closed) must not block re-checks for good: after
+# RECHECK_MAX_FAILS failed attempts in a row the stored result is dropped, logged, and re-checks carry on.
+RECHECK_MAX_FAILS="${RECHECK_MAX_FAILS:-20}"
+recheck_failed() {
+  local n; n="$(cat "$ST/recheck.fails" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$((n + 1))
+  if (( n >= RECHECK_MAX_FAILS )); then
+    log "$1; gave up after $n attempts, result dropped"; rm -f "$ST/recheck.result" "$ST/recheck.statused" "$ST/recheck.fails"
+  else echo "$n" > "$ST/recheck.fails"; log "$1; will retry ($n/$RECHECK_MAX_FAILS)"; fi
+}
 publish_recheck() {  # posts a stored re-check result; kept for the next tick when the post fails
   local sha st desc pr c
   [[ -s "$ST/recheck.result" ]] || return 0
-  read -r sha pr st desc < "$ST/recheck.result"
+  read -r sha pr st desc < "$ST/recheck.result" || true
+  if ! [[ "$sha" =~ ^[0-9a-f]{40}$ && ( "$pr" == - || "$pr" =~ ^[0-9]+$ ) && "$st" =~ ^(success|failure)$ && -s "$ST/recheck.checks.md" ]]; then
+    log "re-check: stored result is unreadable; dropped"; rm -f "$ST/recheck.result" "$ST/recheck.statused" "$ST/recheck.fails"; return 0
+  fi
   if [[ ! -e "$ST/recheck.statused" ]]; then
     if status "$sha" server-check "$st" "re-check: $desc"; then touch "$ST/recheck.statused"
-    else log "${sha:0:7}: re-check status failed; will retry"; return 0; fi
+    else recheck_failed "${sha:0:7}: re-check status failed"; return 0; fi
   fi
   if [[ "$pr" =~ ^[0-9]+$ ]]; then
     jq -Rs '{body: .}' "$ST/recheck.checks.md" > "$TMP/rc.json"
-    gh POST "/repos/$REPO/issues/$pr/comments" "$TMP/rc.json" >/dev/null || { log "re-check comment failed; will retry"; return 0; }
+    gh POST "/repos/$REPO/issues/$pr/comments" "$TMP/rc.json" >/dev/null || { recheck_failed "re-check comment failed"; return 0; }
   fi
-  rm -f "$ST/recheck.result" "$ST/recheck.statused"
+  rm -f "$ST/recheck.result" "$ST/recheck.statused" "$ST/recheck.fails"
   log "${sha:0:7}: re-check posted ($st $desc)"
 }
 # recheck_tick: runs only after the normal flow has finished for the live SHA, and never while a deployment is
@@ -545,7 +561,10 @@ else
   log "main ${sha:0:7}: deploy disabled (first launch not approved by KK)"
 fi
 
-[[ -s "$ST/$sha.checks.state" ]] || run_checks "$sha"
+if [[ ! -s "$ST/$sha.checks.state" ]]; then
+  run_checks "$sha"
+  echo "$(date +%s) $sha normal" > "$ST/recheck.state"   # DEVOS-90: the 6-hour clock restarts after normal checks
+fi
 publish "$sha"
 [[ -e "$ST/done.$sha" ]] && recheck_tick
 exit 0

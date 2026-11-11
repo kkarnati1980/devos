@@ -84,7 +84,8 @@ function handler(req, res) {
     }
     if (p === "/gh/repos/kkarnati1980/devos/pulls" && req.method === "GET") return json(200, M.openPulls || []);
     if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/)) && req.method === "GET") {
-      const all = (M.comments || {})[m[1]] || [];
+      const since = u.searchParams.get("since");
+      const all = ((M.comments || {})[m[1]] || []).filter((c) => !since || c.updated_at >= since);
       const pg = Number(u.searchParams.get("page") || 1), per = Number(u.searchParams.get("per_page") || 30);
       return json(200, all.slice((pg - 1) * per, pg * per));
     }
@@ -646,7 +647,7 @@ test("DEVOS-87 AT13: an allow-listed file missing from bin/ is installed again f
 const counter = `#!/usr/bin/env bash\necho run >> "$DEVOS_DIR/check-runs"\necho "checked $DEVOS_SHA"\n`;
 const checkRuns = () => { try { return fs.readFileSync(path.join(D(), "check-runs"), "utf8").split("\n").filter(Boolean).length; } catch { return 0; } };
 const tracking = (extra = {}) => ({ number: 77, draft: true, head: { ref: "devos-recheck" }, user: { login: "kkarnati1980" }, ...extra });
-const cmt = (id, login, body) => ({ id, user: { login }, body });
+const cmt = (id, login, body) => ({ id, user: { login }, body, updated_at: `2026-11-11T10:00:${String(id).padStart(2, "0")}Z` });
 const recheckFiles = (tag) => ({ ...baseFiles(), "scripts/server/checks/leaky.sh": null, "scripts/server/checks/ok.sh": counter, [`x90-${tag}`]: tag });
 
 test("DEVOS-90 AT1: every 6 hours the checks re-run on the live SHA; a failed post is retried without re-running", async () => {
@@ -710,7 +711,7 @@ test("DEVOS-90 AT2: /recheck on the draft tracking PR runs the checks; another a
   const posts = writes().filter((q) => q.path.endsWith("/issues/77/comments"));
   assert.equal(posts.length, 1, "result comment on the tracking PR");
   assert.match(JSON.parse(posts[0].body).body, /^### Server re-check \(request\)/);
-  assert.ok(!writes().some((q) => /issues\/(78|79)\//.test(q.path)), "a non-draft PR or another author's PR is never the tracking PR");
+  assert.ok(reqs.some((q) => q.method === "GET" && q.path.endsWith("/issues/77/comments")), "comments are read");
   // the agent's own result comment is not a request
   M.comments[77].push(cmt(9, "kkarnati1980", JSON.parse(posts[0].body).body));
   reqs.length = 0;
@@ -737,4 +738,56 @@ test("DEVOS-90 AT3: with deploy on, a re-check never deploys, changes Coolify or
   assert.equal(fs.statSync(path.join(D(), "bin/server-agent.sh")).mtimeMs, installedBefore, "no self-update");
   const sc = statusPosts("server-check");
   assert.equal(sc.length, 1); assert.ok(reqs.some((q) => q.path.endsWith(`/statuses/${sha}`)));
+});
+
+test("DEVOS-90 AT19: a non-draft devos-recheck PR or one opened by another login is never the tracking PR; dry run writes no re-check state", async () => {
+  resetMock(); freshState();
+  const sha = commit(recheckFiles("filters"), "devos-90 filters");
+  M.main = sha; green(sha); pass(sha);
+  M.openPulls = [tracking({ number: 81, draft: false }), tracking({ number: 82, user: { login: "mallory" } })];
+  M.comments = { 81: [], 82: [] };
+  await runAgent(); await runAgent();
+  M.comments[81].push(cmt(21, "kkarnati1980", "/recheck")); M.comments[82].push(cmt(22, "kkarnati1980", "/recheck"));
+  reqs.length = 0;
+  const r = await runAgent();
+  assert.equal(checkRuns(), 1, r.out); assert.equal(writes().length, 0);
+  assert.ok(!reqs.some((q) => /issues\/(81|82)\/comments/.test(q.path)), "their comments are never read");
+  assert.ok(!fs.existsSync(path.join(D(), "agent/recheck.last-id")));
+  // dry run with a pending request on a real tracking PR: decides, writes nothing
+  M.openPulls.push(tracking({ number: 83 })); M.comments[83] = [cmt(23, "kkarnati1980", "/recheck")];
+  fs.writeFileSync(path.join(D(), "agent/recheck.last-id"), "1 2026-11-11T10:00:01Z\n");
+  const before = fs.readdirSync(path.join(D(), "agent")).sort();
+  reqs.length = 0;
+  const d = await runAgent({}, ["--dry-run"]);
+  assert.match(d.out, /WOULD act on the \/recheck request on PR #83/);
+  assert.deepEqual(fs.readdirSync(path.join(D(), "agent")).sort(), before, "dry run creates no state");
+  assert.equal(writes().length, 0); assert.equal(checkRuns(), 1);
+  assert.ok(reqs.some((q) => q.path.endsWith("/issues/83/comments") && q.method === "GET"));
+});
+
+test("DEVOS-90: only comments since the last one seen are read; a post that keeps failing is dropped so re-checks carry on", async () => {
+  resetMock(); freshState();
+  const sha = commit(recheckFiles("since"), "devos-90 since");
+  M.main = sha; green(sha); pass(sha);
+  M.openPulls = [tracking()]; M.comments = { 77: [cmt(31, "kkarnati1980", "hello")] };
+  await runAgent();
+  assert.equal(fs.readFileSync(path.join(D(), "agent/recheck.last-id"), "utf8").trim(), "31 2026-11-11T10:00:31Z");
+  M.comments[77].push(cmt(32, "kkarnati1980", "/recheck"));
+  M.failStatus = 5;
+  const r1 = await runAgent({ RECHECK_MAX_FAILS: "2" });
+  assert.ok(reqs.some((q) => q.path.endsWith("/issues/77/comments")), r1.out);
+  assert.equal(checkRuns(), 2); assert.match(r1.out, /will retry \(1\/2\)/);
+  const r2 = await runAgent({ RECHECK_MAX_FAILS: "2" });
+  assert.match(r2.out, /gave up after 2 attempts, result dropped/);
+  assert.ok(!fs.existsSync(path.join(D(), "agent/recheck.result")));
+  M.failStatus = 0;
+  M.comments[77].push(cmt(33, "kkarnati1980", "/recheck"));
+  reqs.length = 0;
+  const r3 = await runAgent();
+  assert.equal(checkRuns(), 3, r3.out);
+  assert.equal(statusPosts("server-check").length, 1, "the next request runs and posts");
+  // a garbled stored result is dropped, not retried for ever
+  fs.writeFileSync(path.join(D(), "agent/recheck.result"), "garbage\n");
+  const r4 = await runAgent();
+  assert.match(r4.out, /stored result is unreadable; dropped/);
 });
