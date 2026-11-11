@@ -2,6 +2,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { crc32, deflateRawSync, deflateSync } from "node:zlib";
 import { ingest, parseSpec, IngestError, extractRequirementIds, DEFAULT_LIMITS } from "../dist/index.js";
 
@@ -388,4 +390,31 @@ test("AT4b pdf follows the page tree: physical order and unused or obsolete stre
 
   // Without a resolvable page tree, file order is used and the result says so.
   assert.ok(parseSpec(pdf(["BT (FR-1) Tj ET"]), "flat.pdf").warnings.includes("pdf-page-order-unknown"));
+});
+
+// ---------- PR30-r2 ----------
+test("AT1b a fenced <script> example never removes later requirements", () => {
+  const md = ["# Spec", "```html", "<script>", "example();", "```", "", "- FR-001 still here", "<script>unclosed", "- FR-002 also here", "<style>p{}</style>", "- FR-003 kept"].join("\n");
+  const r = parseSpec(enc(md), "s.md");
+  assert.deepEqual(ids(r), ["FR-001", "FR-002", "FR-003"]);
+  const code = r.blocks.find((b) => b.type === "code");
+  assert.equal(code.text, "<script>\nexample();");
+  assert.ok(!r.text.includes("<script"), "nothing active in the output");
+  assert.ok(!r.text.includes("p{}"), "closed style block removed");
+});
+
+test("AT10b check-spec CLI: unreadable input is a fixed refusal with no path", () => {
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const secretPath = "/nonexistent/TOPSECRET-dir/spec.md";
+  let out = "";
+  let status = 0;
+  try {
+    execFileSync(process.execPath, [cli, secretPath], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    out = String(e.stdout) + String(e.stderr);
+    status = e.status;
+  }
+  assert.equal(status, 2);
+  assert.equal(out.trim(), "refused: file-unreadable");
+  assert.ok(!out.includes("TOPSECRET"));
 });

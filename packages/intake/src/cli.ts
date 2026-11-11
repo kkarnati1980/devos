@@ -11,12 +11,20 @@ async function main(): Promise<number> {
     process.stderr.write("usage: check-spec <file>\n");
     return 64;
   }
-  if (statSync(file).size > DEFAULT_LIMITS.maxBytes) {
-    process.stdout.write("refused: too-large\n");
+  let bytes: Buffer;
+  try {
+    if (statSync(file).size > DEFAULT_LIMITS.maxBytes) {
+      process.stdout.write("refused: too-large\n");
+      return 2;
+    }
+    bytes = readFileSync(file);
+  } catch {
+    // A filesystem error is reported as a fixed code only: no path, no library message (PR30-r2).
+    process.stdout.write("refused: file-unreadable\n");
     return 2;
   }
   try {
-    const r = await ingest(readFileSync(file), file);
+    const r = await ingest(bytes, file);
     const counts: Record<string, number> = {};
     for (const b of r.blocks) counts[b.type] = (counts[b.type] ?? 0) + 1;
     const fr = r.requirementIds.filter((x) => /^FR-?\d/.test(x.id));
@@ -38,4 +46,10 @@ async function main(): Promise<number> {
   }
 }
 
-main().then((code) => process.exit(code));
+main().then(
+  (code) => process.exit(code),
+  () => {
+    process.stdout.write("refused: parse-failed\n");
+    process.exit(2);
+  },
+);

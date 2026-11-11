@@ -1,11 +1,39 @@
 import { cleanText, type Block } from "./model.js";
 import { decodeEntities } from "./xml.js";
 
-/** Remove raw <script>/<style> blocks (and unterminated openers) from Markdown; other HTML stays as text. */
+/**
+ * Remove raw <script>/<style> blocks from Markdown text outside fenced code (PR30-r2). A closed block is removed
+ * with its content; an unterminated opener removes only the tag itself, so nothing after it can be lost (the
+ * rest is kept and rendered inert). Fenced code is never touched.
+ */
+function stripActiveSegment(seg: string): string {
+  return seg.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "").replace(/<\/?(script|style)\b[^>]*>/gi, "");
+}
+
 function stripActive(src: string): string {
-  return src
-    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
-    .replace(/<(script|style)\b[^>]*>[\s\S]*$/gi, "");
+  const lines = src.split("\n");
+  const out: string[] = [];
+  let seg: string[] = [];
+  let fence: string | null = null;
+  const flush = () => {
+    if (seg.length) for (const l of stripActiveSegment(seg.join("\n")).split("\n")) out.push(l);
+    seg = [];
+  };
+  for (const line of lines) {
+    if (fence === null) {
+      const f = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+      if (f) {
+        flush();
+        fence = f[1] ?? "```";
+        out.push(line);
+      } else seg.push(line);
+    } else {
+      out.push(line);
+      if (line.trimStart().startsWith(fence)) fence = null;
+    }
+  }
+  flush();
+  return out.join("\n");
 }
 
 function isTableRow(line: string): boolean {
