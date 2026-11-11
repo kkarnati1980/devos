@@ -34,7 +34,8 @@ jobs:
         run: |
           for i in 1 2 3; do
             pnpm --filter @devos/dashboard exec playwright install --with-deps chromium && exit 0
-            echo "browser install failed (attempt $i/3); retrying in 20 s"; sleep 20
+            echo "browser install failed (attempt $i/3)"
+            if [ "$i" -lt 3 ]; then sleep 20; fi
           done
           exit 1
       - name: Browser acceptance tests
