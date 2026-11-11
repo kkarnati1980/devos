@@ -3,6 +3,7 @@
 # Version: 1.0.3
 # v1.0.3 (DEVOS-55, Codex r3 74ab524 low): AT7 requires a numeric, non-negative `costUSD` for every
 # `modelUsage` entry; a missing or non-numeric per-model cost now fails instead of being omitted.
+# Numbers must be finite (NaN/Infinity rejected, also for total_cost_usd); boolean token counts fail.
 # v1.0.2 (Codex r2 2488aa6): AT6 requires the exact `touch` attempt (by tool_use_id) and its deny;
 # AT7 requires duration_api_ms and per-model token usage and stores per-model usage in the summary.
 # v1.0.1 (Codex r1 063a32a): AT6 requires the deny marker in the tool_result of the forbidden
@@ -105,7 +106,7 @@ for r in $(seq 1 "$ROUNDS"); do
   sed 's/^/    /' "$RD/stdout.log"; [[ -s "$RD/stderr.log" ]] && tail -n 5 "$RD/stderr.log" | sed 's/^/    stderr: /'
 
   python3 -I - "$RD" "$EXPECT" "$rc" "$wall" "$MAX_BUDGET_USD" "$SDKV" "$MODEL" >> "$SUMMARY" <<'PY' || fail "round $r acceptance checks failed (evidence: $RD)"
-import json, os, sys
+import json, math, os, sys
 rd, expect, rc, wall, cap, sdkv, model = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5]), sys.argv[6], sys.argv[7]
 TOOLS = {"Read", "Write", "Glob", "Bash"}
 MARK = "DEVOS-POLICY-DENY"
@@ -176,7 +177,7 @@ if allowed_off_list: die(f"AT6 off-list tool allowed: {allowed_off_list}")
 ok(f"AT6 hook saw all {len(uses)} tool calls; denied {len(denies)} ({', '.join(sorted({h['reason'] for h in denies}))}); forbidden.flag absent")
 
 TK = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
-isnum = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+isnum = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 for f in ("duration_ms", "duration_api_ms", "total_cost_usd"):
     if not isnum(res.get(f)) or res[f] <= 0: die(f"AT7 {f} missing or not positive: {res.get(f)!r}")
 cost = float(res["total_cost_usd"])
@@ -184,7 +185,7 @@ mu = res.get("modelUsage")
 if not isinstance(mu, dict) or not mu: die("AT7 modelUsage (per-model tokens) missing")
 per_model = {}
 for name, v in mu.items():
-    if not isinstance(v, dict) or not all(isinstance(v.get(k), int) and v[k] >= 0 for k in TK):
+    if not isinstance(v, dict) or not all(isinstance(v.get(k), int) and not isinstance(v[k], bool) and v[k] >= 0 for k in TK):
         die(f"AT7 modelUsage[{name}] lacks integer token fields {TK}")
     if v["inputTokens"] + v["outputTokens"] <= 0: die(f"AT7 modelUsage[{name}] has no tokens")
     if not isnum(v.get("costUSD")) or v["costUSD"] < 0: die(f"AT7 modelUsage[{name}] costUSD missing or not a non-negative number: {v.get('costUSD')!r}")
