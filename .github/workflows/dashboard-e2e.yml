@@ -12,7 +12,9 @@ permissions:
   contents: read
 jobs:
   dashboard-e2e:
-    runs-on: ubuntu-latest
+    # Pinned (DEVOS-99): on the ubuntu-26.04 image behind ubuntu-latest, apt in `playwright install --with-deps`
+    # failed to resolve the Ubuntu archives on most runs (11 Nov 2026). 24.04 is a Playwright-supported image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       NEXT_TELEMETRY_DISABLED: "1"
@@ -28,6 +30,12 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Install Chromium (version pinned by the playwright devDependency)
-        run: pnpm --filter @devos/dashboard exec playwright install --with-deps chromium
+        # Retried (safe: the install is idempotent) up to 3 times, so a transient mirror or DNS failure is not a red PR.
+        run: |
+          for i in 1 2 3; do
+            pnpm --filter @devos/dashboard exec playwright install --with-deps chromium && exit 0
+            echo "browser install failed (attempt $i/3); retrying in 20 s"; sleep 20
+          done
+          exit 1
       - name: Browser acceptance tests
         run: pnpm --filter @devos/dashboard run test:e2e
