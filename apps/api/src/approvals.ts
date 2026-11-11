@@ -100,7 +100,9 @@ export function parseCard(v: unknown): CardInput | string {
     projectId = b.projectId;
   }
   if ([action, target, reason, consequence ?? ""].some(looksSecret)) return "card-contains-secret";
-  return { gate: b.gate as GateName, action, target, reason, costUsd, consequence, projectId };
+  // A purge action is always gate 5, whoever raises it, so the typed confirmation cannot be skipped (pre-review r2).
+  const gate = isPurgeAction(action) ? "purge" : (b.gate as GateName);
+  return { gate, action, target, reason, costUsd, consequence, projectId };
 }
 
 /** Gate 5: the hash KK's typed confirmation must match. */
@@ -446,7 +448,7 @@ export class MemoryApprovalStore implements ApprovalStore {
       for (const t of blocks) {
         if (!this.blockers.some((b) => b.taskId === t && b.approvalId === card.id)) this.blockers.push({ taskId: t, approvalId: card.id });
         const task = this.tasks.get(t);
-        if (task && (task.status === "ready" || task.status === "blocked")) task.status = "blocked";
+        if (task && (task.status === "ready" || task.status === "blocked" || task.status === "running")) task.status = "blocked";
       }
       this.audit.push(audit);
       return { card: { ...card }, created };
@@ -616,8 +618,11 @@ export class PrismaApprovalStore implements ApprovalStore {
         });
       }
       if (ids.length) {
+        // Task rows are locked in id order after the card, the same order `decide` uses, so a raise and an approve
+        // sharing tasks cannot deadlock (pre-review r2).
+        await tx.$queryRaw`SELECT id FROM task WHERE id = ANY(${ids}::uuid[]) ORDER BY id FOR NO KEY UPDATE`;
         await tx.taskBlocker.createMany({ data: ids.map((taskId) => ({ taskId, approvalId: row.id })), skipDuplicates: true });
-        await tx.task.updateMany({ where: { id: { in: ids }, status: { in: ["ready", "blocked"] } }, data: { status: "blocked" } });
+        await tx.task.updateMany({ where: { id: { in: ids }, status: { in: ["ready", "blocked", "running"] } }, data: { status: "blocked" } });
       }
       await audit(tx, { ...a, details: { ...a.details, approvalId: row.id } }, projectId);
       return { card: toCard(row), created };
@@ -685,7 +690,7 @@ export class PrismaApprovalStore implements ApprovalStore {
         if (taskIds.length) {
           // Lock the tasks (id order), then read the other blockers: a concurrent approval of another blocker of the
           // same task has either committed (we see `approved`) or waits for us (and then sees ours).
-          await tx.$queryRaw`SELECT id FROM task WHERE id = ANY(${taskIds}::uuid[]) ORDER BY id FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM task WHERE id = ANY(${taskIds}::uuid[]) ORDER BY id FOR NO KEY UPDATE`;
           const waiting: { taskId: string }[] = await tx.taskBlocker.findMany({
             where: { taskId: { in: taskIds }, approvalId: { not: id }, approval: { status: { not: "approved" } } },
             select: { taskId: true },

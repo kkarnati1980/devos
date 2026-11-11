@@ -112,6 +112,10 @@ test("AT5 (db): an expired card keeps its task blocked; an expired grant is refu
   assert.match(d.reason, /grant-expired/);
   assert.notEqual(d.outcome, "allow");
   assert.equal((await db.approvalGrant.findUnique({ where: { id: grantId } })).uses, 0);
+  // The refused attempt raises a fresh card and the task waits on it again (AT5 wording).
+  const again = await approvals.cardForDecision(d, { action: c.action, resource: c.target, projectId, taskId: t2 });
+  assert.notEqual(again.id, c.id);
+  assert.equal(await status(t2), "blocked");
 });
 
 test("AT7 (db): two concurrent approvals of one card: one wins, one card-not-pending, one live grant", async () => {
@@ -166,6 +170,19 @@ test("AT8b (db): a dedupe raise racing an approve never leaves a task blocked by
       assert.equal(blockers[0].approval.status, "pending");
       assert.equal(await status(t2), "blocked");
     }
+  }
+});
+
+test("pre-review r2 (db): a multi-task raise racing an approve of a card sharing those tasks does not deadlock", async () => {
+  for (let round = 0; round < 5; round++) {
+    const { projectId, tasks: [t1, t2] } = await fixture(2);
+    const { approvals } = setup();
+    const a = await approvals.raiseCard(card(projectId), [t1, t2]);
+    const [ok, raised] = await Promise.all([approvals.approve(KK, a.id), approvals.raiseCard(card(projectId), [t2, t1])]);
+    assert.equal(ok.card.status, "approved");
+    assert.equal(raised.status, "pending");
+    assert.equal(await status(t1), "blocked");
+    assert.equal(await status(t2), "blocked");
   }
 });
 

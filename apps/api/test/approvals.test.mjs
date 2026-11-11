@@ -278,3 +278,14 @@ test("pre-review AT11: wildcards, Unicode line breaks, bidi overrides and secret
   await assert.rejects(approvals.comment(session, c.id, secret), (e) => e.code === "card-contains-secret");
   await assert.rejects(approvals.reject(session, c.id, secret), (e) => e.code === "card-contains-secret");
 });
+
+test("pre-review r2: a purge action is gate 5 whoever raises it; a running task is parked as blocked", async () => {
+  const { approvals, store, policyStore, session } = setup();
+  const c = await approvals.raiseCard(card({ gate: "decision", action: "project.purge", target: "project:demo" }), [T1]);
+  assert.equal(c.gate, "purge");
+  await assert.rejects(approvals.approve(session, c.id), (e) => e.code === "purge-confirmation-mismatch");
+  assert.equal(policyStore.grants.length, 0);
+  store.tasks.get(T2).status = "running";
+  await approvals.cardForDecision({ enforcedOutcome: "require_approval", reason: "r" }, { action: "deploy.preview", resource: "repo:y", projectId: PROJECT, taskId: T2 });
+  assert.equal(store.tasks.get(T2).status, "blocked");
+});
