@@ -8,7 +8,7 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 - **Claude builds:** Architect (module contracts + plan), Builder (implements one module in its own worktree), Tester (acceptance tests + evidence).
 - **Codex reviews** read-only; it never edits code. Auto-fix is off.
 - **Release** integrates in dependency order and deploys.
-- **KK** answers decision cards and approves gates, or the runner approves G2–G4 under KK's recorded delegation (ADR-0013). G5, a first production launch, and anything involving money, data deletion, legal, D11 or D13 stay with KK.
+- **KK** answers decision cards and approves gates, or the runner approves G2–G4 under KK's recorded delegation (ADR-0013 §2, with its four conditions). G5, a first production launch, and anything involving money, data deletion, legal, D11 or D13 stay with KK.
 - **Runners:** runner A takes Lane A, unlaned issues and the gates; runner B takes Lanes B and C. Neither touches the other's branches or PRs (ADR-0013).
 
 ## Before coding
@@ -20,13 +20,13 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 - One module or task sub-issue = one PR. Split a module too large to review in one pass (about 800 changed lines of non-generated source, or more than one concern) into task sub-issues. The branch name carries the Linear id (e.g. `kishore/devos-33-...`) or the PR body says `Fixes DEVOS-33`.
 - A PR must pass CI (install, typecheck, lint, test) **and** a Codex PASS on the same commit before merge.
 - Store evidence (commands, exit codes, output) for each acceptance test, per commit SHA.
-- Before opening a PR, a separate review agent reviews only the diff against the contract and the Review guidelines; the PR body records `Pre-review: <n> findings, <m> fixed` (ADR-0013).
+- Before opening a PR, a separate review agent reviews only the diff against the contract and the Review guidelines; accepted findings are fixed before the PR opens, and the PR body records `Pre-review: <n> findings, <m> fixed` (ADR-0013).
 - Merge in dependency order.
 
 ## Build ahead behind a gate (ADR-0013)
 - When every module and blocker of a phase is Done and only its gate is open, the next phase's modules may be contracted, built, opened as PRs and reviewed.
 - Nothing from the next phase merges until the gate issue is Done. Keep such PRs up to date with main and PASSed.
-- Never pilot work without KK's go-ahead.
+- No pilot work without KK's go-ahead (pilot hold).
 
 ## Never
 - Print or commit secrets. Secrets live in the server vault / Coolify env — never in the repo or in chat.
@@ -45,10 +45,11 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 
 ## Stop and ask (decision card to KK) when
 The runner makes every technical decision itself and records it with its reasons in the module contract or `docs/decisions/` (ADR-0013). Ask KK only when:
+- Any rule above names KK: D13 copyleft, waivers, a first production launch, G5, or the pilot hold (no pilot work without his go-ahead).
 - A non-technical question blocks (scope, priorities, budget, users, legal, content, accounts).
 - A change would destroy data, spend money, or delete a project.
 - A reverse-engineering request targets a third party — confirm authorisation first.
-- A task fails 3 attempts (Sonnet, Sonnet, Opus) on a non-technical blocker — label it `deadlocked`; the lane moves on to the next ready task. A technical deadlock is resolved by the runner: a narrower scope or an alternative design that still meets the acceptance tests, recorded in the contract, with follow-ups filed.
+- A task is blocked by a non-technical question — card to KK, label it `deadlocked`; the lane moves on to the next ready task. A task that fails 3 attempts (Sonnet, Sonnet, Opus) for a technical reason is resolved by the runner: a narrower scope or an alternative design that still meets the acceptance tests, recorded in the contract, with follow-ups filed.
 
 ## Model routing
 - **Haiku:** summaries, release notes, classification.
