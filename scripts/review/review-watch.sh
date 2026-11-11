@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.1.2
+# Version: 1.2.0
+# v1.2.0 (DEVOS-105, after the DEVOS-101 stall): heartbeat. About once an hour (HEARTBEAT_SECONDS, default 3600)
+# a completed tick sets the commit status `codex-review-watch` = success on the head of main, with the time, the
+# open-PR count and how many wait for green CI. A heartbeat older than 2 hours means the watcher is down, which the
+# runners can see without server access. A failed heartbeat post never fails the tick; --dry-run posts nothing.
 # v1.1.2 (Codex PR9-r4): a stored manual verdict records its PR number before publishing, so the drain can
 # complete it after the PR moves on.
 # v1.1.1 (Codex PR9-r3): pending publications are drained for every stored SHA, including ones a PR has
@@ -132,6 +136,7 @@ verdict_msg() {  # sha label contract -> writes <sha>.msg and <sha>.state from t
   else echo "failure Codex CHANGES_REQUESTED ($label)" > "$STATE/$sha.state"; fi
 }
 
+waiting=0           # PRs whose CI is not green yet (heartbeat)
 reviewed=0          # reviews run this tick (max 1: runner limit 900 s < service limit 1200 s)
 declare -A tried=() # SHAs whose publication was attempted this tick
 prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
@@ -175,7 +180,7 @@ for i in $(seq 0 $((count - 1))); do
   fi
   set +e; ci_green "$sha"; ci=$?; set -e
   if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; continue; fi
-  if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; continue; fi
+  if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; waiting=$((waiting + 1)); continue; fi
 
   round=1
   for f in "$STATE"/*.pr; do
@@ -227,3 +232,22 @@ for m in "$STATE"/*.msg; do
   if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication (no longer the PR head)"; continue; fi
   if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed (no longer the PR head)"; fi
 done
+
+# Heartbeat (v1.2.0): at most one per HEARTBEAT_SECONDS; a failure is logged and retried on the next tick.
+heartbeat() {
+  local every="${HEARTBEAT_SECONDS:-3600}" now last main
+  [[ "$every" =~ ^[0-9]+$ ]] || every=3600
+  now="$(date -u +%s)"
+  last="$(cat "$STATE/heartbeat.last" 2>/dev/null || echo 0)"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( now - last >= every )) || return 0
+  if [[ $DRY -eq 1 ]]; then log "WOULD post heartbeat"; return 0; fi
+  main="$(gh_api GET "/repos/$REPO/commits/main" | jq -r '.sha // empty')" || { log "heartbeat: cannot read main"; return 1; }
+  [[ "$main" =~ ^[0-9a-f]{40}$ ]] || { log "heartbeat: bad main sha"; return 1; }
+  jq -n --arg d "alive at $(date -u +%FT%TZ), $count open PRs, $waiting waiting for green CI" \
+    '{state: "success", context: "codex-review-watch", description: $d}' > "$TMP/heartbeat.json"
+  gh_api POST "/repos/$REPO/statuses/$main" "$TMP/heartbeat.json" >/dev/null || { log "heartbeat: post failed; will retry"; return 1; }
+  echo "$now" > "$STATE/heartbeat.last"
+  log "heartbeat posted on main ${main:0:7}"
+}
+heartbeat || true

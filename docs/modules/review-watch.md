@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-60 · P1 · Lane C (ops tooling; bootstrap until M3.4 Codex reviewer replaces it)
 - **Depends on:** M0.3 (review runner `scripts/review/review-commit.sh` v1.0.2, Codex CLI, read-only deploy key, verdict schema on the server)
-- **Owned files:** `scripts/review/review-watch.sh` (v1.1.2), `scripts/review/install-review-watch.sh` (v1.1.0), this contract.
+- **Owned files:** `scripts/review/review-watch.sh` (v1.2.0), `scripts/review/install-review-watch.sh` (v1.1.0), `scripts/test/review-watch.test.mjs`, this contract.
 - **Approved by KK:** 4 Nov 2026 (build plan v1.0.0, section 7).
 
 ## Goal
@@ -19,6 +19,7 @@ Run the existing Codex review automatically on every new PR head, so a review no
 8. **Runner failure:** post one comment with the last 15 log lines, secrets redacted, and set status `error` (publication retried as in 6). Do not re-run the review for that SHA.
 9. **Drain:** after the PR loop, any stored SHA whose comment or status has not posted is published to the PR recorded for it, even if that PR has moved to a newer head or closed.
 10. Ticks never overlap (own lock). `--dry-run` reports decisions and changes nothing.
+11. **Heartbeat (v1.2.0, DEVOS-105):** at the end of a tick, if the last heartbeat is at least `HEARTBEAT_SECONDS` old (default 3600), set the commit status `codex-review-watch` = `success` on the head of `main`, with the description `alive at <UTC>, <n> open PRs, <k> waiting for green CI`. A failed read or post is logged and retried on the next tick; it never fails the tick. `--dry-run` posts nothing and writes no state. **Reading it:** a newest `codex-review-watch` on main older than 2 hours means the watcher is down; a runner raises it at once (DEVOS-101 lost about 6 hours because nothing showed).
 
 ## Secrets
 - **Token:** a fine-grained GitHub token for `kkarnati1980/devos` only, with Pull requests RW, Commit statuses RW, Actions R, Contents R and Metadata R.
@@ -40,6 +41,9 @@ Run the existing Codex review automatically on every new PR head, so a review no
 | AT11 | A SHA whose publication failed is published on a later tick even after its PR moved to a new head |
 | AT12 | With two green SHAs waiting, one tick runs one review and logs the other as queued; the next tick runs it |
 | AT13 | A token or `sk-` key inside a verdict summary or finding never appears in the posted comment |
+| AT14 | Heartbeat: a tick posts one `codex-review-watch` status on main with the counts; another tick inside the interval posts none; after the interval a new one is posted |
+| AT15 | A failed heartbeat read or post never fails the tick and is retried on the next tick |
+| AT16 | `--dry-run` posts no heartbeat and writes no heartbeat state; the token never appears in output |
 | AT8 | **Live (merge gate):** after install on the server, one real PR receives an automatic verdict comment and status on its head SHA. Recorded on DEVOS-60 |
 
 **Builder verification:** AT1–AT5 were exercised locally against a mock GitHub API and a stub runner. The posted comments contained no leaked token pattern. `shellcheck -S warning` and `bash -n` pass.
@@ -66,3 +70,5 @@ Run the existing Codex review automatically on every new PR head, so a review no
 - **Builder verification (mock):** comment posts fail on ticks 1 and 2, and PR #3 moves to a new head between them. On tick 3, PR #3's old SHA is published ("no longer the PR head"). Tick 1 reviewed one SHA and queued the other; tick 2 reviewed the queued one. A GitHub token and an `sk-` key placed in a verdict appear only as `[redacted]`; 0 leaks. `bash -n` and `shellcheck -S warning` pass.
 
 **v1.1.2 (5 Nov 2026, Codex PR9-r4, medium):** a stored manual verdict was published without recording its PR number, so the drain could not finish it after the PR moved on. The number is now written before publishing. **Mock test:** a manual PASS has its status post fail; the PR then moves to a new head; the next tick completes the publication ("no longer the PR head"). No review was run for that SHA.
+
+**v1.2.0 (11 Nov 2026, DEVOS-105, runner-b):** the watcher stopped for about 6 hours on 11 Nov (DEVOS-101), and nothing on GitHub showed it. It now posts an hourly heartbeat status on main (behaviour 11). The state file is `watch/heartbeat.last` (epoch seconds) and the interval is `HEARTBEAT_SECONDS`. Design choices: a status on main rather than a comment, so nothing notifies people and the latest value is easy to read; at most hourly, well under GitHub's 1,000-statuses-per-SHA limit, and main moves on with each merge; the local state file instead of a status read, so one fewer API call per tick. **Tests:** `scripts/test/review-watch.test.mjs` (AT14–AT16) against a mock GitHub API, 3/3. `bash -n` and `shellcheck -S warning` pass. Deployment: the server agent installs the merged script into `/root/.devos/bin/` (allow-list); KK does nothing.
