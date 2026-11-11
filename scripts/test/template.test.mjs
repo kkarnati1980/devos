@@ -75,6 +75,10 @@ test("AT3: F2-1 catches aliased, required and socket-level clients anywhere outs
     "src/util.test.mjs": "export const t = (u) => fetch(u);\n",
     "worker/fetch.py": "from requests import get\n",
     "worker/u.py": "import urllib.request\n",
+    "src/gt.mjs": "export const f = globalThis.fetch;\n",
+    "src/cp.mjs": 'import { execFile } from "node:child_process";\nexport default execFile;\n',
+    "src/cr.mjs": 'import { createRequire } from "node:module";\nexport default createRequire;\n',
+    "src/dm.mjs": "const m = 'node:' + 'http';\nexport const x = await import(m);\n",
   };
   for (const [f, c] of Object.entries(cases)) write(out, f, c);
   write(out, "public/app.js", 'fetch("/api/items");\n');
@@ -124,4 +128,21 @@ test("the template ships no add-on yet, and no secret or env file", () => {
   assert.deepEqual(fs.readdirSync(addons).filter((n) => n !== ".gitkeep"), []);
   const core = execFileSync("git", ["ls-files", "templates/golden-path"], { cwd: ROOT, encoding: "utf8" });
   assert.ok(!/\.env(\.|$)/m.test(core));
+});
+
+test("AT3: src/server.mjs may serve with node:http but never use its client side", () => {
+  const ok = fresh("server-ok");
+  write(ok, "src/server.mjs", fs.readFileSync(path.join(ok, "src/server.mjs"), "utf8") + "\nconst cache = new Map(); cache.get('k'); new URL('http://x').searchParams.get('a');\n");
+  assert.deepEqual(floorCheck(ok), [], "Map.get and searchParams.get are not HTTP calls");
+  for (const [name, code] of Object.entries({
+    alias: 'import http, { request as r } from "node:http";\nexport const leak = (u) => r(u);\n',
+    named: 'import { get } from "node:http";\nexport default get;\n',
+    bracket: 'import http from "node:http";\nexport const leak = (u) => http["request"](u);\n',
+    dot: 'import http from "node:http";\nexport const leak = (u) => http.get(u);\n',
+    https: 'import https from "node:https";\nexport default https;\n',
+  })) {
+    const out = fresh(`server-${name}`);
+    write(out, "src/server.mjs", code);
+    assert.ok(floorCheck(out).some((l) => l.startsWith("FAIL F2-1 src/server.mjs:")), name);
+  }
 });

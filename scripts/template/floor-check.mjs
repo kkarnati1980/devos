@@ -19,7 +19,12 @@ const RAW_CLIENT = [
   [/["'`](axios|undici|got|node-fetch|superagent|needle|ky|cross-fetch|isomorphic-fetch|ws)["'`]/, "HTTP client package"],
   [/\bnew\s+(XMLHttpRequest|WebSocket|EventSource)\s*\(/, "XMLHttpRequest/WebSocket/EventSource"],
   [/^\s*(import|from)\s+(requests|httpx|urllib3?|aiohttp|http\.client|socket)\b/m, "Python HTTP client"],
+  [/\bglobalThis\s*(\.\s*fetch\b|\[)/, "globalThis.fetch"],
+  [/(\bfrom|\bimport|\brequire)\s*\(?\s*["'`](node:)?(module|child_process|worker_threads)["'`]/, "module loader / child process (can reach the network indirectly)"],
+  [/\bimport\s*\(\s*[^"'`\s)]/, "dynamic import of a computed module name"],
 ];
+// src/server.mjs may take only the server side of node:http: a default/namespace import or { createServer }.
+const SERVER_HTTP_OK = /^import\s+(\w+|\*\s+as\s+\w+|\{\s*createServer\s*\})\s+from\s+["'](node:)?http["'];?\s*$/;
 const SECRET_SHAPE = /(SECRET|TOKEN|KEY|PASSWORD|PASSWD|PRIVATE|CREDENTIAL)/i;
 const CODE = /\.(m?js|cjs|ts|tsx|jsx|py)$/;
 
@@ -45,11 +50,21 @@ export function floorCheck(dir) {
     if (posix !== "src/safe-fetch.mjs" && !isTest && !posix.startsWith("public/")) {
       for (const [re, what] of RAW_CLIENT) if (re.test(src)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${what}) outside src/safe-fetch.mjs`);
       const serving = posix === "src/server.mjs";
-      for (const mm of src.matchAll(new RegExp(NET_MODULE.source, "g"))) {
-        if (serving && mm[3] === "http") continue;
+      const lines = src.split("\n");
+      let binding = null;
+      for (const line of lines) {
+        const mm = line.match(NET_MODULE);
+        if (!mm) continue;
+        if (serving && mm[3] === "http" && SERVER_HTTP_OK.test(line.trim())) {
+          const b = line.match(/^\s*import\s+(?:\*\s+as\s+)?(\w+)\s+from/); if (b) binding = b[1];
+          continue;
+        }
         fails.push(`FAIL F2-1 ${posix}: imports node:${mm[3]} outside src/safe-fetch.mjs`);
       }
-      if (serving && /\.\s*(request|get)\s*\(/.test(src)) fails.push(`FAIL F2-1 ${posix}: client call on node:http in the server`);
+      // The serving binding may only be used for createServer / STATUS_CODES / METHODS.
+      if (binding) for (const u of src.matchAll(new RegExp(`\\b${binding}\\s*(\\.\\s*(\\w+)|\\[)`, "g"))) {
+        if (!["createServer", "STATUS_CODES", "METHODS"].includes(u[2])) { fails.push(`FAIL F2-1 ${posix}: node:http used for more than serving (${binding}${u[1]})`); break; }
+      }
     }
     if (posix.startsWith("public/") && /process\.env/.test(src)) fails.push(`FAIL F1-4 ${posix}: client code reads process.env`);
     const m = src.match(/CLIENT_CONFIG_KEYS\s*=\s*\[([^\]]*)\]/);

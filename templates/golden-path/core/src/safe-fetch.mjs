@@ -67,11 +67,12 @@ async function resolveChecked(host, { lookup, allowed }) {
 }
 
 const defaultLookup = async (host) => dns.lookup(host, { all: true, verbatim: true });
-// Headers that carry credentials are never sent to a different origin after a redirect.
-const SENSITIVE = /^(authorization|proxy-authorization|cookie|x-api-key)$|(token|secret|api-?key)/i;
+// After a redirect to a different origin only these plain headers are kept; everything else (credentials under
+// any name) is dropped.
+const CROSS_ORIGIN_SAFE = new Set(["accept", "accept-language", "accept-encoding", "user-agent", "content-type", "content-language", "cache-control", "pragma"]);
 /** Headers to send on a redirect hop: credentials are dropped once the origin differs from the first one. */
 export function redirectHeaders(headers, fromOrigin, toOrigin) {
-  return fromOrigin === toOrigin ? headers : Object.fromEntries(Object.entries(headers).filter(([k]) => !SENSITIVE.test(k)));
+  return fromOrigin === toOrigin ? headers : Object.fromEntries(Object.entries(headers).filter(([k]) => CROSS_ORIGIN_SAFE.has(k.toLowerCase())));
 }
 function checkAllowHosts(list) {
   return (list || []).map((h) => {
@@ -87,8 +88,8 @@ function checkAllowHosts(list) {
  * safeFetch(url, { method, headers, body, timeoutMs = 10000, maxBytes = 5_000_000, maxRedirects = 5,
  *                  allowHosts = [], lookup }) -> { status, headers, url, body: Buffer, text() }
  * allowHosts names exact hostnames that may be internal (declared services only). It applies to the URL the
- * caller passed and to redirects within that same origin, never to a redirect from another origin, so a public
- * URL cannot bounce into a declared service.
+ * caller passed and to redirects that never left that origin, so a public URL cannot bounce into a declared
+ * service, and a declared service cannot be re-entered through a detour.
  * lookup is for tests. Every failure is a SafeFetchError with a code.
  */
 export async function safeFetch(input, opts = {}) {
@@ -99,13 +100,14 @@ export async function safeFetch(input, opts = {}) {
   let url;
   try { url = new URL(String(input)); } catch { throw new SafeFetchError("url", "invalid URL"); }   // normalises encoded IPv4
   const origin0 = url.origin;
-  let m = String(method).toUpperCase(), b = body, h = { ...headers };
+  let m = String(method).toUpperCase(), b = body, h = { ...headers }, left0 = false;
   for (let hop = 0; ; hop++) {
     if (url.protocol !== "http:" && url.protocol !== "https:") throw new SafeFetchError("scheme", `refused scheme ${url.protocol}`);
     if (url.username || url.password) throw new SafeFetchError("credentials", "refused: credentials in URL");
     const left = deadline - Date.now();
     if (left <= 0) throw new SafeFetchError("timeout", "timed out");
-    const allowed = (hop === 0 || url.origin === origin0) && allowHosts.includes(url.hostname.replace(/^\[|\]$/g, "").toLowerCase());
+    if (url.origin !== origin0) left0 = true;   // once a hop leaves the first origin, allowHosts never applies again
+    const allowed = !left0 && allowHosts.includes(url.hostname.replace(/^\[|\]$/g, "").toLowerCase());
     const addr = await withTimeout(resolveChecked(url.hostname, { lookup, allowed }), left);
     const res = await request(url, addr, { method: m, headers: h, body: b, deadline, maxBytes });
     if ([301, 302, 303, 307, 308].includes(res.status) && res.headers.location) {

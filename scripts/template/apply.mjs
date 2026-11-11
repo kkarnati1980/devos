@@ -29,7 +29,7 @@ export function selectableIds() {
 }
 
 function devosSha() {
-  try { return execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim(); } catch { return "unknown"; }
+  try { return execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return "unknown"; }
 }
 
 export function apply({ out, select = [], sha = devosSha() }) {

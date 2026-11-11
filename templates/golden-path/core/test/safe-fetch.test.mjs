@@ -88,7 +88,7 @@ test("credential headers are dropped when a redirect changes origin; 307/308 kee
   assert.deepEqual(same, { method: "POST", body: "x=1", auth: "Bearer app-token", cookie: "s=1", accept: "application/json" });
 });
 test("credentials are dropped when the origin changes, kept within the origin", () => {
-  const h = { authorization: "Bearer x", cookie: "c", "x-api-key": "k", "x-service-token": "t", "proxy-authorization": "p", accept: "a", "user-agent": "u" };
+  const h = { authorization: "Bearer x", cookie: "c", "x-api-key": "k", "x-service-token": "t", "proxy-authorization": "p", api_key: "k", "x-auth": "a", "x-functions-key": "f", "x-session": "s", accept: "a", "user-agent": "u" };
   assert.deepEqual(redirectHeaders(h, "http://a.test", "http://b.test"), { accept: "a", "user-agent": "u" });
   assert.deepEqual(redirectHeaders(h, "http://a.test", "https://a.test"), { accept: "a", "user-agent": "u" }, "scheme change is a new origin");
   assert.equal(redirectHeaders(h, "http://a.test", "http://a.test"), h);
