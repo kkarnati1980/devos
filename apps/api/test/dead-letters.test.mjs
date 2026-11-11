@@ -7,7 +7,7 @@ import { createApp } from "../dist/app.js";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { loadConfig, startupErrorCode } from "../dist/config.js";
 import { buildRuntime, parseRedisUrl } from "../dist/runtime.js";
-import { DEAD_LETTER_LIMIT, isJobId, toView } from "../dist/dead-letters.js";
+import { DEAD_LETTER_LIMIT, isJobId, reasonCode, toView } from "../dist/dead-letters.js";
 
 const KK = "kk@example.com";
 const ORIGIN = "http://devos:3000";
@@ -119,7 +119,7 @@ test("DL AT2: retry re-queues the job, writes one audit event first, and the job
     assert.deepEqual(r.json, { retried: "run-1" });
     assert.deepEqual(q.retried, ["run-1"]);
     assert.equal(log.rows.length, 1);
-    assert.equal(log.rows[0].action, "run.dead_letter.retried");
+    assert.equal(log.rows[0].action, "run.dead_letter.retry_requested");
     assert.deepEqual(log.rows[0].details, { jobId: "run-1" });
     const after = await api.get("/runs/dead-letters");
     assert.deepEqual(after.json.deadLetters.map((d) => d.jobId), ["run-2"]);
@@ -146,7 +146,7 @@ test("DL AT3: both routes need a session; the retry needs CSRF, origin and same-
   }
 });
 
-test("DL AT4: a bad job id is 400, an unknown one 404; neither reaches the queue's retry", async () => {
+test("DL AT4: a bad job id is 400 with no audit; an unknown one is 404, audited as a request only, nothing retried", async () => {
   const q = new FakeQueue([row(1)]);
   const log = auditLog();
   const s = await start({ queue: q, audit: log.audit });
@@ -162,6 +162,7 @@ test("DL AT4: a bad job id is 400, an unknown one 404; neither reaches the queue
     assert.equal(r.status, 404);
     assert.equal(r.json.code, "dead-letter-not-found");
     assert.deepEqual(q.retried, []);
+    assert.deepEqual(log.rows.map((x) => x.action), ["run.dead_letter.retry_requested"]);
     assert.equal(isJobId("0b1c2d3e-aaaa-4bbb-8ccc-123456789abc"), true);
   } finally {
     await s.app.close();
@@ -227,10 +228,12 @@ test("DL AT7: REDIS_URL parsing and runtime wiring (absent â†’ off; malformed â†
   assert.equal(noDb.deadLetters.queue, null);
 });
 
-test("DL AT8: the view strips control characters and bounds the reason; a missing time is null", () => {
+test("DL AT8: only fixed run-* codes are shown as the reason; raw messages become run-failed; a missing time is null", () => {
   const v = toView({ jobId: "run-1", runId: "run-1", reason: "line1\nline2\u0007" + "x".repeat(400), attemptsMade: -1, failedAt: null });
-  assert.equal(v.reason.length, 200);
-  assert.ok(!/[\u0000-\u001f]/.test(v.reason));
+  assert.equal(v.reason, "run-failed");
+  assert.equal(reasonCode("run-provider_error"), "run-provider_error");
+  assert.equal(reasonCode("run-max-turns"), "run-max-turns");
+  for (const raw of ["Invalid prisma.run.update() invocation: password=TESTONLY", "queue-retry-timeout", "run-x \n secret", "", "run-" + "a".repeat(80)]) assert.equal(reasonCode(raw), "run-failed", raw);
   assert.equal(v.attemptsMade, 0);
   assert.equal(v.failedAt, null);
 });

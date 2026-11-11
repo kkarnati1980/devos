@@ -26,7 +26,16 @@ async function main(): Promise<void> {
       // DEVOS-77: M1.5's RunQueue, imported at runtime like @devos/db so the API typechecks on its own.
       const queueModuleName = "@devos/run-engine";
       const { RunQueue } = (await import(queueModuleName)) as { RunQueue: new (o: { redisUrl: string; opTimeoutMs?: number }) => DeadLetterQueue };
-      return new RunQueue({ redisUrl, opTimeoutMs: config.outboundTimeoutMs });
+      const q = new RunQueue({ redisUrl, opTimeoutMs: config.outboundTimeoutMs }) as DeadLetterQueue & { queue: { on(ev: "error", fn: () => void): unknown } };
+      // A Redis error is logged as a fixed code at most once a minute, never its message (behaviour 4).
+      let lastLog = 0;
+      q.queue.on("error", () => {
+        const t = Date.now();
+        if (t - lastLog < 60_000) return;
+        lastLog = t;
+        stdoutSink({ ts: new Date(t).toISOString(), level: "warn", msg: "dead-letters-queue-error" });
+      });
+      return q;
     },
   });
 
