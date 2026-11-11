@@ -76,6 +76,13 @@ function scanPlainStreamEnd(text: string, start: number): number {
  * token by token so `endstream` inside a string or comment is skipped; a filtered (binary) stream ends at the first
  * `endstream` that is followed by `endobj`.
  */
+const ENDSTREAM_AT = /\s*endstream/y;
+/** `endstream` (after any white space, no window) exactly at `pos`. */
+function endstreamAt(text: string, pos: number): boolean {
+  ENDSTREAM_AT.lastIndex = pos;
+  return ENDSTREAM_AT.test(text);
+}
+
 function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints: ReadonlyMap<number, readonly number[]>): number {
   // The indirect form is tried first, and the direct number must be a whole integer token that is not followed by
   // a generation number and R, so "/Length 19 0 R" can never read as a direct length of 1 (PR30-r10).
@@ -84,7 +91,7 @@ function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints:
   const lens = direct ? [Number(direct[1])] : indirect ? ints.get(Number(indirect[1])) ?? [] : [];
   // A length is used only when `endstream` really follows it (PR30-r13: a decoy candidate never passes this).
   for (const len of lens) {
-    if (start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) return start + len;
+    if (start + len <= buf.length && endstreamAt(text, start + len)) return start + len;
   }
   // An unfiltered (text) stream is scanned token by token, skipping strings and comments, to its real endstream.
   if (!/\/Filter\b/.test(dict)) {
@@ -382,6 +389,27 @@ function stripStrings(s: string): string {
   return out + s.slice(last);
 }
 
+/** The inside of the dictionary that opens at `at` (`<<`), balanced and string/comment-aware; no size window. */
+function readDict(text: string, at: number): string | null {
+  if (!text.startsWith("<<", at)) return null;
+  let depth = 0;
+  let i = at;
+  while (i < text.length) {
+    if (text.startsWith("<<", i)) {
+      depth++;
+      i += 2;
+    } else if (text.startsWith(">>", i)) {
+      depth--;
+      i += 2;
+      if (depth === 0) return text.slice(at + 2, i - 2);
+    } else {
+      const skip = skipOpaque(text, i);
+      i = skip >= 0 ? skip : i + 1;
+    }
+  }
+  return null;
+}
+
 /**
  * Every indirect object, later definitions replacing earlier ones (incremental updates), including objects
  * packed in object streams (/Type /ObjStm).
@@ -400,7 +428,10 @@ function collectObjects(
   // Trailers are looked for only in the text between objects, so a string inside an object cannot fake one.
   const scanGap = (from: number, to: number) => {
     const gap = text.slice(from, to).replace(/%[^\r\n]*/g, (c) => " ".repeat(c.length)); // comments never hold a trailer
-    for (const t of gap.matchAll(/\btrailer\s*<<([\s\S]{0,4096}?)>>/g)) trailers.push({ pos: from + (t.index ?? 0), dict: stripStrings(t[1] ?? "") });
+    for (const t of gap.matchAll(/\btrailer\s*(?=<<)/g)) {
+      const d = readDict(text, from + (t.index ?? 0) + t[0].length);
+      if (d !== null) trailers.push({ pos: from + (t.index ?? 0), dict: stripStrings(d) });
+    }
   };
   const re = new RegExp(OBJECT_HEADER.source, "g");
   let m: RegExpExecArray | null;
@@ -516,7 +547,7 @@ function pageContents(file: PdfFile): number[][] | null {
  */
 function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, number> {
   const offsets = new Map<number, number>();
-  const last = [...text.slice(Math.max(0, text.length - 4096)).matchAll(/startxref\s+(\d{1,12})/g)].pop();
+  const last = [...text.matchAll(/startxref\s+(\d{1,12})/g)].pop();
   let at = last ? Number(last[1]) : -1;
   const seen = new Set<number>();
   const budget = { total: 0 };
@@ -535,7 +566,8 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
           num++;
         }
       }
-      const tdict = /<<([\s\S]{0,4096}?)>>/.exec(text.slice(trailerAt, trailerAt + 4200))?.[1] ?? "";
+      const open = text.indexOf("<<", trailerAt);
+      const tdict = stripStrings(open >= 0 ? readDict(text, open) ?? "" : "");
       const prevM = /\/Prev\s+(\d{1,12})/.exec(tdict);
       const stm = /\/XRefStm\s+(\d{1,12})/.exec(tdict);
       if (stm) readXrefStream(Number(stm[1]));
@@ -548,7 +580,9 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
   return offsets;
 
   function readXrefStream(pos: number): number {
-    const head = new RegExp(String.raw`^(\d{1,10})${WS}\d{1,5}${WS}obj\b`).exec(text.slice(pos, pos + 64));
+    const headRe = new RegExp(String.raw`(\d{1,10})${WS}\d{1,5}${WS}obj\b`, "y");
+    headRe.lastIndex = pos;
+    const head = headRe.exec(text);
     if (!head) return -1;
     const body = scanObjectBody(text, pos + head[0].length);
     if (body.kind !== "stream") return -1;
@@ -624,9 +658,11 @@ function unPng(data: Uint8Array, columns: number): Uint8Array {
 /** Integer objects at the offsets the cross-reference data names (the authoritative length source). */
 function xrefIntegers(text: string, offsets: ReadonlyMap<number, number>): Map<number, number> {
   const ints = new Map<number, number>();
-  const re = new RegExp(String.raw`^(\d{1,10})${WS}\d{1,5}${WS}obj${WS}(\d{1,12})${WS}endobj\b`);
+  // Sticky match at the exact offset over the whole text: no window, so comments of any length are fine (PR30-r15).
+  const re = new RegExp(String.raw`(\d{1,10})${WS}\d{1,5}${WS}obj${WS}(\d{1,12})${WS}endobj\b`, "y");
   for (const [num, off] of offsets) {
-    const m = re.exec(text.slice(off, off + 256));
+    re.lastIndex = off;
+    const m = re.exec(text);
     if (m && Number(m[1]) === num) ints.set(num, Number(m[2]));
   }
   return ints;

@@ -696,7 +696,7 @@ test("AT4n indirect /Length comes from a real integer object, never from a decoy
 
 // ---------- PR30-r14 ----------
 /** Append a classic xref table (or an xref stream with PNG predictor 12) with the real object offsets. */
-function withXref(body, { stream = false } = {}) {
+function withXref(body, { stream = false, trailerExtra = "" } = {}) {
   const text = body.toString("latin1");
   const offsets = new Map();
   for (const m of text.matchAll(/(?:^|\n)(\d+) 0 obj\n/g)) offsets.set(Number(m[1]), m.index + (m[0].startsWith("\n") ? 1 : 0));
@@ -705,7 +705,7 @@ function withXref(body, { stream = false } = {}) {
   if (!stream) {
     let t = `xref\n0 ${max + 1}\n0000000000 65535 f \n`;
     for (let n = 1; n <= max; n++) t += offsets.has(n) ? `${String(offsets.get(n)).padStart(10, "0")} 00000 n \n` : "0000000000 00000 f \n";
-    t += `trailer\n<< /Size ${max + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF\n`;
+    t += `trailer\n<< /Size ${max + 1} ${trailerExtra}/Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF\n`;
     return Buffer.concat([body, Buffer.from(t, "latin1")]);
   }
   const num = max + 1;
@@ -751,5 +751,29 @@ test("AT4o the cross-reference data decides indirect /Length; a later metadata d
     const r = parseSpec(withXref(body, variant), "xref.pdf");
     assert.deepEqual(ids(r), ["FR-001", "FR-002"], JSON.stringify(variant));
     assert.ok(!r.warnings.includes("pdf-stream-damaged"));
+  }
+});
+
+// ---------- PR30-r15 ----------
+test("AT4p long comments in the length object and a long trailer dictionary: no fixed-size windows", () => {
+  const content = "BT (FR-001 before) Tj T* (text: endstream endobj) Tj T* (FR-002 after) Tj ET";
+  const data = deflateSync(Buffer.from(content, "latin1"), { level: 0 });
+  const head =
+    "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" +
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] >>\nendobj\n" +
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" +
+    "4 0 obj\n<< /Length 19 0 R /Filter /FlateDecode >>\nstream\n";
+  const dataStart = Buffer.byteLength(head, "latin1");
+  const afterData = `\nendstream\nendobj\n19 0 obj\n% ${"x".repeat(300)}\n${data.length}\n% ${"y".repeat(300)}\nendobj\n`;
+  const prefix = "5 0 obj\n<< /Note (19 0 obj ";
+  let n = 0;
+  for (let i = 0; i < 3; i++) n = dataStart + data.length + afterData.length + prefix.length + String(n).length + " endobj ".length - dataStart;
+  const decoy = `${prefix}${n} endobj endstream) >>\nendobj\n`;
+  const body = Buffer.concat([Buffer.from(head, "latin1"), data, Buffer.from(afterData + decoy, "latin1")]);
+  assert.equal(body.toString("latin1").slice(dataStart + n, dataStart + n + 9), "endstream");
+  const longId = `/ID [<${"ab".repeat(3000)}> <${"cd".repeat(3000)}>] /Info << /Title (${"z".repeat(5000)} >> fake) >> `;
+  for (const variant of [{}, { stream: true }, { trailerExtra: longId }]) {
+    const r = parseSpec(withXref(body, variant), "long.pdf");
+    assert.deepEqual(ids(r), ["FR-001", "FR-002"], JSON.stringify(Object.keys(variant)));
   }
 });
