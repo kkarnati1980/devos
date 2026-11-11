@@ -506,3 +506,22 @@ test("AT4e stream boundaries: indirect /Length is resolved; 'endstream' in a tex
   assert.deepEqual(ids(parseSpec(build("/Length 9 0 R"), "dangling.pdf")), ["FR-001", "FR-002", "FR-003"]);
   assert.deepEqual(ids(parseSpec(build("/Length 999999"), "wrong.pdf")), ["FR-001", "FR-002", "FR-003"]);
 });
+
+// ---------- PR30-r6 ----------
+test("AT4f object boundaries and structure lookups skip strings and comments", () => {
+  const doc = pdfObjects(
+    [
+      [7, { stream: "BT (FR-001 page one) Tj ET" }],
+      [8, { stream: "BT (FR-002 page two) Tj ET" }],
+      [9, { stream: "BT (FR-666 decoy) Tj ET" }],
+      [1, "<< /Type /Catalog /Pages 2 0 R /Note (/Root 5 0 R) >>"],
+      [2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"],
+      [3, "<< /Type /Page /Parent 2 0 R /Note (endobj stream\n) /Contents 7 0 R >>"],
+      [4, "<< /Type /Page /Parent 2 0 R /Alt (/Contents 9 0 R) % endobj /Contents 9 0 R\n /Contents 8 0 R >>"],
+    ],
+    1,
+  );
+  const r = parseSpec(doc, "strings.pdf");
+  assert.deepEqual(r.blocks.map((b) => b.text), ["FR-001 page one", "FR-002 page two"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+});

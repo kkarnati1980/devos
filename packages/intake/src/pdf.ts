@@ -45,7 +45,9 @@ function scanPlainStreamEnd(text: string, start: number): number {
       if (depth > 0) return -1; // unbalanced: not a text stream we can scan
     } else if (c === "%") {
       while (i < n && text[i] !== "\n" && text[i] !== "\r") i++;
-    } else if (c === "<" && text[i + 1] !== "<") {
+    } else if (c === "<" && text[i + 1] === "<") {
+      i += 2;
+    } else if (c === "<") {
       const close = text.indexOf(">", i);
       if (close < 0) return -1;
       i = close + 1;
@@ -304,6 +306,78 @@ function decodeStream(dict: string, raw: Uint8Array, limits: IngestLimits, warni
   return data;
 }
 
+/** Skip one PDF token that can hide keywords: a literal string, a hex string or a comment. Returns the next index. */
+function skipOpaque(text: string, i: number): number {
+  const n = text.length;
+  const c = text[i];
+  if (c === "(") {
+    let depth = 1;
+    i++;
+    while (i < n && depth > 0) {
+      const ch = text[i];
+      if (ch === "\\") i += 2;
+      else {
+        if (ch === "(") depth++;
+        else if (ch === ")") depth--;
+        i++;
+      }
+    }
+    return Math.min(i, n);
+  }
+  if (c === "%") {
+    while (i < n && text[i] !== "\n" && text[i] !== "\r") i++;
+    return i;
+  }
+  if (c === "<" && text[i + 1] === "<") return i + 2; // dictionary opener: consume both, never a hex string
+  if (c === "<") {
+    const close = text.indexOf(">", i);
+    return close < 0 ? n : close + 1;
+  }
+  return -1;
+}
+
+const DELIM = /[\s()<>[\]{}\/%]/;
+
+/** Find where an object body ends: at a bare `stream` keyword (then its data start) or a bare `endobj`. */
+function scanObjectBody(text: string, from: number): { kind: "stream"; keyword: number; dataStart: number } | { kind: "obj"; end: number } {
+  const n = text.length;
+  let i = from;
+  while (i < n) {
+    const skip = skipOpaque(text, i);
+    if (skip >= 0) {
+      i = skip;
+      continue;
+    }
+    const prevOk = i === 0 || DELIM.test(text[i - 1] ?? " ");
+    if (prevOk && text.startsWith("endobj", i) && (i + 6 >= n || DELIM.test(text[i + 6] ?? " "))) return { kind: "obj", end: i };
+    if (prevOk && text.startsWith("stream", i)) {
+      const eol = /^stream(\r\n|\n|\r)/.exec(text.slice(i, i + 8));
+      if (eol) return { kind: "stream", keyword: i, dataStart: i + eol[0].length };
+    }
+    i++;
+  }
+  return { kind: "obj", end: n };
+}
+
+/** Blank out strings and comments so structural lookups (/Kids, /Contents, /Length, /Root…) never match inside them. */
+function stripStrings(s: string): string {
+  let out = "";
+  let i = 0;
+  let last = 0;
+  while (i < s.length) {
+    if (s[i] === "<" && s[i + 1] === "<") {
+      i += 2; // keep dictionary delimiters
+      continue;
+    }
+    const skip = skipOpaque(s, i);
+    if (skip >= 0) {
+      out += s.slice(last, i) + " ";
+      i = last = skip;
+    } else i++;
+  }
+  return out + s.slice(last);
+}
+
 /**
  * Every indirect object, later definitions replacing earlier ones (incremental updates), including objects
  * packed in object streams (/Type /ObjStm).
@@ -319,11 +393,11 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
     if (++count > limits.maxPdfStreams * 4) throw new IngestError("pdf-invalid");
     const num = Number(m[1]);
     const bodyStart = m.index + m[0].length;
-    const streamM = /\bstream(\r\n|\n|\r)/.exec(text.slice(bodyStart, bodyStart + 1_000_000));
-    const endObj = text.indexOf("endobj", bodyStart);
-    if (streamM && (endObj < 0 || bodyStart + streamM.index < endObj)) {
-      const dict = text.slice(bodyStart, bodyStart + streamM.index);
-      const start = bodyStart + streamM.index + streamM[0].length;
+    // Object boundaries come from a token scan that skips strings and comments (PR30-r6), never a substring search.
+    const body = scanObjectBody(text, bodyStart);
+    if (body.kind === "stream") {
+      const dict = stripStrings(text.slice(bodyStart, body.keyword));
+      const start = body.dataStart;
       const end = streamEnd(buf, text, dict, start, ints);
       if (end < 0) break;
       const data = buf.subarray(start, end);
@@ -340,13 +414,13 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
             const on = head[2 * k] ?? NaN;
             const off = head[2 * k + 1] ?? NaN;
             const next = k + 1 < n ? (head[2 * k + 3] ?? s.length - first) : s.length - first;
-            if (Number.isFinite(on) && Number.isFinite(off)) objs.set(on, { dict: s.slice(first + off, first + next) });
+            if (Number.isFinite(on) && Number.isFinite(off)) objs.set(on, { dict: stripStrings(s.slice(first + off, first + next)) });
           }
         }
       }
     } else {
-      objs.set(num, { dict: text.slice(bodyStart, endObj < 0 ? text.length : endObj) });
-      if (endObj >= 0) re.lastIndex = endObj;
+      objs.set(num, { dict: stripStrings(text.slice(bodyStart, body.end)) });
+      re.lastIndex = body.end;
     }
   }
   return objs;
@@ -358,8 +432,19 @@ function refs(s: string): number[] {
 
 /** The page tree's content-stream object numbers, page by page, or null when the tree cannot be resolved. */
 function pageContents(text: string, objs: Map<number, PdfObject>): number[][] | null {
-  const roots = [...text.matchAll(/\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/g)];
-  const rootNum = roots.length ? Number(roots[roots.length - 1]?.[1]) : NaN;
+  // /Root comes only from trailer dictionaries and cross-reference streams, never from page text (PR30-r6).
+  let rootNum = NaN;
+  for (const t of text.matchAll(/\btrailer\s*<<([\s\S]{0,4096}?)>>/g)) {
+    const r = /\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(stripStrings(t[1] ?? ""));
+    if (r) rootNum = Number(r[1]);
+  }
+  if (!Number.isFinite(rootNum)) {
+    for (const o of objs.values()) {
+      if (!o.data || !/\/Type\s*\/XRef\b/.test(o.dict)) continue;
+      const r = /\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(o.dict);
+      if (r) rootNum = Number(r[1]);
+    }
+  }
   const catalog = objs.get(rootNum)?.dict;
   const pagesRef = catalog ? /\/Pages\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(catalog) : null;
   if (!pagesRef) return null;
