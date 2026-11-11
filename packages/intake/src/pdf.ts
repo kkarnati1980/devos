@@ -316,11 +316,17 @@ function pageContents(text: string, objs: Map<number, PdfObject>): number[][] | 
     seen.add(num);
     const d = objs.get(num)?.dict;
     if (d === undefined) return false;
-    const kids = /\/Kids\s*\[([^\]]*)\]/.exec(d);
-    if (kids) {
-      for (const k of refs(kids[1] ?? "")) if (!walk(k, depth + 1)) return false;
+    // /Kids may be a direct array or an indirect reference to one (PR30-r3).
+    const direct = /\/Kids\s*\[([^\]]*)\]/.exec(d);
+    const indirect = direct ? null : /\/Kids\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(d);
+    if (direct || indirect) {
+      const arr = direct ? direct[1] ?? "" : /\[([^\]]*)\]/.exec(objs.get(Number(indirect?.[1]))?.dict ?? "")?.[1];
+      if (arr === undefined) return false; // unresolvable /Kids: fall back to file order
+      for (const k of refs(arr)) if (!walk(k, depth + 1)) return false;
       return true;
     }
+    // A leaf must be a page; anything else means the tree is not understood (file-order fallback).
+    if (!/\/Type\s*\/Page(?![A-Za-z])/.test(d) && !/\/Contents\b/.test(d)) return false;
     const c = /\/Contents\s*(\[[^\]]*\]|\d{1,10}\s+\d{1,5}\s+R\b)/.exec(d);
     let list = c ? refs(c[1] ?? "") : [];
     // /Contents may point to an indirect array of streams.
@@ -330,7 +336,7 @@ function pageContents(text: string, objs: Map<number, PdfObject>): number[][] | 
     pages.push(list);
     return true;
   };
-  if (!walk(Number(pagesRef[1]), 0) || pages.length === 0) return null;
+  if (!walk(Number(pagesRef[1]), 0) || pages.length === 0 || pages.every((p) => p.length === 0)) return null;
   return pages;
 }
 

@@ -418,3 +418,41 @@ test("AT10b check-spec CLI: unreadable input is a fixed refusal with no path", (
   assert.equal(out.trim(), "refused: file-unreadable");
   assert.ok(!out.includes("TOPSECRET"));
 });
+
+// ---------- PR30-r3 ----------
+test("AT1c a closing fence needs only whitespace after it; a longer or info-string line does not close", () => {
+  const md = ["```html", "```example", "<script>FR-001</script>", "```", "", "````", "```", "FR-002 inside", "````  ", "- FR-003 after"].join("\n");
+  const r = parseSpec(enc(md), "s.md");
+  const codes = r.blocks.filter((b) => b.type === "code").map((b) => b.text);
+  assert.deepEqual(codes, ["```example\n<script>FR-001</script>", "```\nFR-002 inside"]);
+  assert.deepEqual(ids(r), ["FR-001", "FR-002", "FR-003"]);
+  assert.ok(!r.text.includes("<script"), "code is HTML-escaped in the rendered text");
+});
+
+test("AT4c pdf: an indirect /Kids array resolves; an unknown leaf falls back to file order", () => {
+  const doc = pdfObjects(
+    [
+      [7, { stream: "BT (FR-001 via indirect kids) Tj ET" }],
+      [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Kids 5 0 R /Count 1 >>"],
+      [5, "[3 0 R]"],
+      [3, "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>"],
+    ],
+    1,
+  );
+  const r = parseSpec(doc, "kids.pdf");
+  assert.deepEqual(ids(r), ["FR-001"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+  const odd = pdfObjects(
+    [
+      [7, { stream: "BT (FR-002 orphan) Tj ET" }],
+      [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Kids [3 0 R] >>"],
+      [3, "<< /Type /Mystery >>"],
+    ],
+    1,
+  );
+  const o = parseSpec(odd, "odd.pdf");
+  assert.deepEqual(ids(o), ["FR-002"]);
+  assert.ok(o.warnings.includes("pdf-page-order-unknown"));
+});

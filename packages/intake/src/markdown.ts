@@ -1,6 +1,14 @@
 import { cleanText, type Block } from "./model.js";
 import { decodeEntities } from "./xml.js";
 
+/** CommonMark fences: an opener of ≥ 3 backticks or tildes; a closer of the same character, at least as long,
+ * indented ≤ 3 spaces and followed only by whitespace (PR30-r3). */
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
+function isClosingFence(line: string, marker: string): boolean {
+  const m = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+  return !!m && (m[1] ?? "")[0] === marker[0] && (m[1] ?? "").length >= marker.length;
+}
+
 /**
  * Remove raw <script>/<style> blocks from Markdown text outside fenced code (PR30-r2). A closed block is removed
  * with its content; an unterminated opener removes only the tag itself, so nothing after it can be lost (the
@@ -21,7 +29,7 @@ function stripActive(src: string): string {
   };
   for (const line of lines) {
     if (fence === null) {
-      const f = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+      const f = FENCE_OPEN.exec(line);
       if (f) {
         flush();
         fence = f[1] ?? "```";
@@ -29,7 +37,7 @@ function stripActive(src: string): string {
       } else seg.push(line);
     } else {
       out.push(line);
-      if (line.trimStart().startsWith(fence)) fence = null;
+      if (isClosingFence(line, fence)) fence = null;
     }
   }
   flush();
@@ -76,13 +84,13 @@ export function parseMarkdown(src: string): Block[] {
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? "";
-    const fence = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+    const fence = FENCE_OPEN.exec(line);
     if (fence) {
       flush();
       const marker = fence[1] ?? "```";
       const body: string[] = [];
       i++;
-      while (i < lines.length && !(lines[i] ?? "").trimStart().startsWith(marker)) body.push(lines[i++] ?? "");
+      while (i < lines.length && !isClosingFence(lines[i] ?? "", marker)) body.push(lines[i++] ?? "");
       blocks.push({ type: "code", text: body.join("\n") });
       continue;
     }
