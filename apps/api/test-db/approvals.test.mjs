@@ -112,8 +112,12 @@ test("AT5 (db): an expired card keeps its task blocked; an expired grant is refu
   assert.match(d.reason, /grant-expired/);
   assert.notEqual(d.outcome, "allow");
   assert.equal((await db.approvalGrant.findUnique({ where: { id: grantId } })).uses, 0);
-  // The refused attempt raises a fresh card and the task waits on it again (AT5 wording).
-  const again = await approvals.cardForDecision(d, { action: c.action, resource: c.target, projectId, taskId: t2 });
+  // The refused attempt raises a fresh card and the task waits on it again (AT5 wording). The shared test database
+  // runs M1.7 in observe mode (the schema default), so the enforced outcome is "allow"; the evaluated outcome is the
+  // one an enforcing engine would return, and that is what the caller turns into a card.
+  assert.equal(d.outcome, "require_approval");
+  const enforced = { enforcedOutcome: d.outcome, reason: d.reason, matchedRuleIds: d.matchedRuleIds };
+  const again = await approvals.cardForDecision(enforced, { action: c.action, resource: c.target, projectId, taskId: t2 });
   assert.notEqual(again.id, c.id);
   assert.equal(await status(t2), "blocked");
 });
