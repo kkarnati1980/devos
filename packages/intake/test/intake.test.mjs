@@ -483,3 +483,26 @@ test("AT6b huge single blocks within the limits render (no argument-spread Range
   const t = parseSpec(enc(`<table>${rows}</table>`), "rows.html");
   assert.equal(t.blocks[0].rows.length, 200_000);
 });
+
+// ---------- PR30-r5 ----------
+test("AT4e stream boundaries: indirect /Length is resolved; 'endstream' in a text string does not cut the stream", () => {
+  const content = "BT (FR-001) Tj T* (Document endstream for FR-002) Tj T* (and endstream endobj FR-003) Tj ET";
+  const build = (lengthEntry, extra = "") =>
+    Buffer.from(
+      "%PDF-1.4\n" +
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" +
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n" +
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" +
+        `4 0 obj\n<< ${lengthEntry} >>\nstream\n${content}\nendstream\nendobj\n` +
+        extra +
+        "trailer\n<< /Root 1 0 R >>\n%%EOF\n",
+      "latin1",
+    );
+  const viaIndirect = parseSpec(build("/Length 9 0 R", `9 0 obj\n${content.length}\nendobj\n`), "ind.pdf");
+  assert.deepEqual(ids(viaIndirect), ["FR-001", "FR-002", "FR-003"]);
+  const viaDirect = parseSpec(build(`/Length ${content.length}`), "dir.pdf");
+  assert.deepEqual(ids(viaDirect), ["FR-001", "FR-002", "FR-003"]);
+  // No usable length (dangling reference, or none at all): the text stream is scanned past its strings.
+  assert.deepEqual(ids(parseSpec(build("/Length 9 0 R"), "dangling.pdf")), ["FR-001", "FR-002", "FR-003"]);
+  assert.deepEqual(ids(parseSpec(build("/Length 999999"), "wrong.pdf")), ["FR-001", "FR-002", "FR-003"]);
+});

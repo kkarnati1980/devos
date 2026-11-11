@@ -17,9 +17,80 @@ interface RawStream {
   data: Uint8Array;
 }
 
+/** Integer-valued indirect objects (`n g obj 123 endobj`), used to resolve indirect stream /Length values. */
+function integerObjects(text: string): Map<number, number> {
+  const ints = new Map<number, number>();
+  for (const m of text.matchAll(/(?<![0-9])(\d{1,10})\s+\d{1,5}\s+obj\s+(\d{1,12})\s+endobj\b/g)) ints.set(Number(m[1]), Number(m[2]));
+  return ints;
+}
+
+/** End of an unfiltered content stream: the first bare `endstream` outside literal/hex strings and comments. */
+function scanPlainStreamEnd(text: string, start: number): number {
+  const n = text.length;
+  let i = start;
+  while (i < n) {
+    const c = text[i];
+    if (c === "(") {
+      let depth = 1;
+      i++;
+      while (i < n && depth > 0) {
+        const ch = text[i];
+        if (ch === "\\") i += 2;
+        else {
+          if (ch === "(") depth++;
+          else if (ch === ")") depth--;
+          i++;
+        }
+      }
+      if (depth > 0) return -1; // unbalanced: not a text stream we can scan
+    } else if (c === "%") {
+      while (i < n && text[i] !== "\n" && text[i] !== "\r") i++;
+    } else if (c === "<" && text[i + 1] !== "<") {
+      const close = text.indexOf(">", i);
+      if (close < 0) return -1;
+      i = close + 1;
+    } else if (c === "e" && text.startsWith("endstream", i) && (i === start || /\s/.test(text[i - 1] ?? ""))) {
+      let end = i;
+      while (end > start && (text[end - 1] === "\n" || text[end - 1] === "\r")) end--;
+      return end;
+    } else i++;
+  }
+  return -1;
+}
+
+/**
+ * Where a stream's data ends (PR30-r5). The declared /Length — direct or an indirect integer object — is used when
+ * `endstream` follows it. Without a usable length, an unfiltered (text) stream is scanned
+ * token by token so `endstream` inside a string or comment is skipped; a filtered (binary) stream ends at the first
+ * `endstream` that is followed by `endobj`.
+ */
+function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints: ReadonlyMap<number, number>): number {
+  const direct = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict);
+  const indirect = direct ? null : /\/Length\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(dict);
+  const len = direct ? Number(direct[1]) : indirect ? ints.get(Number(indirect[1])) : undefined;
+  if (len !== undefined && start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) {
+    return start + len;
+  }
+  // An unfiltered (text) stream is scanned token by token, skipping strings and comments, to its real endstream.
+  if (!/\/Filter\b/.test(dict)) {
+    const end = scanPlainStreamEnd(text, start);
+    if (end >= 0) return end;
+  }
+  const re = /(\r\n|\n|\r)?endstream\s+endobj\b/g;
+  re.lastIndex = start;
+  const m = re.exec(text);
+  if (m) return m.index;
+  // Last resort (a damaged file without endobj): the first endstream.
+  let end = text.indexOf("endstream", start);
+  if (end < 0) return -1;
+  while (end > start && (text[end - 1] === "\n" || text[end - 1] === "\r")) end--;
+  return end;
+}
+
 function findStreams(buf: Buffer, limits: IngestLimits): RawStream[] {
   const out: RawStream[] = [];
   const text = buf.toString("latin1");
+  const ints = integerObjects(text);
   const re = /stream(\r\n|\n|\r)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
@@ -31,17 +102,8 @@ function findStreams(buf: Buffer, limits: IngestLimits): RawStream[] {
     if (dictEnd < 0 || objStart < 0 || dictEnd < objStart) continue;
     const dict = text.slice(objStart, dictEnd + 2);
     const start = kw + m[0].length;
-    let end = -1;
-    const lenM = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict);
-    if (lenM) {
-      const len = Number(lenM[1]);
-      if (start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) end = start + len;
-    }
-    if (end < 0) {
-      end = text.indexOf("endstream", start);
-      if (end < 0) break;
-      while (end > start && (text[end - 1] === "\n" || text[end - 1] === "\r")) end--;
-    }
+    const end = streamEnd(buf, text, dict, start, ints);
+    if (end < 0) break;
     out.push({ dict, data: buf.subarray(start, end) });
     if (out.length > limits.maxPdfStreams) throw new IngestError("pdf-invalid");
     re.lastIndex = end;
@@ -248,6 +310,7 @@ function decodeStream(dict: string, raw: Uint8Array, limits: IngestLimits, warni
  */
 function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>, budget: { total: number }): Map<number, PdfObject> {
   const text = buf.toString("latin1");
+  const ints = integerObjects(text);
   const objs = new Map<number, PdfObject>();
   const re = /(?<![0-9])(\d{1,10})\s+(\d{1,5})\s+obj\b/g;
   let m: RegExpExecArray | null;
@@ -261,17 +324,8 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
     if (streamM && (endObj < 0 || bodyStart + streamM.index < endObj)) {
       const dict = text.slice(bodyStart, bodyStart + streamM.index);
       const start = bodyStart + streamM.index + streamM[0].length;
-      let end = -1;
-      const lenM = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict);
-      if (lenM) {
-        const len = Number(lenM[1]);
-        if (start + len <= buf.length && /^\s*endstream/.test(text.slice(start + len, start + len + 20))) end = start + len;
-      }
-      if (end < 0) {
-        end = text.indexOf("endstream", start);
-        if (end < 0) break;
-        while (end > start && (text[end - 1] === "\n" || text[end - 1] === "\r")) end--;
-      }
+      const end = streamEnd(buf, text, dict, start, ints);
+      if (end < 0) break;
       const data = buf.subarray(start, end);
       objs.set(num, { dict, data });
       re.lastIndex = end;
