@@ -30,6 +30,9 @@ importers:
       '@devos/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@devos/run-engine':
+        specifier: workspace:*
+        version: link:../../packages/run-engine
       '@nestjs/common':
         specifier: 11.2.8
         version: 11.2.8(reflect-metadata@0.2.2)(rxjs@7.8.2)

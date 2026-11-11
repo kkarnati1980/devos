@@ -161,6 +161,22 @@ export class DevosApi {
   sendTest() {
     return this.call<{ deliveries: Delivery[] }>("POST", "/notifications/test");
   }
+  /** DEVOS-77 dead-letter view. */
+  deadLetters() {
+    return this.call<{ deadLetters: DeadLetter[] }>("GET", "/runs/dead-letters");
+  }
+  retryDeadLetter(jobId: string) {
+    return this.call<{ retried: string }>("POST", `/runs/dead-letters/${encodeURIComponent(jobId)}/retry`);
+  }
+}
+
+/** DEVOS-77: a run job that failed for good (M1.5 dead-letter list). */
+export interface DeadLetter {
+  jobId: string;
+  runId: string;
+  reason: string;
+  attemptsMade: number;
+  failedAt: string | null;
 }
 
 export const SECRET_LABELS: Record<string, string> = {
@@ -182,6 +198,9 @@ export function explain(code: string): string {
   if (code === "notifications-not-configured") return "Notifications need the database (DATABASE_URL).";
   if (code === "invalid:target-https-only") return "The MyBrain bell address must start with https://.";
   if (code === "invalid:target-host") return "The MyBrain bell address must be a public host name, not an IP address or localhost.";
+  if (code === "dead-letters-not-configured") return "The failed-runs view needs the run queue (REDIS_URL) and the database.";
+  if (code === "dead-letters-unavailable") return "The run queue did not answer. Try again in a minute.";
+  if (code === "dead-letter-not-found") return "That run is no longer in the failed list (it may have been retried already).";
   if (code === "vault-not-configured") return "The server vault key is not set yet (DEVOS_VAULT_KEY).";
   if (code.startsWith("invalid:value")) return "That value is not a valid key (16–4,096 characters, no spaces).";
   if (code.startsWith("invalid:") || code.startsWith("missing:")) return `Check the field: ${code.split(":")[1]}.`;

@@ -4,7 +4,8 @@ import { PolicyEngine, PrismaPolicyStore, type PrismaLike } from "@devos/policy"
 import type { KkSessionRegistry } from "./auth.js";
 import { withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
-import { PrismaSettingsStore } from "./settings.js";
+import { PrismaSettingsStore, writeAudit } from "./settings.js";
+import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
 import { parseSmtpConfig } from "./smtp.js";
@@ -44,6 +45,8 @@ export interface Runtime {
   setup: SetupServices;
   /** M1.6: notifications need the database; the bell and email also need their configuration. */
   notify: NotifyServices;
+  /** DEVOS-77: the dead-letter view needs `REDIS_URL` (the run queue) and the database (audit). */
+  deadLetters: DeadLetterServices;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -57,7 +60,13 @@ const notReady = (code: string): ReadinessProbe => async () => {
  */
 export async function buildRuntime(
   env: NodeJS.ProcessEnv,
-  opts: { outboundTimeoutMs: number; kkSessions: KkSessionRegistry; loadDb: (url: string) => Promise<DbClient> },
+  opts: {
+    outboundTimeoutMs: number;
+    kkSessions: KkSessionRegistry;
+    loadDb: (url: string) => Promise<DbClient>;
+    /** DEVOS-77: opens M1.5's RunQueue on `REDIS_URL` (absent → no dead-letter view). */
+    loadQueue?: (redisUrl: string) => Promise<DeadLetterQueue>;
+  },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
   const hmac = env.DEVOS_POLICY_HMAC_KEY;
@@ -67,10 +76,12 @@ export async function buildRuntime(
   // M1.6: a malformed SMTP setting or dashboard URL also stops start-up with a code.
   const smtp = parseSmtpConfig(env);
   const dashboardUrl = parseDashboardUrl(env.DEVOS_DASHBOARD_URL);
+  const redisUrl = parseRedisUrl(env.REDIS_URL);
   const noSetup: SetupServices = { settings: null, vault: null };
   const noNotify: NotifyServices = { notifier: null };
-  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup, notify: noNotify };
-  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup, notify: noNotify };
+  const noDead: DeadLetterServices = { queue: null, audit: null };
+  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead };
+  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead };
   const db = await opts.loadDb(databaseUrl);
   const setup: SetupServices = {
     settings: new PrismaSettingsStore(db, opts.outboundTimeoutMs),
@@ -91,5 +102,22 @@ export async function buildRuntime(
     dashboardUrl,
     timeoutMs: opts.outboundTimeoutMs,
   });
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier } };
+  const t = opts.outboundTimeoutMs;
+  const deadLetters: DeadLetterServices =
+    redisUrl && opts.loadQueue
+      ? {
+          queue: await opts.loadQueue(redisUrl),
+          // Bounded like every other write (ADR-0011 §9): connection wait and transaction both capped.
+          audit: (entry) => db.$transaction((tx: any) => writeAudit(tx, entry), { timeout: t, maxWait: t }),
+        }
+      : noDead;
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters };
+}
+
+/** `REDIS_URL`: absent → null (no dead-letter view); anything but redis:// or rediss:// stops start-up. */
+export function parseRedisUrl(v: string | undefined): string | null {
+  const s = (v ?? "").trim();
+  if (!s) return null;
+  if (!/^rediss?:\/\/[^\s]+$/.test(s)) throw new Error("config-redis-url-invalid");
+  return s;
 }
