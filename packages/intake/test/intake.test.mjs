@@ -564,3 +564,23 @@ test("AT4h file-order fallback reads only real stream objects, never stream-like
   assert.deepEqual(ids(r), ["FR-001"]);
   assert.ok(r.warnings.includes("pdf-page-order-unknown"));
 });
+
+// ---------- PR30-r8 ----------
+test("AT4i comments between objects never create objects or trailers", () => {
+  const doc = Buffer.from(
+    "%PDF-1.4\n" +
+      "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" +
+      "2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] >>\nendobj\n" +
+      "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" +
+      "% 999 0 obj\n" +
+      "4 0 obj\n<< /Length 22 >>\nstream\nBT (FR-001 four) Tj ET\nendstream\nendobj\n" +
+      "5 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>\nendobj\n" +
+      "6 0 obj\n<< /Length 21 >>\nstream\nBT (FR-002 six) Tj ET\nendstream\nendobj\n" +
+      "% trailer << /Root 77 0 R >>\n" +
+      "trailer\n<< /Root 1 0 R >>\n%%EOF\n",
+    "latin1",
+  );
+  const r = parseSpec(doc, "comments.pdf");
+  assert.deepEqual(ids(r), ["FR-001", "FR-002"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+});

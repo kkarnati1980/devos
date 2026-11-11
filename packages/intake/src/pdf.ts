@@ -371,7 +371,7 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
   let gapStart = 0;
   // Trailers are looked for only in the text between objects, so a string inside an object cannot fake one.
   const scanGap = (from: number, to: number) => {
-    const gap = text.slice(from, to);
+    const gap = text.slice(from, to).replace(/%[^\r\n]*/g, (c) => " ".repeat(c.length)); // comments never hold a trailer
     for (const t of gap.matchAll(/\btrailer\s*<<([\s\S]{0,4096}?)>>/g)) trailers.push({ pos: from + (t.index ?? 0), dict: stripStrings(t[1] ?? "") });
   };
   const re = /(?<![0-9])(\d{1,10})\s+(\d{1,5})\s+obj\b/g;
@@ -379,6 +379,14 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
   let count = 0;
   while ((m = re.exec(text))) {
     if (++count > limits.maxPdfStreams * 4) throw new IngestError("pdf-invalid");
+    // A header inside a comment between objects (`% 999 0 obj`) is not an object (PR30-r8). Gaps hold no strings,
+    // so a '%' earlier on the same line, after the previous object, starts a comment.
+    const lineStart = Math.max(gapStart, text.lastIndexOf("\n", m.index) + 1, text.lastIndexOf("\r", m.index) + 1);
+    if (text.slice(lineStart, m.index).includes("%")) {
+      const eol = text.slice(m.index).search(/[\r\n]/);
+      re.lastIndex = eol < 0 ? text.length : m.index + eol;
+      continue;
+    }
     const num = Number(m[1]);
     const pos = m.index;
     scanGap(gapStart, pos);
