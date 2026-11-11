@@ -627,3 +627,30 @@ test("AT4k a multi-digit indirect /Length is resolved, also for a Flate stream w
   assert.deepEqual(ids(r), ["FR-001", "FR-002"]);
   assert.ok(!r.warnings.includes("pdf-stream-damaged"));
 });
+
+// ---------- PR30-r11 ----------
+test("AT4l comments inside the integer object of an indirect /Length (and inside an object header) are allowed", () => {
+  const content = "BT (FR-001 before) Tj T* (text: endstream endobj) Tj T* (FR-002 after) Tj ET";
+  const data = deflateSync(Buffer.from(content, "latin1"), { level: 0 });
+  const doc = Buffer.concat([
+    Buffer.from(
+      "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" +
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] >>\nendobj\n" +
+        "3 % page object\n0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" +
+        "4 0 obj\n<< /Length 19 0 R /Filter /FlateDecode >>\nstream\n",
+      "latin1",
+    ),
+    data,
+    Buffer.from(`\nendstream\nendobj\n19 0 obj\n% stream length\n${data.length} % bytes\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n`, "latin1"),
+  ]);
+  const r = parseSpec(doc, "commented.pdf");
+  assert.deepEqual(ids(r), ["FR-001", "FR-002"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+});
+
+test("AT4m many comment lines between tokens cannot cause catastrophic backtracking", () => {
+  const junk = "1 0 " + "% %% %  % x\n".repeat(20000) + "nope\n";
+  const t0 = Date.now();
+  assert.equal(code(() => parseSpec(Buffer.from("%PDF-1.4\n" + junk + "%%EOF\n", "latin1"), "slow.pdf")), "pdf-no-text");
+  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+});

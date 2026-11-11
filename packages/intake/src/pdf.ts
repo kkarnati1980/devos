@@ -13,10 +13,19 @@ function latin1(b: Uint8Array): string {
 }
 
 
-/** Integer-valued indirect objects (`n g obj 123 endobj`), used to resolve indirect stream /Length values. */
+/**
+ * PDF white space between tokens: whitespace and comments (`% … end of line`) (PR30-r11). A comment must run to
+ * the end of its line, so there is exactly one way to match any stretch: no backtracking blow-up on many comments.
+ */
+const WS = String.raw`(?:\s|%[^\r\n]*(?![^\r\n]))+`;
+const INT_OBJECT = new RegExp(String.raw`(?<![0-9])(\d{1,10})${WS}\d{1,5}${WS}obj${WS}(\d{1,12})${WS}endobj\b`, "g");
+const OBJECT_HEADER = new RegExp(String.raw`(?<![0-9])(\d{1,10})${WS}(\d{1,5})${WS}obj\b`, "g");
+const STREAM_TERMINATOR = new RegExp(String.raw`(\r\n|\n|\r)?endstream${WS}endobj\b`, "g");
+
+/** Integer-valued indirect objects (`n g obj 123 endobj`, comments allowed between tokens), for indirect /Length. */
 function integerObjects(text: string): Map<number, number> {
   const ints = new Map<number, number>();
-  for (const m of text.matchAll(/(?<![0-9])(\d{1,10})\s+\d{1,5}\s+obj\s+(\d{1,12})\s+endobj\b/g)) ints.set(Number(m[1]), Number(m[2]));
+  for (const m of text.matchAll(INT_OBJECT)) ints.set(Number(m[1]), Number(m[2]));
   return ints;
 }
 
@@ -76,7 +85,7 @@ function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints:
     const end = scanPlainStreamEnd(text, start);
     if (end >= 0) return end;
   }
-  const re = /(\r\n|\n|\r)?endstream\s+endobj\b/g;
+  const re = new RegExp(STREAM_TERMINATOR.source, "g");
   re.lastIndex = start;
   const m = re.exec(text);
   if (m) return m.index;
@@ -382,7 +391,7 @@ function collectObjects(buf: Buffer, limits: IngestLimits, warnings: Set<string>
     const gap = text.slice(from, to).replace(/%[^\r\n]*/g, (c) => " ".repeat(c.length)); // comments never hold a trailer
     for (const t of gap.matchAll(/\btrailer\s*<<([\s\S]{0,4096}?)>>/g)) trailers.push({ pos: from + (t.index ?? 0), dict: stripStrings(t[1] ?? "") });
   };
-  const re = /(?<![0-9])(\d{1,10})\s+(\d{1,5})\s+obj\b/g;
+  const re = new RegExp(OBJECT_HEADER.source, "g");
   let m: RegExpExecArray | null;
   let count = 0;
   while ((m = re.exec(text))) {
