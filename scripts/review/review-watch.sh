@@ -43,6 +43,7 @@ VDIR="$DIR/verdicts"
 STATE="$DIR/watch"
 ENVF="$DIR/github-review.env"
 DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
+GH_TIMEOUT="${GH_TIMEOUT:-30}"; [[ "$GH_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || GH_TIMEOUT=30
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 die() { log "ERROR $*"; exit 1; }
@@ -55,7 +56,7 @@ TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
 ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^GITHUB_REVIEW_TOKEN=//p' "$ENVF" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
 gh_api() {  # method path [json-body-file] -> body on stdout; non-2xx is an error
   local method="$1" path="$2" body="${3:-}" code
-  local args=(-sS --connect-timeout 10 --max-time "${GH_TIMEOUT:-30}" -o "$TMP/resp" -w '%{http_code}' -X "$method" -H @"$TMP/auth"
+  local args=(-sS --connect-timeout 10 --max-time "$GH_TIMEOUT" -o "$TMP/resp" -w '%{http_code}' -X "$method" -H @"$TMP/auth"
               -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
   [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data-binary @"$body")
   code="$(curl "${args[@]}" "$API$path")" || { log "curl failed: $method $path"; return 1; }
@@ -238,10 +239,10 @@ done
 # Heartbeat (v1.2.0): at most one per HEARTBEAT_SECONDS; a failure is logged and retried on the next tick.
 heartbeat() {
   local every="${HEARTBEAT_SECONDS:-3600}" now last main
-  [[ "$every" =~ ^[0-9]+$ ]] || every=3600
+  [[ "$every" =~ ^(0|[1-9][0-9]*)$ ]] || every=3600
   now="$(date -u +%s)"
   last="$(cat "$STATE/heartbeat.last" 2>/dev/null || echo 0)"
-  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  [[ "$last" =~ ^(0|[1-9][0-9]*)$ ]] || last=0
   (( last <= now )) || last=0   # a clock step back or a bad value never silences the heartbeat
   (( now - last >= every )) || return 0
   if [[ $DRY -eq 1 ]]; then log "WOULD post heartbeat"; return 0; fi
