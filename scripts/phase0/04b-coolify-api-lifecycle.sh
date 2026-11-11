@@ -13,7 +13,8 @@
 # v1.0.5 (DEVOS-54, tie-break low notes): checks GET /version (HTTP 200, Coolify 4.5.x) itself
 # before any write, using lib/coolify-version.sh shared with 04a; a 2xx rollback reply with no
 # deployment_uuid is logged instead of skipped silently.
-# Run as root on the DevOS server after 04a:  bash 04b-coolify-api-lifecycle.sh
+# Run as root on the DevOS server after 04a, from a repo checkout (it sources lib/coolify-version.sh):
+#   bash scripts/phase0/04b-coolify-api-lifecycle.sh
 #
 # Uses only the Coolify API (http://localhost:8000/api/v1) plus read-only `docker`
 # checks for evidence. Request fields for /deploy and /rollback are taken from the
@@ -57,7 +58,7 @@ need() { [[ "$CODE" =~ ^2 ]] || fail "$1: HTTP $CODE $(head -c 600 <<<"$BODY")";
 
 # AT1 precondition: 04b no longer relies on 04a having just run against the same Coolify.
 api GET /version
-VER="$(coolify_version_ok "$CODE" "$BODY" 2>&1)" || fail "version check: $VER"
+VER="$(coolify_version_ok "$CODE" "$BODY")" || fail "version check: $VER"
 echo "  Coolify $VER (API reachable, token accepted)"
 
 spec() {  # spec PATH METHOD -> {"body":[...],"required":[...],"query":[...]}

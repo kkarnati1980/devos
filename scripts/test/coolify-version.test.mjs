@@ -31,13 +31,14 @@ test("AT1 passes for HTTP 200 and 4.5.x, including the JSON-object body that use
 test("AT1 fails on a non-200 status, another version, or an unreadable body", () => {
   const notOk = run("coolify_version_ok", "401", '"4.5.3"');
   assert.equal(notOk.code, 1);
-  assert.match(notOk.err, /HTTP 401/);
+  assert.match(notOk.out, /HTTP 401/);
   const other = run("coolify_version_ok", "200", '{"version":"4.6.0"}');
   assert.equal(other.code, 1);
-  assert.match(other.err, /'4\.6\.0' is not 4\.5\.x/);
+  assert.match(other.out, /'4\.6\.0' is not 4\.5\.x/);
   const junk = run("coolify_version_ok", "200", "<html>login</html>");
   assert.equal(junk.code, 1);
-  assert.equal(junk.out, "");
+  assert.match(junk.out, /is not 4\.5\.x/);
+  assert.match(run("coolify_version_ok", "200", "[1,2]").out, /unreadable/);
 });
 
 test("04a and 04b both source the shared check and 04b checks /version before any write", async () => {

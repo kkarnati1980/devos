@@ -6,7 +6,8 @@
 # v1.0.2 (Codex review 73a8ee2): AT1 is asserted - HTTP 200 and a 4.5.x version, else exit 1.
 # v1.0.3 (DEVOS-54): the version is parsed as JSON (a string or {"version":...}) via lib/coolify-version.sh,
 # shared with 04b, so a JSON-object body no longer false-FAILs.
-# Run as root on the DevOS server:  bash 04a-coolify-api-discover.sh
+# Run as root on the DevOS server from a repo checkout (it sources lib/coolify-version.sh next to it):
+#   bash scripts/phase0/04a-coolify-api-discover.sh
 # Stores the Coolify API token in /root/.devos/coolify.env (600) via a hidden prompt.
 # Never prints the token. Creates nothing in Coolify.
 set -euo pipefail
@@ -37,7 +38,7 @@ api() { curl -sS -w '\n%{http_code}' -H "Authorization: Bearer ${COOLIFY_TOKEN}"
 say "2/5 Version (AT1)"
 OUT="$(api /version)"; VCODE="$(tail -n1 <<<"$OUT")"; VBODY="$(head -n -1 <<<"$OUT")"
 echo "  HTTP $VCODE  body: $(tr -d '[:space:]' <<<"$VBODY" | head -c 200)"
-VER="$(coolify_version_ok "$VCODE" "$VBODY" 2>&1)" || { echo "  FAIL AT1: $VER"; exit 1; }
+VER="$(coolify_version_ok "$VCODE" "$VBODY")" || { echo "  FAIL AT1: $VER"; exit 1; }
 echo "  PASS AT1 version $VER"
 
 say "3/5 Servers + projects"
