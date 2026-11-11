@@ -60,14 +60,17 @@ export class PrismaSyncStore implements SyncStore {
 /**
  * Sync one project under a per-project Postgres advisory lock, so two syncs of the same project never run at once
  * (two would both miss the marker and both create). A sync that finds the lock taken is skipped, not queued: the
- * holder is already bringing Linear up to date. The lock is transaction-scoped and released on commit or crash.
+ * holder is already bringing Linear up to date. The lock is transaction-scoped and released on commit or crash;
+ * the transaction does nothing else, so it pins one connection but locks no rows.
  */
 export async function syncProjectLocked(db: PrismaLike, projectId: string, run: (plan: DevosPlan, store: SyncStore) => Promise<unknown>,
                                         timeoutMs = 10 * 60_000): Promise<{ skipped: boolean }> {
   return db.$transaction(async (tx: any) => {
     const rows = await tx.$queryRawUnsafe(`SELECT pg_try_advisory_xact_lock(hashtext('devos:linear-sync'), hashtext($1)) AS ok`, projectId);
     if (!rows?.[0]?.ok) return { skipped: true };
-    await run(await loadPlan(tx, projectId), new PrismaSyncStore(tx, projectId));
+    // The transaction only holds the lock. Reads and id writes use the plain client, so each id commits at once
+    // and no module/task row stays locked during the Linear round trips.
+    await run(await loadPlan(db, projectId), new PrismaSyncStore(db, projectId));
     return { skipped: false };
   }, { timeout: timeoutMs, maxWait: 10_000 });
 }

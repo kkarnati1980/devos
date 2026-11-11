@@ -62,8 +62,9 @@ export function graphqlApi(client: LinearClient): LinearApi {
       return ok(d.projectCreate, "project create").project.id;
     },
     async projectExists(id) {
-      try { return Boolean((await client.query<{ project: { id: string } | null }>(`query($id: String!) { project(id: $id) { id } }`, { id })).project); }
-      catch (e) { if (e instanceof LinearError && e.code === "graphql") return false; throw e; }
+      // A filtered list answers "not found" with an empty list instead of an error, whatever status Linear uses.
+      const d = await client.query<{ projects: Conn<{ id: string }> }>(`query($id: ID!) { projects(filter: { id: { eq: $id } }, includeArchived: true) { nodes { id } } }`, { id });
+      return d.projects.nodes.some((p) => p.id === id);
     },
     async updateProject(id, input) {
       ok((await client.mutate<{ projectUpdate: { success: boolean } }>(

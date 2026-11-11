@@ -23,6 +23,8 @@ export function taskState(s: TaskStatus): { type: StateType; deadlocked: boolean
   }
 }
 
+const viewerCache = new WeakMap<LinearApi, string>();
+
 export interface SyncResult { writes: number; created: string[]; updated: string[]; log: string[] }
 export interface SyncOptions { teamKey?: string; kkUserId?: string }
 
@@ -42,10 +44,12 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     if (!id) { id = await api.createLabel(team.id, name); labelIds.set(name, id); r.writes++; r.created.push(`label ${name}`); }
     return id;
   };
-  const kk = opts.kkUserId ?? (await api.viewerId());
+  let kk = opts.kkUserId ?? viewerCache.get(api);
+  if (!kk) { kk = await api.viewerId(); viewerCache.set(api, kk); }   // looked up once per API instance
 
   // Project: stored id, else marker search, else create.
-  const projDesc = withMarker(`DevOS project **${plan.project.name}**. Mirrored by DevOS (M2.6); DevOS is the source of truth.`, "project", plan.project.id);
+  // Linear's project description is a short summary field: keep it fixed and short (no project name), ~60 chars.
+  const projDesc = withMarker("Mirrored by DevOS.", "project", plan.project.id);
   let projectId = plan.project.linearProjectId;
   if (projectId && !(await api.projectExists(projectId))) { r.log.push("stored Linear project id not found; searching by marker"); projectId = null; }
   if (!projectId) {
