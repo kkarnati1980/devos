@@ -214,8 +214,13 @@ test("M2.3 AT12 (DEVOS-135): the approvals inbox lists pending first, escapes ca
   await page.getByTestId("approvals").waitFor();
   await page.getByTestId("nav-pending").filter({ hasText: "(2 pending)" }).waitFor();
   const rows = page.getByTestId("approval-row");
-  assert.equal(await rows.count(), 3);
-  assert.deepEqual(await rows.evaluateAll((els) => els.map((e) => e.getAttribute("data-status"))), ["pending", "pending", "rejected"], "pending cards come first, even the oldest");
+  assert.equal(await rows.count(), 4, "both pending cards, then the first page (2) of rejected cards");
+  assert.deepEqual(await rows.evaluateAll((els) => els.map((e) => e.getAttribute("data-status"))), ["pending", "pending", "rejected", "rejected"], "pending cards come first, even the oldest");
+  await page.getByTestId("approvals-more").click();
+  await rows.nth(4).waitFor();
+  assert.match(await rows.nth(4).innerText(), /oldest reject/, "Show more reads the next page of decided cards");
+  assert.equal(await page.getByTestId("approvals-more").count(), 0, "no more pages, no button");
+  assert.ok(api.state.approvalReads.some((u) => u.includes("status=rejected") && u.includes("cursor=")), "decided cards are paged by status");
   assert.match(await rows.first().innerText(), /<img src=x onerror=window.__xss3=1>/, "the action is shown as text");
   assert.match(await rows.first().innerText(), /\$2\.50 · 1 blocked task\b/);
   await page.getByTestId("open-00000000-0000-4000-8000-0000000000a1").click();

@@ -6,17 +6,36 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { APPROVALS_CHANGED_EVENT, DevosApi, explain, type ApprovalDetail, type ApprovalRow } from "../../lib/api";
 
 const MAX_PENDING_PAGES = 20; // 50 a page (b1); far above what one person's inbox holds
+const DECIDED = ["approved", "rejected", "expired"] as const;
+type Cursors = Partial<Record<(typeof DECIDED)[number], string>>;
+const newestFirst = (a: ApprovalRow, b: ApprovalRow) => (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
 
 export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
   const api = useRef(new DevosApi(apiOrigin)).current;
   const [rows, setRows] = useState<ApprovalRow[] | null>(null);
+  const [more, setMore] = useState<Cursors>({}); // next page per decided status
+
   const [open, setOpen] = useState<ApprovalDetail | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const fail = (code: string) => setMsg(`${explain(code)} (${code})`);
 
-  // Pending first (every page of them, so an old pending card is never hidden behind newer decided ones),
-  // then the newest page of decided cards; each group keeps the API's newest-first order.
+  /** One page of each decided status (from `cursors`, or the first pages), newest first. */
+  const decidedPage = useCallback(async (cursors: Cursors | null) => {
+    const got: ApprovalRow[] = [];
+    const next: Cursors = {};
+    for (const status of DECIDED) {
+      if (cursors && !cursors[status]) continue;
+      const r = await api.approvals({ status, cursor: cursors?.[status] });
+      if (!r.ok) return { ok: false as const, code: r.code };
+      got.push(...r.data.approvals);
+      if (r.data.nextCursor) next[status] = r.data.nextCursor;
+    }
+    return { ok: true as const, rows: got.sort(newestFirst), next };
+  }, [api]);
+
+  // Pending first (every page of them), then decided cards read per status (approved, rejected, expired), so
+  // neither group can be pushed out of view by the other; older decided cards load with "Show more".
   const load = useCallback(async () => {
     const pending: ApprovalRow[] = [];
     let cursor: string | undefined;
@@ -27,10 +46,21 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
       if (!r.data.nextCursor) break;
       cursor = r.data.nextCursor;
     }
-    const recent = await api.approvals();
-    if (!recent.ok) return fail(recent.code);
-    setRows([...pending, ...recent.data.approvals.filter((c) => c.status !== "pending")]);
-  }, [api]);
+    const decided = await decidedPage(null);
+    if (!decided.ok) return fail(decided.code);
+    setMore(decided.next);
+    setRows([...pending, ...decided.rows]);
+  }, [api, decidedPage]);
+
+  async function showMore() {
+    const decided = await decidedPage(more);
+    if (!decided.ok) return fail(decided.code);
+    setMore(decided.next);
+    setRows((prev) => {
+      const seen = new Set((prev ?? []).map((c) => c.id));
+      return [...(prev ?? []), ...decided.rows.filter((c) => !seen.has(c.id))];
+    });
+  }
 
   // Only the newest detail request may fill the panel, so a slow earlier click never replaces the chosen card.
   const showSeq = useRef(0);
@@ -90,6 +120,9 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
             </li>
           ))}
         </ul>
+        {Object.keys(more).length ? (
+          <button type="button" onClick={() => void showMore()} data-testid="approvals-more">Show more decided cards</button>
+        ) : null}
       </section>
       {open ? <Detail key={open.approval.id} d={open} busy={busy} act={act} api={api} /> : null}
     </>

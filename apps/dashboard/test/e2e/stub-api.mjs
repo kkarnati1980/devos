@@ -93,13 +93,21 @@ export async function startStubApi(allowedOrigin) {
     state.approvals ??= [
       { id: A3, gate: "purge", action: "purge", target: "project:old", reason: "teardown", consequence: "deletes the project's data", costUsd: null, projectId: null, status: "pending", createdAt: "2026-11-10T10:00:00.000Z", decidedAt: null, decidedBy: null, blockedTasks: 0, grant: null },
       { id: A1, gate: "decision", action: "deploy <img src=x onerror=window.__xss3=1>", target: "project:shop", reason: "first deploy", consequence: null, costUsd: "2.50", projectId: null, status: "pending", createdAt: "2026-11-12T10:00:00.000Z", decidedAt: null, decidedBy: null, blockedTasks: 1, grant: null },
+      { id: "00000000-0000-4000-8000-0000000000a4", gate: "decision", action: "old approve", target: "x", reason: "older", consequence: null, costUsd: null, projectId: null, status: "rejected", createdAt: "2026-11-09T10:00:00.000Z", decidedAt: "2026-11-09T11:00:00.000Z", decidedBy: "kk", blockedTasks: 0, grant: null },
+      { id: "00000000-0000-4000-8000-0000000000a5", gate: "decision", action: "oldest reject", target: "y", reason: "oldest", consequence: null, costUsd: null, projectId: null, status: "rejected", createdAt: "2026-11-08T10:00:00.000Z", decidedAt: "2026-11-08T11:00:00.000Z", decidedBy: "kk", blockedTasks: 0, grant: null },
       { id: A2, gate: "decision", action: "spend", target: "openai", reason: "old", consequence: null, costUsd: null, projectId: null, status: "rejected", createdAt: "2026-11-11T10:00:00.000Z", decidedAt: "2026-11-11T11:00:00.000Z", decidedBy: "kk", blockedTasks: 0, grant: null },
     ];
     state.approvalComments ??= [];
     if (req.method === "GET" && url.startsWith("/approvals?") || req.method === "GET" && url === "/approvals") {
       // Newest first, as the API returns; the decided card is deliberately listed first to check pending-first sorting.
-      const status = new URL(url, "http://stub").searchParams.get("status");
-      return json(200, { approvals: [...state.approvals].reverse().filter((c) => !status || c.status === status), nextCursor: null });
+      // Newest first and 2 a page (the API pages at 50), so the dashboard's paging is exercised.
+      const q = new URL(url, "http://stub").searchParams;
+      const status = q.get("status");
+      state.approvalReads = [...(state.approvalReads ?? []), url];
+      const all = [...state.approvals].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).filter((c) => !status || c.status === status);
+      const from = q.get("cursor") ? all.findIndex((c) => c.id === q.get("cursor")) + 1 : 0;
+      const page = all.slice(from, from + 2);
+      return json(200, { approvals: page, nextCursor: from + 2 < all.length ? page[page.length - 1].id : null });
     }
     const ap = url.match(/^\/approvals\/([0-9a-f-]{36})(\/(approve|reject|comments))?$/);
     if (ap) {
