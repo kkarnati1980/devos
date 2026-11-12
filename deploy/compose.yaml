@@ -68,6 +68,8 @@ services:
       DEVOS_ALLOWED_ORIGINS: ${DEVOS_ALLOWED_ORIGINS:?DEVOS_ALLOWED_ORIGINS is required}
       DEVOS_COOKIE_SECURE: ${DEVOS_COOKIE_SECURE:-1}
       DEVOS_DASHBOARD_URL: ${DEVOS_DASHBOARD_URL:-}
+      # DEVOS-77: the dead-letter view reads M1.5's run queue (same Redis as the worker; no secret in it).
+      REDIS_URL: redis://redis:6379
       # DEVOS-81: required (:?), so Coolify keeps the values (on 9 Nov it dropped optional ones).
       DEVOS_POLICY_HMAC_KEY: ${DEVOS_POLICY_HMAC_KEY:?DEVOS_POLICY_HMAC_KEY is required}
       DEVOS_VAULT_KEY: ${DEVOS_VAULT_KEY:?DEVOS_VAULT_KEY is required}
