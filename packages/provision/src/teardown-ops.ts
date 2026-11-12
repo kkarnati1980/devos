@@ -70,8 +70,13 @@ export function githubRepoOps(gh: GitHubClient, projectId: string): ResourceOps 
     kind: "repo",
     inspect: async (item) => {
       const [owner, repo] = splitRepo(item.externalId);
-      const r = (await gh.http.get<RepoBody>(`/repos/${owner}/${repo}`)).body;
-      return r ? { owned: repoOwned(projectId, r) } : null;
+      const r = await gh.http.get<RepoBody>(`/repos/${owner}/${repo}`);
+      // Codex PR48-r1: only a 404 proves absence; a 200 must carry a repo object. Anything else is inconclusive.
+      if (r.status === 404) return null;
+      if (r.status !== 200 || !r.body || typeof r.body !== "object" || typeof r.body.full_name !== "string") {
+        throw new ProviderError("github", "bad-response", `github GET /repos/{owner}/{repo} returned an inconclusive response (${r.status})`, r.status);
+      }
+      return { owned: repoOwned(projectId, r.body) };
     },
     remove: async (item) => {
       const [owner, repo] = splitRepo(item.externalId);
@@ -98,8 +103,14 @@ export function coolifyProjectOps(cf: CoolifyClient, projectId: string): Resourc
     provider: "coolify",
     kind: "project",
     inspect: async (item) => {
-      const p = await cf.getProject(item.externalId);
-      return p ? { owned: (p.description ?? "").includes(ownershipMarker(projectId)) } : null;
+      if (!/^[A-Za-z0-9-]{1,64}$/.test(item.externalId)) throw new Error("coolify-uuid-invalid");
+      const r = await cf.http.get<{ uuid?: string; description?: string | null }>(`/api/v1/projects/${item.externalId}`);
+      // Codex PR48-r1: only a 404 proves absence; a 200 must carry the project object.
+      if (r.status === 404) return null;
+      if (r.status !== 200 || !r.body || typeof r.body !== "object" || typeof r.body.uuid !== "string") {
+        throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/projects/{uuid} returned an inconclusive response (${r.status})`, r.status);
+      }
+      return { owned: (r.body.description ?? "").includes(ownershipMarker(projectId)) };
     },
     remove: async (item) => {
       if (!/^[A-Za-z0-9-]{1,64}$/.test(item.externalId)) throw new Error("coolify-uuid-invalid");

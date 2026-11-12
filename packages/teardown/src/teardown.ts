@@ -58,7 +58,8 @@ export type TeardownErrorCode =
   | "unsupported_resource"
   | "delete_unconfirmed"
   | "provider_forbidden"
-  | "provider_error";
+  | "provider_error"
+  | "scan_incomplete";
 
 export class TeardownError extends Error {
   constructor(
@@ -258,6 +259,12 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
     for (const r of rows) {
       if (!map.has(opsKey(r.provider, r.kind))) throw new TeardownError("unsupported_resource", false, `no teardown for ${r.provider} ${r.kind} yet`, pick(r));
     }
+    // Codex PR48-r1: the leftover scan must be independent and complete (decision 6), or `purged` could be claimed
+    // without looking. Required: the inventory scanner, plus one scanner per provider that has teardown ops or rows.
+    const names = new Set(opts.scanners.map((x) => x.name));
+    const needed = new Set(["inventory", ...opts.ops.map((o) => o.provider), ...rows.map((r) => r.provider)]);
+    const missing = [...needed].filter((n) => !names.has(n)).sort();
+    if (missing.length) throw new TeardownError("scan_incomplete", false, `purge needs leftover scanners for: ${missing.join(", ")}`);
     // Pre-review finding 1: reset the step journal before the first delete, so a purge that stops half way (then
     // Restore) can never leave a stale `done` step for a resource that is gone. Safe under the shared lock:
     // provisioning always looks a resource up before trusting or creating it.

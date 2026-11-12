@@ -50,6 +50,7 @@ function fakes() {
     if (f) f.used = true;
     calls.push({ method, path, auth: init.headers?.authorization, signal: init.signal });
     if (f?.action === "timeout-before") throw timeout();
+    if (f?.action?.raw) return new Response(f.action.body === undefined ? null : f.action.body, { status: f.action.status });
     if (f?.action?.status) return json(f.action.status, { message: "injected" });
     const own = handle();
     const res = own ?? (await base.fetchImpl(url, init));
@@ -291,4 +292,28 @@ test("pre-review 3: archive checks ownership of every resource before its first 
   assert.notEqual(s.fake.repos.get("kkarnati1980/devos-acme").archived, true, "the repo was not archived");
   assert.equal(s.fake.calls.filter((c) => c.method === "PATCH").length, 0);
   assert.equal((await s.store.project(P.id)).stage, "live");
+});
+
+test("Codex PR48-r1: a purge without a scanner per provider and the inventory scanner refuses before any call", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const before = s.fake.calls.length;
+  for (const scanners of [[], [githubScanner(s.gh), coolifyScanner(s.cf)], [githubScanner(s.gh), inventoryScanner(s.store)]]) {
+    await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners }), (e) => e instanceof TeardownError && e.code === "scan_incomplete" && e.retryable === false);
+  }
+  assert.equal(s.fake.calls.length, before, "no provider call");
+  assert.equal((await s.store.project(P.id)).stage, "archived");
+});
+
+test("Codex PR48-r1: an inconclusive lookup (204, empty 200, JSON null, wrong shape) never marks a row deleted", async () => {
+  for (const [status, body] of [[204, undefined], [200, ""], [200, "null"], [200, "[]"]]) {
+    const s = setup();
+    await provision(s);
+    await archiveProject(P.id, { ...s.base, authorize: allowAll });
+    s.fake.faults.push({ match: (m, p) => m === "GET" && p.startsWith("/repos/"), action: { raw: true, status, body } });
+    await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => e.code === "provider_error", `${status} ${body}`);
+    assert.equal(s.fake.repos.size, 1);
+    assert.ok(s.store.resources.some((r) => r.provider === "github" && !r.deletedAt), "the repo row stays active");
+  }
 });
