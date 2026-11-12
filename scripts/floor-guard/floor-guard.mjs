@@ -244,7 +244,10 @@ export function analyse(files, show) {
       const onKeys = (ls) => ls.flatMap((l) => [...l.text.matchAll(on)].map((m) => [l, m])); // every switch on a line (PR70-r3)
       // count each switch as a multiset, so one of two `enabled: true` turned off is still a loss (PR70-r4)
       const addedOn = onKeys(f.added).reduce((c, [, m]) => c.set(m[1], (c.get(m[1]) ?? 0) + 1), new Map());
-      if (/coverage|c8rc|nycrc/i.test(p) || f.removed.concat(f.added).some((l) => /coverage/.test(l.text)) || TEST_CONFIG.test(p))
+      // the zero-context diff may not show the `coverage:` key around a changed switch, so the whole base/head file
+      // is read when the changed lines do not mention it (PR70-r7)
+      const mentionsCoverage = () => [show("base", f.oldPath), show("head", p)].some((x) => x != null && /coverage/.test(x));
+      if (/coverage|c8rc|nycrc/i.test(p) || f.removed.concat(f.added).some((l) => /coverage/.test(l.text)) || TEST_CONFIG.test(p) || mentionsCoverage())
         for (const [l, m] of onKeys(f.removed)) { const left = addedOn.get(m[1]) ?? 0; if (left > 0) addedOn.set(m[1], left - 1); else hit("coverage-lowered", p, l.ln, `${m[1]} no longer true: ${l.text}`); }
       for (const a of f.added) if (/\b(exclude|testPathIgnorePatterns|testIgnore|modulePathIgnorePatterns|coveragePathIgnorePatterns)\b["']?\s*[:=]/.test(a.text) && !WORKFLOW.test(p)) hit("tests-excluded", p, a.ln, a.text);
       const retry = /(?<![\w-])(retries|retry|maxRetries)["']?\s*[:=\s]\s*(\d+)/g;
