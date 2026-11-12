@@ -239,3 +239,14 @@ test("DL AT8: only fixed run-* codes are shown as the reason; raw messages becom
   assert.equal(v.attemptsMade, 0);
   assert.equal(v.failedAt, null);
 });
+
+test("DL AT11: openapi.yaml names the audit action the retry actually writes (DEVOS-119)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const spec = readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8");
+  const code = readFileSync(new URL("../src/dead-letters.ts", import.meta.url), "utf8");
+  const written = [...code.matchAll(/action: "(run\.dead_letter\.[a-z_]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(written, ["run.dead_letter.retry_requested"]);
+  const named = [...spec.matchAll(/`(run\.dead_letter\.[a-z_]+)`/g)].map((m) => m[1]);
+  assert.ok(named.length > 0, "openapi.yaml names the retry audit action");
+  for (const a of named) assert.ok(written.includes(a), `openapi.yaml names ${a}, which the code never writes`);
+});
