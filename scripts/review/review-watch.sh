@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.3.0
+# Version: 1.4.0
+# v1.4.0 (DEVOS-116): the longest-waiting head is reviewed first. A head's first-green time is stored
+# (<sha>.green) and the tick reviews the candidate with the oldest one (then the lower PR number), instead of
+# the first one in GitHub's newest-first list, so older PRs no longer starve. Still one review per tick.
 # v1.3.0 (DEVOS-105, after the DEVOS-101 stall): heartbeat. About once an hour (HEARTBEAT_SECONDS, default 3600)
 # a completed tick sets the commit status `codex-review-watch` = success on the head of main, with the time, the
 # open-PR count and how many wait for green CI. A heartbeat older than 2 hours means the watcher is down, which the
@@ -156,7 +159,7 @@ verdict_msg() {  # sha label contract -> writes <sha>.msg and <sha>.state from t
 
 waiting=0           # PRs whose CI is not green yet (heartbeat)
 unreadable=0        # PRs whose workflow runs could not be read (heartbeat)
-reviewed=0          # reviews run this tick (max 1: runner limit 900 s < service limit 1200 s)
+cands=()            # DEVOS-116: green, unreviewed heads: "<first-green epoch> <pr> <sha> <contract>"
 declare -A tried=() # SHAs whose publication was attempted this tick
 prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
 count="$(jq 'length' <<<"$prs")"
@@ -209,13 +212,23 @@ for i in $(seq 0 $((count - 1))); do
   if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; unreadable=$((unreadable + 1)); continue; fi
   if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; waiting=$((waiting + 1)); continue; fi
 
-  round=1
+  # DEVOS-116: green and unreviewed. Remember when this SHA was first seen green (kept across ticks), and
+  # review the longest-waiting candidate after the loop, not the first one GitHub happens to list.
+  since="$(cat "$STATE/$sha.green" 2>/dev/null || true)"
+  if [[ ! "$since" =~ ^[0-9]{1,12}$ ]]; then
+    since="$(date +%s)"
+    [[ $DRY -eq 1 ]] || echo "$since" > "$STATE/$sha.green"
+  fi
+  cands+=("$since $pr $sha $contract")
+done
+
+review_one() {  # pr sha contract
+  local pr="$1" sha="$2" contract="$3" round=1 label rc f
   for f in "$STATE"/*.pr; do
     if [[ -f "$f" && "$(cat "$f")" == "$pr" ]]; then round=$((round + 1)); fi
   done
   label="PR${pr}-r${round}"
-  if (( reviewed >= 1 )); then log "PR #$pr ${sha:0:7}: queued for the next tick (one review per tick)"; continue; fi
-  if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD review as $label against $contract"; continue; fi
+  if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD review as $label against $contract"; return 0; fi
 
   log "PR #$pr ${sha:0:7}: reviewing as $label against $contract"
   set_status "$sha" pending "Codex review $label running" || true
@@ -226,9 +239,8 @@ for i in $(seq 0 $((count - 1))); do
   if grep -q "another review is running" "$TMP/run.safe"; then
     log "PR #$pr: runner busy (manual review in progress); retry next tick"
     set_status "$sha" pending "Codex review queued (runner busy)" || true
-    continue
+    return 0
   fi
-  reviewed=1
   tried[$sha]=1
   echo "$pr" > "$STATE/$sha.pr"
   echo "$label" > "$STATE/$sha.label"
@@ -245,7 +257,17 @@ for i in $(seq 0 $((count - 1))); do
     log "PR #$pr ${sha:0:7}: runner failed (exit $rc)"
   fi
   publish "$pr" "$sha" || true
-done
+}
+
+# DEVOS-116: one review per tick (runner limit 900 s < service limit 1200 s), oldest first-green time first,
+# then the lower PR number. Every other candidate waits for a later tick.
+if (( ${#cands[@]} > 0 )); then
+  first=1
+  while read -r since pr sha contract; do
+    if (( first )); then first=0; review_one "$pr" "$sha" "$contract"
+    else log "PR #$pr ${sha:0:7}: queued for the next tick (one review per tick, oldest first)"; fi
+  done < <(printf '%s\n' "${cands[@]}" | sort -k1,1n -k2,2n)
+fi
 
 # Drain: a SHA reviewed earlier whose comment or status never posted is published even if its PR has since
 # moved to a newer head or closed. The PR number comes from <sha>.pr, recorded when the review ran.

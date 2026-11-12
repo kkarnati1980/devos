@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [] });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [] });
 
 before(async () => {
   reset();
@@ -30,7 +30,13 @@ before(async () => {
       if (p === "/repos/kkarnati1980/devos/pulls") return send(200, M.prs);
       if (p === "/repos/kkarnati1980/devos/commits/main" && M.hangMain) return; // never answers
       if (p === "/repos/kkarnati1980/devos/commits/main") return M.failMain ? send(502, {}) : send(200, { sha: MAIN });
-      if (p === "/repos/kkarnati1980/devos/actions/runs") return send(200, { workflow_runs: [{ workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
+      if (p === "/repos/kkarnati1980/devos/actions/runs") {
+        return send(200, { workflow_runs: [M.green
+          ? { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "completed", conclusion: "success" }
+          : { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
+      }
+      const cm = p.match(/^\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/);
+      if (cm && req.method === "POST") { M.comments.push({ pr: Number(cm[1]), ...JSON.parse(body) }); return send(201, {}); }
       const st = p.match(/^\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/);
       if (st && req.method === "POST") {
         if (M.failStatus) return send(500, {});
@@ -185,6 +191,47 @@ test("AT18: the main loop checks trust before draft, publication, stored-verdict
   const src = execFileSync("sed", ["-n", '/^for i in /,/^done/p', "scripts/review/review-watch.sh"], { cwd: ROOT, encoding: "utf8" });
   const at = (s) => { const i = src.indexOf(s); assert.ok(i > 0, s); return i; };
   const t = at("trusted_pr");
-  for (const later of ['"$draft" == "true"', "published \"$sha\"", '"$STATE/$sha.msg"', '"$VDIR/$sha.json"', "$RUNNER"]) assert.ok(t < at(later), later);
+  // v1.4.0 (DEVOS-116): the loop queues review candidates (`cands+=`); the runner runs only on a queued candidate.
+  for (const later of ['"$draft" == "true"', "published \"$sha\"", '"$STATE/$sha.msg"', '"$VDIR/$sha.json"', "cands+="]) assert.ok(t < at(later), later);
+  assert.ok(!src.includes("$RUNNER"), "the runner is never called inside the PR loop");
+  const all = fs.readFileSync(WATCH, "utf8");
+  assert.equal((all.match(/"\$RUNNER"/g) || []).length, 1, "one runner call site");
+  assert.match(all, /review_one "\$pr" "\$sha" "\$contract"\n[\s\S]*done < <\(printf '%s\\n' "\$\{cands\[@\]\}"/);
   assert.match(src, /external PR, not reviewed/);
+});
+
+// DEVOS-116 (review-watch v1.4.0, AT19): the longest-waiting green head is reviewed first, not the newest PR.
+test("AT19: with three green waiting heads, the one green longest is reviewed first, then the next", async () => {
+  reset();
+  M.green = true;
+  const sha = (c) => c.repeat(40);
+  const pr = (n, c) => ({ number: n, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha(c), repo: { full_name: "kkarnati1980/devos" } }, body: `Review-Contract: docs/modules/M${n}.md` });
+  M.prs = [pr(9, "a"), pr(8, "b"), pr(7, "e")]; // GitHub's order: newest PR first
+  const ws = path.join(dir, "watch");
+  fs.mkdirSync(ws, { recursive: true });
+  fs.mkdirSync(path.join(dir, "verdicts"), { recursive: true });
+  const now = Math.floor(Date.now() / 1000);
+  fs.writeFileSync(path.join(ws, `${sha("b")}.green`), String(now - 3000)); // #8 waited longest
+  fs.writeFileSync(path.join(ws, `${sha("e")}.green`), String(now - 2000));
+  // #9 has no stored time: first seen green now.
+  const log = path.join(dir, "runner.log");
+  const runner = path.join(dir, "runner.sh");
+  fs.writeFileSync(runner, `#!/usr/bin/env bash\necho "$2" >> "${log}"\nprintf '{"verdict":"PASS","summary":"ok","findings":[]}' > "${dir}/verdicts/$2.json"\n`, { mode: 0o755 });
+  const order = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n") : []);
+  const r1 = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(r1.code, 0, r1.out);
+  assert.deepEqual(order(), [sha("b")], "one review per tick, the oldest green head first");
+  assert.match(r1.out, /PR #7 eeeeeee: queued for the next tick/);
+  assert.match(r1.out, /PR #9 aaaaaaa: queued for the next tick/);
+  assert.ok(fs.existsSync(path.join(ws, `${sha("a")}.green`)), "first-green time stored for the new head");
+  await tick([], { REVIEW_RUNNER: runner });
+  await tick([], { REVIEW_RUNNER: runner });
+  assert.deepEqual(order(), [sha("b"), sha("e"), sha("a")]);
+  assert.ok(M.statuses.some((x) => x.sha === sha("b") && x.context === "codex-review" && x.state === "success"));
+  // --dry-run names the same choice and stores nothing.
+  reset(); M.green = true; M.prs = [pr(12, "1"), pr(11, "2")];
+  const r = await tick(["--dry-run"], { REVIEW_RUNNER: runner });
+  assert.match(r.out, /PR #11 2222222: WOULD review/, "a tie on the first-green time goes to the lower PR number");
+  assert.match(r.out, /PR #12 1111111: queued/);
+  assert.equal(fs.existsSync(path.join(ws, `${sha("1")}.green`)), false);
 });
