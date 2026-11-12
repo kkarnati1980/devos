@@ -24,7 +24,7 @@ One check, `ci-gate`, that always reports on every PR into `main` and is green o
 | AT4 | The newest run of a re-run check decides |
 | AT5 | The gate's own workflow, push-only and other-branch workflows are not expected; job `name` or id is the check name; an empty set or a duplicate name is an error |
 | AT6 | The repo's real workflows parse to exactly the 14 current PR checks; the CLI exits 2 on missing inputs or an unsupported workflow |
-| AT7 | A check main runs that the PR deletes or narrows → exit 2 at once; added checks are expected; a missing base directory is an error |
+| AT7 | A check main runs that the PR deletes or narrows → exit 2 at once; added checks are expected; a missing base directory, or an absent/empty `GATE_BASE_WORKFLOWS_DIR` input, is an error (exit 2, Codex PR73-r3) |
 | AT10 | A same-named run from another check suite fails the name; a re-run in the same suite counts |
 | AT8 | Every read uses `filter=all`; pagination over 100 runs; another app's same-named run ignored; 5xx retried to success; 3 network failures or one 4xx → `GateError` |
 | AT9 | Run through a symlinked path with a space and `%`, the CLI still exits 2 on missing inputs (fails on the old `file://` comparison) |
@@ -41,3 +41,6 @@ Re-review (CHANGES_REQUESTED, 7 findings): fixed — a same-named run from anoth
 - **Merge order (medium):** this PR merges after #68 (DEVOS-139 step 1, `0016-ci-throughput.md`), which gives every watched job a timeout of 30 minutes or less; the 27-minute deadline assumes those.
 - Tag-pinned Actions match every other workflow (repo-wide C3 follow-up); `main()` end to end with a stubbed `fetch` is left to the throwaway-PR proof in DEVOS-139.
 - **Codex PR73-r1 (1 medium, fixed):** the check-runs read now passes `filter=all`; GitHub's default `latest` could hide an older failed run of the same name from another suite before the suite rule saw it. AT8 asserts the parameter.
+
+## Codex PR73-r3 (13 Nov 2026; 1 medium, accepted)
+- `expectedUnion` returned the head-only set when `GATE_BASE_WORKFLOWS_DIR` was absent or empty, so a misconfigured run skipped the base comparison. It now refuses that with a `GateError` (exit 2) before reading any workflow; the workflow always sets the input. Test: `undefined`, `""` and blanks are refused.

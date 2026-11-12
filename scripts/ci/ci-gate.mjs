@@ -69,8 +69,9 @@ export function expectedFromWorkflow(file, wf, base) {
  * own file excluded). A PR that deletes or narrows a workflow still has to pass the checks main runs today.
  */
 export function expectedUnion(baseDir, headDir, base) {
+  // Codex PR73-r3: the base directory is required; a missing input fails closed rather than skipping the comparison.
+  if (typeof baseDir !== "string" || !baseDir.trim()) throw new GateError("GATE_BASE_WORKFLOWS_DIR (the base commit's workflow directory) is required");
   const head = expectedChecks(headDir, base);
-  if (!baseDir) return head;
   if (!existsSync(baseDir)) throw new GateError("the base commit's workflow directory is missing");
   const dropped = expectedChecks(baseDir, base).filter((n) => !head.includes(n));
   // Fail at once rather than wait out the deadline: removing a check main runs needs its own approved change (G5).

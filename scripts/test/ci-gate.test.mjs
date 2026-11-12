@@ -104,6 +104,8 @@ test("AT7: a PR that deletes or narrows a check main runs fails at once; added c
   writeFileSync(join(head, "sec.yml"), "on: pull_request\njobs:\n  secret-scan:\n    runs-on: x\n");
   assert.deepEqual(expectedUnion(base, head, "main"), ["build", "extra", "secret-scan"]);
   assert.throws(() => expectedUnion(join(base, "missing"), head, "main"), GateError);
+  // Codex PR73-r3: an absent or empty base input fails closed instead of skipping the base comparison.
+  for (const missing of [undefined, "", "   "]) assert.throws(() => expectedUnion(missing, head, "main"), /GATE_BASE_WORKFLOWS_DIR .* is required/);
 });
 
 test("AT8: check runs are read page by page, only from GitHub Actions, with bounded retries that fail closed", async () => {
