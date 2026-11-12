@@ -236,7 +236,15 @@ export function analyse(files, show) {
         for (const t of b.on) if (!h.on.includes(t)) hit("ci-trigger-removed", p, 0, `trigger ${t} removed`);
         const left = [...h.onLines];
         for (const l of b.onLines) { const i = left.indexOf(l); if (i >= 0) left.splice(i, 1); else hit("ci-trigger-narrowed", p, 0, `trigger line "${l}" changed or removed`); }
-        for (const l of left) if (/^(types|branches|tags|paths|paths-ignore|branches-ignore|tags-ignore)\s*:/.test(l.split(" > ").at(-1))) hit("ci-trigger-narrowed", p, 0, `trigger filter "${l}" added`);
+        for (const l of left) {
+          const parts = l.split(" > "), last = parts.at(-1), parents = parts.slice(0, -1);
+          // a new filter key; any entry added under an *-ignore list; or a `!` exclusion added under an allow-list
+          // (PR70-r10). A plain entry added under branches/paths/tags/types only widens the trigger.
+          if (/^(types|branches|tags|paths|paths-ignore|branches-ignore|tags-ignore)\s*:/.test(last)
+            || parents.some((k) => /^(paths|branches|tags)-ignore$/.test(k))
+            || (/^(paths|branches|tags)$/.test(parents.at(-1) ?? "") && /^-\s*["']?!/.test(last)))
+            hit("ci-trigger-narrowed", p, 0, `trigger filter "${l}" added`);
+        }
       }
     }
 

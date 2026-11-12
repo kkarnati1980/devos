@@ -95,6 +95,9 @@ const VIOLATIONS = [
   ["ci-trigger-narrowed (types added)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    types: [closed]\n") }],
   // PR70-r9: the same filter line moved from push to an unrestricted pull_request narrows PR runs
   ["ci-trigger-narrowed (filter moved between events)", { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n") }, { [WF]: wf(STEPS).replace("  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n", "  push:\n  pull_request:\n    branches: [main]\n") }],
+  // PR70-r10: entries added under an existing *-ignore list, or a `!` exclusion under an allow-list
+  ["ci-trigger-narrowed (entry added under paths-ignore)", { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths-ignore:\n      - docs/**\n") }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths-ignore:\n      - docs/**\n").replace("      - docs/**\n", "      - docs/**\n      - packages/**\n") }],
+  ["ci-trigger-narrowed (! exclusion added under paths)", { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths:\n      - '**'\n") }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths:\n      - '**'\n      - '!packages/**'\n") }],
   ["tests-excluded (quoted jest key in package.json)", { "packages/x/package.json": '{ "jest": {\n} }\n' }, { "packages/x/package.json": '{ "jest": {\n  "testPathIgnorePatterns": ["slow"]\n} }\n' }],
   ["lint-rule-off (unquoted key)", { "packages/x/eslint.config.mjs": "export default [{ rules: {} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'off',\n} }];\n" }],
   ["lint-rule-off (error to warn)", { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'error',\n} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'warn',\n} }];\n" }],
@@ -161,6 +164,12 @@ test("exit 0: a non-env early return in a test helper, and || true on a non-test
 
 test("exit 0: a trivial assertion only moved or re-indented is not new", () => {
   const r = check({ [T]: testSrc("expect(f()).toBe(3);\n  expect(null).toBe(g());") }, { [T]: testSrc("expect(null).toBe(g());\nexpect(f()).toBe(3);") });
+  assert.deepEqual(r.hits, []);
+});
+
+test("exit 0: an entry added under an existing allow-list filter only widens the trigger (PR70-r10)", () => {
+  const base = wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches:\n      - main\n");
+  const r = check({ [WF]: base }, { [WF]: base.replace("      - main\n", "      - main\n      - release/**\n") });
   assert.deepEqual(r.hits, []);
 });
 
