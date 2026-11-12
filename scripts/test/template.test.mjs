@@ -149,15 +149,29 @@ test("AT4/AT6: the generated server starts with `node src/server.mjs` from a pat
   const out = path.join(tmp, "my app");
   assert.equal(apply({ out, select: [], sha: "b".repeat(40) }).code, 0);
   const { spawn } = await import("node:child_process");
-  const port = 20000 + Math.floor(Math.random() * 20000);
-  const child = spawn(process.execPath, ["src/server.mjs"], { cwd: out, env: { PATH: process.env.PATH, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
+  // DEVOS-159: wait for the server's own "listening" log line (bounded at 30 s) instead of a fixed 5 s polling
+  // window, which flaked on loaded CI runners. A random port can collide, so a start that exits with
+  // EADDRINUSE is retried on a new port (at most 3 tries). The assertion is unchanged: /health must answer 200.
+  const start = (port) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ["src/server.mjs"], { cwd: out, env: { PATH: process.env.PATH, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "", done = false;
+    const finish = (state) => { if (!done) { done = true; clearTimeout(timer); resolve({ child, port, state, stderr: () => stderr }); } };
+    const timer = setTimeout(() => finish("timeout"), 30_000);
+    child.stdout.on("data", (d) => { stdout += d; if (/"msg":"listening"/.test(stdout)) finish("listening"); });
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.on("exit", () => finish("exited"));
+  });
+  let started;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    started = await start(20000 + Math.floor(Math.random() * 20000));
+    if (!(started.state === "exited" && /EADDRINUSE/.test(started.stderr()))) break;
+  }
+  const { child, port, state } = started;
   try {
-    let body = null;
-    for (let i = 0; i < 50 && body === null; i++) {
-      await new Promise((r) => setTimeout(r, 100));
-      try { const r = await fetch(`http://127.0.0.1:${port}/health`); if (r.status === 200) body = await r.json(); } catch { /* not up yet */ }
-    }
-    assert.ok(body, "the server never answered /health");
+    assert.equal(state, "listening", `the server never logged "listening" (${state}): ${started.stderr().slice(0, 500)}`);
+    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(10_000) });
+    assert.equal(r.status, 200, "the server never answered /health");
+    assert.ok(await r.json(), "the /health body is JSON");
   } finally { child.kill(); }
 });
 
