@@ -22,8 +22,12 @@ export interface GateApprovalRow {
 export interface GateStore {
   milestone(id: string): Promise<MilestoneRow | null>;
   approval(id: string): Promise<GateApprovalRow | null>;
-  /** Closes the milestone with its gate approval and audits, in one transaction; false if it was already closed. */
-  close(milestoneId: string, approvalId: string, at: Date, audit: AuditEntry, actor: "agent" | "kk" | "system"): Promise<boolean>;
+  /**
+   * Closes the milestone with its gate approval and audits, in one transaction; false if it was already closed or
+   * if, inside that transaction, the milestone's gate or project no longer matches the validated `gate`/`projectId`
+   * or the approval is no longer approved for them (Codex PR41-r1: no check-then-act gap).
+   */
+  close(milestoneId: string, approvalId: string, expect: { gate: string; projectId: string }, at: Date, audit: AuditEntry, actor: "agent" | "kk" | "system"): Promise<boolean>;
 }
 
 /** The M1.7 surface the gate engine needs (structural; `@devos/policy` PolicyEngine.decide). */
@@ -31,6 +35,7 @@ export interface GatePolicy {
   decide(request: {
     identity: { id: string; type: "agent" | "kk" | "system"; roles?: string[] };
     action: { type: string; resource?: string; projectId?: string };
+    approvalGrantId?: string;
   }): Promise<{ enforcedOutcome: "allow" | "deny" | "require_approval"; reason: string }>;
 }
 
@@ -48,8 +53,12 @@ export class GateEngine {
     identity: { id: string; type: "agent" | "kk" | "system"; roles?: string[] },
     milestoneId: string,
     approvalId: string,
+    opts: { approvalGrantId?: string } = {},
   ): Promise<{ milestoneId: string; approvalId: string; closedAt: Date }> {
     if (!UUID.test(milestoneId) || !UUID.test(approvalId)) throw new ApprovalError("invalid-input");
+    // Codex PR41-r1: a gate.transition rule may require approval; KK's grant (from approving the gate card) is
+    // forwarded so M1.7 can lift it. M1.7 checks the grant's scope, expiry, uses and revocation itself.
+    if (opts.approvalGrantId !== undefined && !UUID.test(opts.approvalGrantId)) throw new ApprovalError("invalid-input");
     const m = await this.deps.store.milestone(milestoneId);
     if (!m) throw new ApprovalError("milestone-not-found", 404);
     if (m.closedAt) throw new ApprovalError("milestone-closed", 409);
@@ -60,15 +69,20 @@ export class GateEngine {
     const decision = await this.deps.policy.decide({
       identity,
       action: { type: "gate.transition", resource: `milestone:${m.id}`, projectId: m.projectId },
+      ...(opts.approvalGrantId ? { approvalGrantId: opts.approvalGrantId } : {}),
     });
     if (decision.enforcedOutcome !== "allow") throw new ApprovalError(policyCode(decision.reason), 403);
     const at = new Date((this.deps.now ?? Date.now)());
-    const ok = await this.deps.store.close(m.id, a.id, at, {
+    const ok = await this.deps.store.close(m.id, a.id, { gate: m.gateName, projectId: m.projectId }, at, {
       action: "milestone.closed",
       summary: `Milestone closed through gate ${m.gateName}`,
       details: { milestoneId: m.id, approvalId: a.id, gate: m.gateName },
     }, identity.type);
-    if (!ok) throw new ApprovalError("milestone-closed", 409);
+    if (!ok) {
+      // Lost a race: either another call closed it, or the gate/evidence changed after validation (Codex PR41-r1).
+      const now = await this.deps.store.milestone(m.id);
+      throw new ApprovalError(now?.closedAt ? "milestone-closed" : "gate-evidence-missing", 409);
+    }
     return { milestoneId: m.id, approvalId: a.id, closedAt: at };
   }
 }
@@ -92,9 +106,11 @@ export class MemoryGateStore implements GateStore {
     const a = this.approvals.get(id);
     return a ? { ...a } : null;
   }
-  async close(milestoneId: string, _approvalId: string, at: Date, audit: AuditEntry, _actor: "agent" | "kk" | "system") {
+  async close(milestoneId: string, approvalId: string, expect: { gate: string; projectId: string }, at: Date, audit: AuditEntry, _actor: "agent" | "kk" | "system") {
     const m = this.milestones.get(milestoneId);
-    if (!m || m.closedAt) return false;
+    const a = this.approvals.get(approvalId);
+    if (!m || m.closedAt || m.gateName !== expect.gate || m.projectId !== expect.projectId) return false;
+    if (!a || a.status !== "approved" || a.gate !== expect.gate || a.projectId !== expect.projectId) return false;
     m.closedAt = at;
     this.audit.push(audit);
     return true;
@@ -132,10 +148,19 @@ export class PrismaGateStore implements GateStore {
     });
   }
 
-  close(milestoneId: string, approvalId: string, at: Date, audit: AuditEntry, actor: "agent" | "kk" | "system") {
+  close(milestoneId: string, approvalId: string, expect: { gate: string; projectId: string }, at: Date, audit: AuditEntry, actor: "agent" | "kk" | "system") {
     return this.tx(async (tx) => {
-      // The milestone_gate_approved trigger re-checks the approval under its row lock (backstop).
-      const r = await tx.milestone.updateMany({ where: { id: milestoneId, closedAt: null }, data: { closedAt: at, gateApprovalId: approvalId } });
+      // Codex PR41-r1: re-check the gate match inside the closing transaction. The approval row is locked (FOR SHARE)
+      // so its status and gate cannot change before commit; the milestone update is conditional on the validated
+      // gate name and project, so a concurrent gate_name change makes it match no row. The
+      // milestone_gate_approved trigger stays the backstop for status and project.
+      const ap = (await tx.$queryRaw`SELECT status::text AS status, gate::text AS gate, project_id::text AS project_id FROM approval WHERE id = ${approvalId}::uuid FOR SHARE`) as Array<{ status: string; gate: string; project_id: string | null }>;
+      const row = ap[0];
+      if (!row || row.status !== "approved" || row.gate !== expect.gate || row.project_id !== expect.projectId) return false;
+      const r = await tx.milestone.updateMany({
+        where: { id: milestoneId, closedAt: null, gateName: expect.gate, projectId: expect.projectId },
+        data: { closedAt: at, gateApprovalId: approvalId },
+      });
       if (r.count !== 1) return false;
       const m = await tx.milestone.findUnique({ where: { id: milestoneId }, select: { projectId: true } });
       await tx.auditEvent.create({

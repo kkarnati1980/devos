@@ -289,3 +289,40 @@ test("pre-review r2: a purge action is gate 5 whoever raises it; a running task 
   await approvals.cardForDecision({ enforcedOutcome: "require_approval", reason: "r" }, { action: "deploy.preview", resource: "repo:y", projectId: PROJECT, taskId: T2 });
   assert.equal(store.tasks.get(T2).status, "blocked");
 });
+
+test("Codex PR41-r1: a gate.transition that requires approval closes only with KK's forwarded grant", async () => {
+  const M = "55555555-5555-4555-8555-555555555556";
+  const gateRule = { ...approvalRule, id: "r-gate-approve", name: "gate transitions need approval", actions: ["gate.transition"] };
+  const { approvals, engine, session } = setup({ rules: [gateRule] });
+  const c = await approvals.raiseCard(card({ gate: "requirements", action: "gate.transition", target: `milestone:${M}` }), [T1]);
+  const { grantId } = await approvals.approve(session, c.id);
+  const store = new MemoryGateStore();
+  store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
+  store.approvals.set(c.id, { id: c.id, projectId: PROJECT, gate: "requirements", status: "approved" });
+  const gates = new GateEngine({ store, policy: engine });
+  // The release agent acts on KK's grant (M1.7 refuses a grant used by its own issuer).
+  const releaser = { id: "agent:release", type: "agent" };
+  await assert.rejects(gates.closeMilestone(releaser, M, c.id), (e) => e instanceof ApprovalError && e.status === 403 && e.code.startsWith("approval-required"));
+  await assert.rejects(gates.closeMilestone(releaser, M, c.id, { approvalGrantId: "not-a-uuid" }), (e) => e.code === "invalid-input");
+  assert.equal(store.milestones.get(M).closedAt, null);
+  const closed = await gates.closeMilestone(releaser, M, c.id, { approvalGrantId: grantId });
+  assert.equal(closed.milestoneId, M);
+  assert.ok(store.milestones.get(M).closedAt);
+});
+
+test("Codex PR41-r1: a gate name changed between validation and close does not close the milestone", async () => {
+  const M = "55555555-5555-4555-8555-555555555557";
+  const A = "66666666-6666-4666-8666-666666666667";
+  const store = new MemoryGateStore();
+  store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
+  store.approvals.set(A, { id: A, projectId: PROJECT, gate: "requirements", status: "approved" });
+  const policy = { decide: async () => { store.milestones.get(M).gateName = "first_launch"; return { enforcedOutcome: "allow", reason: "ok" }; } };
+  const gates = new GateEngine({ store, policy });
+  await assert.rejects(gates.closeMilestone({ id: "kk:kk@example.com", type: "kk" }, M, A), (e) => e.code === "gate-evidence-missing" && e.status === 409);
+  assert.equal(store.milestones.get(M).closedAt, null);
+  // An approval revoked (no longer approved) in the same window is caught the same way.
+  store.milestones.get(M).gateName = "requirements";
+  const p2 = { decide: async () => { store.approvals.get(A).status = "rejected"; return { enforcedOutcome: "allow", reason: "ok" }; } };
+  await assert.rejects(new GateEngine({ store, policy: p2 }).closeMilestone({ id: "kk:kk@example.com", type: "kk" }, M, A), (e) => e.code === "gate-evidence-missing");
+  assert.equal(store.milestones.get(M).closedAt, null);
+});
