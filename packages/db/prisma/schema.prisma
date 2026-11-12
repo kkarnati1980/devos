@@ -208,6 +208,14 @@ enum ResourceProvider {
   @@map("resource_provider")
 }
 
+enum ProvisionStepStatus {
+  pending
+  done
+  failed
+
+  @@map("provision_step_status")
+}
+
 enum ResourceStatus {
   active
   deleted
@@ -365,6 +373,7 @@ model Project {
   healthChecks       HealthCheck[]
   approvals          Approval[]
   resources          Resource[]
+  provisionSteps     ProvisionStep[]
   vaultSecrets       VaultSecret[]
   memoryItems        MemoryItem[]
   auditEvents        AuditEvent[]
@@ -823,6 +832,27 @@ model Resource {
   @@unique([provider, kind, externalId])
   @@index([projectId, status])
   @@map("resource")
+}
+
+// M2.4 provisioning step journal (docs/modules/M2.4.md, decision 4): written before each external
+// create (pending) and after it (done), so a re-run resolves a pending step by lookup, never by a blind create.
+model ProvisionStep {
+  id         String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId  String              @map("project_id") @db.Uuid
+  key        String
+  provider   ResourceProvider
+  kind       String
+  status     ProvisionStepStatus @default(pending)
+  attempts   Int                 @default(0)
+  externalId String?             @map("external_id")
+  lastError  String?             @map("last_error")
+  createdAt  DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
+
+  @@unique([projectId, key])
+  @@map("provision_step")
 }
 
 model AppSettings {
