@@ -30,7 +30,11 @@ const RX = {
   assert: /\bexpect(\.\w+)?\s*\(|\bassert(\.\w+)*\s*\(/g,
   suppress: /eslint-disable|@ts-ignore|@ts-expect-error|@ts-nocheck|istanbul ignore|c8 ignore|\bnosec\b|gitleaks:allow/,
   envIf: /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{\s*$/,
-  trivial: /\bexpect\s*\(\s*(true|false|1|0|null|undefined|""|'')\s*\)|\bassert(\.ok)?\s*\(\s*(true|1)\s*[,)]|\bassert\.equal\s*\(\s*(\d+|true)\s*,\s*\3\s*[,)]/,
+  trivial: [ // separate expressions, so no back-reference can point at the wrong group
+    /\bexpect\s*\(\s*(true|false|1|0|null|undefined|""|'')\s*\)/,
+    /\bassert(\.ok)?\s*\(\s*(true|1)\s*[,)]/,
+    /\bassert\.(?:strict)?(?:deep)?(?:[Ee]qual|[Ss]trictEqual)\s*\(\s*(-?\d+(?:\.\d+)?|true|false|null|undefined|"[^"]*"|'[^']*')\s*,\s*\1\s*[,)]/,
+  ],
   swallow: /\|\|\s*:(\s|$|;)|\|\|\s*true\b|\bset\s+\+e\b|\|\|\s*exit\s+0\b/,
   testCmd: /\b(test|vitest|jest|playwright|tsc|eslint|lint|typecheck|pnpm|npm|npx|node --test)\b/,
   stub: /\b(TODO|FIXME)\b|not implemented/i,
@@ -111,12 +115,17 @@ export function workflowShape(src) {
     if (ind === jobIndent) { const m = /^([\w-]+)\s*:/.exec(t); job = m ? m[1] : null; if (job) jobs[job] = []; stepsIndent = -1; continue; }
     if (!job) continue;
     if (t === "steps:") { stepsIndent = ind; itemIndent = -1; continue; }
-    if (stepsIndent >= 0 && ind <= stepsIndent) stepsIndent = -1;
+    // YAML allows the step list at the same indentation as "steps:"; anything else at or above that indent ends it
+    if (stepsIndent >= 0 && (ind < stepsIndent || (ind === stepsIndent && !t.startsWith("- ")))) stepsIndent = -1;
     if (stepsIndent < 0) continue;
-    if (t.startsWith("- ") && (itemIndent < 0 || ind === itemIndent)) { itemIndent = ind; step = { id: null, body: [] }; jobs[job].push(step); }
+    if (t.startsWith("- ") && (itemIndent < 0 || ind === itemIndent) && ind >= stepsIndent) { itemIndent = ind; step = { id: null, body: [] }; jobs[job].push(step); }
     if (step && !/^-?\s*name\s*:/.test(t)) step.body.push(t.replace(/^-\s+/, ""));
     const m = /^-?\s*(name|uses|run)\s*:\s*(.*)$/.exec(t);
     if (step && m && (step.key !== "name")) { if (m[1] === "name" || !step.id) { step.id = `${m[1]}:${m[2].replace(/^["']|["']$/g, "").trim().replace(m[1] === "uses" ? /@[^@\s]*$/ : /$^/, "")}`; step.key = m[1]; } }
+  }
+  for (const steps of Object.values(jobs)) { // duplicate identities get #2, #3 … so multiplicity counts
+    const seen = {};
+    for (const st of steps) { const id = st.id || "?"; seen[id] = (seen[id] ?? 0) + 1; st.id = seen[id] > 1 ? `${id}#${seen[id]}` : id; }
   }
   return {
     jobs: Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.map((s) => s.id || "?")])),
@@ -166,7 +175,7 @@ export function analyse(files, show) {
       f.added.forEach((a, i) => {
         if (RX.skip.some((r) => r.test(a.text))) hit("test-skipped", p, a.ln, a.text);
         else if (RX.envIf.test(a.text) && /^\s*return\b/.test(f.added[i + 1]?.text ?? "") && f.added[i + 1].ln === a.ln + 1) hit("test-skipped", p, a.ln, a.text);
-        if (RX.trivial.test(a.text) && !removedTrim.delete(a.text.trim())) hit("trivial-assertion", p, a.ln, a.text);
+        if (RX.trivial.some((r) => r.test(a.text)) && !removedTrim.delete(a.text.trim())) hit("trivial-assertion", p, a.ln, a.text);
       });
       const count = (ls) => ls.reduce((n, l) => n + [...l.text.matchAll(RX.assert)].length, 0);
       const lost = count(f.removed) - count(f.added);
@@ -211,6 +220,12 @@ export function analyse(files, show) {
       const was = numbers(f.removed, cov), now = numbers(f.added, cov);
       for (const n of now) { const o = was.find((w) => w.key === n.key); if (o && n.v < o.v) hit("coverage-lowered", p, n.l.ln, n.l.text); }
       for (const o of was) if (!now.some((n) => n.key === o.key)) hit("coverage-lowered", p, o.l.ln, `removed: ${o.l.text}`);
+      // boolean coverage switches: perFile / all / enabled turned off or removed
+      const on = /\b(perFile|all|enabled|reportOnFailure)\b["']?\s*[:=]\s*true\b/;
+      const onKeys = (ls) => ls.map((l) => [l, on.exec(l.text)]).filter(([, m]) => m);
+      const addedOn = new Set(onKeys(f.added).map(([, m]) => m[1]));
+      if (/coverage|c8rc|nycrc/i.test(p) || f.removed.concat(f.added).some((l) => /coverage/.test(l.text)) || TEST_CONFIG.test(p))
+        for (const [l, m] of onKeys(f.removed)) if (!addedOn.has(m[1])) hit("coverage-lowered", p, l.ln, `${m[1]} no longer true: ${l.text}`);
       for (const a of f.added) if (/\b(exclude|testPathIgnorePatterns|testIgnore|modulePathIgnorePatterns|coveragePathIgnorePatterns)\b["']?\s*[:=]/.test(a.text) && !WORKFLOW.test(p)) hit("tests-excluded", p, a.ln, a.text);
       const retry = /(?<![\w-])(retries|retry|maxRetries)["']?\s*[:=\s]\s*(\d+)/g;
       const rw = numbers(f.removed, retry), rn = numbers(f.added, retry);
