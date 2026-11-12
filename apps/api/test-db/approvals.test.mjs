@@ -224,3 +224,27 @@ test("AT10 (db): closeMilestone needs an approved, same-project, same-gate appro
   assert.equal(await db.auditEvent.count({ where: { projectId, action: "milestone.closed" } }), 1);
   await assert.rejects(gates.closeMilestone(KK.identity, ms.id, pending.id), (e) => e.code === "milestone-closed");
 });
+
+test("PR41-r3 (db): concurrent closes on one approval never deadlock (same milestone and two milestones)", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals } = setup();
+  const ap = await approvals.raiseCard(card(projectId, { gate: "requirements" }), []);
+  await approvals.approve(KK, ap.id);
+  await db.policyRule.create({
+    data: { name: `m23-r3-${randomUUID()}`, version: 1, priority: 0, actions: ["gate.transition"], resources: [], principals: [], roles: [], environments: [], effect: "allow", constraints: {}, createdBy: "kk:kk@kiot.io" },
+  });
+  const gates = new GateEngine({ store: new PrismaGateStore(db, 5000), policy: new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: KEY }) });
+  const outcome = (p) => p.then(() => "closed", (e) => (e && e.code) || String(e && e.message));
+  for (let round = 0; round < 5; round++) {
+    const m1 = await db.milestone.create({ data: { projectId, ordinal: 10 + round * 2, name: `R${round}a`, gateName: "requirements" } });
+    const m2 = await db.milestone.create({ data: { projectId, ordinal: 11 + round * 2, name: `R${round}b`, gateName: "requirements" } });
+    // same milestone, four at once: exactly one closes, the rest see milestone-closed
+    const same = await Promise.all([1, 2, 3, 4].map(() => outcome(gates.closeMilestone(KK.identity, m1.id, ap.id))));
+    assert.equal(same.filter((o) => o === "closed").length, 1, same.join(","));
+    assert.ok(same.every((o) => o === "closed" || o === "milestone-closed"), same.join(","));
+    // two milestones sharing the approval, at once: both close
+    const m3 = await db.milestone.create({ data: { projectId, ordinal: 100 + round, name: `R${round}c`, gateName: "requirements" } });
+    const two = await Promise.all([m2.id, m3.id].map((id) => outcome(gates.closeMilestone(KK.identity, id, ap.id))));
+    assert.deepEqual(two, ["closed", "closed"], two.join(","));
+  }
+});

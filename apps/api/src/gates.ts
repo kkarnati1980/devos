@@ -154,7 +154,7 @@ export class PrismaGateStore implements GateStore {
       // so its status and gate cannot change before commit; the milestone update is conditional on the validated
       // gate name and project, so a concurrent gate_name change makes it match no row. The
       // milestone_gate_approved trigger stays the backstop for status and project.
-      const ap = (await tx.$queryRaw`SELECT status::text AS status, gate::text AS gate, project_id::text AS project_id FROM approval WHERE id = ${approvalId}::uuid FOR SHARE`) as Array<{ status: string; gate: string; project_id: string | null }>;
+      const ap = (await tx.$queryRaw`SELECT status::text AS status, gate::text AS gate, project_id::text AS project_id FROM approval WHERE id = ${approvalId}::uuid FOR UPDATE`) as Array<{ status: string; gate: string; project_id: string | null }>;
       const row = ap[0];
       if (!row || row.status !== "approved" || row.gate !== expect.gate || row.project_id !== expect.projectId) return false;
       const r = await tx.milestone.updateMany({
