@@ -315,3 +315,32 @@ test("AT6c a requirements section split by phase keeps its items; hyphenated wor
   assert.deepEqual(a.requirements.map((r) => [r.key, r.milestone]), [["FR-A001", "Phase 1"], ["FR-A002", "Phase 2"], ["FR-5", "Phase 2"]]);
   assert.deepEqual(a.milestones.map((m) => m.name), ["Phase 1", "Phase 2"]);
 });
+
+test("AT10 (PR53-r1) bare IDs are not definitions; priority aliases on lines; TBD criteria become questions", () => {
+  const { a } = analyze(`## Requirements
+
+FR-1
+
+- FR-2: Dark mode (W)
+- FR-3: Export (P2)
+- FR-4: Theme (Low)
+- FR-5: Login (Must)
+  - Session duration TBD
+  - Link sent
+
+| ID | Title | Priority | Acceptance |
+|---|---|---|---|
+| FR-6 | Reports | Must | Totals shown; Format TBC |
+
+## Stack
+
+- Hosting TBD
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.priority]), [["FR-3", "should"], ["FR-4", "could"], ["FR-5", "must"], ["FR-6", "must"]]);
+  assert.deepEqual(a.outOfScope.map((o) => o.key), ["FR-2"]);
+  assert.deepEqual(a.requirements[2].acceptance, ["Link sent"]);
+  assert.deepEqual(a.requirements[3].acceptance, ["Totals shown"]);
+  const stated = a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text);
+  assert.deepEqual(stated, ["Session duration TBD", "Format TBC", "Hosting TBD"]);
+  assert.deepEqual(a.stack.map((s) => s.text), ["Hosting TBD"]);
+});

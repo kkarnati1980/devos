@@ -76,6 +76,8 @@ const MILESTONE_HEADING =
 const ACCEPTANCE_PARA = /^(acceptance( criteria)?\s*:|ac\s*:|done when\s*:|given\b|when\b|then\b)/i;
 // A hyphen separates only when followed by a space, so FR-1-2 is not FR-1 titled "2".
 const SEPARATOR = /^\s*(?:[:–—.)]|-(?=\s))\s*/;
+// A trailing "(Must)", "(W)", "(P2)", "(Low)" … on a line or heading requirement; aliases as in parsePriority.
+const PRIORITY_SUFFIX = /\((must|should|could|won['’]?t|wont have|will not|m|s|c|w|p[0-3]|high|critical|medium|low|nice to have)\)\s*$/i;
 const ASSIGNED_TOKEN = /(?<![A-Za-z0-9_-])[A-Z][A-Z0-9]{0,9}-A\d+(?![A-Za-z0-9_])/g;
 
 function norm(s: string): string {
@@ -107,7 +109,7 @@ function isQuestionText(t: string): boolean {
 }
 
 /** The requirement ID that starts `text` (after emphasis/heading marks), and the rest after a separator. */
-function leadingId(text: string, prefixes: readonly string[]): { key: string; rest: string } | null {
+function leadingId(text: string, prefixes: readonly string[], allowBare = false): { key: string; rest: string } | null {
   const stripped = text.replace(/^[\s*_[`]+/, "");
   const first = extractRequirementIds(stripped.slice(0, 80), prefixes)[0];
   if (!first || !stripped.startsWith(first.id)) return null;
@@ -116,6 +118,8 @@ function leadingId(text: string, prefixes: readonly string[]): { key: string; re
   // An ID followed directly by words with no separator is a reference, not a definition.
   if (!sep && rest.trim() !== "") return null;
   rest = rest.slice(sep ? sep[0].length : 0).replace(/^[*_]+\s*/, "").trim();
+  // A line definition needs a title (PR53-r1); only a table ID cell may hold the bare ID.
+  if (rest === "" && !allowBare) return null;
   return { key: first.id, rest };
 }
 
@@ -142,8 +146,8 @@ function tableColumns(rows: string[][], prefixes: readonly string[]): TableColum
   if (id < 0) {
     // No ID header: the first column holds IDs in every data row.
     const body = rows.slice(1);
-    const allIds = (rs: string[][]) => rs.length > 0 && rs.every((r) => leadingId(r[0] ?? "", prefixes)?.rest === "");
-    if (allIds(body) && leadingId(header[0] ?? "", prefixes) === null) {
+    const allIds = (rs: string[][]) => rs.length > 0 && rs.every((r) => leadingId(r[0] ?? "", prefixes, true)?.rest === "");
+    if (allIds(body) && leadingId(header[0] ?? "", prefixes, true) === null) {
       id = 0;
       hasHeader = true;
     } else if (allIds(rows)) {
@@ -234,7 +238,10 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     let priority: Priority = "must";
     if (pr === null) warnings.push({ code: "priority-defaulted", key, source });
     else priority = pr;
-    const r: Requirement = { key, title, priority, acceptance, milestone, assigned, source };
+    const kept: string[] = [];
+    for (const c of acceptance) (isQuestionText(c) ? stated.push({ text: c, source }) : kept.push(c));
+    const r: Requirement = { key, title, priority, acceptance: kept, milestone, assigned, source };
+    if (isQuestionText(title)) stated.push({ text: `${key}: ${title}`, source });
     requirements.push(r);
     byKey.set(key, r);
     return r;
@@ -249,6 +256,11 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   const sink = (key: string, source: number): Requirement => ({
     key, title: "", priority: "must", acceptance: [], milestone: null, assigned: false, source,
   });
+  // An unresolved criterion (TBD/TBC or a trailing "?") is an open question, not a criterion (PR53-r1).
+  const addCriterion = (req: Requirement, text: string, source: number) => {
+    if (isQuestionText(text)) stated.push({ text, source });
+    else req.acceptance.push(text);
+  };
   const isCriterionId = (key: string) => /^AC(?![A-Z])/.test(key);
 
   blocks.forEach((b, i) => {
@@ -264,7 +276,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
         return;
       }
       if (id) {
-        const prMatch = /\((must|should|could|won['’]?t)\)\s*$/i.exec(id.rest);
+        const prMatch = PRIORITY_SUFFIX.exec(id.rest);
         const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;
         const r = addRequirement(id.key, title, prMatch?.[1] ?? "", [], currentMilestone, i);
         open = { req: r ?? sink(id.key, i), kind: "heading" };
@@ -283,7 +295,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
         return;
       }
       for (const row of b.rows.slice(cols.hasHeader ? 1 : 0)) {
-        const id = leadingId(row[cols.id] ?? "", prefixes);
+        const id = leadingId(row[cols.id] ?? "", prefixes, true);
         if (!id) continue;
         const title = (cols.title >= 0 ? row[cols.title] : "")?.trim() ?? "";
         const ms = cols.milestone >= 0 ? (row[cols.milestone] ?? "").trim() : "";
@@ -303,16 +315,16 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     const cur = open as typeof open;
     if (cur) {
       if (cur.kind === "list" && b.type === "list-item" && b.depth > cur.depth) {
-        cur.req.acceptance.push(text);
+        addCriterion(cur.req, text, i);
         return;
       }
       const lid = leadingId(text, prefixes);
       if (cur.kind === "heading" && b.type === "list-item" && (!lid || isCriterionId(lid.key))) {
-        cur.req.acceptance.push(text);
+        addCriterion(cur.req, text, i);
         return;
       }
       if (b.type === "paragraph" && ACCEPTANCE_PARA.test(text)) {
-        cur.req.acceptance.push(text.replace(/^(acceptance( criteria)?|ac|done when)\s*:\s*/i, "").trim() || text);
+        addCriterion(cur.req, text.replace(/^(acceptance( criteria)?|ac|done when)\s*:\s*/i, "").trim() || text, i);
         return;
       }
       if (cur.kind === "list" && !(b.type === "list-item" && b.depth > cur.depth)) open = null;
@@ -320,7 +332,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
 
     const id = leadingId(text, prefixes);
     if (id && (b.type === "list-item" || b.type === "paragraph")) {
-      const prMatch = /\((must|should|could|won['’]?t)\)\s*$/i.exec(id.rest);
+      const prMatch = PRIORITY_SUFFIX.exec(id.rest);
       const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;
       const req = addRequirement(id.key, title, prMatch?.[1] ?? "", [], currentMilestone, i) ?? sink(id.key, i);
       open = b.type === "list-item" ? { req, kind: "list", depth } : { req, kind: "heading" };
@@ -329,6 +341,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
 
     if (section === "stack") {
       stack.push({ text, source: i });
+      if (isQuestionText(text)) stated.push({ text, source: i });
       return;
     }
     if (section === "questions") {
@@ -341,7 +354,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     }
     if (section === "requirements" && b.type === "list-item" && b.depth === 0) {
       // ID-less requirement item: assign an ID that never collides with a spec ID or token.
-      const prMatch = /\((must|should|could|won['’]?t)\)\s*$/i.exec(text);
+      const prMatch = PRIORITY_SUFFIX.exec(text);
       const key = nextAssignedKey();
       const title = prMatch ? text.slice(0, prMatch.index).trim() : text;
       const req = addRequirement(key, title, prMatch?.[1] ?? "", [], currentMilestone, i, true) ?? sink(key, i);
