@@ -8,7 +8,8 @@
 #   isolation-apply.sh --dry-run  fetch the state and print the generated block; changes nothing
 #   isolation-apply.sh --remove   delete the S4 jumps and chains; M0.1/M0.2 rules stay as they are
 #
-# The block is two chains, DEVOS-ISO-FWD (jumped to first from DOCKER-USER) and DEVOS-ISO-IN (jumped to first
+# The block is two chains, DEVOS-ISO-FWD (jumped to first from DOCKER-USER and from FORWARD, so tailscaled's
+# own `ts-forward` jump at FORWARD 1 cannot accept tailnet-bound pool traffic before it) and DEVOS-ISO-IN (jumped to first
 # from INPUT), for sources in the project pool 10.208.0.0/14 (one /24 per stack, from the stack index):
 #   FWD: replies pass; same /24 passes; declared tailnet CIDRs pass; every other pool, private, tailnet,
 #        link-local (cloud metadata) or multicast destination drops; internet passes only for stacks with
@@ -50,7 +51,7 @@ ipt() { timeout 10 iptables -w 5 "$@"; }
 
 remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if nothing of S4 is left
   local c rc=0
-  for c in DOCKER-USER:$FWD INPUT:$IN; do
+  for c in DOCKER-USER:$FWD FORWARD:$FWD INPUT:$IN; do
     while ipt -C "${c%%:*}" -j "${c#*:}" 2>/dev/null; do ipt -D "${c%%:*}" -j "${c#*:}" || { rc=1; break; }; done
   done
   for c in $FWD $IN; do
@@ -62,7 +63,7 @@ remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if n
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
-  if remove_block; then rm -f "$ISO/installed.rules"; echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched)"; exit 0; fi
+  if remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"; echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched)"; exit 0; fi
   echo "remove failed: some S4 rules are still in place (see iptables -S DOCKER-USER / INPUT)"; exit 1
 fi
 
@@ -109,10 +110,6 @@ v4_in_tailnet() {  # a.b.c.d/p -> 0 if it is a well-formed IPv4 CIDR inside 100.
   [[ "$p" =~ ^(0|[1-9][0-9]?)$ ]] && (( p >= 10 && p <= 32 )) || return 1
   (( a == 100 && b >= 64 && b <= 127 ))
 }
-v6_in_tailnet() {  # fd7a:115c:a1e0:... /p -> 0 if inside fd7a:115c:a1e0::/48 (lexical check, no ip6tables rule in v1)
-  [[ "$1" =~ ^[fF][dD]7[aA]:115[cC]:[aA]1[eE]0(:[0-9a-fA-F]{0,4}){1,5}/([0-9]{2,3})$ ]] || return 1
-  local p=${BASH_REMATCH[2]}; (( 10#$p >= 48 && 10#$p <= 128 ))
-}
 
 declare -A seen_idx=() seen_stack=()
 STACKS=()
@@ -128,9 +125,8 @@ while IFS=$'\t' read -r idx slug env egress tailnet; do
   if [[ -n "$tailnet" ]]; then
     read -r -a cidrs <<<"$tailnet"
     for c in "${cidrs[@]}"; do
-      if v4_in_tailnet "$c"; then v4+="$c "
-      elif ! v6_in_tailnet "$c"; then echo "refused: tailnet entry for $slug/$env is not inside 100.64.0.0/10 or fd7a:115c:a1e0::/48; nothing changed"; exit 1
-      fi
+      v4_in_tailnet "$c" || { echo "refused: tailnet entry for $slug/$env is not an IPv4 CIDR inside 100.64.0.0/10 (IPv6 entries wait for S4-b2); nothing changed"; exit 1; }
+      v4+="$c "
     done
   fi
   STACKS+=("$idx $slug $env $egress ${v4% }")
@@ -182,7 +178,7 @@ if [[ "$MODE" == dry ]]; then printf '%s\n' "$BLOCK"; echo "# dry run: nothing c
 # all inside the same COMMIT.
 jump_ops() {  # -> restore lines that leave exactly one jump, first, in each built-in chain
   local c chain target n first
-  for c in DOCKER-USER:$FWD INPUT:$IN; do
+  for c in DOCKER-USER:$FWD FORWARD:$FWD INPUT:$IN; do
     chain="${c%%:*}" target="${c#*:}"
     n="$(ipt -S "$chain" 2>/dev/null | grep -cxF -- "-A $chain -j $target")"
     first="$(ipt -S "$chain" 2>/dev/null | grep '^-A ' | sed -n 1p)"
@@ -191,13 +187,21 @@ jump_ops() {  # -> restore lines that leave exactly one jump, first, in each bui
     echo "-I $chain 1 -j $target"
   done
 }
-live_matches() {  # 0 when the live S4 chains have exactly the rules of the block (count per chain)
+live_fp() {  # fingerprint of the live S4 chains as `iptables -S` prints them (normalised by iptables itself)
+  { ipt -S "$FWD" && ipt -S "$IN"; } 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+live_matches() {  # 0 when the live S4 chains have the block's rule count AND the fingerprint recorded at apply
   local c want have
   for c in $FWD $IN; do
     want="$(grep -c -- "^-A $c " <<<"$1")"
     have="$(ipt -S "$c" 2>/dev/null | grep -c -- "^-A $c ")" || return 1
     [[ "$want" == "$have" ]] || return 1
   done
+  [[ -s "$ISO/live.sha256" && "$(live_fp)" == "$(cat "$ISO/live.sha256")" ]]
+}
+record() {  # block -> installed.rules + live fingerprint
+  printf '%s\n' "$1" > "$ISO/installed.rules.tmp" && mv -f "$ISO/installed.rules.tmp" "$ISO/installed.rules" \
+    && live_fp > "$ISO/live.sha256.tmp" && mv -f "$ISO/live.sha256.tmp" "$ISO/live.sha256"
 }
 install_block() {  # block text in $1 -> live, in one transaction with the jump changes
   ipt -S DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (M0.1 not applied?)"; return 1; }
@@ -236,17 +240,16 @@ if ! install_block "$BLOCK"; then
 fi
 if ! post_msg="$(selftest)"; then
   if (( pre_ok == 0 )); then
-    printf '%s\n' "$BLOCK" > "$ISO/installed.rules.tmp" && mv -f "$ISO/installed.rules.tmp" "$ISO/installed.rules"
+    record "$BLOCK"
     echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
   if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && echo "rolled back to the previous block" || echo "rollback failed: run $0 --remove from the console"
+    install_block "$PREV" && record "$PREV" && echo "rolled back to the previous block" || echo "rollback failed: run $0 --remove from the console"
   else
-    remove_block && echo "rolled back: S4 block removed" || echo "rollback failed: run $0 --remove from the console"
+    remove_block && rm -f "$ISO/live.sha256" && echo "rolled back: S4 block removed" || echo "rollback failed: run $0 --remove from the console"
   fi
   exit 1
 fi
-printf '%s\n' "$BLOCK" > "$ISO/installed.rules.tmp" && mv -f "$ISO/installed.rules.tmp" "$ISO/installed.rules" \
-  || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
+record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"

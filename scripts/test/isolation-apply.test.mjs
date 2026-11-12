@@ -24,7 +24,7 @@ before(async () => {
 echo "$*" >> "$FAKE_LOG/iptables.log"
 op="$1" ch="$2"; shift 2; f="$FAKE_NF/$ch"
 case "$op" in
-  -S) [[ -f "$f" ]] || exit 1; [[ "$ch" == INPUT ]] && echo "-P INPUT DROP" || echo "-N $ch"; cat "$f" ;;
+  -S) [[ -f "$f" ]] || exit 1; [[ "$ch" == INPUT || "$ch" == FORWARD ]] && echo "-P $ch DROP" || echo "-N $ch"; cat "$f" ;;
   -C) [[ -f "$f" ]] && grep -qxF -- "-A $ch $*" "$f" ;;
   -D) [[ -f "$f" ]] && grep -qxF -- "-A $ch $*" "$f" || exit 1
       awk -v r="-A $ch $*" '!d && $0==r {d=1; next} {print}' "$f" > "$f.n" && mv "$f.n" "$f" ;;
@@ -63,7 +63,7 @@ after(() => { up?.close(); fs.rmSync(tmp, { recursive: true, force: true }); });
 
 const STATE = { stacks: [
   { slug: "beta", env: "live", idx: 257, egress: true, tailnet: [] },
-  { slug: "alpha", env: "preview", idx: 0, egress: false, tailnet: ["100.101.102.103/32", "fd7a:115c:a1e0::5/128"] },
+  { slug: "alpha", env: "preview", idx: 0, egress: false, tailnet: ["100.101.102.103/32"] },
 ] };
 
 function host(state, { conf = "", token = "t0ken-abcdefghijklmnop" } = {}) {
@@ -73,6 +73,7 @@ function host(state, { conf = "", token = "t0ken-abcdefghijklmnop" } = {}) {
   fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=127.0.0.1:${upPort}\n${conf}`);
   fs.writeFileSync(path.join(h, "nf/DOCKER-USER"), "-A DOCKER-USER -j ufw-user-forward\n-A DOCKER-USER -j ufw-docker-logging-deny\n");
   fs.writeFileSync(path.join(h, "nf/INPUT"), "-A INPUT -j ufw-before-logging-input\n");
+  fs.writeFileSync(path.join(h, "nf/FORWARD"), "-A FORWARD -j ts-forward\n-A FORWARD -j DOCKER-USER\n");
   setState(h, state);
   return h;
 }
@@ -137,6 +138,7 @@ for (const [name, bad] of [
   ["fractional index", { stacks: [{ slug: "a", env: "live", idx: 1.5, egress: false, tailnet: [] }] }],
   ["duplicate index", { stacks: [{ slug: "a", env: "live", idx: 3, egress: false, tailnet: [] }, { slug: "b", env: "live", idx: 3, egress: false, tailnet: [] }]}],
   ["tailnet CIDR outside 100.64/10", { stacks: [{ slug: "a", env: "live", idx: 1, egress: false, tailnet: ["10.0.0.0/8"] }] }],
+  ["IPv6 tailnet entry (no ip6tables rule until S4-b2)", { stacks: [{ slug: "a", env: "live", idx: 1, egress: false, tailnet: ["fd7a:115c:a1e0::5/128"] }] }],
   ["too-wide tailnet prefix", { stacks: [{ slug: "a", env: "live", idx: 1, egress: false, tailnet: ["100.64.0.0/2"] }] }],
   ["unknown env", { stacks: [{ slug: "a", env: "prod", idx: 1, egress: false, tailnet: [] }] }],
   ["string egress", { stacks: [{ slug: "a", env: "live", idx: 1, egress: "yes", tailnet: [] }] }],
@@ -185,9 +187,35 @@ test("AT7 the jumps change in the same restore transaction as the chains (no -D/
   const h = host(STATE);
   assert.equal(run(h).code, 0);
   const tx = fs.readFileSync(path.join(h, "log/restore.0"), "utf8");
-  assert.match(tx, /-I DOCKER-USER 1 -j DEVOS-ISO-FWD\n-I INPUT 1 -j DEVOS-ISO-IN\nCOMMIT\n$/);
+  assert.match(tx, /-I DOCKER-USER 1 -j DEVOS-ISO-FWD\n-I FORWARD 1 -j DEVOS-ISO-FWD\n-I INPUT 1 -j DEVOS-ISO-IN\nCOMMIT\n$/);
   const writes = fs.readFileSync(path.join(h, "log/iptables.log"), "utf8").split("\n").filter((l) => /^-(I|D|F|X) /.test(l));
   assert.deepEqual(writes, []);
+});
+
+test("FORWARD gets the jump first, above tailscaled's ts-forward, and keeps it there", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(nf(h, "FORWARD").split("\n").slice(0, 2), ["-A FORWARD -j DEVOS-ISO-FWD", "-A FORWARD -j ts-forward"]);
+  // tailscaled restarts and re-inserts ts-forward at position 1
+  fs.writeFileSync(path.join(h, "nf/FORWARD"), "-A FORWARD -j ts-forward\n" + nf(h, "FORWARD").replace("-A FORWARD -j ts-forward\n", ""));
+  const r = run(h);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(nf(h, "FORWARD").split("\n")[0], "-A FORWARD -j DEVOS-ISO-FWD");
+  assert.equal(nf(h, "FORWARD").match(/DEVOS-ISO-FWD/g).length, 1);
+  assert.equal(run(h, ["--remove"]).code, 0);
+  assert.doesNotMatch(nf(h, "FORWARD"), /DEVOS-ISO/);
+});
+
+test("drift: a hand-edited rule with the same rule count is rebuilt on the next run", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const good = nf(h, "DEVOS-ISO-FWD");
+  fs.writeFileSync(path.join(h, "nf/DEVOS-ISO-FWD"), good.replace(/-A DEVOS-ISO-FWD -j DROP\n$/, "-A DEVOS-ISO-FWD -j ACCEPT\n"));
+  assert.notEqual(nf(h, "DEVOS-ISO-FWD"), good);
+  const r = run(h);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /applied/);
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), good);
 });
 
 test("drift: a hand-flushed S4 chain is rebuilt on the next run", () => {
