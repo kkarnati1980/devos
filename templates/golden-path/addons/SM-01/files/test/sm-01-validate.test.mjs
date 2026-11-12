@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createApp } from "../src/server.mjs";
 import { loadConfig } from "../src/config.mjs";
 import http from "node:http";
-import { validate, validated, invalidCases } from "../src/validate.mjs";
+import { validate, validated, invalidCases, assertAllValidated } from "../src/validate.mjs";
 
 const NOTE = {
   type: "object",
@@ -127,4 +127,22 @@ test("SM-01-L1: error messages name the field and rule, never echo the value sen
   assert.throws(() => validated({ body: { type: "object", properties: { tags: { type: "array" } } } }, () => {}), /list without items/);
   assert.throws(() => validated({ query: { type: "object", properties: { n: { type: "strng" } } } }, () => {}), /bad schema/);
   assert.throws(() => invalidCases(NOTE, { title: "" }), /not valid/);
+});
+
+test("SM-01-L1: an over-long value never reaches the pattern (no ReDoS); +json bodies are JSON; every route is wrapped", async () => {
+  const evil = { type: "string", maxLength: 10, pattern: /^(a+)+$/ };
+  const t0 = Date.now();
+  assert.equal(validate(evil, "a".repeat(40) + "!").length, 1);
+  assert.ok(Date.now() - t0 < 200, "the pattern did not run on the over-long value");
+  const reached = [];
+  const routes = { "PATCH /notes": validated({ body: { type: "object", properties: { title: { type: "string", maxLength: 80 } } } }, (req, res) => { reached.push(1); res.end("{}"); }) };
+  await withRoutes(routes, async (base) => {
+    const r = await fetch(`${base}/notes`, { method: "PATCH", headers: { "content-type": "application/merge-patch+json" }, body: JSON.stringify({ title: "x" }) });
+    assert.equal(r.status, 200);
+    assert.equal((await fetch(`${base}/notes`, { method: "PATCH", headers: { "content-type": "text/json+evil" }, body: "{}" })).status, 415);
+  });
+  assert.equal(reached.length, 1);
+  assert.doesNotThrow(() => assertAllValidated({ ...noteRoutes([]), ...routes }));
+  assert.throws(() => assertAllValidated({ ...routes, "DELETE /notes": async () => {} }), /DELETE \/notes/);
+  assert.throws(() => validated({ body: { type: "object", properties: {}, required: ["titel"] } }, () => {}), /required "titel"/);
 });

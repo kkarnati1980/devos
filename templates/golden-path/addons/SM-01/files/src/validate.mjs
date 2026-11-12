@@ -20,6 +20,13 @@ const TYPES = new Set(["string", "integer", "number", "boolean", "array", "objec
 export function checkSchema(schema, path = "(root)") {
   if (!schema || typeof schema !== "object" || !TYPES.has(schema.type)) throw new Error(`validate: bad schema at ${path}`);
   if (schema.pattern !== undefined) new RegExp(schema.pattern);
+  if (schema.enum !== undefined && !Array.isArray(schema.enum)) throw new Error(`validate: enum must be a list at ${path}`);
+  for (const k of ["min", "max", "minLength", "maxLength", "minItems", "maxItems"]) {
+    if (schema[k] !== undefined && !Number.isFinite(schema[k])) throw new Error(`validate: ${k} must be a number at ${path}`);
+  }
+  if (schema.type === "object") {
+    for (const k of schema.required ?? []) if (!Object.hasOwn(schema.properties ?? {}, k)) throw new Error(`validate: required "${k}" is not a property at ${path}`);
+  }
   if (schema.type === "array") {
     if (!schema.items) throw new Error(`validate: list without items at ${path}`);
     checkSchema(schema.items, `${path}[]`);
@@ -35,7 +42,8 @@ export function validate(schema, value, path = "", errors = []) {
     case "string": {
       if (typeof value !== "string") return err("must be a string"), errors;
       const max = schema.maxLength ?? DEFAULT_MAX_LENGTH;
-      if (value.length > max) err(`must be at most ${max} characters`);
+      // Over the cap: stop here, so no pattern ever runs on more text than the schema allows (pre-review r2, ReDoS).
+      if (value.length > max) return err(`must be at most ${max} characters`), errors;
       if (schema.minLength !== undefined && value.length < schema.minLength) err(`must be at least ${schema.minLength} characters`);
       if (schema.pattern && !new RegExp(schema.pattern).test(value)) err("has the wrong format");
       if (schema.enum && !schema.enum.includes(value)) err("is not one of the allowed values");
@@ -111,6 +119,9 @@ const groupQuery = (url) => {
   return [...m];
 };
 
+/** `application/json` and the `+json` family (`application/merge-patch+json`, `application/problem+json`, …). */
+const isJsonType = (t) => t === "application/json" || /^application\/[a-z0-9.-]+\+json$/.test(t);
+
 class HttpInputError extends Error {
   constructor(status, error) { super(error); this.status = status; this.error = error; }
 }
@@ -137,7 +148,7 @@ export function readJson(req, { limit = DEFAULT_BODY_LIMIT, timeoutMs = DEFAULT_
     req.on("error", () => finish(reject, new HttpInputError(400, "body-unreadable")));
     req.on("end", () => {
       if (size === 0) return finish(resolve, undefined);
-      if (type !== "application/json") return finish(reject, new HttpInputError(415, "body-must-be-json"));
+      if (!isJsonType(type)) return finish(reject, new HttpInputError(415, "body-must-be-json"));
       try { finish(resolve, JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { finish(reject, new HttpInputError(400, "body-not-json")); }
     });
   });
@@ -158,7 +169,7 @@ const send = (res, code, obj) => {
 export function validated(schemas, handler, opts = {}) {
   const { body: bodySchema, query: querySchema, params: paramsSchema } = schemas ?? {};
   for (const s of [bodySchema, querySchema, paramsSchema]) if (s !== undefined) checkSchema(s); // fail at start-up, not on a request
-  return async (req, res, ctx = {}) => {
+  const wrapped = async (req, res, ctx = {}) => {
     const details = [];
     const check = (where, schema, value) => {
       if (!schema) {
@@ -185,6 +196,16 @@ export function validated(schemas, handler, opts = {}) {
     if (details.length) return send(res, 400, { error: "invalid-input", details: details.slice(0, MAX_ERRORS) });
     return handler(req, res, { ...ctx, input: { params, query, body } });
   };
+  Object.defineProperty(wrapped, VALIDATED, { value: true });
+  return wrapped;
+}
+
+const VALIDATED = Symbol.for("devos.sm01.validated");
+
+/** For an app test (SM-01-L1 "each route"): throws naming every route in `routes` not wrapped with `validated()`. */
+export function assertAllValidated(routes) {
+  const bare = Object.entries(routes).filter(([, h]) => !h?.[VALIDATED]).map(([k]) => k);
+  if (bare.length) throw new Error(`routes without input validation: ${bare.join(", ")}`);
 }
 
 /**
