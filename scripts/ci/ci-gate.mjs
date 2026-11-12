@@ -79,25 +79,49 @@ export function expectedUnion(baseDir, headDir, base) {
   return head;
 }
 
+/**
+ * Every check-run name the workflows in `dir` produce for a PR into `base`, mapped to the workflow file that
+ * produces it (the gate's own file excluded). Codex PR73-r4: the file is how a check run is tied to the PR's
+ * own workflow run, so a same-named job from another workflow (e.g. push-only) never counts.
+ * @returns {Map<string, string>} check name → workflow file name
+ */
+export function checkOwners(dir, base) {
+  const files = readdirSync(dir).filter((f) => /\.ya?ml$/.test(f) && f !== GATE_WORKFLOW).sort();
+  const owners = new Map();
+  const dupes = new Set();
+  for (const f of files) {
+    for (const n of expectedFromWorkflow(f, parse(readFileSync(join(dir, f), "utf8")), base)) {
+      if (owners.has(n)) dupes.add(n);
+      else owners.set(n, f);
+    }
+  }
+  if (dupes.size) throw new GateError(`two jobs report the same check name: ${[...dupes].join(", ")}`);
+  if (owners.size === 0) throw new GateError("no checks expected; refusing to pass an empty set");
+  return owners;
+}
+
 /** Every check-run name the workflows in `dir` produce for a PR into `base` (the gate's own file excluded). */
 export function expectedChecks(dir, base) {
-  const files = readdirSync(dir).filter((f) => /\.ya?ml$/.test(f) && f !== GATE_WORKFLOW).sort();
-  const all = [];
-  for (const f of files) all.push(...expectedFromWorkflow(f, parse(readFileSync(join(dir, f), "utf8")), base));
-  const dupes = all.filter((n, i) => all.indexOf(n) !== i);
-  if (dupes.length) throw new GateError(`two jobs report the same check name: ${[...new Set(dupes)].join(", ")}`);
-  if (all.length === 0) throw new GateError("no checks expected; refusing to pass an empty set");
-  return all;
+  return [...checkOwners(dir, base).keys()];
 }
 
 /**
  * Compare expected names with the check runs on the SHA. The newest run of a name counts (re-runs).
+ * Codex PR73-r4: a run counts only when it belongs to a `pull_request` workflow run of the file that owns its
+ * name (`r.workflow`, from `attributeRuns`); anything else, such as a push-only workflow's same-named job that
+ * reports first, is ignored, so the expected check stays pending until its own PR run reports.
+ * @param {string[]} expected
+ * @param {{ name: string, workflow: string | null }[]} runs
+ * @param {Map<string, string>} owners  check name → workflow file (`checkOwners`); required
  * @returns {{ state: "success" | "failure" | "pending", failed: string[], pending: string[] }}
  */
-export function evaluate(expected, runs) {
+export function evaluate(expected, runs, owners) {
+  if (!(owners instanceof Map)) throw new GateError("evaluate needs the check → workflow map");
+  for (const name of expected) if (!owners.has(name)) throw new GateError(`no workflow owns expected check ${name}`);
   const newest = new Map();
-  const suites = new Map(); // name → check suites it appeared in; a re-run stays in its suite
+  const suites = new Map(); // name → PR check suites it appeared in; a re-run stays in its suite
   for (const r of runs) {
+    if (!r.workflow || r.workflow !== owners.get(r.name)) continue;
     if (!suites.has(r.name)) suites.set(r.name, new Set());
     suites.get(r.name).add(String(r.suite));
     const prev = newest.get(r.name);
@@ -107,7 +131,7 @@ export function evaluate(expected, runs) {
   const pending = [];
   for (const name of expected) {
     const r = newest.get(name);
-    // Another workflow (e.g. a push-triggered job with the same name) must not stand in for the real check.
+    // Two PR workflow runs of the owning file on one SHA (e.g. a close and reopen): ambiguous, fail closed.
     if ((suites.get(name)?.size ?? 0) > 1) failed.push(`${name}=reported-by-more-than-one-workflow-run`);
     else if (!r || r.status !== "completed") pending.push(name);
     else if (r.conclusion !== "success") failed.push(`${name}=${r.conclusion}`);
@@ -121,7 +145,7 @@ export function evaluate(expected, runs) {
 export const ACTIONS_APP_SLUG = "github-actions";
 
 /** One page read; a GET is safe to retry (ADR-0011), so a transient error gets 3 attempts before exit 2. */
-async function readPage(url, token, fetchImpl, pause) {
+async function readPage(url, token, fetchImpl, pause, what = "check-runs") {
   let last = "unknown";
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -137,7 +161,7 @@ async function readPage(url, token, fetchImpl, pause) {
     }
     if (attempt < 3) await pause(attempt * 2_000);
   }
-  throw new GateError(`check-runs read failed: ${last}`);
+  throw new GateError(`${what} read failed: ${last}`);
 }
 
 export async function listRuns(api, repo, sha, token, fetchImpl, pause = (ms) => new Promise((r) => setTimeout(r, ms))) {
@@ -153,11 +177,36 @@ export async function listRuns(api, repo, sha, token, fetchImpl, pause = (ms) =>
   throw new GateError("more than 1,000 check runs on one SHA");
 }
 
+/**
+ * The head SHA's `pull_request` workflow runs, as check-suite id → workflow file name (Codex PR73-r4).
+ * Needs `actions: read`. Same paging, timeout and retry rules as `listRuns`.
+ */
+export async function listPrWorkflowRuns(api, repo, sha, token, fetchImpl, pause = (ms) => new Promise((r) => setTimeout(r, ms))) {
+  const suites = new Map();
+  for (let page = 1; page <= 10; page++) {
+    const url = `${api}/repos/${repo}/actions/runs?head_sha=${sha}&event=pull_request&per_page=100&page=${page}`;
+    const body = await readPage(url, token, fetchImpl, pause, "workflow-runs");
+    if (!Array.isArray(body?.workflow_runs) || typeof body.total_count !== "number") throw new GateError("workflow-runs read returned an unexpected body");
+    for (const w of body.workflow_runs) {
+      // The query filters by event already; checking again keeps a push run out if the filter were ignored.
+      if (w.event !== "pull_request" || w.head_sha !== sha || w.check_suite_id == null || typeof w.path !== "string") continue;
+      suites.set(String(w.check_suite_id), w.path.split("@")[0].split("/").pop());
+    }
+    if (page * 100 >= body.total_count || body.workflow_runs.length < 100) return suites;
+  }
+  throw new GateError("more than 1,000 workflow runs on one SHA");
+}
+
+/** Tag each check run with the workflow file of its PR workflow run, or null when its suite is not one. */
+export function attributeRuns(runs, prSuites) {
+  return runs.map((r) => ({ ...r, workflow: prSuites.get(String(r.suite)) ?? null }));
+}
+
 /** Poll until every expected check has finished, one fails, or the deadline passes. */
-export async function waitForChecks({ expected, read, deadlineMs, intervalMs, now = Date.now, sleep, log = () => {} }) {
+export async function waitForChecks({ expected, owners, read, deadlineMs, intervalMs, now = Date.now, sleep, log = () => {} }) {
   const end = now() + deadlineMs;
   for (;;) {
-    const v = evaluate(expected, await read());
+    const v = evaluate(expected, await read(), owners);
     if (v.state !== "pending") return v;
     if (now() >= end) return { ...v, state: "failure", failed: v.pending.map((n) => `${n}=not-finished-in-time`) };
     log(`waiting for: ${v.pending.join(", ")}`);
@@ -169,11 +218,18 @@ async function main() {
   const { GITHUB_API_URL = "https://api.github.com", GITHUB_REPOSITORY, GATE_SHA, GATE_BASE, GITHUB_TOKEN } = process.env;
   if (!GITHUB_REPOSITORY || !GATE_SHA || !GATE_BASE || !GITHUB_TOKEN) throw new GateError("GITHUB_REPOSITORY, GATE_SHA, GATE_BASE and GITHUB_TOKEN are required");
   if (!/^[0-9a-f]{40}$/.test(GATE_SHA)) throw new GateError("GATE_SHA is not a full commit SHA");
-  const expected = expectedUnion(process.env.GATE_BASE_WORKFLOWS_DIR, process.env.GATE_WORKFLOWS_DIR ?? ".github/workflows", GATE_BASE);
+  const headDir = process.env.GATE_WORKFLOWS_DIR ?? ".github/workflows";
+  const expected = expectedUnion(process.env.GATE_BASE_WORKFLOWS_DIR, headDir, GATE_BASE);
+  const owners = checkOwners(headDir, GATE_BASE);
   console.log(`ci-gate: ${GATE_SHA} needs ${expected.length} checks: ${expected.join(", ")}`);
   const v = await waitForChecks({
     expected,
-    read: () => listRuns(GITHUB_API_URL, GITHUB_REPOSITORY, GATE_SHA, GITHUB_TOKEN, fetch),
+    owners,
+    // Check runs first, then the PR workflow runs: a suite created between the two reads is still found.
+    read: async () => {
+      const runs = await listRuns(GITHUB_API_URL, GITHUB_REPOSITORY, GATE_SHA, GITHUB_TOKEN, fetch);
+      return attributeRuns(runs, await listPrWorkflowRuns(GITHUB_API_URL, GITHUB_REPOSITORY, GATE_SHA, GITHUB_TOKEN, fetch));
+    },
     deadlineMs: Number(process.env.GATE_DEADLINE_MS ?? 27 * 60_000), // inside the job's 30-minute timeout
     intervalMs: 20_000,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),

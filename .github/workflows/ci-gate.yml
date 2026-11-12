@@ -11,6 +11,7 @@ concurrency:
 permissions:
   contents: read
   checks: read
+  actions: read # list the head SHA's pull_request workflow runs (Codex PR73-r4)
 jobs:
   ci-gate:
     runs-on: ubuntu-latest
