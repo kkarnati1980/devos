@@ -42,6 +42,8 @@ export class MemoryRequirementsStore implements RequirementsStore {
   async saveAnalysis(input: SaveAnalysisInput): Promise<SaveAnalysisResult> {
     // Synchronous body = one atomic step in a single-threaded runtime (the Prisma store uses a transaction + lock).
     const pid = input.projectId;
+    const project = this.projects.get(pid);
+    if (!project || project.stage !== input.expectedStage) throw new PipelineError("project-not-in-intake", 409);
     const docs = this.docs.filter((d) => d.projectId === pid);
     if (docs.some((d) => d.status === "approved")) throw new PipelineError("requirements-already-approved", 409);
     const specVersion = this.specs.filter((s) => s.projectId === pid).reduce((m, s) => Math.max(m, s.version), 0) + 1;

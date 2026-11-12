@@ -39,6 +39,8 @@ export interface RequirementRowInput {
 
 export interface SaveAnalysisInput {
   projectId: string;
+  /** Re-checked under the project lock: `project-not-in-intake` (409) when the stage has changed. */
+  expectedStage: string;
   spec: { sourceFormat: SpecSourceFormat; originalName: string | null; fileSha256: string; text: string };
   requirements: RequirementRowInput[];
   milestones: { ordinal: number; name: string; gateName: string }[];
@@ -120,6 +122,7 @@ export interface SubmitResult {
 }
 
 export const REPO_PATH = "docs/requirements.md";
+/** UTF-16 code units, as `String.length` counts them. */
 export const PASTE_MAX_CHARS = 500_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OPEN_STAGES = new Set(["intake"]);
@@ -194,7 +197,10 @@ export class RequirementsPipeline {
     let analysis = analyzeSpec(ingested.blocks);
     if (this.ports.runner) {
       try {
-        analysis = (await assistAnalysis(ingested.blocks, analysis, this.ports.runner)).analysis;
+        const assisted = await assistAnalysis(ingested.blocks, analysis, this.ports.runner);
+        analysis = assisted.analysis;
+        // assistAnalysis reports a failed or unusable model call as a warning instead of throwing (pre-review 1).
+        if (assisted.warnings.some((w) => w.code === "model-failed" || w.code === "model-output-invalid")) warnings.push("assist-failed");
       } catch {
         // assistAnalysis reports model failures itself; anything thrown here is a bug or a cap stop. The
         // deterministic analysis still stands (it never invents a requirement).
@@ -205,6 +211,7 @@ export class RequirementsPipeline {
     const ordinals = new Map(analysis.milestones.map((m) => [m.name, m.ordinal]));
     const saved = await this.ports.store.saveAnalysis({
       projectId,
+      expectedStage: project.stage,
       spec: {
         sourceFormat,
         originalName: sourceFormat === "paste" ? null : ingested.specRow.originalName,
@@ -274,7 +281,14 @@ export class RequirementsPipeline {
       warnings.push("card-failed");
       return null;
     }
-    if (!(await this.ports.store.linkApproval(docId, id))) {
+    let linked = false;
+    try {
+      linked = await this.ports.store.linkApproval(docId, id);
+    } catch {
+      // The spec is already stored; a link failure must not stop the question cards (pre-review 2).
+      linked = false;
+    }
+    if (!linked) {
       warnings.push("card-link-failed");
       return null;
     }

@@ -133,7 +133,7 @@ test("PL3 KK approves once: only an approved requirements card for the newest do
   await rejects(pipeline.submitSpec(P1, { kind: "paste", text: SPEC }), "requirements-already-approved", 409);
   assert.equal(store.specs.length, 2, "a refused submission stores nothing");
   // The store refuses too (the pipeline pre-check can race a concurrent approval).
-  await rejects(store.saveAnalysis({ projectId: P1, spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "requirements-already-approved", 409);
+  await rejects(store.saveAnalysis({ projectId: P1, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "requirements-already-approved", 409);
 });
 
 test("PL4 open questions: non-technical become cards, technical go to the Architect log; failures never block", async () => {
@@ -164,6 +164,15 @@ test("PL4 open questions: non-technical become cards, technical go to the Archit
   const r4 = await s3.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
   assert.ok(r4.approvalId);
   assert.ok(r4.questionCards.failed.length > 0 && r4.questionCards.failed.every((f) => f.code === "store-down"));
+
+  // A store error while linking the card: the spec stays stored, the result says so, question cards still go out.
+  const s4 = setup();
+  s4.store.linkApproval = async () => { throw new Error("db down"); };
+  const r5 = await s4.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(r5.approvalId, null);
+  assert.deepEqual(r5.warnings, ["card-link-failed"]);
+  assert.equal(s4.store.specs.length, 1);
+  assert.ok(s4.qCards.length > 0);
 });
 
 test("PL5 input checks: bad id, unknown project, wrong stage, empty or oversize paste, refused file type", async () => {
@@ -178,6 +187,13 @@ test("PL5 input checks: bad id, unknown project, wrong stage, empty or oversize 
   assert.equal(store.specs.length, 0, "nothing stored for a refused submission");
   const late = setup({ stage: "building" });
   await rejects(late.pipeline.submitSpec(P1, { kind: "paste", text: SPEC }), "project-not-in-intake", 409);
+  assert.equal(late.store.specs.length, 0);
+  // The stage is re-checked under the store's lock: a stage change after the pre-check stores nothing.
+  const racing = setup();
+  const orig = racing.store.project.bind(racing.store);
+  racing.store.project = async (id) => { const p = await orig(id); racing.store.projects.get(id).stage = "provisioning"; return p; };
+  await rejects(racing.pipeline.submitSpec(P1, { kind: "paste", text: SPEC }), "project-not-in-intake", 409);
+  assert.equal(racing.store.specs.length, 0);
 });
 
 const PROSE = `# Bakery app
@@ -210,6 +226,9 @@ test("PL6 model pass: grounded proposals are stored and flagged on the card; a f
   const r2 = await failing.pipeline.submitSpec(P1, { kind: "paste", text: PROSE });
   assert.deepEqual([...failing.store.requirements.get(P1).keys()], ["FR-1"]);
   assert.equal(r2.counts.proposed, 0);
+  assert.deepEqual(r2.warnings, ["assist-failed"], "a failed model pass is visible");
+  const junk = setup({ runner: async () => ({ output: "not json" }) });
+  assert.deepEqual((await junk.pipeline.submitSpec(P1, { kind: "paste", text: PROSE })).warnings, ["assist-failed"]);
 });
 
 test("PL7 requirementsCard is accepted by the M2.3 card rules for long counts and never includes spec text", () => {
