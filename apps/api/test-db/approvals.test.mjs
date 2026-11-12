@@ -312,7 +312,8 @@ function holdCardLock(id, { approve = false, rollback = false } = {}) {
   let release;
   const gate = new Promise((r) => (release = r));
   let onLocked;
-  const locked = new Promise((r) => (onLocked = r));
+  let onFail;
+  const locked = new Promise((r, j) => ((onLocked = r), (onFail = j)));
   const done = db
     .$transaction(
       async (tx) => {
@@ -325,7 +326,9 @@ function holdCardLock(id, { approve = false, rollback = false } = {}) {
       { timeout: 20_000, maxWait: 20_000 },
     )
     .catch((e) => {
-      if (!rollback || e.message !== "rollback") throw e;
+      if (rollback && e.message === "rollback") return;
+      onFail(e); // a hold that fails before locking fails the test at once instead of hanging
+      throw e;
     });
   return { locked, release: () => release(), done };
 }

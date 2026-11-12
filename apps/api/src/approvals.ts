@@ -404,7 +404,10 @@ export class Approvals {
    * this call expired. System-only: there is no route to it.
    */
   async expireCardsById(ids: readonly string[], reason: string): Promise<string[]> {
-    if (!Array.isArray(ids) || ids.some((i) => typeof i !== "string")) throw new ApprovalError("invalid-input");
+    // Raw bound first (BS-A01), so an oversized call is refused before any per-id work.
+    if (!Array.isArray(ids) || ids.length > 4 * EXPIRE_IDS_MAX || ids.some((i) => typeof i !== "string" || i.length > 64)) {
+      throw new ApprovalError("invalid-input");
+    }
     const why = text(reason, EXPIRE_REASON_MAX, false);
     if (!why) throw new ApprovalError("invalid-input");
     if (looksSecret(why)) throw new ApprovalError("card-contains-secret");

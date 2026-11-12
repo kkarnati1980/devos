@@ -399,7 +399,7 @@ test("DEVOS-164 expireCardsById validates its input", async () => {
   const { approvals, store } = setup();
   const c = await approvals.raiseCard(card(), [T1]);
   assert.deepEqual(await approvals.expireCardsById([], "nothing named"), []);
-  for (const bad of [[c.id, 5], "not-an-array", null]) {
+  for (const bad of [[c.id, 5], "not-an-array", null, Array(2001).fill(c.id), [c.id, "x".repeat(65)]]) {
     await assert.rejects(approvals.expireCardsById(bad, "reason"), (e) => e.code === "invalid-input");
   }
   for (const reason of ["", "   ", "two\nlines", "x".repeat(501), 7]) {
