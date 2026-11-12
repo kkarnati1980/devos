@@ -1,0 +1,19 @@
+# F3: every service has CPU, memory and pid limits and joins only the project network. Host rules are S4's.
+services:
+  app:
+    build: .
+    environment:
+      GIT_SHA: ${GIT_SHA:-unknown}
+    cpus: "0.5"
+    mem_limit: 512m
+    pids_limit: 256
+    read_only: true
+    tmpfs: ["/tmp"]
+    networks: [project]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+networks:
+  project: {}
