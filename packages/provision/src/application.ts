@@ -148,6 +148,8 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
         description: `DevOS ${p.slug} ${hookEnvName(env)} stack ${marker}`,
         docker_compose_raw: Buffer.from(stringify(hardened.compose), "utf8").toString("base64"),
         instant_deploy: false,
+        // Decision 1: tailnet only; Coolify must not generate a proxy domain (Codex PR76-r1).
+        autogenerate_domain: false,
       });
       const uuid = r.body?.uuid;
       if (typeof uuid !== "string" || !UUID_RE.test(uuid)) {

@@ -65,6 +65,7 @@ test("AT1 one application per environment, from the repo's Compose after the hoo
     assert.equal(b.project_uuid, proj.uuid);
     assert.equal(b.server_uuid, SERVER);
     assert.equal(b.instant_deploy, false, "M2.4 deploys nothing");
+    assert.equal(b.autogenerate_domain, false, "decision 1: no Coolify domain, tailnet only");
     assert.ok(b.description.includes(`devos:${P.id}`), "marker in the create call itself");
     const sent = parse(Buffer.from(b.docker_compose_raw, "base64").toString("utf8"));
     assert.equal(sent["x-hardened"], env[1], "Coolify gets the hook's Compose");
@@ -75,6 +76,7 @@ test("AT1 one application per environment, from the repo's Compose after the hoo
   const apps = s.store.resources.filter((r) => r.kind === "application");
   assert.deepEqual(apps.map((r) => r.name).sort(), ["devos-acme-live", "devos-acme-preview"]);
   assert.ok(!s.fake.calls.some((c) => c.path.startsWith("/api/v1/deploy")), "no deploy call");
+  assert.ok([...s.fake.apps.values()].every((a) => a.fqdn === undefined), "no generated domain");
 });
 
 test("AT2 a re-run creates nothing; a lost journal adopts both applications by name and marker", async () => {

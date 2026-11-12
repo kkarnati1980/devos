@@ -134,6 +134,8 @@ export function fakeProviders() {
       const p = projects.get(b.project_uuid);
       if (!p || !(p.environments ?? []).includes(b.environment_name)) return json(404, { message: "Project or environment not found." });
       if (typeof b.docker_compose_raw !== "string" || !b.server_uuid) return json(422, { message: "Validation failed." });
+      // Like Coolify, a domain is generated unless the create turns it off (decision 1 forbids one).
+      if (b.autogenerate_domain !== false) b.fqdn = `http://${b.name}.sslip.io`;
       const uuid = `ap${randomUUID().replace(/-/g, "").slice(0, 20)}`;
       apps.set(uuid, { uuid, name: b.name, description: b.description ?? null, ...b });
       return json(201, { uuid });
