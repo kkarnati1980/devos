@@ -134,6 +134,8 @@ already_commented() {  # pr sha -> 0 posted; 1 not on the PR; 2 cannot read the 
   local pr="$1" sha="$2" head cs
   head="$(head -n1 "$STATE/$sha.msg")"
   cs="$(gh_all "/repos/$REPO/issues/$pr/comments?per_page=100" '')" || return 2
+  # Codex PR52-r5: gh_all stops at 30 pages; a list that reached the cap may be truncated, so it proves nothing.
+  (( $(jq 'length' <<<"$cs") < 3000 )) || return 2
   jq -e --arg h "$head" --arg c "- **Commit:** \`$sha\`" --arg bot "${REVIEW_BOT_LOGIN:-kkarnati1980}" \
     'any(.[]; ((.user.login // "") == $bot) and ((.body // "") | startswith($h) and contains($c)))' <<<"$cs" >/dev/null && return 0
   return 1

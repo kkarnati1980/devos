@@ -113,3 +113,4 @@ Run the existing Codex review automatically on every new PR head, so a review no
   - **The query string is now `?per_page=100`**, replacing the no-op `sort=created`.
   - **AT20 covers more cases:** a failed comment read, a forged comment by another login, and an own comment that belongs to a different SHA.
 - **Codex PR52-r2 (1 medium, accepted):** runner-failure reports ("could not run") had no commit line, so a retry could not recognise one that GitHub had stored. They now carry `- **Commit:** \`<sha>\`` like verdicts do, and the same duplicate check covers them. Test: a failure report whose POST timed out is not posted again (review-watch 11/11).
+- **Codex PR52-r5 (1 medium, accepted):** `gh_all` stops after 30 pages. A comment list that reaches 3,000 entries may be truncated, so it now counts as indeterminate (return 2): the POST waits instead of risking a duplicate. Test: every page full → no POST, nothing marked posted (review-watch 12/12).

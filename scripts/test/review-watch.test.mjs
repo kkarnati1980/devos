@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false, manyComments: false });
 
 before(async () => {
   reset();
@@ -44,6 +44,7 @@ before(async () => {
       }
       if (cm && req.method === "GET") {
         if (M.failCommentsGet) return send(502, {});
+        if (M.manyComments) return send(200, Array.from({ length: 100 }, () => ({ body: "x", user: { login: "someone" } }))); // every page full
         return send(200, M.comments.filter((c) => c.pr === Number(cm[1])).map((c) => ({ body: c.body, user: c.user })));
       }
       const st = p.match(/^\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/);
@@ -315,4 +316,19 @@ test("AT20 (Codex PR52-r2): a runner-failure report carries the commit line and 
   assert.match(r2.out, /verdict comment already on the PR/);
   assert.equal(M.comments.length, 1, "the failure report is not duplicated");
   assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "error"));
+});
+
+test("AT20 (Codex PR52-r5): a comment list that hits the 30-page cap is indeterminate, so the POST waits", async () => {
+  reset();
+  M.green = true; M.manyComments = true;
+  const sha = "6".repeat(40);
+  M.prs = [{ number: 34, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M34.md" }];
+  fs.writeFileSync(path.join(dir, "watch", `${sha}.msg`), "### Codex review PR34-r1 — **PASS**\n\n- **Commit:** `" + sha + "`\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha}.state`), "success Codex PASS (PR34-r1)\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha}.comment-tried`), "");
+  const r = await tick();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /cannot check the PR's comments/);
+  assert.equal(M.comments.length, 0, "no POST on a truncated list");
+  assert.equal(fs.existsSync(path.join(dir, "watch", `${sha}.commented`)), false);
 });
