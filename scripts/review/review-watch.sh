@@ -18,9 +18,10 @@
 # captured into variables; an unreadable check-runs API is reported as a token problem, not as "CI not green".
 #
 # Runs on the DevOS server from a systemd timer (installed by install-review-watch.sh). Each tick:
-#   1. lists open, non-draft PRs on kkarnati1980/devos;
+#   1. lists open, non-draft PRs on kkarnati1980/devos whose head is in that repo and whose author is on
+#      REVIEW_AUTHORS (v1.2.0); any other PR is logged once and nothing is posted on it;
 #   2. for each PR whose head SHA has no stored verdict yet, and whose CI check runs have all
-#      completed successfully (Codex never sees failing code — PRD build loop step 4), reads the
+#      completed successfully per the Actions API (Codex never sees failing code — PRD build loop step 4), reads the
 #      contract path from the PR body line `Review-Contract: docs/modules/<id>.md`;
 #   3. runs /root/.devos/bin/review-commit.sh main <sha> <contract> PR<n>-r<k> (unchanged M0.3 runner:
 #      read-only deploy key, pristine checkout, schema-validated verdict per SHA);
