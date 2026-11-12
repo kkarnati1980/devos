@@ -152,7 +152,7 @@ export class PrismaRequirementsStore implements RequirementsStore {
           SELECT DISTINCT ON (project_id) project_id, status, approval_id, created_at
           FROM requirements_doc ORDER BY project_id, version DESC
         ) d
-        JOIN approval a ON a.id = d.approval_id AND a.status = 'approved'
+        JOIN approval a ON a.id = d.approval_id AND a.status = 'approved' AND a.gate = 'requirements'
         WHERE d.status = 'draft'
         ORDER BY d.created_at, d.project_id
         LIMIT ${n}`;

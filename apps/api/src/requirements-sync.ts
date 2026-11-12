@@ -99,24 +99,31 @@ export function skipDecidedQuestions(raise: RaiseCard, cards: DecidedCardLister)
     const c = draft.card as { gate: string; action: string; target: string; projectId?: string | null };
     if (c.projectId) {
       // A failed lookup must not drop the question (pre-review finding 4): a possible repeat card is the lesser harm.
-      const prior = await findDecided(cards, c.projectId, c.action, c.target).catch(() => null);
+      const prior = await decidedKeys(cards, c.projectId).then((m) => m.get(key(c.action, c.target)) ?? null, () => null);
       if (prior) return { id: prior };
     }
     return raise(draft, reason);
   };
 }
 
-async function findDecided(cards: DecidedCardLister, projectId: string, action: string, target: string): Promise<string | null> {
+const key = (action: string, target: string) => `${action}\u0000${target}`;
+
+/** The project's decided `decision` cards as action/target → card id (approved first), at most DECIDED_SCAN_MAX read. */
+async function decidedKeys(cards: DecidedCardLister, projectId: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
   let read = 0; // shared by both statuses: at most DECIDED_SCAN_MAX cards in all
   for (const status of ["approved", "rejected"] as const) {
     let cursor: string | undefined;
     while (read < DECIDED_SCAN_MAX) {
       const page = await cards.list({ status, projectId, cursor, limit: Math.min(PAGE, DECIDED_SCAN_MAX - read) });
-      for (const k of page) if (k.gate === "decision" && k.projectId === projectId && k.action === action && k.target === target) return k.id;
+      for (const k of page) {
+        const kk = key(k.action, k.target);
+        if (k.gate === "decision" && k.projectId === projectId && !out.has(kk)) out.set(kk, k.id);
+      }
       read += page.length;
       if (page.length === 0 || page.length < PAGE) break;
       cursor = page[page.length - 1]!.id;
     }
   }
-  return null;
+  return out;
 }
