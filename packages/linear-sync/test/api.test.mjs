@@ -20,12 +20,22 @@ test("issues are read across pages; blocked-by comes from inverse 'blocks' relat
   assert.deepEqual(is.map((i) => [i.id, i.blockedBy, i.milestoneId, i.labelNames]), [["i1", [], "m1", ["Module"]], ["i2", ["i1"], "m1", ["Module"]]]);
 });
 
-test("A blocked by B is created as 'B blocks A'; an update sends only changed fields, never team or project", async () => {
+test("A blocked by B is created as 'B blocks A'; an update sends only changed fields, never the team; a project only when set (moving an issue back)", async () => {
   const { a, calls } = api(() => ({ issueRelationCreate: { success: true }, issueUpdate: { success: true } }));
   await a.addBlockedBy("A", "B");
   assert.deepEqual(calls[0].variables.i, { issueId: "B", relatedIssueId: "A", type: "blocks" });
   await a.updateIssue("A", { stateId: "s1", milestoneId: "m2" });
   assert.deepEqual(calls[1].variables, { id: "A", i: { stateId: "s1", projectMilestoneId: "m2" } });
+  await a.updateIssue("A", { teamId: "t9", projectId: "p1" });
+  assert.deepEqual(calls[2].variables, { id: "A", i: { projectId: "p1" } });
+});
+
+test("issueRef reads one issue by id filter (archived included); a gone issue is null, not an error", async () => {
+  const { a, calls } = api((b) => ({ issues: { nodes: b.variables.id === "gone" ? [] : [{ id: b.variables.id, project: b.variables.id === "loose" ? null : { id: "p7" } }] } }));
+  assert.deepEqual(await a.issueRef("i1"), { id: "i1", projectId: "p7" });
+  assert.deepEqual(await a.issueRef("loose"), { id: "loose", projectId: null });
+  assert.equal(await a.issueRef("gone"), null);
+  assert.match(calls[0].query, /includeArchived: true/);
 });
 
 test("a success:false payload is an error", async () => {
