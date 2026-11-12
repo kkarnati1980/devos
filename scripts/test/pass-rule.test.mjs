@@ -84,6 +84,13 @@ test("the contract template and the backfilled current-phase Lane A contracts pa
   }
 });
 
+test("PR71-r4: a ``` line inside a ```` fence does not close it, so a pass rule shown in an example block does not count", () => {
+  const r = validateContract("# M9\n````markdown\n```markdown\n## Pass rule\n- AT1 passes\n```\n````\n");
+  assert.equal(r.ok, false);
+  assert.match(r.errors[0], /no "## Pass rule" section/);
+  assert.deepEqual(validateContract(c("## Pass rule\n- Run it:\n````sh\npnpm test\n````\n")).errors, []);
+});
+
 test("PR71-r3: a top-level fence ends the bullet, so a following indented-less line is its own item and needs an anchor", () => {
   const r = validateContract(c("## Pass rule\n- Run the suite\n```sh\npnpm test\n```\nworks as expected\n"));
   assert.equal(r.ok, false);

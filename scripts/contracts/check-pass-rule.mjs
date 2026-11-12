@@ -31,8 +31,11 @@ function scan(text) {
   const clean = text.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, " "));
   let fence = null;
   return clean.split("\n").map((l) => {
-    const f = /^\s*(```|~~~)/.exec(l);
-    if (f) { const was = fence; fence = fence ? (l.trim().startsWith(fence) ? null : fence) : f[1]; return { l, fenced: true, edge: true, opened: !was }; }
+    // CommonMark: a fence is a run of 3+ backticks or tildes; only a run of the same character, at least as long,
+    // with nothing after it closes it, so a ``` line inside a ```` block is content (PR71-r4)
+    const f = /^\s*(`{3,}|~{3,})(.*)$/.exec(l);
+    if (f && !fence) { fence = f[1]; return { l, fenced: true, edge: true, opened: true }; }
+    if (f && fence && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) { fence = null; return { l, fenced: true, edge: true, opened: false }; }
     return { l, fenced: !!fence };
   });
 }
