@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { APPROVALS_CHANGED_EVENT, DevosApi, explain, type ApprovalDetail, type ApprovalRow } from "../../lib/api";
 
-const ORDER: Record<string, number> = { pending: 0, approved: 1, rejected: 1, expired: 1 };
+const MAX_PENDING_PAGES = 20; // 50 a page (b1); far above what one person's inbox holds
 
 export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
   const api = useRef(new DevosApi(apiOrigin)).current;
@@ -15,15 +15,29 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
   const [busy, setBusy] = useState(false);
   const fail = (code: string) => setMsg(`${explain(code)} (${code})`);
 
+  // Pending first (every page of them, so an old pending card is never hidden behind newer decided ones),
+  // then the newest page of decided cards; each group keeps the API's newest-first order.
   const load = useCallback(async () => {
-    const r = await api.approvals();
-    if (!r.ok) return fail(r.code);
-    // Stable: pending first, then decided; each group keeps the API's newest-first order.
-    setRows([...r.data.approvals].sort((a, b) => (ORDER[a.status] ?? 1) - (ORDER[b.status] ?? 1)));
+    const pending: ApprovalRow[] = [];
+    let cursor: string | undefined;
+    for (let i = 0; i < MAX_PENDING_PAGES; i++) {
+      const r = await api.approvals({ status: "pending", cursor });
+      if (!r.ok) return fail(r.code);
+      pending.push(...r.data.approvals);
+      if (!r.data.nextCursor) break;
+      cursor = r.data.nextCursor;
+    }
+    const recent = await api.approvals();
+    if (!recent.ok) return fail(recent.code);
+    setRows([...pending, ...recent.data.approvals.filter((c) => c.status !== "pending")]);
   }, [api]);
 
+  // Only the newest detail request may fill the panel, so a slow earlier click never replaces the chosen card.
+  const showSeq = useRef(0);
   const show = useCallback(async (id: string) => {
+    const mine = ++showSeq.current;
     const r = await api.approval(id);
+    if (mine !== showSeq.current) return;
     if (!r.ok) return fail(r.code);
     setOpen(r.data);
   }, [api]);
@@ -38,15 +52,19 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
     })();
   }, [api, load, show]);
 
-  async function act(run: () => Promise<{ ok: boolean; code?: string }>, done: string) {
+  async function act(run: () => Promise<{ ok: boolean; code?: string }>, done: string): Promise<boolean> {
     setBusy(true);
     const r = await run();
     setBusy(false);
-    if (!r.ok) return fail(r.code ?? "unknown");
+    if (!r.ok) {
+      fail(r.code ?? "unknown");
+      return false;
+    }
     setMsg(done);
     window.dispatchEvent(new Event(APPROVALS_CHANGED_EVENT)); // the nav's pending count
     await load();
     if (open) await show(open.approval.id);
+    return true;
   }
 
   if (!rows) return msg ? <p className="panel" role="alert">{msg}</p> : <p className="muted">Loading…</p>;
@@ -78,7 +96,7 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
 function Detail({ d, busy, act, api }: {
   d: ApprovalDetail;
   busy: boolean;
-  act: (run: () => Promise<{ ok: boolean; code?: string }>, done: string) => Promise<void>;
+  act: (run: () => Promise<{ ok: boolean; code?: string }>, done: string) => Promise<boolean>;
   api: DevosApi;
 }) {
   const c = d.approval;
@@ -108,9 +126,12 @@ function Detail({ d, busy, act, api }: {
       ) : null}
       {pending ? (
         <form onSubmit={(e) => { e.preventDefault(); void act(() => api.approve(c.id, { expiresInHours: Number(hours), maxUses: Number(uses), ...(purge ? { confirmation: phrase } : {}) }), "Approved."); }}>
-          <label>Valid for (hours) <input type="number" min={1} max={2160} value={hours} onChange={(e) => setHours(e.target.value)} data-testid="approve-hours" /></label>
-          <label>Uses <input type="number" min={1} max={100} value={uses} onChange={(e) => setUses(e.target.value)} data-testid="approve-uses" /></label>
-          {purge ? <label>Type the confirmation phrase <input value={phrase} onChange={(e) => setPhrase(e.target.value)} data-testid="approve-phrase" /></label> : null}
+          <label>Valid for (hours) <input type="number" required min={1} max={2160} step={1} value={hours} onChange={(e) => setHours(e.target.value)} data-testid="approve-hours" /></label>
+          <label>Uses <input type="number" required min={1} max={100} step={1} value={uses} onChange={(e) => setUses(e.target.value)} data-testid="approve-uses" /></label>
+          {purge ? (
+            <label>Type <code data-testid="purge-phrase">PURGE {c.target}</code> to confirm the deletion
+              <input value={phrase} required onChange={(e) => setPhrase(e.target.value)} data-testid="approve-phrase" autoComplete="off" /></label>
+          ) : null}
           <button type="submit" disabled={busy} data-testid="approve">Approve</button>
         </form>
       ) : null}
@@ -127,10 +148,10 @@ function Detail({ d, busy, act, api }: {
   );
 }
 
-function CommentForm({ busy, onSend }: { busy: boolean; onSend: (body: string) => Promise<void> }) {
+function CommentForm({ busy, onSend }: { busy: boolean; onSend: (body: string) => Promise<boolean> }) {
   const [body, setBody] = useState("");
   return (
-    <form onSubmit={(e) => { e.preventDefault(); if (body.trim()) void onSend(body.trim()).then(() => setBody("")); }}>
+    <form onSubmit={(e) => { e.preventDefault(); if (body.trim()) void onSend(body.trim()).then((ok) => { if (ok) setBody(""); }); }}>
       <label>Comment <textarea value={body} onChange={(e) => setBody(e.target.value)} data-testid="comment-body" /></label>
       <button type="submit" disabled={busy || !body.trim()} data-testid="comment-send">Add comment</button>
     </form>

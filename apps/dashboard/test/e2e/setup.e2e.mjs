@@ -212,10 +212,10 @@ test("M2.3 AT12 (DEVOS-135): the approvals inbox lists pending first, escapes ca
   const refusedBefore = api.state.csrfRefused ?? 0;
   const { page, context, problems } = await open("/approvals");
   await page.getByTestId("approvals").waitFor();
-  await page.getByTestId("nav-pending").filter({ hasText: "(1 pending)" }).waitFor();
+  await page.getByTestId("nav-pending").filter({ hasText: "(2 pending)" }).waitFor();
   const rows = page.getByTestId("approval-row");
-  assert.equal(await rows.count(), 2);
-  assert.equal(await rows.first().getAttribute("data-status"), "pending", "pending cards come first");
+  assert.equal(await rows.count(), 3);
+  assert.deepEqual(await rows.evaluateAll((els) => els.map((e) => e.getAttribute("data-status"))), ["pending", "pending", "rejected"], "pending cards come first, even the oldest");
   assert.match(await rows.first().innerText(), /<img src=x onerror=window.__xss3=1>/, "the action is shown as text");
   assert.match(await rows.first().innerText(), /\$2\.50 · 1 blocked task\b/);
   await page.getByTestId("open-00000000-0000-4000-8000-0000000000a1").click();
@@ -229,8 +229,7 @@ test("M2.3 AT12 (DEVOS-135): the approvals inbox lists pending first, escapes ca
   await page.getByTestId("detail-status").filter({ hasText: "approved" }).waitFor();
   assert.match(await page.getByTestId("detail-grant").innerText(), /0\/2 uses/);
   assert.equal(await page.getByTestId("approve").count(), 0, "a decided card has no Approve");
-  await page.getByTestId("nav-pending").waitFor({ state: "detached" });
-  assert.equal(await page.getByTestId("nav-approvals").innerText(), "Approvals", "no pending cards: the count is gone");
+  await page.getByTestId("nav-pending").filter({ hasText: "(1 pending)" }).waitFor();
   const writes = api.state.received.filter((r) => r.url.startsWith("/approvals/"));
   assert.deepEqual(writes.map((w) => w.url), ["/approvals/00000000-0000-4000-8000-0000000000a1/comments", "/approvals/00000000-0000-4000-8000-0000000000a1/approve"]);
   assert.deepEqual(JSON.parse(writes[1].body), { expiresInHours: 72, maxUses: 2 });
@@ -238,6 +237,28 @@ test("M2.3 AT12 (DEVOS-135): the approvals inbox lists pending first, escapes ca
   assert.equal(await page.evaluate(() => [window.__xss3, window.__xss4]).then((v) => v.every((x) => x === undefined)), true, "card text never runs as script");
   assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "no horizontal scroll at 390 px");
+  assert.deepEqual(problems, []);
+  await context.close();
+});
+
+test("M2.3 AT12 (DEVOS-135): a deep-linked purge card shows the phrase to type and Reject sends its comment with CSRF", async () => {
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  const A3 = "00000000-0000-4000-8000-0000000000a3";
+  const { page, context, problems } = await open(`/approvals?id=${A3}`);
+  await page.getByTestId("approval-detail").waitFor();
+  assert.equal(await page.getByTestId("purge-phrase").innerText(), "PURGE project:old", "the exact phrase is shown");
+  assert.equal(await page.getByTestId("approve-phrase").inputValue(), "", "the phrase is never prefilled");
+  await page.getByTestId("reject-comment").fill("not now");
+  await page.getByTestId("reject").click();
+  await page.getByTestId("detail-status").filter({ hasText: "rejected" }).waitFor();
+  assert.equal(await page.getByTestId("reject").count(), 0, "a decided card has no Reject");
+  const last = api.state.received.at(-1);
+  assert.equal(last.url, `/approvals/${A3}/reject`);
+  assert.deepEqual(JSON.parse(last.body), { comment: "not now" });
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "the reject carried the session's CSRF token");
+  await page.getByTestId("nav-pending").waitFor({ state: "detached" });
+  assert.equal(await page.getByTestId("nav-approvals").innerText(), "Approvals", "no pending cards: the count is gone");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
   assert.deepEqual(problems, []);
   await context.close();
 });

@@ -298,6 +298,7 @@ export function explain(code: string): string {
   if (code === "approvals-store-error") return "The approvals store did not answer. Try again in a minute.";
   if (code === "card-not-found") return "That approval card no longer exists.";
   if (code === "card-not-pending") return "That card was already decided.";
+  if (code === "invalid-input") return "Check the values you entered: whole numbers within the shown limits.";
   if (code === "purge-confirmation-mismatch") return "The typed phrase does not match. Type it exactly as shown.";
   if (code === "grant-not-found") return "There is no live grant on this card to revoke.";
   if (code === "vault-not-configured") return "The server vault key is not set yet (DEVOS_VAULT_KEY).";

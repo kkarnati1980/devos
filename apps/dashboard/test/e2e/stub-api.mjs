@@ -89,7 +89,9 @@ export async function startStubApi(allowedOrigin) {
     // M2.3-b2 (DEVOS-135) approvals inbox
     const A1 = "00000000-0000-4000-8000-0000000000a1";
     const A2 = "00000000-0000-4000-8000-0000000000a2";
+    const A3 = "00000000-0000-4000-8000-0000000000a3";
     state.approvals ??= [
+      { id: A3, gate: "purge", action: "purge", target: "project:old", reason: "teardown", consequence: "deletes the project's data", costUsd: null, projectId: null, status: "pending", createdAt: "2026-11-10T10:00:00.000Z", decidedAt: null, decidedBy: null, blockedTasks: 0, grant: null },
       { id: A1, gate: "decision", action: "deploy <img src=x onerror=window.__xss3=1>", target: "project:shop", reason: "first deploy", consequence: null, costUsd: "2.50", projectId: null, status: "pending", createdAt: "2026-11-12T10:00:00.000Z", decidedAt: null, decidedBy: null, blockedTasks: 1, grant: null },
       { id: A2, gate: "decision", action: "spend", target: "openai", reason: "old", consequence: null, costUsd: null, projectId: null, status: "rejected", createdAt: "2026-11-11T10:00:00.000Z", decidedAt: "2026-11-11T11:00:00.000Z", decidedBy: "kk", blockedTasks: 0, grant: null },
     ];
