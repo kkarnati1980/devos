@@ -403,3 +403,19 @@ Customers integrate the ledger to export orders.
   const r3 = await assistAnalysis(blocks, a, fake({ requirements: [{ block: plain, title: "Customers integrate ledger to export orders" }], criteria: [] }));
   assert.equal(r3.analysis.requirements.filter((x) => x.proposed).length, 1);
 });
+
+test("AB8f (PR56-r6) an unseparated custom key (SHOP12) still makes SHOP-1 in a model title contains-id", async () => {
+  const md = `# Shop
+
+- SHOP12: Export orders
+
+Customers integrate SHOP-1 to export orders.
+`;
+  const blocks = blocksOf(md);
+  const a = analyzeSpec(blocks, { idPrefixes: ["SHOP"] });
+  assert.deepEqual(a.requirements.map((r) => r.key), ["SHOP12"]);
+  const src = idx(blocks, "integrate SHOP-1");
+  const r = await assistAnalysis(blocks, a, fake({ requirements: [{ block: src, title: "SHOP-1 integration exports orders" }], criteria: [] }));
+  assert.deepEqual(r.analysis.requirements.filter((x) => x.proposed), []);
+  assert.ok(r.warnings.some((w) => w.reason === "contains-id" && w.source === src));
+});

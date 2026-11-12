@@ -71,10 +71,22 @@ function blockText(b: Block): string {
 
 const PREFIX_RE = /^[A-Z][A-Z0-9]{0,9}$/;
 
-/** The upper-case prefix of a requirement key (`SHOP` for `SHOP-1`), or null. */
-function keyPrefix(key: string): string | null {
-  const own = /^[A-Za-z][A-Za-z0-9]*(?=[-_.]?\d)/.exec(key)?.[0];
-  return own && PREFIX_RE.test(own) ? own : null;
+/**
+ * Every upper-case prefix a requirement key can be read with. A separated key has one (`SHOP` for
+ * `SHOP-1`); an unseparated one is ambiguous, so each split whose rest is digits counts (`SHOP12` gives
+ * `SHOP1` and `SHOP`; PR56-r6). Extra prefixes only make the ID checks stricter: IDs come back verbatim.
+ */
+function keyPrefixCandidates(key: string): string[] {
+  const sep = /^([A-Za-z][A-Za-z0-9]*)[-_.]\d/.exec(key);
+  if (sep) return PREFIX_RE.test(sep[1]!) ? [sep[1]!] : [];
+  const out: string[] = [];
+  const m = /^([A-Za-z][A-Za-z0-9]*?)(\d+)$/.exec(key);
+  if (!m) return out;
+  for (let i = m[1]!.length; i < key.length; i++) {
+    const p = key.slice(0, i);
+    if (PREFIX_RE.test(p)) out.push(p);
+  }
+  return out;
 }
 
 function validPrefixes(list: readonly string[]): string[] {
@@ -83,10 +95,7 @@ function validPrefixes(list: readonly string[]): string[] {
 
 function keyPrefixes(analysis: Analysis): string[] {
   const out = new Set<string>();
-  for (const r of analysis.requirements) {
-    const p = keyPrefix(r.key);
-    if (p) out.add(p);
-  }
+  for (const r of analysis.requirements) for (const p of keyPrefixCandidates(r.key)) out.add(p);
   return [...out];
 }
 
@@ -104,8 +113,8 @@ export function requirementText(
   if (b.type !== "table") return b.text;
   // The key's own prefix always counts, so a spec analysed with custom `idPrefixes` (`SHOP-1`) still finds
   // its rows without the caller passing them again (PR56-r3).
-  const own = keyPrefix(r.key);
-  if (own && !prefixes.includes(own)) prefixes = [...prefixes, own];
+  const own = keyPrefixCandidates(r.key).filter((p) => !prefixes.includes(p));
+  if (own.length > 0) prefixes = [...prefixes, ...own];
   // A row belongs to the ID that opens its first ID-bearing cell (emphasis ignored), never to an ID that
   // only appears inside another row's title (PR56-r1).
   const rowKey = (cells: readonly string[]): string | null => {
