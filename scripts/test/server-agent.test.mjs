@@ -84,6 +84,7 @@ function handler(req, res) {
     }
     if (p === "/gh/repos/kkarnati1980/devos/pulls" && req.method === "GET") return json(200, M.openPulls || []);
     if ((m = p.match(/^\/gh\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/)) && req.method === "GET") {
+      if (M.failComments > 0) { M.failComments--; return json(500, {}); }
       const since = u.searchParams.get("since");
       const all = ((M.comments || {})[m[1]] || []).filter((c) => !since || c.updated_at >= since);
       const pg = Number(u.searchParams.get("page") || 1), per = Number(u.searchParams.get("per_page") || 30);
@@ -790,6 +791,33 @@ test("DEVOS-90: only comments since the last one seen are read; a post that keep
   fs.writeFileSync(path.join(D(), "agent/recheck.result"), "garbage\n");
   const r4 = await runAgent();
   assert.match(r4.out, /stored result is unreadable; dropped/);
+});
+
+test("DEVOS-90 AT22: a comment page over 128 KiB still finds /recheck (bodies never pass as a jq argument); a bad page is not fatal", async () => {
+  resetMock(); freshState();
+  const sha = commit(recheckFiles("bigpage"), "devos-90 big page");
+  M.main = sha; green(sha); pass(sha);
+  M.openPulls = [tracking()];
+  M.comments = { 77: [cmt(40, "kkarnati1980", "seed")] };
+  const r0 = await runAgent();
+  assert.match(r0.out, /comment baseline recorded on PR #77/);
+  const big = "x".repeat(200 * 1024);
+  M.comments[77].push(cmt(41, "kkarnati1980", big), cmt(42, "kkarnati1980", big), cmt(43, "kkarnati1980", "/recheck"));
+  reqs.length = 0;
+  const r1 = await runAgent();
+  assert.equal(r1.code, 0, r1.out);
+  assert.doesNotMatch(r1.out, /Argument list too long/);
+  assert.equal(checkRuns(), 2, "the /recheck after two 200 KiB comments re-runs the checks: " + r1.out);
+  assert.equal(fs.readFileSync(path.join(D(), "agent/recheck.last-id"), "utf8").trim(), "43 2026-11-11T10:00:43Z");
+  const src = fs.readFileSync(new URL("../server/server-agent.sh", import.meta.url), "utf8");
+  const fn = src.slice(src.indexOf("scan_requests() {"), src.indexOf("recheck_target() {"));
+  assert.doesNotMatch(fn, /--argjson c /, "pages are merged through files");
+  // an unreadable comment page: logged, the tick goes on (timed re-checks are not blocked)
+  M.failComments = 1;
+  reqs.length = 0;
+  const r2 = await runAgent();
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.out, /re-check: cannot (read|merge) PR #77 comments; next tick/);
 });
 
 test("DEVOS-90: the 6-hour clock restarts when a new SHA's normal checks run", async () => {

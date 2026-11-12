@@ -379,22 +379,35 @@ recheck_pr() {  # -> number of the tracking PR (empty if none); 1 on read error
       and ((.user.login // "") as $u | $u != "" and ($a | contains(" " + $u + " "))))] | min_by(.number) // empty | .number' <<<"$p"
 }
 scan_requests() {  # sets recheck.requested when an allowed /recheck is new; never fatal
-  local pr page=1 chunk acc='[]' n last max since="" q=""
+  local pr page=1 chunk accf pagef n=0 last max since="" q="" acc
   pr="$(recheck_pr)" || { log "re-check: cannot read the tracking PR; next tick"; return 0; }
   [[ "$pr" =~ ^[0-9]+$ ]] || return 0
   # Only comments updated since the last one seen are read (GitHub's since= filter), so a long thread stays cheap.
   since="$(sed -n '1s/^[0-9]\{1,20\} \([0-9TZ:-]\{20\}\)$/\1/p' "$ST/recheck.last-id" 2>/dev/null || true)"
   [[ -n "$since" ]] && q="&since=$since"
+  # Pages are merged through temp files and bodies are reduced to a flag at once (Codex PR31-r1): a page is never
+  # passed as a jq argument, so a large page cannot hit the kernel's per-argument limit; every failure is non-fatal.
+  accf="$(mktemp "$TMP/rc-acc.XXXXXX")" && pagef="$(mktemp "$TMP/rc-page.XXXXXX")" \
+    || { rm -f "${accf:-}"; log "re-check: cannot create temp files; next tick"; return 0; }
+  printf '[]' > "$accf"
   while :; do
-    chunk="$(gh GET "/repos/$REPO/issues/$pr/comments?per_page=100&page=$page$q")" || { log "re-check: cannot read PR #$pr comments; next tick"; return 0; }
-    chunk="$(jq -c '[.[]? | {id, login: .user.login, body, at: (.updated_at // "")}]' <<<"$chunk")" || return 0
-    acc="$(jq -c --argjson c "$chunk" '. + $c' <<<"$acc")"
-    n="$(jq 'length' <<<"$chunk")"
+    if ! gh GET "/repos/$REPO/issues/$pr/comments?per_page=100&page=$page$q" > "$pagef"; then
+      rm -f "$accf" "$pagef"; log "re-check: cannot read PR #$pr comments; next tick"; return 0
+    fi
+    if ! { jq -c '[.[]? | {id, login: .user.login, recheck: (((.body // "") | gsub("^\\s+|\\s+$"; "")) == "/recheck"),
+                           at: (.updated_at // "")}]' "$pagef" > "$pagef.k" && mv "$pagef.k" "$pagef" \
+           && jq -c -s '.[0] + .[1]' "$accf" "$pagef" > "$accf.n" && mv "$accf.n" "$accf" \
+           && n="$(jq 'length' "$pagef")"; }; then
+      rm -f "$accf" "$accf.n" "$pagef" "$pagef.k"; log "re-check: cannot merge PR #$pr comments; next tick"; return 0
+    fi
     if (( n < 100 )) || (( page >= 30 )); then break; fi
     page=$((page + 1))
   done
-  if (( n >= 100 && page >= 30 )) && [[ "$(jq length <<<"$chunk")" -ge 100 ]]; then log "re-check: more than 3000 new comments on PR #$pr; only the first 3000 were read"; fi
-  max="$(jq -r 'max_by(.id) // {id: 0, at: ""} | "\(.id) \(.at)"' <<<"$acc")"
+  if (( n >= 100 && page >= 30 )); then log "re-check: more than 3000 new comments on PR #$pr; only the first 3000 were read"; fi
+  acc="$(cat "$accf")" || acc=""
+  rm -f "$accf" "$pagef"
+  [[ -n "$acc" ]] || return 0
+  max="$(jq -r 'max_by(.id) // {id: 0, at: ""} | "\(.id) \(.at)"' <<<"$acc")" || return 0
   [[ "$max" =~ ^[0-9]+\ ([0-9TZ:-]{20})?$ ]] || return 0
   if [[ ! -s "$ST/recheck.last-id" ]]; then
     [[ $DRY -eq 1 ]] && { log "re-check: WOULD record the comment baseline on PR #$pr"; return 0; }
@@ -406,7 +419,7 @@ scan_requests() {  # sets recheck.requested when an allowed /recheck is new; nev
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     if allowed_author "$login"; then hit="$id"
     else log "re-check: ignored /recheck from a login that is not allowed ($(tr -cd 'A-Za-z0-9[]-' <<<"$login" | head -c 40))"; fi
-  done < <(jq -r --argjson l "$last" '.[] | select(.id > $l and ((.body // "") | gsub("^\\s+|\\s+$"; "")) == "/recheck")
+  done < <(jq -r --argjson l "$last" '.[] | select(.id > $l and .recheck == true)
              | [.id, (.login // ""), "x"] | @tsv' <<<"$acc")
   [[ $DRY -eq 1 ]] && { [[ -n "$hit" ]] && log "re-check: WOULD act on the /recheck request on PR #$pr"; return 0; }
   [[ -n "$hit" ]] && { echo "$pr $hit" > "$ST/recheck.requested"; log "re-check requested on PR #$pr"; }
