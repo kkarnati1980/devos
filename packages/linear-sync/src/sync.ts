@@ -173,6 +173,8 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   for (const d of plan.dependencies) {
     const a = modIssue.get(d.moduleId), b = modIssue.get(d.dependsOnId);
     if (!a || !b) continue;
+    // A stuck issue (a refused move) is left alone entirely: no relation writes to or from it (Codex PR64-r1).
+    if (stuck.has(a) || stuck.has(b)) continue;
     const cur = byId.get(a);
     if (cur && cur.blockedBy.includes(b)) continue;
     await api.addBlockedBy(a, b); r.writes++; r.created.push("relation");

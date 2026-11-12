@@ -208,6 +208,26 @@ test("DEVOS-132 pre-review: a move Linear refuses is logged and skipped; the res
   await assert.rejects(syncProject(plan, L.api, store), /socket hang up/);
 });
 
+test("Codex PR64-r1: a stuck module gets no relation writes either way; an unchanged plan makes no writes for it", async () => {
+  const { LinearError } = await import("../dist/index.js");
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  assert.ok(plan.dependencies.length > 0, "the plan has a dependency");
+  await syncProject(plan, L.api, store);
+  const update = L.api.updateIssue;
+  for (const which of ["moduleId", "dependsOnId"]) {
+    const modId = plan.dependencies[0][which];
+    const mod = L.issues.find((x) => x.id === plan.modules.find((m) => m.id === modId).linearIssue);
+    const home = mod.projectId;
+    mod.projectId = null;
+    L.api.updateIssue = async (id, patch) => { if (id === mod.id && "projectId" in patch) throw new LinearError("graphql", "Linear refused issueUpdate"); return update(id, patch); };
+    L.writes.length = 0;
+    await syncProject(plan, L.api, store);
+    await syncProject(plan, L.api, store);
+    assert.equal(L.writes.filter((w) => w.op === "addBlockedBy" || w.op === "createIssue").length, 0, `${which}: no relation or create writes`);
+    mod.projectId = home; L.api.updateIssue = update;
+  }
+});
+
 test("DEVOS-132: the issues query stays under Linear's complexity limit", async () => {
   const { ISSUES_QUERY_COST, LINEAR_MAX_COMPLEXITY, ISSUE_PAGE } = await import("../dist/index.js");
   assert.ok(ISSUES_QUERY_COST <= LINEAR_MAX_COMPLEXITY, `${ISSUES_QUERY_COST} > ${LINEAR_MAX_COMPLEXITY}`);
