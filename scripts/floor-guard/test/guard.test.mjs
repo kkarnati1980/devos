@@ -69,6 +69,8 @@ const VIOLATIONS = [
   ["ci-continue-on-error (quoted key)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, '    "continue-on-error": true\n') }],
   ["ci-continue-on-error (quoted ${{ true }})", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    continue-on-error: '${{ true }}'\n") }],
   ["timeout-past-ceiling (quoted timeout-minutes key)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, '    "timeout-minutes": 90\n') }],
+  ["ci-disabled (folded block scalar if: >- ${{ false }})", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: >-\n      ${{ false }}\n") }],
+  ["ci-disabled (block scalar value changed to false)", { [WF]: wf(STEPS, "    if: |\n      ${{ true }}\n") }, { [WF]: wf(STEPS, "    if: |\n      ${{ false }}\n") }],
   ["ci-disabled (quoted if key)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, '    "if": false\n') }],
   ["test-skipped (CI condition added above an existing return)", { [T]: testSrc("if (result === null) {\nreturn;\n}\nexpect(1).toBe(1);") }, { [T]: testSrc("if (process.env.CI) {\nreturn;\n}\nexpect(1).toBe(1);") }],
   ["ci-disabled (step if: \"false\")", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: \"false\"\n")) }],

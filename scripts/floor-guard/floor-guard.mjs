@@ -208,6 +208,27 @@ function unquoteKey(text) {
   return text.replace(/(^|[\s{,\[-])(["'])([\w.-]+)\2(\s*:)/g, "$1$3$4");
 }
 
+/**
+ * Maps every line (1-based) of a YAML block scalar (`key: >-`, `key: |`, with indicators) to one logical line,
+ * `key: <value lines joined by spaces>`, with key quotes removed (PR70-r20).
+ */
+function blockScalars(text) {
+  const lines = text.split("\n"), out = new Map();
+  const ind = (l) => l.length - l.trimStart().length;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(\s*(?:-\s*)?[\w.-]+\s*:)\s*[|>][+-]?\d*\s*(?:#.*)?$/.exec(unquoteKey(lines[i]));
+    if (!m) continue;
+    const base = ind(lines[i]) + (/^\s*-\s/.test(lines[i]) ? 2 : 0);
+    let j = i + 1;
+    const parts = [];
+    while (j < lines.length && (!lines[j].trim() || ind(lines[j]) > base)) { if (lines[j].trim()) parts.push(lines[j].trim()); j++; }
+    const b = { start: i + 1, text: `${m[1]} ${parts.join(" ")}` };
+    for (let k = i; k < j; k++) out.set(k + 1, b);
+    i = j - 1;
+  }
+  return out;
+}
+
 /** True when an `if:` value is constant-false, quoted or not, bare or in ${{ }} (PR70-r12, PR70-r13). */
 function constFalseIf(text) {
   const m = /^\s*(?:-\s*)?if\s*:\s*(.*?)\s*(?:#.*)?$/.exec(text);
@@ -284,6 +305,18 @@ export function analyse(files, show) {
     // workflows: a quoted key (`"timeout-minutes":`, `'if':`) is the same YAML key, so every workflow rule reads
     // the changed lines with key quotes removed (PR70-r18, PR70-r19)
     if (WORKFLOW.test(p)) for (const side of ["added", "removed"]) f[side] = f[side].map((l) => ({ ...l, text: unquoteKey(l.text) }));
+    // a block scalar (`if: >-` / `if: |` with the value on the lines below) is read as one logical line, from the
+    // head copy, whether the key line or a value line changed (PR70-r20)
+    if (WORKFLOW.test(p) && f.added.length && f.status !== "D") {
+      const logical = blockScalars(show("head", p) ?? "");
+      const seen = new Set();
+      f.added = f.added.map((l) => {
+        const b = logical.get(l.ln);
+        if (!b || seen.has(b.start)) return b ? { ...l, text: "" } : l;
+        seen.add(b.start);
+        return { ...l, text: b.text };
+      });
+    }
     if (isGuard(p) || isGuard(f.oldPath)) continue;
     const test = isTest(p), oldTest = isTest(f.oldPath);
     const code = CODE.test(p) || p.endsWith(".gitleaksignore");
