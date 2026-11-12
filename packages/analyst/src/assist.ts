@@ -6,7 +6,8 @@ import { DEFAULT_ID_PREFIXES, extractRequirementIds, type Block } from "@devos/i
 import { MILESTONE_HEADING, type Analysis, type OpenQuestion, type Requirement } from "./analyze.js";
 
 /** One model call. M2.2-d wires this to the M1.5 run engine; tests pass a fake. */
-export type ModelRunner = (request: { prompt: string; tag: "analyst_assist" }) => Promise<{ output: string }>;
+/** `projectId` is set by the pipeline, so a run-backed runner can record the run against the project (M2.2-d3b1). */
+export type ModelRunner = (request: { prompt: string; tag: "analyst_assist"; projectId?: string }) => Promise<{ output: string }>;
 
 export type AssistWarningCode =
   | "model-skipped"
