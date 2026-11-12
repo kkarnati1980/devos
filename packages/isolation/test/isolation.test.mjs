@@ -282,3 +282,16 @@ test("S4-a1 pre-review: a YAML merge key at any depth is refused (labels, enviro
   ];
   for (const d of docs) assert.throws(() => hardenCompose(d, "live", net), code("compose_unsafe"), JSON.stringify(d).slice(0, 80));
 });
+
+test("S4-a1 PR69-r1: a service without limits gets its default clamped to the per-service caps", () => {
+  const caps = { cpus: 0.5, memBytes: 128 * 1024 * 1024, pids: 64 };
+  for (const env of ["live", "preview"]) {
+    const n = stackNetwork("shop", env, 3);
+    const out = hardenCompose({ services: { app: { image: "a" }, web: { image: "b" } } }, env, n, { ...DEFAULT_LIMITS, caps });
+    for (const svc of Object.values(out.services)) {
+      assert.ok(svc.cpus > 0 && svc.cpus <= caps.cpus, `${env} cpus ${svc.cpus}`);
+      assert.ok(svc.pids_limit > 0 && svc.pids_limit <= caps.pids, `${env} pids ${svc.pids_limit}`);
+      assert.ok(svc.mem_limit > 0 && svc.mem_limit <= caps.memBytes, `${env} memory ${svc.mem_limit}`);
+    }
+  }
+});

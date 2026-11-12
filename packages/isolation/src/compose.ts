@@ -217,13 +217,14 @@ function askedLimits(name: string, s: Obj, cap: Limits): Asked {
  * per-env default, lowered to an even share of what the explicit limits leave of the stack budget, so an
  * ordinary app + db + cache stack fits without hand-tuning. Over budget → limits_over_budget.
  */
-function fillLimits(asked: Map<string, Asked>, d: Limits, budget: Limits, env: StackEnv): Map<string, Limits> {
+function fillLimits(asked: Map<string, Asked>, d: Limits, caps: Limits, budget: Limits, env: StackEnv): Map<string, Limits> {
   const out = new Map<string, Limits>(); for (const k of asked.keys()) out.set(k, { cpus: 0, memBytes: 0, pids: 0 });
   for (const dim of ["cpus", "memBytes", "pids"] as const) {
     let explicit = 0, unset = 0;
     for (const a of asked.values()) { if (a[dim] === undefined) unset++; else explicit += a[dim]!; }
     const left = budget[dim] - explicit;
-    let share = unset ? Math.min(d[dim], left / unset) : 0;
+    // Codex PR69-r1: a default is clamped to the per-service cap too, like an explicit limit (decision 3).
+    let share = unset ? Math.min(d[dim], caps[dim], left / unset) : 0;
     if (dim !== "cpus") share = Math.floor(share); else share = Math.floor(share * 100) / 100;
     if (left < -1e-9 || (unset && share < MIN_LIMITS[dim])) {
       throw new IsolationError("limits_over_budget", `the stack's services together ask for more ${dim === "memBytes" ? "memory" : dim} than its ${env} budget`);
@@ -277,7 +278,7 @@ export function hardenCompose(input: unknown, env: StackEnv, net: StackNetwork, 
     // `ports` entry could bind any host port or interface, so it is dropped, not refused (S4-a decision 4).
     delete s.ports;
   }
-  for (const [name, l] of fillLimits(asked, d, settings.stack[env], env)) {
+  for (const [name, l] of fillLimits(asked, d, settings.caps, settings.stack[env], env)) {
     const s = services[name] as Obj;
     s.cpus = l.cpus; s.mem_limit = l.memBytes; s.memswap_limit = l.memBytes;   // no swap beyond the memory limit
     s.pids_limit = l.pids;
