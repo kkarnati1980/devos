@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { evaluate, expectedChecks, expectedFromWorkflow, expectedUnion, GateError, listRuns, waitForChecks } from "../ci/ci-gate.mjs";
 
-const run = (id, name, status, conclusion) => ({ id, name, status, conclusion });
+const run = (id, name, status, conclusion, suite = `s-${name}`) => ({ id, name, status, conclusion, suite });
 const wf = (pr, jobs = { a: { "runs-on": "x" } }) => ({ on: { pull_request: pr }, jobs });
 
 test("AT1: every expected check succeeded passes; any failure, cancel, timeout or skip fails at once", () => {
@@ -93,13 +93,15 @@ test("CLI: missing inputs or a bad workflow exit 2, never 0", () => {
   assert.equal(exit({ GITHUB_REPOSITORY: "o/r", GATE_SHA: "a".repeat(40), GATE_BASE: "main", GITHUB_TOKEN: "t", GATE_WORKFLOWS_DIR: join(dir, "wf") }), 2);
 });
 
-test("AT7: a PR that deletes or narrows a workflow still has to pass main's checks (base ∪ head)", () => {
+test("AT7: a PR that deletes or narrows a check main runs fails at once; added checks are expected", () => {
   const base = mkdtempSync(join(tmpdir(), "ci-gate-base-"));
   const head = mkdtempSync(join(tmpdir(), "ci-gate-head-"));
   writeFileSync(join(base, "sec.yml"), "on: pull_request\njobs:\n  secret-scan:\n    runs-on: x\n");
   writeFileSync(join(base, "ci.yml"), "on: pull_request\njobs:\n  build:\n    runs-on: x\n");
   writeFileSync(join(head, "ci.yml"), "on: pull_request\njobs:\n  build:\n    runs-on: x\n  extra:\n    runs-on: x\n");
   writeFileSync(join(head, "sec.yml"), "on:\n  pull_request:\n    branches: [release]\njobs:\n  secret-scan:\n    runs-on: x\n");
+  assert.throws(() => expectedUnion(base, head, "main"), /removes or narrows checks main runs: secret-scan/);
+  writeFileSync(join(head, "sec.yml"), "on: pull_request\njobs:\n  secret-scan:\n    runs-on: x\n");
   assert.deepEqual(expectedUnion(base, head, "main"), ["build", "extra", "secret-scan"]);
   assert.throws(() => expectedUnion(join(base, "missing"), head, "main"), GateError);
 });
@@ -138,4 +140,14 @@ test("AT9: run through a symlinked path with a space, the CLI still runs main() 
     status = e.status;
   }
   assert.equal(status, 2);
+});
+
+test("AT10: a same-named run from another workflow run (check suite) never stands in for the real check", () => {
+  const real = run(5, "secret-scan", "completed", "failure", "suite-security");
+  const fake = run(9, "secret-scan", "completed", "success", "suite-push");
+  const v = evaluate(["secret-scan"], [real, fake]);
+  assert.equal(v.state, "failure");
+  assert.deepEqual(v.failed, ["secret-scan=reported-by-more-than-one-workflow-run"]);
+  // A re-run inside the same workflow run keeps its suite and is fine.
+  assert.equal(evaluate(["secret-scan"], [real, run(9, "secret-scan", "completed", "success", "suite-security")]).state, "success");
 });

@@ -72,8 +72,10 @@ export function expectedUnion(baseDir, headDir, base) {
   const head = expectedChecks(headDir, base);
   if (!baseDir) return head;
   if (!existsSync(baseDir)) throw new GateError("the base commit's workflow directory is missing");
-  const fromBase = expectedChecks(baseDir, base);
-  return [...head, ...fromBase.filter((n) => !head.includes(n))];
+  const dropped = expectedChecks(baseDir, base).filter((n) => !head.includes(n));
+  // Fail at once rather than wait out the deadline: removing a check main runs needs its own approved change (G5).
+  if (dropped.length) throw new GateError(`the PR removes or narrows checks main runs: ${dropped.join(", ")}`);
+  return head;
 }
 
 /** Every check-run name the workflows in `dir` produce for a PR into `base` (the gate's own file excluded). */
@@ -93,7 +95,10 @@ export function expectedChecks(dir, base) {
  */
 export function evaluate(expected, runs) {
   const newest = new Map();
+  const suites = new Map(); // name → check suites it appeared in; a re-run stays in its suite
   for (const r of runs) {
+    if (!suites.has(r.name)) suites.set(r.name, new Set());
+    suites.get(r.name).add(String(r.suite));
     const prev = newest.get(r.name);
     if (!prev || Number(r.id) > Number(prev.id)) newest.set(r.name, r);
   }
@@ -101,7 +106,9 @@ export function evaluate(expected, runs) {
   const pending = [];
   for (const name of expected) {
     const r = newest.get(name);
-    if (!r || r.status !== "completed") pending.push(name);
+    // Another workflow (e.g. a push-triggered job with the same name) must not stand in for the real check.
+    if ((suites.get(name)?.size ?? 0) > 1) failed.push(`${name}=reported-by-more-than-one-workflow-run`);
+    else if (!r || r.status !== "completed") pending.push(name);
     else if (r.conclusion !== "success") failed.push(`${name}=${r.conclusion}`);
   }
   if (failed.length) return { state: "failure", failed, pending };
@@ -138,7 +145,7 @@ export async function listRuns(api, repo, sha, token, fetchImpl, pause = (ms) =>
     const body = await readPage(`${api}/repos/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`, token, fetchImpl, pause);
     if (!Array.isArray(body?.check_runs) || typeof body.total_count !== "number") throw new GateError("check-runs read returned an unexpected body");
     for (const c of body.check_runs) {
-      if (c.app?.slug === ACTIONS_APP_SLUG) runs.push({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion });
+      if (c.app?.slug === ACTIONS_APP_SLUG) runs.push({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion, suite: c.check_suite?.id ?? null });
     }
     if (page * 100 >= body.total_count || body.check_runs.length < 100) return runs;
   }
