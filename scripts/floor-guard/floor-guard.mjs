@@ -228,13 +228,16 @@ export function analyse(files, show) {
       // boolean coverage switches: perFile / all / enabled turned off or removed
       const on = /\b(perFile|all|enabled|reportOnFailure)\b["']?\s*[:=]\s*true\b/g;
       const onKeys = (ls) => ls.flatMap((l) => [...l.text.matchAll(on)].map((m) => [l, m])); // every switch on a line (PR70-r3)
-      const addedOn = new Set(onKeys(f.added).map(([, m]) => m[1]));
+      // count each switch as a multiset, so one of two `enabled: true` turned off is still a loss (PR70-r4)
+      const addedOn = onKeys(f.added).reduce((c, [, m]) => c.set(m[1], (c.get(m[1]) ?? 0) + 1), new Map());
       if (/coverage|c8rc|nycrc/i.test(p) || f.removed.concat(f.added).some((l) => /coverage/.test(l.text)) || TEST_CONFIG.test(p))
-        for (const [l, m] of onKeys(f.removed)) if (!addedOn.has(m[1])) hit("coverage-lowered", p, l.ln, `${m[1]} no longer true: ${l.text}`);
+        for (const [l, m] of onKeys(f.removed)) { const left = addedOn.get(m[1]) ?? 0; if (left > 0) addedOn.set(m[1], left - 1); else hit("coverage-lowered", p, l.ln, `${m[1]} no longer true: ${l.text}`); }
       for (const a of f.added) if (/\b(exclude|testPathIgnorePatterns|testIgnore|modulePathIgnorePatterns|coveragePathIgnorePatterns)\b["']?\s*[:=]/.test(a.text) && !WORKFLOW.test(p)) hit("tests-excluded", p, a.ln, a.text);
       const retry = /(?<![\w-])(retries|retry|maxRetries)["']?\s*[:=\s]\s*(\d+)/g;
       const rw = numbers(f.removed, retry), rn = numbers(f.added, retry);
-      for (const n of rn) { const o = rw.find((w) => w.key === n.key); if ((o && n.v > o.v) || (!o && n.v > 0 && !WORKFLOW.test(p))) hit("retries-raised", p, n.l.ln, n.l.text); }
+      // pair the k-th new occurrence of a key with its k-th old one, as for coverage (PR70-r4)
+      const rwk = byKey(rw), seen = {};
+      for (const n of rn) { const k = (seen[n.key] = (seen[n.key] ?? -1) + 1); const o = rwk[n.key]?.[k]; if ((o && n.v > o.v) || (!o && n.v > 0 && !WORKFLOW.test(p))) hit("retries-raised", p, n.l.ln, n.l.text); }
       const mw = /--max-warnings[=\s]+(-?\d+)/;
       const val = (m) => (+m[1] < 0 ? Infinity : +m[1]);
       const mwOld = f.removed.map((l) => mw.exec(l.text)).filter(Boolean), mwNew = f.added.map((l) => [l, mw.exec(l.text)]).filter(([, m]) => m);
