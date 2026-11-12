@@ -68,6 +68,36 @@ const VIOLATIONS = [
   ["stub-body", { "packages/x/src/a.ts": "export function f(x: number) {\n  const y = x * 2;\n  if (y > 10) return y - 1;\n  return y + 1;\n}\n" }, { "packages/x/src/a.ts": "export function f(x: number) {\n  return 0;\n}\n" }],
   ["contract-weakened", { "docs/modules/M9.md": "# M9\n## Acceptance tests\n| # | Pass when |\n|---|---|\n| AT1 | parses 10 rows |\n| AT2 | rejects bad input |\n" }, { "docs/modules/M9.md": "# M9\n## Acceptance tests\n| # | Pass when |\n|---|---|\n| AT1 | parses rows |\n" }],
   ["contract-weakened (pass rule)", { "docs/modules/M9.md": "# M9\n## Pass rule\n- `pnpm --filter x test` exits 0\n" }, { "docs/modules/M9.md": "# M9\n## Pass rule\n- works as expected\n" }],
+  ["test-skipped (fit)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'fit("a"') }],
+  ["test-skipped (fdescribe)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);") + 'fdescribe("d", () => {});\n' }],
+  ["test-skipped (xtest)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);") + 'xtest("d", () => {});\n' }],
+  ["test-skipped (runIf)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.runIf(process.env.DB)("a"') }],
+  ["test-skipped (test.fixme)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);") + 'test.fixme("d", () => {});\n' }],
+  ["test-skipped (todo option)", { "scripts/test/b.test.mjs": 'test("a", () => { assert.ok(1); });\n' }, { "scripts/test/b.test.mjs": 'test("a", { todo: "later" }, () => { assert.ok(1); });\n' }],
+  ["test-skipped (skip option on its own line)", { "scripts/test/b.test.mjs": 'test("a", () => { assert.ok(1); });\n' }, { "scripts/test/b.test.mjs": 'test(\n  "a",\n  {\n    skip: !process.env.DB,\n  },\n  () => { assert.ok(1); },\n);\n' }],
+  ["test-skipped (two-line early return)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("if (!process.env.DB) {\n  return;\n}\nexpect(1).toBe(1);") }],
+  ["test-file-deleted (renamed to a non-test path)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: null, "packages/x/src/old-a.ts": testSrc("expect(1).toBe(1);") }],
+  ["trivial-assertion", { [T]: testSrc("expect(f()).toBe(3);") }, { [T]: testSrc("expect(true).toBe(true);") }],
+  ["suppression-added (c8 ignore)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "/* c8 ignore next */\nexport const a = 1;\n" }],
+  ["failure-swallowed (|| exit 0)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm lint", "run: pnpm lint || exit 0")) }],
+  ["failure-swallowed (|| :)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm lint", "run: pnpm lint || :")) }],
+  ["max-warnings-raised (removed)", { "packages/x/package.json": '{ "scripts": {\n  "lint": "eslint . --max-warnings 0"\n} }\n' }, { "packages/x/package.json": '{ "scripts": {\n  "lint": "eslint ."\n} }\n' }],
+  ["max-warnings-raised (-1 = unlimited)", { "packages/x/package.json": '{ "scripts": { "lint": "eslint . --max-warnings 0" } }\n' }, { "packages/x/package.json": '{ "scripts": { "lint": "eslint . --max-warnings -1" } }\n' }],
+  ["retries-raised (new non-zero)", { "apps/d/playwright.config.ts": "export default { use: {} };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 2, use: {} };\n" }],
+  ["timeout-past-ceiling (hookTimeout)", { "packages/x/vitest.config.ts": "export default { test: {} };\n" }, { "packages/x/vitest.config.ts": "export default { test: { hookTimeout: 300000 } };\n" }],
+  ["coverage-lowered (thresholds removed)", { "packages/x/vitest.config.ts": "export default { test: { coverage: {\n  thresholds: { lines: 90 },\n} } };\n" }, { "packages/x/vitest.config.ts": "export default { test: { coverage: {\n} } };\n" }],
+  ["tests-excluded", { "packages/x/vitest.config.ts": "export default { test: {} };\n" }, { "packages/x/vitest.config.ts": "export default { test: { exclude: ['test/slow/**'] } };\n" }],
+  ["test-script-changed", { "packages/x/package.json": '{ "scripts": {\n  "test": "vitest run"\n} }\n' }, { "packages/x/package.json": '{ "scripts": {\n  "test": "echo ok"\n} }\n' }],
+  ["lint-rule-off", { "packages/x/eslint.config.mjs": "export default [{ rules: {} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  \"no-unused-vars\": \"off\",\n} }];\n" }],
+  ["ci-step-changed", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm test", "run: echo ok")) }],
+  ["ci-trigger-narrowed (paths filter)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    paths: ['docs/**']\n") }],
+  ["ci-trigger-narrowed (branches)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [nope]\n") }],
+  ["gitattributes-changed", { "packages/x/src/a.ts": "export const a = 1;\n" }, { ".gitattributes": "*.ts binary\n", "packages/x/src/a.ts": "export const a = 2;\n" }],
+  ["contract-weakened (Green section)", { "docs/modules/M9.md": "# M9\n## Green\n- GC1: x exits 1\n" }, { "docs/modules/M9.md": "# M9\n## Green\n- GC1: x runs\n" }],
+  ["contract-weakened (moved out of docs/modules)", { "docs/modules/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n" }, { "docs/modules/M9.md": null, "docs/old/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n" }],
+  ["contract-weakened (line starting with --)", { "docs/modules/M9.md": "# M9\n## Acceptance tests\n-- AT1 must parse\n" }, { "docs/modules/M9.md": "# M9\n## Acceptance tests\n" }],
+  ["policy-weakened (rules file)", { "packages/policy/rules/base.json": '{ "id": "r1", "effect": "require_approval" }\n' }, { "packages/policy/rules/base.json": "\n" }],
+  ["policy-weakened (file deleted)", { "packages/policy/src/evaluator.ts": "export const x = 1;\n" }, { "packages/policy/src/evaluator.ts": null }],
   ["policy-weakened", { "packages/policy/src/evaluator.ts": "const deny = matched.find((r) => r.effect === \"deny\");\nconst outcome = deny ? \"deny\" : \"allow\";\n" }, { "packages/policy/src/evaluator.ts": "const outcome = \"allow\";\n" }],
 ];
 
@@ -138,6 +168,18 @@ test("workflowShape reads jobs, step identities and triggers", () => {
   const s = workflowShape(wf(STEPS));
   assert.deepEqual(s.jobs, { build: ["uses:actions/checkout@v4", "name:Lint", "name:Test"] });
   assert.ok(s.on.includes("pull_request") && s.on.includes("push"));
+});
+
+test("binary attribute cannot hide a skip: .gitattributes in the head is ignored for the diff and is itself a hit", () => {
+  const r = check({ [T]: testSrc("expect(1).toBe(1);") }, { ".gitattributes": "*.ts binary\n", [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
+  assert.ok(rules(r).includes("test-skipped") && rules(r).includes("gitattributes-changed"), String(rules(r)));
+});
+
+test("CLI: run through a symlinked path still exits 2 on an unknown ref (never a silent 0)", () => {
+  const dir = repo({}, {});
+  const link = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "devos-fg link ")), "guard.mjs");
+  fs.symlinkSync(GUARD, link);
+  assert.equal(spawnSync(process.execPath, [link, "--base", "main", "--head", "nope"], { cwd: dir }).status, 2);
 });
 
 test("CLI: exit codes, HIT lines and the JSON report", () => {

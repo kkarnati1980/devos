@@ -15,6 +15,7 @@ KK's gate-integrity spec (12 Nov 2026) §4 asks for a deterministic CI job that 
 6. Two rules were narrowed after a dry run over the last 15 merged PRs (see the contract): shell `|| true` counts only on test/check lines, and an early `return` in a test only behind an env/platform/CI/skip condition. Neither narrowing removes a §4.2 pattern.
 
 ## Consequences
-- PRs that add a suppression or reword an acceptance row now fail `floor-guard` until restored or kept by Codex. The dry run suggests about one PR in five.
+- PRs that add a suppression, reword an acceptance row or change a CI step now fail `floor-guard` until restored or kept by Codex. The dry run suggests about one PR in four.
+- A PR can edit `floor-guard.yml` itself, and GitHub runs the PR's copy; until GI-1b makes the Release path refuse unnamed guard changes, Codex review is the only check on that.
 - The CI throughput work (DEVOS-139) restructures workflows; renamed or moved steps show as `ci-step-removed` and need a Codex Keep in that PR.
 - The guard is a detector. Blocking the merge in code is Part 3 (DEVOS-143) and the ruleset (DEVOS-145).

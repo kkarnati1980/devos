@@ -6,6 +6,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 export const CEILINGS = Object.freeze({ ciTimeoutMinutes: 30, testTimeoutMs: 120000 });
 
@@ -19,15 +20,18 @@ const TEST_FILE = /(^|\/)(test|tests|__tests__|test-db|e2e)\/.*\.(m?[jt]sx?|c[jt
 const WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const TEST_CONFIG = /(^|\/)(vitest|jest|playwright|vite)\.config\.[cm]?[jt]s$|(^|\/)\.(c8rc|nycrc)(\.json)?$|(^|\/)package\.json$/;
 const SHELL = /\.(sh|bash)$/;
+const LINT_CONFIG = /(^|\/)(eslint\.config\.[cm]?[jt]s|\.eslintrc(\.[\w]+)?)$/;
 
 const RX = {
   skip: [
     /\.(skip|only|todo)\s*\(/, /\b(xit|xdescribe|xtest|fit|fdescribe)\s*\(/, /\b(skipIf|runIf)\s*\(/,
-    /[{,]\s*(skip|todo|only)\s*:\s*[^,}\s]/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
+    /\.fixme\s*\(/, /(^|[{,])\s*(skip|todo|only)\s*:\s*[^,}\s]/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
   ],
   assert: /\bexpect(\.\w+)?\s*\(|\bassert(\.\w+)*\s*\(/g,
   suppress: /eslint-disable|@ts-ignore|@ts-expect-error|@ts-nocheck|istanbul ignore|c8 ignore|\bnosec\b|gitleaks:allow/,
-  swallow: /\|\|\s*true\b|\bset\s+\+e\b|\|\|\s*exit\s+0\b/,
+  envIf: /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{\s*$/,
+  trivial: /\bexpect\s*\(\s*(true|false|1|0|null|undefined|""|'')\s*\)|\bassert(\.ok)?\s*\(\s*(true|1)\s*[,)]|\bassert\.equal\s*\(\s*(\d+|true)\s*,\s*\3\s*[,)]/,
+  swallow: /\|\|\s*:(\s|$|;)|\|\|\s*true\b|\bset\s+\+e\b|\|\|\s*exit\s+0\b/,
   testCmd: /\b(test|vitest|jest|playwright|tsc|eslint|lint|typecheck|pnpm|npm|npx|node --test)\b/,
   stub: /\b(TODO|FIXME)\b|not implemented/i,
   constBody: /^\s*(throw\b.*|return\s+(true|false|null|undefined|-?\d+(\.\d+)?|'[^']*'|"[^"]*"|`[^`]*`|\[\]|\{\})\s*;?)\s*$/,
@@ -50,28 +54,32 @@ function git(cwd, args) {
 /** Parse `git diff --unified=0` output into files with status, removed and added lines (with line numbers). */
 export function parseDiff(text) {
   const files = [];
-  let f = null, oldLn = 0, newLn = 0;
+  let f = null, oldLn = 0, newLn = 0, inHeader = false;
   for (const line of text.split("\n")) {
     if (line.startsWith("diff --git ")) {
       const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
       if (!m) throw new GuardError(`unreadable diff header: ${line.slice(0, 120)}`);
       f = { oldPath: m[1], path: m[2], status: "M", removed: [], added: [], hunks: [] };
-      files.push(f);
+      files.push(f); inHeader = true;
     } else if (!f) {
       if (line.trim()) throw new GuardError(`unreadable diff: text before the first file header`);
-    } else if (line.startsWith("new file mode")) f.status = "A";
-    else if (line.startsWith("deleted file mode")) f.status = "D";
-    else if (line.startsWith("rename to ")) f.status = "R";
-    else if (line.startsWith("Binary files ")) f.binary = true;
+    } else if (inHeader && line.startsWith("new file mode")) f.status = "A";
+    else if (inHeader && line.startsWith("deleted file mode")) f.status = "D";
+    else if (inHeader && line.startsWith("rename to ")) f.status = "R";
+    else if (inHeader && (line.startsWith("Binary files ") || line.startsWith("GIT binary patch"))) f.binary = true;
+    else if (inHeader && /^(--- |\+\+\+ |index |similarity |dissimilarity |rename from |copy |old mode|new mode)/.test(line)) { /* header */ }
     else if (line.startsWith("@@")) {
+      inHeader = false;
       const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
       if (!m) throw new GuardError(`unreadable hunk header in ${f.path}`);
       oldLn = +m[1]; newLn = +m[2];
       f.hunks.push({ removed: [], added: [] });
-    } else if (line.startsWith("-") && !line.startsWith("--- ")) {
+    } else if (inHeader) {
+      if (line.trim()) throw new GuardError(`unreadable diff header line in ${f.path}: ${line.slice(0, 80)}`);
+    } else if (line.startsWith("-")) {
       const r = { ln: oldLn++, text: line.slice(1) };
       f.removed.push(r); f.hunks.at(-1)?.removed.push(r);
-    } else if (line.startsWith("+") && !line.startsWith("+++ ")) {
+    } else if (line.startsWith("+")) {
       const a = { ln: newLn++, text: line.slice(1) };
       f.added.push(a); f.hunks.at(-1)?.added.push(a);
     }
@@ -88,15 +96,16 @@ export function workflowShape(src) {
   const lines = src.split("\n");
   const indent = (s) => s.length - s.trimStart().length;
   const jobs = {};
-  const on = new Set();
+  const on = new Set(), onLines = [];
   let jobsIndent = -1, jobIndent = -1, job = null, stepsIndent = -1, itemIndent = -1, step = null, onIndent = -1;
   for (const raw of lines) {
     if (!raw.trim() || raw.trimStart().startsWith("#")) continue;
     const ind = indent(raw), t = raw.trim();
     if (ind === 0) { jobsIndent = t === "jobs:" ? 0 : -1; onIndent = /^(on|"on"|'on'):/.test(t) ? 0 : -1; job = null; stepsIndent = -1;
+      if (onIndent === 0) onLines.push(t);
       const inline = /^(?:on|"on"|'on'):\s*(.+)$/.exec(t); if (inline) inline[1].replace(/[[\]]/g, "").split(",").forEach((x) => x.trim() && on.add(x.trim()));
       continue; }
-    if (onIndent === 0 && ind > 0) { const m = /^-?\s*([\w-]+)\s*:?/.exec(t); if (m && (jobIndent < 0 || ind <= 2)) on.add(m[1]); continue; }
+    if (onIndent === 0 && ind > 0) { onLines.push(t); const m = /^-?\s*([\w-]+)\s*:?/.exec(t); if (m && (jobIndent < 0 || ind <= 2)) on.add(m[1]); continue; }
     if (jobsIndent !== 0) continue;
     if (jobIndent < 0) jobIndent = ind;
     if (ind === jobIndent) { const m = /^([\w-]+)\s*:/.exec(t); job = m ? m[1] : null; if (job) jobs[job] = []; stepsIndent = -1; continue; }
@@ -104,11 +113,16 @@ export function workflowShape(src) {
     if (t === "steps:") { stepsIndent = ind; itemIndent = -1; continue; }
     if (stepsIndent >= 0 && ind <= stepsIndent) stepsIndent = -1;
     if (stepsIndent < 0) continue;
-    if (t.startsWith("- ") && (itemIndent < 0 || ind === itemIndent)) { itemIndent = ind; step = { id: null }; jobs[job].push(step); }
+    if (t.startsWith("- ") && (itemIndent < 0 || ind === itemIndent)) { itemIndent = ind; step = { id: null, body: [] }; jobs[job].push(step); }
+    if (step && !/^-?\s*name\s*:/.test(t)) step.body.push(t.replace(/^-\s+/, ""));
     const m = /^-?\s*(name|uses|run)\s*:\s*(.*)$/.exec(t);
     if (step && m && (step.key !== "name")) { if (m[1] === "name" || !step.id) { step.id = `${m[1]}:${m[2].replace(/^["']|["']$/g, "").trim()}`; step.key = m[1]; } }
   }
-  return { jobs: Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.map((s) => s.id || "?")])), on: [...on] };
+  return {
+    jobs: Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.map((s) => s.id || "?")])),
+    bodies: Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, Object.fromEntries(v.map((s) => [s.id || "?", s.body.join("\n")]))])),
+    on: [...on], onLines,
+  };
 }
 
 function sectionOf(baseLines, ln) {
@@ -137,15 +151,22 @@ export function analyse(files, show) {
 
   for (const f of files) {
     const p = f.path;
-    if (isGuard(p) || isGuard(f.oldPath) || f.binary) continue;
+    if (isGuard(p) || isGuard(f.oldPath)) continue;
     const test = isTest(p), oldTest = isTest(f.oldPath);
     const code = CODE.test(p) || p.endsWith(".gitleaksignore");
 
     if (oldTest && (f.status === "D" || (f.status === "R" && !test))) { hit("test-file-deleted", f.oldPath, 0, `${f.oldPath} deleted`); continue; }
-    if (f.status === "D" && WORKFLOW.test(f.oldPath)) { hit("ci-workflow-deleted", f.oldPath, 0, `${f.oldPath} deleted`); continue; }
+    if (WORKFLOW.test(f.oldPath) && (f.status === "D" || (f.status === "R" && !WORKFLOW.test(p)))) { hit("ci-workflow-deleted", f.oldPath, 0, `${f.oldPath} deleted`); continue; }
+    if (/^docs\/modules\/[^/]+\.md$/.test(f.oldPath) && (f.status === "D" || (f.status === "R" && f.oldPath !== p))) hit("contract-weakened", f.oldPath, 0, `${f.oldPath} ${f.status === "D" ? "deleted" : "moved to " + p}`);
+    if (/(^|\/)\.gitattributes$/.test(p) || /(^|\/)\.gitattributes$/.test(f.oldPath)) { hit("gitattributes-changed", p, 0, "a .gitattributes change can hide diffs from the guard"); continue; }
+    if (f.binary) { if (code || test || oldTest || /^packages\/policy\//.test(p)) hit("binary-code-change", p, 0, `${p} changed as binary`); continue; }
 
     if (test) {
-      for (const a of f.added) if (RX.skip.some((r) => r.test(a.text))) hit("test-skipped", p, a.ln, a.text);
+      f.added.forEach((a, i) => {
+        if (RX.skip.some((r) => r.test(a.text))) hit("test-skipped", p, a.ln, a.text);
+        else if (RX.envIf.test(a.text) && /^\s*return\b/.test(f.added[i + 1]?.text ?? "") && f.added[i + 1].ln === a.ln + 1) hit("test-skipped", p, a.ln, a.text);
+        if (RX.trivial.test(a.text)) hit("trivial-assertion", p, a.ln, a.text);
+      });
       const count = (ls) => ls.reduce((n, l) => n + [...l.text.matchAll(RX.assert)].length, 0);
       const lost = count(f.removed) - count(f.added);
       if (lost > 0) hit("assertions-lost", p, 0, `net ${lost} expect/assert call(s) removed`);
@@ -163,14 +184,21 @@ export function analyse(files, show) {
         if (/continue-on-error\s*:\s*(true|\$\{\{)/.test(a.text)) hit("ci-continue-on-error", p, a.ln, a.text);
         if (/^\s*(-\s*)?if\s*:\s*(false|\$\{\{\s*false\s*\}\})\s*$/.test(a.text)) hit("ci-disabled", p, a.ln, a.text);
       }
-      const before = show("base", f.oldPath), after = show("head", p);
-      if (before != null && after != null) {
+      const before = f.status === "A" ? null : show("base", f.oldPath), after = show("head", p);
+      if (after == null || (before == null && f.status !== "A")) throw new GuardError(`cannot read workflow ${p} at base/head`);
+      if (before != null) {
         const b = workflowShape(before), h = workflowShape(after);
         for (const [job, steps] of Object.entries(b.jobs)) {
           if (!(job in h.jobs)) { hit("ci-job-removed", p, 0, `job ${job} removed`); continue; }
-          for (const s of steps) if (!h.jobs[job].includes(s)) hit("ci-step-removed", p, 0, `job ${job}: step ${s} removed`);
+          for (const s of steps) {
+            if (!h.jobs[job].includes(s)) hit("ci-step-removed", p, 0, `job ${job}: step ${s} removed`);
+            else if (b.bodies[job][s] !== h.bodies[job][s]) hit("ci-step-changed", p, 0, `job ${job}: step ${s} changed`);
+          }
         }
         for (const t of b.on) if (!h.on.includes(t)) hit("ci-trigger-removed", p, 0, `trigger ${t} removed`);
+        const left = [...h.onLines];
+        for (const l of b.onLines) { const i = left.indexOf(l); if (i >= 0) left.splice(i, 1); else hit("ci-trigger-narrowed", p, 0, `trigger line "${l}" changed or removed`); }
+        for (const l of h.onLines) if (/^(paths|paths-ignore|branches-ignore|tags-ignore)\s*:/.test(l) && !b.onLines.includes(l)) hit("ci-trigger-narrowed", p, 0, `trigger filter "${l}" added`);
       }
     }
 
@@ -181,14 +209,24 @@ export function analyse(files, show) {
       const cov = /\b(lines|branches|functions|statements|threshold|perFile)\b["']?\s*[:=]\s*(\d+(?:\.\d+)?)/g;
       const was = numbers(f.removed, cov), now = numbers(f.added, cov);
       for (const n of now) { const o = was.find((w) => w.key === n.key); if (o && n.v < o.v) hit("coverage-lowered", p, n.l.ln, n.l.text); }
+      for (const o of was) if (!now.some((n) => n.key === o.key)) hit("coverage-lowered", p, o.l.ln, `removed: ${o.l.text}`);
+      for (const a of f.added) if (/\b(exclude|testPathIgnorePatterns|testIgnore|modulePathIgnorePatterns|coveragePathIgnorePatterns)\b\s*[:=]/.test(a.text) && !WORKFLOW.test(p)) hit("tests-excluded", p, a.ln, a.text);
       const retry = /(?<![\w-])(retries|retry|maxRetries)["']?\s*[:=\s]\s*(\d+)/g;
       const rw = numbers(f.removed, retry), rn = numbers(f.added, retry);
       for (const n of rn) { const o = rw.find((w) => w.key === n.key); if ((o && n.v > o.v) || (!o && n.v > 0 && !WORKFLOW.test(p))) hit("retries-raised", p, n.l.ln, n.l.text); }
-      const mw = /--max-warnings[=\s]+(\d+)/;
+      const mw = /--max-warnings[=\s]+(-?\d+)/;
+      const val = (m) => (+m[1] < 0 ? Infinity : +m[1]);
       const mwOld = f.removed.map((l) => mw.exec(l.text)).filter(Boolean), mwNew = f.added.map((l) => [l, mw.exec(l.text)]).filter(([, m]) => m);
-      for (const [l, m] of mwNew) if (mwOld.some((o) => +m[1] > +o[1])) hit("max-warnings-raised", p, l.ln, l.text);
+      for (const [l, m] of mwNew) if (val(m) === Infinity || mwOld.some((o) => val(m) > val(o))) hit("max-warnings-raised", p, l.ln, l.text);
       if (mwOld.length && !mwNew.length && !f.added.some((l) => l.text.includes("--max-warnings"))) hit("max-warnings-raised", p, 0, "--max-warnings removed");
     }
+
+    if (p.endsWith("package.json")) {
+      const scripts = (ls) => new Map(ls.map((l) => /^\s*"((?:test|lint|typecheck|check)(?::[\w:-]+)?)"\s*:\s*"(.*)"\s*,?\s*$/.exec(l.text)).filter(Boolean).map((m) => [m[1], m[2]]));
+      const was = scripts(f.removed), now = scripts(f.added);
+      for (const [k, v] of was) if (now.get(k) !== v) hit("test-script-changed", p, 0, `script "${k}": "${v}" -> ${now.has(k) ? `"${now.get(k)}"` : "removed"}`);
+    }
+    if (LINT_CONFIG.test(p)) for (const a of f.added) if (/["'][@\w/-]+["']\s*:\s*\[?\s*(["']off["']|0\s*[,\]}]|0\s*$)/.test(a.text) || /\bignores?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
 
     // stubs in non-test source
     if (code && !test && !WORKFLOW.test(p) && !p.endsWith(".json") && !p.startsWith("docs/")) {
@@ -242,7 +280,7 @@ export function run({ cwd = process.cwd(), base, head }) {
     if (!base || !head) throw new GuardError("usage: floor-guard.mjs --base <rev> --head <rev>");
     sha = git(cwd, ["rev-parse", "--verify", `${head}^{commit}`]).trim();
     const mb = git(cwd, ["merge-base", base, sha]).trim();
-    const diff = git(cwd, ["diff", "--no-color", "--no-ext-diff", "--unified=0", "--find-renames", mb, sha]);
+    const diff = git(cwd, ["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0", "--find-renames", mb, sha]);
     const revs = { base: mb, head: sha };
     const show = (rev, p) => { try { return execFileSync("git", ["show", `${revs[rev]}:${p}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 }); } catch { return null; } };
     const hits = analyse(parseDiff(diff), show);
@@ -263,4 +301,5 @@ function main(argv) {
   return report.exit;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exit(main(process.argv.slice(2)));
+const isMain = () => { try { return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1] ?? ""); } catch { return false; } };
+if (isMain()) process.exit(main(process.argv.slice(2)));
