@@ -33,6 +33,10 @@ const NON_TECHNICAL = new RegExp(
       "charge", "charges", "charging", "free", "plan", "plans", "tier", "tiers", "revenue", "refund", "refunds",
       "discount", "discounts", "include", "includes", "exclude", "excludes", "phase", "phases", "feature", "features",
       "client", "clients", "staff", "shift", "shifts", "period", "live",
+      // Buying anything is a money decision, even when it names a technology (PR57-r2).
+      "buy", "buys", "buying", "bought", "purchase", "purchases", "purchased", "purchasing", "procure", "procurement",
+      "rent", "renting", "lease", "leasing", "hire", "hiring", "premium", "paywall", "trial", "quote", "quotes",
+      "commercial", "sponsor", "sponsorship",
       // Data deletion is always KK's (ADR-0013 §6, stop-and-ask), even when it names a database (PR57-r1).
       "delete", "deletes", "deleted", "deleting", "deletion", "remove", "removes", "removal", "erase", "erasure",
       "purge", "purges", "purging", "wipe", "wipes", "wiping", "drop", "drops", "destroy", "destroys", "truncate",

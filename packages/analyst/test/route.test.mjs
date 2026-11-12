@@ -67,6 +67,10 @@ test("RT1 classification: non-technical topics win over technical ones; unclear 
     "Should we delete all database records?",
     "Can we purge the old Postgres backups?",
     "Wipe the cache tables on migration?",
+    // Buying is a money decision even when it names a technology (PR57-r2).
+    "Should we buy managed PostgreSQL hosting?",
+    "Do we purchase a Redis cloud plan or self-host?",
+    "Is a premium API tier worth it?",
   ]) assert.equal(cls(q).class, "non-technical", q);
   // The whole text is classified: a non-technical word after 4,000+ characters still sends it to KK.
   assert.equal(cls("Which database " + "x ".repeat(2500) + "fits the budget?").class, "non-technical");
