@@ -199,6 +199,14 @@ test("A lost project lock stops the run before the create", async () => {
   assert.equal(fake.creates().length, 0);
 });
 
+test("A lock lost during the pending journal write still stops the create (PR44-r3)", async () => {
+  const { fake, steps, store } = setup();
+  const orig = store.markPending.bind(store);
+  store.markPending = async (...a) => { await orig(...a); store.lockLost = true; };
+  await assert.rejects(runProvision(P.id, steps(), { store, authorize: allowAll }), /provision_lock_lost/);
+  assert.equal(fake.creates().length, 0);
+});
+
 test("PrismaStore lock: session lock with lock_timeout, released at the end, and a dead lock connection stops creates", async () => {
   const log = []; let pingFails = false;
   const conn = { query: async (sql, params) => { log.push([sql, params]); if (sql === "SELECT 1" && pingFails) throw new Error("conn gone"); return {}; },

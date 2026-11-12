@@ -166,6 +166,9 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
 
   await store.assertLockHeld(projectId);
   await store.markPending(projectId, spec);
+  // Re-check right before the external create: the lock connection may have dropped during the journal write
+  // (Codex PR44-r3). A pending row with no create is safe: the next run looks the resource up first.
+  await store.assertLockHeld(projectId);
   let created: Found;
   try {
     created = await spec.create();
