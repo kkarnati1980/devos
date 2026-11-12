@@ -71,7 +71,7 @@ function setup() {
   store.addProject({ id: P.id, slug: P.slug, stage: "live" });
   const steps = (p = P) => [githubRepoStep(gh, p, "kkarnati1980"), coolifyProjectStep(cf, p)];
   const ops = [githubRepoOps(gh, P.id), coolifyProjectOps(cf, P.id)];
-  const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store)];
+  const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store), store.vaultScanner()];
   const t0 = Date.UTC(2026, 10, 12, 8, 0, 0);
   const base = { store, ops, now: () => t0 };
   return { fake, gh, cf, store, steps, ops, scanners, base, t0, sleeps };
@@ -389,7 +389,7 @@ test("M2.5-a2 pre-review: a purge built on pinnedGitHub keeps the preflight's to
   const pinned = await pinnedGitHub(gh);
   token = "ghp_TESTONLY_narrowed_token_after_preflight_000";
   const ops = [githubRepoOps(pinned, P.id), coolifyProjectOps(s.cf, P.id)];
-  const scanners = [githubScanner(pinned), coolifyScanner(s.cf), inventoryScanner(s.store)];
+  const scanners = [githubScanner(pinned), coolifyScanner(s.cf), inventoryScanner(s.store), s.store.vaultScanner()];
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 1 }) } });
   const before = s.fake.calls.length;
   const out = await purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners, preflight: [githubTokenScopeCheck(pinned, { owner: "kkarnati1980" })] });
@@ -412,4 +412,62 @@ test("Codex PR55-r1: a token for another GitHub account fails the preflight, eve
   assert.equal(resets, 0, "nothing reset");
   assert.equal(s.fake.deletes().length, 0, "nothing deleted");
   assert.throws(() => githubTokenScopeCheck(s.gh, {}), /github-owner-invalid/);
+});
+
+test("DEVOS-131: purge deletes the project's vault secrets after every resource, and only this project's", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.store.secrets.push({ projectId: P.id, name: "APP_SESSION_SECRET" }, { projectId: P.id, name: "DB_PASSWORD" }, { projectId: "other", name: "DB_PASSWORD" });
+  const order = [];
+  const orig = s.store.deleteProjectSecrets.bind(s.store);
+  s.store.deleteProjectSecrets = async (id) => { order.push(["secrets", s.fake.deletes().length]); return orig(id); };
+  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners });
+  assert.equal(out.secretsDeleted, 2);
+  assert.equal(out.purged, true);
+  assert.deepEqual(s.store.secrets, [{ projectId: "other", name: "DB_PASSWORD" }]);
+  // Every provider delete happened before the secrets went.
+  assert.ok(s.fake.deletes().length >= 2);
+  assert.deepEqual(order, [["secrets", s.fake.deletes().length]]);
+  assert.deepEqual(s.store.audits, [{ projectId: P.id, action: "teardown.secrets_deleted", details: { count: 2, names: ["APP_SESSION_SECRET", "DB_PASSWORD"] } }]);
+});
+
+test("DEVOS-131: a purge that stops on an ownership mismatch keeps the project's secrets", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.store.secrets.push({ projectId: P.id, name: "DB_PASSWORD" });
+  const repo = s.fake.repos.get("kkarnati1980/devos-acme");
+  repo.description = "not ours any more";
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => e.code === "ownership_mismatch");
+  assert.equal(s.store.secrets.length, 1);
+  assert.equal(s.store.audits.length, 0);
+});
+
+test("DEVOS-131: a purge that stops after a provider delete (crash before the row update) keeps the project's secrets", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.store.secrets.push({ projectId: P.id, name: "DB_PASSWORD" });
+  s.store.failNextMarkDeleted = true;
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), /simulated crash/);
+  assert.equal(s.store.secrets.length, 1);
+});
+
+test("DEVOS-131: the vault scanner is required for every purge, and a surviving secret keeps the project archived", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const before = s.fake.calls.length;
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners.filter((x) => x.name !== "vault") }),
+    (e) => e instanceof TeardownError && e.code === "scan_incomplete" && /vault/.test(e.message),
+  );
+  assert.equal(s.fake.calls.length, before, "no provider call");
+  s.store.secrets.push({ projectId: P.id, name: "DB_PASSWORD" });
+  s.store.deleteProjectSecrets = async () => 0;
+  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners });
+  assert.equal(out.purged, false);
+  assert.deepEqual(out.report.hits.map((h) => `${h.provider}:${h.name}`), ["vault:DB_PASSWORD"]);
+  assert.equal((await s.store.project(P.id)).stage, "archived");
 });
