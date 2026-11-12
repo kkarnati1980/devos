@@ -274,12 +274,28 @@ paths:
   /projects/{id}/requirements:
     get:
       operationId: getRequirements
-      summary: "M2.2-d2: newest requirements doc (decided card applied) and requirement rows"
+      summary: "M2.2-d2: newest requirements doc and requirement rows (read-only)"
       x-devos-access: session
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         "200": { description: "`{ doc: DocRow | null, requirements: RequirementRow[] }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "500": { description: "`requirements-store-error`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/{id}/requirements/sync:
+    post:
+      operationId: syncRequirementsApproval
+      summary: "M2.2-d2: apply the decided requirements card to the newest draft (idempotent)"
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ doc: DocRow | null }`" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }

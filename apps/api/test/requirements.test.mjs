@@ -115,7 +115,7 @@ test("AT-R1 paste: 201 with versions and a linked card; GET shows the draft and 
   }
 });
 
-test("AT-R2 file upload needs a file name; a refused type keeps the M2.1 code; GET applies an approved card once", async () => {
+test("AT-R2 file upload needs a file name; a refused type keeps the M2.1 code; GET is read-only and the sync POST (CSRF) applies an approved card", async () => {
   const { app, port, cards } = await start();
   try {
     const h = await signIn(port);
@@ -126,6 +126,13 @@ test("AT-R2 file upload needs a file name; a refused type keeps the M2.1 code; G
     const up = await call(port, "POST", `/projects/${P1}/spec`, { headers: { ...h, "content-type": "application/octet-stream", "x-devos-filename": "shop.md" }, body: SPEC });
     assert.equal(up.status, 201, up.text);
     cards.get(up.json.result.approvalId).status = "approved";
+    // GET never writes (ADR-0011 §1, PR66-r1): the doc stays a draft until the sync POST.
+    const g0 = await call(port, "GET", `/projects/${P1}/requirements`, { headers: { cookie: h.cookie } });
+    assert.equal(g0.json.doc.status, "draft");
+    const noCsrf = await call(port, "POST", `/projects/${P1}/requirements/sync`, { headers: { origin: ORIGIN, cookie: h.cookie } });
+    assert.equal(noCsrf.status, 403);
+    const sync = await call(port, "POST", `/projects/${P1}/requirements/sync`, { headers: h });
+    assert.deepEqual([sync.status, sync.json.doc.status], [200, "approved"]);
     const g = await call(port, "GET", `/projects/${P1}/requirements`, { headers: { cookie: h.cookie } });
     assert.equal(g.json.doc.status, "approved");
     const again = await call(port, "POST", `/projects/${P1}/spec`, { headers: { ...h, "content-type": "text/markdown" }, body: SPEC });
