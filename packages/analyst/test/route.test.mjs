@@ -1,4 +1,12 @@
 import { test } from "node:test";
+// Copies of M2.3 parseCard's checks (apps/api/src/approvals.ts ONE_LINE / MULTI_LINE / text()); apps/api is not
+// a dependency of this package, so the test pins the same rules.
+const ONE_LINE = /^[^\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+$/;
+const MULTI_LINE = /^[^\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]*$/;
+const accepted = (card) =>
+  [card.action, card.target].every((v) => v.trim().length >= 1 && v.trim().length <= 200 && ONE_LINE.test(v.trim())) &&
+  card.reason.trim().length >= 1 && card.reason.trim().length <= 2000 && MULTI_LINE.test(card.reason.trim()) &&
+  !card.action.includes("*") && !card.target.includes("*");
 import assert from "node:assert/strict";
 import { parseSpec } from "@devos/intake";
 import {
@@ -46,6 +54,9 @@ test("RT1 classification: non-technical topics win over technical ones; unclear 
   });
   // Whole words only: "dbase" / "userland" are not "db" / "user".
   assert.equal(cls("Is dbase ok?").reason, "default-non-technical");
+  assert.equal(cls("Is userland ok?").reason, "default-non-technical");
+  // The whole text is classified: a non-technical word after 4,000+ characters still sends it to KK.
+  assert.equal(cls("Which database " + "x ".repeat(2500) + "fits the budget?").class, "non-technical");
 });
 
 test("RT2 plan: non-technical questions become decision cards, technical ones go to the Architect log", () => {
@@ -63,8 +74,8 @@ test("RT2 plan: non-technical questions become decision cards, technical ones go
   for (const c of p.cards) {
     assert.equal(c.card.gate, "decision");
     assert.equal(c.card.projectId, "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d");
-    assert.ok(!/[\n\r*]/.test(c.card.action + c.card.target));
-    assert.ok(c.card.reason.length <= 2000 && c.card.action.length <= 200 && c.card.target.length <= 200);
+    assert.ok(accepted(c.card), c.card.target);
+    assert.ok(ONE_LINE.test(c.card.reason));
     assert.match(c.card.reason, /spec version 3/);
   }
   // Every question is routed exactly once.
@@ -87,6 +98,22 @@ test("RT3 cards block only what depends on them (DV-FR-012)", () => {
 `);
   const card = p2.cards.find((c) => c.card.target.startsWith("spec-question:"));
   assert.deepEqual(card.blocks, ["FR-7"]);
+  // One TBD cell in a requirements table blocks only its own row, though all rows share one block.
+  const { p: p3 } = plan(`| ID | Requirement | Acceptance |
+|---|---|---|
+| FR-1 | Login | works |
+| FR-2 | Export | format TBD |
+| FR-3 | Import | ok |
+`);
+  assert.deepEqual(p3.cards.filter((c) => c.card.target.startsWith("spec-question:")).map((c) => c.blocks), [["FR-2"]]);
+  assert.ok(!p3.cards.some((c) => c.blocks.includes("FR-1") || c.blocks.includes("FR-3")));
+  // A TBD criterion under a heading requirement blocks that requirement.
+  const { p: p4 } = plan(`### FR-1: Login
+
+- works
+- Password rules TBD
+`);
+  assert.deepEqual(p4.cards.map((c) => c.blocks), [["FR-1"]]);
 });
 
 test("RT4 stable targets: the same question in a later spec version dedupes in M2.3; repeats in one spec merge", () => {
@@ -109,8 +136,16 @@ test("RT5 spec text stays inert: one-line, clipped, and the Architect log escape
 - Which API <script>alert(1)</script> [x](javascript:alert(1)) should we use?
 `);
   assert.equal(p.cards.length, 1);
-  assert.ok(p.cards[0].card.reason.length <= 2000);
+  assert.ok(accepted(p.cards[0].card));
   assert.ok(p.cards[0].card.reason.endsWith('…"'));
+  // Non-BMP text is clipped by UTF-16 units (what parseCard counts) and never splits a surrogate pair;
+  // bidi overrides and isolates are removed, so parseCard accepts the card.
+  const { p: emoji } = plan(`## Open questions\n\n- Who pays ${"\u{1F600}".repeat(1600)}?\n- Who pays \u202Eevil\u2066x\u2069?\n`);
+  assert.equal(emoji.cards.length, 2);
+  for (const c of emoji.cards) {
+    assert.ok(accepted(c.card), c.card.reason.slice(0, 40));
+    assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(c.card.reason));
+  }
   const md = renderArchitectLog(p, { specVersion: 3, generatedAt: "2026-11-12" });
   assert.ok(!md.includes("<script>"));
   assert.ok(!md.includes("](javascript:"));
@@ -128,6 +163,8 @@ test("RT6 raising: one failure never stops the rest; a secret refusal retries on
     if (draft.card.target === "spec-acceptance:FR-2") throw Object.assign(new Error("db down: SECRET"), { code: "db-down" });
     if (draft.card.target === "spec-acceptance:FR-3" && reason === draft.card.reason)
       throw Object.assign(new Error("x"), { code: "card-contains-secret" });
+    if (/Who pays/.test(draft.card.reason) && reason === draft.card.reason)
+      throw Object.assign(new Error("x"), { code: "invalid-input" });
     if (draft.card.action.startsWith("Answer") && /thing/.test(reason)) throw new Error("plain failure, no code");
     return { id: `card-${calls.length}` };
   };
@@ -140,6 +177,9 @@ test("RT6 raising: one failure never stops the rest; a secret refusal retries on
   const fr3 = r.raised.find((x) => x.questionId === p.cards.find((c) => c.card.target === "spec-acceptance:FR-3").questionId);
   assert.equal(fr3.withheld, true);
   assert.ok(calls.some(([, reason]) => /withheld/.test(reason)));
+  assert.equal(r.raised.filter((x) => x.withheld).length, 2);
+  // A missing-acceptance reason quotes the requirement's title, not analyzer-generated text.
+  assert.match(p.cards.find((c) => c.card.target === "spec-acceptance:FR-2").card.reason, /title in the spec: "Export"/);
   // Failure codes never carry error messages.
   assert.ok(!JSON.stringify(r).includes("SECRET"));
 });

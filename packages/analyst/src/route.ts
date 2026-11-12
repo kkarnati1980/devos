@@ -56,7 +56,8 @@ const TECHNICAL = new RegExp(
 export function classifyQuestion(q: Pick<OpenQuestion, "kind" | "text">): Classification {
   // What "done" means for a requirement is a product decision (DV-FR-011: KK approves criteria).
   if (q.kind === "missing-acceptance") return { class: "non-technical", reason: "missing-acceptance" };
-  const text = q.text.slice(0, 4000);
+  // The whole text: both patterns are linear, and a cut could hide a non-technical word (pre-review).
+  const text = q.text;
   if (NON_TECHNICAL.test(text)) return { class: "non-technical", reason: "non-technical-topic" };
   if (TECHNICAL.test(text)) return { class: "technical", reason: "technical-topic" };
   return { class: "non-technical", reason: "default-non-technical" };
@@ -95,15 +96,20 @@ export const CARD_LINE_MAX = 200;
 export const CARD_REASON_MAX = 2000;
 const QUOTE_MAX = 1500;
 // C0/C1 controls and Unicode line/paragraph separators: a card line is one line.
-const CONTROL = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+", "g");
+// Same set as M2.3 `ONE_LINE` (approvals.ts), including bidi overrides and isolates, so parseCard accepts it.
+const CONTROL = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]+", "g");
 
 function oneLine(s: string): string {
   return s.replace(CONTROL, " ").replace(/\s+/g, " ").trim();
 }
 
+/** Clip to `max` UTF-16 units (what M2.3 `parseCard` counts) without splitting a surrogate pair. */
 function clip(s: string, max: number): string {
-  const chars = Array.from(s);
-  return chars.length <= max ? s : `${chars.slice(0, max - 1).join("")}…`;
+  if (s.length <= max) return s;
+  let end = max - 1;
+  const c = s.charCodeAt(end - 1);
+  if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+  return `${s.slice(0, end)}…`;
 }
 
 /** Stable across spec versions (Q-numbers are not), so M2.3 dedupe returns the pending card for a repeat. */
@@ -111,11 +117,14 @@ export function questionFingerprint(text: string): string {
   return createHash("sha256").update(oneLine(text).toLowerCase(), "utf8").digest("hex").slice(0, 16);
 }
 
-/** Requirement keys a question depends on: its own requirement, or requirements defined in its block. */
+/**
+ * Requirement keys a question depends on: the requirement it is about (missing acceptance) or was raised
+ * from (a TBD title or criterion, `owner`). Never by block index: all rows of one table share a block, so
+ * one TBD cell would block every row (pre-review). Keys not in the requirements (out of scope) block nothing.
+ */
 function dependents(q: OpenQuestion, analysis: Analysis): string[] {
-  if (q.kind === "missing-acceptance") return q.requirement ? [q.requirement] : [];
-  const keys = analysis.requirements.filter((r) => r.source === q.source).map((r) => r.key);
-  return [...new Set(keys)];
+  const key = q.kind === "missing-acceptance" ? q.requirement : q.owner;
+  return key && analysis.requirements.some((r) => r.key === key) ? [key] : [];
 }
 
 const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -143,11 +152,11 @@ export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan 
     seen.add(target);
     const action = key ? `Confirm acceptance criteria for ${key}` : "Answer an open question in the spec";
     const head = `${q.id}, spec version ${meta.specVersion}, block ${q.source}.`;
-    const quoted = clip(oneLine(q.text), QUOTE_MAX);
+    const req = q.requirement ? analysis.requirements.find((r) => r.key === q.requirement) : undefined;
     const reason =
       q.kind === "missing-acceptance"
-        ? `${head} The spec gives no acceptance criteria for this requirement. Its text: "${quoted}"`
-        : `${head} The spec leaves this open: "${quoted}"`;
+        ? `${head} The spec gives no acceptance criteria for this requirement. Its title in the spec: "${clip(oneLine(req?.title ?? ""), QUOTE_MAX)}"`
+        : `${head} The spec leaves this open: "${clip(oneLine(q.text), QUOTE_MAX)}"`;
     cards.push({
       questionId: q.id,
       card: {
@@ -157,7 +166,7 @@ export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan 
         reason: clip(reason, CARD_REASON_MAX),
         projectId: meta.projectId ?? null,
       },
-      fallbackReason: `${head} The question text is withheld because it looks like it holds a secret; open the spec to read it.`,
+      fallbackReason: `${head} The question text is withheld because the approvals inbox could not accept it (it may look like a secret); open the spec to read it.`,
       blocks,
       reason: c.reason,
     });
@@ -205,7 +214,7 @@ function errorCode(e: unknown): string {
 
 /**
  * Raise every card, one at a time. One failure never stops the others (independent work continues,
- * DV-FR-012); a `card-contains-secret` refusal is retried once with the fallback reason. Failure codes
+ * DV-FR-012); a `card-contains-secret` or `invalid-input` refusal is retried once with the fallback reason. Failure codes
  * are fixed strings, never spec text or error messages.
  */
 export async function raiseQuestionCards(plan: QuestionPlan, raise: RaiseCard): Promise<RouteResult> {
@@ -216,7 +225,8 @@ export async function raiseQuestionCards(plan: QuestionPlan, raise: RaiseCard): 
       result.raised.push({ questionId: d.questionId, cardId: id, withheld: false });
     } catch (e) {
       const code = errorCode(e);
-      if (code !== "card-contains-secret") {
+      // Spec text the approvals core refuses (secret-shaped, or a shape it rejects) is retried without it.
+      if (code !== "card-contains-secret" && code !== "invalid-input") {
         result.failed.push({ questionId: d.questionId, code });
         continue;
       }
