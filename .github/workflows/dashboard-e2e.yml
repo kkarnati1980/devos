@@ -15,7 +15,7 @@ jobs:
     # Pinned (DEVOS-99): on the ubuntu-26.04 image behind ubuntu-latest, apt in `playwright install --with-deps`
     # failed to resolve the Ubuntu archives on most runs (11 Nov 2026). 24.04 is a Playwright-supported image.
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30  # DEVOS-98: room for the bounded package-install retry
     env:
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
@@ -41,5 +41,23 @@ jobs:
             if [ "$i" -lt 3 ]; then sleep 20; fi
           done
           exit 1
+      # DEVOS-98: the runner's apt mirrors intermittently fail DNS ("Temporary failure resolving"), for
+      # 15+ minutes at a time. The ubuntu-latest image already carries most browser libraries, so the
+      # package install is best effort (2 tries, idempotent, so safe to retry) and the next step is the
+      # hard check: Chromium must launch, or the job fails. The tests themselves are unchanged.
+      - name: Install Chromium system packages (best effort, bounded retry)
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          for i in 1 2; do
+            if pnpm --filter @devos/dashboard exec playwright install-deps chromium; then exit 0; fi
+            if [ "$i" -lt 2 ]; then echo "::warning::install-deps try $i failed; retrying in 30 s"; sleep 30; fi
+          done
+          echo "::warning::install-deps failed twice; relying on the runner image's libraries (checked next)"
+          exit 1
+      - name: Check Chromium launches
+        timeout-minutes: 2
+        working-directory: apps/dashboard
+        run: node -e "import('playwright').then(async ({ chromium }) => { const b = await chromium.launch(); await b.close(); console.log('chromium-launch-ok'); })"
       - name: Browser acceptance tests
         run: pnpm --filter @devos/dashboard run test:e2e
