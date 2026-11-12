@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import { MemoryRequirementsStore, RequirementsPipeline } from "@devos/analyst";
 import { createApp } from "../dist/app.js";
 import { KkSessionRegistry } from "../dist/auth.js";
@@ -59,6 +60,26 @@ function call(port, method, path, { headers = {}, body } = {}) {
     req.on("error", reject);
     if (body !== undefined) req.write(body);
     req.end();
+  });
+}
+
+/** A raw HTTP exchange: the response is collected even if the server closes the socket mid-upload. */
+function rawPost(port, path, headers, chunks) {
+  return new Promise((resolve) => {
+    const sock = net.connect(port, "127.0.0.1");
+    let data = "";
+    sock.on("data", (c) => (data += c));
+    sock.on("error", () => {});
+    sock.on("close", () => resolve(data));
+    const head = [`POST ${path} HTTP/1.1`, "host: 127.0.0.1", "connection: close", ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`)].join("\r\n");
+    sock.write(head + "\r\n\r\n");
+    (async () => {
+      for (const c of chunks) {
+        if (sock.destroyed) break;
+        await new Promise((r) => sock.write(c, () => r()));
+      }
+      if (!sock.destroyed) sock.end();
+    })().catch(() => {});
   });
 }
 
@@ -133,9 +154,10 @@ test("AT-R3 refusals: no CSRF token 403, wrong type 415, bad UTF-8 400, oversize
       req.end(body);
     });
     assert.deepEqual([bad.status, bad.json.code], [400, "text-not-utf8"]);
-    // Declared too large: refused before any body is read (the server may close the socket after answering).
-    const big = await call(port, "POST", `/projects/${P1}/spec`, { headers: { ...h, "content-type": "text/markdown", "content-length": String(10 * 1024 * 1024 + 1) } }).catch((e) => ({ status: e.code }));
-    if (big.status !== "ECONNRESET") assert.deepEqual([big.status, big.json.code], [413, "spec-too-large"]);
+    // Declared too large: refused before any body is read.
+    const big = await rawPost(port, `/projects/${P1}/spec`, { ...h, "content-type": "text/markdown", "content-length": String(10 * 1024 * 1024 + 1) }, []);
+    assert.match(big, /^HTTP\/1\.1 413 /);
+    assert.match(big, /"code":"spec-too-large"/);
     const unknown = await call(port, "POST", `/projects/5b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d/spec`, { headers: { ...h, "content-type": "text/markdown" }, body: SPEC });
     assert.deepEqual([unknown.status, unknown.json.code], [404, "project-not-found"]);
     const badId = await call(port, "GET", `/projects/nope/requirements`, { headers: { cookie: h.cookie } });
@@ -149,18 +171,12 @@ test("AT-R4 the body limit holds while streaming, without a Content-Length", asy
   const { app, port } = await start();
   try {
     const h = await signIn(port);
-    const r = await new Promise((resolve, reject) => {
-      const req = http.request({ host: "127.0.0.1", port, method: "POST", path: `/projects/${P1}/spec`, headers: { ...h, "content-type": "text/markdown", "transfer-encoding": "chunked" } }, (res) => {
-        let t = "";
-        res.on("data", (c) => (t += c));
-        res.on("end", () => resolve({ status: res.statusCode, json: JSON.parse(t) }));
-      });
-      req.on("error", () => resolve({ status: "reset" }));
-      const chunk = Buffer.alloc(1024 * 1024, 0x61);
-      for (let i = 0; i < 11; i++) req.write(chunk);
-      req.end();
-    });
-    if (r.status !== "reset") assert.deepEqual([r.status, r.json.code], [413, "spec-too-large"]);
+    // 11 chunks of 1 MiB, chunked encoding, no Content-Length: the 413 must come from the streaming cap.
+    const mib = Buffer.alloc(1024 * 1024, 0x61);
+    const chunk = Buffer.concat([Buffer.from(`${mib.length.toString(16)}\r\n`), mib, Buffer.from("\r\n")]);
+    const r = await rawPost(port, `/projects/${P1}/spec`, { ...h, "content-type": "text/markdown", "transfer-encoding": "chunked" }, [...Array(11).fill(chunk), Buffer.from("0\r\n\r\n")]);
+    assert.match(r, /^HTTP\/1\.1 413 /);
+    assert.match(r, /"code":"spec-too-large"/);
   } finally {
     await app.close();
   }

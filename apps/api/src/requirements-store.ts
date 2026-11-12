@@ -14,6 +14,9 @@ import {
 
 type Tx = any;
 
+/** Most requirements one spec version may store: keeps `saveAnalysis` well inside its transaction timeout. */
+export const MAX_REQUIREMENTS = 2000;
+
 function toDoc(r: { id: string; projectId: string; version: number; status: DocStatus; approvalId: string | null }): DocRow {
   return { id: r.id, projectId: r.projectId, version: r.version, status: r.status, approvalId: r.approvalId ?? null };
 }
@@ -50,6 +53,8 @@ export class PrismaRequirementsStore implements RequirementsStore {
   }
 
   saveAnalysis(input: SaveAnalysisInput): Promise<SaveAnalysisResult> {
+    // Checked before the transaction: a refusal with a clear code instead of a timeout (pre-review d2 finding 3).
+    if (input.requirements.length > MAX_REQUIREMENTS) return Promise.reject(new PipelineError("too-many-requirements", 413));
     return this.tx(async (tx) => {
       const pid = input.projectId;
       const stage = await this.lockProject(tx, pid);

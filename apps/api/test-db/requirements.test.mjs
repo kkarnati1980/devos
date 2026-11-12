@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { createDb } from "@devos/db";
 import { PipelineError, RequirementsPipeline } from "@devos/analyst";
-import { PrismaRequirementsStore } from "../dist/requirements-store.js";
+import { MAX_REQUIREMENTS, PrismaRequirementsStore } from "../dist/requirements-store.js";
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required for test:db");
@@ -65,6 +65,16 @@ test("AT-D1 a submission writes spec, doc, requirement and milestone rows in one
   const doc = await db.requirementsDoc.findFirst({ where: { projectId: p.id } });
   assert.deepEqual([doc.status, doc.approvalId, doc.repoPath], ["draft", r.approvalId, "docs/requirements.md"]);
   assert.equal(await db.auditEvent.count({ where: { projectId: p.id, action: "requirements.analysed" } }), 1);
+  // The row view behind GET /projects/:id/requirements.
+  assert.deepEqual(await store.rows(p.id), [
+    { key: "FR-1", title: "Owner login", priority: "must", acceptance: "Login works\nLogout works", milestone: 1 },
+    { key: "FR-2", title: "Menu page", priority: "should", acceptance: "Menu shows prices", milestone: 1 },
+    { key: "FR-3", title: "Online payment", priority: "must", acceptance: "", milestone: 2 },
+  ]);
+  // Too many requirements: a clear refusal, nothing stored.
+  const many = Array.from({ length: MAX_REQUIREMENTS + 1 }, (_, i) => ({ key: `FR-${i + 100}`, title: "x", priority: "must", acceptance: "", milestoneOrdinal: null }));
+  await rejectsCode(store.saveAnalysis({ projectId: p.id, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: many, milestones: [], repoPath: "docs/requirements.md" }), "too-many-requirements");
+  assert.equal(await db.spec.count({ where: { projectId: p.id } }), 1);
 });
 
 test("AT-D2 a second version supersedes the draft, upserts rows and keeps dropped ones", async () => {
@@ -103,20 +113,35 @@ test("AT-D4 concurrent submission and approval serialise on the project lock: ne
   const store = new PrismaRequirementsStore(db, 5000);
   const pl = pipeline(store);
   const r1 = await pl.submitSpec(p.id, { kind: "paste", text: SPEC });
-  const results = await Promise.allSettled([
-    pl.applyDecision({ id: r1.approvalId, gate: "requirements", status: "approved" }),
-    pl.submitSpec(p.id, { kind: "paste", text: SPEC }),
-  ]);
+  // Hold the project row lock in another transaction so the approval and the save both queue on it, then release.
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let locked;
+  const isLocked = new Promise((r) => (locked = r));
+  const holder = db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM project WHERE id = ${p.id}::uuid FOR UPDATE`;
+    locked();
+    await gate;
+  }, { timeout: 15_000 });
+  await isLocked;
+  const save = store.saveAnalysis({ projectId: p.id, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "b".repeat(64), text: "v2" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" });
+  const approve = store.approveDoc(r1.docId);
+  await new Promise((r) => setTimeout(r, 300));
+  release();
+  await holder;
+  const results = await Promise.allSettled([approve, save]);
   const approved = await db.requirementsDoc.findMany({ where: { projectId: p.id, status: "approved" } });
   assert.ok(approved.length <= 1);
-  if (results[0].status === "fulfilled" && results[0].value === "approved") {
-    // Approval won: the submission was refused and stored nothing.
+  if (results[0].status === "fulfilled" && results[0].value === true) {
+    // Approval won: the save was refused and rolled back.
     assert.equal(results[1].status, "rejected");
+    assert.equal(results[1].reason.code, "requirements-already-approved");
     assert.equal(await db.spec.count({ where: { projectId: p.id } }), 1);
   } else {
-    // Submission won: v1 is superseded and stays unapproved.
+    // Save won: v1 was superseded before the approval re-read it, so nothing is approved.
     assert.equal(results[1].status, "fulfilled");
     assert.equal(approved.length, 0);
+    assert.equal((await db.requirementsDoc.findUnique({ where: { id: r1.docId } })).status, "superseded");
   }
   // Stage re-check under the lock and unknown project.
   const late = await project("building");
