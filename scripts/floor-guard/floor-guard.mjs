@@ -16,7 +16,7 @@ export const GUARD_PATHS = [/^scripts\/floor-guard\//, /^scripts\/test\/floor-gu
 const GUARD_COMPANIONS = [/^docs\/decisions\/[^/]+\.md$/, /^docs\/modules\/GI-1\.md$/];
 
 const CODE = /\.(m?[jt]sx?|c[jt]s|sh|bash|ya?ml|json|py)$/;
-const TEST_FILE = /(^|\/)(test|tests|__tests__|test-db|e2e)\/.*\.(m?[jt]sx?|c[jt]s)$|\.(test|spec)\.(m?[jt]sx?|c[jt]s)$/;
+const TEST_FILE = /(^|\/)(test|tests|__tests__|test-db|e2e)\/.*\.(m?[jt]sx?|c[jt]s)$|\.(test|spec)\.[\w-]+$/; // any extension for the *.test.* / *.spec.* suffix (PR70-r5)
 const WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const TEST_CONFIG = /(^|\/)(vitest|jest|playwright|vite)\.config\.[cm]?[jt]s$|(^|\/)\.(c8rc|nycrc)(\.json)?$|(^|\/)package\.json$/;
 const SHELL = /\.(sh|bash)$/;
@@ -118,9 +118,14 @@ export function workflowShape(src) {
     // YAML allows the step list at the same indentation as "steps:"; anything else at or above that indent ends it
     if (stepsIndent >= 0 && (ind < stepsIndent || (ind === stepsIndent && !t.startsWith("- ")))) stepsIndent = -1;
     if (stepsIndent < 0) continue;
-    if (t.startsWith("- ") && (itemIndent < 0 || ind === itemIndent) && ind >= stepsIndent) { itemIndent = ind; step = { id: null, body: [] }; jobs[job].push(step); }
-    if (step && !/^-?\s*name\s*:/.test(t)) step.body.push(t.replace(/^-\s+/, ""));
-    const m = /^-?\s*(name|uses|run)\s*:\s*(.*)$/.exec(t);
+    let keyLevel = false;
+    if (t.startsWith("- ") && (itemIndent < 0 || ind === itemIndent) && ind >= stepsIndent) {
+      itemIndent = ind; step = { id: null, body: [], keyIndent: ind + (t.length - t.replace(/^-\s+/, "").length) }; jobs[job].push(step); keyLevel = true;
+    } else if (step && ind === step.keyIndent) keyLevel = true;
+    // only the step's own `name:` is its identity; a nested `with: name:` or env entry is body (PR70-r5)
+    const own = keyLevel && /^-?\s*name\s*:/.test(t);
+    if (step && !own) step.body.push(t.replace(/^-\s+/, ""));
+    const m = keyLevel ? /^-?\s*(name|uses|run)\s*:\s*(.*)$/.exec(t) : null;
     if (step && m && (step.key !== "name")) { if (m[1] === "name" || !step.id) { step.id = `${m[1]}:${m[2].replace(/^["']|["']$/g, "").trim().replace(m[1] === "uses" ? /@[^@\s]*$/ : /$^/, "")}`; step.key = m[1]; } }
   }
   for (const steps of Object.values(jobs)) { // duplicate identities get #2, #3 … so multiplicity counts
