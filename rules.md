@@ -6,7 +6,8 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 - **Claude builds:** Architect (module contracts + plan), Builder (implements one module in its own worktree), Tester (acceptance tests + evidence).
 - **Codex reviews** read-only; it never edits code. Auto-fix is off.
 - **Release** integrates in dependency order and deploys.
-- **KK** answers decision cards and approves gates.
+- **KK** answers decision cards and approves gates, or the runner approves G2–G4 under KK's recorded delegation (ADR-0013 §2, with its four conditions). G5, a first production launch, and anything involving money, data deletion, legal, D11 or D13 stay with KK.
+- **Runners:** runner A takes Lane A, unlaned issues and the gates; runner B takes Lanes B and C. Neither touches the other's branches or PRs (ADR-0013).
 
 ## Before coding
 1. Read the module contract in `docs/modules/<id>.md` and the requirement IDs it cites.
@@ -14,10 +15,16 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 3. Work only on your assigned module's files, in your own worktree/branch.
 
 ## Every change
-- One module = one PR. The branch name carries the Linear id (e.g. `kishore/devos-33-...`) or the PR body says `Fixes DEVOS-33`.
+- One module or task sub-issue = one PR. Split a module too large to review in one pass (about 800 changed lines of non-generated source, or more than one concern) into task sub-issues. The branch name carries the Linear id (e.g. `kishore/devos-33-...`) or the PR body says `Fixes DEVOS-33`.
 - A PR must pass CI (install, typecheck, lint, test) **and** a Codex PASS on the same commit before merge.
 - Store evidence (commands, exit codes, output) for each acceptance test, per commit SHA.
+- Before opening a PR, a separate review agent reviews only the diff against the contract and the Review guidelines; accepted findings are fixed before the PR opens, and the PR body records `Pre-review: <n> findings, <m> fixed` (ADR-0013).
 - Merge in dependency order.
+
+## Build ahead behind a gate (ADR-0013)
+- When every module and blocker of a phase is Done and only its gate is open, the next phase's modules may be contracted, built, opened as PRs and reviewed.
+- Nothing from the next phase merges until the gate issue is Done. Keep such PRs up to date with main and PASSed.
+- No pilot work without KK's go-ahead (pilot hold).
 
 ## Never
 - Print or commit secrets. Secrets live in the server vault / Coolify env — never in the repo or in chat.
@@ -35,10 +42,12 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 - Waivers come only from KK (a scoped `approval_grant`, ≤90 days). An agent never waives a rule.
 
 ## Stop and ask (decision card to KK) when
+The runner makes every technical decision itself and records it with its reasons in the module contract or `docs/decisions/` (ADR-0013). Ask KK only when:
+- Any rule above names KK: D13 copyleft, waivers, a first production launch, G5, or the pilot hold (no pilot work without his go-ahead).
 - A non-technical question blocks (scope, priorities, budget, users, legal, content, accounts).
 - A change would destroy data, spend money, or delete a project.
 - A reverse-engineering request targets a third party — confirm authorisation first.
-- A task fails 3 attempts (Sonnet, Sonnet, Opus) — label it `deadlocked`; the lane moves on to the next ready task.
+- A task is blocked by a non-technical question — card to KK, label it `deadlocked`; the lane moves on to the next ready task. A task that fails 3 attempts (Sonnet, Sonnet, Opus) for a technical reason is resolved by the runner: a narrower scope or an alternative design that still meets the acceptance tests, recorded in the contract, with follow-ups filed.
 
 ## Model routing
 - **Haiku:** summaries, release notes, classification.
@@ -49,7 +58,7 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 ## Source of truth
 - **Linear** (team Devos, project "AI Development Team") is the plan: milestones = phases, module issues, task sub-issues.
 - **GitHub** holds code; PRs link to Linear issues by branch name. No GitHub issue mirroring.
-- Decisions: `docs/decisions/`. Module contracts: `docs/modules/`.
+- Decisions: `docs/decisions/` (ADR-0013: build ahead, delegated gates, two runners). Module contracts: `docs/modules/`.
 
 ## Review guidelines
 Codex (CLI `codex exec review` and, if enabled, the GitHub code-review app) reviews against these. Review only; never implement, fix, or push changes — Claude writes all code.
@@ -57,6 +66,6 @@ Codex (CLI `codex exec review` and, if enabled, the GitHub code-review app) revi
 - **Correctness first:** does it satisfy the cited requirement IDs and the `docs/modules/<id>.md` contract? Flag logic errors, unhandled edge cases, race conditions, and broken error handling over style.
 - **Security:** no secrets, keys, or tokens in code or config; input validated at trust boundaries; no new network egress outside the allow-list; least-privilege tokens only.
 - **Tests:** acceptance tests exist for the requirement and actually exercise it; no test weakened or skipped to pass.
-- **Scope:** change touches only the assigned module's files; one module = one PR.
+- **Scope:** change touches only the assigned module's files; one module or task sub-issue = one PR.
 - **Build standard:** for an app, check the floor (F1–F3) and the modules in its `selection.md`, and cite the module or check ID (e.g. `SM-02-L2`) in each finding; a rule from an unselected module is advisory, never blocking. For DevOS itself, check ADR-0011.
 - **Boundaries (D11/D13):** no circumvention of copy protection/DRM/licensing/paywalls, no lifting proprietary code, no malware/exploits; referenced-repo licences kept intact.
