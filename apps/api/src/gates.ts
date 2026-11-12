@@ -3,6 +3,7 @@
 // The M1.1 AT18 trigger (milestone_gate_approved) is the database backstop; this gives the friendly error first.
 import { ApprovalError, type AuditEntry, type CardStatus } from "./approvals.js";
 
+const SHA = /^[0-9a-f]{40}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface MilestoneRow {
@@ -34,7 +35,7 @@ export interface GateStore {
 export interface GatePolicy {
   decide(request: {
     identity: { id: string; type: "agent" | "kk" | "system"; roles?: string[] };
-    action: { type: string; resource?: string; projectId?: string };
+    action: { type: string; resource?: string; projectId?: string; sha?: string };
     approvalGrantId?: string;
   }): Promise<{ enforcedOutcome: "allow" | "deny" | "require_approval"; reason: string }>;
 }
@@ -53,12 +54,15 @@ export class GateEngine {
     identity: { id: string; type: "agent" | "kk" | "system"; roles?: string[] },
     milestoneId: string,
     approvalId: string,
-    opts: { approvalGrantId?: string } = {},
+    opts: { approvalGrantId?: string; sha?: string } = {},
   ): Promise<{ milestoneId: string; approvalId: string; closedAt: Date }> {
     if (!UUID.test(milestoneId) || !UUID.test(approvalId)) throw new ApprovalError("invalid-input");
     // Codex PR41-r1: a gate.transition rule may require approval; KK's grant (from approving the gate card) is
     // forwarded so M1.7 can lift it. M1.7 checks the grant's scope, expiry, uses and revocation itself.
     if (opts.approvalGrantId !== undefined && !UUID.test(opts.approvalGrantId)) throw new ApprovalError("invalid-input");
+    // Codex PR41-r4: a SHA-scoped grant (approve with { sha }) is usable only when the acting commit is forwarded;
+    // M1.7 compares grant.sha with action.sha itself. Same 40-hex shape as the grant's sha.
+    if (opts.sha !== undefined && (typeof opts.sha !== "string" || !SHA.test(opts.sha))) throw new ApprovalError("invalid-input");
     const m = await this.deps.store.milestone(milestoneId);
     if (!m) throw new ApprovalError("milestone-not-found", 404);
     if (m.closedAt) throw new ApprovalError("milestone-closed", 409);
@@ -68,7 +72,7 @@ export class GateEngine {
     }
     const decision = await this.deps.policy.decide({
       identity,
-      action: { type: "gate.transition", resource: `milestone:${m.id}`, projectId: m.projectId },
+      action: { type: "gate.transition", resource: `milestone:${m.id}`, projectId: m.projectId, ...(opts.sha ? { sha: opts.sha } : {}) },
       ...(opts.approvalGrantId ? { approvalGrantId: opts.approvalGrantId } : {}),
     });
     if (decision.enforcedOutcome !== "allow") throw new ApprovalError(policyCode(decision.reason), 403);

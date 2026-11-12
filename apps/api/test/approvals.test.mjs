@@ -310,6 +310,28 @@ test("Codex PR41-r1: a gate.transition that requires approval closes only with K
   assert.ok(store.milestones.get(M).closedAt);
 });
 
+test("Codex PR41-r4: a SHA-scoped gate grant closes the milestone only for the approved commit", async () => {
+  const M = "55555555-5555-4555-8555-555555555557";
+  const SHA_OK = "a".repeat(40);
+  const gateRule = { ...approvalRule, id: "r-gate-approve-sha", name: "gate transitions need approval", actions: ["gate.transition"] };
+  const { approvals, engine, session } = setup({ rules: [gateRule] });
+  const c = await approvals.raiseCard(card({ gate: "requirements", action: "gate.transition", target: `milestone:${M}` }), [T1]);
+  const { grantId } = await approvals.approve(session, c.id, { sha: SHA_OK });
+  const store = new MemoryGateStore();
+  store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
+  store.approvals.set(c.id, { id: c.id, projectId: PROJECT, gate: "requirements", status: "approved" });
+  const gates = new GateEngine({ store, policy: engine });
+  const releaser = { id: "agent:release", type: "agent" };
+  // No SHA forwarded, or another commit: M1.7 refuses the SHA-scoped grant.
+  await assert.rejects(gates.closeMilestone(releaser, M, c.id, { approvalGrantId: grantId }), (e) => e instanceof ApprovalError && e.status === 403);
+  await assert.rejects(gates.closeMilestone(releaser, M, c.id, { approvalGrantId: grantId, sha: "b".repeat(40) }), (e) => e instanceof ApprovalError && e.status === 403);
+  await assert.rejects(gates.closeMilestone(releaser, M, c.id, { approvalGrantId: grantId, sha: "NOT-A-SHA" }), (e) => e.code === "invalid-input");
+  assert.equal(store.milestones.get(M).closedAt, null);
+  const closed = await gates.closeMilestone(releaser, M, c.id, { approvalGrantId: grantId, sha: SHA_OK });
+  assert.equal(closed.milestoneId, M);
+  assert.ok(store.milestones.get(M).closedAt);
+});
+
 test("Codex PR41-r1: a gate name changed between validation and close does not close the milestone", async () => {
   const M = "55555555-5555-4555-8555-555555555557";
   const A = "66666666-6666-4666-8666-666666666667";
