@@ -805,3 +805,49 @@ test("DEVOS-90: the 6-hour clock restarts when a new SHA's normal checks run", a
   const r2 = await runAgent();
   assert.equal(checkRuns(), 2, "no timed re-check right after the normal checks " + r2.out);
 });
+
+// DEVOS-114 AT21: gh_all_runs must list a workflow-run page larger than the kernel's 128 KiB per-argument limit.
+test("DEVOS-114 AT21: gh_all_runs lists a page over 128 KiB in full and never passes page data as a jq argument", () => {
+  const harness = `set -euo pipefail
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+REPO=x/y
+gh(){ case "$2" in
+  *page=1) jq -nc '{workflow_runs: [range(100) | {id: ., workflow_id: 1, pad: ("y" * 2000)}]}';;
+  *page=2) jq -nc '{workflow_runs: [range(3) | {id: (. + 100), workflow_id: 2}]}';;
+  esac; }
+eval "$(sed -n '/^gh_all_runs() {/,/^}/p' scripts/server/server-agent.sh)"
+r="$(gh_all_runs abc)"
+printf '%s %s %s\\n' "$(jq length <<<"$r")" "$(jq '[.[].id] | unique | length' <<<"$r")" "\${#r}"
+`;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sa-runs-"));
+  const f = path.join(dir, "h.sh");
+  fs.writeFileSync(f, harness);
+  const [runs, unique, bytes] = execFileSync("bash", [f], { cwd: ROOT, encoding: "utf8" }).trim().split(" ").map(Number);
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(runs, 103);
+  assert.equal(unique, 103);
+  assert.ok(bytes > 131072, `first page must exceed 128 KiB, was ${bytes}`);
+  const src = execFileSync("sed", ["-n", "/^gh_all_runs() {/,/^}/p", "scripts/server/server-agent.sh"], { cwd: ROOT, encoding: "utf8" });
+  assert.doesNotMatch(src, /--argjson|--arg /);
+});
+
+test("DEVOS-114 AT21: gh_all_runs fails (no partial list) when a page cannot be read", () => {
+  const harness = `set -uo pipefail
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+REPO=x/y
+gh(){ case "$2" in
+  *page=1) jq -nc '{workflow_runs: [range(100) | {id: .}]}';;
+  *page=2) [[ "\${BAD:-}" == json ]] && { echo 'not json'; return 0; }; return 1;;
+  esac; }
+eval "$(sed -n '/^gh_all_runs() {/,/^}/p' scripts/server/server-agent.sh)"
+if out="$(gh_all_runs abc)"; then echo "ok \${#out}"; else echo "fail $(ls "$TMP" | wc -l)"; fi
+BAD=json
+if out="$(gh_all_runs abc)"; then echo "ok \${#out}"; else echo "fail $(ls "$TMP" | wc -l)"; fi
+`;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sa-runs-"));
+  const f = path.join(dir, "h.sh");
+  fs.writeFileSync(f, harness);
+  const out = execFileSync("bash", [f], { cwd: ROOT, encoding: "utf8" }).trim();
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(out, "fail 0\nfail 0", "a failed or non-JSON page must fail the call and leave no temp files");
+});
