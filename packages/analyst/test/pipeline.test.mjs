@@ -215,14 +215,16 @@ The shop owner can publish a daily menu with prices for each bread.
 test("PL6 model pass: grounded proposals are stored and flagged on the card; a failing model leaves the deterministic result", async () => {
   const blocks = parseSpec(Buffer.from(PROSE, "utf8"), "pasted-spec.md").blocks;
   const menu = blocks.findIndex((b) => b.type !== "table" && b.text.includes("daily menu"));
-  const calls = [];
+  const calls = [], projects = [];
   const runner = async (req) => {
     calls.push(req.tag);
+    projects.push(req.projectId);
     return { output: JSON.stringify({ requirements: [{ block: menu, title: "Owner publishes daily menu with prices" }], criteria: [] }) };
   };
   const { store, pipeline, reqCards } = setup({ runner });
   const r = await pipeline.submitSpec(P1, { kind: "paste", text: PROSE });
   assert.deepEqual(calls, ["analyst_assist"]);
+  assert.deepEqual(projects, [P1], "the runner learns the project, so a run can be recorded against it (M2.2-d3b1)");
   assert.equal(r.counts.proposed, 1);
   assert.ok(store.requirements.get(P1).has("FR-M001"));
   assert.match(reqCards[0].reason, /1 requirements were proposed by the model/);

@@ -1,0 +1,164 @@
+// M2.2-d3b1: the analyst model pass as one M1.5 run per call (contract docs/modules/M2.2.md, "M2.2-d3b").
+// The real RunEngine, M1.7 PolicyEngine and Claude adapter (with a fake SDK query) over the memory stores.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
+import { ClaudeAgentSdkAdapter, MemoryRunStore, RunEngine } from "@devos/run-engine";
+import { MemoryRequirementsStore } from "@devos/analyst";
+import { Approvals, MemoryApprovalStore } from "../dist/approvals.js";
+import { requirementsServices } from "../dist/runtime.js";
+import { runEngineModelRunner, ANALYST_MODEL, ANALYST_MAX_OUTPUT_BYTES } from "../dist/analyst-runner.js";
+
+const P1 = "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d";
+// The overview paragraph is not yet a requirement, so the model pass is called (the M2.2-d1 PL6 fixture).
+const SPEC = `# Bakery app
+
+## Overview
+
+The shop owner can publish a daily menu with prices for each bread.
+
+## Phase 1: Launch
+
+- FR-1: Owner login
+`;
+
+/** The task/run rows over MemoryRunStore (the Postgres twin is PrismaAnalystRunRows, test-db). */
+function memoryRows(runStore) {
+  const tasks = new Map();
+  let n = 0;
+  return {
+    tasks,
+    created: [],
+    async createRun(input) {
+      const taskId = `task-${++n}`;
+      tasks.set(taskId, { kind: "analysis", assignee: "agent", status: "running", title: input.title, projectId: input.projectId });
+      const runId = `run-${randomBytes(4).toString("hex")}`;
+      runStore.runs.set(runId, { id: runId, taskId, projectId: input.projectId, role: "analyst", model: input.model, attempt: 1, status: "queued", maxTurns: input.maxTurns, maxSeconds: input.maxSeconds, maxCostUsd: input.maxCostUsd, turns: 0 });
+      this.created.push({ runId, ...input });
+      return runId;
+    },
+    async textEvents(runId) {
+      return runStore.events.filter((e) => e.runId === runId && e.type === "text").sort((a, b) => a.seq - b.seq).map((e) => e.payload.text);
+    },
+    async finishTask(runId, ok) {
+      tasks.get(runStore.runs.get(runId).taskId).status = ok ? "done" : "failed";
+    },
+  };
+}
+
+/** A fake Agent SDK query: one assistant turn whose text is `text`, then a result with `cost`. */
+function sdk(text, { cost = 0.02, fail = false } = {}) {
+  return () => (async function* () {
+    yield { type: "system", subtype: "init", session_id: "s1" };
+    if (fail) throw Object.assign(new Error("bad request"), { status: 400 });
+    yield { type: "assistant", message: { model: ANALYST_MODEL, content: [{ type: "text", text }], usage: { input_tokens: 100, output_tokens: 50 } } };
+    yield { type: "result", subtype: "success", is_error: false, total_cost_usd: cost, result: "ok" };
+  })();
+}
+
+function setup({ text = "", budgets = [], fail = false, mode = "observe" } = {}) {
+  const runStore = new MemoryRunStore();
+  const policy = new PolicyEngine({ store: new MemoryPolicyStore({ mode }), hmacKey: randomBytes(32), budgets });
+  const engine = new RunEngine({ store: runStore, policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: sdk(text, { fail }) }) });
+  const rows = memoryRows(runStore);
+  const reqStore = new MemoryRequirementsStore();
+  reqStore.addProject({ id: P1, name: "Shop", stage: "intake" });
+  const approvalStore = new MemoryApprovalStore();
+  const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
+  const svc = requirementsServices(reqStore, approvals, approvalStore, runEngineModelRunner(rows, engine));
+  return { runStore, rows, reqStore, svc };
+}
+
+const proposal = (blocks) => JSON.stringify({ requirements: [{ block: blocks, title: "Owner publishes daily menu with prices" }], criteria: [] });
+
+test("AT-MR1 one analysis task and one analyst run (Sonnet, max_turns 2, one turn used); the run's text is the model output", async () => {
+  // Block 2 is the overview paragraph (blocks: title, Overview, paragraph, Phase 1, FR-1).
+  const s = setup({ text: proposal(2) });
+  const r = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(r.counts.proposed, 1, "a grounded proposal from the run's text was stored");
+  assert.deepEqual(r.warnings, []);
+  assert.equal(s.rows.created.length, 1);
+  const [c] = s.rows.created;
+  assert.equal(c.projectId, P1);
+  assert.equal(c.model, "claude-sonnet-5-5");
+  assert.equal(c.maxTurns, 2);
+  const run = s.runStore.runs.get(c.runId);
+  assert.equal(run.role, "analyst");
+  assert.equal(s.runStore.finished.get(c.runId).status, "succeeded");
+  assert.equal(s.runStore.finished.get(c.runId).turns, 1);
+  const task = s.rows.tasks.get(run.taskId);
+  assert.deepEqual([task.kind, task.assignee, task.status], ["analysis", "agent", "done"]);
+});
+
+test("AT-MR2 the engine records the cost (one cost_entry for the run); the runner adds none of its own", async () => {
+  const s = setup({ text: "{}" });
+  await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  const [c] = s.rows.created;
+  const costs = s.runStore.costs.filter((x) => x.runId === c.runId);
+  assert.equal(costs.length, 1);
+  assert.equal(costs[0].role, "analyst");
+  assert.ok(Math.abs(costs[0].usd - 0.02) < 1e-9);
+  assert.equal(s.runStore.costs.length, 1);
+  assert.equal(s.runStore.finished.get(c.runId).status, "succeeded");
+});
+
+test("AT-MR3 an adapter error and a budget stop each give assist-failed with the deterministic requirements kept", async () => {
+  const cases = {
+    "adapter error": setup({ fail: true }),
+    "budget stop (the project budget refuses the reservation)": setup({ text: "{}", budgets: [{ id: "cap", projectId: P1, maxCostUsd: 0.01, maxTokens: 10_000_000 }], mode: "enforce" }),
+  };
+  for (const [name, s] of Object.entries(cases)) {
+    const r = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+    assert.deepEqual(r.warnings, ["assist-failed"], name);
+    assert.ok(s.reqStore.requirements.get(P1).has("FR-1"), `${name}: deterministic FR-1 stored`);
+    assert.equal(r.counts.proposed, 0, name);
+    const [c] = s.rows.created;
+    assert.notEqual(s.runStore.finished.get(c.runId)?.status, "succeeded", name);
+    assert.equal(s.rows.tasks.get(s.runStore.runs.get(c.runId).taskId).status, "failed", `${name}: task closed as failed`);
+  }
+});
+
+test("AT-MR4 output over 256 KiB is refused before the validator", async () => {
+  const s = setup({ text: "x".repeat(ANALYST_MAX_OUTPUT_BYTES + 1) });
+  const r = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.deepEqual(r.warnings, ["assist-failed"]);
+  const runner = runEngineModelRunner(s.rows, { execute: async () => ({ status: "succeeded" }) });
+  s.rows.textEvents = async () => ["é".repeat(ANALYST_MAX_OUTPUT_BYTES / 2 + 1)];
+  s.rows.createRun = async () => "r-x";
+  s.rows.finishTask = async () => {};
+  await assert.rejects(runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /analyst-output-too-long/, "bytes, not characters");
+  await assert.rejects(runner({ prompt: "p", tag: "analyst_assist" }), /analyst-run-no-project/);
+});
+
+test("AT-MR5 buildRuntime keeps the model pass off without loadAnalystEngine; with it, the runner records a run over the database", async () => {
+  const { buildRuntime } = await import("../dist/runtime.js");
+  const { KkSessionRegistry } = await import("../dist/auth.js");
+  const env = { DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" };
+  const writes = [];
+  const tx = {
+    $queryRaw: async () => [],
+    task: { create: async (a) => (writes.push(["task.create", a.data]), { id: "t1" }), update: async (a) => writes.push(["task.update", a.where, a.data]) },
+    run: { create: async (a) => (writes.push(["run.create", a.data]), { id: "r1" }), findUnique: async () => ({ taskId: "t1" }) },
+    runEvent: { findMany: async (a) => (writes.push(["runEvent.findMany", a.where, a.orderBy]), [{ payload: { text: "{" } }, { payload: { text: "}" } }]) },
+  };
+  const db = { $transaction: async (fn) => fn(tx) };
+  const opts = { outboundTimeoutMs: 500, kkSessions: new KkSessionRegistry(), loadDb: async () => db };
+  const off = await buildRuntime(env, opts);
+  assert.equal(off.requirements.pipeline.ports.runner, null, "no engine → deterministic only");
+
+  const seen = [];
+  const on = await buildRuntime(env, { ...opts, loadAnalystEngine: async (d, policy) => {
+    seen.push([d === db, typeof policy.decide]);
+    return { execute: async (input) => (seen.push(input), { status: "succeeded" }) };
+  } });
+  const runner = on.requirements.pipeline.ports.runner;
+  assert.equal(typeof runner, "function");
+  assert.deepEqual(seen[0], [true, "function"], "the engine is built over this database and the M1.7 policy engine");
+  assert.deepEqual(await runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), { output: "{}" });
+  assert.deepEqual(writes[0], ["task.create", { projectId: P1, kind: "analysis", assignee: "agent", title: "Analyst assist", status: "running" }]);
+  assert.deepEqual(writes[1], ["run.create", { taskId: "t1", projectId: P1, role: "analyst", model: "claude-sonnet-5-5", maxTurns: 2, maxSeconds: 90, maxCostUsd: "0.500000" }]);
+  assert.deepEqual(seen[1], { runId: "r1", provider: "anthropic", prompt: "p", cwd: seen[1].cwd, tag: "analyst_assist" });
+  assert.deepEqual(writes[2], ["runEvent.findMany", { runId: "r1", type: "text" }, { seq: "asc" }]);
+  assert.deepEqual(writes[3], ["task.update", { id: "t1" }, { status: "done" }]);
+});
