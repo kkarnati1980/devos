@@ -208,7 +208,8 @@ export class RequirementsPipeline {
     let analysis = analyzeSpec(ingested.blocks);
     if (this.ports.runner) {
       try {
-        const assisted = await assistAnalysis(ingested.blocks, analysis, this.ports.runner);
+        const runner = this.ports.runner;
+        const assisted = await assistAnalysis(ingested.blocks, analysis, (req) => runner({ ...req, projectId }));
         analysis = assisted.analysis;
         // assistAnalysis reports a failed or unusable model call as a warning instead of throwing (pre-review 1).
         if (assisted.warnings.some((w) => w.code === "model-failed" || w.code === "model-output-invalid")) warnings.push("assist-failed");
