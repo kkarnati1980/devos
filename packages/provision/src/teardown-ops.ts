@@ -184,3 +184,48 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
     },
   };
 }
+
+/**
+ * M2.5-a2 purge preflight (M2.5 pre-review finding 2): GitHub answers 404 for a private repo the token cannot see,
+ * so a token narrowed to selected repositories could make a repo look gone. The token must see every repo its
+ * account owns: the owned-repo listing must hold at least `public_repos + owned_private_repos` from `GET /user`.
+ * The token's login must also be `owner` (Codex PR55-r1). Throws `github-token-scope` otherwise (the purge stops
+ * with `provider_forbidden`, nothing deleted).
+ */
+export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; maxPages?: number }): () => Promise<void> {
+  const maxPages = opts.maxPages ?? 20;
+  if (typeof opts?.owner !== "string" || !NAME_RE.test(opts.owner)) throw new Error("github-owner-invalid");
+  return async () => {
+    const http = await gh.http.pinned();
+    const u = await http.get<{ login?: string; public_repos?: number; owned_private_repos?: number }>("/user");
+    const pub = u.body?.public_repos; const priv = u.body?.owned_private_repos;
+    if (u.status !== 200 || typeof pub !== "number" || typeof priv !== "number" || typeof u.body?.login !== "string") {
+      throw new Error("github-token-scope: the token cannot read its account's repository counts");
+    }
+    // Codex PR55-r1: the token must belong to the account that owns the project's repos, or its 404s and its owned-
+    // repo scan say nothing about them. Checked on the same snapshot the purge uses (pinnedGitHub).
+    if (u.body.login.toLowerCase() !== opts.owner.toLowerCase()) {
+      throw new Error("github-token-scope: the token belongs to another account than the repository owner");
+    }
+    let seen = 0;
+    for (let page = 1; page <= maxPages; page++) {
+      const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
+      if (r.status !== 200 || !Array.isArray(r.body)) throw new Error("github-token-scope: the repository list is unreadable");
+      seen += r.body.length;
+      if (r.body.length < 100) break;
+    }
+    if (seen < pub + priv) throw new Error(`github-token-scope: the token sees ${seen} of ${pub + priv} owned repositories; give it access to all repositories`);
+  };
+}
+
+/**
+ * Codex pre-review (M2.5-a2): one GitHub token snapshot for a whole purge. Returns a client whose every call (the
+ * scope preflight, inspect, delete and the leftover scan) uses the token read now, so a token narrowed in the vault
+ * after the preflight can never make a repo it cannot see look gone. Build the purge's GitHub ops and scanner from it.
+ */
+export async function pinnedGitHub(gh: GitHubClient): Promise<GitHubClient> {
+  const http = await gh.http.pinned();
+  const c = Object.create(Object.getPrototypeOf(gh)) as GitHubClient;
+  Object.defineProperty(c, "http", { value: http, enumerable: true });
+  return c;
+}
