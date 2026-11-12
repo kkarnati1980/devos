@@ -6,8 +6,8 @@ import { readFileSync, readdirSync } from "node:fs";
 const schema = readFileSync(new URL("../prisma/schema.prisma", import.meta.url), "utf8");
 const models = [...schema.matchAll(/^model (\w+) \{([\s\S]*?)^\}/gm)].map((m) => ({ name: m[1], body: m[2] }));
 
-test("44 models (31 core + 13 ADR-0006/0008/0009), each mapped to a snake_case table", () => {
-  assert.equal(models.length, 44);
+test("45 models (31 core + 13 ADR-0006/0008/0009 + 1 M2.4 provision_step), each mapped to a snake_case table", () => {
+  assert.equal(models.length, 45);
   for (const m of models) {
     const map = m.body.match(/@@map\("([a-z_]+)"\)/);
     assert.ok(map, `${m.name} has no @@map`);
