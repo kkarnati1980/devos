@@ -376,3 +376,30 @@ test("AB8d (PR56-r3) a table requirement with a custom ID prefix is still sent f
   assert.ok(line("SHOP-2").includes("import of products"));
   assert.ok(!line("SHOP-1").includes("import"), "SHOP-1 is grounded on its own row");
 });
+
+test("AB8e (PR56-r4) a model title carrying a custom-prefix spec ID is rejected contains-id", async () => {
+  const md = `# Shop
+
+- SHOP-1: Export orders
+
+Customers integrate SHOP-1 to export orders.
+
+Customers integrate the ledger to export orders.
+`;
+  const blocks = blocksOf(md);
+  const a = analyzeSpec(blocks, { idPrefixes: ["SHOP"] });
+  assert.deepEqual(a.requirements.map((r) => r.key), ["SHOP-1"]);
+  const withId = idx(blocks, "integrate SHOP-1");
+  const plain = idx(blocks, "the ledger");
+  const reply = { requirements: [{ block: withId, title: "SHOP-1 integration exports orders" }], criteria: [] };
+  // Derived from the analysis keys alone (no option passed).
+  const r = await assistAnalysis(blocks, a, fake(reply));
+  assert.deepEqual(r.analysis.requirements.filter((x) => x.proposed), []);
+  assert.ok(r.warnings.some((w) => w.code === "proposal-rejected" && w.reason === "contains-id" && w.source === withId));
+  // A custom prefix passed by the caller counts even when no key uses it yet.
+  const r2 = await assistAnalysis(blocks, a, fake({ requirements: [{ block: plain, title: "ACME-7 ledger export orders" }], criteria: [] }), { idPrefixes: ["ACME"] });
+  assert.ok(r2.warnings.some((w) => w.reason === "contains-id" && w.source === plain));
+  // Without it, a grounded title with no known ID is still accepted.
+  const r3 = await assistAnalysis(blocks, a, fake({ requirements: [{ block: plain, title: "Customers integrate ledger to export orders" }], criteria: [] }));
+  assert.equal(r3.analysis.requirements.filter((x) => x.proposed).length, 1);
+});

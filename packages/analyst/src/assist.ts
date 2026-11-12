@@ -44,6 +44,8 @@ export interface AssistOptions {
   maxOutputChars?: number;
   /** Share of a proposal's content words that must appear in its cited block (default 0.6). */
   minGrounding?: number;
+  /** Custom ID prefixes the spec was analysed with (`analyzeSpec`'s `idPrefixes`); used to reject model titles carrying an ID. */
+  idPrefixes?: readonly string[];
 }
 
 export interface AssistResult {
@@ -67,6 +69,27 @@ function blockText(b: Block): string {
   return b.text;
 }
 
+const PREFIX_RE = /^[A-Z][A-Z0-9]{0,9}$/;
+
+/** The upper-case prefix of a requirement key (`SHOP` for `SHOP-1`), or null. */
+function keyPrefix(key: string): string | null {
+  const own = /^[A-Za-z][A-Za-z0-9]*(?=[-_.]?\d)/.exec(key)?.[0];
+  return own && PREFIX_RE.test(own) ? own : null;
+}
+
+function validPrefixes(list: readonly string[]): string[] {
+  return list.filter((x) => typeof x === "string" && PREFIX_RE.test(x));
+}
+
+function keyPrefixes(analysis: Analysis): string[] {
+  const out = new Set<string>();
+  for (const r of analysis.requirements) {
+    const p = keyPrefix(r.key);
+    if (p) out.add(p);
+  }
+  return [...out];
+}
+
 /**
  * Text the model sees and grounds against for a requirement: its own table row (cells joined) for a
  * table requirement, else its source block's text (PR pre-review: never the whole table).
@@ -81,8 +104,8 @@ export function requirementText(
   if (b.type !== "table") return b.text;
   // The key's own prefix always counts, so a spec analysed with custom `idPrefixes` (`SHOP-1`) still finds
   // its rows without the caller passing them again (PR56-r3).
-  const own = /^[A-Za-z][A-Za-z0-9]*(?=[-_.]?\d)/.exec(r.key)?.[0];
-  if (own && /^[A-Z][A-Z0-9]{0,9}$/.test(own) && !prefixes.includes(own)) prefixes = [...prefixes, own];
+  const own = keyPrefix(r.key);
+  if (own && !prefixes.includes(own)) prefixes = [...prefixes, own];
   // A row belongs to the ID that opens its first ID-bearing cell (emphasis ignored), never to an ID that
   // only appears inside another row's title (PR56-r1).
   const rowKey = (cells: readonly string[]): string | null => {
@@ -247,7 +270,9 @@ export async function assistAnalysis(
   if (sent.size === 0 && sentRequirements.size === 0) {
     return { analysis, called: false, warnings: [{ code: "model-skipped" }] };
   }
-  const idPrefixes = [...new Set([...DEFAULT_ID_PREFIXES, prefix])];
+  // Titles carrying any known ID are rejected: the defaults, the assigned prefix, the caller's custom
+  // prefixes and the prefix of every requirement key already in the analysis (`SHOP-1`; PR56-r4).
+  const idPrefixes = [...new Set([...DEFAULT_ID_PREFIXES, prefix, ...validPrefixes(options.idPrefixes ?? []), ...keyPrefixes(analysis)])];
 
   let output: string;
   try {
