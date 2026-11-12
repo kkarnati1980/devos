@@ -296,3 +296,23 @@ test("AT20: a timed-out verdict comment that GitHub stored is found on the next 
   assert.equal(M.comments.length, 3, "posted once: the forged and other-SHA comments did not count");
   assert.equal(M.comments.at(-1).user.login, "kkarnati1980");
 });
+
+test("AT20 (Codex PR52-r2): a runner-failure report carries the commit line and is not posted twice after a timed-out POST", async () => {
+  reset();
+  M.green = true; M.hangComment = true;
+  const sha = "7".repeat(40);
+  M.prs = [{ number: 33, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M33.md" }];
+  const failing = path.join(dir, "runner-fail.sh");
+  fs.writeFileSync(failing, "#!/usr/bin/env bash\necho 'ERROR: Quota exceeded.'\nexit 1\n", { mode: 0o755 });
+  const r1 = await tick([], { REVIEW_RUNNER: failing, GH_TIMEOUT: "2" });
+  assert.equal(r1.code, 0, r1.out);
+  assert.equal(M.comments.length, 1);
+  assert.match(M.comments[0].body, /could not run \(exit 1\)/);
+  assert.ok(M.comments[0].body.includes("- **Commit:** `" + sha + "`"));
+  M.hangComment = false;
+  const r2 = await tick([], { REVIEW_RUNNER: failing });
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.out, /verdict comment already on the PR/);
+  assert.equal(M.comments.length, 1, "the failure report is not duplicated");
+  assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "error"));
+});

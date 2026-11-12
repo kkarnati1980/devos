@@ -276,7 +276,8 @@ review_one() {  # pr sha contract
     log "PR #$pr ${sha:0:7}: $(jq -r .verdict "$VDIR/$sha.json")"
   else
     {
-      printf '### Codex review %s — could not run (exit %s)\n\nNo verdict was stored. Last lines of the runner log:\n\n```\n' "$label" "$rc"
+      # Codex PR52-r2: the commit line makes a runner-failure report recognisable on a retry too (DEVOS-106).
+      printf '### Codex review %s — could not run (exit %s)\n\n- **Commit:** `%s`\n\nNo verdict was stored. Last lines of the runner log:\n\n```\n' "$label" "$rc" "$sha"
       tail -n 15 "$TMP/run.safe"
       printf '```\nIt will not be retried for this commit; push a new commit, or run the installer with RETRY_FAILED=1.\n'
     } > "$STATE/$sha.msg"
