@@ -28,6 +28,8 @@ export interface LinearApi {
   createMilestone(input: { projectId: string; name: string; description: string; sortOrder: number }): Promise<string>;
   updateMilestone(id: string, input: { name?: string; description?: string }): Promise<void>;
   issues(projectId: string): Promise<LinearIssue[]>;
+  /** One issue by id, archived included, with its project; null when it no longer exists (DEVOS-132: moved issues). */
+  issueRef(id: string): Promise<{ id: string; projectId: string | null } | null>;
   createIssue(input: IssueInput): Promise<string>;
   updateIssue(id: string, input: Partial<IssueInput>): Promise<void>;
   addBlockedBy(issueId: string, blockerId: string): Promise<void>;
@@ -42,4 +44,6 @@ export interface SyncStore {
   setMilestoneId(milestoneId: string, linearMilestoneId: string): Promise<void>;
   setModuleIssue(moduleId: string, issueId: string): Promise<void>;
   setTaskIssue(taskId: string, issueId: string): Promise<void>;
+  /** M2.6-b (AT6): KK completed or cancelled a human task in Linear; the DevOS task becomes done (audited). */
+  completeHumanTask(taskId: string, how: "completed" | "canceled"): Promise<boolean>;   // true when a row changed
 }

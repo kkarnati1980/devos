@@ -45,6 +45,11 @@ export interface TeardownStore {
   /** Removes the project's `provision_step` rows (M2.4 hand-off: no stale `done` rows after a purge). */
   resetSteps(projectId: string): Promise<void>;
   saveScan(projectId: string, report: ScanReport): Promise<void>;
+  /**
+   * DEVOS-131: deletes every vault secret scoped to the project (`vault_secret.project_id`). Vault secrets are not
+   * inventory rows, so this runs once every inventory resource is gone. Returns how many rows went.
+   */
+  deleteProjectSecrets(projectId: string): Promise<number>;
   markPurged(projectId: string): Promise<void>;
 }
 
@@ -100,6 +105,8 @@ export interface PurgeOptions extends TeardownOptions {
 
 export interface PurgeResult {
   deleted: number;
+  /** Vault secrets of the project deleted by this run (DEVOS-131). */
+  secretsDeleted: number;
   report: ScanReport;
   purged: boolean;
 }
@@ -269,7 +276,8 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
     // Codex PR48-r1: the leftover scan must be independent and complete (decision 6), or `purged` could be claimed
     // without looking. Required: the inventory scanner, plus one scanner per provider that has teardown ops or rows.
     const names = new Set(opts.scanners.map((x) => x.name));
-    const needed = new Set(["inventory", ...opts.ops.map((o) => o.provider), ...rows.map((r) => r.provider)]);
+    // DEVOS-131: `vault` is always required. App secrets are not inventory rows, so only the vault scanner can see one.
+    const needed = new Set(["inventory", "vault", ...opts.ops.map((o) => o.provider), ...rows.map((r) => r.provider)]);
     const missing = [...needed].filter((n) => !names.has(n)).sort();
     if (missing.length) throw new TeardownError("scan_incomplete", false, `purge needs leftover scanners for: ${missing.join(", ")}`);
     for (const check of opts.preflight ?? []) {
@@ -306,11 +314,15 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
       }
       await opts.store.markResourceDeleted(r.id, new Date(now()));
     }
+    // DEVOS-131: the project's vault secrets go last, after every resource that used them is confirmed gone, so a
+    // purge that stops half way (then Restore) keeps the secrets its remaining apps still need.
+    await opts.store.assertLockHeld(projectId);
+    const secretsDeleted = await opts.store.deleteProjectSecrets(projectId);
     const report = await scanLeftovers({ id: p.id, slug: p.slug }, opts.scanners, now);
     await opts.store.saveScan(projectId, report);
     const purged = report.hits.length === 0 && report.errors.length === 0;
     if (purged) await opts.store.markPurged(projectId);
-    return { deleted, report, purged };
+    return { deleted, secretsDeleted, report, purged };
   });
 }
 

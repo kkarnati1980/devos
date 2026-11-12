@@ -65,7 +65,7 @@ function setup() {
   store.addProject({ id: P.id, slug: P.slug, stage: "live" });
   const steps = () => [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P), ...stackSteps(cf, store, P, RANGE)];
   const ops = [githubRepoOps(gh, P.id), coolifyProjectOps(cf, P.id), coolifyEnvironmentOps(cf, P.id), coolifyPortOps()];
-  const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store)];
+  const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store), store.vaultScanner()];
   const base = { store, ops, now: () => Date.UTC(2026, 10, 12, 13, 0, 0) };
   return { fake, cf, store, steps, scanners, base };
 }

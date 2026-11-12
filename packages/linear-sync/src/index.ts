@@ -5,7 +5,7 @@ export type { MarkerKind } from "./markers.js";
 export { syncProject, moduleState, taskState, LANE_LABEL } from "./sync.js";
 export type { SyncResult, SyncOptions } from "./sync.js";
 export type { DevosPlan, LinearApi, LinearIssue, IssueInput, SyncStore, StateType } from "./types.js";
-export { graphqlApi } from "./api.js";
+export { graphqlApi, ISSUE_PAGE, NESTED, ISSUES_QUERY_COST, LINEAR_MAX_COMPLEXITY } from "./api.js";
 export { loadPlan, PrismaSyncStore, syncProjectLocked, fencedApi, bounded, WRITE_MARGIN_MS, STORE_OP_MS, STORE_WAIT_MS } from "./prisma-store.js";
 export type { LockGuard } from "./prisma-store.js";
 export type { PrismaLike } from "./prisma-store.js";
