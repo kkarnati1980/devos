@@ -11,6 +11,7 @@ export interface TeardownPrismaLike {
   resource: any;
   provisionStep: any;
   auditEvent: any;
+  vaultSecret: any;
   $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T>;
 }
 
@@ -104,6 +105,12 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
   async lastScan(projectId: string): Promise<ScanReport | null> {
     const ev = await this.q(this.tdb.auditEvent.findFirst({ where: { projectId, action: "teardown.scan", actor: "system" }, orderBy: [{ occurredAt: "desc" }, { id: "desc" }], select: { details: true } })) as any;
     return (ev?.details as ScanReport) ?? null;
+  }
+
+  /** DEVOS-131: hard delete; ciphertext of a purged project is a liability, and the purge is KK's decision (M2.3). */
+  async deleteProjectSecrets(projectId: string): Promise<number> {
+    const r = await this.q(this.tdb.vaultSecret.deleteMany({ where: { projectId } })) as { count: number };
+    return r.count;
   }
 
   async markPurged(projectId: string): Promise<void> {

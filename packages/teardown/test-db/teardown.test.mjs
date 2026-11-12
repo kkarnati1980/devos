@@ -8,7 +8,7 @@ import {
   allowAll, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, runProvision,
   githubRepoOps, coolifyProjectOps, githubScanner, coolifyScanner,
 } from "@devos/provision";
-import { archiveProject, restoreProject, purgeProject, inventoryScanner, PrismaTeardownStore } from "../dist/index.js";
+import { archiveProject, restoreProject, purgeProject, inventoryScanner, vaultScanner, PrismaTeardownStore } from "../dist/index.js";
 import { fakeProviders } from "../../provision/test/fakes.mjs";
 
 const url = process.env.DATABASE_URL;
@@ -45,7 +45,7 @@ async function setup() {
   const store = new PrismaTeardownStore(db, { databaseUrl: url });
   const steps = () => [githubRepoStep(gh, p, "kkarnati1980"), coolifyProjectStep(cf, p)];
   const ops = [githubRepoOps(gh, p.id), coolifyProjectOps(cf, p.id)];
-  const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store)];
+  const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store), vaultScanner(db)];
   return { p, fake, store, steps, ops, scanners, deletes, provision: () => runProvision(p.id, steps(), { store, authorize: allowAll }) };
 }
 
@@ -104,16 +104,33 @@ test("AT7 on Postgres: after a purge the same project provisions fresh; its own 
   assert.equal(await db.resource.count({ where: { projectId: s.p.id, status: "active" } }), 2);
 });
 
-test("AT6 on Postgres: a vault secret left for the project is a leftover (listed by name, never by value); the stage stays archived", async () => {
-  const { vaultScanner } = await import("../dist/index.js");
+test("DEVOS-131 on Postgres: purge deletes the project's vault secrets (only this project's) and ends purged", async () => {
   const s = await setup();
+  const other = await setup();
+  await s.provision();
+  await archiveProject(s.p.id, { store: s.store, ops: s.ops, authorize: allowAll });
+  const mk = (projectId, name) => db.vaultSecret.create({ data: { projectId, name, ciphertext: Buffer.from("x"), nonce: Buffer.alloc(12), keyVersion: 1 } });
+  await mk(s.p.id, "APP_SESSION_SECRET");
+  await mk(s.p.id, "DB_PASSWORD");
+  await mk(other.p.id, "APP_SESSION_SECRET");
+  const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: s.scanners, authorize: allowAll });
+  assert.equal(out.secretsDeleted, 2);
+  assert.equal(out.purged, true);
+  assert.equal(await db.vaultSecret.count({ where: { projectId: s.p.id } }), 0);
+  assert.equal(await db.vaultSecret.count({ where: { projectId: other.p.id } }), 1);
+});
+
+test("AT6 on Postgres: a vault secret left for the project is a leftover (listed by name, never by value); the stage stays archived", async () => {
+  const s = await setup();
+  // Simulates a secret that survives the delete (e.g. written by a racing writer): the scan must still see it.
+  s.store.deleteProjectSecrets = async () => 0;
   await s.provision();
   await archiveProject(s.p.id, { store: s.store, ops: s.ops, authorize: allowAll });
   await db.vaultSecret.create({ data: { projectId: s.p.id, name: "APP_SESSION_SECRET", ciphertext: Buffer.from("x"), nonce: Buffer.alloc(12), keyVersion: 1 } });
   // The scanner must never select the ciphertext or nonce (decision 7).
   const selects = [];
   const spyDb = { vaultSecret: { findMany: (q) => { selects.push(q.select); return db.vaultSecret.findMany(q); } } };
-  const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: [...s.scanners, vaultScanner(spyDb)], authorize: allowAll });
+  const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: [...s.scanners.filter((x) => x.name !== "vault"), vaultScanner(spyDb)], authorize: allowAll });
   assert.equal(selects.length, 1);
   assert.deepEqual(Object.keys(selects[0]).sort(), ["id", "name"]);
   assert.equal(out.purged, false);

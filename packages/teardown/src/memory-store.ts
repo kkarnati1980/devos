@@ -12,6 +12,8 @@ interface Row extends ResourceRecord {
 export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
   readonly projects = new Map<string, TeardownProject>();
   readonly scans: ScanReport[] = [];
+  /** Project-scoped vault secrets (names only; no values in tests). */
+  readonly secrets: { projectId: string; name: string }[] = [];
   private seq = 0;
 
   addProject(p: { id: string; slug: string; stage?: string }): void {
@@ -73,6 +75,20 @@ export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
 
   async saveScan(_projectId: string, report: ScanReport): Promise<void> {
     this.scans.push(report);
+  }
+
+  async deleteProjectSecrets(projectId: string): Promise<number> {
+    const before = this.secrets.length;
+    for (let i = this.secrets.length - 1; i >= 0; i--) if (this.secrets[i]?.projectId === projectId) this.secrets.splice(i, 1);
+    return before - this.secrets.length;
+  }
+
+  /** A vault leftover scanner over `secrets`, shaped like the Postgres `vaultScanner`. */
+  vaultScanner(): { name: string; scan: (p: { id: string }) => Promise<{ provider: string; kind: string; externalId: string; name: string }[]> } {
+    return {
+      name: "vault",
+      scan: async (p) => this.secrets.filter((x) => x.projectId === p.id).map((x) => ({ provider: "vault", kind: "secret", externalId: x.name, name: x.name })),
+    };
   }
 
   async markPurged(projectId: string): Promise<void> {
