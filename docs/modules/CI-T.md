@@ -11,7 +11,7 @@
 
 | # | Pass when |
 |---|---|
-| T1 | `node --test scripts/test/ci-timeouts.test.mjs` passes, with one test per job in every workflow file (14 jobs today) |
+| T1 | `node --test scripts/test/ci-timeouts.test.mjs` passes, with one test per workflow file and one per job (14 jobs today; jobs that call a reusable workflow are skipped, since GitHub forbids a timeout there and the called file is checked) |
 | T2 | Removing the timeout from any job (e.g. `db.yml`) makes T1 fail |
 | T3 | The diff adds exactly one `timeout-minutes` line to each of the 8 jobs and removes or changes no other workflow line (G5) |
 
