@@ -12,7 +12,9 @@ permissions:
   contents: read
 jobs:
   dashboard-e2e:
-    runs-on: ubuntu-latest
+    # Pinned (DEVOS-99): on the ubuntu-26.04 image behind ubuntu-latest, apt in `playwright install --with-deps`
+    # failed to resolve the Ubuntu archives on most runs (11 Nov 2026). 24.04 is a Playwright-supported image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30  # DEVOS-98: room for the bounded package-install retry
     env:
       NEXT_TELEMETRY_DISABLED: "1"
@@ -28,8 +30,17 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Install Chromium (version pinned by the playwright devDependency)
-        timeout-minutes: 5
-        run: pnpm --filter @devos/dashboard exec playwright install chromium
+        # No apt (DEVOS-99): the ubuntu-24.04 runner image already ships the shared libraries Chromium needs
+        # (it has Google Chrome preinstalled), and apt was the step failing to resolve the Ubuntu archives.
+        # Only the browser download is retried (idempotent); a missing library still fails the tests below.
+        timeout-minutes: 9
+        run: |
+          for i in 1 2 3; do
+            timeout 150 pnpm --filter @devos/dashboard exec playwright install chromium && exit 0
+            echo "browser download failed (attempt $i/3)"
+            if [ "$i" -lt 3 ]; then sleep 20; fi
+          done
+          exit 1
       # DEVOS-98: the runner's apt mirrors intermittently fail DNS ("Temporary failure resolving"), for
       # 15+ minutes at a time. The ubuntu-latest image already carries most browser libraries, so the
       # package install is best effort (2 tries, idempotent, so safe to retry) and the next step is the
