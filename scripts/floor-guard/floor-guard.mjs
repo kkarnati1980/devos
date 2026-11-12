@@ -124,7 +124,8 @@ export function workflowShape(src) {
     } else if (step && ind === step.keyIndent) keyLevel = true;
     // only the step's own `name:` is its identity; a nested `with: name:` or env entry is body (PR70-r5)
     const own = keyLevel && /^-?\s*name\s*:/.test(t);
-    if (step && !own) step.body.push(t.replace(/^-\s+/, ""));
+    // keep indentation relative to the step's keys, so re-nesting a line (e.g. under `if False:`) is a change (PR70-r6)
+    if (step && !own) step.body.push(" ".repeat(Math.max(0, ind - step.keyIndent)) + t.replace(/^-\s+/, ""));
     const m = keyLevel ? /^-?\s*(name|uses|run)\s*:\s*(.*)$/.exec(t) : null;
     if (step && m && (step.key !== "name")) { if (m[1] === "name" || !step.id) { step.id = `${m[1]}:${m[2].replace(/^["']|["']$/g, "").trim().replace(m[1] === "uses" ? /@[^@\s]*$/ : /$^/, "")}`; step.key = m[1]; } }
   }
@@ -177,9 +178,17 @@ export function analyse(files, show) {
 
     if (test) {
       const removedTrim = new Set(f.removed.map((r) => r.text.trim()));
+      let headLines = null;
       f.added.forEach((a, i) => {
         if (RX.skip.some((r) => r.test(a.text))) hit("test-skipped", p, a.ln, a.text);
-        else if (RX.envIf.test(a.text) && /^\s*return\b/.test(f.added[i + 1]?.text ?? "") && f.added[i + 1].ln === a.ln + 1) hit("test-skipped", p, a.ln, a.text);
+        // an added early return right under an env/platform/skip condition, whether that condition is added or
+        // already there (PR70-r6): the line above it is read from the head copy of the file
+        else if (/^\s*return\b/.test(a.text)) {
+          headLines ??= (show("head", p) ?? "").split("\n");
+          let j = a.ln - 2;
+          while (j >= 0 && !headLines[j].trim()) j--;
+          if (j >= 0 && RX.envIf.test(headLines[j])) hit("test-skipped", p, a.ln, `${headLines[j].trim()} ${a.text.trim()}`);
+        }
         if (RX.trivial.some((r) => r.test(a.text)) && !removedTrim.delete(a.text.trim())) hit("trivial-assertion", p, a.ln, a.text);
       });
       const count = (ls) => ls.reduce((n, l) => n + [...l.text.matchAll(RX.assert)].length, 0);
