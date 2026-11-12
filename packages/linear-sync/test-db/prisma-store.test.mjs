@@ -77,6 +77,19 @@ test("Codex PR35-r1: a sync whose lock is about to expire makes no Linear write"
   assert.equal(L.projects.length, 0);
 });
 
+test("Codex PR35-r10: a slow lock probe is followed by a second margin check; no Linear write starts", async () => {
+  const { syncProjectLocked, fencedApi, WRITE_MARGIN_MS } = await import("../dist/index.js");
+  const pid = await seed(); const L = fakeLinear();
+  // now() calls: 1 = the deadline, 2 = the guard's check before SELECT 1 (enough margin), 3 = after it. The probe
+  // "took" long enough that less than WRITE_MARGIN_MS is left by call 3.
+  const timeout = WRITE_MARGIN_MS + 20_000;
+  let calls = 0;
+  const now = () => (++calls >= 3 ? 1_000_000 + 30_000 : 1_000_000);
+  await assert.rejects(syncProjectLocked(db, pid, (plan, store, guard) => syncProject(plan, fencedApi(L.api, guard), store), timeout, now), /linear-sync-lock-expiring/);
+  assert.equal(L.projects.length, 0);
+  assert.ok(calls >= 3);
+});
+
 test("Codex PR35-r4: an id write blocked by a row lock gives up within the bounded time instead of waiting past the sync lock", async () => {
   const pid = await seed();
   const mod = await db.module.findFirst({ where: { projectId: pid }, select: { id: true } });

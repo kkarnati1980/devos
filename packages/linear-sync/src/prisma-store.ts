@@ -137,6 +137,9 @@ export async function syncProjectLocked(db: PrismaLike, projectId: string,
       } catch {
         throw new Error("linear-sync-lock-lost");
       }
+      // Codex PR35-r10: the probe itself can be slow, so the margin is checked again after it, right before the
+      // caller is allowed to write.
+      if (deadline - now() < WRITE_MARGIN_MS) throw new Error("linear-sync-lock-expiring");
     };
     // The transaction only holds the lock. Reads and id writes use the plain client in their own bounded
     // transactions, so each id commits at once, no module/task row stays locked during the Linear round trips,
