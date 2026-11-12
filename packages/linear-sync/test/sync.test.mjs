@@ -138,6 +138,7 @@ test("Codex PR35-r4: every PrismaSyncStore write and the plan read run in a boun
     assert.ok(inTx > 0, `${name}.${String(op)} ran outside a bounded transaction`);
     if (op === "findUnique") return { id: "p1", name: "P" };
     if (op === "findMany") return [];
+    if (op === "updateMany") return { count: 0 };
     return null;
   } });
   const tx = { project: delegate("project"), milestone: delegate("milestone"), module: delegate("module"), moduleDependency: delegate("moduleDependency"),
@@ -147,12 +148,13 @@ test("Codex PR35-r4: every PrismaSyncStore write and the plan read run in a boun
     $transaction: async (fn, opts) => { seen.push(opts); inTx++; try { return await fn(tx); } finally { inTx--; } } };
   const store = new PrismaSyncStore(db, "p1");
   await store.setProjectId("p1", "lp1"); await store.setMilestoneId("m1", "lm1"); await store.setModuleIssue("mod1", "i1"); await store.setTaskIssue("t1", "i2");
+  await store.completeHumanTask("t1", "completed");
   await loadPlan(db, "p1");
   const opts = seen.filter((x) => typeof x === "object");
-  assert.equal(opts.length, 5);
+  assert.equal(opts.length, 6);
   for (const o of opts) assert.deepEqual(o, { timeout: STORE_OP_MS, maxWait: STORE_WAIT_MS });
-  assert.equal(seen.filter((x) => x === "SET LOCAL statement_timeout = 10000").length, 5);
-  assert.equal(seen.filter((x) => x === "SET LOCAL lock_timeout = 10000").length, 5);
+  assert.equal(seen.filter((x) => x === "SET LOCAL statement_timeout = 10000").length, 6);
+  assert.equal(seen.filter((x) => x === "SET LOCAL lock_timeout = 10000").length, 6);
 });
 
 test("Codex PR35-r7: when a label create fails, no other Linear write is still in flight after the sync returns", async () => {
@@ -268,16 +270,34 @@ test("AT6: completing an agent issue in Linear is reverted on the next sync and 
   assert.deepEqual(store.completed, []); assert.equal(agentTasks[0].status === "done", false);
 });
 
-test("AT6: the fenced store checks the lock guard before completing a human task", async () => {
-  const { syncProjectLocked } = await import("../dist/index.js");
-  let guarded = 0;
-  const tx = { $queryRawUnsafe: async (q) => (q.includes("pg_try_advisory_xact_lock") ? [{ ok: true }] : [{}]) };
-  const inner = { $executeRawUnsafe: async () => {}, task: { updateMany: async () => ({ count: 0 }) }, auditEvent: { create: async () => {} },
-    project: { findUnique: async () => ({ id: "p", name: "P" }) }, milestone: { findMany: async () => [] }, module: { findMany: async () => [] }, task2: {}, resource: { findMany: async () => [] }, moduleDependency: { findMany: async () => [] } };
-  inner.task.findMany = async () => [];
+test("AT6: the fenced store checks the lock guard before completing a human task; a failed guard writes nothing", async () => {
+  const { syncProjectLocked, WRITE_MARGIN_MS } = await import("../dist/index.js");
+  const calls = [];
+  const lockTx = { $queryRawUnsafe: async (q) => (q.includes("pg_try_advisory_xact_lock") ? [{ ok: true }] : [{}]) };
+  const inner = { $executeRawUnsafe: async () => {}, task: { updateMany: async () => { calls.push("updateMany"); return { count: 1 }; } }, auditEvent: { create: async () => { calls.push("audit"); } } };
   let depth = 0;
-  const db = { $transaction: async (fn) => { depth++; try { return await fn(depth === 1 ? tx : inner); } finally { depth--; } } };
-  const origQuery = tx.$queryRawUnsafe; tx.$queryRawUnsafe = async (q, ...a) => { if (q === "SELECT 1") guarded++; return origQuery(q, ...a); };
-  await syncProjectLocked(db, "p", async (_plan, store) => { await store.completeHumanTask("t", "completed"); });
-  assert.equal(guarded, 1);
+  const db = { $transaction: async (fn) => { depth++; try { return await fn(depth === 1 ? lockTx : inner); } finally { depth--; } } };
+  let t = 0;
+  // The run callback is given the fenced store; time jumps so the guard refuses before the write.
+  const run = async (_plan, store) => { t += 10 * 60_000; await store.completeHumanTask("t", "completed"); };
+  inner.project = { findUnique: async () => ({ id: "p", name: "P" }) };
+  for (const k of ["milestone", "module", "resource", "moduleDependency"]) inner[k] = { findMany: async () => [] };
+  inner.task.findMany = async () => [];
+  await assert.rejects(syncProjectLocked(db, "p", run, WRITE_MARGIN_MS + 1_000, () => t), /linear-sync-lock-expiring/);
+  assert.deepEqual(calls, [], "no task update or audit row after a failed guard");
+  t = 0;
+  await syncProjectLocked(db, "p", async (_p, store) => { assert.equal(await store.completeHumanTask("t", "completed"), true); }, WRITE_MARGIN_MS + 120_000, () => t);
+  assert.deepEqual(calls, ["updateMany", "audit"]);
+});
+
+test("M2.6-b decision 3: a human task reopened in Linear after DevOS took it as done stays done and is logged", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const issue = L.issues.find((i) => i.title === "Create the API key");
+  issue.stateId = "s-c"; await syncProject(plan, L.api, store);
+  issue.stateId = "s-u"; L.writes.length = 0;
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(plan.tasks.find((t) => t.id === u(33)).status, "done");
+  assert.ok(r.log.some((l) => /reopened in Linear \(unstarted\) but done in DevOS/.test(l)), r.log.join("\n"));
+  assert.equal(r.writes, 0); assert.equal(r.inbound.length, 0);
 });
