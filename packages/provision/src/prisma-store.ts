@@ -74,15 +74,18 @@ export class PrismaStore implements ProvisionStore {
   }
 
   private async lockAndRun<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
-    const conn = await this.openLock();
+    // Codex PR44-r2: every lock-connection call is bounded on the client too. Postgres lock_timeout bounds lock
+    // contention, not a stalled connection or a lost response.
+    const conn = await bounded(this.openLock(), this.dbMs, "provision_lock_connect");
     const state = { conn, lost: false };
     conn.on("error", () => { state.lost = true; });
     try {
       const wait = Math.max(1, Math.floor(Number(this.o.lockWaitMs ?? 15 * 60_000)));
       if (!Number.isFinite(wait)) throw new Error("provision_lock_wait_invalid");
-      await conn.query(`SET lock_timeout = ${wait}`);
+      await bounded(conn.query(`SET lock_timeout = ${wait}`), this.dbMs, "provision_lock_setup");
       try {
-        await conn.query(LOCK_SQL, [projectId]);
+        // Postgres gives up at `wait`; the client allows that plus the DB timeout for the answer to arrive.
+        await bounded(conn.query(LOCK_SQL, [projectId]), wait + this.dbMs, "provision_lock_wait");
       } catch (e) {
         // 55P03 lock_not_available: another run holds the project; typed so the caller retries later (not an attempt).
         if ((e as { code?: string }).code === "55P03") throw new Error("provision_busy");
@@ -96,7 +99,8 @@ export class PrismaStore implements ProvisionStore {
         await bounded(conn.query(UNLOCK_SQL, [projectId]), this.dbMs, "provision_unlock").catch(() => {});
       }
     } finally {
-      await conn.end().catch(() => {}); // closing the session also releases the lock
+      // Closing the session also releases the lock. Bounded: a stalled end never holds up the run or the queue.
+      await bounded(conn.end(), this.dbMs, "provision_lock_end").catch(() => {});
     }
   }
 

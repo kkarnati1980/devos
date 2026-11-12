@@ -26,7 +26,15 @@ export class CoolifyClient {
     if (r.status !== 200 || !Array.isArray(r.body)) {
       throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/projects returned an unexpected response (${r.status})`, r.status);
     }
-    return r.body.filter((x) => x && x.name === name && typeof x.uuid === "string");
+    // Codex PR44-r2: a malformed entry (not an object, or a non-string name/uuid) makes the whole list
+    // inconclusive. Dropping it could hide our project and lead to a duplicate POST.
+    for (const x of r.body as unknown[]) {
+      const e = x as Partial<ProjectBody> | null;
+      if (!e || typeof e !== "object" || typeof e.name !== "string" || typeof e.uuid !== "string" || !e.uuid) {
+        throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/projects returned a malformed project entry", r.status);
+      }
+    }
+    return r.body.filter((x) => x.name === name);
   }
 
   async getProject(uuid: string): Promise<ProjectBody | null> {

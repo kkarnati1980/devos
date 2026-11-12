@@ -241,8 +241,9 @@ test("runStep on a done step makes no provider calls", async () => {
   assert.equal(fake.calls.length, n);
 });
 
-test("Codex PR44-r1: an inconclusive Coolify project list (404, object, null) fails the lookup and creates nothing", async () => {
-  for (const body of [{ status: 404 }, { status: 200, obj: { data: [] } }, { status: 200, empty: true }]) {
+test("Codex PR44-r1/r2: an inconclusive Coolify project list (404, object, empty, malformed entries) fails the lookup and creates nothing", async () => {
+  for (const body of [{ status: 404 }, { status: 200, obj: { data: [] } }, { status: 200, empty: true },
+    { status: 200, obj: [{ name: "devos-acme" }] }, { status: 200, obj: [null] }, { status: 200, obj: [{ uuid: 7, name: "devos-acme" }] }]) {
     const fake = fakeProviders();
     const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, sleep: noSleep,
       fetchImpl: async (u, init = {}) => {
@@ -285,4 +286,19 @@ test("Codex PR44-r1: a response body that stalls past the timeout is a transient
   clearTimeout(keepAlive);
   assert.equal(out[0].outcome, "adopted");
   assert.equal(fake.creates().filter((c) => c.path === "/api/v1/projects").length, 1);
+});
+
+test("Codex PR44-r2: a stalled lock connection (connect, SET, lock or end) is bounded on the client", async () => {
+  const never = () => new Promise(() => {});
+  const keepAlive = setTimeout(() => {}, 5000);
+  const mk = (stall) => ({ query: async (sql) => (stall === sql.split(" ")[0] + (sql.includes("advisory_lock(") ? "L" : "") ? never() : {}),
+                           end: async () => (stall === "end" ? never() : undefined), on: () => {} });
+  const opts = (conn) => ({ connectLock: async () => conn, lockWaitMs: 30, dbTimeoutMs: 40 });
+  await assert.rejects(new PrismaStore({ provisionStep: {}, resource: {} }, { ...opts(null), connectLock: never }).withProjectLock(P.id, async () => 1), /provision_lock_connect_timeout/);
+  await assert.rejects(new PrismaStore({ provisionStep: {}, resource: {} }, opts(mk("SET"))).withProjectLock(P.id, async () => 1), /provision_lock_setup_timeout/);
+  await assert.rejects(new PrismaStore({ provisionStep: {}, resource: {} }, opts(mk("SELECTL"))).withProjectLock(P.id, async () => 1), /provision_lock_wait_timeout/);
+  const t0 = Date.now();
+  assert.equal(await new PrismaStore({ provisionStep: {}, resource: {} }, opts(mk("end"))).withProjectLock(P.id, async () => 7), 7);
+  assert.ok(Date.now() - t0 < 2000, "a stalled end() does not hold the run");
+  clearTimeout(keepAlive);
 });
