@@ -131,17 +131,24 @@ export async function buildRuntime(
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals };
 }
 
-/** M1.7's grant rows for one card, newest first, bounded like every other read (ADR-0011 §9). */
-export function grantsForApproval(db: DbClient, approvalId: string, timeoutMs: number): Promise<GrantSummary[]> {
+/**
+ * M1.7's grant rows for one card, newest first, bounded like every other read (ADR-0011 §9). Codex PR60-r1: the
+ * live grants (not revoked, not expired) are read in full, separately from the 20 newest history rows, so a burst
+ * of revoked race losers can never push a live grant out of the window the summary and the revoke route see.
+ */
+export function grantsForApproval(db: DbClient, approvalId: string, timeoutMs: number, now: () => number = Date.now): Promise<GrantSummary[]> {
+  const select = { id: true, scopeAction: true, scopeResource: true, projectId: true, sha: true, issuedAt: true, expiresAt: true, maxUses: true, uses: true, revokedAt: true };
+  const orderBy = [{ issuedAt: "desc" }, { id: "desc" }];
   return db.$transaction(
     async (tx: any) => {
       await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
-      return tx.approvalGrant.findMany({
-        where: { approvalId },
-        orderBy: [{ issuedAt: "desc" }, { id: "desc" }],
-        take: 20,
-        select: { id: true, scopeAction: true, scopeResource: true, projectId: true, sha: true, expiresAt: true, maxUses: true, uses: true, revokedAt: true },
-      });
+      const live = await tx.approvalGrant.findMany({ where: { approvalId, revokedAt: null, expiresAt: { gt: new Date(now()) } }, orderBy, select });
+      const recent = await tx.approvalGrant.findMany({ where: { approvalId }, orderBy, take: 20, select });
+      const byId = new Map<string, GrantSummary & { issuedAt: Date }>();
+      for (const g of [...live, ...recent]) byId.set(g.id, g);
+      return [...byId.values()]
+        .sort((a, b) => b.issuedAt.getTime() - a.issuedAt.getTime() || (a.id < b.id ? 1 : -1))
+        .map(({ issuedAt: _i, ...g }) => g);
     },
     { timeout: timeoutMs, maxWait: timeoutMs },
   );
