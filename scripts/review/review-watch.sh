@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.1.3
+# Version: 1.2.0
+# v1.2.0 (DEVOS-115, 12 Nov 2026): the repo is public, so only PRs whose head is in kkarnati1980/devos and
+# whose author is on REVIEW_AUTHORS (default: kkarnati1980) are reviewed or published on. A fork or
+# stranger's PR is logged once per head as "external PR, not reviewed" and nothing is posted on it.
 # v1.1.2 (Codex PR9-r4): a stored manual verdict records its PR number before publishing, so the drain can
 # complete it after the PR moves on.
 # v1.1.1 (Codex PR9-r3): pending publications are drained for every stored SHA, including ones a PR has
@@ -40,6 +43,12 @@ ENVF="$DIR/github-review.env"
 DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+REVIEW_AUTHORS="${REVIEW_AUTHORS:-kkarnati1980}"   # space-separated GitHub logins whose PRs are reviewed
+trusted_pr() {  # one PR object on stdin -> 0 only when its head is in $REPO and its author is on REVIEW_AUTHORS
+  jq -e --arg r "$REPO" --arg a " $REVIEW_AUTHORS " \
+    '((.head.repo.full_name // "") == $r) and ((.user.login // "") as $u | $u != "" and ($u | test("^[A-Za-z0-9-]+$"))
+      and ($a | contains(" " + $u + " ")))' >/dev/null
+}
 die() { log "ERROR $*"; exit 1; }
 install -d -m 700 "$STATE"
 exec 8>"$STATE/watch.lock"
@@ -149,6 +158,14 @@ for i in $(seq 0 $((count - 1))); do
   draft="$(jq -r ".[$i].draft" <<<"$prs")"
   contract="$(jq -r ".[$i].body // \"\"" <<<"$prs" | sed -n 's/^[[:space:]]*Review-Contract:[[:space:]]*\(docs\/[A-Za-z0-9._/-]*\.md\)[[:space:]]*$/\1/p' | head -n1)"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { log "PR #$pr: bad head sha"; continue; }
+  # DEVOS-115: never review, publish or drain for a PR from a fork or an author not on REVIEW_AUTHORS.
+  if ! jq -c ".[$i]" <<<"$prs" | trusted_pr; then
+    if [[ ! -e "$STATE/$sha.external" ]]; then
+      log "PR #$pr ${sha:0:7}: external PR, not reviewed"
+      [[ $DRY -eq 1 ]] || : > "$STATE/$sha.external"
+    fi
+    continue
+  fi
   if [[ "$draft" == "true" ]]; then log "PR #$pr ${sha:0:7}: draft, skipped"; continue; fi
   if published "$sha"; then log "PR #$pr ${sha:0:7}: already reviewed and published"; continue; fi
 
