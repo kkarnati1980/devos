@@ -10,6 +10,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # DEVOS-139 G3: p95 under 4 min on 12 Nov; the ceiling only stops a hung job
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

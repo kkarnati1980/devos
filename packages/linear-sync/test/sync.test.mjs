@@ -1,7 +1,7 @@
 // M2.6-a AT1–AT3: outbound sync against an in-memory Linear.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { syncProject, fencedApi } from "../dist/index.js";
+import { syncProject, fencedApi, withMarker } from "../dist/index.js";
 import { fakeLinear, memoryStore } from "./fake-linear.mjs";
 
 const u = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
@@ -300,4 +300,38 @@ test("M2.6-b decision 3: a human task reopened in Linear after DevOS took it as 
   assert.equal(plan.tasks.find((t) => t.id === u(33)).status, "done");
   assert.ok(r.log.some((l) => /reopened in Linear \(unstarted\) but done in DevOS/.test(l)), r.log.join("\n"));
   assert.equal(r.writes, 0); assert.equal(r.inbound.length, 0);
+});
+
+test("DEVOS-162: tasks of kind `analysis` are never created, updated or adopted in Linear", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  const analysis = [
+    { id: u(41), moduleId: u(22), title: "Analyst pass 1", kind: "analysis", assignee: "agent", status: "failed", linearIssue: null },
+    { id: u(42), moduleId: null, title: "Analyst pass 2", kind: "analysis", assignee: "agent", status: "done", linearIssue: null },
+  ];
+  plan.tasks.push(...analysis);
+  const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const baseline = fakeLinear(); const clean = throwaway();
+  await syncProject(clean, baseline.api, memoryStore(clean));
+  const shape = (X) => X.issues.map((i) => `${i.title}|${i.parentId ? X.issues.find((p) => p.id === i.parentId)?.title : ""}`).sort();
+  assert.deepEqual(shape(L), shape(baseline), "same issues (titles and parents) as a plan with no analysis tasks");
+  for (const a of analysis) {
+    assert.ok(!L.issues.some((i) => (i.description ?? "").includes(a.id) || i.title === a.title), `${a.title} is not in Linear`);
+    assert.equal(a.linearIssue, null, "no Linear id stored for an analysis task");
+  }
+  L.writes.length = 0;
+  await syncProject(plan, L.api, store);
+  assert.equal(L.writes.length, 0, "a second sync writes nothing");
+});
+
+test("DEVOS-162: an analysis task with a stored id and a marked Linear issue is neither updated, moved nor adopted", async () => {
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const pid = L.projects[0].id;
+  const strayId = "i-stray-analysis";
+  L.issues.push({ ...L.issues[L.issues.length - 1], id: strayId, blockedBy: [], projectId: pid, parentId: null, title: "Old analyst issue", description: withMarker("x", "task", u(43)) });
+  plan.tasks.push({ id: u(43), moduleId: u(22), title: "Analyst pass 3", kind: "analysis", assignee: "agent", status: "failed", linearIssue: strayId });
+  L.writes.length = 0;
+  await syncProject(plan, L.api, store);
+  assert.deepEqual(L.writes, [], "no write at all: the marked issue is not updated, moved or re-titled");
 });
