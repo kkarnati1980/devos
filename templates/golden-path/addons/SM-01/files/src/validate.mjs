@@ -14,6 +14,19 @@ export const DEFAULT_BODY_TIMEOUT_MS = 10_000;
 
 const kindOf = (v) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
 
+const TYPES = new Set(["string", "integer", "number", "boolean", "array", "object"]);
+
+/** Throws on a schema mistake (unknown type, list without items, bad pattern), anywhere in the schema. */
+export function checkSchema(schema, path = "(root)") {
+  if (!schema || typeof schema !== "object" || !TYPES.has(schema.type)) throw new Error(`validate: bad schema at ${path}`);
+  if (schema.pattern !== undefined) new RegExp(schema.pattern);
+  if (schema.type === "array") {
+    if (!schema.items) throw new Error(`validate: list without items at ${path}`);
+    checkSchema(schema.items, `${path}[]`);
+  }
+  if (schema.type === "object") for (const [k, s] of Object.entries(schema.properties ?? {})) checkSchema(s, `${path}.${k}`);
+}
+
 /** Returns a list of `{ path, message }`; empty when `value` matches `schema`. */
 export function validate(schema, value, path = "", errors = []) {
   const err = (message) => { if (errors.length < MAX_ERRORS) errors.push({ path: path || "(root)", message }); };
@@ -52,7 +65,8 @@ export function validate(schema, value, path = "", errors = []) {
       if (kindOf(value) !== "object") return err("must be an object"), errors;
       const props = schema.properties ?? {};
       for (const k of Object.keys(value)) {
-        if (!Object.hasOwn(props, k)) err(`${JSON.stringify(k.slice(0, 40))} is not an allowed field`);
+        // The name is shown only when it is a plain identifier, so a crafted key is never echoed (no reflection).
+        if (!Object.hasOwn(props, k)) err(/^[A-Za-z0-9_]{1,40}$/.test(k) ? `"${k}" is not an allowed field` : "has a field that is not allowed");
       }
       for (const k of schema.required ?? []) {
         if (!Object.hasOwn(value, k) || value[k] === undefined) {
@@ -74,7 +88,9 @@ export function validate(schema, value, path = "", errors = []) {
  * schema asks for them, so the same schema rules apply. A repeated query key is refused unless the schema is a list.
  */
 function coerce(schema, raw) {
-  const out = {};
+  // Built with own data properties (Object.fromEntries), never `out[k] = …`: a `__proto__` key must stay a plain,
+  // unknown field that validation refuses, not a prototype change that hides it (pre-review r1).
+  const out = [];
   const props = schema?.properties ?? {};
   const one = (s, v) => {
     if ((s?.type === "integer" || s?.type === "number") && /^-?\d{1,15}(\.\d{1,15})?$/.test(v)) return Number(v);
@@ -83,10 +99,10 @@ function coerce(schema, raw) {
   };
   for (const [k, vals] of raw) {
     const s = Object.hasOwn(props, k) ? props[k] : undefined;
-    if (s?.type === "array") out[k] = vals.map((v) => one(s.items, v));
-    else out[k] = vals.length === 1 ? one(s, vals[0]) : [...vals]; // a repeated key is a list: refused unless the schema says list
+    if (s?.type === "array") out.push([k, vals.map((v) => one(s.items, v))]);
+    else out.push([k, vals.length === 1 ? one(s, vals[0]) : [...vals]]); // a repeated key is a list: refused unless the schema says list
   }
-  return out;
+  return Object.fromEntries(out);
 }
 
 const groupQuery = (url) => {
@@ -109,10 +125,13 @@ export function readJson(req, { limit = DEFAULT_BODY_LIMIT, timeoutMs = DEFAULT_
     let size = 0;
     let done = false;
     const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); fn(v); };
-    const timer = setTimeout(() => { finish(reject, new HttpInputError(408, "body-timeout")); req.destroy(); }, timeoutMs);
+    // Over the limit or too slow: stop buffering (the rest is discarded) and let the caller answer 413/408 first;
+    // the socket is closed once that answer is sent (pre-review r1), so the client sees the status, not a reset.
+    const timer = setTimeout(() => finish(reject, new HttpInputError(408, "body-timeout")), timeoutMs);
     req.on("data", (c) => {
+      if (done) return;
       size += c.length;
-      if (size > limit) { finish(reject, new HttpInputError(413, "body-too-large")); req.destroy(); return; }
+      if (size > limit) { chunks.length = 0; finish(reject, new HttpInputError(413, "body-too-large")); return; }
       chunks.push(c);
     });
     req.on("error", () => finish(reject, new HttpInputError(400, "body-unreadable")));
@@ -138,7 +157,7 @@ const send = (res, code, obj) => {
  */
 export function validated(schemas, handler, opts = {}) {
   const { body: bodySchema, query: querySchema, params: paramsSchema } = schemas ?? {};
-  for (const s of [bodySchema, querySchema, paramsSchema]) if (s !== undefined) validate(s, undefined); // fail fast on a bad schema type
+  for (const s of [bodySchema, querySchema, paramsSchema]) if (s !== undefined) checkSchema(s); // fail at start-up, not on a request
   return async (req, res, ctx = {}) => {
     const details = [];
     const check = (where, schema, value) => {
@@ -152,7 +171,10 @@ export function validated(schemas, handler, opts = {}) {
     try {
       body = await readJson(req, opts);
     } catch (e) {
-      if (e instanceof HttpInputError) return send(res, e.status, { error: e.error });
+      if (e instanceof HttpInputError) {
+        if (e.status === 413 || e.status === 408) res.on("finish", () => req.destroy());
+        return send(res, e.status, { error: e.error });
+      }
       throw e;
     }
     const params = coerce(paramsSchema, Object.entries(ctx.params ?? {}).map(([k, v]) => [k, [String(v)]]));

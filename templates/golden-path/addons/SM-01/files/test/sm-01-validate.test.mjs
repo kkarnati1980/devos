@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createApp } from "../src/server.mjs";
 import { loadConfig } from "../src/config.mjs";
+import http from "node:http";
 import { validate, validated, invalidCases } from "../src/validate.mjs";
 
 const NOTE = {
@@ -96,15 +97,34 @@ test("SM-01-L1: malformed bodies get 4xx: not JSON (400), wrong content type (41
     assert.equal((await post(base, JSON.stringify(VALID), { "content-type": "text/plain" })).status, 415);
     assert.equal((await post(base, { ...VALID, title: "x".repeat(200_000) })).status, 413);
     assert.equal((await post(base, '{"title":"a","priority":1,"__proto__":{"admin":true}}')).status, 400, "__proto__ is an unknown field");
+    for (const q of ["__proto__=a", "__proto__=a&__proto__=b", "constructor=x"]) {
+      assert.equal((await fetch(`${base}/notes?${q}`)).status, 400, `GET ?${q}`);
+      assert.equal((await fetch(`${base}/notes?${q}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(VALID) })).status, 400, `POST ?${q}`);
+    }
+    // A chunked body over the limit gets a 413 answer, not a connection reset.
+    const status = await new Promise((resolve, reject) => {
+      const u = new URL(`${base}/notes`);
+      const r = http.request({ host: u.hostname, port: u.port, path: "/notes", method: "POST", headers: { "content-type": "application/json", "transfer-encoding": "chunked" } }, (res) => { res.resume(); resolve(res.statusCode); });
+      r.on("error", reject);
+      const chunk = "x".repeat(16_000);
+      let n = 0;
+      const pump = () => { while (n < 25) { n++; if (!r.write(chunk)) return r.once("drain", pump); } r.end(); };
+      pump();
+    });
+    assert.equal(status, 413);
     assert.equal(reached.length, 0);
   });
 });
 
 test("SM-01-L1: error messages name the field and rule, never echo the value sent", () => {
-  const errs = validate(NOTE, { title: "<script>alert(1)</script>".repeat(10), priority: 9, extra: 1 });
+  const errs = validate(NOTE, { title: "<script>alert(1)</script>".repeat(10), priority: 9, extra: 1, "<img src=x onerror=alert(1)>": 1 });
   const text = JSON.stringify(errs);
   assert.ok(!text.includes("<script>"));
-  assert.deepEqual(errs.map((e) => e.path).sort(), ["(root)", "priority", "title"]);
+  assert.ok(!text.includes("<img"));
+  assert.deepEqual(errs.map((e) => e.path).sort(), ["(root)", "(root)", "priority", "title"]);
   assert.throws(() => validate({ type: "nope" }, 1), /unknown schema type/);
+  // Schema mistakes fail when the route is set up, not on the first request.
+  assert.throws(() => validated({ body: { type: "object", properties: { tags: { type: "array" } } } }, () => {}), /list without items/);
+  assert.throws(() => validated({ query: { type: "object", properties: { n: { type: "strng" } } } }, () => {}), /bad schema/);
   assert.throws(() => invalidCases(NOTE, { title: "" }), /not valid/);
 });
