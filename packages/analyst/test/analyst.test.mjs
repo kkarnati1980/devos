@@ -463,3 +463,21 @@ test("AT10g (PR53-r10) an IDs-only reference inside a heading requirement keeps 
   assert.ok(!a.openQuestions.some((q) => q.kind === "missing-acceptance"));
   assert.ok(!a.warnings.some((w) => w.code === "duplicate-id"));
 });
+
+test("AT10h (PR53-r11) IDs-only items under a requirement are references, not criteria", () => {
+  const { a } = analyze(`## Requirements
+
+### FR-1: Login
+
+- FR-2
+- FR-2, FR-3
+
+- FR-4: Export
+  - FR-5
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.acceptance]), [["FR-1", []], ["FR-4", []]]);
+  assert.deepEqual(
+    a.openQuestions.filter((q) => q.kind === "missing-acceptance").map((q) => q.requirement),
+    ["FR-1", "FR-4"],
+  );
+});
