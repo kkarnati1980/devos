@@ -357,6 +357,11 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     // Criteria under an open requirement.
     const cur = open as typeof open;
     if (cur) {
+      // An IDs-only item (`- FR-2`, `- FR-2, FR-3`) is a reference, never a criterion, under either kind of
+      // requirement; it keeps a heading requirement's scope open (PR53-r10, r11).
+      if (b.type === "list-item" && (cur.kind === "heading" || b.depth > cur.depth) && isBareIdReference(text, prefixes)) {
+        return;
+      }
       if (cur.kind === "list" && b.type === "list-item" && b.depth > cur.depth) {
         addCriterion(cur.req, text, i);
         return;
