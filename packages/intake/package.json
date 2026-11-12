@@ -1,0 +1,25 @@
+{
+  "name": "@devos/intake",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DevOS spec ingestion: .docx, .pdf, .md, .html to inert structured text with requirement IDs (M2.1).",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
+    "check-spec": "tsc -p tsconfig.json && node dist/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "typescript": "^5.6.3"
+  }
+}
