@@ -344,3 +344,17 @@ FR-1
   assert.deepEqual(stated, ["Session duration TBD", "Format TBC", "Hosting TBD"]);
   assert.deepEqual(a.stack.map((s) => s.text), ["Hosting TBD"]);
 });
+
+test("AT10b (PR53-r2) bare ID list items are references; an ID-less item with TBD is a requirement and a question", () => {
+  const { a } = analyze(`## Requirements
+
+- FR-1
+- **FR-2**, FR-3
+- Users can export reports; format TBD
+  - Export downloads
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.title, r.assigned]), [["FR-A001", "Users can export reports; format TBD", true]]);
+  assert.deepEqual(a.requirements[0].acceptance, ["Export downloads"]);
+  assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), ["FR-A001: Users can export reports; format TBD"]);
+  assert.equal(a.openQuestions.filter((q) => q.kind === "missing-acceptance").length, 0);
+});

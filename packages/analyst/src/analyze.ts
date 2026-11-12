@@ -179,6 +179,15 @@ function blockText(b: Block): string {
  * Deterministic Analyst pass (M2.2-a): spec blocks → requirements, milestones, stack and open questions.
  * Every item points at the block it came from; nothing is produced from outside the blocks.
  */
+/** True when the text is only requirement IDs plus punctuation/emphasis (a reference list item). */
+function isBareIdReference(text: string, prefixes: readonly string[]): boolean {
+  const ids = extractRequirementIds(text, prefixes);
+  if (ids.length === 0) return false;
+  let rest = text;
+  for (const { id } of ids) rest = rest.split(id).join(" ");
+  return !/[\p{L}\p{N}]/u.test(rest.replace(/\b(and|or|see)\b/gi, " "));
+}
+
 export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = {}): Analysis {
   const prefixes = options.idPrefixes ?? DEFAULT_ID_PREFIXES;
   const assignPrefix = options.assignPrefix ?? "FR";
@@ -348,17 +357,21 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
       stated.push({ text, source: i });
       return;
     }
-    if (isQuestionText(text)) {
-      stated.push({ text, source: i });
-      return;
-    }
     if (section === "requirements" && b.type === "list-item" && b.depth === 0) {
-      // ID-less requirement item: assign an ID that never collides with a spec ID or token.
+      // A bare ID reference (`- FR-1`, `- **FR-1**, FR-2`) is not a definition: no requirement (PR53-r2).
+      if (isBareIdReference(text, prefixes)) return;
+      // ID-less requirement item: assign an ID that never collides with a spec ID or token. An item with
+      // an unresolved detail (`format TBD`) is both a requirement and (via addRequirement) a stated
+      // question (behaviours 5, 7).
       const prMatch = PRIORITY_SUFFIX.exec(text);
       const key = nextAssignedKey();
       const title = prMatch ? text.slice(0, prMatch.index).trim() : text;
       const req = addRequirement(key, title, prMatch?.[1] ?? "", [], currentMilestone, i, true) ?? sink(key, i);
       open = { req, kind: "list", depth };
+      return;
+    }
+    if (isQuestionText(text)) {
+      stated.push({ text, source: i });
     }
   });
 
