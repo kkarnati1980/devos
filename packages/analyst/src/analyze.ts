@@ -70,17 +70,22 @@ const PRIORITY_HEADERS = new Set(["priority", "moscow"]);
 const ACCEPTANCE_HEADERS = new Set(["acceptance", "acceptance criteria", "done when", "ac"]);
 const MILESTONE_HEADERS = new Set(["milestone", "phase", "release"]);
 
-const MILESTONE_HEADING = /^(phase|milestone|stage|release|sprint|iteration)\b\s*[\w.]*/i;
+// A milestone heading names a number or a name: "Phase 1", "Release 2.0", "Milestone: MVP", "Stage IV", "Phase one".
+const MILESTONE_HEADING =
+  /^(phase|milestone|stage|release|sprint|iteration)\s*(?:\d|[ivx]+\b|(?:one|two|three|four|five|six|seven|eight|nine|ten)\b|[:\-–—]\s*\S)/i;
 const ACCEPTANCE_PARA = /^(acceptance( criteria)?\s*:|ac\s*:|done when\s*:|given\b|when\b|then\b)/i;
-const SEPARATOR = /^\s*(?:[:\-–—.)]|\*\*\s*[:\-–—.)]?)\s*/;
+// A hyphen separates only when followed by a space, so FR-1-2 is not FR-1 titled "2".
+const SEPARATOR = /^\s*(?:[:–—.)]|-(?=\s))\s*/;
+const ASSIGNED_TOKEN = /(?<![A-Za-z0-9_-])[A-Z][A-Z0-9]{0,9}-A\d+(?![A-Za-z0-9_])/g;
 
 function norm(s: string): string {
   return s.toLowerCase().replace(/[*_`]/g, "").replace(/\s+/g, " ").trim();
 }
 
 function sectionOf(heading: string): Section {
-  const h = norm(heading);
-  if (/open questions?|^questions\b|\btbd\b|unresolved|assumptions to confirm/.test(h)) return "questions";
+  // Numbered headings ("3. Functional requirements", "4.2 Open questions") are matched without the number.
+  const h = norm(heading).replace(/^\d+(?:\.\d+)*\.?\s*/, "");
+  if (/\bquestions?\b|\btbd\b|unresolved|assumptions to confirm/.test(h)) return "questions";
   if (/\bstack\b|\btechnolog(y|ies)\b|\btech\b/.test(h)) return "stack";
   if (/^(functional )?requirements\b|^features\b|^user stories\b/.test(h)) return "requirements";
   return "other";
@@ -108,10 +113,8 @@ function leadingId(text: string, prefixes: readonly string[]): { key: string; re
   if (!first || !stripped.startsWith(first.id)) return null;
   let rest = stripped.slice(first.id.length).replace(/^[*_\]`]+/, "");
   const sep = SEPARATOR.exec(rest);
-  if (!sep || (sep[0].trim() === "" && rest.trim() !== "")) {
-    // An ID followed directly by words with no separator is a reference, not a definition.
-    if (rest.trim() !== "") return null;
-  }
+  // An ID followed directly by words with no separator is a reference, not a definition.
+  if (!sep && rest.trim() !== "") return null;
   rest = rest.slice(sep ? sep[0].length : 0).replace(/^[*_]+\s*/, "").trim();
   return { key: first.id, rest };
 }
@@ -184,12 +187,23 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   const stack: StackItem[] = [];
   const stated: { text: string; source: number }[] = [];
   const outOfScope: OutOfScopeItem[] = [];
+  const outOfScopeKeys = new Set<string>();
   const warnings: AnalysisWarning[] = [];
-  const unassigned: { title: string; source: number; milestone: string | null; priority: Priority | "wont" | null }[] = [];
 
   // Every ID that appears anywhere, so assigned IDs never collide with one.
   const allText = blocks.map(blockText).join("\n");
   const specIds = new Set(extractRequirementIds(allText, prefixes).map((r) => r.id));
+  // Tokens already shaped like an assigned ID (one linear pass; PR pre-review finding 4).
+  for (const m of allText.matchAll(ASSIGNED_TOKEN)) specIds.add(m[0]);
+  let assignedN = 0;
+  const nextAssignedKey = (): string => {
+    let key: string;
+    do {
+      assignedN += 1;
+      key = `${assignPrefix}-A${String(assignedN).padStart(3, "0")}`;
+    } while (specIds.has(key) || byKey.has(key));
+    return key;
+  };
 
   const addMilestone = (name: string, source: number) => {
     const n = name.trim();
@@ -208,12 +222,13 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     assigned = false,
   ): Requirement | null => {
     const pr = parsePriority(rawPriority);
-    if (pr === "wont") {
-      outOfScope.push({ key, title, source });
+    if (byKey.has(key) || outOfScopeKeys.has(key)) {
+      warnings.push({ code: "duplicate-id", key, source });
       return null;
     }
-    if (byKey.has(key) || outOfScope.some((o) => o.key === key)) {
-      warnings.push({ code: "duplicate-id", key, source });
+    if (pr === "wont") {
+      outOfScope.push({ key, title, source });
+      outOfScopeKeys.add(key);
       return null;
     }
     let priority: Priority = "must";
@@ -228,7 +243,13 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   let section: Section = "other";
   let currentMilestone: string | null = null;
   // The requirement that following criteria attach to, and how they attach.
+  // A rejected requirement (duplicate or Won't) still owns its criteria: they go to a sink, never becoming
+  // requirements of their own (pre-review finding 1).
   let open: { req: Requirement; kind: "heading" } | { req: Requirement; kind: "list"; depth: number } | null = null;
+  const sink = (key: string, source: number): Requirement => ({
+    key, title: "", priority: "must", acceptance: [], milestone: null, assigned: false, source,
+  });
+  const isCriterionId = (key: string) => /^AC(?![A-Z])/.test(key);
 
   blocks.forEach((b, i) => {
     if (b.type === "heading") {
@@ -237,6 +258,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
       if (ms && !id) {
         addMilestone(b.text.trim(), i);
         currentMilestone = b.text.trim();
+        section = "other";
         open = null;
         return;
       }
@@ -244,7 +266,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
         const prMatch = /\((must|should|could|won['’]?t)\)\s*$/i.exec(id.rest);
         const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;
         const r = addRequirement(id.key, title, prMatch?.[1] ?? "", [], currentMilestone, i);
-        open = r ? { req: r, kind: "heading" } : null;
+        open = { req: r ?? sink(id.key, i), kind: "heading" };
         return;
       }
       section = sectionOf(b.text);
@@ -283,7 +305,8 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
         cur.req.acceptance.push(text);
         return;
       }
-      if (cur.kind === "heading" && b.type === "list-item" && !leadingId(text, prefixes)) {
+      const lid = leadingId(text, prefixes);
+      if (cur.kind === "heading" && b.type === "list-item" && (!lid || isCriterionId(lid.key))) {
         cur.req.acceptance.push(text);
         return;
       }
@@ -298,8 +321,8 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     if (id && (b.type === "list-item" || b.type === "paragraph")) {
       const prMatch = /\((must|should|could|won['’]?t)\)\s*$/i.exec(id.rest);
       const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;
-      const r = addRequirement(id.key, title, prMatch?.[1] ?? "", [], currentMilestone, i);
-      open = r ? (b.type === "list-item" ? { req: r, kind: "list", depth } : { req: r, kind: "heading" }) : null;
+      const req = addRequirement(id.key, title, prMatch?.[1] ?? "", [], currentMilestone, i) ?? sink(id.key, i);
+      open = b.type === "list-item" ? { req, kind: "list", depth } : { req, kind: "heading" };
       return;
     }
 
@@ -316,27 +339,15 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
       return;
     }
     if (section === "requirements" && b.type === "list-item" && b.depth === 0) {
+      // ID-less requirement item: assign an ID that never collides with a spec ID or token.
       const prMatch = /\((must|should|could|won['’]?t)\)\s*$/i.exec(text);
-      unassigned.push({
-        title: prMatch ? text.slice(0, prMatch.index).trim() : text,
-        source: i,
-        milestone: currentMilestone,
-        priority: prMatch ? parsePriority(prMatch[1] ?? "") : null,
-      });
+      const key = nextAssignedKey();
+      const title = prMatch ? text.slice(0, prMatch.index).trim() : text;
+      const req = addRequirement(key, title, prMatch?.[1] ?? "", [], currentMilestone, i, true) ?? sink(key, i);
+      open = { req, kind: "list", depth };
     }
   });
 
-  // Assign IDs to ID-less requirement items, never colliding with a spec ID.
-  let n = 0;
-  for (const u of unassigned) {
-    let key: string;
-    do {
-      n += 1;
-      key = `${assignPrefix}-A${String(n).padStart(3, "0")}`;
-    } while (specIds.has(key) || byKey.has(key) || new RegExp(`(?<![A-Za-z0-9_-])${key}(?![A-Za-z0-9_])`).test(allText));
-    const pr = u.priority === null ? "" : u.priority;
-    addRequirement(key, u.title, pr, [], u.milestone, u.source, true);
-  }
   requirements.sort((a, b) => a.source - b.source);
 
   const openQuestions: OpenQuestion[] = [];

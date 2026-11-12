@@ -200,3 +200,98 @@ test("AT9 60 requirements across 9 phases", () => {
 test("assignPrefix is validated", () => {
   assert.throws(() => analyzeSpec([], { assignPrefix: "fr-x" }), TypeError);
 });
+
+test("AT5b rejected headings swallow their criteria; Won't after a kept ID is a duplicate", () => {
+  const { a } = analyze(`## Requirements
+
+### FR-1: Login (Must)
+
+- Link sent
+
+### FR-1: Login again
+
+- Second definition criterion
+
+### FR-9: Dark mode (Won't)
+
+- Toggle in settings
+- Remembers choice
+`);
+  assert.deepEqual(a.requirements.map((r) => r.key), ["FR-1"]);
+  assert.deepEqual(a.requirements[0].acceptance, ["Link sent"]);
+  assert.deepEqual(a.outOfScope.map((o) => o.key), ["FR-9"]);
+  assert.ok(a.requirements.every((r) => !r.assigned));
+  const t = analyze(`| ID | Title | Priority | Acceptance |
+|---|---|---|---|
+| FR-1 | Login | Must | ok |
+| FR-1 | Login v2 | Won't | x |
+`).a;
+  assert.deepEqual(t.requirements.map((r) => r.key), ["FR-1"]);
+  assert.equal(t.outOfScope.length, 0);
+  assert.ok(t.warnings.some((w) => w.code === "duplicate-id" && w.key === "FR-1"));
+});
+
+test("AT2b AC-n items are criteria of the requirement above", () => {
+  const { a } = analyze(`### FR-1: Login (Must)
+
+- AC-1: Link sent
+- AC-2: Link expires
+`);
+  assert.deepEqual(a.requirements.map((r) => r.key), ["FR-1"]);
+  assert.deepEqual(a.requirements[0].acceptance, ["AC-1: Link sent", "AC-2: Link expires"]);
+  assert.equal(a.openQuestions.length, 0);
+});
+
+test("AT4b assigned requirements keep nested criteria; numbered section headings", () => {
+  const { a } = analyze(`## 3. Functional requirements
+
+- Users can reset password (Must)
+  - Email sent within 1 min
+
+## 4.2 Outstanding questions
+
+- Which SMS provider
+`);
+  assert.equal(a.requirements.length, 1);
+  assert.equal(a.requirements[0].key, "FR-A001");
+  assert.deepEqual(a.requirements[0].acceptance, ["Email sent within 1 min"]);
+  assert.deepEqual(a.openQuestions.map((q) => q.text), ["Which SMS provider"]);
+});
+
+test("AT6b sections end at milestone headings; Release notes is not a milestone; references are not definitions", () => {
+  const { a } = analyze(`## Tech stack
+
+- Go
+
+## Phase 1 — MVP
+
+- FR-1: Login
+  - works
+
+The dashboard shows totals.
+
+## Release notes
+
+- FR-2: Export (Must)
+  - CSV
+
+- FR-1-2: Not an ID definition
+`);
+  assert.deepEqual(a.stack.map((s) => s.text), ["Go"]);
+  assert.deepEqual(a.milestones.map((m) => m.name), ["Phase 1 — MVP"]);
+  assert.equal(a.requirements[1].milestone, "Phase 1 — MVP");
+  assert.deepEqual(a.requirements.map((r) => r.key), ["FR-1", "FR-2"]);
+});
+
+test("AT8b out of scope renders; many assigned IDs stay linear", () => {
+  const { a } = analyze(`| ID | Title | Priority | Acceptance |
+|---|---|---|---|
+| FR-2 | Dark mode | Won't | n/a |
+`);
+  assert.match(renderRequirementsMd(a, META), /## Out of scope\n\n- FR-2 — Dark mode/);
+  const items = Array.from({ length: 20000 }, (_, i) => `- Item ${i}`).join("\n");
+  const t0 = Date.now();
+  const big = analyze(`## Requirements\n\n${items}\n`).a;
+  assert.equal(big.requirements.length, 20000);
+  assert.ok(Date.now() - t0 < 5000, "20k assigned IDs took too long");
+});
