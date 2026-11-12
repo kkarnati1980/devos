@@ -3,7 +3,7 @@
 // Contract: docs/modules/S4.md (S4-b, AT5-AT8).
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -28,15 +28,26 @@ case "$op" in
   -C) [[ -f "$f" ]] && grep -qxF -- "-A $ch $*" "$f" ;;
   -D) [[ -f "$f" ]] && grep -qxF -- "-A $ch $*" "$f" || exit 1
       awk -v r="-A $ch $*" '!d && $0==r {d=1; next} {print}' "$f" > "$f.n" && mv "$f.n" "$f" ;;
-  -I) shift; { echo "-A $ch $*"; cat "$f"; } > "$f.n" && mv "$f.n" "$f"; [[ -n "\${FAKE_I_RC:-}" ]] && exit "$FAKE_I_RC"; exit 0 ;;
+  -I) shift; { echo "-A $ch $*"; cat "$f"; } > "$f.n" && mv "$f.n" "$f" ;;
   -F) : > "$f" ;;
   -X) rm -f "$f" ;;
   *) exit 2 ;;
 esac`);
-  // iptables-restore --noflush: declared chains are (re)created empty, then -A lines appended; FAKE_RESTORE_RC != 0 fails first.
+  // iptables-restore --noflush: all-or-nothing like the real one (FAKE_RESTORE_RC != 0 fails before any
+  // change); declared chains are (re)created empty, then -A / -D / -I lines are applied in order. When
+  // FAKE_KILL_PID is set, that process (a self-test listener) is killed after a successful restore.
   w("iptables-restore", `in="$(cat)"; n=$(ls "$FAKE_LOG" | grep -c '^restore\\.' ); printf '%s\\n' "$in" > "$FAKE_LOG/restore.$n"
 [[ "\${FAKE_RESTORE_RC:-0}" == 0 ]] || exit "$FAKE_RESTORE_RC"
-while IFS= read -r l; do case "$l" in :*) c="\${l#:}"; c="\${c%% *}"; : > "$FAKE_NF/$c" ;; -A\\ *) c="$(cut -d' ' -f2 <<<"$l")"; echo "$l" >> "$FAKE_NF/$c" ;; esac; done <<<"$in"`);
+while IFS= read -r l; do
+  c="$(cut -d' ' -f2 <<<"$l")"; f="$FAKE_NF/$c"
+  case "$l" in
+    :*) c="\${l#:}"; c="\${c%% *}"; : > "$FAKE_NF/$c" ;;
+    -A\\ *) echo "$l" >> "$f" ;;
+    -D\\ *) r="-A \${l#-D }"; awk -v r="$r" '!d && $0==r {d=1; next} {print}' "$f" > "$f.n" && mv "$f.n" "$f" ;;
+    -I\\ *) r="\${l#-I $c 1 }"; { echo "-A $c $r"; cat "$f"; } > "$f.n" && mv "$f.n" "$f" ;;
+  esac
+done <<<"$in"
+if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sleep 0.3; fi`);
   // curl: logs argv (to prove the token is not on it) and prints FAKE_STATE; FAKE_CURL_RC fails the fetch.
   w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; cat "$FAKE_STATE"`);
   w("tailscale", `exit 1`);
@@ -99,7 +110,7 @@ test("apply puts both jumps first, records the block, and a second run writes no
   assert.equal(fs.readFileSync(installed(h), "utf8"), fs.readFileSync(GOLDEN, "utf8"));
   const log = fs.readFileSync(path.join(h, "log/curl.args"), "utf8");
   assert.doesNotMatch(log, /t0ken/, "token never on curl's argv");
-  assert.match(log, /--max-time 15/);
+  assert.match(log, /--max-time 10/);
   const ipLog1 = fs.readFileSync(path.join(h, "log/iptables.log"), "utf8");
   r = run(h);
   assert.equal(r.code, 0, r.out);
@@ -131,6 +142,9 @@ for (const [name, bad] of [
   ["string egress", { stacks: [{ slug: "a", env: "live", idx: 1, egress: "yes", tailnet: [] }] }],
   ["extra field", { stacks: [{ slug: "a", env: "live", idx: 1, egress: false, tailnet: [], secret: "x" }] }],
   ["malformed JSON", "{\"stacks\": ["],
+  ["newline in a tailnet string forging a stack", { stacks: [{ slug: "alpha", env: "preview", idx: 0, egress: false, tailnet: ["100.64.0.1/32\n7\tforged\tlive\ttrue\t100.64.0.0/10"] }] }],
+  ["two CIDRs in one string", { stacks: [{ slug: "a", env: "live", idx: 1, egress: false, tailnet: ["100.64.0.1/32,100.64.0.2/32"] }] }],
+  ["two concatenated documents", '{"stacks":[]}{"stacks":[{"slug":"a","env":"live","idx":1,"egress":true,"tailnet":[]}]}'],
   ["injection in comment text", { stacks: [{ slug: "a\" -j ACCEPT", env: "live", idx: 1, egress: false, tailnet: [] }] }],
 ]) {
   test(`AT6 bad state refused: ${name}; last good block kept`, () => {
@@ -154,42 +168,109 @@ test("AT6 a failed state fetch changes nothing", () => {
   assert.equal(restores(h), 0);
 });
 
-test("AT7 a failed iptables-restore leaves the previous block and installed record in place", () => {
+test("AT7 a failed iptables-restore leaves the previous chains, jumps and record in place", () => {
   const h = host(STATE);
   assert.equal(run(h).code, 0);
+  const snap = ["DOCKER-USER", "INPUT", "DEVOS-ISO-FWD", "DEVOS-ISO-IN"].map((c) => nf(h, c));
   const before = fs.readFileSync(installed(h), "utf8");
   setState(h, { stacks: [] });
   const r = run(h, [], { FAKE_RESTORE_RC: "1" });
   assert.equal(r.code, 1, r.out);
-  assert.match(r.out, /apply failed/);
+  assert.match(r.out, /apply failed .*previous block is still in place/);
+  assert.deepEqual(["DOCKER-USER", "INPUT", "DEVOS-ISO-FWD", "DEVOS-ISO-IN"].map((c) => nf(h, c)), snap);
   assert.equal(fs.readFileSync(installed(h), "utf8"), before);
 });
 
-test("AT8 self-test failure rolls back to the previous block in the same run", () => {
+test("AT7 the jumps change in the same restore transaction as the chains (no -D/-I outside it)", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const tx = fs.readFileSync(path.join(h, "log/restore.0"), "utf8");
+  assert.match(tx, /-I DOCKER-USER 1 -j DEVOS-ISO-FWD\n-I INPUT 1 -j DEVOS-ISO-IN\nCOMMIT\n$/);
+  const writes = fs.readFileSync(path.join(h, "log/iptables.log"), "utf8").split("\n").filter((l) => /^-(I|D|F|X) /.test(l));
+  assert.deepEqual(writes, []);
+});
+
+test("drift: a hand-flushed S4 chain is rebuilt on the next run", () => {
   const h = host(STATE);
   assert.equal(run(h).code, 0);
   const good = nf(h, "DEVOS-ISO-FWD");
-  setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
-  fs.appendFileSync(path.join(h, "devos/server-agent.conf"), "");
-  fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=127.0.0.1:${upPort} 127.0.0.1:${downPort}\n`);
+  fs.writeFileSync(path.join(h, "nf/DEVOS-ISO-FWD"), "");
   const r = run(h);
-  assert.equal(r.code, 1, r.out);
-  assert.match(r.out, /self-test: 127\.0\.0\.1:\d+ did not answer/);
-  assert.match(r.out, /rolled back to the previous block/);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /applied/);
   assert.equal(nf(h, "DEVOS-ISO-FWD"), good);
-  assert.doesNotMatch(fs.readFileSync(installed(h), "utf8"), /gamma/);
 });
 
-test("AT8 self-test failure on the first apply removes the block entirely", () => {
-  const h = host(STATE, { conf: "" });
-  fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=127.0.0.1:${downPort}\n`);
+test("index 1023 is accepted (pool 10.211.255.0/24)", () => {
+  const h = host({ stacks: [{ slug: "last", env: "live", idx: 1023, egress: false, tailnet: [] }] });
+  const r = run(h, ["--dry-run"]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /-s 10\.211\.255\.0\/24 -d 10\.211\.255\.0\/24/);
+});
+
+async function listener() {  // a self-test target in its own process, so the fake restore can kill it
+  const c = spawn(process.execPath, ["-e", "require('net').createServer(s=>s.end()).listen(0,'127.0.0.1',function(){console.log(this.address().port)})"]);
+  const port = await new Promise((r) => c.stdout.once("data", (d) => r(Number(String(d).trim()))));
+  return { pid: c.pid, port, stop: () => { try { c.kill("SIGKILL"); } catch {} } };
+}
+const targets = (h, ...ports) => fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=${ports.map((p) => "127.0.0.1:" + p).join(" ")}\n`);
+
+test("AT8 self-test that passed before and fails after rolls back to the previous block", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const good = nf(h, "DEVOS-ISO-FWD");
+  const l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /self-test failed after apply \(self-test: 127\.0\.0\.1:\d+ did not answer\)/);
+    assert.match(r.out, /rolled back to the previous block/);
+    assert.equal(nf(h, "DEVOS-ISO-FWD"), good);
+    assert.equal(nf(h, "DOCKER-USER").match(/DEVOS-ISO-FWD/g).length, 1);
+    assert.doesNotMatch(fs.readFileSync(installed(h), "utf8"), /gamma/);
+  } finally { l.stop(); }
+});
+
+test("AT8 self-test failure on the first apply removes the block entirely", async () => {
+  const h = host(STATE);
+  const l = await listener();
+  try {
+    targets(h, l.port);
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /rolled back: S4 block removed/);
+    assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+    assert.doesNotMatch(nf(h, "DOCKER-USER"), /DEVOS-ISO/);
+    assert.doesNotMatch(nf(h, "INPUT"), /DEVOS-ISO/);
+    assert.equal(fs.existsSync(installed(h)), false);
+  } finally { l.stop(); }
+});
+
+test("a host self-test already failing before the change keeps the block (isolation is the floor) and reports it", () => {
+  const h = host(STATE);
+  targets(h, downPort);
   const r = run(h);
   assert.equal(r.code, 1, r.out);
-  assert.match(r.out, /rolled back: S4 block removed/);
-  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
-  assert.doesNotMatch(nf(h, "DOCKER-USER"), /DEVOS-ISO/);
-  assert.doesNotMatch(nf(h, "INPUT"), /DEVOS-ISO/);
-  assert.equal(fs.existsSync(installed(h)), false);
+  assert.match(r.out, /block kept; the host self-test was already failing before the change/);
+  assert.equal(nf(h, "DOCKER-USER").split("\n")[0], "-A DOCKER-USER -j DEVOS-ISO-FWD");
+  assert.equal(fs.readFileSync(installed(h), "utf8"), fs.readFileSync(GOLDEN, "utf8"));
+});
+
+test("a second run waits for nobody: a held lock skips (exit 3) and changes nothing", () => {
+  const h = host(STATE);
+  fs.mkdirSync(path.join(h, "devos/isolation"), { recursive: true });
+  const lock = path.join(h, "devos/isolation/.lock");
+  fs.writeFileSync(lock, "");
+  const holder = spawn("flock", [lock, "sleep", "5"]);
+  spawnSync("sleep", ["0.3"]);
+  try {
+    const r = run(h);
+    assert.equal(r.code, 3, r.out);
+    assert.match(r.out, /another isolation-apply run holds/);
+    assert.equal(restores(h), 0);
+  } finally { holder.kill("SIGKILL"); }
 });
 
 test("AT8 --remove leaves only the M0.1/M0.2 rules", () => {

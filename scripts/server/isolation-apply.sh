@@ -18,10 +18,13 @@
 # State: GET $ISOLATION_STATE_URL (default http://127.0.0.1:$API_INTERNAL_PORT/internal/isolation-state, port
 # 3002) with the token in $DEVOS_DIR/secrets/isolation_state_token (sent as a header from a file, never on argv).
 # The whole document is refused on any invalid entry; then nothing changes.
-# Apply: one `iptables-restore --noflush` of the generated block (atomic per table), then the two jumps are
-# put first. The installed block is kept in $DEVOS_DIR/isolation/installed.rules; an unchanged block with
-# both jumps in place makes no write. After a change the host self-test (SSH on the tailnet IP, Coolify,
-# DevOS API) must pass, else the previous block is restored (or the block removed if there was none).
+# Apply: one `iptables-restore --noflush` transaction rebuilds both chains and puts each jump first, exactly
+# once (atomic per table; no moment without the jump). The installed block is kept in
+# $DEVOS_DIR/isolation/installed.rules; "unchanged" (no write) needs the same block, both jumps already first
+# and the live chains holding the block's rule count. The host self-test (SSH on the tailnet IP, Coolify,
+# DevOS API) runs before and after: if it passed before and fails after, the previous block is restored (or
+# the block removed if there was none); if it already failed before, the block is kept and the failure
+# reported. One run at a time ($DEVOS_DIR/isolation/.lock). Worst case stays under the agent's 60 s timeout.
 # Exit 0 applied or unchanged, 1 failed (previous block kept or restored), 3 skipped (not set up yet).
 # Prints no token and no secret.
 set -uo pipefail
@@ -43,7 +46,7 @@ case "${1:-}" in
 esac
 [[ $# -le 1 ]] || { echo "usage: $0 [--dry-run|--remove]"; exit 2; }
 
-ipt() { timeout 20 iptables -w 10 "$@"; }
+ipt() { timeout 10 iptables -w 5 "$@"; }
 
 remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if nothing of S4 is left
   local c rc=0
@@ -58,11 +61,12 @@ remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if n
 
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
+  mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
   if remove_block; then rm -f "$ISO/installed.rules"; echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched)"; exit 0; fi
   echo "remove failed: some S4 rules are still in place (see iptables -S DOCKER-USER / INPUT)"; exit 1
 fi
 
-for c in jq curl iptables iptables-restore; do
+for c in jq curl flock iptables iptables-restore; do
   command -v "$c" >/dev/null 2>&1 || { echo "skipped: $c not installed"; exit 3; }
 done
 [[ -s "$TOKEN_FILE" ]] || { echo "skipped: no isolation state token yet ($TOKEN_FILE)"; exit 3; }
@@ -75,20 +79,28 @@ URL="$(conf ISOLATION_STATE_URL)"; URL="${URL:-http://127.0.0.1:$PORT/internal/i
   || { echo "refused: ISOLATION_STATE_URL must be a loopback http URL"; exit 1; }
 tok="$(head -c 512 "$TOKEN_FILE" | tr -d '\r\n')"
 [[ "$tok" =~ ^[A-Za-z0-9._~+/=-]{16,512}$ ]] || { echo "refused: the isolation state token file is malformed"; exit 1; }
-state="$(curl -sS --fail --connect-timeout 5 --max-time 15 --max-filesize 1048576 --proto =http \
+state="$(curl -sS --fail --connect-timeout 3 --max-time 10 --max-filesize 1048576 --proto =http \
   -H @<(printf 'Authorization: Bearer %s\n' "$tok") "$URL" 2>/dev/null)"; crc=$?
 unset tok
 (( crc == 0 )) || { echo "state fetch failed (curl exit $crc): nothing changed"; exit 1; }
 
-# Structure: {"stacks":[{"slug","env","idx","egress","tailnet":[...]}, ...]} and nothing else.
-rows="$(jq -r '
+# Structure: exactly one JSON document {"stacks":[{"slug","env","idx","egress","tailnet":[...]}, ...]} and
+# nothing else. Every string is checked against its pattern inside jq BEFORE it is turned into a line, so no
+# value can carry a tab, newline or comma into the row stream (Codex pre-review: a newline in a tailnet string
+# forged an extra stack). Rows are emitted with @tsv; the tailnet list is space-joined after each entry
+# matched ^[0-9a-fA-F.:/]{1,49}$.
+rows="$(jq -r -s '
+  if length != 1 then "BAD" else .[0] |
   if (type == "object") and (keys == ["stacks"]) and (.stacks | type == "array") then
     .stacks[] | if (type == "object") and (keys == ["egress","env","idx","slug","tailnet"])
-      and (.slug | type == "string") and (.env | type == "string") and (.idx | type == "number")
-      and (.egress | type == "boolean") and (.tailnet | type == "array") and all(.tailnet[]; type == "string")
-    then "\(.idx)\t\(.slug)\t\(.env)\t\(.egress)\t\(.tailnet | join(","))" else "BAD" end
-  else "BAD" end' <<<"$state" 2>/dev/null)" || rows=BAD
-[[ "$rows" != *BAD* ]] || { echo "refused: the isolation state is not valid JSON of the documented shape; nothing changed"; exit 1; }
+      and (.slug | type == "string" and test("^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"))
+      and (.env | type == "string" and (. == "preview" or . == "live"))
+      and (.idx | type == "number" and . == floor and . >= 0 and . <= 1023)
+      and (.egress | type == "boolean") and (.tailnet | type == "array" and length <= 64)
+      and all(.tailnet[]; type == "string" and test("^[0-9a-fA-F.:/]{1,49}$"))
+    then [(.idx | tostring), .slug, .env, (.egress | tostring), (.tailnet | join(" "))] | @tsv else "BAD" end
+  else "BAD" end end' <<<"$state" 2>/dev/null)" || rows=BAD
+[[ "$rows" != *BAD* ]] || { echo "refused: the isolation state is not one valid JSON document of the documented shape; nothing changed"; exit 1; }
 
 v4_in_tailnet() {  # a.b.c.d/p -> 0 if it is a well-formed IPv4 CIDR inside 100.64.0.0/10
   [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
@@ -106,7 +118,7 @@ declare -A seen_idx=() seen_stack=()
 STACKS=()
 while IFS=$'\t' read -r idx slug env egress tailnet; do
   [[ -n "$idx$slug" ]] || continue
-  [[ "$idx" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( idx <= 1023 )) || { echo "refused: stack index '$idx' outside 0-1023; nothing changed"; exit 1; }
+  [[ "$idx" =~ ^(0|[1-9][0-9]{0,3})$ ]] && (( idx <= 1023 )) || { echo "refused: stack index '$idx' outside 0-1023; nothing changed"; exit 1; }
   [[ "$slug" =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || { echo "refused: invalid project slug in the isolation state; nothing changed"; exit 1; }
   [[ "$env" == preview || "$env" == live ]] || { echo "refused: invalid environment for $slug; nothing changed"; exit 1; }
   [[ -z "${seen_idx[$idx]:-}" ]] || { echo "refused: stack index $idx used twice; nothing changed"; exit 1; }
@@ -114,7 +126,7 @@ while IFS=$'\t' read -r idx slug env egress tailnet; do
   seen_idx[$idx]=1; seen_stack[$slug/$env]=1
   v4=""
   if [[ -n "$tailnet" ]]; then
-    IFS=, read -r -a cidrs <<<"$tailnet"
+    read -r -a cidrs <<<"$tailnet"
     for c in "${cidrs[@]}"; do
       if v4_in_tailnet "$c"; then v4+="$c "
       elif ! v6_in_tailnet "$c"; then echo "refused: tailnet entry for $slug/$env is not inside 100.64.0.0/10 or fd7a:115c:a1e0::/48; nothing changed"; exit 1
@@ -164,21 +176,32 @@ BLOCK="$(generate)"
 if [[ "$MODE" == dry ]]; then printf '%s\n' "$BLOCK"; echo "# dry run: nothing changed (${#STACKS[@]} stacks)"; exit 0; fi
 
 # --- 3. apply when changed ---------------------------------------------------------------------------------
-jumps_first() {  # 0 when both jumps are the first rule of their built-in chain
-  [[ "$(ipt -S DOCKER-USER 2>/dev/null | sed -n 2p)" == "-A DOCKER-USER -j $FWD" ]] \
-    && [[ "$(ipt -S INPUT 2>/dev/null | grep -v '^-P' | sed -n 1p)" == "-A INPUT -j $IN" ]]
-}
-put_jumps() {  # removes any extra jump, then inserts each at position 1
-  local c
-  ipt -S DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (M0.1 not applied?)"; return 1; }
+# One iptables-restore transaction carries the chain rebuild AND the jump changes, so DOCKER-USER/INPUT never
+# lose the S4 jump mid-apply (Codex pre-review: a separate -D then -I left a gap). A jump that is already the
+# only one and first is left alone; otherwise existing copies are deleted and one is inserted at position 1,
+# all inside the same COMMIT.
+jump_ops() {  # -> restore lines that leave exactly one jump, first, in each built-in chain
+  local c chain target n first
   for c in DOCKER-USER:$FWD INPUT:$IN; do
-    while ipt -C "${c%%:*}" -j "${c#*:}" 2>/dev/null; do ipt -D "${c%%:*}" -j "${c#*:}" || return 1; done
-    ipt -I "${c%%:*}" 1 -j "${c#*:}" || return 1
+    chain="${c%%:*}" target="${c#*:}"
+    n="$(ipt -S "$chain" 2>/dev/null | grep -cxF -- "-A $chain -j $target")"
+    first="$(ipt -S "$chain" 2>/dev/null | grep '^-A ' | sed -n 1p)"
+    [[ "$n" == 1 && "$first" == "-A $chain -j $target" ]] && continue
+    while (( n-- > 0 )); do echo "-D $chain -j $target"; done
+    echo "-I $chain 1 -j $target"
   done
 }
-install_block() {  # block text on stdin -> live
-  timeout 20 iptables-restore -w 10 --noflush || return 1
-  put_jumps
+live_matches() {  # 0 when the live S4 chains have exactly the rules of the block (count per chain)
+  local c want have
+  for c in $FWD $IN; do
+    want="$(grep -c -- "^-A $c " <<<"$1")"
+    have="$(ipt -S "$c" 2>/dev/null | grep -c -- "^-A $c ")" || return 1
+    [[ "$want" == "$have" ]] || return 1
+  done
+}
+install_block() {  # block text in $1 -> live, in one transaction with the jump changes
+  ipt -S DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (M0.1 not applied?)"; return 1; }
+  { grep -vx 'COMMIT' <<<"$1"; jump_ops; echo COMMIT; } | timeout 15 iptables-restore -w 5 --noflush
 }
 selftest() {  # every target host:port must accept a TCP connection within 3 s
   local t targets ts_ip api
@@ -197,19 +220,28 @@ selftest() {  # every target host:port must accept a TCP connection within 3 s
 }
 
 mkdir -p "$ISO" && chmod 700 "$ISO" || { echo "cannot create $ISO"; exit 1; }
+# One run at a time (the agent tick and KK's --remove must not interleave).
+exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply run holds $ISO/.lock"; exit 3; }
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
-if [[ "$BLOCK" == "$PREV" ]] && jumps_first; then echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0; fi
-
-if ! printf '%s\n' "$BLOCK" | install_block; then
-  echo "apply failed: restoring the previous block"
-  if [[ -n "$PREV" ]]; then printf '%s\n' "$PREV" | install_block || echo "restore failed too: run $0 --remove from the console"
-  else remove_block || true; fi
-  exit 1
+if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
+  echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
 fi
-if ! selftest; then
-  echo "self-test failed after apply: rolling back"
+
+# Probe before the change: the S4 chains match only pool sources, so they cannot break a host probe. If the
+# host already fails before the change, the cause is elsewhere; the block is applied and kept (isolation is
+# the floor) and the failure is reported. Roll back only when the probe passed before and fails after.
+pre_ok=1; pre_msg="$(selftest)" || pre_ok=0
+if ! install_block "$BLOCK"; then
+  echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
+fi
+if ! post_msg="$(selftest)"; then
+  if (( pre_ok == 0 )); then
+    printf '%s\n' "$BLOCK" > "$ISO/installed.rules.tmp" && mv -f "$ISO/installed.rules.tmp" "$ISO/installed.rules"
+    echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
+  fi
+  echo "self-test failed after apply ($post_msg): rolling back"
   if [[ -n "$PREV" ]]; then
-    printf '%s\n' "$PREV" | install_block && echo "rolled back to the previous block" || echo "rollback failed: run $0 --remove from the console"
+    install_block "$PREV" && echo "rolled back to the previous block" || echo "rollback failed: run $0 --remove from the console"
   else
     remove_block && echo "rolled back: S4 block removed" || echo "rollback failed: run $0 --remove from the console"
   fi
