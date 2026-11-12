@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseSpec } from "@devos/intake";
-import { MemoryRequirementsStore, PipelineError, RequirementsPipeline, requirementsCard } from "../dist/index.js";
+import { createHash } from "node:crypto";
+import { MemoryRequirementsStore, PipelineError, RequirementsPipeline, ingestStatus, requirementsCard } from "../dist/index.js";
 
 // Same checks as M2.3 parseCard (apps/api/src/approvals.ts), pinned here because apps/api is not a dependency.
 const ONE_LINE = /^[^\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+$/;
@@ -65,7 +66,7 @@ test("PL1 paste: spec v1, requirement and milestone rows, draft doc linked to on
   assert.equal(r.docVersion, 1);
   assert.equal(store.specs[0].sourceFormat, "paste");
   assert.equal(store.specs[0].originalName, null);
-  assert.match(store.specs[0].fileSha256, /^[0-9a-f]{64}$/);
+  assert.equal(store.specs[0].fileSha256, createHash("sha256").update(SPEC, "utf8").digest("hex"));
   const rows = store.requirements.get(P1);
   assert.deepEqual([...rows.keys()], ["FR-1", "FR-2", "FR-3"]);
   assert.deepEqual(rows.get("FR-1"), { key: "FR-1", title: "Owner login", priority: "must", acceptance: "Login works\nLogout works", milestoneOrdinal: 1 });
@@ -133,7 +134,11 @@ test("PL3 KK approves once: only an approved requirements card for the newest do
   await rejects(pipeline.submitSpec(P1, { kind: "paste", text: SPEC }), "requirements-already-approved", 409);
   assert.equal(store.specs.length, 2, "a refused submission stores nothing");
   // The store refuses too (the pipeline pre-check can race a concurrent approval).
-  await rejects(store.saveAnalysis({ projectId: P1, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "requirements-already-approved", 409);
+  const before = JSON.stringify([store.specs, store.docs, [...store.requirements.get(P1)]]);
+  await rejects(store.saveAnalysis({ projectId: P1, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [{ key: "FR-9", title: "x", priority: "must", acceptance: "", milestoneOrdinal: null }], milestones: [], repoPath: "docs/requirements.md" }), "requirements-already-approved", 409);
+  assert.equal(JSON.stringify([store.specs, store.docs, [...store.requirements.get(P1)]]), before, "a refused save stores nothing");
+  // approveDoc itself refuses a doc that is not the newest draft (it holds the project lock in the Prisma store).
+  assert.equal(await store.approveDoc(store.docs[0].id), false);
 });
 
 test("PL4 open questions: non-technical become cards, technical go to the Architect log; failures never block", async () => {
@@ -229,6 +234,12 @@ test("PL6 model pass: grounded proposals are stored and flagged on the card; a f
   assert.deepEqual(r2.warnings, ["assist-failed"], "a failed model pass is visible");
   const junk = setup({ runner: async () => ({ output: "not json" }) });
   assert.deepEqual((await junk.pipeline.submitSpec(P1, { kind: "paste", text: PROSE })).warnings, ["assist-failed"]);
+});
+
+test("PL8 ingest refusals map to fixed statuses: size 413, conversion faults 422, file faults 400", () => {
+  for (const c of ["too-large", "text-too-long", "too-many-blocks"]) assert.equal(ingestStatus(c), 413);
+  for (const c of ["parse-timeout", "parse-memory", "parse-failed"]) assert.equal(ingestStatus(c), 422);
+  for (const c of ["type-unknown", "empty", "pdf-no-text", "zip-corrupt"]) assert.equal(ingestStatus(c), 400);
 });
 
 test("PL7 requirementsCard is accepted by the M2.3 card rules for long counts and never includes spec text", () => {

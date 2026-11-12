@@ -78,8 +78,12 @@ export interface RequirementsStore {
   docForApproval(approvalId: string): Promise<DocRow | null>;
   /** Sets `approval_id` only while it is null and the doc is a draft; false otherwise. */
   linkApproval(docId: string, approvalId: string): Promise<boolean>;
-  /** Compare-and-set on status; false when the doc is not in `from`. */
-  setDocStatus(docId: string, from: DocStatus, to: DocStatus): Promise<boolean>;
+  /**
+   * Approves a doc under the SAME project-row lock as `saveAnalysis`, so an approval and a new submission
+   * serialise: true only when the doc is a draft AND the project's newest doc (pre-review r2: a bare
+   * compare-and-set outside the lock could leave two approved docs).
+   */
+  approveDoc(docId: string): Promise<boolean>;
 }
 
 /** An M2.3 `CardInput` for the requirements gate; the port is `Approvals.raiseCard(card, [])`. */
@@ -126,6 +130,13 @@ export const REPO_PATH = "docs/requirements.md";
 export const PASTE_MAX_CHARS = 500_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OPEN_STAGES = new Set(["intake"]);
+
+/** Size limits → 413, conversion faults (timeout, memory, crash) → 422, anything else the file's fault → 400. */
+export function ingestStatus(code: string): number {
+  if (code === "too-large" || code === "text-too-long" || code === "too-many-blocks") return 413;
+  if (code === "parse-timeout" || code === "parse-memory" || code === "parse-failed") return 422;
+  return 400;
+}
 
 function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -188,7 +199,7 @@ export class RequirementsPipeline {
     try {
       ingested = await this.ingest(bytes, name);
     } catch (e) {
-      if (e instanceof IngestError) throw new PipelineError(e.code, e.code === "too-large" || e.code === "text-too-long" ? 413 : 400);
+      if (e instanceof IngestError) throw new PipelineError(e.code, ingestStatus(e.code));
       throw e;
     }
     if (sourceFormat !== "paste") sourceFormat = ingested.format;
@@ -304,8 +315,6 @@ export class RequirementsPipeline {
     if (card.gate !== "requirements" || card.status !== "approved") return "ignored";
     const doc = await this.ports.store.docForApproval(card.id);
     if (!doc || doc.status !== "draft") return "ignored";
-    const latest = await this.ports.store.latestDoc(doc.projectId);
-    if (!latest || latest.id !== doc.id) return "ignored";
-    return (await this.ports.store.setDocStatus(doc.id, "draft", "approved")) ? "approved" : "ignored";
+    return (await this.ports.store.approveDoc(doc.id)) ? "approved" : "ignored";
   }
 }

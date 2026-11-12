@@ -47,6 +47,7 @@ export {
   PipelineError,
   REPO_PATH,
   RequirementsPipeline,
+  ingestStatus,
   requirementsCard,
   type DocRow,
   type DocStatus,

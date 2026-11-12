@@ -87,10 +87,13 @@ export class MemoryRequirementsStore implements RequirementsStore {
     return true;
   }
 
-  async setDocStatus(docId: string, from: DocStatus, to: DocStatus): Promise<boolean> {
+  async approveDoc(docId: string): Promise<boolean> {
     const d = this.docs.find((x) => x.id === docId);
-    if (!d || d.status !== from) return false;
-    d.status = to;
+    if (!d || d.status !== "draft") return false;
+    const newest = this.docs.filter((x) => x.projectId === d.projectId).reduce((m, x) => Math.max(m, x.version), 0);
+    if (d.version !== newest) return false;
+    d.status = "approved";
     return true;
   }
+
 }
