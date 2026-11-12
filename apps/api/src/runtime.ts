@@ -6,6 +6,8 @@ import { withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore, writeAudit } from "./settings.js";
 import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
+import { Approvals, PrismaApprovalStore, type GrantIssuer } from "./approvals.js";
+import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js";
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
 import { parseSmtpConfig } from "./smtp.js";
@@ -47,6 +49,8 @@ export interface Runtime {
   notify: NotifyServices;
   /** DEVOS-77: the dead-letter view needs `REDIS_URL` (the run queue) and the database (audit). */
   deadLetters: DeadLetterServices;
+  /** M2.3-b1: the approvals inbox needs the database and the policy engine. */
+  approvals: ApprovalRouteServices;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -80,18 +84,20 @@ export async function buildRuntime(
   const noSetup: SetupServices = { settings: null, vault: null };
   const noNotify: NotifyServices = { notifier: null };
   const noDead: DeadLetterServices = { queue: null, audit: null };
-  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead };
-  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead };
+  const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
+  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals };
+  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals };
   const db = await opts.loadDb(databaseUrl);
   const setup: SetupServices = {
     settings: new PrismaSettingsStore(db, opts.outboundTimeoutMs),
     vault: vaultKey ? new Vault(new PrismaVaultStore(db, opts.outboundTimeoutMs), vaultKey, vaultKeyVersion) : null,
   };
-  const grants = new PolicyEngine({
+  const engine = new PolicyEngine({
     store: new PrismaPolicyStore(db),
     hmacKey: Buffer.from(hmac, "utf8"),
     verifyKkSession: opts.kkSessions.verify,
-  }) as unknown as GrantService;
+  });
+  const grants = engine as unknown as GrantService;
   const vault = setup.vault;
   const notifier = new Notifier(new PrismaNotificationStore(db, opts.outboundTimeoutMs), {
     // The bell key and SMTP password are vault secrets (entered in the wizard), read at send time.
@@ -111,7 +117,34 @@ export async function buildRuntime(
           audit: (entry) => db.$transaction((tx: any) => writeAudit(tx, entry), { timeout: t, maxWait: t }),
         }
       : noDead;
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters };
+  // M2.3-b1: the approvals core over Postgres, the same engine for grants, and M1.6 for the "new card" notice.
+  const approvals: ApprovalRouteServices = {
+    approvals: new Approvals({
+      store: new PrismaApprovalStore(db, t),
+      grants: engine as unknown as GrantIssuer,
+      notifier,
+      verifyKkSession: opts.kkSessions.verify,
+    }),
+    grantsFor: (approvalId) => grantsForApproval(db, approvalId, t),
+    revokeGrant: (session, grantId) => engine.revokeGrant(session as Parameters<PolicyEngine["revokeGrant"]>[0], grantId),
+  };
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals };
+}
+
+/** M1.7's grant rows for one card, newest first, bounded like every other read (ADR-0011 §9). */
+export function grantsForApproval(db: DbClient, approvalId: string, timeoutMs: number): Promise<GrantSummary[]> {
+  return db.$transaction(
+    async (tx: any) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
+      return tx.approvalGrant.findMany({
+        where: { approvalId },
+        orderBy: [{ issuedAt: "desc" }, { id: "desc" }],
+        take: 20,
+        select: { id: true, scopeAction: true, scopeResource: true, projectId: true, sha: true, expiresAt: true, maxUses: true, uses: true, revokedAt: true },
+      });
+    },
+    { timeout: timeoutMs, maxWait: timeoutMs },
+  );
 }
 
 /** `REDIS_URL`: absent → null (no dead-letter view); anything but redis:// or rediss:// stops start-up. */

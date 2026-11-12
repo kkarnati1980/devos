@@ -8,6 +8,7 @@ import { createDb } from "@devos/db";
 import { PolicyEngine, PrismaPolicyStore } from "@devos/policy";
 import { Approvals, PrismaApprovalStore } from "../dist/approvals.js";
 import { GateEngine, PrismaGateStore } from "../dist/gates.js";
+import { grantsForApproval } from "../dist/runtime.js";
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required for test:db");
@@ -248,3 +249,23 @@ test("PR41-r3 (db): concurrent closes on one approval never deadlock (same miles
     assert.deepEqual(two, ["closed", "closed"], two.join(","));
   }
 });
+
+test("M2.3-b1 (db): grantsForApproval returns the card's grants newest first, with revoke state and no other card's", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, engine } = setup();
+  const a = await approvals.raiseCard(card(projectId), [t1]);
+  const b = await approvals.raiseCard(card(projectId), []);
+  const { grantId } = await approvals.approve(KK, a.id, { maxUses: 2 });
+  await approvals.approve(KK, b.id);
+  let rows = await grantsForApproval(db, a.id, 5000);
+  assert.deepEqual(rows.map((g) => g.id), [grantId]);
+  assert.equal(rows[0].maxUses, 2);
+  assert.equal(rows[0].uses, 0);
+  assert.equal(rows[0].revokedAt, null);
+  assert.equal(rows[0].scopeResource, "repo:devos-app");
+  assert.equal(await engine.revokeGrant(KK, grantId), true);
+  rows = await grantsForApproval(db, a.id, 5000);
+  assert.ok(rows[0].revokedAt instanceof Date);
+  assert.deepEqual(await grantsForApproval(db, randomUUID(), 5000), []);
+});
+
