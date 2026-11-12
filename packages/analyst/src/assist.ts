@@ -126,6 +126,9 @@ export function assistCandidates(blocks: readonly Block[], analysis: Analysis): 
   for (const q of analysis.openQuestions) if (q.kind === "stated") used.add(q.source);
   for (const o of analysis.outOfScope) used.add(o.source);
   for (const c of analysis.criteriaBlocks ?? []) used.add(c);
+  // A rejected duplicate definition (including a later copy of a Won't item) is not prose: the model must
+  // never re-propose it under a new key (PR56-r2).
+  for (const w of analysis.warnings) if (w.code === "duplicate-id" && typeof w.source === "number") used.add(w.source);
   const prose: number[] = [];
   blocks.forEach((b, i) => {
     if (used.has(i)) return;

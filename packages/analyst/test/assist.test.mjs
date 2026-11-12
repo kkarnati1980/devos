@@ -336,3 +336,24 @@ The shop owner can publish a daily menu with prices for each bread.
   assert.ok(p, JSON.stringify(r.warnings));
   assert.equal(p.milestone, "Phase 1");
 });
+
+test("AB8c (PR56-r2) a rejected duplicate definition is never a prose candidate, so it cannot come back", async () => {
+  const md = `## Requirements
+
+- FR-1: Export customer records (W)
+- FR-1: Export customer records
+- FR-2: Login
+  - works
+
+The shop owner can publish a daily menu with prices for each bread.
+`;
+  const blocks = blocksOf(md);
+  const a = analyzeSpec(blocks);
+  const dup = blocks.findIndex((b, i) => i > 0 && b.type === "list-item" && b.text === "FR-1: Export customer records");
+  assert.ok(a.warnings.some((w) => w.code === "duplicate-id" && w.source === dup));
+  const cand = assistCandidates(blocks, a);
+  assert.ok(!cand.prose.includes(dup));
+  const r = await assistAnalysis(blocks, a, fake({ requirements: [{ block: dup, title: "Export customer records" }], criteria: [] }));
+  assert.ok(!r.analysis.requirements.some((x) => x.proposed));
+  assert.ok(r.warnings.some((w) => w.code === "proposal-rejected" && w.reason === "source-not-candidate"));
+});
