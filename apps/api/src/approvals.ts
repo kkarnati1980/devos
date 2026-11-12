@@ -265,6 +265,10 @@ export class Approvals {
     request: { action: string; resource: string; projectId?: string | null; taskId?: string | null },
   ): Promise<Card> {
     if (decision.enforcedOutcome !== "require_approval") throw new ApprovalError("card-not-required");
+    // DEVOS-104 item 1: a card's grant is scoped to its target, and an M1.7 grant can only match a named resource,
+    // so a card for a resource-less request could never be lifted. Such a request gets its own code (the caller
+    // re-asks with the resource it acts on) instead of a generic invalid-input; no card, no task change.
+    if (typeof request.resource !== "string" || request.resource.trim() === "") throw new ApprovalError("card-needs-resource");
     // The gate comes from the matched rule, never from the caller (pre-review finding 3); a purge action is always
     // gate 5, so its typed confirmation cannot be dodged.
     let gate: GateName = (this.deps.gateForRules ? await this.deps.gateForRules(decision.matchedRuleIds ?? []) : null) ?? "decision";
