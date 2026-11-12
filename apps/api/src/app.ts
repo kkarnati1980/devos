@@ -23,6 +23,7 @@ import {
 import { SessionService } from "./session.js";
 import { NotificationsController, type NotifyServices } from "./notify-routes.js";
 import { NOTIFY } from "./notify.js";
+import { DEAD_LETTERS, DeadLettersController, type DeadLetterServices } from "./dead-letters.js";
 
 export interface AppDeps {
   config: ApiConfig;
@@ -38,6 +39,8 @@ export interface AppDeps {
   setup?: SetupServices;
   /** M1.6 notifier (null → notification routes answer 503 `notifications-not-configured`). */
   notify?: NotifyServices;
+  /** DEVOS-77 dead-letter view (null parts → 503 `dead-letters-not-configured`). */
+  deadLetters?: DeadLetterServices;
   /** R3-a: certificate + key → the API listens on HTTPS (TLS 1.2+); null/absent → plain HTTP (tests, CI). */
   tls?: ApiTls | null;
 }
@@ -47,7 +50,7 @@ class ApiModule {
   static register(deps: Required<Omit<AppDeps, "now" | "log" | "tls">> & { sessions: SessionService }): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController],
+      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController, DeadLettersController],
       providers: [
         { provide: CONFIG, useValue: deps.config },
         { provide: IDENTITY, useValue: deps.identity },
@@ -57,6 +60,7 @@ class ApiModule {
         { provide: KK_SESSIONS, useValue: deps.kkSessions },
         { provide: SETUP, useValue: deps.setup },
         { provide: NOTIFY, useValue: deps.notify },
+        { provide: DEAD_LETTERS, useValue: deps.deadLetters },
         { provide: APP_GUARD, useClass: AccessGuard },
       ],
     };
@@ -75,6 +79,7 @@ export async function createApp(deps: AppDeps): Promise<NestExpressApplication> 
       kkSessions: deps.kkSessions ?? new KkSessionRegistry(),
       setup: deps.setup ?? { settings: null, vault: null },
       notify: deps.notify ?? { notifier: null },
+      deadLetters: deps.deadLetters ?? { queue: null, audit: null },
       sessions,
     }),
     {

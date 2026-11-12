@@ -5,7 +5,7 @@ import http from "node:http";
 const NAMES = ["anthropic_api_key", "openai_api_key", "github_token", "linear_api_key", "r2_access_key_id", "r2_secret_access_key", "coolify_api_token", "mybrain_bell_key", "smtp_password"];
 
 export async function startStubApi(allowedOrigin) {
-  const state = { signIns: 0, received: [], csrfSeen: [], settings: { anthropicCapUsd: "15.00", openaiCapUsd: "15.00", defaultProjectCapUsd: "15.00", defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null }, secrets: new Map(), notices: [], channels: [{ kind: "dashboard", enabled: true, target: null, configured: true }, { kind: "mybrain", enabled: true, target: null, configured: true }, { kind: "email", enabled: true, target: null, configured: true }] };
+  const state = { signIns: 0, received: [], csrfSeen: [], settings: { anthropicCapUsd: "15.00", openaiCapUsd: "15.00", defaultProjectCapUsd: "15.00", defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null }, secrets: new Map(), deadLetters: [{ jobId: "run-7", runId: "run-7", reason: "run-provider_error <img src=x onerror=window.__xss2=1>", attemptsMade: 3, failedAt: "2026-11-06T09:00:00.000Z" }, { jobId: "run-8", runId: "run-8", reason: "run-tool_denied", attemptsMade: 1, failedAt: null }], notices: [], channels: [{ kind: "dashboard", enabled: true, target: null, configured: true }, { kind: "mybrain", enabled: true, target: null, configured: true }, { kind: "email", enabled: true, target: null, configured: true }] };
   const meta = (name) => {
     const v = state.secrets.get(name);
     return v ? { name, set: true, hint: v.slice(-4), keyVersion: 1, createdAt: "2026-11-06T10:00:00.000Z", updatedAt: "2026-11-06T10:00:00.000Z" } : { name, set: false, hint: null, keyVersion: null, createdAt: null, updatedAt: null };
@@ -75,6 +75,16 @@ export async function startStubApi(allowedOrigin) {
       const c = state.channels.find((x) => x.kind === ch[1]);
       Object.assign(c, JSON.parse(body));
       return json(200, { channel: { kind: c.kind, enabled: c.enabled, target: c.target } });
+    }
+    // DEVOS-77 dead-letter view
+    if (req.method === "GET" && url === "/runs/dead-letters") return json(200, { deadLetters: state.deadLetters });
+    const dl = url.match(/^\/runs\/dead-letters\/([A-Za-z0-9._-]+)\/retry$/);
+    if (req.method === "POST" && dl) {
+      state.received.push({ url, body });
+      const i = state.deadLetters.findIndex((d) => d.jobId === dl[1]);
+      if (i < 0) return json(404, { statusCode: 404, code: "dead-letter-not-found" });
+      state.deadLetters.splice(i, 1);
+      return json(200, { retried: dl[1] });
     }
     if (req.method === "POST" && url === "/notifications/test") {
       state.received.push({ url, body });

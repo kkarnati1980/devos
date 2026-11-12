@@ -15,6 +15,7 @@
   "dependencies": {
     "@devos/db": "workspace:*",
     "@devos/policy": "workspace:*",
+    "@devos/run-engine": "workspace:*",
     "@nestjs/common": "11.2.8",
     "@nestjs/core": "11.2.8",
     "@nestjs/platform-express": "11.2.8",
