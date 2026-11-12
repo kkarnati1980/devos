@@ -128,6 +128,16 @@ export function fakeProviders() {
 
   function coolify(method, path, init) {
     let m;
+    if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)\/envs$/))) {
+      const a = apps.get(m[1]);
+      if (!a) return json(404, { message: "Application not found." });
+      a.envs ??= [];
+      if (method === "GET") return json(200, a.envs.map((e) => ({ ...e })));
+      const b = JSON.parse(init.body);
+      const i = a.envs.findIndex((e) => e.key === b.key && e.is_preview === b.is_preview);
+      if (method === "POST") { if (i >= 0) return json(409, { message: "Environment variable already exists." }); a.envs.push(b); return json(201, { uuid: `env${a.envs.length}` }); }
+      if (method === "PATCH") { if (i < 0) return json(404, { message: "Environment variable not found." }); a.envs[i] = b; return json(201, { uuid: `env${i + 1}` }); }
+    }
     if (method === "GET" && path === "/api/v1/applications") return json(200, [...apps.values()].map(({ uuid, name, description }) => ({ uuid, name, description })));
     if (method === "POST" && path === "/api/v1/applications/dockercompose") {
       const b = JSON.parse(init.body);

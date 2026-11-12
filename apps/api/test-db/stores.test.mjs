@@ -63,3 +63,30 @@ test("M1.4 AT14b: global secrets are saved and rotated in place, with the hint c
   assert.equal(list.find((m) => m.name === "linear_api_key").set, true);
   await assert.rejects(db.vaultSecret.update({ where: { id: rows[0].id }, data: { hint: "toolong" } })); // check: 4 chars
 });
+
+test("M2.4-c2b: project app secrets are one row per (project, name), rotated in place, audited under the project", async () => {
+  const vault = new Vault(new PrismaVaultStore(db, 3000), randomBytes(32), 1);
+  const slug = `c2b-${randomBytes(6).toString("hex")}`;
+  const p = await db.project.create({ data: { slug, name: slug } });
+  const q = await db.project.create({ data: { slug: `${slug}-q`, name: `${slug}-q` } });
+  const v1 = randomBytes(32).toString("base64url");
+  const v2 = randomBytes(32).toString("base64url");
+  assert.equal(await vault.hasProject(p.id, "preview/SESSION_SECRET"), false);
+  assert.deepEqual(await vault.putProject(p.id, "preview/SESSION_SECRET", v1), { rotated: false });
+  assert.deepEqual(await vault.putProject(p.id, "preview/SESSION_SECRET", v2), { rotated: true });
+  assert.equal(await vault.hasProject(p.id, "preview/SESSION_SECRET"), true);
+  assert.equal(await vault.hasProject(q.id, "preview/SESSION_SECRET"), false);
+  const rows = await db.vaultSecret.findMany({ where: { projectId: p.id } });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].hint, null);
+  assert.ok(!Buffer.from(rows[0].ciphertext).includes(Buffer.from(v2)));
+  assert.equal(await db.vaultSecret.count({ where: { projectId: null, name: "preview/SESSION_SECRET" } }), 0, "no global row");
+  const ev = await db.auditEvent.findMany({ where: { projectId: p.id, action: { startsWith: "vault.app_secret." } }, orderBy: { occurredAt: "asc" } });
+  assert.deepEqual(ev.map((e) => e.action), ["vault.app_secret.saved", "vault.app_secret.rotated"]);
+  assert.ok(!JSON.stringify(ev).includes(v1) && !JSON.stringify(ev).includes(v2));
+  // Two concurrent first puts leave one row (unique (project_id, name)).
+  const n = "production/DB_PASSWORD";
+  await Promise.allSettled([vault.putProject(q.id, n, v1), vault.putProject(q.id, n, v2)]);
+  assert.equal(await db.vaultSecret.count({ where: { projectId: q.id, name: n } }), 1);
+  await db.vaultSecret.deleteMany({ where: { projectId: { in: [p.id, q.id] } } });
+});

@@ -511,3 +511,39 @@ test("M1.4 AT16 (PR17-r1): every Prisma store operation, reads included, runs in
   for (const c of calls) assert.deepEqual(c, { timeout: 1234, maxWait: 1234 });
   assert.equal(ops.filter((o) => o === "auditEvent.create").length, 3);
 });
+
+// M2.4-c2b: project-scoped app secrets (provisioner only).
+test("M2.4-c2b project secrets: sealed per project, bound to it, never in clear, audited by name only", async () => {
+  const { Vault, MemoryVaultStore, projectSecretsPort } = await import("../dist/vault.js");
+  const { randomBytes, createDecipheriv } = await import("node:crypto");
+  const store = new MemoryVaultStore();
+  const key = randomBytes(32);
+  const v = new Vault(store, key, 1);
+  const pid = "11111111-2222-4333-8444-555555555555";
+  const other = "22222222-2222-4333-8444-555555555555";
+  const value = randomBytes(32).toString("base64url");
+  const port = projectSecretsPort(v);
+  assert.equal(await port.has(pid, "preview/DB_PASSWORD"), false);
+  await port.put(pid, "preview/DB_PASSWORD", value);
+  assert.equal(await port.has(pid, "preview/DB_PASSWORD"), true);
+  assert.equal(await port.has(other, "preview/DB_PASSWORD"), false, "scoped to the project");
+  assert.equal(store.rows.size, 0, "no global row");
+  const row = store.projectRows.get(`${pid}\npreview/DB_PASSWORD`);
+  assert.equal(row.hint, null);
+  assert.ok(!row.ciphertext.includes(Buffer.from(value)));
+  const open = (projectId) => {
+    const d = createDecipheriv("aes-256-gcm", key, row.nonce);
+    d.setAAD(Buffer.from(`devos-vault/v1\nproject:${projectId}\npreview/DB_PASSWORD\n1`));
+    d.setAuthTag(row.ciphertext.subarray(-16));
+    return Buffer.concat([d.update(row.ciphertext.subarray(0, -16)), d.final()]).toString();
+  };
+  assert.equal(open(pid), value);
+  assert.throws(() => open(other), "bound to its project in the AAD");
+  await port.put(pid, "preview/DB_PASSWORD", randomBytes(32).toString("base64url"));
+  assert.deepEqual(store.audits.map((a) => a.action), ["vault.app_secret.saved", "vault.app_secret.rotated"]);
+  assert.ok(store.audits.every((a) => a.projectId === pid && !JSON.stringify(a).includes(value)));
+  for (const [p, n] of [["not-a-uuid", "preview/X"], [pid, "live/X"], [pid, "preview/lower"], [pid, "github_token"]]) {
+    await assert.rejects(port.put(p, n, value), /invalid:/);
+  }
+  await assert.rejects(port.put(pid, "preview/X", "short"), /invalid:value-too-short/);
+});
