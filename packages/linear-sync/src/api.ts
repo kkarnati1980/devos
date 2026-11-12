@@ -7,6 +7,8 @@ import { LinearError } from "./client.js";
 import { readMarker } from "./markers.js";
 
 const PAGE = 100, MAX_PAGES = 50;
+/** Page size of lists nested in the issues query (labels, relations), kept small for Linear's query complexity. */
+const NESTED = 50;
 type Conn<T> = { nodes: T[]; pageInfo?: { hasNextPage: boolean; endCursor: string | null } };
 
 function ok<T>(payload: { success?: boolean } & T, what: string): T {
@@ -104,20 +106,41 @@ export function graphqlApi(client: LinearClient): LinearApi {
         `mutation($id: String!, $i: ProjectMilestoneUpdateInput!) { projectMilestoneUpdate(id: $id, input: $i) { success } }`, { id, i: input })).projectMilestoneUpdate, "milestone update");
     },
     async issues(projectId) {
+      type R = { type: string; issue: { id: string } };
+      // The rest of one issue's inverse relations, every page; fail closed when a page has no cursor or the limit runs out.
+      const moreRelations = async (issueId: string, cursor: string | null | undefined): Promise<R[]> => {
+        const got: R[] = [];
+        let c = cursor;
+        for (let p = 0; p < MAX_PAGES; p++) {
+          if (!c) throw new LinearError("bad-response", "Linear relation page without a cursor");
+          const r: { issue: { inverseRelations: Conn<R> } } = await client.query(
+            `query($id: String!, $after: String) { issue(id: $id) { inverseRelations(first: ${PAGE}, after: $after) { nodes { type issue { id } } pageInfo { hasNextPage endCursor } } } }`,
+            { id: issueId, after: c });
+          got.push(...r.issue.inverseRelations.nodes);
+          if (!r.issue.inverseRelations.pageInfo?.hasNextPage) return got;
+          c = r.issue.inverseRelations.pageInfo.endCursor;
+        }
+        throw new LinearError("bad-response", "too many relations on one Linear issue");
+      };
       type N = { id: string; title: string; description: string | null; state: { type: StateType }; labels: Conn<{ name: string }>;
         parent: { id: string } | null; projectMilestone: { id: string } | null; assignee: { id: string } | null;
-        inverseRelations: Conn<{ type: string; issue: { id: string } }> };
+        inverseRelations: Conn<R> };
       const out: LinearIssue[] = [];
       let after: string | null = null;
       for (let p = 0; p < MAX_PAGES; p++) {
         const d: { project: { issues: Conn<N> } } = await client.query(
           `query($id: String!, $after: String) { project(id: $id) { issues(first: ${PAGE}, after: $after, includeArchived: true) { nodes {
-             id title description state { type } labels { nodes { name } } parent { id } projectMilestone { id } assignee { id }
-             inverseRelations { nodes { type issue { id } } } } pageInfo { hasNextPage endCursor } } } }`, { id: projectId, after });
+             id title description state { type } labels(first: ${NESTED}) { nodes { name } pageInfo { hasNextPage } } parent { id } projectMilestone { id } assignee { id }
+             inverseRelations(first: ${NESTED}) { nodes { type issue { id } } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } }`, { id: projectId, after });
         for (const n of d.project.issues.nodes) {
+          // Codex PR35-r5: nested lists are complete or the read fails. A cut-off label list would re-add labels;
+          // a cut-off relation list would re-create relations that exist (AT2).
+          if (n.labels.pageInfo?.hasNextPage) throw new LinearError("bad-response", `more than ${NESTED} labels on one Linear issue`);
+          const rel = [...n.inverseRelations.nodes];
+          if (n.inverseRelations.pageInfo?.hasNextPage) rel.push(...(await moreRelations(n.id, n.inverseRelations.pageInfo.endCursor)));
           out.push({ id: n.id, title: n.title, description: n.description, stateType: n.state.type, labelNames: n.labels.nodes.map((l) => l.name),
             parentId: n.parent?.id ?? null, milestoneId: n.projectMilestone?.id ?? null, assigneeId: n.assignee?.id ?? null,
-            blockedBy: n.inverseRelations.nodes.filter((r) => r.type === "blocks").map((r) => r.issue.id) });
+            blockedBy: rel.filter((r) => r.type === "blocks").map((r) => r.issue.id) });
         }
         if (!d.project.issues.pageInfo?.hasNextPage) return out;
         if (!d.project.issues.pageInfo.endCursor) throw new LinearError("bad-response", "Linear issue page without a cursor");

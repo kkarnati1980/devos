@@ -82,3 +82,25 @@ test("Codex PR35-r4: an exhausted label list fails closed (a cut-off list would 
     : { issueLabels: { nodes: [], pageInfo: { hasNextPage: true, endCursor: `x${++n}` } } }));
   await assert.rejects(a.team("DEV"), /too many issue labels/);
 });
+
+test("Codex PR35-r5: an issue's inverse relations are read across pages, so an existing blocker on page 2 is seen", async () => {
+  const { a, calls } = api((b) => {
+    if (b.query.includes("issue(id:")) {
+      return b.variables.after === "r1"
+        ? { issue: { inverseRelations: { nodes: [{ type: "blocks", issue: { id: "b2" } }], pageInfo: { hasNextPage: true, endCursor: "r2" } } } }
+        : { issue: { inverseRelations: { nodes: [{ type: "blocks", issue: { id: "b3" } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
+    }
+    return { project: { issues: { nodes: [node("i1", { inverseRelations: { nodes: [{ type: "blocks", issue: { id: "b1" } }], pageInfo: { hasNextPage: true, endCursor: "r1" } } })], pageInfo: { hasNextPage: false, endCursor: null } } } };
+  });
+  const [i] = await a.issues("p1");
+  assert.deepEqual(i.blockedBy, ["b1", "b2", "b3"]);
+  assert.match(calls[0].query, /inverseRelations\(first: \d+\) \{ nodes \{ type issue \{ id \} \} pageInfo \{ hasNextPage endCursor \} \}/);
+  assert.equal(calls.filter((c) => c.query.includes("issue(id:")).length, 2);
+});
+
+test("Codex PR35-r5: a cut-off label list or a relation page without a cursor fails closed", async () => {
+  const labels = api(() => ({ project: { issues: { nodes: [node("i1", { labels: { nodes: [{ name: "Module" }], pageInfo: { hasNextPage: true } } })], pageInfo: { hasNextPage: false, endCursor: null } } } }));
+  await assert.rejects(labels.a.issues("p1"), /labels on one Linear issue/);
+  const rel = api(() => ({ project: { issues: { nodes: [node("i1", { inverseRelations: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } })], pageInfo: { hasNextPage: false, endCursor: null } } } }));
+  await assert.rejects(rel.a.issues("p1"), /relation page without a cursor/);
+});
