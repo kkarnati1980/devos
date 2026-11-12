@@ -184,3 +184,26 @@ test("M1.6 AT12: the notifications page sets the bell URL and recipient, sends a
   assert.deepEqual(problems, []);
   await context.close();
 });
+
+test("DEVOS-77 DL AT9: the failed-runs page lists dead letters escaped and retries one with CSRF", async () => {
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  const { page, context, problems } = await open("/dead-letters");
+  await page.getByTestId("dead-letters").waitFor();
+  assert.equal(await page.getByTestId("dead-letter").count(), 2);
+  const first = await page.getByTestId("dead-letter").first().innerText();
+  assert.match(first, /run-7/);
+  assert.match(first, /3 attempts/);
+  assert.match(first, /<img src=x onerror=window.__xss2=1>/, "the reason is shown as text");
+  assert.equal(await page.evaluate(() => window.__xss2), undefined, "a reason never runs as script");
+  assert.match(await page.getByTestId("dead-letter").nth(1).innerText(), /time unknown/);
+  await page.getByTestId("retry-run-7").click();
+  await page.getByTestId("notice").filter({ hasText: "Run run-7 queued again." }).waitFor();
+  await page.waitForFunction(() => document.querySelectorAll('[data-testid="dead-letter"]').length === 1);
+  const writes = api.state.received.filter((r) => r.url.startsWith("/runs/"));
+  assert.deepEqual(writes.map((w) => w.url), ["/runs/dead-letters/run-7/retry"]);
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "the retry carried the session's CSRF token");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "no horizontal scroll at 390 px");
+  assert.deepEqual(problems, []);
+  await context.close();
+});
