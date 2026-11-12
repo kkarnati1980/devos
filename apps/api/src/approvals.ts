@@ -408,7 +408,7 @@ export class Approvals {
     const why = text(reason, EXPIRE_REASON_MAX, false);
     if (!why) throw new ApprovalError("invalid-input");
     if (looksSecret(why)) throw new ApprovalError("card-contains-secret");
-    const unique = [...new Set(ids.filter((i) => UUID.test(i)))].sort();
+    const unique = [...new Set(ids.map((i) => i.toLowerCase()).filter((i) => UUID.test(i)))].sort();
     if (unique.length > EXPIRE_IDS_MAX) throw new ApprovalError("invalid-input");
     if (!unique.length) return [];
     return this.deps.store.expireIds(unique, new Date(this.now()), why);
@@ -785,14 +785,23 @@ export class PrismaApprovalStore implements ApprovalStore {
     return this.tx(async (tx) => {
       // FOR UPDATE (not SKIP LOCKED) in id order: a concurrent decide on one of these rows finishes first, and the
       // WHERE is re-checked on the committed row, so a card it approved or rejected is not selected here.
-      const rows: { id: string }[] = await tx.$queryRaw`
-        SELECT id::text AS id FROM approval WHERE id = ANY(${sorted}::uuid[]) AND status = 'pending' ORDER BY id FOR UPDATE`;
-      const out: string[] = [];
-      for (const { id } of rows) {
-        const r = await tx.approval.update({ where: { id }, data: { status: "expired", decidedAt: at, decidedBy: "system:expiry" } });
-        await audit(tx, { action: "approval.expired", summary: `Expired: ${r.action}`.slice(0, 500), details: { gate: r.gate, approvalId: id, reason } }, r.projectId ?? null);
-        out.push(id);
-      }
+      const rows: { id: string; action: string; gate: string; projectId: string | null }[] = await tx.$queryRaw`
+        SELECT id::text AS id, action, gate::text AS gate, project_id::text AS "projectId"
+        FROM approval WHERE id = ANY(${sorted}::uuid[]) AND status = 'pending' ORDER BY id FOR UPDATE`;
+      if (!rows.length) return [];
+      // One update and one audit insert for the whole batch (pre-review: 500 cards x 2 round trips could outrun the
+      // transaction timeout).
+      const out = rows.map((r) => r.id);
+      await tx.approval.updateMany({ where: { id: { in: out } }, data: { status: "expired", decidedAt: at, decidedBy: "system:expiry" } });
+      await tx.auditEvent.createMany({
+        data: rows.map((r) => ({
+          actor: "system",
+          action: "approval.expired",
+          summary: `Expired: ${r.action}`.slice(0, 500),
+          details: { gate: r.gate, approvalId: r.id, reason },
+          projectId: r.projectId ?? null,
+        })),
+      });
       return out;
     });
   }

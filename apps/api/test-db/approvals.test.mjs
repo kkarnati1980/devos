@@ -306,7 +306,73 @@ test("DEVOS-164 (db): expireCardsById expires named pending cards with one audit
   assert.deepEqual(await approvals.expireCardsById([pending.id], "again"), [], "idempotent");
 });
 
-test("DEVOS-164 (db): expireCardsById racing approve: the card is either approved or expired, never both", async () => {
+// Holds a row lock on one approval in its own transaction until release() is called. With `approve`, the held
+// transaction marks the card approved before committing; with `rollback`, it changes nothing and rolls back.
+function holdCardLock(id, { approve = false, rollback = false } = {}) {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let onLocked;
+  const locked = new Promise((r) => (onLocked = r));
+  const done = db
+    .$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM approval WHERE id = ${id}::uuid FOR UPDATE`;
+        if (approve) await tx.approval.update({ where: { id }, data: { status: "approved", decidedAt: new Date(), decidedBy: "kk:kk@kiot.io" } });
+        onLocked();
+        await gate;
+        if (rollback) throw new Error("rollback");
+      },
+      { timeout: 20_000, maxWait: 20_000 },
+    )
+    .catch((e) => {
+      if (!rollback || e.message !== "rollback") throw e;
+    });
+  return { locked, release: () => release(), done };
+}
+
+const settledWithin = (p, ms) => Promise.race([p.then(() => true, () => true), new Promise((r) => setTimeout(() => r(false), ms))]);
+
+test("DEVOS-164 (db): expireCardsById waits for a decide holding the row and then leaves the decided card alone", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, store } = setup();
+  const c = await approvals.raiseCard(card(projectId), [t1]);
+  const held = holdCardLock(c.id, { approve: true });
+  await held.locked;
+  const exp = approvals.expireCardsById([c.id], "superseded");
+  assert.equal(await settledWithin(exp, 400), false, "the expiry waits on the row lock (no SKIP LOCKED, no dirty read)");
+  held.release();
+  await held.done;
+  assert.deepEqual(await exp, [], "re-checked on the committed row: approved, so not expired");
+  assert.equal((await store.get(c.id)).status, "approved");
+  assert.equal(await db.auditEvent.count({ where: { action: "approval.expired", details: { path: ["approvalId"], equals: c.id } } }), 0);
+});
+
+test("DEVOS-164 (db): a row lock that changes nothing does not cut the expiry short (not SKIP LOCKED)", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, store } = setup();
+  const c = await approvals.raiseCard(card(projectId), [t1]);
+  const held = holdCardLock(c.id, { rollback: true });
+  await held.locked;
+  const exp = approvals.expireCardsById([c.id], "superseded");
+  assert.equal(await settledWithin(exp, 400), false);
+  held.release();
+  await held.done;
+  assert.deepEqual(await exp, [c.id]);
+  assert.equal((await store.get(c.id)).status, "expired");
+});
+
+test("DEVOS-164 (db): a full batch of 500 named cards expires in one call with 500 audit rows", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals } = setup();
+  const ids = Array.from({ length: 500 }, () => randomUUID());
+  await db.approval.createMany({ data: ids.map((id) => ({ id, projectId, gate: "decision", action: `bulk.${id}`, target: "repo:devos-app", reason: "bulk" })) });
+  const out = await approvals.expireCardsById(ids.map((i) => i.toUpperCase()), "superseded by requirements v3");
+  assert.deepEqual(out, [...ids].sort());
+  assert.equal(await db.approval.count({ where: { id: { in: ids }, status: "expired", decidedBy: "system:expiry" } }), 500);
+  assert.equal(await db.auditEvent.count({ where: { action: "approval.expired", projectId, summary: { startsWith: "Expired: bulk." } } }), 500);
+});
+
+test("DEVOS-164 (db): smoke: expireCardsById racing approve: the card is either approved or expired, never both", async () => {
   for (let i = 0; i < 5; i++) {
     const { projectId, tasks: [t1] } = await fixture(1);
     const { approvals, store } = setup();

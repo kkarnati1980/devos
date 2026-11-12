@@ -410,3 +410,13 @@ test("DEVOS-164 expireCardsById validates its input", async () => {
   await assert.rejects(approvals.expireCardsById(many, "too many"), (e) => e.code === "invalid-input");
   assert.equal((await store.get(c.id)).status, "pending", "a refused call changes nothing");
 });
+
+test("DEVOS-164 expireCardsById boundaries: 500 distinct ids and a 500-character reason are accepted; ids are case-insensitive", async () => {
+  const { approvals, store } = setup();
+  const c = await approvals.raiseCard(card(), [T1]);
+  const filler = Array.from({ length: 499 }, (_, i) => `00000000-0000-4000-8000-${(i + 1000).toString(16).padStart(12, "0")}`);
+  // 499 unknown ids + the card (upper case) + duplicates and non-UUIDs: 500 distinct UUIDs, under the cap.
+  const ids = [...filler, c.id.toUpperCase(), c.id, filler[0], "nope"];
+  assert.deepEqual(await approvals.expireCardsById(ids, "r".repeat(500)), [c.id]);
+  assert.equal((await store.get(c.id)).status, "expired");
+});
