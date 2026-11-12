@@ -99,3 +99,11 @@ Run the existing Codex review automatically on every new PR head, so a review no
   - A future first-green time (the clock stepped back) is reset to now.
   - The runner and `publish` get `</dev/null`, so they can never read the candidate list.
   - Not changed: per-SHA state files, `.green` among them, are not pruned (as before).
+
+**v1.4.1 (12 Nov 2026, DEVOS-106, runner-b): no duplicate verdict comment.**
+- **Problem.** A comment POST that GitHub completes after our 30 s timeout used to be posted again on the next tick.
+- **Fix.** Before each comment POST, the watcher writes `watch/<sha>.comment-tried`. On a retry, when that marker exists, it first reads the PR's comments (all pages, bounded like every GitHub call). A comment that starts with the same first line (`### Codex review <label> — **<verdict>**`) and carries `- **Commit:** \`<sha>\`` counts as posted. The watcher then only sets the status. Normal ticks make no extra call.
+- **Tests:** AT20.
+  - A POST that GitHub stores but never answers leaves exactly one comment after the retry tick, and the PR is published.
+  - A tried comment with no copy on GitHub is posted once.
+  - `review-watch.test.mjs`: 10/10.

@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0 });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false });
 
 before(async () => {
   reset();
@@ -37,7 +37,12 @@ before(async () => {
           : { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
       }
       const cm = p.match(/^\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/);
-      if (cm && req.method === "POST") { M.comments.push({ pr: Number(cm[1]), ...JSON.parse(body) }); return send(201, {}); }
+      if (cm && req.method === "POST") {
+        M.comments.push({ pr: Number(cm[1]), ...JSON.parse(body) });
+        if (M.hangComment) return; // GitHub stored it, but the answer never arrives
+        return send(201, {});
+      }
+      if (cm && req.method === "GET") return send(200, M.comments.filter((c) => c.pr === Number(cm[1])).map((c) => ({ body: c.body })));
       const st = p.match(/^\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/);
       if (st && req.method === "POST") {
         if (M.failStatus) return send(500, {});
@@ -243,4 +248,36 @@ test("AT19: with three green waiting heads, the one green longest is reviewed fi
   assert.equal(r5.code, 0, r5.out);
   assert.equal(order().at(-1), sha("4"), "PR #21 (lower number) first despite being listed and timed second");
   assert.equal(fs.readFileSync(path.join(ws, `${sha("3")}.green`), "utf8").trim(), fs.readFileSync(path.join(ws, `${sha("4")}.green`), "utf8").trim());
+});
+
+// DEVOS-106 (review-watch v1.4.1, AT20): a comment POST that GitHub completes after our timeout is not posted again.
+test("AT20: a timed-out verdict comment that GitHub stored is found on the next tick and not posted twice", async () => {
+  reset();
+  M.green = true; M.hangComment = true;
+  const sha = "f".repeat(40);
+  M.prs = [{ number: 31, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M31.md" }];
+  fs.mkdirSync(path.join(dir, "verdicts"), { recursive: true });
+  const runner = path.join(dir, "runner20.sh");
+  fs.writeFileSync(runner, `#!/usr/bin/env bash\nprintf '{"verdict":"PASS","summary":"ok","findings":[]}' > "${dir}/verdicts/$2.json"\n`, { mode: 0o755 });
+  const r1 = await tick([], { REVIEW_RUNNER: runner, GH_TIMEOUT: "2" });
+  assert.equal(r1.code, 0, r1.out);
+  assert.match(r1.out, /comment failed; will retry/);
+  assert.equal(M.comments.length, 1);
+  M.hangComment = false;
+  const r2 = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.out, /verdict comment already on the PR/);
+  assert.equal(M.comments.length, 1, "no duplicate verdict comment");
+  assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "success"));
+  assert.ok(fs.existsSync(path.join(dir, "watch", `${sha}.published`)));
+  // A comment that never reached GitHub is still retried.
+  reset(); M.green = true;
+  const sha2 = "9".repeat(40);
+  M.prs = [{ number: 32, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha2, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M32.md" }];
+  fs.writeFileSync(path.join(dir, "watch", `${sha2}.msg`), "### Codex review PR32-r1 — **PASS**\n\n- **Commit:** `" + sha2 + "`\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha2}.state`), "success Codex PASS (PR32-r1)\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha2}.comment-tried`), "");
+  const r3 = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(r3.code, 0, r3.out);
+  assert.equal(M.comments.length, 1, "posted once, since GitHub had no copy");
 });
