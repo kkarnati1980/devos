@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.3.1
+# Version: 1.4.0
+# v1.4.0 (DEVOS-90): server re-checks without a new main SHA. Every 6 hours, and within a tick (about 3 minutes)
+# of a "/recheck" comment by an allowed author on the open draft tracking PR (head branch devos-recheck), the
+# agent runs the installed checks again on the currently deployed SHA and posts a fresh server-check status.
+# A re-check never self-updates, deploys or calls Coolify; nothing from the comment is executed.
 # v1.3.1 (DEVOS-114): gh_all_runs merges workflow-run pages through temp files (a page over 128 KiB broke jq).
 # v1.3.0 (DEVOS-87, R3-d): the allow-list gains scripts/server/cert-renew.sh, run once a day at the start of a
 # tick (never while a deployment is in flight); a failure is retried after an hour. An allow-listed file missing
@@ -42,6 +46,9 @@ CF_ENV="$DIR/coolify-deploy.env"
 ALLOW=(scripts/review/review-watch.sh scripts/review/review-commit.sh scripts/server/server-agent.sh scripts/server/cert-renew.sh)
 CERT_EVERY="${CERT_EVERY:-86400}"       # R3-d: renew once a day
 CERT_RETRY="${CERT_RETRY:-3600}"        # after a failed renewal, try again after an hour
+RECHECK_EVERY="${RECHECK_EVERY:-21600}" # DEVOS-90: re-run the server checks every 6 hours
+RECHECK_BRANCH="${RECHECK_BRANCH:-devos-recheck}"            # head branch of the draft tracking PR
+RECHECK_AUTHORS="${RECHECK_AUTHORS:-${REPO%%/*}}"            # logins allowed to request; default the repo owner
 DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
@@ -271,9 +278,9 @@ deploy() {  # sha -> 0 when Coolify finished deploying exactly this sha
   log "deployment ${dep:0:8}: still running at the time limit; the next tick resumes it"; return 2
 }
 
-run_checks() {  # sha -> writes $ST/<sha>.checks.md and $ST/<sha>.checks.state ("state description")
-  local sha="$1" f n rc pass=0 fail=0 skip=0 res total desc
-  printf '### Server checks at `%s`\n\n| Check | Result |\n|---|---|\n' "$sha" > "$TMP/head.md"
+run_checks() {  # sha [out-prefix] -> writes <prefix>.checks.md and <prefix>.checks.state ("state description")
+  local sha="$1" out="${2:-$ST/$1}" title="${3:-Server checks}" f n rc pass=0 fail=0 skip=0 res total desc
+  printf '### %s at `%s`\n\n| Check | Result |\n|---|---|\n' "$title" "$sha" > "$TMP/head.md"
   : > "$TMP/body.md"
   for f in "$BIN"/checks/*.sh; do
     [[ -e "$f" ]] || continue
@@ -283,11 +290,11 @@ run_checks() {  # sha -> writes $ST/<sha>.checks.md and $ST/<sha>.checks.state (
     printf '| `%s` | %s |\n' "$n" "$res" >> "$TMP/head.md"
     { printf '\n<details><summary>%s — %s</summary>\n\n```\n' "$n" "$res"; tail -n 20 "$TMP/check.out" | redact; printf '```\n</details>\n'; } >> "$TMP/body.md"
   done
-  cat "$TMP/head.md" "$TMP/body.md" | redact > "$ST/$sha.checks.md"
+  cat "$TMP/head.md" "$TMP/body.md" | redact > "$out.checks.md"
   total=$((pass + fail + skip)); desc="$pass/$total passed"; (( skip > 0 )) && desc="$desc, $skip skipped"
-  if (( total == 0 )); then echo "failure no server checks installed" > "$ST/$sha.checks.state"
-  elif (( fail == 0 )); then echo "success $desc" > "$ST/$sha.checks.state"
-  else echo "failure $desc" > "$ST/$sha.checks.state"; fi
+  if (( total == 0 )); then echo "failure no server checks installed" > "$out.checks.state"
+  elif (( fail == 0 )); then echo "success $desc" > "$out.checks.state"
+  else echo "failure $desc" > "$out.checks.state"; fi
 }
 
 # publish sha -> posts every result stored for sha that has not been posted yet; marks done.<sha> when the
@@ -358,6 +365,136 @@ repair_allowlist() {
   done
 }
 
+# ---- DEVOS-90: re-checks without a new main SHA ----
+# The request channel is the open DRAFT pull request whose head branch is $RECHECK_BRANCH (drafts are never
+# reviewed by the watcher and never merged). Its comments are read with the existing token (Pull requests: Read);
+# a GitHub issue would need Issues permission, which this token does not have. A request is a comment whose whole
+# body is "/recheck", written by a login in $RECHECK_AUTHORS. Comment ids already seen are in recheck.last-id;
+# the first scan only records a baseline, so old comments never fire.
+allowed_author() { local a; for a in $RECHECK_AUTHORS; do [[ "$1" == "$a" ]] && return 0; done; return 1; }
+recheck_pr() {  # -> number of the tracking PR (empty if none); 1 on read error
+  local p
+  p="$(gh GET "/repos/$REPO/pulls?state=open&head=${REPO%%/*}:$RECHECK_BRANCH&per_page=100")" || return 1
+  jq -r --arg b "$RECHECK_BRANCH" --arg a " $RECHECK_AUTHORS " '[.[]? | select(.head.ref == $b and .draft == true
+      and ((.user.login // "") as $u | $u != "" and ($a | contains(" " + $u + " "))))] | min_by(.number) // empty | .number' <<<"$p"
+}
+scan_requests() {  # sets recheck.requested when an allowed /recheck is new; never fatal
+  local pr page=1 chunk accf pagef n=0 last max since="" q="" acc
+  pr="$(recheck_pr)" || { log "re-check: cannot read the tracking PR; next tick"; return 0; }
+  [[ "$pr" =~ ^[0-9]+$ ]] || return 0
+  # Only comments updated since the last one seen are read (GitHub's since= filter), so a long thread stays cheap.
+  since="$(sed -n '1s/^[0-9]\{1,20\} \([0-9TZ:-]\{20\}\)$/\1/p' "$ST/recheck.last-id" 2>/dev/null || true)"
+  [[ -n "$since" ]] && q="&since=$since"
+  # Pages are merged through temp files and bodies are reduced to a flag at once (Codex PR31-r1): a page is never
+  # passed as a jq argument, so a large page cannot hit the kernel's per-argument limit; every failure is non-fatal.
+  accf="$(mktemp "$TMP/rc-acc.XXXXXX")" && pagef="$(mktemp "$TMP/rc-page.XXXXXX")" \
+    || { rm -f "${accf:-}"; log "re-check: cannot create temp files; next tick"; return 0; }
+  printf '[]' > "$accf"
+  while :; do
+    if ! gh GET "/repos/$REPO/issues/$pr/comments?per_page=100&page=$page$q" > "$pagef"; then
+      rm -f "$accf" "$pagef"; log "re-check: cannot read PR #$pr comments; next tick"; return 0
+    fi
+    if ! { jq -c '[.[]? | {id, login: .user.login, recheck: (((.body // "") | gsub("^\\s+|\\s+$"; "")) == "/recheck"),
+                           at: (.updated_at // "")}]' "$pagef" > "$pagef.k" && mv "$pagef.k" "$pagef" \
+           && jq -c -s '.[0] + .[1]' "$accf" "$pagef" > "$accf.n" && mv "$accf.n" "$accf" \
+           && n="$(jq 'length' "$pagef")"; }; then
+      rm -f "$accf" "$accf.n" "$pagef" "$pagef.k"; log "re-check: cannot merge PR #$pr comments; next tick"; return 0
+    fi
+    if (( n < 100 )) || (( page >= 30 )); then break; fi
+    page=$((page + 1))
+  done
+  if (( n >= 100 && page >= 30 )); then log "re-check: more than 3000 new comments on PR #$pr; only the first 3000 were read"; fi
+  acc="$(cat "$accf")" || acc=""
+  rm -f "$accf" "$pagef"
+  [[ -n "$acc" ]] || return 0
+  max="$(jq -r 'max_by(.id) // {id: 0, at: ""} | "\(.id) \(.at)"' <<<"$acc")" || return 0
+  [[ "$max" =~ ^[0-9]+\ ([0-9TZ:-]{20})?$ ]] || return 0
+  if [[ ! -s "$ST/recheck.last-id" ]]; then
+    [[ $DRY -eq 1 ]] && { log "re-check: WOULD record the comment baseline on PR #$pr"; return 0; }
+    echo "$max" > "$ST/recheck.last-id"; log "re-check: comment baseline recorded on PR #$pr"; return 0
+  fi
+  last="$(head -n1 "$ST/recheck.last-id" | cut -d' ' -f1)"; [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  local id login body hit=""
+  while IFS=$'\t' read -r id login body; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    if allowed_author "$login"; then hit="$id"
+    else log "re-check: ignored /recheck from a login that is not allowed ($(tr -cd 'A-Za-z0-9[]-' <<<"$login" | head -c 40))"; fi
+  done < <(jq -r --argjson l "$last" '.[] | select(.id > $l and .recheck == true)
+             | [.id, (.login // ""), "x"] | @tsv' <<<"$acc")
+  [[ $DRY -eq 1 ]] && { [[ -n "$hit" ]] && log "re-check: WOULD act on the /recheck request on PR #$pr"; return 0; }
+  [[ -n "$hit" ]] && { echo "$pr $hit" > "$ST/recheck.requested"; log "re-check requested on PR #$pr"; }
+  (( ${max%% *} > last )) && echo "$max" > "$ST/recheck.last-id"
+  return 0
+}
+recheck_target() {  # -> the SHA that is live now: the last successful deploy, else (deploy off) the installed SHA
+  local s=""
+  if [[ -s "$ST/deployed.sha" ]]; then
+    s="$(head -n1 "$ST/deployed.sha")"
+    [[ "$(cut -d' ' -f1 "$ST/deployed.$s" 2>/dev/null)" == success ]] || s=""
+  elif [[ ! -e "$ST/deploy.enabled" && -s "$ST/installed.sha" ]]; then
+    s="$(head -n1 "$ST/installed.sha")"
+  fi
+  [[ "$s" =~ ^[0-9a-f]{40}$ && -e "$ST/done.$s" && -e "$ST/installed.$s" ]] || return 0
+  printf '%s' "$s"
+}
+# A post that keeps failing (e.g. the tracking PR was closed) must not block re-checks for good: after
+# RECHECK_MAX_FAILS failed attempts in a row (about a day) the stored result is dropped, logged, and re-checks carry on.
+RECHECK_MAX_FAILS="${RECHECK_MAX_FAILS:-480}"   # 480 ticks of 3 min = about a day
+recheck_failed() {
+  local n; n="$(cat "$ST/recheck.fails" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$((n + 1))
+  if (( n >= RECHECK_MAX_FAILS )); then
+    log "$1; gave up after $n attempts, result dropped"; rm -f "$ST/recheck.result" "$ST/recheck.statused" "$ST/recheck.fails"
+  else echo "$n" > "$ST/recheck.fails"; log "$1; will retry ($n/$RECHECK_MAX_FAILS)"; fi
+}
+publish_recheck() {  # posts a stored re-check result; kept for the next tick when the post fails
+  local sha st desc pr c
+  [[ -s "$ST/recheck.result" ]] || return 0
+  read -r sha pr st desc < "$ST/recheck.result" || true
+  if ! [[ "$sha" =~ ^[0-9a-f]{40}$ && ( "$pr" == - || "$pr" =~ ^[0-9]+$ ) && "$st" =~ ^(success|failure)$ && -s "$ST/recheck.checks.md" ]]; then
+    log "re-check: stored result is unreadable; dropped"; rm -f "$ST/recheck.result" "$ST/recheck.statused" "$ST/recheck.fails"; return 0
+  fi
+  if [[ ! -e "$ST/recheck.statused" ]]; then
+    if status "$sha" server-check "$st" "re-check: $desc"; then touch "$ST/recheck.statused"
+    else recheck_failed "${sha:0:7}: re-check status failed"; return 0; fi
+  fi
+  if [[ "$pr" =~ ^[0-9]+$ ]]; then
+    jq -Rs '{body: .}' "$ST/recheck.checks.md" > "$TMP/rc.json"
+    gh POST "/repos/$REPO/issues/$pr/comments" "$TMP/rc.json" >/dev/null || { recheck_failed "re-check comment failed"; return 0; }
+  fi
+  rm -f "$ST/recheck.result" "$ST/recheck.statused" "$ST/recheck.fails"
+  log "${sha:0:7}: re-check posted ($st $desc)"
+}
+# recheck_tick: runs only after the normal flow has finished for the live SHA, and never while a deployment is
+# in flight. It runs the installed checks and posts server-check on that SHA; it never installs or deploys.
+recheck_tick() {
+  local now last sha why="" f pr=""
+  [[ $DRY -eq 0 ]] && publish_recheck
+  [[ $DRY -eq 0 && -s "$ST/recheck.result" ]] && return 0   # an earlier result is still unposted
+  scan_requests
+  now="$(date +%s)"
+  last="$(sed -n '1s/^\([0-9]\{1,12\}\).*/\1/p' "$ST/recheck.state" 2>/dev/null || true)"
+  if [[ -z "$last" ]]; then
+    [[ $DRY -eq 0 ]] && echo "$now baseline" > "$ST/recheck.state"   # first sight: the next timed re-check is in 6 h
+    last="$now"
+  fi
+  [[ -s "$ST/recheck.requested" ]] && { why=request; read -r pr _ < "$ST/recheck.requested"; }
+  [[ -z "$why" ]] && (( now - last >= RECHECK_EVERY )) && why=timer
+  [[ -n "$why" ]] || return 0
+  for f in "$ST"/deploy-started.*; do
+    [[ -e "$f" ]] || continue
+    [[ -s "$ST/deployed.${f##*/deploy-started.}" ]] || { log "re-check deferred: a deployment is in flight"; return 0; }
+  done
+  sha="$(recheck_target)"
+  [[ -n "$sha" ]] || { log "re-check deferred: no deployed SHA has finished its normal checks yet"; return 0; }
+  [[ $DRY -eq 1 ]] && { log "${sha:0:7}: WOULD re-check ($why)"; return 0; }
+  run_checks "$sha" "$ST/recheck" "Server re-check ($why)"
+  echo "$now $sha $why" > "$ST/recheck.state"
+  { printf '%s %s ' "$sha" "${pr:--}"; cat "$ST/recheck.checks.state"; } > "$ST/recheck.result"
+  rm -f "$ST/recheck.requested"
+  log "${sha:0:7}: re-check ($why) $(cat "$ST/recheck.checks.state")"
+  publish_recheck
+}
+
 # ---- tick ----
 repair_allowlist
 cert_renewal
@@ -399,7 +536,7 @@ for f in "$ST"/refused.* "$ST"/deployed.* "$ST"/*.checks.state; do
   publish "$s"
 done
 
-if [[ -e "$ST/done.$sha" ]]; then log "main ${sha:0:7}: already handled"; exit 0; fi
+if [[ -e "$ST/done.$sha" ]]; then log "main ${sha:0:7}: already handled"; recheck_tick; exit 0; fi
 if [[ -e "$ST/refused.$sha" ]]; then
   [[ $DRY -eq 1 ]] && { log "main ${sha:0:7}: refused; WOULD retry publication"; exit 0; }
   publish "$sha"; exit 0
@@ -442,5 +579,10 @@ else
   log "main ${sha:0:7}: deploy disabled (first launch not approved by KK)"
 fi
 
-[[ -s "$ST/$sha.checks.state" ]] || run_checks "$sha"
+if [[ ! -s "$ST/$sha.checks.state" ]]; then
+  run_checks "$sha"
+  echo "$(date +%s) $sha normal" > "$ST/recheck.state"   # DEVOS-90: the 6-hour clock restarts after normal checks
+fi
 publish "$sha"
+[[ -e "$ST/done.$sha" ]] && recheck_tick
+exit 0

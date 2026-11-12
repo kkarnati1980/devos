@@ -181,20 +181,36 @@ function blockText(b: Block): string {
   return b.text;
 }
 
+/** Strips leading/trailing dots and hyphens by index (no regex, so no backtracking on long runs). */
+function trimEdgePunct(s: string): string {
+  let i = 0;
+  let j = s.length;
+  while (i < j && (s[i] === "." || s[i] === "-")) i++;
+  while (j > i && (s[j - 1] === "." || s[j - 1] === "-")) j--;
+  return s.slice(i, j);
+}
+
+const CONNECTOR_WORDS: ReadonlySet<string> = new Set(["and", "or", "see"]);
+
+/** True when the text is only requirement IDs plus punctuation/emphasis (a reference list item). */
+function isBareIdReference(text: string, prefixes: readonly string[]): boolean {
+  const ids = new Set(extractRequirementIds(text, prefixes).map((r) => r.id));
+  if (ids.size === 0) return false;
+  // One linear pass over the item's tokens (PR53-r4: no per-ID rescans). A token is a run of letters, digits,
+  // dots and hyphens; edge dots/hyphens are punctuation. Each token must be an extracted ID or a connector word,
+  // or carry no letter/digit at all. Whole-token matching also keeps FR-1 from eating FR-10 or FR-1.2 (PR53-r3).
+  for (const raw of text.split(/[^\p{L}\p{N}.\-]+/u)) {
+    const tok = trimEdgePunct(raw);
+    if (tok === "" || ids.has(tok) || CONNECTOR_WORDS.has(tok.toLowerCase())) continue;
+    if (/[\p{L}\p{N}]/u.test(tok)) return false;
+  }
+  return true;
+}
+
 /**
  * Deterministic Analyst pass (M2.2-a): spec blocks → requirements, milestones, stack and open questions.
  * Every item points at the block it came from; nothing is produced from outside the blocks.
  */
-/** True when the text is only requirement IDs plus punctuation/emphasis (a reference list item). */
-function isBareIdReference(text: string, prefixes: readonly string[]): boolean {
-  const ids = extractRequirementIds(text, prefixes);
-  if (ids.length === 0) return false;
-  let rest = text;
-  // Longest first, so removing FR-1 cannot eat the prefix of FR-10 or FR-1.2 (PR53-r3).
-  for (const { id } of [...ids].sort((x, y) => y.id.length - x.id.length)) rest = rest.split(id).join(" ");
-  return !/[\p{L}\p{N}]/u.test(rest.replace(/\b(and|or|see)\b/gi, " "));
-}
-
 export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = {}): Analysis {
   const prefixes = options.idPrefixes ?? DEFAULT_ID_PREFIXES;
   const assignPrefix = options.assignPrefix ?? "FR";
@@ -293,6 +309,10 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
         open = null;
         return;
       }
+      if (id && isBareIdReference(b.text, prefixes)) {
+        open = null; // an IDs-only heading is a reference: no requirement, section unchanged (PR53-r5)
+        return;
+      }
       if (id) {
         const prMatch = PRIORITY_SUFFIX.exec(id.rest);
         const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;
@@ -306,10 +326,20 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     }
 
     if (b.type === "table") {
-      open = null;
       const cols = tableColumns(b.rows, prefixes);
+      // A requirement table ends any open scope. A non-requirement table does not end a heading requirement's
+      // criteria (they run to the next heading, behaviour 2); it does end a list item's nested scope (PR53-r8).
+      if (cols || (open as typeof open)?.kind !== "heading") open = null;
       if (!cols) {
-        if (section === "stack") for (const row of b.rows.slice(1)) stack.push({ text: row.filter(Boolean).join(" — "), source: i });
+        // A non-requirement table's rows follow the list-item rules (PR53-r5, r6): under a stack heading each row
+        // is a stack item; under a questions heading each row is a stated question; anywhere, a row with
+        // TBD/TBC or a trailing "?" is a stated question.
+        for (const row of b.rows.slice(1)) {
+          const text = row.filter(Boolean).join(" — ");
+          if (!text) continue;
+          if (section === "stack") stack.push({ text, source: i });
+          if (section === "questions" || isQuestionText(text)) stated.push({ text, source: i });
+        }
         return;
       }
       for (const row of b.rows.slice(cols.hasHeader ? 1 : 0)) {
@@ -349,6 +379,11 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     }
 
     const id = leadingId(text, prefixes);
+    // `FR-1 — FR-2` or `FR-1. FR-2` holds only IDs: a reference, never a definition of FR-1 (PR53-r5).
+    if (id && (b.type === "list-item" || b.type === "paragraph") && isBareIdReference(text, prefixes)) {
+      open = null;
+      return;
+    }
     if (id && (b.type === "list-item" || b.type === "paragraph")) {
       const prMatch = PRIORITY_SUFFIX.exec(id.rest);
       const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;

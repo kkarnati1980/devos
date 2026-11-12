@@ -359,3 +359,81 @@ test("AT10b (PR53-r2, r3) bare ID list items (also overlapping IDs) are referenc
   assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), ["FR-A001: Users can export reports; format TBD"]);
   assert.equal(a.openQuestions.filter((q) => q.kind === "missing-acceptance").length, 0);
 });
+
+test("AT10c (PR53-r4) one bare-ID item with 100k distinct IDs stays linear; trailing dots and emphasis are punctuation", () => {
+  const ids = Array.from({ length: 100000 }, (_, i) => `FR-${i + 1}`).join(", ");
+  const t0 = Date.now();
+  const big = analyze(`## Requirements\n\n- ${ids}\n- Users can sign up\n`).a;
+  assert.ok(Date.now() - t0 < 5000, "100k IDs in one item took too long");
+  assert.deepEqual(big.requirements.map((r) => r.title), ["Users can sign up"]);
+  const { a } = analyze(`## Requirements
+
+- *FR-3* and FR-4, FR-1.2.
+- FR-5 export
+- x-FR-6
+`);
+  assert.deepEqual(a.requirements.map((r) => r.title), ["FR-5 export", "x-FR-6"]);
+});
+
+test("AT10d (PR53-r5) IDs-only items with a separator are references; unresolved stack table rows are questions", () => {
+  const { a } = analyze(`## Requirements
+
+- FR-1 — FR-2
+- FR-1. FR-2
+FR-3: FR-4
+
+### FR-5 – FR-6
+
+- FR-1: Login
+- FR-2: Export
+
+## Stack
+
+| Component | Choice |
+|---|---|
+| Hosting | TBD |
+| Database | Postgres |
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.title]), [["FR-1", "Login"], ["FR-2", "Export"]]);
+  assert.equal(a.warnings.filter((w) => w.code === "duplicate-id").length, 0);
+  assert.deepEqual(a.stack.map((s) => s.text), ["Hosting — TBD", "Database — Postgres"]);
+  assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), ["Hosting — TBD"]);
+});
+
+test("AT10e (PR53-r6) non-requirement tables outside stack: questions-section rows and TBD rows are stated questions", () => {
+  const { a } = analyze(`## Open questions
+
+| Topic | Decision |
+|---|---|
+| Hosting | TBD |
+| Billing | Who pays for SMS |
+
+## Notes
+
+| Item | Status |
+|---|---|
+| Branding | TBC |
+| Logo | Done |
+`);
+  assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), [
+    "Hosting — TBD",
+    "Billing — Who pays for SMS",
+    "Branding — TBC",
+  ]);
+  assert.equal(a.stack.length, 0);
+});
+
+test("AT10f (PR53-r8) a non-requirement table inside a heading requirement keeps its criteria scope", () => {
+  const { a } = analyze(`## Requirements
+
+### FR-1: Login
+
+| Field | Type |
+|---|---|
+| email | text |
+
+- Login succeeds
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.acceptance]), [["FR-1", ["Login succeeds"]]]);
+  assert.equal(a.openQuestions.filter((q) => q.kind === "missing-acceptance").length, 0);
+});
