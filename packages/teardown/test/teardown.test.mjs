@@ -10,7 +10,6 @@ import { fakeProviders } from "../../provision/test/fakes.mjs";
 
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme", name: "Acme app" };
-const noSleep = async () => {};
 const DAY = 86_400_000;
 
 /** M2.4's fakes plus the teardown endpoints: repo PATCH/DELETE, the repo list, Coolify project DELETE. */
@@ -49,7 +48,7 @@ function fakes() {
     };
     const f = faults.find((x) => !x.used && x.match(method, path));
     if (f) f.used = true;
-    calls.push({ method, path, auth: init.headers?.authorization });
+    calls.push({ method, path, auth: init.headers?.authorization, signal: init.signal });
     if (f?.action === "timeout-before") throw timeout();
     if (f?.action?.status) return json(f.action.status, { message: "injected" });
     const own = handle();
@@ -63,8 +62,10 @@ function fakes() {
 
 function setup() {
   const fake = fakes();
-  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: noSleep });
-  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: noSleep });
+  const sleeps = [];
+  const sleep = async (ms) => { sleeps.push(ms); };
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep });
+  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep });
   const store = new MemoryTeardownStore();
   store.addProject({ id: P.id, slug: P.slug, stage: "live" });
   const steps = (p = P) => [githubRepoStep(gh, p, "kkarnati1980"), coolifyProjectStep(cf, p)];
@@ -72,7 +73,7 @@ function setup() {
   const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store)];
   const t0 = Date.UTC(2026, 10, 12, 8, 0, 0);
   const base = { store, ops, now: () => t0 };
-  return { fake, gh, cf, store, steps, ops, scanners, base, t0 };
+  return { fake, gh, cf, store, steps, ops, scanners, base, t0, sleeps };
 }
 
 const provision = (s) => runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
@@ -226,6 +227,8 @@ test("AT8 retries and timeouts: a timed-out delete that succeeded is confirmed b
   assert.equal(out.purged, true);
   assert.equal(s.fake.deletes().filter((d) => d.path.startsWith("/repos/")).length, 1);
   assert.ok(s.fake.faults.every((f) => f.used), "both injected faults fired");
+  assert.equal(s.sleeps.length, 1, "the 503 lookup was retried once, after a backoff sleep");
+  assert.ok(s.sleeps[0] > 0);
 
   // Timeout before the delete reached the provider: still there → delete_unconfirmed (retryable); the re-run deletes.
   const s2 = setup();
@@ -252,6 +255,8 @@ test("AT8 retries and timeouts: a timed-out delete that succeeded is confirmed b
   const everything = JSON.stringify([err.message, err.resource, s.store.scans, s2.store.scans, [...s3.store.steps.values()], s3.store.resources]);
   assert.ok(!everything.includes(TOKEN));
   assert.ok(s.fake.calls.every((c) => c.auth === `Bearer ${TOKEN}`));
+  // Every call carried a timeout signal (ADR-0011 §9).
+  assert.ok([...s.fake.calls, ...s2.fake.calls, ...s3.fake.calls].every((c) => c.signal instanceof AbortSignal));
 });
 
 test("teardown refuses an inventory kind it cannot delete before deleting anything", async () => {
@@ -261,4 +266,29 @@ test("teardown refuses an inventory kind it cannot delete before deleting anythi
   await archiveProject(P.id, { ...s.base, authorize: allowAll });
   await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => e.code === "unsupported_resource");
   assert.equal(s.fake.deletes().length, 0);
+});
+
+test("pre-review 1: a purge that stops half way resets the steps, so Restore + re-provision recreates the deleted resource", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.fake.faults.push({ match: (m, p) => m === "DELETE" && p.startsWith("/repos/"), action: { status: 403 } });
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => e.code === "provider_forbidden");
+  assert.equal(s.fake.projects.size, 0, "the Coolify project was deleted first");
+  assert.equal(s.store.steps.size, 0, "no stale done step");
+  await restoreProject(P.id, { ...s.base, authorize: allowAll });
+  const out = await provision(s);
+  assert.deepEqual(out.map((o) => o.outcome), ["adopted", "created"]);
+  assert.equal(s.fake.projects.size, 1);
+});
+
+test("pre-review 3: archive checks ownership of every resource before its first write", async () => {
+  const s = setup();
+  await provision(s);
+  const cfOps = { provider: "coolify", kind: "project", inspect: async () => ({ owned: false }), remove: async () => {}, archive: async () => { throw new Error("must not run"); } };
+  const ghFirst = [githubRepoOps(s.gh, P.id), cfOps];
+  await assert.rejects(archiveProject(P.id, { ...s.base, ops: ghFirst, authorize: allowAll }), (e) => e.code === "ownership_mismatch");
+  assert.notEqual(s.fake.repos.get("kkarnati1980/devos-acme").archived, true, "the repo was not archived");
+  assert.equal(s.fake.calls.filter((c) => c.method === "PATCH").length, 0);
+  assert.equal((await s.store.project(P.id)).stage, "live");
 });

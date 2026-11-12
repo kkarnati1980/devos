@@ -167,15 +167,21 @@ export async function archiveProject(projectId: string, opts: ArchiveOptions): P
     if (p.stage === "archived" || p.stage === "purged") throw new TeardownError("already_archived", false, `project is already ${p.stage}`);
     await check(opts, "teardown.archive", projectId);
     await opts.cancelRuns?.(projectId);
+    // Pre-review finding 3: prove ownership of every resource before the first write, so a mismatch never
+    // leaves the project half archived.
+    const todo: { r: ActiveResource; ops: ResourceOps }[] = [];
     for (const r of await opts.store.activeResources(projectId)) {
       const ops = map.get(opsKey(r.provider, r.kind));
       if (!ops?.archive) continue;
       const got = await inspect(ops, r);
       if (!got) continue;
       if (!got.owned) throw new TeardownError("ownership_mismatch", false, `${describe(r)} no longer carries this project's marker; not touched`, pick(r));
+      todo.push({ r, ops });
+    }
+    for (const { r, ops } of todo) {
       await opts.store.assertLockHeld(projectId);
       try {
-        await ops.archive(r);
+        await ops.archive!(r);
       } catch (e) {
         throw writeError(e, "archive", r);
       }
@@ -194,15 +200,21 @@ export async function restoreProject(projectId: string, opts: TeardownOptions): 
     const p = await loadProject(opts.store, projectId);
     if (p.stage !== "archived") throw new TeardownError("not_archived", false, `project is ${p.stage}, not archived`);
     await check(opts, "teardown.restore", projectId);
+    // Pre-review finding 3: prove ownership of every resource before the first write, so a mismatch never
+    // leaves the project half restored.
+    const todo: { r: ActiveResource; ops: ResourceOps }[] = [];
     for (const r of await opts.store.activeResources(projectId)) {
       const ops = map.get(opsKey(r.provider, r.kind));
       if (!ops?.unarchive) continue;
       const got = await inspect(ops, r);
       if (!got) continue;
       if (!got.owned) throw new TeardownError("ownership_mismatch", false, `${describe(r)} no longer carries this project's marker; not touched`, pick(r));
+      todo.push({ r, ops });
+    }
+    for (const { r, ops } of todo) {
       await opts.store.assertLockHeld(projectId);
       try {
-        await ops.unarchive(r);
+        await ops.unarchive!(r);
       } catch (e) {
         throw writeError(e, "restore", r);
       }
@@ -246,6 +258,10 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
     for (const r of rows) {
       if (!map.has(opsKey(r.provider, r.kind))) throw new TeardownError("unsupported_resource", false, `no teardown for ${r.provider} ${r.kind} yet`, pick(r));
     }
+    // Pre-review finding 1: reset the step journal before the first delete, so a purge that stops half way (then
+    // Restore) can never leave a stale `done` step for a resource that is gone. Safe under the shared lock:
+    // provisioning always looks a resource up before trusting or creating it.
+    await opts.store.resetSteps(projectId);
     let deleted = 0;
     for (const r of rows) {
       const ops = map.get(opsKey(r.provider, r.kind))!;
@@ -266,7 +282,6 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
       }
       await opts.store.markResourceDeleted(r.id, new Date(now()));
     }
-    await opts.store.resetSteps(projectId);
     const report = await scanLeftovers({ id: p.id, slug: p.slug }, opts.scanners, now);
     await opts.store.saveScan(projectId, report);
     const purged = report.hits.length === 0 && report.errors.length === 0;
