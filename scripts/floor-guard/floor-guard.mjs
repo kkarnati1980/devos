@@ -159,10 +159,28 @@ function sectionOf(baseLines, ln) {
   return chain.join("\n");
 }
 
+/** A JS/TS/YAML numeric literal as written: separators (`1_000`), hex/octal/binary, decimals, exponents (PR70-r13). */
+const NUM = String.raw`(0[xX][\da-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?)`;
+const num = (s) => { const v = Number(s.replace(/_/g, "")); return Number.isNaN(v) ? Infinity : v; };
+
 function numbers(lines, rx) {
   const out = [];
-  for (const l of lines) for (const m of l.text.matchAll(rx)) out.push({ key: m[1].toLowerCase(), v: Number(m[2]), l });
+  for (const l of lines) for (const m of l.text.matchAll(rx)) out.push({ key: m[1].toLowerCase(), v: num(m[2]), l });
   return out;
+}
+
+/** True when an `if:` value is constant-false, quoted or not, bare or in ${{ }} (PR70-r12, PR70-r13). */
+function constFalseIf(text) {
+  const m = /^\s*(?:-\s*)?if\s*:\s*(.*?)\s*(?:#.*)?$/.exec(text);
+  if (!m) return false;
+  let e = m[1].trim();
+  for (let i = 0; i < 3; i++) {
+    const q = /^(["'])(.*)\1$/.exec(e); if (q) e = q[2].trim();
+    const x = /^\$\{\{(.*)\}\}$/.exec(e); if (x) e = x[1].trim();
+    const pr = /^\((.*)\)$/.exec(e); if (pr) e = pr[1].trim();
+  }
+  const F = String.raw`(?:false|0|''|""|null|!\s*true)`;
+  return new RegExp(`^${F}$`).test(e) || new RegExp(`(^|&&)\\s*${F}\\s*(&&|$)`).test(e);
 }
 
 /**
@@ -221,7 +239,7 @@ export function analyse(files, show) {
       for (const a of f.added) {
         if (/continue-on-error\s*:\s*(true|\$\{\{)/.test(a.text)) hit("ci-continue-on-error", p, a.ln, a.text);
         // a trailing YAML comment is still `if: false` (PR70-r12); job-level and step-level alike
-        if (/^\s*(-\s*)?if\s*:\s*(false|\$\{\{\s*false\s*\}\})\s*(#.*)?$/.test(a.text)) hit("ci-disabled", p, a.ln, a.text);
+        if (constFalseIf(a.text)) hit("ci-disabled", p, a.ln, a.text);
       }
       const before = f.status === "A" ? null : show("base", f.oldPath), after = show("head", p);
       if (after == null || (before == null && f.status !== "A")) throw new GuardError(`cannot read workflow ${p} at base/head`);
@@ -250,10 +268,10 @@ export function analyse(files, show) {
     }
 
     // thresholds: CI timeout-minutes and test timeouts past the ceiling; coverage lowered; retries / max-warnings raised.
-    if (WORKFLOW.test(p)) for (const a of f.added) { const m = /timeout-minutes\s*:\s*(\d+)/.exec(a.text); if (m && +m[1] > CEILINGS.ciTimeoutMinutes) hit("timeout-past-ceiling", p, a.ln, a.text); }
-    if (test || TEST_CONFIG.test(p)) for (const a of f.added) for (const m of a.text.matchAll(/\b(testTimeout|hookTimeout|timeout)["']?\s*[:=]\s*(\d[\d_]*)/g)) if (+m[2].replace(/_/g, "") > CEILINGS.testTimeoutMs) hit("timeout-past-ceiling", p, a.ln, a.text);
+    if (WORKFLOW.test(p)) for (const a of f.added) { const m = new RegExp(String.raw`timeout-minutes\s*:\s*["']?` + NUM).exec(a.text); if (m && num(m[1]) > CEILINGS.ciTimeoutMinutes) hit("timeout-past-ceiling", p, a.ln, a.text); }
+    if (test || TEST_CONFIG.test(p)) for (const a of f.added) for (const m of a.text.matchAll(new RegExp(String.raw`\b(testTimeout|hookTimeout|timeout)["']?\s*[:=]\s*` + NUM, "g"))) if (num(m[2]) > CEILINGS.testTimeoutMs) hit("timeout-past-ceiling", p, a.ln, a.text);
     if (TEST_CONFIG.test(p) || test || WORKFLOW.test(p)) {
-      const cov = /\b(lines|branches|functions|statements|threshold|perFile)\b["']?\s*[:=]\s*(\d+(?:\.\d+)?)/g;
+      const cov = new RegExp(String.raw`\b(lines|branches|functions|statements|threshold|perFile)\b["']?\s*[:=]\s*` + NUM, "g");
       const was = numbers(f.removed, cov), now = numbers(f.added, cov);
       // pair the k-th new occurrence of a key with its k-th old one, so nested/per-path thresholds compare in place (PR70-r2)
       const byKey = (xs) => xs.reduce((m, x) => (m[x.key] ??= []).push(x) && m, {});
@@ -273,7 +291,7 @@ export function analyse(files, show) {
       if (/coverage|c8rc|nycrc/i.test(p) || f.removed.concat(f.added).some((l) => /coverage/.test(l.text)) || TEST_CONFIG.test(p) || mentionsCoverage())
         for (const [l, m] of onKeys(f.removed)) { const left = addedOn.get(m[1]) ?? 0; if (left > 0) addedOn.set(m[1], left - 1); else hit("coverage-lowered", p, l.ln, `${m[1]} no longer true: ${l.text}`); }
       for (const a of f.added) if (/\b(exclude|testPathIgnorePatterns|testIgnore|modulePathIgnorePatterns|coveragePathIgnorePatterns)\b["']?\s*[:=]/.test(a.text) && !WORKFLOW.test(p)) hit("tests-excluded", p, a.ln, a.text);
-      const retry = /(?<![\w-])(retries|retry|maxRetries)["']?\s*[:=\s]\s*(\d+)/g;
+      const retry = new RegExp(String.raw`(?<![\w-])(retries|retry|maxRetries)["']?\s*[:=\s]\s*` + NUM, "g");
       const rw = numbers(f.removed, retry), rn = numbers(f.added, retry);
       // pair the k-th new occurrence of a key with its k-th old one, as for coverage (PR70-r4)
       const rwk = byKey(rw), seen = {};

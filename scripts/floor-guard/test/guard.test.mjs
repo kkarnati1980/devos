@@ -63,6 +63,14 @@ const VIOLATIONS = [
   // PR70-r12: a job-level `if: false` with a trailing comment
   ["ci-disabled (job-level if: false # comment)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: false # temporarily disabled\n") }],
   ["ci-disabled (step if: ${{ false }} # comment)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: ${{ false }}  # later\n")) }],
+  // PR70-r13: quoted constant-false values, job-level and step-level
+  ["ci-disabled (job-level if: '${{ false }}')", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: '${{ false }}'\n") }],
+  ["ci-disabled (step if: \"false\")", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: \"false\"\n")) }],
+  ["ci-disabled (if: ${{ false && github.event_name == 'push' }})", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: ${{ false && github.event_name == 'push' }}\n") }],
+  // PR70-r13: numeric separators and other literal forms are read at their real value
+  ["retries-raised (1 -> 1_000)", { "apps/d/playwright.config.ts": "export default { retries: 1 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 1_000 };\n" }],
+  ["retries-raised (1 -> 0x10)", { "apps/d/playwright.config.ts": "export default { retries: 1 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 0x10 };\n" }],
+  ["timeout-past-ceiling (timeout-minutes: '1_000')", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    timeout-minutes: '1_000'\n") }],
   ["ci-disabled (if: false)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: false\n")) }],
   ["failure-swallowed (|| true)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm test", "run: pnpm test || true")) }],
   ["failure-swallowed (set +e)", { "scripts/t.sh": "#!/usr/bin/env bash\nset -e\nnode --test\n" }, { "scripts/t.sh": "#!/usr/bin/env bash\nset +e; pnpm test\nnode --test\n" }],
@@ -250,4 +258,10 @@ test("CLI: exit codes, HIT lines and the JSON report", () => {
   assert.equal(bad.status, 2); assert.match(bad.stderr, /could not run/);
   g(dir, "switch", "-q", "main");
   assert.equal(spawnSync(process.execPath, [GUARD, "--base", "main", "--head", "main"], { cwd: dir }).status, 0);
+});
+
+test("exit 0: a real condition is not ci-disabled, and a lowered literal retry is not raised (PR70-r13)", () => {
+  const r = check({ [WF]: wf(STEPS), "apps/d/playwright.config.ts": "export default { retries: 1_0 };\n" },
+    { [WF]: wf(STEPS, "    if: \"${{ github.event_name != 'schedule' && !cancelled() }}\"\n    timeout-minutes: '15'\n"), "apps/d/playwright.config.ts": "export default { retries: 2 };\n" });
+  assert.deepEqual(r.hits, []);
 });
