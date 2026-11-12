@@ -330,7 +330,7 @@ paths:
       parameters:
         - { name: jobId, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" } }
       responses:
-        "200": { description: "`{ retried: jobId }`; audited (`run.dead_letter.retried`) before the job is re-queued" }
+        "200": { description: "`{ retried: jobId }`; audited (`run.dead_letter.retry_requested`) before the job is re-queued" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
