@@ -107,3 +107,8 @@ Run the existing Codex review automatically on every new PR head, so a review no
   - A POST that GitHub stores but never answers leaves exactly one comment after the retry tick, and the PR is published.
   - A tried comment with no copy on GitHub is posted once.
   - `review-watch.test.mjs`: 10/10.
+- **Pre-review (2 medium, 2 low; all fixed):**
+  - **A failed comment read posts nothing.** It is now its own outcome (return code 2): the watcher logs it, skips the comment POST for that tick and still sets the status. So a slow GitHub can no longer cause a duplicate.
+  - **Only the watcher's own comment counts.** The comment must be authored by `REVIEW_BOT_LOGIN` (default `kkarnati1980`, the account whose token posts), so another user's forged copy cannot suppress the real verdict.
+  - **The query string is now `?per_page=100`**, replacing the no-op `sort=created`.
+  - **AT20 covers more cases:** a failed comment read, a forged comment by another login, and an own comment that belongs to a different SHA.

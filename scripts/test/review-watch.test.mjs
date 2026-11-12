@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false });
 
 before(async () => {
   reset();
@@ -38,11 +38,14 @@ before(async () => {
       }
       const cm = p.match(/^\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/);
       if (cm && req.method === "POST") {
-        M.comments.push({ pr: Number(cm[1]), ...JSON.parse(body) });
+        M.comments.push({ pr: Number(cm[1]), user: { login: "kkarnati1980" }, ...JSON.parse(body) });
         if (M.hangComment) return; // GitHub stored it, but the answer never arrives
         return send(201, {});
       }
-      if (cm && req.method === "GET") return send(200, M.comments.filter((c) => c.pr === Number(cm[1])).map((c) => ({ body: c.body })));
+      if (cm && req.method === "GET") {
+        if (M.failCommentsGet) return send(502, {});
+        return send(200, M.comments.filter((c) => c.pr === Number(cm[1])).map((c) => ({ body: c.body, user: c.user })));
+      }
       const st = p.match(/^\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/);
       if (st && req.method === "POST") {
         if (M.failStatus) return send(500, {});
@@ -264,6 +267,14 @@ test("AT20: a timed-out verdict comment that GitHub stored is found on the next 
   assert.match(r1.out, /comment failed; will retry/);
   assert.equal(M.comments.length, 1);
   M.hangComment = false;
+  // The comment read fails: no POST this tick (that would risk the duplicate), and nothing marked posted.
+  M.failCommentsGet = true;
+  const rf = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(rf.code, 0, rf.out);
+  assert.match(rf.out, /cannot check the PR's comments/);
+  assert.equal(M.comments.length, 1);
+  assert.equal(fs.existsSync(path.join(dir, "watch", `${sha}.commented`)), false);
+  M.failCommentsGet = false;
   const r2 = await tick([], { REVIEW_RUNNER: runner });
   assert.equal(r2.code, 0, r2.out);
   assert.match(r2.out, /verdict comment already on the PR/);
@@ -277,7 +288,11 @@ test("AT20: a timed-out verdict comment that GitHub stored is found on the next 
   fs.writeFileSync(path.join(dir, "watch", `${sha2}.msg`), "### Codex review PR32-r1 — **PASS**\n\n- **Commit:** `" + sha2 + "`\n");
   fs.writeFileSync(path.join(dir, "watch", `${sha2}.state`), "success Codex PASS (PR32-r1)\n");
   fs.writeFileSync(path.join(dir, "watch", `${sha2}.comment-tried`), "");
+  // A forged copy by another user, and our own comment for a different SHA, do not count.
+  M.comments.push({ pr: 32, user: { login: "mallory" }, body: "### Codex review PR32-r1 — **PASS**\n\n- **Commit:** `" + sha2 + "`\n" });
+  M.comments.push({ pr: 32, user: { login: "kkarnati1980" }, body: "### Codex review PR32-r1 — **PASS**\n\n- **Commit:** `" + "8".repeat(40) + "`\n" });
   const r3 = await tick([], { REVIEW_RUNNER: runner });
   assert.equal(r3.code, 0, r3.out);
-  assert.equal(M.comments.length, 1, "posted once, since GitHub had no copy");
+  assert.equal(M.comments.length, 3, "posted once: the forged and other-SHA comments did not count");
+  assert.equal(M.comments.at(-1).user.login, "kkarnati1980");
 });
