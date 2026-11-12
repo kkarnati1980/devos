@@ -188,6 +188,26 @@ test("DEVOS-132: an agent issue moved to another Linear project is moved back on
   assert.equal(plan.modules[0].linearIssue, mod.id, "the stored id is kept");
 });
 
+test("DEVOS-132 pre-review: a move Linear refuses is logged and skipped; the rest syncs and nothing is duplicated", async () => {
+  const { LinearError } = await import("../dist/index.js");
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const mod = L.issues.find((x) => x.id === plan.modules[0].linearIssue);
+  const count = L.issues.length;
+  mod.projectId = null;
+  const update = L.api.updateIssue;
+  L.api.updateIssue = async (id, patch) => { if (id === mod.id && "projectId" in patch) throw new LinearError("graphql", "Linear refused issueUpdate"); return update(id, patch); };
+  plan.tasks[0].title = "renamed task";
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(L.issues.length, count, "no issue created");
+  assert.equal(mod.projectId, null, "left as it is");
+  assert.ok(r.log.some((l) => l.includes(mod.id) && l.includes("refused")));
+  assert.ok(L.issues.some((x) => x.title === "renamed task"), "other issues still sync");
+  // A transient failure is not swallowed: the sync fails and retries later.
+  L.api.updateIssue = async () => { throw new LinearError("network", "socket hang up"); };
+  await assert.rejects(syncProject(plan, L.api, store), /socket hang up/);
+});
+
 test("DEVOS-132: the issues query stays under Linear's complexity limit", async () => {
   const { ISSUES_QUERY_COST, LINEAR_MAX_COMPLEXITY, ISSUE_PAGE } = await import("../dist/index.js");
   assert.ok(ISSUES_QUERY_COST <= LINEAR_MAX_COMPLEXITY, `${ISSUES_QUERY_COST} > ${LINEAR_MAX_COMPLEXITY}`);

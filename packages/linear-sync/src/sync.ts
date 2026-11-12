@@ -2,6 +2,7 @@
 // id or, failing that, by its marker before anything is created; an unchanged plan makes no Linear write.
 import type { DevosPlan, LinearApi, LinearIssue, StateType, SyncStore, ModuleStatus, TaskStatus } from "./types.js";
 import { readMarker, sameText, withMarker } from "./markers.js";
+import { LinearError } from "./client.js";
 
 export const LANE_LABEL = (lane: number) => `Lane ${String.fromCharCode(64 + Math.min(Math.max(lane, 1), 3))}`;
 
@@ -88,11 +89,22 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   // created again. The list is read once more after a move.
   const listed = new Set(issues.map((i) => i.id));
   let moved = 0;
+  // Pre-review: a move Linear refuses (e.g. the issue now sits in a team this project does not include) must not stop
+  // every later sync of the project. That issue is left where it is, logged, and neither updated nor created again.
+  const stuck = new Set<string>();
   for (const stored of [...plan.modules.map((m) => m.linearIssue), ...plan.tasks.map((t) => t.linearIssue)]) {
     if (!stored || listed.has(stored)) continue;
     const ref = await api.issueRef(stored);
     if (ref && ref.projectId !== projectId) {
-      await api.updateIssue(ref.id, { projectId });
+      try {
+        await api.updateIssue(ref.id, { projectId });
+      } catch (e) {
+        const refused = e instanceof LinearError && (e.code === "graphql" || (e.code === "http" && (e.status ?? 0) >= 400 && (e.status ?? 0) < 500 && e.status !== 429));
+        if (!refused) throw e;
+        stuck.add(ref.id);
+        r.log.push(`issue ${ref.id} is outside the project and Linear refused to move it back; left as it is`);
+        continue;
+      }
       r.writes++; r.updated.push(`issue ${ref.id} moved back into the project`); moved++;
     }
   }
@@ -128,6 +140,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
 
   const modIssue = new Map<string, string>();
   for (const m of plan.modules) {
+    if (m.linearIssue && stuck.has(m.linearIssue)) { modIssue.set(m.id, m.linearIssue); continue; }
     const st = moduleState(m.status);
     const existing = find(m.linearIssue, "module", m.id);
     const id = await upsert(`module ${m.key}`, existing, {
@@ -140,6 +153,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     modIssue.set(m.id, id);
   }
   for (const t of plan.tasks) {
+    if (t.linearIssue && stuck.has(t.linearIssue)) continue;
     const st = taskState(t.status);
     const human = t.assignee === "kk";
     const existing = find(t.linearIssue, "task", t.id);
