@@ -137,6 +137,10 @@ export function workflowShape(src) {
     if (ind === jobIndent) { const m = /^([\w-]+)\s*:/.exec(t); job = m ? m[1] : null; if (job) jobs[job] = []; stepsIndent = -1; continue; }
     if (!job) continue;
     if (t === "steps:") { stepsIndent = ind; itemIndent = -1; continue; }
+    // A flow-style or other inline step list is not parsed into steps: it fails closed as one opaque step, so any
+    // edit to it is a ci-step-changed hit and its removal a ci-step-removed hit (PR70-r16).
+    const inl = /^steps\s*:\s*(\S.*)$/.exec(t);
+    if (inl) { jobs[job].push({ id: "inline-steps", body: [inl[1]] }); stepsIndent = -1; continue; }
     // YAML allows the step list at the same indentation as "steps:"; anything else at or above that indent ends it
     if (stepsIndent >= 0 && (ind < stepsIndent || (ind === stepsIndent && !t.startsWith("- ")))) stepsIndent = -1;
     if (stepsIndent < 0) continue;

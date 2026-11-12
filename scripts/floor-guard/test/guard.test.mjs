@@ -73,6 +73,8 @@ const VIOLATIONS = [
   ["ci-step-changed (steps: # comment)", { [WF]: wf(STEPS).replace("    steps:\n", "    steps: # checks\n") }, { [WF]: wf(STEPS).replace("    steps:\n", "    steps: # checks\n").replace("run: pnpm test", "run: echo ok") }],
   ["ci-step-changed (jobs: # comment)", { [WF]: wf(STEPS).replace("jobs:\n", "jobs: # all\n") }, { [WF]: wf(STEPS).replace("jobs:\n", "jobs: # all\n").replace("run: pnpm test", "run: echo ok") }],
   ["ci-step-removed (quoted job id)", { [WF]: wf(STEPS).replace("  build:\n", '  "build":\n') }, { [WF]: wf(STEPS.replace(/      - name: Test\n[^]*$/, "")).replace("  build:\n", '  "build":\n') }],
+  // PR70-r16: a flow-style step list fails closed as one opaque step
+  ["ci-step-changed (flow-style steps)", { [WF]: wf("").replace("    steps:\n", "    steps: [{name: Test, run: 'pnpm test'}]\n") }, { [WF]: wf("").replace("    steps:\n", "    steps: [{name: Test, run: 'echo green'}]\n") }],
   // PR70-r13: numeric separators and other literal forms are read at their real value
   ["retries-raised (1 -> 1_000)", { "apps/d/playwright.config.ts": "export default { retries: 1 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 1_000 };\n" }],
   ["retries-raised (1 -> 0x10)", { "apps/d/playwright.config.ts": "export default { retries: 1 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 0x10 };\n" }],
