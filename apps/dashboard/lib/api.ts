@@ -34,6 +34,22 @@ export interface SetupStatus {
 
 const TIMEOUT_MS = 10_000; // ADR-0011 §9: every outbound call has a timeout
 
+/**
+ * M2.3-b2 (DEVOS-135): page-wide signals for the nav's pending-approvals count. The nav never signs in
+ * itself (a second sign-in would rotate the cookie and stale the page's CSRF token, and an unsigned
+ * probe would log a 401), so it waits until a page's DevosApi holds a session, then only reads.
+ */
+export const SESSION_EVENT = "devos:session";
+export const APPROVALS_CHANGED_EVENT = "devos:approvals-changed";
+let sessionSeen = false;
+export function hasSession(): boolean {
+  return sessionSeen;
+}
+function markSession(): void {
+  sessionSeen = true;
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(SESSION_EVENT));
+}
+
 /** M1.6 notifications. */
 export type ChannelKind = "dashboard" | "mybrain" | "email";
 export interface Delivery {
@@ -110,6 +126,7 @@ export class DevosApi {
     const r = await this.once<{ login: string; expiresAt: string; csrfToken: string }>("GET", "/auth/session");
     if (!r.ok) return r;
     this.csrf = r.data.csrfToken;
+    markSession();
     return { ok: true, data: { login: r.data.login, expiresAt: r.data.expiresAt } };
   }
 
@@ -128,6 +145,7 @@ export class DevosApi {
     const r = await this.once<{ login: string; expiresAt: string; csrfToken: string }>("POST", "/auth/session");
     if (!r.ok) return r;
     this.csrf = r.data.csrfToken;
+    markSession();
     return { ok: true, data: { login: r.data.login, expiresAt: r.data.expiresAt } };
   }
 

@@ -3,7 +3,7 @@
 // (expiry and uses; purge asks for the typed phrase), Reject (comment) and comments. Escaped output only (no raw
 // HTML, strict nonce CSP); every POST is CSRF-protected by DevosApi.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { DevosApi, explain, type ApprovalDetail, type ApprovalRow } from "../../lib/api";
+import { APPROVALS_CHANGED_EVENT, DevosApi, explain, type ApprovalDetail, type ApprovalRow } from "../../lib/api";
 
 const ORDER: Record<string, number> = { pending: 0, approved: 1, rejected: 1, expired: 1 };
 
@@ -44,6 +44,7 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
     setBusy(false);
     if (!r.ok) return fail(r.code ?? "unknown");
     setMsg(done);
+    window.dispatchEvent(new Event(APPROVALS_CHANGED_EVENT)); // the nav's pending count
     await load();
     if (open) await show(open.approval.id);
   }

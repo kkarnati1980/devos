@@ -96,7 +96,8 @@ export async function startStubApi(allowedOrigin) {
     state.approvalComments ??= [];
     if (req.method === "GET" && url.startsWith("/approvals?") || req.method === "GET" && url === "/approvals") {
       // Newest first, as the API returns; the decided card is deliberately listed first to check pending-first sorting.
-      return json(200, { approvals: [...state.approvals].reverse(), nextCursor: null });
+      const status = new URL(url, "http://stub").searchParams.get("status");
+      return json(200, { approvals: [...state.approvals].reverse().filter((c) => !status || c.status === status), nextCursor: null });
     }
     const ap = url.match(/^\/approvals\/([0-9a-f-]{36})(\/(approve|reject|comments))?$/);
     if (ap) {

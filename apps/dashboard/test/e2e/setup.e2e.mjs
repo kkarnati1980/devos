@@ -212,6 +212,7 @@ test("M2.3 AT12 (DEVOS-135): the approvals inbox lists pending first, escapes ca
   const refusedBefore = api.state.csrfRefused ?? 0;
   const { page, context, problems } = await open("/approvals");
   await page.getByTestId("approvals").waitFor();
+  await page.getByTestId("nav-pending").filter({ hasText: "(1 pending)" }).waitFor();
   const rows = page.getByTestId("approval-row");
   assert.equal(await rows.count(), 2);
   assert.equal(await rows.first().getAttribute("data-status"), "pending", "pending cards come first");
@@ -228,6 +229,8 @@ test("M2.3 AT12 (DEVOS-135): the approvals inbox lists pending first, escapes ca
   await page.getByTestId("detail-status").filter({ hasText: "approved" }).waitFor();
   assert.match(await page.getByTestId("detail-grant").innerText(), /0\/2 uses/);
   assert.equal(await page.getByTestId("approve").count(), 0, "a decided card has no Approve");
+  await page.getByTestId("nav-pending").waitFor({ state: "detached" });
+  assert.equal(await page.getByTestId("nav-approvals").innerText(), "Approvals", "no pending cards: the count is gone");
   const writes = api.state.received.filter((r) => r.url.startsWith("/approvals/"));
   assert.deepEqual(writes.map((w) => w.url), ["/approvals/00000000-0000-4000-8000-0000000000a1/comments", "/approvals/00000000-0000-4000-8000-0000000000a1/approve"]);
   assert.deepEqual(JSON.parse(writes[1].body), { expiresInHours: 72, maxUses: 2 });
