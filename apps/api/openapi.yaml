@@ -313,3 +313,26 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /runs/dead-letters:
+    get:
+      operationId: listDeadLetters
+      x-devos-access: session
+      responses:
+        "200": { description: "DEVOS-77: `{ deadLetters: { jobId, runId, reason, attemptsMade, failedAt }[] }`, the newest 100 run jobs that failed for good" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /runs/dead-letters/{jobId}/retry:
+    post:
+      operationId: retryDeadLetter
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" } }
+      responses:
+        "200": { description: "`{ retried: jobId }`; audited (`run.dead_letter.retried`) before the job is re-queued" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`dead-letter-not-found`: no failed job with that id", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
