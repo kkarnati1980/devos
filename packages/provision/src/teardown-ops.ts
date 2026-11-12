@@ -210,3 +210,15 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { maxPages?: numbe
     if (seen < pub + priv) throw new Error(`github-token-scope: the token sees ${seen} of ${pub + priv} owned repositories; give it access to all repositories`);
   };
 }
+
+/**
+ * Codex pre-review (M2.5-a2): one GitHub token snapshot for a whole purge. Returns a client whose every call (the
+ * scope preflight, inspect, delete and the leftover scan) uses the token read now, so a token narrowed in the vault
+ * after the preflight can never make a repo it cannot see look gone. Build the purge's GitHub ops and scanner from it.
+ */
+export async function pinnedGitHub(gh: GitHubClient): Promise<GitHubClient> {
+  const http = await gh.http.pinned();
+  const c = Object.create(Object.getPrototypeOf(gh)) as GitHubClient;
+  Object.defineProperty(c, "http", { value: http, enumerable: true });
+  return c;
+}

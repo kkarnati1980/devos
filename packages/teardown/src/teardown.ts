@@ -272,6 +272,8 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
         await check();
       } catch (e) {
         const msg = e instanceof Error ? e.message : "preflight failed";
+        // A transient provider failure (5xx, timeout, network) is retryable, never read as a permanent scope problem.
+        if (e instanceof ProviderError && e.transient) throw new TeardownError("provider_error", true, `purge preflight: ${msg.slice(0, 200)}`);
         throw new TeardownError("provider_forbidden", false, `purge preflight: ${msg.slice(0, 200)}`);
       }
     }

@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   allowAll, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, runProvision,
-  githubRepoOps, coolifyProjectOps, githubScanner, coolifyScanner, githubTokenScopeCheck,
+  githubRepoOps, coolifyProjectOps, githubScanner, coolifyScanner, githubTokenScopeCheck, pinnedGitHub,
 } from "@devos/provision";
 import { archiveProject, restoreProject, purgeProject, inventoryScanner, MemoryTeardownStore, TeardownError } from "../dist/index.js";
 import { fakeProviders } from "../../provision/test/fakes.mjs";
@@ -356,4 +356,44 @@ test("M2.5-a2: the GitHub token-scope preflight stops a purge when the token can
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 1 }) } });
   const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] });
   assert.equal(out.purged, true);
+});
+
+test("M2.5-a2 pre-review: the preflight reads every page, refuses missing counts, treats a 5xx as retryable, and stops before resetSteps", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const user = (body) => ({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify(body) } });
+  let resets = 0; const orig = s.store.resetSteps.bind(s.store); s.store.resetSteps = async (id) => { resets++; return orig(id); };
+  // Counts missing → refused, nothing reset or deleted.
+  s.fake.faults.push(user({ login: "kkarnati1980" }));
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] }), (e) => e.code === "provider_forbidden");
+  assert.equal(resets, 0); assert.equal(s.fake.deletes().length, 0);
+  // A 503 on GET /user (after the transport's retries) → retryable provider_error.
+  for (let i = 0; i < 3; i++) s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { status: 503 } });
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] }), (e) => e.code === "provider_error" && e.retryable === true);
+  // 150 owned repos over two pages: both pages are read and the counts match.
+  const many = Array.from({ length: 150 }, (_, i) => ({ id: 1000 + i, name: `r${i}`, full_name: `kkarnati1980/r${i}`, private: true, description: null }));
+  s.fake.faults.push(user({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 150 }));
+  s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(many.slice(0, 100)) } });
+  s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(many.slice(100)) } });
+  await githubTokenScopeCheck(s.gh)();
+  assert.ok(s.fake.faults.every((f) => f.used));
+});
+
+test("M2.5-a2 pre-review: a purge built on pinnedGitHub keeps the preflight's token even if the vault token changes", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  let token = TOKEN;
+  const gh = new GitHubClient({ token: () => token, fetchImpl: s.fake.fetchImpl, sleep: async () => {} });
+  const pinned = await pinnedGitHub(gh);
+  token = "ghp_TESTONLY_narrowed_token_after_preflight_000";
+  const ops = [githubRepoOps(pinned, P.id), coolifyProjectOps(s.cf, P.id)];
+  const scanners = [githubScanner(pinned), coolifyScanner(s.cf), inventoryScanner(s.store)];
+  s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 1 }) } });
+  const before = s.fake.calls.length;
+  const out = await purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners, preflight: [githubTokenScopeCheck(pinned)] });
+  assert.equal(out.purged, true);
+  const ghCalls = s.fake.calls.slice(before).filter((c) => c.path.startsWith("/repos/") || c.path.startsWith("/user"));
+  assert.ok(ghCalls.length > 0 && ghCalls.every((c) => c.auth === `Bearer ${TOKEN}`), "every GitHub call used the pinned token");
 });

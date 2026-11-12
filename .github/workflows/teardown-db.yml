@@ -39,5 +39,5 @@ jobs:
         run: pnpm --filter @devos/db exec prisma migrate deploy
       - name: Build the db client
         run: pnpm --filter @devos/db run build
-      - name: AT1, AT2, AT4 and AT7 against Postgres
+      - name: AT1, AT2, AT4, AT6 and AT7 against Postgres
         run: pnpm --filter @devos/teardown run test:db

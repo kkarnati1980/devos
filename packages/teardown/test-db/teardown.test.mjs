@@ -1,4 +1,4 @@
-// M2.5-a2 on Postgres through the M1.1 Prisma client (teardown-db workflow): AT1, AT4 and AT7 against the real
+// M2.5-a2 on Postgres through the M1.1 Prisma client (teardown-db workflow): AT1, AT2, AT4, AT6 and AT7 against the real
 // schema, with M2.4's fake GitHub and Coolify.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
@@ -110,9 +110,13 @@ test("AT6 on Postgres: a vault secret left for the project is a leftover (listed
   await s.provision();
   await archiveProject(s.p.id, { store: s.store, ops: s.ops, authorize: allowAll });
   await db.vaultSecret.create({ data: { projectId: s.p.id, name: "APP_SESSION_SECRET", ciphertext: Buffer.from("x"), nonce: Buffer.alloc(12), keyVersion: 1 } });
-  const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: [...s.scanners, vaultScanner(db)], authorize: allowAll });
+  // The scanner must never select the ciphertext or nonce (decision 7).
+  const selects = [];
+  const spyDb = { vaultSecret: { findMany: (q) => { selects.push(q.select); return db.vaultSecret.findMany(q); } } };
+  const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: [...s.scanners, vaultScanner(spyDb)], authorize: allowAll });
+  assert.equal(selects.length, 1);
+  assert.deepEqual(Object.keys(selects[0]).sort(), ["id", "name"]);
   assert.equal(out.purged, false);
   assert.deepEqual(out.report.hits.map((h) => `${h.provider}:${h.name}`), ["vault:APP_SESSION_SECRET"]);
-  assert.ok(!JSON.stringify(out.report).includes("ciphertext"));
   assert.equal((await db.project.findUnique({ where: { id: s.p.id } })).stage, "archived");
 });

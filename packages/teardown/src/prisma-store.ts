@@ -32,8 +32,8 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
 
   private async previousStage(projectId: string, client: any = this.tdb): Promise<string | null> {
     const ev = await this.q(client.auditEvent.findFirst({
-      where: { projectId, action: "teardown.archived" },
-      orderBy: { occurredAt: "desc" },
+      where: { projectId, action: "teardown.archived", actor: "system" },
+      orderBy: [{ occurredAt: "desc" }, { id: "desc" }],
       select: { details: true },
     })) as any;
     const s = ev?.details?.previousStage;
@@ -102,7 +102,7 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
 
   /** The newest stored scan report (shown on the project page, M2.5-b). */
   async lastScan(projectId: string): Promise<ScanReport | null> {
-    const ev = await this.q(this.tdb.auditEvent.findFirst({ where: { projectId, action: "teardown.scan" }, orderBy: { occurredAt: "desc" }, select: { details: true } })) as any;
+    const ev = await this.q(this.tdb.auditEvent.findFirst({ where: { projectId, action: "teardown.scan", actor: "system" }, orderBy: [{ occurredAt: "desc" }, { id: "desc" }], select: { details: true } })) as any;
     return (ev?.details as ScanReport) ?? null;
   }
 
