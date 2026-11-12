@@ -8,6 +8,7 @@ import { createDb } from "@devos/db";
 import { PolicyEngine, PrismaPolicyStore } from "@devos/policy";
 import { Approvals, PrismaApprovalStore } from "../dist/approvals.js";
 import { GateEngine, PrismaGateStore } from "../dist/gates.js";
+import { grantsForApproval } from "../dist/runtime.js";
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required for test:db");
@@ -248,3 +249,39 @@ test("PR41-r3 (db): concurrent closes on one approval never deadlock (same miles
     assert.deepEqual(two, ["closed", "closed"], two.join(","));
   }
 });
+
+test("M2.3-b1 (db): grantsForApproval returns the card's grants newest first, with revoke state and no other card's", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, engine } = setup();
+  const a = await approvals.raiseCard(card(projectId), [t1]);
+  const b = await approvals.raiseCard(card(projectId), []);
+  const { grantId } = await approvals.approve(KK, a.id, { maxUses: 2 });
+  await approvals.approve(KK, b.id);
+  let rows = await grantsForApproval(db, a.id, 5000);
+  assert.deepEqual(rows.map((g) => g.id), [grantId]);
+  assert.equal(rows[0].maxUses, 2);
+  assert.equal(rows[0].uses, 0);
+  assert.equal(rows[0].revokedAt, null);
+  assert.equal(rows[0].scopeResource, "repo:devos-app");
+  assert.equal(await engine.revokeGrant(KK, grantId), true);
+  rows = await grantsForApproval(db, a.id, 5000);
+  assert.ok(rows[0].revokedAt instanceof Date);
+  assert.deepEqual(await grantsForApproval(db, randomUUID(), 5000), []);
+});
+
+test("Codex PR60-r1 (db): a live grant older than 20 newer revoked grants is still returned, so it can be shown and revoked", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals, engine } = setup();
+  const a = await approvals.raiseCard(card(projectId), []);
+  const { grantId: live } = await approvals.approve(KK, a.id);
+  const base = await db.approvalGrant.findUnique({ where: { id: live } });
+  for (let i = 1; i <= 22; i++) {
+    await db.approvalGrant.create({ data: { approvalId: a.id, scopeAction: base.scopeAction, scopeResource: base.scopeResource, projectId, issuedBy: base.issuedBy, issuedAt: new Date(base.issuedAt.getTime() + i * 1000), expiresAt: base.expiresAt, maxUses: 1, revokedAt: new Date(base.issuedAt.getTime() + i * 1000 + 1) } });
+  }
+  const rows = await grantsForApproval(db, a.id, 5000);
+  assert.ok(rows.some((g) => g.id === live && g.revokedAt === null), "the live grant is present");
+  assert.equal(rows.length, 21, "the 20 newest plus the live one");
+  assert.equal(rows.at(-1).id, live, "newest first; the live grant is the oldest");
+  assert.equal(await engine.revokeGrant(KK, live), true);
+});
+

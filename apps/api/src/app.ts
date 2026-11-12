@@ -25,6 +25,7 @@ import { NotificationsController, type NotifyServices } from "./notify-routes.js
 import { NOTIFY } from "./notify.js";
 import { DEAD_LETTERS, DeadLettersController, type DeadLetterServices } from "./dead-letters.js";
 import { REQUIREMENTS, RequirementsController, type RequirementsServices } from "./requirements.js";
+import { APPROVALS, ApprovalsController, type ApprovalRouteServices } from "./approvals-routes.js";
 
 export interface AppDeps {
   config: ApiConfig;
@@ -44,6 +45,8 @@ export interface AppDeps {
   deadLetters?: DeadLetterServices;
   /** M2.2-d2 spec intake (null parts → 503 `requirements-not-configured`). */
   requirements?: RequirementsServices;
+  /** M2.3-b1 approvals inbox (null parts → 503 `approvals-not-configured`). */
+  approvals?: ApprovalRouteServices;
   /** R3-a: certificate + key → the API listens on HTTPS (TLS 1.2+); null/absent → plain HTTP (tests, CI). */
   tls?: ApiTls | null;
 }
@@ -53,7 +56,7 @@ class ApiModule {
   static register(deps: Required<Omit<AppDeps, "now" | "log" | "tls">> & { sessions: SessionService }): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController, DeadLettersController, RequirementsController],
+      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController, DeadLettersController, RequirementsController, ApprovalsController],
       providers: [
         { provide: CONFIG, useValue: deps.config },
         { provide: IDENTITY, useValue: deps.identity },
@@ -65,6 +68,7 @@ class ApiModule {
         { provide: NOTIFY, useValue: deps.notify },
         { provide: DEAD_LETTERS, useValue: deps.deadLetters },
         { provide: REQUIREMENTS, useValue: deps.requirements },
+        { provide: APPROVALS, useValue: deps.approvals },
         { provide: APP_GUARD, useClass: AccessGuard },
       ],
     };
@@ -85,6 +89,7 @@ export async function createApp(deps: AppDeps): Promise<NestExpressApplication> 
       notify: deps.notify ?? { notifier: null },
       deadLetters: deps.deadLetters ?? { queue: null, audit: null },
       requirements: deps.requirements ?? { pipeline: null, store: null, cards: null },
+      approvals: deps.approvals ?? { approvals: null, grantsFor: null, revokeGrant: null },
       sessions,
     }),
     {
