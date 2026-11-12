@@ -15,7 +15,8 @@ export class LinearError extends Error {
 
 export interface LinearClientOptions {
   apiKey: () => Promise<string> | string;
-  endpoint?: string;
+  /** Only LINEAR_ENDPOINT is accepted (Codex PR35-r6, F2): the key is never sent anywhere else. */
+  endpoint?: typeof LINEAR_ENDPOINT;
   timeoutMs?: number;
   /** Bound on reading the key from the vault (Codex PR35-r3): key + call stay inside the lock's write margin. */
   keyTimeoutMs?: number;
@@ -33,6 +34,7 @@ export class LinearClient {
   private readonly o: Required<Omit<LinearClientOptions, "apiKey">> & { apiKey: LinearClientOptions["apiKey"] };
 
   constructor(opts: LinearClientOptions) {
+    if (opts.endpoint !== undefined && opts.endpoint !== LINEAR_ENDPOINT) throw new LinearError("bad-response", "Linear endpoint must be https://api.linear.app/graphql");
     this.o = {
       endpoint: LINEAR_ENDPOINT, timeoutMs: 15_000, keyTimeoutMs: 10_000, maxAttempts: 3, baseDelayMs: 500, minRemaining: 50,
       fetchImpl: fetch, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => Date.now(), ...opts,
@@ -86,8 +88,10 @@ export class LinearClient {
     } finally { if (timer) clearTimeout(timer); }
     let res: Response;
     try {
-      res = await this.o.fetchImpl(this.o.endpoint, {
+      res = await this.o.fetchImpl(LINEAR_ENDPOINT, {
         method: "POST",
+        // Codex PR35-r6: never follow a redirect with the key on it; a 3xx is refused below.
+        redirect: "manual",
         headers: { "content-type": "application/json", authorization: key },
         body: JSON.stringify({ query, variables }),
         signal: AbortSignal.timeout(this.o.timeoutMs),
@@ -96,6 +100,7 @@ export class LinearClient {
       const name = (e as { name?: string })?.name;
       throw new LinearError(name === "TimeoutError" || name === "AbortError" ? "timeout" : "network", name === "TimeoutError" ? "Linear call timed out" : "Linear call failed");
     }
+    if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) throw new LinearError("bad-response", "Linear answered with a redirect; not followed", res.status);
     const remaining = Number(res.headers.get("x-ratelimit-requests-remaining"));
     const reset = Number(res.headers.get("x-ratelimit-requests-reset"));
     if (Number.isFinite(remaining) && res.headers.has("x-ratelimit-requests-remaining") && remaining < this.o.minRemaining) {

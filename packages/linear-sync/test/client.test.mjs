@@ -108,3 +108,15 @@ test("the default key bound plus the call timeout fits inside the sync lock's wr
   const c = new LinearClient({ apiKey: () => KEY });
   assert.ok(c["o"].keyTimeoutMs + c["o"].timeoutMs < WRITE_MARGIN_MS);
 });
+
+test("Codex PR35-r6: only the Linear endpoint is accepted, and a redirect is refused, not followed or retried", async () => {
+  const { LinearClient, LinearError, LINEAR_ENDPOINT } = await import("../dist/index.js");
+  for (const endpoint of ["http://127.0.0.1:3000/graphql", "https://api.linear.app.evil.test/graphql", "https://api.linear.app/other"]) {
+    assert.throws(() => new LinearClient({ apiKey: () => "k", endpoint }), (e) => e instanceof LinearError);
+  }
+  const seen = [];
+  const fetchImpl = async (u, init) => { seen.push([u, init.redirect]); return new Response(null, { status: 302, headers: { location: "http://169.254.169.254/" } }); };
+  const c = new LinearClient({ apiKey: () => "k", fetchImpl, sleep: async () => {} });
+  await assert.rejects(c.query("query { viewer { id } }"), (e) => e instanceof LinearError && e.code === "bad-response" && /redirect/.test(e.message));
+  assert.deepEqual(seen, [[LINEAR_ENDPOINT, "manual"]], "one call, to the fixed endpoint, with redirects not followed");
+});
