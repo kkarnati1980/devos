@@ -55,6 +55,8 @@ export interface ProvisionStore {
   markFailed(projectId: string, spec: Pick<StepSpec, "key" | "provider" | "kind">, error: string): Promise<void>;
   /** Upsert into the inventory by (provider, kind, external id). Throws `resource_owned_elsewhere` if the row belongs to another project. */
   recordResource(projectId: string, r: ResourceRecord): Promise<void>;
+  /** M2.4-c: every inventory row of one provider/kind, across all projects, active or not (port allocation). */
+  listResources(provider: ProviderName, kind: string): Promise<{ projectId: string; externalId: string; name: string; active: boolean }[]>;
   /** Throws if this run no longer holds the project lock (checked right before every external create). */
   assertLockHeld(projectId: string): Promise<void>;
 }
@@ -68,7 +70,8 @@ export type StepErrorCode =
   | "approval_required"
   | "create_unconfirmed"
   | "provider_error"
-  | "resource_owned_elsewhere";
+  | "resource_owned_elsewhere"
+  | "port_range_exhausted";
 
 export class StepError extends Error {
   constructor(
@@ -173,6 +176,11 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
   try {
     created = await spec.create();
   } catch (e) {
+    // M2.4-c: a step may fail with its own typed, final error (e.g. `port_range_exhausted`); keep its code.
+    if (e instanceof StepError) {
+      await store.markFailed(projectId, spec, errLine(e.code, e));
+      throw e;
+    }
     const transient = e instanceof ProviderError && e.transient;
     const nameTaken = e instanceof ProviderError && e.code === "http" && (e.status === 409 || e.status === 422);
     if (!transient && !nameTaken) {
