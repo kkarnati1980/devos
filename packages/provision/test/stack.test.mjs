@@ -92,3 +92,27 @@ test("an environment step without a provisioned Coolify project creates nothing"
   await assert.rejects(runProvision(P.id, [envStep], { store: s.store, authorize: allowAll }));
   assert.equal(s.fake.creates().length, 0);
 });
+
+test("Codex PR50-r1: a lock lost during the port or environment read stops the write; an existing own port is adopted", async () => {
+  const s = setup();
+  await runProvision(P.id, s.steps().slice(0, 2), { store: s.store, authorize: allowAll });
+  // The lock drops while the port list is read: nothing is inserted.
+  const [, , envPreview, , portPreview] = s.steps();
+  const orig = s.store.listResources.bind(s.store);
+  s.store.listResources = async (...a) => { const r = await orig(...a); s.store.lockLost = true; return r; };
+  await assert.rejects(portPreview.create(), /provision_lock_lost/);
+  assert.ok(!s.store.resources.some((r) => r.kind === "port"));
+  s.store.listResources = orig;
+  // The lock drops while the parent uuid is read: no POST.
+  const origGet = s.store.getStep.bind(s.store);
+  s.store.lockLost = false;
+  s.store.getStep = async (...a) => { const r = await origGet(...a); s.store.lockLost = true; return r; };
+  const before = s.fake.creates().length;
+  await assert.rejects(envPreview.create(), /provision_lock_lost/);
+  assert.equal(s.fake.creates().length, before);
+  s.store.getStep = origGet; s.store.lockLost = false;
+  // A row another run of this project already inserted is adopted, not doubled.
+  await s.store.recordResource(P.id, { provider: "coolify", kind: "port", externalId: "20000", name: "acme/preview" });
+  assert.equal((await portPreview.create()).externalId, "20000");
+  assert.equal(s.store.resources.filter((r) => r.kind === "port").length, 1);
+});

@@ -55,6 +55,8 @@ export function coolifyEnvironmentStep(cf: CoolifyClient, store: ProvisionStore,
     },
     create: async () => {
       const uuid = await parentUuid();
+      // Codex PR50-r1: the journal read above is an await after the runner's last lock check; check again.
+      await store.assertLockHeld(projectId);
       await cf.http.write("POST", `/api/v1/projects/${uuid}/environments`, { name: env });
       return found(uuid);
     },
@@ -99,10 +101,16 @@ export function portStep(store: ProvisionStore, p: { id: string; slug: string },
       return mine ? { externalId: mine.externalId, name, owned: true } : null;
     },
     create: async () => {
-      const used = new Set((await store.listResources("coolify", "port")).map((r) => r.externalId));
+      const all = await store.listResources("coolify", "port");
+      // Codex PR50-r1: never allocate a second port for this stack. If our row exists (a run that lost the lock
+      // inserted it), adopt it; and re-check the lock after the read, right before every insert.
+      const own = all.find((r) => r.projectId === p.id && r.name === name && r.active);
+      if (own) return { externalId: own.externalId, name, owned: true };
+      const used = new Set(all.map((r) => r.externalId));
       for (let port = range.from + ((range.from % 2 === parity) ? 0 : 1); port <= range.to; port += 2) {
         const id = String(port);
         if (used.has(id)) continue;
+        await store.assertLockHeld(p.id);
         try {
           await store.recordResource(p.id, { provider: "coolify", kind: "port", externalId: id, name });
           return { externalId: id, name, owned: true };
