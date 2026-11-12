@@ -1,7 +1,7 @@
 // M2.3-b1 (docs/modules/M2.3.md, "Routes" and "M2.3-b split"): the six /approvals routes over the M2.3-a core.
 // All routes are `session` (deny by default); the guard (M1.2) admits only KK's tailnet login with a live session
-// and checks CSRF on every POST. Only fixed codes leave this file: an ApprovalError keeps its code, an M1.7
-// `grant-*` validation code is a 400, and anything else (a driver or store error) is 503 `approvals-store-error`.
+// and checks CSRF on every POST. Only fixed codes leave this file (`mapApprovalError`): an ApprovalError keeps its
+// code, M1.7 `grant-*` codes are 400 (issuer checks 403), and anything else is 503 `approvals-store-error`.
 // No error message is returned or logged.
 import { Body, Controller, Get, HttpCode, Inject, Param, Post, Query, Req } from "@nestjs/common";
 import { httpError, KK_SESSIONS, KkSessionRegistry } from "./auth.js";
