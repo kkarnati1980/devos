@@ -116,7 +116,7 @@ export function evaluate(expected, runs) {
   return { state: "success", failed, pending };
 }
 
-/** Only GitHub Actions' own check runs count; another app posting a same-named "success" is ignored. */
+/** `filter=all`: GitHub's default (`latest`) would hide an older same-named run from another suite (PR73-r1). Only GitHub Actions' own check runs count; another app posting a same-named "success" is ignored. */
 export const ACTIONS_APP_SLUG = "github-actions";
 
 /** One page read; a GET is safe to retry (ADR-0011), so a transient error gets 3 attempts before exit 2. */
@@ -142,7 +142,7 @@ async function readPage(url, token, fetchImpl, pause) {
 export async function listRuns(api, repo, sha, token, fetchImpl, pause = (ms) => new Promise((r) => setTimeout(r, ms))) {
   const runs = [];
   for (let page = 1; page <= 10; page++) {
-    const body = await readPage(`${api}/repos/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`, token, fetchImpl, pause);
+    const body = await readPage(`${api}/repos/${repo}/commits/${sha}/check-runs?filter=all&per_page=100&page=${page}`, token, fetchImpl, pause);
     if (!Array.isArray(body?.check_runs) || typeof body.total_count !== "number") throw new GateError("check-runs read returned an unexpected body");
     for (const c of body.check_runs) {
       if (c.app?.slug === ACTIONS_APP_SLUG) runs.push({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion, suite: c.check_suite?.id ?? null });

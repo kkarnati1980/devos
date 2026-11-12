@@ -115,6 +115,7 @@ test("AT8: check runs are read page by page, only from GitHub Actions, with boun
   assert.equal(runs.length, 101, "the other app's run is ignored");
   assert.ok(!runs.some((r) => r.name === "secret-scan"));
   assert.equal(urls.length, 2);
+  assert.ok(urls.every((u) => new URL(u).searchParams.get("filter") === "all"), "every run is read, not only the latest per name (PR73-r1)");
   let calls = 0;
   const flaky = async () => (++calls < 3 ? { ok: false, status: 502 } : { ok: true, status: 200, json: async () => ({ total_count: 1, check_runs: [mk(1, "a")] }) });
   assert.equal((await listRuns("https://api.example", "o/r", "s", "t", flaky, async () => {})).length, 1);
