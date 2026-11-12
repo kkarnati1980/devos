@@ -38,15 +38,41 @@ const SERVER_HTTP_OK = /^import\s+(\w+|\*\s+as\s+\w+|\{\s*createServer\s*\})\s+f
 const SECRET_SHAPE = /(SECRET|TOKEN|KEY|PASSWORD|PASSWD|PRIVATE|CREDENTIAL)/i;
 const CODE = /\.(m?js|cjs|m?ts|cts|tsx|jsx|py)$/;
 const MARKUP = /\.(html?|xhtml|svg)$/i;
+// Codex PR32-r12: the browser decodes character references in attribute values before it runs them as code, so
+// handler and javascript: values are decoded first. Named references outside this table are left as they are; the
+// raw-text F1-4 rule below does not depend on this table (decision v0.1.12 in docs/modules/S3.md).
+const NAMED_REFS = { quot: '"', apos: "'", amp: "&", lt: "<", gt: ">", period: ".", lsqb: "[", lbrack: "[", rsqb: "]",
+  rbrack: "]", sol: "/", ast: "*", midast: "*", colon: ":", semi: ";", comma: ",", lpar: "(", rpar: ")", equals: "=",
+  quest: "?", grave: "`", bsol: "\\", dollar: "$", Tab: "\t", NewLine: "\n", nbsp: " " };
+export function decodeEntities(v) {
+  return v.replace(/&(?:#[xX]([0-9a-fA-F]+)|#(\d+)|([A-Za-z][A-Za-z0-9]*));?/g, (x, hex, dec, name) => {
+    if (name !== undefined) return Object.hasOwn(NAMED_REFS, name) ? NAMED_REFS[name] : x;
+    const cp = parseInt(hex ?? dec, hex !== undefined ? 16 : 10);
+    return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : x;
+  });
+}
 /** The browser code inside markup: <script> bodies and on…="…" handler values, each on its own line. */
 export function inlineScripts(html) {
   const parts = [];
   for (const m of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)) parts.push(m[1]);
-  for (const m of html.matchAll(/\son[a-z]+\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi)) parts.push(m[2] ?? m[3] ?? m[4]);
+  for (const m of html.matchAll(/\son[a-z]+\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi)) parts.push(decodeEntities(m[2] ?? m[3] ?? m[4]));
   // Codex PR32-r11: the value runs to its own closing delimiter, so a quote of the other kind inside it does not end it.
   for (const m of html.matchAll(/(?:href|src|action|formaction|xlink:href)\s*=\s*(?:"\s*javascript:([^"]*)"|'\s*javascript:([^']*)'|javascript:([^\s>]*))/gi))
-    parts.push(m[1] ?? m[2] ?? m[3]);
+    parts.push(decodeEntities(m[1] ?? m[2] ?? m[3]));
   return parts.join("\n;\n");
+}
+// F1-4 raw-text rule (decision v0.1.12): every markup file under public/ is also scanned as plain text, with no extraction
+// and no comment or string blanking, so no parser is left to have a bypass. A `process` word followed by a property
+// access (`.`, `?.` or `[`, with only whitespace or comments between) is a finding. Each file is checked as written,
+// with character references decoded, and with JS \u escapes decoded; a hit in any view counts.
+const RAW_PROCESS = /(^|[^.\w$])process(?![\w$])(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*|<!--[\s\S]*?-->)*(?:\?\.|\.|\[)/;
+const jsUnescape = (v) => v.replace(/\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/g, (x, a, b) => {
+  const cp = parseInt(a ?? b, 16);
+  return cp <= 0x10ffff ? String.fromCodePoint(cp) : x;
+});
+export function rawProcessAccess(text) {
+  const decoded = decodeEntities(text);
+  return [text, decoded, jsUnescape(text), jsUnescape(decoded)].some((v) => RAW_PROCESS.test(v));
 }
 
 // Codex PR32-r4: comments are blanked before F2-1 matching (string literals are kept, newlines and offsets are
@@ -164,7 +190,7 @@ export function floorCheck(dir) {
     if (posix.startsWith("public/")) {
       const code = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`/g,
         (x) => (/^(["'`])process\1$/.test(x) ? "process" : x[0] === "`" && x.includes("${") ? x : " ".repeat(x.length)));
-      if (/(^|[^.\w$])process(?![\w$])/.test(code)) fails.push(`FAIL F1-4 ${posix}: client code reads process.env`);
+      if (/(^|[^.\w$])process(?![\w$])/.test(jsUnescape(code)) || (MARKUP.test(posix) && rawProcessAccess(text))) fails.push(`FAIL F1-4 ${posix}: client code reads process.env`);
     }
     const m = src.match(/CLIENT_CONFIG_KEYS\s*=\s*\[([^\]]*)\]/);
     if (m) for (const k of m[1].match(/["'][^"']+["']/g) || []) if (SECRET_SHAPE.test(k)) fails.push(`FAIL F1-4 ${posix}: secret-shaped client config key ${k}`);

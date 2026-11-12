@@ -270,3 +270,16 @@ test("Codex PR32-r9: browser code inline in public/ HTML is scanned for F1-4; ma
   for (const name of ["public/a.html", "public/b.htm", "public/c.html", "public/d.html", "public/e.html"]) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 ${name}:`)), `${name} in\n${f.join("\n")}`);
   assert.ok(!f.some((l) => l.includes("public/ok.html")), f.join("\n"));
 });
+
+test("Codex PR32-r12 / decision v0.1.12: public/ markup is also scanned as raw text, with character references and \\u escapes decoded", () => {
+  const out = fresh("f14raw");
+  write(out, "public/a.html", '<button onclick="console.log(&quot;https://example.com&quot;);alert(process.env.API_TOKEN)">x</button>\n');
+  write(out, "public/b.html", '<button onclick="console.log(&#34;//&#34;);const {env} = process">x</button>\n');
+  write(out, "public/c.html", "<button onclick=\"alert(process&#x2e;env.T)\">x</button>\n");
+  write(out, "public/d.mjs", "export const t = \\u0070rocess.env.T;\n");
+  write(out, "public/e.mjs", "export const t = process /* c */ ?.env;\n");
+  write(out, "public/ok.html", "<p>We process &quot;orders&quot; daily; processing.time is shown.</p>\n");
+  const f = floorCheck(out);
+  for (const name of ["a.html", "b.html", "c.html", "d.mjs", "e.mjs"]) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 public/${name}:`)), `${name} in\n${f.join("\n")}`);
+  assert.ok(!f.some((l) => l.includes("public/ok.html")), f.join("\n"));
+});
