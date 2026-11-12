@@ -118,6 +118,9 @@ test("DEVOS-131 on Postgres: purge deletes the project's vault secrets (only thi
   assert.equal(out.purged, true);
   assert.equal(await db.vaultSecret.count({ where: { projectId: s.p.id } }), 0);
   assert.equal(await db.vaultSecret.count({ where: { projectId: other.p.id } }), 1);
+  const ev = await db.auditEvent.findFirst({ where: { projectId: s.p.id, action: "teardown.secrets_deleted" } });
+  assert.deepEqual(ev.details, { count: 2, names: ["APP_SESSION_SECRET", "DB_PASSWORD"] });
+  assert.ok(!JSON.stringify(ev).includes("ciphertext"));
 });
 
 test("AT6 on Postgres: a vault secret left for the project is a leftover (listed by name, never by value); the stage stays archived", async () => {

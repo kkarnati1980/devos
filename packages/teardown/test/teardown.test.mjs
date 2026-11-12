@@ -427,10 +427,24 @@ test("DEVOS-131: purge deletes the project's vault secrets after every resource,
   assert.equal(out.purged, true);
   assert.deepEqual(s.store.secrets, [{ projectId: "other", name: "DB_PASSWORD" }]);
   // Every provider delete happened before the secrets went.
+  assert.ok(s.fake.deletes().length >= 2);
   assert.deepEqual(order, [["secrets", s.fake.deletes().length]]);
+  assert.deepEqual(s.store.audits, [{ projectId: P.id, action: "teardown.secrets_deleted", details: { count: 2, names: ["APP_SESSION_SECRET", "DB_PASSWORD"] } }]);
 });
 
-test("DEVOS-131: a purge that stops on a provider delete keeps the project's secrets (Restore still works)", async () => {
+test("DEVOS-131: a purge that stops on an ownership mismatch keeps the project's secrets", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.store.secrets.push({ projectId: P.id, name: "DB_PASSWORD" });
+  const repo = s.fake.repos.get("kkarnati1980/devos-acme");
+  repo.description = "not ours any more";
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => e.code === "ownership_mismatch");
+  assert.equal(s.store.secrets.length, 1);
+  assert.equal(s.store.audits.length, 0);
+});
+
+test("DEVOS-131: a purge that stops after a provider delete (crash before the row update) keeps the project's secrets", async () => {
   const s = setup();
   await provision(s);
   await archiveProject(P.id, { ...s.base, authorize: allowAll });

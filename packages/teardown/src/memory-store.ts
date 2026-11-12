@@ -14,6 +14,8 @@ export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
   readonly scans: ScanReport[] = [];
   /** Project-scoped vault secrets (names only; no values in tests). */
   readonly secrets: { projectId: string; name: string }[] = [];
+  /** Audit events written with a secrets delete (mirrors the Postgres store). */
+  readonly audits: { projectId: string; action: string; details: { count: number; names: string[] } }[] = [];
   private seq = 0;
 
   addProject(p: { id: string; slug: string; stage?: string }): void {
@@ -78,9 +80,11 @@ export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
   }
 
   async deleteProjectSecrets(projectId: string): Promise<number> {
-    const before = this.secrets.length;
+    const names = this.secrets.filter((x) => x.projectId === projectId).map((x) => x.name).sort();
+    if (!names.length) return 0;
     for (let i = this.secrets.length - 1; i >= 0; i--) if (this.secrets[i]?.projectId === projectId) this.secrets.splice(i, 1);
-    return before - this.secrets.length;
+    this.audits.push({ projectId, action: "teardown.secrets_deleted", details: { count: names.length, names } });
+    return names.length;
   }
 
   /** A vault leftover scanner over `secrets`, shaped like the Postgres `vaultScanner`. */
