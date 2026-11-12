@@ -19,11 +19,11 @@ const G = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*`;
 const NET_MODULE = new RegExp(String.raw`(\bfrom|\bimport|\brequire)${G}\(?${G}["'\`](node:)?(https?|http2|net|tls|dgram)["'\`]`);
 const RAW_CLIENT = [
   [new RegExp(String.raw`\bfetch${G}\(`), "fetch("],
-  [/["'`](axios|undici|got|node-fetch|superagent|needle|ky|cross-fetch|isomorphic-fetch|ws)["'`]/, "HTTP client package"],
+  [/["'`](axios|undici|got|node-fetch|superagent|needle|ky|cross-fetch|isomorphic-fetch|ws)(\/[^"'`\n]*)?["'`]/, "HTTP client package"],
   [/\bnew\s+(XMLHttpRequest|WebSocket|EventSource)\s*\(/, "XMLHttpRequest/WebSocket/EventSource"],
   [/^\s*(import|from)\s+(requests|httpx|urllib3?|aiohttp|http\.client|socket)\b/m, "Python HTTP client"],
-  [/\bglobalThis\s*(\.\s*fetch\b|\[)/, "globalThis.fetch"],
-  [new RegExp(String.raw`(\bfrom|\bimport|\brequire)${G}\(?${G}["'\`](node:)?(module|child_process|worker_threads)["'\`]`), "module loader / child process (can reach the network indirectly)"],
+  [/\b(globalThis|global|self|window)\s*(\.\s*(fetch|WebSocket|EventSource|XMLHttpRequest)\b|\[)/, "globalThis.fetch"],
+  [new RegExp(String.raw`(\bfrom|\bimport|\brequire)${G}\(?${G}["'\`](node:)?(module|child_process|worker_threads|vm|wasi)["'\`]`), "module loader / child process (can reach the network indirectly)"],
 ];
 // Codex PR32-r5: every import(…) / require(…) must name ONE plain string literal and nothing else (an
 // expression that starts with a quote, `import("node:" + "http")`, is computed too). Anything else is a finding.
@@ -36,7 +36,16 @@ function computedLoad(src) {
 // src/server.mjs may take only the server side of node:http: a default/namespace import or { createServer }.
 const SERVER_HTTP_OK = /^import\s+(\w+|\*\s+as\s+\w+|\{\s*createServer\s*\})\s+from\s+["'](node:)?http["'];?\s*$/;
 const SECRET_SHAPE = /(SECRET|TOKEN|KEY|PASSWORD|PASSWD|PRIVATE|CREDENTIAL)/i;
-const CODE = /\.(m?js|cjs|ts|tsx|jsx|py)$/;
+const CODE = /\.(m?js|cjs|m?ts|cts|tsx|jsx|py)$/;
+const MARKUP = /\.(html?|xhtml|svg)$/i;
+/** The browser code inside markup: <script> bodies and on…="…" handler values, each on its own line. */
+export function inlineScripts(html) {
+  const parts = [];
+  for (const m of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)) parts.push(m[1]);
+  for (const m of html.matchAll(/\son[a-z]+\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi)) parts.push(m[2] ?? m[3] ?? m[4]);
+  for (const m of html.matchAll(/(?:href|src|action)\s*=\s*["']?\s*javascript:([^"'>]*)/gi)) parts.push(m[1]);
+  return parts.join("\n;\n");
+}
 
 // Codex PR32-r4: comments are blanked before F2-1 matching (string literals are kept, newlines and offsets are
 // preserved), so `import { request } from /* client */ "node:https"` is still an import of node:https.
@@ -44,6 +53,20 @@ const STRING_OR_COMMENT = /("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\
 export function blankComments(src) {
   return src.replace(STRING_OR_COMMENT, (x, str) => (str !== undefined ? x : x.replace(/[^\n]/g, " ")));
 }
+// Codex PR32-r8 / runner pre-review: the code-only view blanks comments AND plain strings (an interpolated template
+// literal is kept), so identifier rules see only code. Matching shapes like `fetch(` lost to `(0, fetch)(u)`,
+// `fetch?.(u)`, a tagged template or `const { fetch: get } = globalThis`; any bare use of these names is a finding.
+export function codeOnly(src) {
+  return src.replace(STRING_OR_COMMENT, (x, str) => (str !== undefined && x[0] === "`" && x.includes("${") ? x : x.replace(/[^\n]/g, " ")));
+}
+const BARE = (names) => new RegExp(String.raw`(^|[^.\w$])(${names})(?![\w$])`);
+const CLIENT_IDENT = BARE("fetch|WebSocket|EventSource|XMLHttpRequest");
+// Built-in module access that is not an import: process.getBuiltinModule (Node 22), process.binding/_linkedBinding.
+const BUILTIN_ACCESS = /\b(getBuiltinModule|_linkedBinding)\b|\bprocess\s*\.\s*binding\b/;
+// `require` used as a value (`const r = require`, `require.call(…)`) instead of called with one literal.
+// Run-time code generation can rebuild any of the above from strings, so it is a finding outside safe-fetch.
+const DYNAMIC_CODE = BARE("eval|Function|WebAssembly");
+const REQUIRE_VALUE = new RegExp(String.raw`(^|[^.\w$])require(?![\w$])(?!\s*\()`);
 
 // Codex PR32-r4: a limit counts only when it actually limits. Compose reads `pids_limit: -1` (and 0) as
 // unlimited and `cpus: "0"` as no CPU limit, so each value must parse as a positive number.
@@ -71,14 +94,32 @@ function walk(dir, rel = "") {
 export function floorCheck(dir) {
   const fails = [];
   const files = walk(dir);
-  for (const f of files.filter((x) => CODE.test(x))) {
+  // Codex PR32-r9: HTML (and SVG) under public/ carries browser code in <script> blocks and on…="" handlers, so
+  // those are scanned as client code too; the markup around them is not code.
+  const isMarkup = (x) => /^public\//.test(x.split(path.sep).join("/")) && MARKUP.test(x);
+  for (const f of files.filter((x) => CODE.test(x) || isMarkup(x))) {
     const posix = f.split(path.sep).join("/");
     const isTest = posix.startsWith("test/");   // only the root test/ folder may use fetch against local stubs
-    const raw = fs.readFileSync(path.join(dir, f), "utf8");
+    const text = fs.readFileSync(path.join(dir, f), "utf8");
+    const raw = MARKUP.test(posix) ? inlineScripts(text) : text;
     const src = /\.py$/.test(posix) ? raw : blankComments(raw);
+    const code = /\.py$/.test(posix) ? raw : codeOnly(raw);
+    // Browser code under public/ may use fetch against its own origin (F1-4 covers it), but a node: network import,
+    // built-in module access or a module loader there is server egress hidden in public/ (runner pre-review).
+    if (posix.startsWith("public/") && !/\.py$/.test(posix)) {
+      for (const mm of src.matchAll(new RegExp(NET_MODULE.source, "g"))) { fails.push(`FAIL F2-1 ${posix}: imports node:${mm[3]} in browser code`); break; }
+      if (BUILTIN_ACCESS.test(code) || REQUIRE_VALUE.test(code) || computedLoad(src) || RAW_CLIENT[5][0].test(src))
+        fails.push(`FAIL F2-1 ${posix}: raw HTTP client (module loader or built-in access) in browser code`);
+    }
     // F2 is server-side: browser code under public/ talks to its own origin and is covered by F1-4.
     if (posix !== "src/safe-fetch.mjs" && !isTest && !posix.startsWith("public/")) {
       for (const [re, what] of RAW_CLIENT) if (re.test(src)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${what}) outside src/safe-fetch.mjs`);
+      if (!/\.py$/.test(posix)) {
+        if (CLIENT_IDENT.test(code)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (fetch/WebSocket/EventSource/XMLHttpRequest used) outside src/safe-fetch.mjs`);
+        if (BUILTIN_ACCESS.test(code)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (built-in module access: getBuiltinModule/binding) outside src/safe-fetch.mjs`);
+        if (DYNAMIC_CODE.test(code)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (eval/Function/WebAssembly can build one at run time) outside src/safe-fetch.mjs`);
+        if (REQUIRE_VALUE.test(code)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (require used as a value) outside src/safe-fetch.mjs`);
+      }
       const load = computedLoad(src);
       if (load) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${load === "import" ? "dynamic import" : "require"} of a computed module name) outside src/safe-fetch.mjs`);
       const serving = posix === "src/server.mjs";

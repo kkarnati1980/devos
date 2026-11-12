@@ -228,3 +228,43 @@ test("Codex PR32-r8: F1-4 flags any use of process in browser code, however it i
   for (const name of Object.keys(bad)) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 ${name}:`)), `${name} in\n${f.join("\n")}`);
   assert.ok(!f.some((l) => l.includes("public/ok.js")), f.join("\n"));
 });
+
+test("runner pre-review: F2-1 catches built-in access, bare client identifiers, require as a value, .mts/.cts, package subpaths and node: imports in public/", () => {
+  const out = fresh("f21b");
+  const bad = {
+    "src/a.mjs": 'const h = process.getBuiltinModule("node:https"); h.get("https://169.254.169.254/");\n',
+    "src/a2.mjs": 'const b = process . binding("tcp_wrap"); export default b;\n',
+    "public/net.mjs": 'import https from "node:https";\nexport default https;\n',
+    "src/b1.mjs": "const { fetch: get } = globalThis; export const x = (u) => get(u);\n",
+    "src/b2.mjs": "export const x = (u) => (0, fetch)(u);\n",
+    "src/b3.mjs": "export const x = (u) => fetch?.(u);\n",
+    "src/b4.mjs": "export const x = () => fetch`http://10.0.0.1/`;\n",
+    "src/b5.mjs": "const W = WebSocket; export const x = (u) => new W(u);\n",
+    "src/d.cjs": 'const r = require; module.exports = r("node:https");\n',
+    "src/d2.cjs": 'module.exports = require.call(null, "node:https");\n',
+    "src/e.mts": 'export const x = (u: string) => fetch(u);\n',
+    "src/e2.cts": 'export const x = (u: string) => fetch(u);\n',
+    "src/f.mjs": 'import { request } from "undici/index.js";\nexport default request;\n',
+    "src/g.mjs": "const f = global.fetch; export const x = (u) => f(u);\n",
+    "src/h.mjs": 'export const x = (s) => eval(s);\n',
+    "src/h2.mjs": 'export const x = new Function("u", "return u");\n',
+    "src/h3.mjs": 'import vm from "node:vm";\nexport default vm;\n',
+  };
+  const good = { "src/ok.mjs": '// fetch(u) is not called here\nconst label = "fetch"; export const run = (job) => job.go(label);\n' };
+  for (const [f, src] of Object.entries({ ...bad, ...good })) write(out, f, src);
+  const f = floorCheck(out);
+  for (const name of Object.keys(bad)) assert.ok(f.some((l) => l.startsWith(`FAIL F2-1 ${name}:`)), `${name} in\n${f.join("\n")}`);
+  assert.ok(!f.some((l) => l.includes("src/ok.mjs")), f.join("\n"));
+  assert.ok(!f.some((l) => /^FAIL \S+ (src\/(server|safe-fetch|config|log)\.mjs|public\/)/.test(l) && !Object.keys(bad).some((b) => l.includes(b))), "the core itself stays clean");
+});
+
+test("Codex PR32-r9: browser code inline in public/ HTML is scanned for F1-4; markup text is not code", () => {
+  const out = fresh("f14html");
+  write(out, "public/a.html", "<!doctype html><p>Hello</p><script>const token = process.env.API_TOKEN;</script>\n");
+  write(out, "public/b.htm", '<button onclick="alert(process.env.X)">x</button>\n');
+  write(out, "public/c.html", "<SCRIPT type=module>\n  const t = process\n  .env.X;\n</SCRIPT>\n");
+  write(out, "public/ok.html", "<p>Our review process takes a day.</p><script>const n = 1;</script>\n");
+  const f = floorCheck(out);
+  for (const name of ["public/a.html", "public/b.htm", "public/c.html"]) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 ${name}:`)), `${name} in\n${f.join("\n")}`);
+  assert.ok(!f.some((l) => l.includes("public/ok.html")), f.join("\n"));
+});
