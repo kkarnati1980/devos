@@ -75,14 +75,24 @@ export function appSecretStep(cf: CoolifyClient, store: ProvisionStore, secrets:
       // A half-done earlier run (vault written, env var not, or the reverse) is finished by a rotation: nothing is
       // deployed by M2.4, so a new value is harmless, and reading a stored value back is never needed.
       const value = randomBytes(32).toString("base64url");
-      // Pre-review: the reads above are awaits after the runner's last lock check. Check before the vault write too,
-      // or a run that lost the lock could leave the vault and Coolify holding different values.
-      await store.assertLockHeld(p.id);
-      await secrets.put(p.id, vaultName, value);
-      await store.assertLockHeld(p.id);
-      await cf.http.write(present ? "PATCH" : "POST", `/api/v1/applications/${uuid}/envs`, {
-        key: secret, value, is_preview: false, is_literal: true,
-      });
+      const body = { key: secret, value, is_preview: false, is_literal: true };
+      // Write order makes an unconfirmed write safe: the half written LAST is the one the lookup can trust.
+      // - Key absent (POST): vault first, then Coolify. If the POST's outcome is unknown, the key is present only
+      //   if this value landed, so the lookup's "both halves" means both hold this value.
+      // - Key present, vault missing (PATCH): Coolify first, then vault (second pre-review). If the PATCH's outcome
+      //   is unknown, the vault is still missing, the lookup finds nothing, and the next run rotates both again.
+      // The lock is checked right before each write (the reads above are awaits after the runner's last check).
+      if (present) {
+        await store.assertLockHeld(p.id);
+        await cf.http.write("PATCH", `/api/v1/applications/${uuid}/envs`, body);
+        await store.assertLockHeld(p.id);
+        await secrets.put(p.id, vaultName, value);
+      } else {
+        await store.assertLockHeld(p.id);
+        await secrets.put(p.id, vaultName, value);
+        await store.assertLockHeld(p.id);
+        await cf.http.write("POST", `/api/v1/applications/${uuid}/envs`, body);
+      }
       return { externalId, name: externalId, owned: true };
     },
   };

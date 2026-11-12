@@ -89,12 +89,17 @@ test("AT7 no generated value appears in the journal, inventory, results, errors 
   const s = await withApps();
   const out = await runProvision(P.id, s.all(), { store: s.store, authorize: allowAll });
   const values = [...s.vault.rows.values()];
-  const envBodies = new Set(envWrites(s.fake));
-  const elsewhere = JSON.stringify({
+  const all = JSON.stringify({
     out, steps: [...s.store.steps.values()], resources: s.store.resources,
-    calls: s.fake.calls.filter((c) => !envBodies.has(c)).map((c) => ({ ...c, auth: undefined })),
+    calls: s.fake.calls.map((c) => ({ ...c, auth: undefined })),
   });
-  for (const v of values) assert.ok(!elsewhere.includes(v), "a secret value leaked");
+  // Each value appears exactly once in everything captured: in the env write for its own key, and nowhere else.
+  for (const v of values) {
+    assert.equal(all.split(v).length - 1, 1, "a secret value appears outside its own env write");
+    const own = envWrites(s.fake).filter((c) => JSON.stringify(c.body).includes(v));
+    assert.equal(own.length, 1);
+    assert.equal(own[0].body.value, v);
+  }
   // A failing env write: the error and the journal row name no value.
   const t = await withApps();
   t.fake.faults.push({ match: (m, p) => m === "POST" && p.endsWith("/envs"), action: { status: 422 }, once: false });
@@ -180,4 +185,19 @@ test("pre-review: a lock lost during the env read writes neither the vault nor C
   await assert.rejects(runProvision(P.id, steps, { store: s.store, authorize: allowAll }));
   assert.equal(s.vault.puts.length, 0);
   assert.equal(envWrites(s.fake).length, 0);
+});
+
+test("second pre-review: a PATCH whose outcome is unknown never leaves a vault/Coolify mismatch adopted", async () => {
+  for (const action of ["timeout-before", "timeout-after"]) {
+    const s = await withApps();
+    await runProvision(P.id, s.all(), { store: s.store, authorize: allowAll });
+    s.vault.rows.delete(`${P.id}/preview/SESSION_SECRET`);                        // the env key stays: PATCH path
+    s.store.steps.delete(`${P.id}/vault/app_secret/preview/SESSION_SECRET`);
+    s.fake.faults.push({ match: (m, p) => m === "PATCH" && p.endsWith("/envs"), action });
+    await assert.rejects(runProvision(P.id, s.all(), { store: s.store, authorize: allowAll }), (e) => e.code === "create_unconfirmed", action);
+    assert.equal(s.vault.rows.has(`${P.id}/preview/SESSION_SECRET`), false, "the vault half is written only after the PATCH");
+    await runProvision(P.id, s.all(), { store: s.store, authorize: allowAll });
+    const app = [...s.fake.apps.values()].find((a) => a.name.endsWith("-preview"));
+    assert.equal(app.envs.find((e) => e.key === "SESSION_SECRET").value, s.vault.rows.get(`${P.id}/preview/SESSION_SECRET`), action);
+  }
 });
