@@ -777,3 +777,20 @@ test("AT4p long comments in the length object and a long trailer dictionary: no 
     assert.deepEqual(ids(r), ["FR-001", "FR-002"], JSON.stringify(Object.keys(variant)));
   }
 });
+
+// ---------- PR30-r16 ----------
+test("AT4q structural keys are read at the dictionary's own depth, never from nested dictionaries", () => {
+  const doc = pdfObjects(
+    [
+      [4, { stream: "BT (FR-001 real page text) Tj ET" }],
+      [9, { stream: "BT (FR-999 private app data) Tj ET" }],
+      [1, "<< /Type /Catalog /Extra << /Pages 8 0 R >> /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Meta << /Kids [9 0 R] >> /Kids [3 0 R] >>"],
+      [3, "<< /Type /Page /PieceInfo << /App << /Private << /Contents 9 0 R >> >> >> /Annots [<< /Contents 9 0 R >>] /Contents 4 0 R >>"],
+    ],
+    1,
+  );
+  const r = parseSpec(doc, "nested.pdf");
+  assert.deepEqual(ids(r), ["FR-001"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+});

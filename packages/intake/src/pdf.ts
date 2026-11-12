@@ -370,6 +370,32 @@ function scanObjectBody(text: string, from: number): { kind: "stream"; keyword: 
   return { kind: "obj", end: n };
 }
 
+/**
+ * Keep only a dictionary's own keys (PR30-r16): everything inside nested dictionaries (/PieceInfo, /Resources,
+ * annotation dicts in arrays …) is blanked, so /Contents, /Kids, /Type, /Length or /Root can only match at the
+ * dictionary's own depth. Input is already string- and comment-blanked.
+ */
+function topLevel(s: string): string {
+  const keep = /^\s*<</.test(s) ? 1 : 0;
+  let depth = 0;
+  let out = "";
+  for (let i = 0; i < s.length; ) {
+    if (s.startsWith("<<", i)) {
+      depth++;
+      out += depth > keep ? "  " : "<<";
+      i += 2;
+    } else if (s.startsWith(">>", i)) {
+      out += depth > keep ? "  " : ">>";
+      depth--;
+      i += 2;
+    } else {
+      out += depth > keep ? " " : s[i];
+      i++;
+    }
+  }
+  return out;
+}
+
 /** Blank out strings and comments so structural lookups (/Kids, /Contents, /Length, /Root…) never match inside them. */
 function stripStrings(s: string): string {
   let out = "";
@@ -430,7 +456,7 @@ function collectObjects(
     const gap = text.slice(from, to).replace(/%[^\r\n]*/g, (c) => " ".repeat(c.length)); // comments never hold a trailer
     for (const t of gap.matchAll(/\btrailer\s*(?=<<)/g)) {
       const d = readDict(text, from + (t.index ?? 0) + t[0].length);
-      if (d !== null) trailers.push({ pos: from + (t.index ?? 0), dict: stripStrings(d) });
+      if (d !== null) trailers.push({ pos: from + (t.index ?? 0), dict: topLevel(stripStrings(d)) });
     }
   };
   const re = new RegExp(OBJECT_HEADER.source, "g");
@@ -453,7 +479,7 @@ function collectObjects(
     // Object boundaries come from a token scan that skips strings and comments (PR30-r6), never a substring search.
     const body = scanObjectBody(text, bodyStart);
     if (body.kind === "stream") {
-      const dict = stripStrings(text.slice(bodyStart, body.keyword));
+      const dict = topLevel(stripStrings(text.slice(bodyStart, body.keyword)));
       const start = body.dataStart;
       const end = streamEnd(buf, text, dict, start, ints);
       if (end < 0) break;
@@ -472,12 +498,12 @@ function collectObjects(
             const on = head[2 * k] ?? NaN;
             const off = head[2 * k + 1] ?? NaN;
             const next = k + 1 < n ? (head[2 * k + 3] ?? s.length - first) : s.length - first;
-            if (Number.isFinite(on) && Number.isFinite(off)) objs.set(on, { dict: stripStrings(s.slice(first + off, first + next)), pos });
+            if (Number.isFinite(on) && Number.isFinite(off)) objs.set(on, { dict: topLevel(stripStrings(s.slice(first + off, first + next))), pos });
           }
         }
       }
     } else {
-      objs.set(num, { dict: stripStrings(text.slice(bodyStart, body.end)), pos });
+      objs.set(num, { dict: topLevel(stripStrings(text.slice(bodyStart, body.end))), pos });
       re.lastIndex = body.end;
       gapStart = body.end;
     }
@@ -567,7 +593,7 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
         }
       }
       const open = text.indexOf("<<", trailerAt);
-      const tdict = stripStrings(open >= 0 ? readDict(text, open) ?? "" : "");
+      const tdict = topLevel(stripStrings(open >= 0 ? readDict(text, open) ?? "" : ""));
       const prevM = /\/Prev\s+(\d{1,12})/.exec(tdict);
       const stm = /\/XRefStm\s+(\d{1,12})/.exec(tdict);
       if (stm) readXrefStream(Number(stm[1]));
@@ -586,7 +612,8 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
     if (!head) return -1;
     const body = scanObjectBody(text, pos + head[0].length);
     if (body.kind !== "stream") return -1;
-    const dict = stripStrings(text.slice(pos + head[0].length, body.keyword));
+    const full = stripStrings(text.slice(pos + head[0].length, body.keyword));
+    const dict = topLevel(full); // own keys; /DecodeParms (nested) is read from `full`
     if (!/\/Type\s*\/XRef\b/.test(dict)) return -1;
     const len = /\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R)/.exec(dict);
     if (!len) return -1;
@@ -598,12 +625,14 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
       return -1;
     }
     if (!data) return -1;
-    const pred = Number(/\/Predictor\s+(\d+)/.exec(dict)?.[1] ?? 1);
+    const dpAt = /\/DecodeParms\s*(?=<<)/.exec(full);
+    const parms = dpAt ? readDict(full, dpAt.index + dpAt[0].length) ?? "" : "";
+    const pred = Number(/\/Predictor\s+(\d+)/.exec(parms)?.[1] ?? 1);
     const w = (/\/W\s*\[([^\]]*)\]/.exec(dict)?.[1] ?? "").trim().split(/\s+/).map(Number);
     if (w.length !== 3 || w.some((x) => !Number.isInteger(x) || x < 0 || x > 8)) return -1;
     const rowLen = (w[0] ?? 0) + (w[1] ?? 0) + (w[2] ?? 0);
     if (rowLen === 0) return -1;
-    if (pred >= 10) data = unPng(data, Number(/\/Columns\s+(\d+)/.exec(dict)?.[1] ?? rowLen));
+    if (pred >= 10) data = unPng(data, Number(/\/Columns\s+(\d+)/.exec(parms)?.[1] ?? rowLen));
     const size = Number(/\/Size\s+(\d+)/.exec(dict)?.[1] ?? 0);
     const index = (/\/Index\s*\[([^\]]*)\]/.exec(dict)?.[1] ?? `0 ${size}`).trim().split(/\s+/).map(Number);
     let row = 0;
