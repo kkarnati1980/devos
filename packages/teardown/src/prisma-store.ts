@@ -113,3 +113,17 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
     }, { timeout: this.ms, maxWait: this.ms });
   }
 }
+
+/**
+ * Vault leftover scan (decision 6): any `vault_secret` row still scoped to the project is a hit, listed by name only.
+ * The ciphertext is never selected (decision 7).
+ */
+export function vaultScanner(db: { vaultSecret: any }, dbTimeoutMs = 10_000) {
+  return {
+    name: "vault",
+    scan: async (p: { id: string; slug: string }) => {
+      const rows = await bounded(db.vaultSecret.findMany({ where: { projectId: p.id }, select: { id: true, name: true } }), dbTimeoutMs, "teardown_db") as any[];
+      return rows.map((r) => ({ provider: "vault", kind: "secret", externalId: r.id, name: r.name }));
+    },
+  };
+}

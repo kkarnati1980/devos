@@ -103,3 +103,16 @@ test("AT7 on Postgres: after a purge the same project provisions fresh; its own 
   assert.deepEqual(out.map((o) => o.outcome), ["created", "created"]);
   assert.equal(await db.resource.count({ where: { projectId: s.p.id, status: "active" } }), 2);
 });
+
+test("AT6 on Postgres: a vault secret left for the project is a leftover (listed by name, never by value); the stage stays archived", async () => {
+  const { vaultScanner } = await import("../dist/index.js");
+  const s = await setup();
+  await s.provision();
+  await archiveProject(s.p.id, { store: s.store, ops: s.ops, authorize: allowAll });
+  await db.vaultSecret.create({ data: { projectId: s.p.id, name: "APP_SESSION_SECRET", ciphertext: Buffer.from("x"), nonce: Buffer.alloc(12), keyVersion: 1 } });
+  const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: [...s.scanners, vaultScanner(db)], authorize: allowAll });
+  assert.equal(out.purged, false);
+  assert.deepEqual(out.report.hits.map((h) => `${h.provider}:${h.name}`), ["vault:APP_SESSION_SECRET"]);
+  assert.ok(!JSON.stringify(out.report).includes("ciphertext"));
+  assert.equal((await db.project.findUnique({ where: { id: s.p.id } })).stage, "archived");
+});
