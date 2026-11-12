@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.4b — Coolify API lifecycle spike (create → deploy → update → rollback → delete, ×ROUNDS)
-# Version: 1.0.4
+# Version: 1.0.5
 # v1.0.1 (Codex review 14e71f7): ROUNDS must be an integer >= 2; leftover scan checks
 # names AND labels of containers, volumes and networks; project deletion is required
 # and verified (GET -> 404).
@@ -10,13 +10,19 @@
 # v1.0.4 (Codex review 6db46b4): the failure trap also removes a spike project created by
 # this run (after its app), retrying while the app deletion settles; a pre-existing project
 # is never deleted by the trap.
-# Run as root on the DevOS server after 04a:  bash 04b-coolify-api-lifecycle.sh
+# v1.0.5 (DEVOS-54, tie-break low notes): checks GET /version (HTTP 200, Coolify 4.5.x) itself
+# before any write, using lib/coolify-version.sh shared with 04a; a 2xx rollback reply with no
+# deployment_uuid is logged instead of skipped silently.
+# Run as root on the DevOS server after 04a, from a repo checkout (it sources lib/coolify-version.sh):
+#   bash scripts/phase0/04b-coolify-api-lifecycle.sh
 #
 # Uses only the Coolify API (http://localhost:8000/api/v1) plus read-only `docker`
 # checks for evidence. Request fields for /deploy and /rollback are taken from the
 # installed OpenAPI spec (/root/.devos/openapi.yaml, written by 04a), so the script
 # follows the running Coolify version. Never prints the token. Cleans up on failure.
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/coolify-version.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/coolify-version.sh"
 
 API=http://localhost:8000/api/v1
 DIR=/root/.devos
@@ -49,6 +55,11 @@ api() {  # api METHOD PATH [JSON]  -> sets CODE, BODY
   CODE="$(tail -n1 <<<"$out")"; BODY="$(head -n -1 <<<"$out")"
 }
 need() { [[ "$CODE" =~ ^2 ]] || fail "$1: HTTP $CODE $(head -c 600 <<<"$BODY")"; }
+
+# AT1 precondition: 04b no longer relies on 04a having just run against the same Coolify.
+api GET /version
+VER="$(coolify_version_ok "$CODE" "$BODY")" || fail "version check: $VER"
+echo "  Coolify $VER (API reachable, token accepted)"
 
 spec() {  # spec PATH METHOD -> {"body":[...],"required":[...],"query":[...]}
   python3 - "$SPEC" "$1" "$2" <<'PY'
@@ -189,7 +200,11 @@ for r in $(seq 1 "$ROUNDS"); do
     echo "  rollback body $rb -> HTTP $CODE: $(head -c 300 <<<"$BODY")"
     if [[ "$CODE" =~ ^2 ]]; then
       dep="$(jq -r '[.. | objects | .deployment_uuid? // empty] | first // empty' <<<"$BODY")"
-      [[ -n "$dep" ]] && wait_deploy "$dep"
+      if [[ -n "$dep" ]]; then
+        wait_deploy "$dep"
+      else
+        echo "  rollback HTTP $CODE returned no deployment_uuid - not polling; AT5 relies on the container image check below"
+      fi
       method="api-rollback"
     fi
   fi
@@ -218,7 +233,7 @@ api GET "/projects/$PROJ"; [[ "$CODE" == 404 ]] || fail "project $PROJ still pre
 pass "spike project deleted (GET -> 404)"
 
 trap - EXIT
-echo "----- M0.4 evidence v1.0.4 $(date -u +%FT%TZ) -----"
+echo "----- M0.4 evidence v1.0.5 $(date -u +%FT%TZ) -----"
 printf '%s\n' "${SUMMARY[@]}"
 echo "AT7 repeat: $ROUNDS rounds passed with no manual cleanup"
 echo "AT8 secrets: $ENVF mode $(stat -c %a "$ENVF"), $DIR mode $(stat -c %a "$DIR"); token never printed"
