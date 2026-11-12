@@ -24,6 +24,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@devos/analyst':
+        specifier: workspace:*
+        version: link:../../packages/analyst
       '@devos/db':
         specifier: workspace:*
         version: link:../../packages/db

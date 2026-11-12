@@ -98,7 +98,7 @@ test("AT5 (sync level): a Linear failure during sync carries no key, and nothing
   const fetchImpl = async () => new Response(JSON.stringify({ errors: [{ message: `echo ${KEY}` }] }), { status: 200 });
   const api = graphqlApi(new LinearClient({ apiKey: () => KEY, fetchImpl, sleep: async () => {} }));
   const plan = throwaway(); const stored = [];
-  const store = { setProjectId: async (...a) => stored.push(a), setMilestoneId: async (...a) => stored.push(a), setModuleIssue: async (...a) => stored.push(a), setTaskIssue: async (...a) => stored.push(a) };
+  const store = { setProjectId: async (...a) => stored.push(a), setMilestoneId: async (...a) => stored.push(a), setModuleIssue: async (...a) => stored.push(a), setTaskIssue: async (...a) => stored.push(a), completeHumanTask: async (...a) => stored.push(a) };
   const err = await syncProject(plan, api, store).catch((e) => e);
   assert.ok(err instanceof Error);
   assert.ok(!JSON.stringify({ m: err.message, s: err.stack, stored, plan }).includes(KEY));
@@ -138,6 +138,7 @@ test("Codex PR35-r4: every PrismaSyncStore write and the plan read run in a boun
     assert.ok(inTx > 0, `${name}.${String(op)} ran outside a bounded transaction`);
     if (op === "findUnique") return { id: "p1", name: "P" };
     if (op === "findMany") return [];
+    if (op === "updateMany") return { count: 0 };
     return null;
   } });
   const tx = { project: delegate("project"), milestone: delegate("milestone"), module: delegate("module"), moduleDependency: delegate("moduleDependency"),
@@ -147,12 +148,13 @@ test("Codex PR35-r4: every PrismaSyncStore write and the plan read run in a boun
     $transaction: async (fn, opts) => { seen.push(opts); inTx++; try { return await fn(tx); } finally { inTx--; } } };
   const store = new PrismaSyncStore(db, "p1");
   await store.setProjectId("p1", "lp1"); await store.setMilestoneId("m1", "lm1"); await store.setModuleIssue("mod1", "i1"); await store.setTaskIssue("t1", "i2");
+  await store.completeHumanTask("t1", "completed");
   await loadPlan(db, "p1");
   const opts = seen.filter((x) => typeof x === "object");
-  assert.equal(opts.length, 5);
+  assert.equal(opts.length, 6);
   for (const o of opts) assert.deepEqual(o, { timeout: STORE_OP_MS, maxWait: STORE_WAIT_MS });
-  assert.equal(seen.filter((x) => x === "SET LOCAL statement_timeout = 10000").length, 5);
-  assert.equal(seen.filter((x) => x === "SET LOCAL lock_timeout = 10000").length, 5);
+  assert.equal(seen.filter((x) => x === "SET LOCAL statement_timeout = 10000").length, 6);
+  assert.equal(seen.filter((x) => x === "SET LOCAL lock_timeout = 10000").length, 6);
 });
 
 test("Codex PR35-r7: when a label create fails, no other Linear write is still in flight after the sync returns", async () => {
@@ -171,4 +173,131 @@ test("Codex PR35-r7: when a label create fails, no other Linear write is still i
   await assert.rejects(syncProject(plan, L.api, memoryStore(plan)), /label create failed/);
   assert.equal(inflight, 0, "a label write outlived the sync");
   assert.equal(maxInflight, 1, "label writes ran concurrently");
+});
+
+test("DEVOS-132: an agent issue moved to another Linear project is moved back on the next sync, never duplicated", async () => {
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const mod = L.issues.find((x) => x.id === plan.modules[0].linearIssue);
+  const count = L.issues.length;
+  mod.projectId = "p-somewhere-else"; mod.description = "edited by hand";
+  L.writes.length = 0;
+  await syncProject(plan, L.api, store);
+  assert.equal(L.issues.length, count, "no issue created");
+  assert.equal(L.writes.filter((w) => w.op === "createIssue").length, 0);
+  assert.equal(mod.projectId, L.projects[0].id, "moved back into the project");
+  assert.match(mod.description, /devos-ref: module\//, "the manual edit is overwritten");
+  assert.equal(plan.modules[0].linearIssue, mod.id, "the stored id is kept");
+});
+
+test("DEVOS-132 pre-review: a move Linear refuses is logged and skipped; the rest syncs and nothing is duplicated", async () => {
+  const { LinearError } = await import("../dist/index.js");
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const mod = L.issues.find((x) => x.id === plan.modules[0].linearIssue);
+  const count = L.issues.length;
+  mod.projectId = null;
+  const update = L.api.updateIssue;
+  L.api.updateIssue = async (id, patch) => { if (id === mod.id && "projectId" in patch) throw new LinearError("graphql", "Linear refused issueUpdate"); return update(id, patch); };
+  plan.tasks[0].title = "renamed task";
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(L.issues.length, count, "no issue created");
+  assert.equal(mod.projectId, null, "left as it is");
+  assert.ok(r.log.some((l) => l.includes(mod.id) && l.includes("refused")));
+  assert.ok(L.issues.some((x) => x.title === "renamed task"), "other issues still sync");
+  // A transient failure is not swallowed: the sync fails and retries later.
+  L.api.updateIssue = async () => { throw new LinearError("network", "socket hang up"); };
+  await assert.rejects(syncProject(plan, L.api, store), /socket hang up/);
+});
+
+test("Codex PR64-r1: a stuck module gets no relation writes either way; an unchanged plan makes no writes for it", async () => {
+  const { LinearError } = await import("../dist/index.js");
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  assert.ok(plan.dependencies.length > 0, "the plan has a dependency");
+  await syncProject(plan, L.api, store);
+  const update = L.api.updateIssue;
+  for (const which of ["moduleId", "dependsOnId"]) {
+    const modId = plan.dependencies[0][which];
+    const mod = L.issues.find((x) => x.id === plan.modules.find((m) => m.id === modId).linearIssue);
+    const home = mod.projectId;
+    mod.projectId = null;
+    L.api.updateIssue = async (id, patch) => { if (id === mod.id && "projectId" in patch) throw new LinearError("graphql", "Linear refused issueUpdate"); return update(id, patch); };
+    L.writes.length = 0;
+    await syncProject(plan, L.api, store);
+    await syncProject(plan, L.api, store);
+    assert.equal(L.writes.filter((w) => w.op === "addBlockedBy" || w.op === "createIssue").length, 0, `${which}: no relation or create writes`);
+    mod.projectId = home; L.api.updateIssue = update;
+  }
+});
+
+test("DEVOS-132: the issues query stays under Linear's complexity limit", async () => {
+  const { ISSUES_QUERY_COST, LINEAR_MAX_COMPLEXITY, ISSUE_PAGE } = await import("../dist/index.js");
+  assert.ok(ISSUES_QUERY_COST <= LINEAR_MAX_COMPLEXITY, `${ISSUES_QUERY_COST} > ${LINEAR_MAX_COMPLEXITY}`);
+  assert.ok(ISSUE_PAGE >= 10, "pages are not so small that a project needs hundreds of reads");
+});
+
+test("AT6: KK completing a human task in Linear makes the DevOS task done within one sync; a second sync changes nothing", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const human = L.issues.find((i) => i.title === "Create the API key");
+  human.stateId = "s-c"; L.writes.length = 0;
+  const r = await syncProject(plan, L.api, store);
+  assert.deepEqual(store.completed, [[u(33), "completed"]]);
+  assert.equal(plan.tasks.find((t) => t.id === u(33)).status, "done");
+  assert.equal(r.inbound.length, 1); assert.equal(r.writes, 0, "inbound sync writes nothing to Linear");
+  const r2 = await syncProject(plan, L.api, store);
+  assert.equal(store.completed.length, 1); assert.equal(r2.inbound.length, 0); assert.equal(r2.writes, 0);
+});
+
+test("AT6: a cancelled human task becomes done, recorded as cancelled", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  L.issues.find((i) => i.title === "Create the API key").stateId = "s-x";
+  await syncProject(plan, L.api, store);
+  assert.deepEqual(store.completed, [[u(33), "canceled"]]);
+});
+
+test("AT6: completing an agent issue in Linear is reverted on the next sync and logged; no inbound change", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const agentTasks = plan.tasks.filter((t) => t.assignee !== "kk" && t.status !== "done");
+  assert.ok(agentTasks.length);
+  const issue = L.issues.find((i) => i.id === agentTasks[0].linearIssue);
+  const before = issue.stateId; issue.stateId = "s-c"; L.writes.length = 0;
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(issue.stateId, before, "state put back");
+  assert.ok(r.log.some((l) => /: state completed -> /.test(l)), r.log.join("\n"));
+  assert.deepEqual(store.completed, []); assert.equal(agentTasks[0].status === "done", false);
+});
+
+test("AT6: the fenced store checks the lock guard before completing a human task; a failed guard writes nothing", async () => {
+  const { syncProjectLocked, WRITE_MARGIN_MS } = await import("../dist/index.js");
+  const calls = [];
+  const lockTx = { $queryRawUnsafe: async (q) => (q.includes("pg_try_advisory_xact_lock") ? [{ ok: true }] : [{}]) };
+  const inner = { $executeRawUnsafe: async () => {}, task: { updateMany: async () => { calls.push("updateMany"); return { count: 1 }; } }, auditEvent: { create: async () => { calls.push("audit"); } } };
+  let depth = 0;
+  const db = { $transaction: async (fn) => { depth++; try { return await fn(depth === 1 ? lockTx : inner); } finally { depth--; } } };
+  let t = 0;
+  // The run callback is given the fenced store; time jumps so the guard refuses before the write.
+  const run = async (_plan, store) => { t += 10 * 60_000; await store.completeHumanTask("t", "completed"); };
+  inner.project = { findUnique: async () => ({ id: "p", name: "P" }) };
+  for (const k of ["milestone", "module", "resource", "moduleDependency"]) inner[k] = { findMany: async () => [] };
+  inner.task.findMany = async () => [];
+  await assert.rejects(syncProjectLocked(db, "p", run, WRITE_MARGIN_MS + 1_000, () => t), /linear-sync-lock-expiring/);
+  assert.deepEqual(calls, [], "no task update or audit row after a failed guard");
+  t = 0;
+  await syncProjectLocked(db, "p", async (_p, store) => { assert.equal(await store.completeHumanTask("t", "completed"), true); }, WRITE_MARGIN_MS + 120_000, () => t);
+  assert.deepEqual(calls, ["updateMany", "audit"]);
+});
+
+test("M2.6-b decision 3: a human task reopened in Linear after DevOS took it as done stays done and is logged", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const issue = L.issues.find((i) => i.title === "Create the API key");
+  issue.stateId = "s-c"; await syncProject(plan, L.api, store);
+  issue.stateId = "s-u"; L.writes.length = 0;
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(plan.tasks.find((t) => t.id === u(33)).status, "done");
+  assert.ok(r.log.some((l) => /reopened in Linear \(unstarted\) but done in DevOS/.test(l)), r.log.join("\n"));
+  assert.equal(r.writes, 0); assert.equal(r.inbound.length, 0);
 });

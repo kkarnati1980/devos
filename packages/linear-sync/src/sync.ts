@@ -2,6 +2,7 @@
 // id or, failing that, by its marker before anything is created; an unchanged plan makes no Linear write.
 import type { DevosPlan, LinearApi, LinearIssue, StateType, SyncStore, ModuleStatus, TaskStatus } from "./types.js";
 import { readMarker, sameText, withMarker } from "./markers.js";
+import { LinearError } from "./client.js";
 
 export const LANE_LABEL = (lane: number) => `Lane ${String.fromCharCode(64 + Math.min(Math.max(lane, 1), 3))}`;
 
@@ -25,13 +26,13 @@ export function taskState(s: TaskStatus): { type: StateType; deadlocked: boolean
 
 const viewerCache = new WeakMap<LinearApi, string>();
 
-export interface SyncResult { writes: number; created: string[]; updated: string[]; log: string[] }
+export interface SyncResult { writes: number; created: string[]; updated: string[]; log: string[]; inbound: string[] }
 export interface SyncOptions { teamKey?: string; kkUserId?: string }
 
 const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
 
 export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncStore, opts: SyncOptions = {}): Promise<SyncResult> {
-  const r: SyncResult = { writes: 0, created: [], updated: [], log: [] };
+  const r: SyncResult = { writes: 0, created: [], updated: [], log: [], inbound: [] };
   const team = await api.team(opts.teamKey ?? "DEVOS");
   const stateId = (type: StateType) => {
     const s = team.states.find((x) => x.type === type);
@@ -81,7 +82,33 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   }
 
   // Issues: modules, then tasks (sub-issues need their parent's id).
-  const issues = await api.issues(projectId);
+  let issues = await api.issues(projectId);
+  // An agent issue someone moved out of the project (or whose project was cleared) is not in the list, and neither is
+  // its marker, so it would be created again. A stored id missing from the list is looked up by id: if the issue still
+  // exists it is moved back into the project (a manual edit is overwritten, never duplicated); only a gone issue is
+  // created again. The list is read once more after a move.
+  const listed = new Set(issues.map((i) => i.id));
+  let moved = 0;
+  // Pre-review: a move Linear refuses (e.g. the issue now sits in a team this project does not include) must not stop
+  // every later sync of the project. That issue is left where it is, logged, and neither updated nor created again.
+  const stuck = new Set<string>();
+  for (const stored of [...plan.modules.map((m) => m.linearIssue), ...plan.tasks.map((t) => t.linearIssue)]) {
+    if (!stored || listed.has(stored)) continue;
+    const ref = await api.issueRef(stored);
+    if (ref && ref.projectId !== projectId) {
+      try {
+        await api.updateIssue(ref.id, { projectId });
+      } catch (e) {
+        const refused = e instanceof LinearError && (e.code === "graphql" || (e.code === "http" && (e.status ?? 0) >= 400 && (e.status ?? 0) < 500 && e.status !== 429));
+        if (!refused) throw e;
+        stuck.add(ref.id);
+        r.log.push(`issue ${ref.id} is outside the project and Linear refused to move it back; left as it is`);
+        continue;
+      }
+      r.writes++; r.updated.push(`issue ${ref.id} moved back into the project`); moved++;
+    }
+  }
+  if (moved) issues = await api.issues(projectId);
   const byId = new Map(issues.map((i) => [i.id, i]));
   const find = (stored: string | null, kind: "module" | "task", id: string): LinearIssue | undefined =>
     (stored ? byId.get(stored) : undefined) ?? issues.find((i) => readMarker(i.description, kind) === id);
@@ -102,6 +129,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     if (existing.title !== want.title) patch.title = want.title;
     if (!sameText(existing.description, want.description)) patch.description = want.description;
     // Human tasks: Linear owns their state after creation (KK completes them there; M2.6-b reads it back).
+    // An agent-owned issue moved by hand in Linear is put back (DevOS owns its state) and the revert is logged (AT6).
     if (!want.keepLinearState && existing.stateType !== want.state) { patch.stateId = stateId(want.state); r.log.push(`${what}: state ${existing.stateType} -> ${want.state}`); }
     if (!sameSet(existing.labelNames, want.labels)) patch.labelIds = lids;
     if (existing.parentId !== want.parentId) patch.parentId = want.parentId;
@@ -113,6 +141,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
 
   const modIssue = new Map<string, string>();
   for (const m of plan.modules) {
+    if (m.linearIssue && stuck.has(m.linearIssue)) { modIssue.set(m.id, m.linearIssue); continue; }
     const st = moduleState(m.status);
     const existing = find(m.linearIssue, "module", m.id);
     const id = await upsert(`module ${m.key}`, existing, {
@@ -125,9 +154,20 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     modIssue.set(m.id, id);
   }
   for (const t of plan.tasks) {
+    if (t.linearIssue && stuck.has(t.linearIssue)) continue;
     const st = taskState(t.status);
     const human = t.assignee === "kk";
     const existing = find(t.linearIssue, "task", t.id);
+    // M2.6-b inbound (AT6): Linear owns a human task's state after creation. Completed or cancelled there → the
+    // DevOS task becomes done (cancel is recorded as such), which the scheduler sees as an unblocked dependency.
+    if (human && existing && t.status !== "done" && (existing.stateType === "completed" || existing.stateType === "canceled")) {
+      if (await store.completeHumanTask(t.id, existing.stateType)) r.inbound.push(`task ${t.title.slice(0, 40)}: ${existing.stateType} in Linear -> done`);
+    }
+    // M2.6-b decision 3: a human task reopened in Linear after DevOS took it as done stays done (dependent work may
+    // have started); the divergence is logged on every sync so it is visible, and nothing is written.
+    if (human && existing && t.status === "done" && existing.stateType !== "completed" && existing.stateType !== "canceled") {
+      r.log.push(`task ${t.title.slice(0, 40)}: reopened in Linear (${existing.stateType}) but done in DevOS; left as is`);
+    }
     const mod = t.moduleId ? plan.modules.find((m) => m.id === t.moduleId) : undefined;
     const id = await upsert(`task ${t.title.slice(0, 40)}`, existing, {
       title: t.title,
@@ -144,6 +184,8 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   for (const d of plan.dependencies) {
     const a = modIssue.get(d.moduleId), b = modIssue.get(d.dependsOnId);
     if (!a || !b) continue;
+    // A stuck issue (a refused move) is left alone entirely: no relation writes to or from it (Codex PR64-r1).
+    if (stuck.has(a) || stuck.has(b)) continue;
     const cur = byId.get(a);
     if (cur && cur.blockedBy.includes(b)) continue;
     await api.addBlockedBy(a, b); r.writes++; r.created.push("relation");

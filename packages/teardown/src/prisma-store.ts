@@ -11,6 +11,7 @@ export interface TeardownPrismaLike {
   resource: any;
   provisionStep: any;
   auditEvent: any;
+  vaultSecret: any;
   $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T>;
 }
 
@@ -104,6 +105,25 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
   async lastScan(projectId: string): Promise<ScanReport | null> {
     const ev = await this.q(this.tdb.auditEvent.findFirst({ where: { projectId, action: "teardown.scan", actor: "system" }, orderBy: [{ occurredAt: "desc" }, { id: "desc" }], select: { details: true } })) as any;
     return (ev?.details as ScanReport) ?? null;
+  }
+
+  /**
+   * DEVOS-131: hard delete; ciphertext of a purged project is a liability, and the purge is KK's decision (M2.3).
+   * Like every vault mutation (apps/api/src/vault.ts), the delete and its audit event commit together; the event
+   * lists names and the count, never a value.
+   */
+  async deleteProjectSecrets(projectId: string): Promise<number> {
+    return this.tdb.$transaction(async (tx: any) => {
+      const rows = (await tx.vaultSecret.findMany({ where: { projectId }, select: { id: true, name: true }, orderBy: { name: "asc" } })) as { id: string; name: string }[];
+      if (!rows.length) return 0;
+      const r = (await tx.vaultSecret.deleteMany({ where: { projectId, id: { in: rows.map((x) => x.id) } } })) as { count: number };
+      await tx.auditEvent.create({ data: {
+        actor: "system", projectId, action: "teardown.secrets_deleted",
+        summary: `Purge deleted ${r.count} vault secret(s)`,
+        details: { count: r.count, names: rows.map((x) => x.name) },
+      } });
+      return r.count;
+    }, { timeout: this.ms, maxWait: this.ms });
   }
 
   async markPurged(projectId: string): Promise<void> {
