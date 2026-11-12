@@ -318,8 +318,10 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     }
 
     if (b.type === "table") {
-      open = null;
       const cols = tableColumns(b.rows, prefixes);
+      // A requirement table ends any open scope. A non-requirement table does not end a heading requirement's
+      // criteria (they run to the next heading, behaviour 2); it does end a list item's nested scope (PR53-r8).
+      if (cols || (open as typeof open)?.kind !== "heading") open = null;
       if (!cols) {
         // A non-requirement table's rows follow the list-item rules (PR53-r5, r6): under a stack heading each row
         // is a stack item; under a questions heading each row is a stated question; anywhere, a row with

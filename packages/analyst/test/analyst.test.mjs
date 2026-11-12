@@ -422,3 +422,18 @@ test("AT10e (PR53-r6) non-requirement tables outside stack: questions-section ro
   ]);
   assert.equal(a.stack.length, 0);
 });
+
+test("AT10f (PR53-r8) a non-requirement table inside a heading requirement keeps its criteria scope", () => {
+  const { a } = analyze(`## Requirements
+
+### FR-1: Login
+
+| Field | Type |
+|---|---|
+| email | text |
+
+- Login succeeds
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.acceptance]), [["FR-1", ["Login succeeds"]]]);
+  assert.equal(a.openQuestions.filter((q) => q.kind === "missing-acceptance").length, 0);
+});
