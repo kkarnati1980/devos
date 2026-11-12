@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0 });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false, manyComments: false });
 
 before(async () => {
   reset();
@@ -37,7 +37,16 @@ before(async () => {
           : { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
       }
       const cm = p.match(/^\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/);
-      if (cm && req.method === "POST") { M.comments.push({ pr: Number(cm[1]), ...JSON.parse(body) }); return send(201, {}); }
+      if (cm && req.method === "POST") {
+        M.comments.push({ pr: Number(cm[1]), user: { login: "kkarnati1980" }, ...JSON.parse(body) });
+        if (M.hangComment) return; // GitHub stored it, but the answer never arrives
+        return send(201, {});
+      }
+      if (cm && req.method === "GET") {
+        if (M.failCommentsGet) return send(502, {});
+        if (M.manyComments) return send(200, Array.from({ length: 100 }, () => ({ body: "x", user: { login: "someone" } }))); // every page full
+        return send(200, M.comments.filter((c) => c.pr === Number(cm[1])).map((c) => ({ body: c.body, user: c.user })));
+      }
       const st = p.match(/^\/repos\/kkarnati1980\/devos\/statuses\/([0-9a-f]{40})$/);
       if (st && req.method === "POST") {
         if (M.failStatus) return send(500, {});
@@ -243,4 +252,83 @@ test("AT19: with three green waiting heads, the one green longest is reviewed fi
   assert.equal(r5.code, 0, r5.out);
   assert.equal(order().at(-1), sha("4"), "PR #21 (lower number) first despite being listed and timed second");
   assert.equal(fs.readFileSync(path.join(ws, `${sha("3")}.green`), "utf8").trim(), fs.readFileSync(path.join(ws, `${sha("4")}.green`), "utf8").trim());
+});
+
+// DEVOS-106 (review-watch v1.4.1, AT20): a comment POST that GitHub completes after our timeout is not posted again.
+test("AT20: a timed-out verdict comment that GitHub stored is found on the next tick and not posted twice", async () => {
+  reset();
+  M.green = true; M.hangComment = true;
+  const sha = "f".repeat(40);
+  M.prs = [{ number: 31, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M31.md" }];
+  fs.mkdirSync(path.join(dir, "verdicts"), { recursive: true });
+  const runner = path.join(dir, "runner20.sh");
+  fs.writeFileSync(runner, `#!/usr/bin/env bash\nprintf '{"verdict":"PASS","summary":"ok","findings":[]}' > "${dir}/verdicts/$2.json"\n`, { mode: 0o755 });
+  const r1 = await tick([], { REVIEW_RUNNER: runner, GH_TIMEOUT: "2" });
+  assert.equal(r1.code, 0, r1.out);
+  assert.match(r1.out, /comment failed; will retry/);
+  assert.equal(M.comments.length, 1);
+  M.hangComment = false;
+  // The comment read fails: no POST this tick (that would risk the duplicate), and nothing marked posted.
+  M.failCommentsGet = true;
+  const rf = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(rf.code, 0, rf.out);
+  assert.match(rf.out, /cannot check the PR's comments/);
+  assert.equal(M.comments.length, 1);
+  assert.equal(fs.existsSync(path.join(dir, "watch", `${sha}.commented`)), false);
+  M.failCommentsGet = false;
+  const r2 = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.out, /verdict comment already on the PR/);
+  assert.equal(M.comments.length, 1, "no duplicate verdict comment");
+  assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "success"));
+  assert.ok(fs.existsSync(path.join(dir, "watch", `${sha}.published`)));
+  // A comment that never reached GitHub is still retried.
+  reset(); M.green = true;
+  const sha2 = "9".repeat(40);
+  M.prs = [{ number: 32, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha2, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M32.md" }];
+  fs.writeFileSync(path.join(dir, "watch", `${sha2}.msg`), "### Codex review PR32-r1 — **PASS**\n\n- **Commit:** `" + sha2 + "`\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha2}.state`), "success Codex PASS (PR32-r1)\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha2}.comment-tried`), "");
+  // A forged copy by another user, and our own comment for a different SHA, do not count.
+  M.comments.push({ pr: 32, user: { login: "mallory" }, body: "### Codex review PR32-r1 — **PASS**\n\n- **Commit:** `" + sha2 + "`\n" });
+  M.comments.push({ pr: 32, user: { login: "kkarnati1980" }, body: "### Codex review PR32-r1 — **PASS**\n\n- **Commit:** `" + "8".repeat(40) + "`\n" });
+  const r3 = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(r3.code, 0, r3.out);
+  assert.equal(M.comments.length, 3, "posted once: the forged and other-SHA comments did not count");
+  assert.equal(M.comments.at(-1).user.login, "kkarnati1980");
+});
+
+test("AT20 (Codex PR52-r2): a runner-failure report carries the commit line and is not posted twice after a timed-out POST", async () => {
+  reset();
+  M.green = true; M.hangComment = true;
+  const sha = "7".repeat(40);
+  M.prs = [{ number: 33, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M33.md" }];
+  const failing = path.join(dir, "runner-fail.sh");
+  fs.writeFileSync(failing, "#!/usr/bin/env bash\necho 'ERROR: Quota exceeded.'\nexit 1\n", { mode: 0o755 });
+  const r1 = await tick([], { REVIEW_RUNNER: failing, GH_TIMEOUT: "2" });
+  assert.equal(r1.code, 0, r1.out);
+  assert.equal(M.comments.length, 1);
+  assert.match(M.comments[0].body, /could not run \(exit 1\)/);
+  assert.ok(M.comments[0].body.includes("- **Commit:** `" + sha + "`"));
+  M.hangComment = false;
+  const r2 = await tick([], { REVIEW_RUNNER: failing });
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.out, /verdict comment already on the PR/);
+  assert.equal(M.comments.length, 1, "the failure report is not duplicated");
+  assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "error"));
+});
+
+test("AT20 (Codex PR52-r5): a comment list that hits the 30-page cap is indeterminate, so the POST waits", async () => {
+  reset();
+  M.green = true; M.manyComments = true;
+  const sha = "6".repeat(40);
+  M.prs = [{ number: 34, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M34.md" }];
+  fs.writeFileSync(path.join(dir, "watch", `${sha}.msg`), "### Codex review PR34-r1 — **PASS**\n\n- **Commit:** `" + sha + "`\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha}.state`), "success Codex PASS (PR34-r1)\n");
+  fs.writeFileSync(path.join(dir, "watch", `${sha}.comment-tried`), "");
+  const r = await tick();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /cannot check the PR's comments/);
+  assert.equal(M.comments.length, 0, "no POST on a truncated list");
+  assert.equal(fs.existsSync(path.join(dir, "watch", `${sha}.commented`)), false);
 });

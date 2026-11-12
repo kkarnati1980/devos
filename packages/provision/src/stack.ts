@@ -16,7 +16,7 @@ interface EnvBody {
 }
 
 /** `GET /projects/{uuid}/environments` (M0.4 04b): only a 200 with an array of named entries proves absence. */
-async function listEnvironments(cf: CoolifyClient, projectUuid: string): Promise<EnvBody[]> {
+export async function listEnvironments(cf: CoolifyClient, projectUuid: string): Promise<EnvBody[]> {
   if (!UUID_RE.test(projectUuid)) throw new Error("coolify-uuid-invalid");
   const r = await cf.http.get<EnvBody[]>(`/api/v1/projects/${projectUuid}/environments`);
   if (r.status !== 200 || !Array.isArray(r.body)) {

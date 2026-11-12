@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.4.0
+# Version: 1.4.1
+# v1.4.1 (DEVOS-106): a verdict comment whose POST timed out on our side is not posted again if GitHub completed
+# it: before a retry, the PR's comments are read, and one with the same first line and commit counts as posted.
 # v1.4.0 (DEVOS-116): the longest-waiting head is reviewed first. A head's first-green time is stored
 # (<sha>.green) and the tick reviews the candidate with the oldest one (then the lower PR number), instead of
 # the first one in GitHub's newest-first list, so older PRs no longer starve. Still one review per tick.
@@ -126,10 +128,35 @@ comment() {  # pr markdown-file
 #   <sha>.commented, <sha>.statused   publication steps that succeeded (each done exactly once)
 #   <sha>.published          both done; <sha>.done is the v1.0.x equivalent
 published() { [[ -e "$STATE/$1.published" || -e "$STATE/$1.done" ]]; }
+already_commented() {  # pr sha -> 0 posted; 1 not on the PR; 2 cannot read the comments (do not POST this tick)
+  # Only a comment by the watcher's own account counts (REVIEW_BOT_LOGIN, default the repo owner whose token posts),
+  # so another user's copy of the first line can never stand in for the verdict.
+  local pr="$1" sha="$2" head cs
+  head="$(head -n1 "$STATE/$sha.msg")"
+  cs="$(gh_all "/repos/$REPO/issues/$pr/comments?per_page=100" '')" || return 2
+  # Codex PR52-r5: gh_all stops at 30 pages; a list that reached the cap may be truncated, so it proves nothing.
+  (( $(jq 'length' <<<"$cs") < 3000 )) || return 2
+  jq -e --arg h "$head" --arg c "- **Commit:** \`$sha\`" --arg bot "${REVIEW_BOT_LOGIN:-kkarnati1980}" \
+    'any(.[]; ((.user.login // "") == $bot) and ((.body // "") | startswith($h) and contains($c)))' <<<"$cs" >/dev/null && return 0
+  return 1
+}
+
 publish() {  # pr sha -> 0 when comment and final status are both posted (retried on later ticks otherwise)
   local pr="$1" sha="$2" st desc
   [[ -s "$STATE/$sha.msg" && -s "$STATE/$sha.state" ]] || { log "PR #$pr ${sha:0:7}: nothing to publish"; return 1; }
-  if [[ ! -e "$STATE/$sha.commented" ]]; then
+  local seen=1
+  if [[ ! -e "$STATE/$sha.commented" && -e "$STATE/$sha.comment-tried" ]]; then
+    set +e; already_commented "$pr" "$sha"; seen=$?; set -e
+    if [[ $seen -eq 0 ]]; then
+      # DEVOS-106: an earlier POST timed out on our side but GitHub completed it; never post the verdict twice.
+      log "PR #$pr ${sha:0:7}: verdict comment already on the PR (earlier POST completed after its timeout)"
+      touch "$STATE/$sha.commented"
+    elif [[ $seen -eq 2 ]]; then
+      log "PR #$pr ${sha:0:7}: cannot check the PR's comments; comment retry deferred to the next tick"
+    fi
+  fi
+  if [[ ! -e "$STATE/$sha.commented" && $seen -ne 2 ]]; then
+    : > "$STATE/$sha.comment-tried"
     if comment "$pr" "$STATE/$sha.msg"; then touch "$STATE/$sha.commented"; else log "PR #$pr ${sha:0:7}: comment failed; will retry"; fi
   fi
   if [[ ! -e "$STATE/$sha.statused" ]]; then
@@ -251,7 +278,8 @@ review_one() {  # pr sha contract
     log "PR #$pr ${sha:0:7}: $(jq -r .verdict "$VDIR/$sha.json")"
   else
     {
-      printf '### Codex review %s — could not run (exit %s)\n\nNo verdict was stored. Last lines of the runner log:\n\n```\n' "$label" "$rc"
+      # Codex PR52-r2: the commit line makes a runner-failure report recognisable on a retry too (DEVOS-106).
+      printf '### Codex review %s — could not run (exit %s)\n\n- **Commit:** `%s`\n\nNo verdict was stored. Last lines of the runner log:\n\n```\n' "$label" "$rc" "$sha"
       tail -n 15 "$TMP/run.safe"
       printf '```\nIt will not be retried for this commit; push a new commit, or run the installer with RETRY_FAILED=1.\n'
     } > "$STATE/$sha.msg"
