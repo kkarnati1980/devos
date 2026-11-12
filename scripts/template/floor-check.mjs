@@ -24,11 +24,15 @@ const RAW_CLIENT = [
   [/^\s*(import|from)\s+(requests|httpx|urllib3?|aiohttp|http\.client|socket)\b/m, "Python HTTP client"],
   [/\bglobalThis\s*(\.\s*fetch\b|\[)/, "globalThis.fetch"],
   [new RegExp(String.raw`(\bfrom|\bimport|\brequire)${G}\(?${G}["'\`](node:)?(module|child_process|worker_threads)["'\`]`), "module loader / child process (can reach the network indirectly)"],
-  [new RegExp(String.raw`\bimport${G}\(${G}[^"'\`\s)/]`), "dynamic import of a computed module name"],
-  // A template literal with an interpolation is computed too (Codex PR32-r1): import(`node:${name}`).
-  [/\b(import|require)\s*\(\s*`[^`]*\$\{/, "dynamic import of a computed module name"],
-  [new RegExp(String.raw`\brequire${G}\(${G}[^"'\`\s)/]`), "require of a computed module name"],
 ];
+// Codex PR32-r5: every import(…) / require(…) must name ONE plain string literal and nothing else (an
+// expression that starts with a quote, `import("node:" + "http")`, is computed too). Anything else is a finding.
+const LOAD_CALL = new RegExp(String.raw`\b(import|require)${G}\(`, "g");
+const LITERAL_ARG = new RegExp(String.raw`^${G}(?:"[^"\\\n]*"|'[^'\\\n]*'|\`[^\`\\$]*\`)${G}[,)]`);
+function computedLoad(src) {
+  for (const m of src.matchAll(LOAD_CALL)) if (!LITERAL_ARG.test(src.slice(m.index + m[0].length))) return m[1];
+  return null;
+}
 // src/server.mjs may take only the server side of node:http: a default/namespace import or { createServer }.
 const SERVER_HTTP_OK = /^import\s+(\w+|\*\s+as\s+\w+|\{\s*createServer\s*\})\s+from\s+["'](node:)?http["'];?\s*$/;
 const SECRET_SHAPE = /(SECRET|TOKEN|KEY|PASSWORD|PASSWD|PRIVATE|CREDENTIAL)/i;
@@ -75,6 +79,8 @@ export function floorCheck(dir) {
     // F2 is server-side: browser code under public/ talks to its own origin and is covered by F1-4.
     if (posix !== "src/safe-fetch.mjs" && !isTest && !posix.startsWith("public/")) {
       for (const [re, what] of RAW_CLIENT) if (re.test(src)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${what}) outside src/safe-fetch.mjs`);
+      const load = computedLoad(src);
+      if (load) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${load === "import" ? "dynamic import" : "require"} of a computed module name) outside src/safe-fetch.mjs`);
       const serving = posix === "src/server.mjs";
       // Codex PR32-r3: matched on the whole source, not line by line, so an import split over lines
       // (`import { request } from\n"node:https"`) is still found (\s in NET_MODULE spans newlines). src/server.mjs

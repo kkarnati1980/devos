@@ -88,6 +88,11 @@ test("AT3: F2-1 catches aliased, required and socket-level clients anywhere outs
     "src/cl.mjs": 'import { get } from // line comment\n  "node:http";\nget("http://10.0.0.1/");\n',
     "src/cr2.cjs": 'const h = require(/* x */ "node:https");\nmodule.exports = h;\n',
     "src/cf.mjs": 'export const f = (u) => fetch /* x */ (u);\n',
+    // Codex PR32-r5: computed names that start with a quote.
+    "src/cc.mjs": 'const h = await import("node:" + "http");\nh.get("http://169.254.169.254/");\n',
+    "src/cc2.cjs": "const h = require('node:' + 'https');\nmodule.exports = h;\n",
+    "src/cc3.mjs": 'const t = "s"; export const m = await import("node:http" + t);\n',
+    "src/cc4.mjs": 'export const m = await import(`node:http`.concat("s"));\n',
   };
   for (const [f, c] of Object.entries(cases)) write(out, f, c);
   write(out, "public/app.js", 'fetch("/api/items");\n');
@@ -119,6 +124,9 @@ test("AT3: F3-2 counts only limits that limit: -1, 0 and \"0\" are findings; pos
 test("AT1: comments do not hide imports, and URLs inside strings are not comments (Codex PR32-r4)", () => {
   const out = fresh("comments");
   write(out, "src/ok.mjs", 'export const u = "http://example.com/a//b"; // a "quoted" note\n/* import x from "node:https" is only text here */\n');
+  // A plain literal dynamic import or require (with import attributes) is not computed.
+  write(out, "src/lit.mjs", 'export const a = await import("./ok.mjs");\nexport const b = await import(\'./data.json\', { with: { type: "json" } });\n');
+  write(out, "src/data.json", "{}\n");
   assert.deepEqual(floorCheck(out), []);
 });
 
