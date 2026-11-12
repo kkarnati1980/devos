@@ -16,29 +16,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # The gate's own code comes from the base branch, so a PR cannot change the rule that judges it. The
-      # PR head supplies only the workflow files (they define which checks this PR runs).
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: base
-          persist-credentials: false
+      # The workflow and the gate script both come from the PR (pull_request runs the PR's own workflow file), so
+      # changes to them are guarded by the floor guard (DEVOS-141) and Codex review, not by this job. The base
+      # commit's workflow list is read too, so a PR that deletes or narrows a check still has to pass it.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          path: head
-          sparse-checkout: |
-            .github/workflows
-            scripts/ci
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .gate-base
+          sparse-checkout: .github/workflows
           persist-credentials: false
       - uses: pnpm/action-setup@v4
         with:
           version: 9.12.0
       - uses: actions/setup-node@v4
         with:
-          node-version-file: base/.nvmrc
-      - name: Install the gate's one dependency (yaml, pinned by the base lockfile)
-        working-directory: base
+          node-version-file: .nvmrc
+      - name: Install the gate's one dependency (yaml, pinned by the lockfile)
         run: pnpm install --frozen-lockfile --filter . --ignore-scripts
       - name: Wait for every PR check on the head SHA
         timeout-minutes: 28
@@ -46,9 +43,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GATE_SHA: ${{ github.event.pull_request.head.sha }}
           GATE_BASE: ${{ github.event.pull_request.base.ref }}
-          GATE_WORKFLOWS_DIR: ${{ github.workspace }}/head/.github/workflows
-        working-directory: base
-        # Bootstrap only: until main has the gate (the PR that adds it), the head's copy runs.
-        run: |
-          if [ -f scripts/ci/ci-gate.mjs ]; then node scripts/ci/ci-gate.mjs
-          else echo "ci-gate: bootstrap, base has no gate yet; running the head copy"; cp ../head/scripts/ci/ci-gate.mjs scripts/ci-gate-bootstrap.mjs && node scripts/ci-gate-bootstrap.mjs; fi
+          GATE_WORKFLOWS_DIR: .github/workflows
+          GATE_BASE_WORKFLOWS_DIR: .gate-base/.github/workflows
+        run: node scripts/ci/ci-gate.mjs

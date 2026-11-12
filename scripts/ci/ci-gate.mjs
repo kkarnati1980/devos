@@ -4,8 +4,9 @@
 // one of them succeeded. It never passes by default: a failure, cancel, skip, timeout, missing check, or a
 // workflow it cannot reason about (path filters, job `if:`, matrices, reusable workflows) is a fail.
 // Exit codes: 0 pass · 1 a check failed or did not report in time · 2 error (never treated as a pass).
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
 
 export const GATE_WORKFLOW = "ci-gate.yml";
@@ -63,7 +64,19 @@ export function expectedFromWorkflow(file, wf, base) {
   return names;
 }
 
-/** Every check-run name the PR must pass, from the workflow files in `dir` (the gate's own file excluded). */
+/**
+ * Every check-run name the PR must pass: the union of the base commit's and the head's workflows (the gate's
+ * own file excluded). A PR that deletes or narrows a workflow still has to pass the checks main runs today.
+ */
+export function expectedUnion(baseDir, headDir, base) {
+  const head = expectedChecks(headDir, base);
+  if (!baseDir) return head;
+  if (!existsSync(baseDir)) throw new GateError("the base commit's workflow directory is missing");
+  const fromBase = expectedChecks(baseDir, base);
+  return [...head, ...fromBase.filter((n) => !head.includes(n))];
+}
+
+/** Every check-run name the workflows in `dir` produce for a PR into `base` (the gate's own file excluded). */
 export function expectedChecks(dir, base) {
   const files = readdirSync(dir).filter((f) => /\.ya?ml$/.test(f) && f !== GATE_WORKFLOW).sort();
   const all = [];
@@ -96,18 +109,38 @@ export function evaluate(expected, runs) {
   return { state: "success", failed, pending };
 }
 
-async function listRuns(api, repo, sha, token, fetchImpl) {
+/** Only GitHub Actions' own check runs count; another app posting a same-named "success" is ignored. */
+export const ACTIONS_APP_SLUG = "github-actions";
+
+/** One page read; a GET is safe to retry (ADR-0011), so a transient error gets 3 attempts before exit 2. */
+async function readPage(url, token, fetchImpl, pause) {
+  let last = "unknown";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetchImpl(url, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" },
+        signal: AbortSignal.timeout(15_000), // ADR-0011: every outbound call has a timeout
+      });
+      if (res.ok) return await res.json();
+      last = `HTTP ${res.status}`;
+      if (res.status < 500 && res.status !== 429) break;
+    } catch {
+      last = "network error or timeout";
+    }
+    if (attempt < 3) await pause(attempt * 2_000);
+  }
+  throw new GateError(`check-runs read failed: ${last}`);
+}
+
+export async function listRuns(api, repo, sha, token, fetchImpl, pause = (ms) => new Promise((r) => setTimeout(r, ms))) {
   const runs = [];
   for (let page = 1; page <= 10; page++) {
-    const ctl = AbortSignal.timeout(15_000); // ADR-0011: every outbound call has a timeout
-    const res = await fetchImpl(`${api}/repos/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" },
-      signal: ctl,
-    });
-    if (!res.ok) throw new GateError(`check-runs read failed: HTTP ${res.status}`);
-    const body = await res.json();
-    runs.push(...body.check_runs.map((c) => ({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion })));
-    if (runs.length >= body.total_count || body.check_runs.length < 100) return runs;
+    const body = await readPage(`${api}/repos/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`, token, fetchImpl, pause);
+    if (!Array.isArray(body?.check_runs) || typeof body.total_count !== "number") throw new GateError("check-runs read returned an unexpected body");
+    for (const c of body.check_runs) {
+      if (c.app?.slug === ACTIONS_APP_SLUG) runs.push({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion });
+    }
+    if (page * 100 >= body.total_count || body.check_runs.length < 100) return runs;
   }
   throw new GateError("more than 1,000 check runs on one SHA");
 }
@@ -128,7 +161,7 @@ async function main() {
   const { GITHUB_API_URL = "https://api.github.com", GITHUB_REPOSITORY, GATE_SHA, GATE_BASE, GITHUB_TOKEN } = process.env;
   if (!GITHUB_REPOSITORY || !GATE_SHA || !GATE_BASE || !GITHUB_TOKEN) throw new GateError("GITHUB_REPOSITORY, GATE_SHA, GATE_BASE and GITHUB_TOKEN are required");
   if (!/^[0-9a-f]{40}$/.test(GATE_SHA)) throw new GateError("GATE_SHA is not a full commit SHA");
-  const expected = expectedChecks(process.env.GATE_WORKFLOWS_DIR ?? ".github/workflows", GATE_BASE);
+  const expected = expectedUnion(process.env.GATE_BASE_WORKFLOWS_DIR, process.env.GATE_WORKFLOWS_DIR ?? ".github/workflows", GATE_BASE);
   console.log(`ci-gate: ${GATE_SHA} needs ${expected.length} checks: ${expected.join(", ")}`);
   const v = await waitForChecks({
     expected,
@@ -146,7 +179,17 @@ async function main() {
   return 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/** True when this file is the script node was asked to run (symlinks, spaces and % resolved), so it never exits 0 unrun. */
+export function isEntry(argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  try {
+    return pathToFileURL(realpathSync(argv1)).href === pathToFileURL(realpathSync(new URL(import.meta.url))).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isEntry()) {
   main().then(
     (code) => process.exit(code),
     (e) => {

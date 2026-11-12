@@ -1,11 +1,11 @@
 // CI-T-b (DEVOS-152): ci-gate acceptance tests AT1–AT5 (docs/modules/CI-T-b.md).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { evaluate, expectedChecks, expectedFromWorkflow, GateError, waitForChecks } from "../ci/ci-gate.mjs";
+import { evaluate, expectedChecks, expectedFromWorkflow, expectedUnion, GateError, listRuns, waitForChecks } from "../ci/ci-gate.mjs";
 
 const run = (id, name, status, conclusion) => ({ id, name, status, conclusion });
 const wf = (pr, jobs = { a: { "runs-on": "x" } }) => ({ on: { pull_request: pr }, jobs });
@@ -72,8 +72,8 @@ test("AT5: the gate never expects itself; push-only and other-branch workflows a
 
 test("the repo's own workflows parse: every PR job is expected, and the gate is not", () => {
   const names = expectedChecks(".github/workflows", "main");
-  assert.ok(names.length >= 14, `got ${names.length}`);
-  for (const n of ["build", "db", "api-db", "dashboard-e2e", "compose-smoke", "secret-scan", "security-selftest"]) assert.ok(names.includes(n), n);
+  // Exact list: adding or renaming a PR check must update this test (and the ruleset notes) on purpose.
+  assert.deepEqual([...names].sort(), ["api-db", "build", "compose-smoke", "dashboard-e2e", "db", "licence-check", "linear-sync-db", "policy-db", "provision-db", "run-engine-db", "secret-scan", "security-selftest", "teardown-db", "vuln-scan"]);
   assert.ok(!names.includes("ci-gate"));
 });
 
@@ -91,4 +91,51 @@ test("CLI: missing inputs or a bad workflow exit 2, never 0", () => {
   mkdirSync(join(dir, "wf"));
   writeFileSync(join(dir, "wf", "a.yml"), "on:\n  pull_request:\n    paths: [x]\njobs:\n  a:\n    runs-on: x\n");
   assert.equal(exit({ GITHUB_REPOSITORY: "o/r", GATE_SHA: "a".repeat(40), GATE_BASE: "main", GITHUB_TOKEN: "t", GATE_WORKFLOWS_DIR: join(dir, "wf") }), 2);
+});
+
+test("AT7: a PR that deletes or narrows a workflow still has to pass main's checks (base ∪ head)", () => {
+  const base = mkdtempSync(join(tmpdir(), "ci-gate-base-"));
+  const head = mkdtempSync(join(tmpdir(), "ci-gate-head-"));
+  writeFileSync(join(base, "sec.yml"), "on: pull_request\njobs:\n  secret-scan:\n    runs-on: x\n");
+  writeFileSync(join(base, "ci.yml"), "on: pull_request\njobs:\n  build:\n    runs-on: x\n");
+  writeFileSync(join(head, "ci.yml"), "on: pull_request\njobs:\n  build:\n    runs-on: x\n  extra:\n    runs-on: x\n");
+  writeFileSync(join(head, "sec.yml"), "on:\n  pull_request:\n    branches: [release]\njobs:\n  secret-scan:\n    runs-on: x\n");
+  assert.deepEqual(expectedUnion(base, head, "main"), ["build", "extra", "secret-scan"]);
+  assert.throws(() => expectedUnion(join(base, "missing"), head, "main"), GateError);
+});
+
+test("AT8: check runs are read page by page, only from GitHub Actions, with bounded retries that fail closed", async () => {
+  const mk = (id, name, slug = "github-actions") => ({ id, name, status: "completed", conclusion: "success", app: { slug } });
+  const pages = { 1: Array.from({ length: 100 }, (_, i) => mk(i + 1, `j${i}`)), 2: [mk(101, "last"), mk(102, "secret-scan", "evil-app")] };
+  const urls = [];
+  const ok = async (url) => { urls.push(url); const p = Number(new URL(url).searchParams.get("page")); return { ok: true, status: 200, json: async () => ({ total_count: 102, check_runs: pages[p] }) }; };
+  const runs = await listRuns("https://api.example", "o/r", "a".repeat(40), "t", ok, async () => {});
+  assert.equal(runs.length, 101, "the other app's run is ignored");
+  assert.ok(!runs.some((r) => r.name === "secret-scan"));
+  assert.equal(urls.length, 2);
+  let calls = 0;
+  const flaky = async () => (++calls < 3 ? { ok: false, status: 502 } : { ok: true, status: 200, json: async () => ({ total_count: 1, check_runs: [mk(1, "a")] }) });
+  assert.equal((await listRuns("https://api.example", "o/r", "s", "t", flaky, async () => {})).length, 1);
+  calls = 0;
+  const down = async () => { calls++; throw new Error("reset"); };
+  await assert.rejects(listRuns("https://api.example", "o/r", "s", "t", down, async () => {}), GateError);
+  assert.equal(calls, 3, "three attempts, then exit 2");
+  calls = 0;
+  const denied = async () => { calls++; return { ok: false, status: 403 }; };
+  await assert.rejects(listRuns("https://api.example", "o/r", "s", "t", denied, async () => {}), /HTTP 403/);
+  assert.equal(calls, 1, "a 4xx is not retried");
+});
+
+test("AT9: run through a symlinked path with a space, the CLI still runs main() and exits 2 on missing inputs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ci gate %20 "));
+  cpSync("scripts/ci/ci-gate.mjs", join(dir, "real.mjs"));
+  symlinkSync(join(process.cwd(), "node_modules"), join(dir, "node_modules"));
+  symlinkSync(join(dir, "real.mjs"), join(dir, "link.mjs"));
+  let status = 0;
+  try {
+    execFileSync(process.execPath, [join(dir, "link.mjs")], { env: { PATH: process.env.PATH }, stdio: "pipe" });
+  } catch (e) {
+    status = e.status;
+  }
+  assert.equal(status, 2);
 });
