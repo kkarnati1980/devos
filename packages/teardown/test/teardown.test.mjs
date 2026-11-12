@@ -318,6 +318,29 @@ test("Codex PR48-r1: an inconclusive lookup (204, empty 200, JSON null, wrong sh
   }
 });
 
+test("Codex PR48-r4: a malformed repo or project entry makes the scan inconclusive, never clean", async () => {
+  const bad = [
+    { gh: [{ full_name: "kkarnati1980/devos-acme", description: null }] },          // no name
+    { gh: [{ full_name: "kkarnati1980/devos-acme", name: "other", description: null }] }, // name ≠ full_name
+    { gh: [{ full_name: "kkarnati1980/devos-acme", name: "devos-acme", description: 7 }] },
+    { cf: [{ uuid: "cf1", name: "x", description: { marker: true } }] },
+    // Codex PR48-r5: an omitted description (a different name, so only the marker could match) is inconclusive.
+    { gh: [{ full_name: "kkarnati1980/other", name: "other" }] },
+    { cf: [{ uuid: "cf2", name: "other" }] },
+  ];
+  for (const b of bad) {
+    const s = setup();
+    await provision(s);
+    await archiveProject(P.id, { ...s.base, authorize: allowAll });
+    if (b.gh) s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(b.gh) } });
+    if (b.cf) s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/api/v1/projects", action: { raw: true, status: 200, body: JSON.stringify(b.cf) } });
+    const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners });
+    assert.equal(out.purged, false, JSON.stringify(b));
+    assert.equal(out.report.errors.length, 1);
+    assert.equal((await s.store.project(P.id)).stage, "archived");
+  }
+});
+
 test("M2.5-a2: the GitHub token-scope preflight stops a purge when the token cannot see every owned repo", async () => {
   const s = setup();
   await provision(s);
