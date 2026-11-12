@@ -348,13 +348,13 @@ test("M2.5-a2: the GitHub token-scope preflight stops a purge when the token can
   // GET /user says the account owns 3 repos; the token lists only 1.
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 1, owned_private_repos: 2 }) } });
   await assert.rejects(
-    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] }),
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })] }),
     (e) => e instanceof TeardownError && e.code === "provider_forbidden" && /sees 1 of 3/.test(e.message),
   );
   assert.equal(s.fake.deletes().length, 0);
   // A token that sees them all passes.
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 1 }) } });
-  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] });
+  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })] });
   assert.equal(out.purged, true);
 });
 
@@ -366,17 +366,17 @@ test("M2.5-a2 pre-review: the preflight reads every page, refuses missing counts
   let resets = 0; const orig = s.store.resetSteps.bind(s.store); s.store.resetSteps = async (id) => { resets++; return orig(id); };
   // Counts missing → refused, nothing reset or deleted.
   s.fake.faults.push(user({ login: "kkarnati1980" }));
-  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] }), (e) => e.code === "provider_forbidden");
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })] }), (e) => e.code === "provider_forbidden");
   assert.equal(resets, 0); assert.equal(s.fake.deletes().length, 0);
   // A 503 on GET /user (after the transport's retries) → retryable provider_error.
   for (let i = 0; i < 3; i++) s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { status: 503 } });
-  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] }), (e) => e.code === "provider_error" && e.retryable === true);
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })] }), (e) => e.code === "provider_error" && e.retryable === true);
   // 150 owned repos over two pages: both pages are read and the counts match.
   const many = Array.from({ length: 150 }, (_, i) => ({ id: 1000 + i, name: `r${i}`, full_name: `kkarnati1980/r${i}`, private: true, description: null }));
   s.fake.faults.push(user({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 150 }));
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(many.slice(0, 100)) } });
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(many.slice(100)) } });
-  await githubTokenScopeCheck(s.gh)();
+  await githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })();
   assert.ok(s.fake.faults.every((f) => f.used));
 });
 
@@ -392,8 +392,24 @@ test("M2.5-a2 pre-review: a purge built on pinnedGitHub keeps the preflight's to
   const scanners = [githubScanner(pinned), coolifyScanner(s.cf), inventoryScanner(s.store)];
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 1 }) } });
   const before = s.fake.calls.length;
-  const out = await purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners, preflight: [githubTokenScopeCheck(pinned)] });
+  const out = await purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners, preflight: [githubTokenScopeCheck(pinned, { owner: "kkarnati1980" })] });
   assert.equal(out.purged, true);
   const ghCalls = s.fake.calls.slice(before).filter((c) => c.path.startsWith("/repos/") || c.path.startsWith("/user"));
   assert.ok(ghCalls.length > 0 && ghCalls.every((c) => c.auth === `Bearer ${TOKEN}`), "every GitHub call used the pinned token");
+});
+
+test("Codex PR55-r1: a token for another GitHub account fails the preflight, even with matching counts", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  let resets = 0; const orig = s.store.resetSteps.bind(s.store); s.store.resetSteps = async (id) => { resets++; return orig(id); };
+  // The vault now holds a token for "someone-else", whose own counts and listing agree (1 repo).
+  s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "someone-else", public_repos: 0, owned_private_repos: 1 }) } });
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })] }),
+    (e) => e instanceof TeardownError && e.code === "provider_forbidden" && /another account/.test(e.message),
+  );
+  assert.equal(resets, 0, "nothing reset");
+  assert.equal(s.fake.deletes().length, 0, "nothing deleted");
+  assert.throws(() => githubTokenScopeCheck(s.gh, {}), /github-owner-invalid/);
 });
