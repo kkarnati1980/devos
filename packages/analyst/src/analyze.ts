@@ -11,6 +11,10 @@ export interface Requirement {
   assigned: boolean;
   /** Index of the source block (no invented requirements). */
   source: number;
+  /** M2.2-b: proposed by the model pass from the cited source block (validated, never invented). */
+  proposed?: boolean;
+  /** M2.2-b: the acceptance criteria were proposed by the model pass from the source block. */
+  modelCriteria?: boolean;
 }
 
 export interface Milestone {
@@ -56,6 +60,8 @@ export interface Analysis {
   openQuestions: OpenQuestion[];
   outOfScope: OutOfScopeItem[];
   warnings: AnalysisWarning[];
+  /** M2.2-b: indices of blocks taken as acceptance criteria (also of rejected duplicate/`Won't` items), sorted. */
+  criteriaBlocks?: number[];
 }
 
 export interface AnalyzeOptions {
@@ -73,7 +79,7 @@ const ACCEPTANCE_HEADERS = new Set(["acceptance", "acceptance criteria", "done w
 const MILESTONE_HEADERS = new Set(["milestone", "phase", "release"]);
 
 // A milestone heading names a number or a name: "Phase 1", "Release 2.0", "Milestone: MVP", "Stage IV", "Phase one".
-const MILESTONE_HEADING =
+export const MILESTONE_HEADING =
   /^(phase|milestone|stage|release|sprint|iteration)\s*(?:\d|[ivx]+\b|(?:one|two|three|four|five|six|seven|eight|nine|ten)\b|(?:[:–—]|\s-)\s*\S)/i;
 const ACCEPTANCE_PARA = /^(acceptance( criteria)?\s*:|ac\s*:|done when\s*:|given\b|when\b|then\b)/i;
 // A hyphen separates only when followed by a space, so FR-1-2 is not FR-1 titled "2".
@@ -285,7 +291,9 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     key, title: "", priority: "must", acceptance: [], milestone: null, assigned: false, source,
   });
   // An unresolved criterion (TBD/TBC or a trailing "?") is an open question, not a criterion (PR53-r1).
+  const criteriaBlocks = new Set<number>();
   const addCriterion = (req: Requirement, text: string, source: number) => {
+    criteriaBlocks.add(source);
     // A rejected duplicate's sink shares the kept requirement's key; its questions own nothing (pre-review).
     if (isQuestionText(text)) stated.push(byKey.get(req.key) === req ? { text, source, owner: req.key } : { text, source });
     else req.acceptance.push(text);
@@ -442,5 +450,5 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   }
   if (requirements.length === 0) warnings.push({ code: "no-requirements" });
 
-  return { requirements, milestones, stack, openQuestions, outOfScope, warnings };
+  return { requirements, milestones, stack, openQuestions, outOfScope, warnings, criteriaBlocks: [...criteriaBlocks].sort((x, y) => x - y) };
 }

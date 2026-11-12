@@ -13,6 +13,18 @@ export {
 } from "./analyze.js";
 export { renderRequirementsMd, type RenderMeta } from "./render.js";
 export {
+  assistAnalysis,
+  assistCandidates,
+  buildAssistPrompt,
+  grounding,
+  type AssistOptions,
+  type AssistRejectReason,
+  type AssistResult,
+  type AssistWarning,
+  type AssistWarningCode,
+  type ModelRunner,
+} from "./assist.js";
+export {
   classifyQuestion,
   planQuestions,
   questionFingerprint,
@@ -30,3 +42,25 @@ export {
   type RouteResult,
   type TechnicalEntry,
 } from "./route.js";
+export {
+  PASTE_MAX_CHARS,
+  PipelineError,
+  REPO_PATH,
+  RequirementsPipeline,
+  ingestStatus,
+  requirementsCard,
+  type DocRow,
+  type DocStatus,
+  type PipelinePorts,
+  type PipelineWarningCode,
+  type ProjectRow,
+  type RequirementRowInput,
+  type RequirementsCard,
+  type RequirementsStore,
+  type SaveAnalysisInput,
+  type SaveAnalysisResult,
+  type SpecInput,
+  type SpecSourceFormat,
+  type SubmitResult,
+} from "./pipeline.js";
+export { MemoryRequirementsStore, type MemoryRequirement, type MemorySpec } from "./memory-store.js";

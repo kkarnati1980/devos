@@ -348,3 +348,24 @@ test("Codex PR41-r1: a gate name changed between validation and close does not c
   await assert.rejects(new GateEngine({ store, policy: p2 }).closeMilestone({ id: "kk:kk@example.com", type: "kk" }, M, A), (e) => e.code === "gate-evidence-missing");
   assert.equal(store.milestones.get(M).closedAt, null);
 });
+
+test("DEVOS-104 item 1: a require_approval decision with no resource is refused card-needs-resource; nothing changes", async () => {
+  const { approvals, store } = setup();
+  const d = { enforcedOutcome: "require_approval", reason: "rule r1" };
+  for (const resource of ["", "   ", undefined]) {
+    await assert.rejects(approvals.cardForDecision(d, { action: "deploy.preview", resource, projectId: PROJECT, taskId: T1 }), (e) => e instanceof ApprovalError && e.code === "card-needs-resource");
+  }
+  assert.equal(store.cards.size, 0);
+  assert.equal(store.tasks.get(T1).status, "ready");
+});
+
+test("DEVOS-104 item 2: expiry takes effect at the sweep; until then a pending card can still be decided", async () => {
+  const { approvals, store, session, advance } = setup({ rules: [approvalRule] });
+  const c = await approvals.raiseCard(card(), [T1]);
+  advance(7 * 24 * 3600 * 1000 + 1);
+  const { card: decided } = await approvals.approve(session, c.id);
+  assert.equal(decided.status, "approved");
+  assert.deepEqual(await approvals.expireCards(), []);
+  assert.equal(store.tasks.get(T1).status, "ready");
+});
+
