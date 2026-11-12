@@ -71,7 +71,7 @@ export function validateContract(text, file = "contract") {
         fences.get(items.length - 1).at(-1).push(l); continue;
       }
       if (!l.trim()) { open = false; continue; }
-      if (/^\s*([-*]|\d+\.)\s+/.test(l)) { items.push(l.replace(/^\s*([-*]|\d+\.)\s+/, "")); open = true; }
+      if (/^\s*([-*+]|\d+[.)])\s+/.test(l)) { items.push(l.replace(/^\s*([-*+]|\d+[.)])\s+/, "")); open = true; }
       else if (open && /^\s+\S/.test(l)) items[items.length - 1] += " " + l.trim();
       else { items.push(l.trim()); open = true; }
     }

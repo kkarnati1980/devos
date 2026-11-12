@@ -84,6 +84,13 @@ test("the contract template and the backfilled current-phase Lane A contracts pa
   }
 });
 
+test("PR71-r5: '+' bullets and '1)' items are bullets of their own, so each needs its own anchor", () => {
+  for (const bad of ["## Pass rule\n- AT1 passes\n  + works as expected\n", "## Pass rule\n1) AT1 passes\n2) works as expected\n", "## Pass rule\n+ works as expected\n"]) {
+    assert.equal(validateContract(c(bad)).ok, false, bad);
+  }
+  assert.deepEqual(validateContract(c("## Pass rule\n+ AT1 passes\n1) `pnpm test` exits 0\n")).errors, []);
+});
+
 test("PR71-r4: a ``` line inside a ```` fence does not close it, so a pass rule shown in an example block does not count", () => {
   const r = validateContract("# M9\n````markdown\n```markdown\n## Pass rule\n- AT1 passes\n```\n````\n");
   assert.equal(r.ok, false);
