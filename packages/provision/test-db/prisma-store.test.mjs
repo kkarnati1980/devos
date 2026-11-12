@@ -127,7 +127,8 @@ test("AT10 on Postgres: a port another project takes between our read and our in
     if (first) { first = false; await new PrismaStore(db, { databaseUrl: url }).recordResource(q.id, { provider: "coolify", kind: "port", externalId: String(from), name: `${q.slug}/preview` }); }
     return r;
   };
-  const got = await portStep(store, p, "preview", range).create();
+  // Steps create under the project lock (Codex PR50-r1 re-checks it before every insert), as the runner does.
+  const got = await store.withProjectLock(p.id, () => portStep(store, p, "preview", range).create());
   assert.equal(got.externalId, String(from + 2));
   const row = await db.resource.findFirst({ where: { provider: "coolify", kind: "port", externalId: String(from) } });
   assert.equal(row.projectId, q.id);
