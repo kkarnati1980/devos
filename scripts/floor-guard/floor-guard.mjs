@@ -203,6 +203,11 @@ function numbers(lines, rx) {
   return out;
 }
 
+/** `"key": v` / `'key': v` → `key: v`, keeping the indentation and any `- ` list marker (PR70-r18). */
+function unquoteKey(text) {
+  return text.replace(/^(\s*(?:-\s*)?)(["'])([\w.-]+)\2(\s*:)/, "$1$3$4");
+}
+
 /** True when an `if:` value is constant-false, quoted or not, bare or in ${{ }} (PR70-r12, PR70-r13). */
 function constFalseIf(text) {
   const m = /^\s*(?:-\s*)?if\s*:\s*(.*?)\s*(?:#.*)?$/.exec(text);
@@ -289,10 +294,18 @@ export function analyse(files, show) {
     if (test) {
       const removedTrim = new Set(f.removed.map((r) => r.text.trim()));
       let headLines = null;
+      const addedLn = new Set(f.added.map((a) => a.ln));
       f.added.forEach((a, i) => {
         if (RX.skip.some((r) => r.test(a.text))) hit("test-skipped", p, a.ln, a.text);
         // an added early return right under an env/platform/skip condition, whether that condition is added or
         // already there (PR70-r6): the line above it is read from the head copy of the file
+        // an added env/platform/CI/skip condition directly above a return that is already there (PR70-r18)
+        else if (RX.envIf.test(a.text)) {
+          headLines ??= (show("head", p) ?? "").split("\n");
+          let j = a.ln;
+          while (j < headLines.length && !headLines[j].trim()) j++;
+          if (j < headLines.length && /^\s*return\b/.test(headLines[j]) && !addedLn.has(j + 1)) hit("test-skipped", p, a.ln, `${a.text.trim()} ${headLines[j].trim()}`);
+        }
         else if (/^\s*return\b/.test(a.text)) {
           headLines ??= (show("head", p) ?? "").split("\n");
           let j = a.ln - 2;
@@ -315,9 +328,11 @@ export function analyse(files, show) {
 
     if (WORKFLOW.test(p)) {
       for (const a of f.added) {
-        if (/continue-on-error\s*:\s*(true|\$\{\{)/.test(a.text)) hit("ci-continue-on-error", p, a.ln, a.text);
+        // a quoted key (`"continue-on-error":`, `'if':`) is the same key (PR70-r18)
+        const t = unquoteKey(a.text);
+        if (/continue-on-error\s*:\s*(["']\s*)?(true|\$\{\{)/.test(t)) hit("ci-continue-on-error", p, a.ln, a.text);
         // a trailing YAML comment is still `if: false` (PR70-r12); job-level and step-level alike
-        if (constFalseIf(a.text)) hit("ci-disabled", p, a.ln, a.text);
+        if (constFalseIf(t)) hit("ci-disabled", p, a.ln, a.text);
       }
       const before = f.status === "A" ? null : show("base", f.oldPath), after = show("head", p);
       if (after == null || (before == null && f.status !== "A")) throw new GuardError(`cannot read workflow ${p} at base/head`);

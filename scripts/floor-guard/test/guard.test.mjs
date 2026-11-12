@@ -65,6 +65,11 @@ const VIOLATIONS = [
   ["ci-disabled (step if: ${{ false }} # comment)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: ${{ false }}  # later\n")) }],
   // PR70-r13: quoted constant-false values, job-level and step-level
   ["ci-disabled (job-level if: '${{ false }}')", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: '${{ false }}'\n") }],
+  // PR70-r18: quoted keys and quoted values are the same YAML; an env condition added above an existing return
+  ["ci-continue-on-error (quoted key)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, '    "continue-on-error": true\n') }],
+  ["ci-continue-on-error (quoted ${{ true }})", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    continue-on-error: '${{ true }}'\n") }],
+  ["ci-disabled (quoted if key)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, '    "if": false\n') }],
+  ["test-skipped (CI condition added above an existing return)", { [T]: testSrc("if (result === null) {\nreturn;\n}\nexpect(1).toBe(1);") }, { [T]: testSrc("if (process.env.CI) {\nreturn;\n}\nexpect(1).toBe(1);") }],
   ["ci-disabled (step if: \"false\")", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: \"false\"\n")) }],
   ["ci-disabled (if: ${{ false && github.event_name == 'push' }})", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: ${{ false && github.event_name == 'push' }}\n") }],
   // PR70-r14: precedence — every || operand false, or a false && term inside a parenthesised operand
