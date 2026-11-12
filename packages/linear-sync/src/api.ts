@@ -31,9 +31,12 @@ export function graphqlApi(client: LinearClient): LinearApi {
         const l: { issueLabels: Conn<{ id: string; name: string; team: { id: string } | null }> } = await client.query(
           `query($after: String) { issueLabels(first: ${PAGE}, after: $after) { nodes { id name team { id } } pageInfo { hasNextPage endCursor } } }`, { after });
         labels.push(...l.issueLabels.nodes.filter((x) => !x.team || x.team.id === t.id).map(({ id, name }) => ({ id, name })));
-        if (!l.issueLabels.pageInfo?.hasNextPage) break;
+        if (!l.issueLabels.pageInfo?.hasNextPage) { after = null; break; }
+        if (!l.issueLabels.pageInfo.endCursor) throw new LinearError("bad-response", "Linear label page without a cursor");
         after = l.issueLabels.pageInfo.endCursor;
       }
+      // Codex PR35-r4: a label list cut off by the page limit would make the sync create a duplicate label.
+      if (after !== null) throw new LinearError("bad-response", "too many issue labels in this Linear workspace");
       // Several states can share a type (e.g. In Progress and In Review are both "started"): the lowest position wins.
       const states = [...t.states.nodes].sort((a, b) => a.position - b.position).map(({ id, type }) => ({ id, type }));
       return { id: t.id, states, labels };
@@ -52,9 +55,12 @@ export function graphqlApi(client: LinearClient): LinearApi {
         const hit = d.team.projects.nodes.find((x) => readMarker(x.description, "project") === devosProjectId);
         if (hit) return hit;
         if (!d.team.projects.pageInfo?.hasNextPage) return null;
+        if (!d.team.projects.pageInfo.endCursor) throw new LinearError("bad-response", "Linear project page without a cursor");
         after = d.team.projects.pageInfo.endCursor;
       }
-      return null;
+      // Codex PR35-r4: "not found" only after the last page. An exhausted search fails closed (as milestones()
+      // does), so a marker beyond the limit is never taken as absent and a second project is never created (AT3).
+      throw new LinearError("bad-response", "too many projects in this Linear team to search for the marker");
     },
     async createProject({ teamId, name, description }) {
       const d = await client.mutate<{ projectCreate: { success: boolean; project: { id: string } } }>(
@@ -114,6 +120,7 @@ export function graphqlApi(client: LinearClient): LinearApi {
             blockedBy: n.inverseRelations.nodes.filter((r) => r.type === "blocks").map((r) => r.issue.id) });
         }
         if (!d.project.issues.pageInfo?.hasNextPage) return out;
+        if (!d.project.issues.pageInfo.endCursor) throw new LinearError("bad-response", "Linear issue page without a cursor");
         after = d.project.issues.pageInfo.endCursor;
       }
       throw new LinearError("bad-response", "too many issues in one Linear project");

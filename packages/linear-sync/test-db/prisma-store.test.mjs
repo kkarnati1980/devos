@@ -76,3 +76,23 @@ test("Codex PR35-r1: a sync whose lock is about to expire makes no Linear write"
   }, timeout, () => t), /linear-sync-lock-expiring/);
   assert.equal(L.projects.length, 0);
 });
+
+test("Codex PR35-r4: an id write blocked by a row lock gives up within the bounded time instead of waiting past the sync lock", async () => {
+  const pid = await seed();
+  const mod = await db.module.findFirst({ where: { projectId: pid }, select: { id: true } });
+  let release; const held = new Promise((r) => { release = r; });
+  let locked; const isLocked = new Promise((r) => { locked = r; });
+  const holder = db.$transaction(async (tx) => {
+    await tx.$queryRawUnsafe(`SELECT id FROM module WHERE id = $1::uuid FOR UPDATE`, mod.id);
+    locked(); await held;
+  }, { timeout: 60_000, maxWait: 10_000 });
+  await isLocked;
+  const store = new PrismaSyncStore(db, pid);
+  const t0 = Date.now();
+  await assert.rejects(store.setModuleIssue(mod.id, "issue-x"));
+  const took = Date.now() - t0;
+  release(); await holder;
+  assert.ok(took < 20_000, `gave up after ${took} ms`);
+  const row = await db.module.findUnique({ where: { id: mod.id }, select: { linearIssue: true } });
+  assert.equal(row.linearIssue, null, "the blocked write never committed");
+});

@@ -12,8 +12,29 @@ export interface PrismaLike {
 
 const RES = (kind: "project" | "milestone") => ({ provider: "linear", kind });
 
+/**
+ * Codex PR35-r4 (ADR-0011 timeouts, fencing): every store operation runs in its own short transaction with a
+ * statement and lock timeout, so a write that passed the guard either commits or rolls back within
+ * STORE_WAIT_MS + STORE_OP_MS, well inside WRITE_MARGIN_MS. It can never be left waiting on a row lock until
+ * after the sync lock has expired and a later sync has taken it.
+ */
+export const STORE_OP_MS = 15_000;
+export const STORE_WAIT_MS = 5_000;
+const STATEMENT_MS = 10_000;
+export async function bounded<T>(db: PrismaLike, fn: (tx: any) => Promise<T>): Promise<T> {
+  return db.$transaction(async (tx: any) => {
+    await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${STATEMENT_MS}`);
+    await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = ${STATEMENT_MS}`);
+    return fn(tx);
+  }, { timeout: STORE_OP_MS, maxWait: STORE_WAIT_MS });
+}
+
 /** Read the plan of one project, with the Linear ids already known. */
-export async function loadPlan(db: PrismaLike, projectId: string): Promise<DevosPlan> {
+export async function loadPlan(client: PrismaLike, projectId: string): Promise<DevosPlan> {
+  return bounded(client, (db) => readPlan(db, projectId));
+}
+
+async function readPlan(db: any, projectId: string): Promise<DevosPlan> {
   const p = await db.project.findUnique({ where: { id: projectId }, select: { id: true, name: true } });
   if (!p) throw new Error("linear-sync: project not found");
   const [milestones, modules, tasks, resources] = await Promise.all([
@@ -38,23 +59,25 @@ export async function loadPlan(db: PrismaLike, projectId: string): Promise<Devos
 export class PrismaSyncStore implements SyncStore {
   constructor(private readonly db: PrismaLike, private readonly projectId: string) {}
 
-  private async upsertResource(kind: "project" | "milestone", name: string, externalId: string) {
-    const existing = await this.db.resource.findFirst({ where: { projectId: this.projectId, ...RES(kind), name, status: "active" }, select: { id: true, externalId: true } });
-    if (existing?.externalId === externalId) return;
-    // The same Linear object may have a soft-deleted row (resource is unique on provider + kind + external id): reuse it.
-    const prior = await this.db.resource.findFirst({ where: { ...RES(kind), externalId }, select: { id: true, projectId: true } });
-    if (prior && prior.projectId === this.projectId) {
-      if (existing) await this.db.resource.update({ where: { id: existing.id }, data: { status: "deleted", deletedAt: new Date() } });
-      await this.db.resource.update({ where: { id: prior.id }, data: { status: "active", deletedAt: null, name } });
-      return;
-    }
-    if (existing) await this.db.resource.update({ where: { id: existing.id }, data: { externalId } });
-    else await this.db.resource.create({ data: { projectId: this.projectId, ...RES(kind), name, externalId } });
+  private upsertResource(kind: "project" | "milestone", name: string, externalId: string) {
+    return bounded(this.db, async (tx) => {
+      const existing = await tx.resource.findFirst({ where: { projectId: this.projectId, ...RES(kind), name, status: "active" }, select: { id: true, externalId: true } });
+      if (existing?.externalId === externalId) return;
+      // The same Linear object may have a soft-deleted row (resource is unique on provider + kind + external id): reuse it.
+      const prior = await tx.resource.findFirst({ where: { ...RES(kind), externalId }, select: { id: true, projectId: true } });
+      if (prior && prior.projectId === this.projectId) {
+        if (existing) await tx.resource.update({ where: { id: existing.id }, data: { status: "deleted", deletedAt: new Date() } });
+        await tx.resource.update({ where: { id: prior.id }, data: { status: "active", deletedAt: null, name } });
+        return;
+      }
+      if (existing) await tx.resource.update({ where: { id: existing.id }, data: { externalId } });
+      else await tx.resource.create({ data: { projectId: this.projectId, ...RES(kind), name, externalId } });
+    });
   }
   setProjectId(projectId: string, linearProjectId: string) { return this.upsertResource("project", projectId, linearProjectId); }
   setMilestoneId(milestoneId: string, linearMilestoneId: string) { return this.upsertResource("milestone", milestoneId, linearMilestoneId); }
-  async setModuleIssue(moduleId: string, issueId: string) { await this.db.module.update({ where: { id: moduleId }, data: { linearIssue: issueId } }); }
-  async setTaskIssue(taskId: string, issueId: string) { await this.db.task.update({ where: { id: taskId }, data: { linearIssue: issueId } }); }
+  async setModuleIssue(moduleId: string, issueId: string) { await bounded(this.db, (tx) => tx.module.update({ where: { id: moduleId }, data: { linearIssue: issueId } })); }
+  async setTaskIssue(taskId: string, issueId: string) { await bounded(this.db, (tx) => tx.task.update({ where: { id: taskId }, data: { linearIssue: issueId } })); }
 }
 
 /** Throws when the sync lock can no longer be trusted to outlive the next outbound write (Codex PR35-r1). */
@@ -102,6 +125,7 @@ export async function syncProjectLocked(db: PrismaLike, projectId: string,
                                         run: (plan: DevosPlan, store: SyncStore, guard: LockGuard) => Promise<unknown>,
                                         timeoutMs = 10 * 60_000, now: () => number = Date.now): Promise<{ skipped: boolean }> {
   if (timeoutMs <= WRITE_MARGIN_MS) throw new Error("linear-sync: lock timeout must exceed the write margin");
+  if (STORE_WAIT_MS + STORE_OP_MS >= WRITE_MARGIN_MS) throw new Error("linear-sync: a store write must fit in the write margin");
   return db.$transaction(async (tx: any) => {
     const deadline = now() + timeoutMs;
     const rows = await tx.$queryRawUnsafe(`SELECT pg_try_advisory_xact_lock(hashtext('devos:linear-sync'), hashtext($1)) AS ok`, projectId);
@@ -114,8 +138,9 @@ export async function syncProjectLocked(db: PrismaLike, projectId: string,
         throw new Error("linear-sync-lock-lost");
       }
     };
-    // The transaction only holds the lock. Reads and id writes use the plain client, so each id commits at once
-    // and no module/task row stays locked during the Linear round trips.
+    // The transaction only holds the lock. Reads and id writes use the plain client in their own bounded
+    // transactions, so each id commits at once, no module/task row stays locked during the Linear round trips,
+    // and no id write can outlive the lock (Codex PR35-r4).
     await run(await loadPlan(db, projectId), fencedStore(new PrismaSyncStore(db, projectId), guard), guard);
     return { skipped: false };
   }, { timeout: timeoutMs, maxWait: 10_000 });

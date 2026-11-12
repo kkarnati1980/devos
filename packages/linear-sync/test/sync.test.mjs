@@ -129,3 +129,28 @@ test("Codex PR35-r1: fencedApi checks the lock guard before every Linear write a
   assert.equal(checks, 4, "one check per write; the fourth refused");
   assert.equal(L.writes.length, 3);
 });
+
+test("Codex PR35-r4: every PrismaSyncStore write and the plan read run in a bounded transaction with statement and lock timeouts", async () => {
+  const { PrismaSyncStore, loadPlan, STORE_OP_MS, STORE_WAIT_MS, WRITE_MARGIN_MS } = await import("../dist/index.js");
+  assert.ok(STORE_OP_MS + STORE_WAIT_MS < WRITE_MARGIN_MS, "a store write ends inside the write margin");
+  const seen = []; let inTx = 0;
+  const delegate = (name) => new Proxy({}, { get: (_t, op) => async () => {
+    assert.ok(inTx > 0, `${name}.${String(op)} ran outside a bounded transaction`);
+    if (op === "findUnique") return { id: "p1", name: "P" };
+    if (op === "findMany") return [];
+    return null;
+  } });
+  const tx = { project: delegate("project"), milestone: delegate("milestone"), module: delegate("module"), moduleDependency: delegate("moduleDependency"),
+    task: delegate("task"), resource: delegate("resource"), $executeRawUnsafe: async (q) => { seen.push(q); } };
+  const plain = () => { throw new Error("plain client used directly"); };
+  const db = { project: { findUnique: plain }, milestone: {}, module: { update: plain }, moduleDependency: {}, task: { update: plain }, resource: { findFirst: plain },
+    $transaction: async (fn, opts) => { seen.push(opts); inTx++; try { return await fn(tx); } finally { inTx--; } } };
+  const store = new PrismaSyncStore(db, "p1");
+  await store.setProjectId("p1", "lp1"); await store.setMilestoneId("m1", "lm1"); await store.setModuleIssue("mod1", "i1"); await store.setTaskIssue("t1", "i2");
+  await loadPlan(db, "p1");
+  const opts = seen.filter((x) => typeof x === "object");
+  assert.equal(opts.length, 5);
+  for (const o of opts) assert.deepEqual(o, { timeout: STORE_OP_MS, maxWait: STORE_WAIT_MS });
+  assert.equal(seen.filter((x) => x === "SET LOCAL statement_timeout = 10000").length, 5);
+  assert.equal(seen.filter((x) => x === "SET LOCAL lock_timeout = 10000").length, 5);
+});

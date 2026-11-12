@@ -60,3 +60,25 @@ test("a milestone page that claims more but gives no cursor is refused, not trea
   const { a } = api(() => ({ project: { projectMilestones: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } } }));
   await assert.rejects(a.milestones("p1"), /milestone page without a cursor/);
 });
+
+test("Codex PR35-r4: an exhausted project search fails closed instead of reporting the marker absent", async () => {
+  let n = 0;
+  const { a } = api(() => ({ team: { projects: { nodes: [{ id: `p${n}`, name: "x", description: "no marker" }], pageInfo: { hasNextPage: true, endCursor: `c${++n}` } } } }));
+  await assert.rejects(a.findProject("t1", "devos-1"), /too many projects/);
+  assert.equal(n, 50, "every allowed page was read first");
+});
+
+test("Codex PR35-r4: the project search returns null only after the last page, and refuses a page with no cursor", async () => {
+  const last = api(() => ({ team: { projects: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } }));
+  assert.equal(await last.a.findProject("t1", "devos-1"), null);
+  const nocur = api(() => ({ team: { projects: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } } }));
+  await assert.rejects(nocur.a.findProject("t1", "devos-1"), /project page without a cursor/);
+});
+
+test("Codex PR35-r4: an exhausted label list fails closed (a cut-off list would create a duplicate label)", async () => {
+  let n = 0;
+  const { a } = api((b) => (b.query.includes("teams(")
+    ? { teams: { nodes: [{ id: "t1", states: { nodes: [{ id: "s1", type: "started", position: 1 }] } }] } }
+    : { issueLabels: { nodes: [], pageInfo: { hasNextPage: true, endCursor: `x${++n}` } } }));
+  await assert.rejects(a.team("DEV"), /too many issue labels/);
+});
