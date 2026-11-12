@@ -141,6 +141,11 @@ export class PrismaStore implements ProvisionStore {
     await this.upsertStep(projectId, spec, { status: "failed", lastError }, { status: "failed", lastError });
   }
 
+  async listResources(provider: string, kind: string) {
+    const rows = await bounded(this.db.resource.findMany({ where: { provider, kind }, select: { projectId: true, externalId: true, name: true, status: true } }), this.dbMs, "provision_db") as any[];
+    return rows.map((r) => ({ projectId: r.projectId, externalId: r.externalId, name: r.name, active: r.status === "active" }));
+  }
+
   async recordResource(projectId: string, r: ResourceRecord): Promise<void> {
     const where = { provider_kind_externalId: { provider: r.provider, kind: r.kind, externalId: r.externalId } };
     const q = <T>(p: Promise<T>) => bounded(p, this.dbMs, "provision_db");
