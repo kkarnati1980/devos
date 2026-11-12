@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.1 — Server baseline hardening (Hostinger KVM 4, Ubuntu 24.04 + Coolify)
-# Version: 1.3.1
+# Version: 1.3.2
 # Run as root on the DevOS server, e.g. in Hostinger's browser terminal:
 #     sudo bash 01-server-baseline.sh
 #
@@ -34,6 +34,11 @@
 # - ufw writes its rule files as ASCII and crashed on an em dash in the v1.1/1.2 block
 #   comment; all rule text is ASCII now and non-ASCII is scrubbed from /etc/ufw/*.rules
 #   before any ufw command runs.
+#
+# v1.3.2 (DEVOS-52): the printed laptop check covers IPv4 and IPv6 on 8000, 8080, 6001, 6002,
+#   80 and 443 (contract AT3). Step 2 prints the SSH-tunnel route (AT4) until M0.2 is applied
+#   (tailscale0 up), then says the server is tailnet-only (PR37-r1). Text only;
+#   no firewall change, so a re-run is not needed.
 set -euo pipefail
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -149,12 +154,27 @@ echo "----- end evidence -----"
 cat <<'EOF_NEXT'
 
 NEXT STEPS
-1. From YOUR LAPTOP (not the server), confirm nothing is public — each should time out:
-       for p in 8000 6001 6002 80 443; do curl -sS -m 5 -o /dev/null -w "$p HTTP %{http_code}\n" http://200.234.41.176:$p || echo "$p blocked"; done
-2. Reach the Coolify panel through an SSH tunnel from your laptop (6001/6002 = realtime + terminal):
+1. From YOUR LAPTOP (not the server; a request from the server to itself proves nothing), confirm
+   nothing is public over IPv4 or IPv6 — every port should end in "blocked" (after "HTTP 000"):
+       for h in 200.234.41.176 '[2a02:4780:63:89c2::1]'; do for p in 8000 8080 6001 6002 80 443; do curl -sS -g -m 5 -o /dev/null -w "$h:$p HTTP %{http_code}\n" "http://$h:$p" 2>/dev/null || echo "$h:$p blocked"; done; done
+   If your network has no IPv6, the IPv6 lines fail either way; then the server's
+   ufw6-docker-logging-deny packet counter is the evidence (docs/modules/M0.1.md).
+EOF_NEXT
+if ip link show tailscale0 >/dev/null 2>&1; then
+  cat <<'EOF_NEXT'
+2. M0.2 is applied (tailscale0 is up), so the server is tailnet-only (ADR-0004): open Coolify and
+   DevOS only over Tailscale, never through a public port or an SSH tunnel.
+EOF_NEXT
+else
+  cat <<'EOF_NEXT'
+2. M0.2 (Tailscale) is not applied yet. Reach the Coolify panel through an SSH tunnel from your
+   laptop (6001/6002 = realtime + terminal; contract AT4):
        ssh -L 8000:localhost:8000 -L 6001:localhost:6001 -L 6002:localhost:6002 root@200.234.41.176
    then browse  http://localhost:8000  and create the Coolify admin account.
+   Permanent private access (Tailscale) is set up next in M0.2.
+EOF_NEXT
+fi
+cat <<'EOF_NEXT'
 3. In hPanel, confirm VPS snapshots/backups are enabled for this server.
-4. Send Claude: the evidence block above + the laptop curl output + "snapshots on: yes/no".
-Permanent private access (Tailscale, Google login) is set up next in M0.2.
+4. Send Claude: the evidence block above + the laptop output + "snapshots on: yes/no".
 EOF_NEXT
