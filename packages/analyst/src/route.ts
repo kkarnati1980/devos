@@ -33,6 +33,10 @@ const NON_TECHNICAL = new RegExp(
       "charge", "charges", "charging", "free", "plan", "plans", "tier", "tiers", "revenue", "refund", "refunds",
       "discount", "discounts", "include", "includes", "exclude", "excludes", "phase", "phases", "feature", "features",
       "client", "clients", "staff", "shift", "shifts", "period", "live",
+      // Data deletion is always KK's (ADR-0013 §6, stop-and-ask), even when it names a database (PR57-r1).
+      "delete", "deletes", "deleted", "deleting", "deletion", "remove", "removes", "removal", "erase", "erasure",
+      "purge", "purges", "purging", "wipe", "wipes", "wiping", "drop", "drops", "destroy", "destroys", "truncate",
+      "data", "record", "records", "retention", "retain", "archive", "archives", "backup", "backups", "restore",
     ].join("|") +
     ")\\b",
   "i",
@@ -141,6 +145,9 @@ export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan 
   // Maps keep the plan linear in the number of questions (F3).
   const cardByTarget = new Map<string, QuestionCardDraft>();
   const techByFp = new Map<string, TechnicalEntry>();
+  // Blockers accumulate in Sets and become arrays once at the end: linear even when every row of a table
+  // repeats the same question (PR57-r1, F3).
+  const blockSets = new Map<object, Set<string>>();
   const reqByKey = new Map(analysis.requirements.map((r) => [r.key, r] as const));
   for (const q of analysis.openQuestions) {
     const c = classifyQuestion(q);
@@ -150,10 +157,11 @@ export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan 
       const prev = techByFp.get(fp);
       if (prev) {
         prev.questionIds.push(q.id);
-        prev.blocks = [...new Set([...prev.blocks, ...blocks])];
+        for (const k of blocks) blockSets.get(prev)!.add(k);
       } else {
         const entry: TechnicalEntry = { questionId: q.id, questionIds: [q.id], text: q.text, source: q.source, blocks, reason: c.reason };
         technical.push(entry);
+        blockSets.set(entry, new Set(blocks));
         techByFp.set(fp, entry);
       }
       continue;
@@ -164,7 +172,7 @@ export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan 
     const prev = cardByTarget.get(target);
     if (prev) {
       prev.questionIds.push(q.id);
-      prev.blocks = [...new Set([...prev.blocks, ...blocks])];
+      for (const k of blocks) blockSets.get(prev)!.add(k);
       continue;
     }
     const action = key ? `Confirm acceptance criteria for ${key}` : "Answer an open question in the spec";
@@ -189,8 +197,10 @@ export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan 
       reason: c.reason,
     };
     cards.push(draft);
+    blockSets.set(draft, new Set(blocks));
     cardByTarget.set(target, draft);
   }
+  for (const x of [...cards, ...technical]) x.blocks = [...blockSets.get(x)!];
   return { cards, technical };
 }
 

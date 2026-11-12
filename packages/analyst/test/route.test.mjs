@@ -63,6 +63,10 @@ test("RT1 classification: non-technical topics win over technical ones; unclear 
     "Do we need a test period with the client before go-live?",
     "Can a worker see other workers' shifts?",
     "How long should a coaching session last?",
+    // Data deletion is KK's even when a technical word appears (PR57-r1).
+    "Should we delete all database records?",
+    "Can we purge the old Postgres backups?",
+    "Wipe the cache tables on migration?",
   ]) assert.equal(cls(q).class, "non-technical", q);
   // The whole text is classified: a non-technical word after 4,000+ characters still sends it to KK.
   assert.equal(cls("Which database " + "x ".repeat(2500) + "fits the budget?").class, "non-technical");
@@ -219,4 +223,18 @@ test("RT6b the withheld retry runs exactly once and records its own failure code
   assert.equal(n, 2);
   assert.deepEqual(r.failed, [{ questionId: "Q-1", code: "db-down" }]);
   assert.deepEqual(r.raised, []);
+});
+
+test("RT7 (PR57-r1) planning is linear: 20,000 table rows sharing one TBD cell plan in under 2 s", () => {
+  const rows = Array.from({ length: 20000 }, (_, i) => `| FR-${i + 1} | Item ${i + 1} | Format TBD |`).join("\n");
+  const md = `| ID | Requirement | Acceptance |\n|---|---|---|\n${rows}\n`;
+  const blocks = parseSpec(Buffer.from(md, "utf8"), "spec.md").blocks;
+  const a = analyzeSpec(blocks);
+  const t0 = performance.now();
+  const p = planQuestions(a, { specVersion: 1 });
+  const ms = performance.now() - t0;
+  const shared = p.cards.find((c) => c.card.target === `spec-question:${questionFingerprint("Format TBD")}`);
+  assert.equal(shared.blocks.length, 20000);
+  assert.equal(shared.questionIds.length, 20000);
+  assert.ok(ms < 2000, `${ms} ms`);
 });
