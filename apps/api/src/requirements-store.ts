@@ -139,8 +139,10 @@ export class PrismaRequirementsStore implements RequirementsStore {
   }
 
   /**
-   * M2.2-d3c1: projects whose newest doc is a draft linked to a card, oldest draft first, at most `limit` (the sync
-   * job's batch). Read-only; the job applies each decision through `syncApproval`.
+   * M2.2-d3c1: projects whose newest doc is a draft linked to an **approved** card, oldest draft first, at most
+   * `limit` (the sync job's batch). Only approved cards are read, so drafts whose card is pending, rejected or expired
+   * never fill the batch and starve newer projects (pre-review finding 2). Read-only; the job applies each decision
+   * through `syncApproval`.
    */
   draftsAwaitingDecision(limit: number): Promise<string[]> {
     const n = Math.max(1, Math.min(1000, Math.trunc(limit)));
@@ -150,7 +152,8 @@ export class PrismaRequirementsStore implements RequirementsStore {
           SELECT DISTINCT ON (project_id) project_id, status, approval_id, created_at
           FROM requirements_doc ORDER BY project_id, version DESC
         ) d
-        WHERE d.status = 'draft' AND d.approval_id IS NOT NULL
+        JOIN approval a ON a.id = d.approval_id AND a.status = 'approved'
+        WHERE d.status = 'draft'
         ORDER BY d.created_at, d.project_id
         LIMIT ${n}`;
       return rows.map((r) => r.project_id);

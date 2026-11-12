@@ -19,7 +19,7 @@ export function syncIntervalMs(v: string | undefined): number {
   return Math.min(SYNC_MAX_MS, Math.max(SYNC_MIN_MS, Number(s)));
 }
 
-/** The store read the job needs: projects whose newest doc is a draft linked to a card, oldest first. */
+/** The store read the job needs: projects whose newest doc is a draft linked to an approved card, oldest first. */
 export interface DraftLister {
   draftsAwaitingDecision(limit: number): Promise<string[]>;
 }
@@ -98,7 +98,8 @@ export function skipDecidedQuestions(raise: RaiseCard, cards: DecidedCardLister)
   return async (draft, reason) => {
     const c = draft.card as { gate: string; action: string; target: string; projectId?: string | null };
     if (c.projectId) {
-      const prior = await findDecided(cards, c.projectId, c.action, c.target);
+      // A failed lookup must not drop the question (pre-review finding 4): a possible repeat card is the lesser harm.
+      const prior = await findDecided(cards, c.projectId, c.action, c.target).catch(() => null);
       if (prior) return { id: prior };
     }
     return raise(draft, reason);

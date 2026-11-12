@@ -34,7 +34,7 @@ function wire() {
       const out = [];
       for (const p of [P1, P2]) {
         const d = await store.latestDoc(p);
-        if (d && d.status === "draft" && d.approvalId) out.push(p);
+        if (d && d.status === "draft" && d.approvalId && approvalStore.cards.get(d.approvalId)?.status === "approved") out.push(p);
       }
       return out.slice(0, limit);
     },
@@ -63,6 +63,8 @@ test("AT-S2 pending/rejected cards leave the draft; a failing project is logged 
   assert.equal((await svc.store.latestDoc(P1)).status, "draft", "rejected leaves the draft");
   assert.equal((await svc.store.latestDoc(P2)).status, "draft", "pending leaves the draft");
 
+  // Both approved now; P1's sync throws, P2's must still run.
+  approvalStore.cards.get(r1.approvalId).status = "approved";
   approvalStore.cards.get(r2.approvalId).status = "approved";
   const realGet = svc.cards.get;
   svc.cards.get = async (id) => {
@@ -75,6 +77,7 @@ test("AT-S2 pending/rejected cards leave the draft; a failing project is logged 
   assert.deepEqual(logs, [{ level: "warn", msg: "requirements-sync-failed", projectId: P1 }]);
   assert.ok(!JSON.stringify(logs).includes("secret"), "the error message is never logged");
   assert.equal((await svc.store.latestDoc(P2)).status, "approved");
+  assert.equal((await svc.store.latestDoc(P1)).status, "draft", "the failed project is left for the next tick");
 });
 
 test("AT-S2 a failing lister is logged and the tick ends cleanly", async () => {
@@ -127,17 +130,36 @@ test("AT-Q1 a question approved or rejected in an earlier version is not raised 
   }
 });
 
-test("AT-Q2 an expired earlier card, or a decided card of another project, does not stop the question", async () => {
+test("AT-Q2 an expired earlier card does not stop the question", async () => {
   const { svc, approvalStore } = wire();
   const v1 = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
   for (const { cardId } of v1.questionCards.raised) approvalStore.cards.get(cardId).status = "expired";
   const v2 = await svc.pipeline.submitSpec(P1, { kind: "paste", text: `${SPEC}\n- FR-9: Reviews\n  - Reviews show\n` });
   const old = new Set(v1.questionCards.raised.map((x) => x.cardId));
   assert.ok(v2.questionCards.raised.length >= 1 && v2.questionCards.raised.every((x) => !old.has(x.cardId)), "asked again after expiry");
+});
 
-  // Another project's decided twin does not count.
-  const p2 = await svc.pipeline.submitSpec(P2, { kind: "paste", text: SPEC });
-  assert.ok(p2.questionCards.raised.every((x) => !old.has(x.cardId)));
+test("AT-Q2 an approved or rejected card of another project does not stop the question (same action and target)", async () => {
+  for (const decided of ["approved", "rejected"]) {
+    const { svc, approvalStore } = wire();
+    const v1 = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+    for (const { cardId } of v1.questionCards.raised) approvalStore.cards.get(cardId).status = decided;
+    const p1Cards = v1.questionCards.raised.map((x) => approvalStore.cards.get(x.cardId));
+    const before = [...approvalStore.cards.values()].filter((c) => c.gate === "decision").length;
+    const p2 = await svc.pipeline.submitSpec(P2, { kind: "paste", text: SPEC });
+    const old = new Set(p1Cards.map((c) => c.id));
+    assert.ok(p2.questionCards.raised.length >= 1 && p2.questionCards.raised.every((x) => !old.has(x.cardId)), `${decided}: P2 gets its own cards`);
+    // the twin really shares action and target, so only the project filter keeps them apart
+    const p2Cards = p2.questionCards.raised.map((x) => approvalStore.cards.get(x.cardId));
+    assert.ok(p2Cards.some((c) => p1Cards.some((o) => o.action === c.action && o.target === c.target)), "same dedupe key across projects");
+    assert.equal([...approvalStore.cards.values()].filter((c) => c.gate === "decision").length, before + p2.questionCards.raised.length);
+  }
+});
+
+test("AT-Q2 a failed decided-card lookup still raises the question", async () => {
+  let raised = 0;
+  const port = skipDecidedQuestions(async () => ({ id: `new-${++raised}` }), { list: async () => { throw new Error("db timeout"); } });
+  assert.deepEqual(await port({ card: { gate: "decision", action: "a", target: "t", projectId: P1, reason: "r" } }, "r"), { id: "new-1" });
 });
 
 test("AT-Q1 the decided-card scan is bounded and paged", async () => {
