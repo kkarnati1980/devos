@@ -207,3 +207,34 @@ test("DEVOS-77 DL AT9: the failed-runs page lists dead letters escaped and retri
   assert.deepEqual(problems, []);
   await context.close();
 });
+
+test("M2.3 AT12 (DEVOS-135): the approvals inbox lists pending first, escapes card text, comments and approves with CSRF", async () => {
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  const { page, context, problems } = await open("/approvals");
+  await page.getByTestId("approvals").waitFor();
+  const rows = page.getByTestId("approval-row");
+  assert.equal(await rows.count(), 2);
+  assert.equal(await rows.first().getAttribute("data-status"), "pending", "pending cards come first");
+  assert.match(await rows.first().innerText(), /<img src=x onerror=window.__xss3=1>/, "the action is shown as text");
+  assert.match(await rows.first().innerText(), /\$2\.50 · 1 blocked task\b/);
+  await page.getByTestId("open-00000000-0000-4000-8000-0000000000a1").click();
+  await page.getByTestId("approval-detail").waitFor();
+  assert.match(await page.getByTestId("approval-detail").innerText(), /Deploy shop <b>live<\/b>/, "task titles are text");
+  await page.getByTestId("comment-body").fill("ok <script>window.__xss4=1</script>");
+  await page.getByTestId("comment-send").click();
+  await page.getByTestId("comments").filter({ hasText: "window.__xss4" }).waitFor();
+  await page.getByTestId("approve-uses").fill("2");
+  await page.getByTestId("approve").click();
+  await page.getByTestId("detail-status").filter({ hasText: "approved" }).waitFor();
+  assert.match(await page.getByTestId("detail-grant").innerText(), /0\/2 uses/);
+  assert.equal(await page.getByTestId("approve").count(), 0, "a decided card has no Approve");
+  const writes = api.state.received.filter((r) => r.url.startsWith("/approvals/"));
+  assert.deepEqual(writes.map((w) => w.url), ["/approvals/00000000-0000-4000-8000-0000000000a1/comments", "/approvals/00000000-0000-4000-8000-0000000000a1/approve"]);
+  assert.deepEqual(JSON.parse(writes[1].body), { expiresInHours: 72, maxUses: 2 });
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "every POST carried the session's CSRF token");
+  assert.equal(await page.evaluate(() => [window.__xss3, window.__xss4]).then((v) => v.every((x) => x === undefined)), true, "card text never runs as script");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "no horizontal scroll at 390 px");
+  assert.deepEqual(problems, []);
+  await context.close();
+});

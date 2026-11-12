@@ -86,6 +86,43 @@ export async function startStubApi(allowedOrigin) {
       state.deadLetters.splice(i, 1);
       return json(200, { retried: dl[1] });
     }
+    // M2.3-b2 (DEVOS-135) approvals inbox
+    const A1 = "00000000-0000-4000-8000-0000000000a1";
+    const A2 = "00000000-0000-4000-8000-0000000000a2";
+    state.approvals ??= [
+      { id: A1, gate: "decision", action: "deploy <img src=x onerror=window.__xss3=1>", target: "project:shop", reason: "first deploy", consequence: null, costUsd: "2.50", projectId: null, status: "pending", createdAt: "2026-11-12T10:00:00.000Z", decidedAt: null, decidedBy: null, blockedTasks: 1, grant: null },
+      { id: A2, gate: "decision", action: "spend", target: "openai", reason: "old", consequence: null, costUsd: null, projectId: null, status: "rejected", createdAt: "2026-11-11T10:00:00.000Z", decidedAt: "2026-11-11T11:00:00.000Z", decidedBy: "kk", blockedTasks: 0, grant: null },
+    ];
+    state.approvalComments ??= [];
+    if (req.method === "GET" && url.startsWith("/approvals?") || req.method === "GET" && url === "/approvals") {
+      // Newest first, as the API returns; the decided card is deliberately listed first to check pending-first sorting.
+      return json(200, { approvals: [...state.approvals].reverse(), nextCursor: null });
+    }
+    const ap = url.match(/^\/approvals\/([0-9a-f-]{36})(\/(approve|reject|comments))?$/);
+    if (ap) {
+      const card = state.approvals.find((c) => c.id === ap[1]);
+      if (!card) return json(404, { statusCode: 404, code: "card-not-found" });
+      const view = () => { const { blockedTasks, grant, ...c } = card; return c; };
+      if (req.method === "GET" && !ap[2]) return json(200, { approval: view(), comments: state.approvalComments, blockedTasks: card.blockedTasks ? [{ id: "t1", title: "Deploy shop <b>live</b>", status: "blocked" }] : [], grant: card.grant });
+      if (req.method === "POST") state.received.push({ url, body });
+      if (req.method === "POST" && ap[3] === "approve") {
+        if (card.status !== "pending") return json(409, { statusCode: 409, code: "card-not-pending" });
+        Object.assign(card, { status: "approved", decidedBy: "kk", decidedAt: "2026-11-12T10:05:00.000Z", blockedTasks: 0 });
+        const b = JSON.parse(body || "{}");
+        card.grant = { id: "g1", scopeAction: card.action, scopeResource: card.target, projectId: null, sha: null, expiresAt: "2026-11-15T10:05:00.000Z", maxUses: b.maxUses ?? 1, uses: 0, revoked: false };
+        return json(200, { approval: view(), grantId: "g1" });
+      }
+      if (req.method === "POST" && ap[3] === "reject") {
+        if (card.status !== "pending") return json(409, { statusCode: 409, code: "card-not-pending" });
+        Object.assign(card, { status: "rejected", decidedBy: "kk" });
+        return json(200, { approval: view() });
+      }
+      if (req.method === "POST" && ap[3] === "comments") {
+        const c = { id: `c${state.approvalComments.length + 1}`, author: "kk", body: JSON.parse(body).body, createdAt: "2026-11-12T10:06:00.000Z" };
+        state.approvalComments.push(c);
+        return json(201, { comment: c });
+      }
+    }
     if (req.method === "POST" && url === "/notifications/test") {
       state.received.push({ url, body });
       const deliveries = state.channels.filter((c) => c.enabled).map((c) => ({ channel: c.kind, status: "sent", error: null }));
