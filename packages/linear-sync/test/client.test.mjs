@@ -120,3 +120,19 @@ test("Codex PR35-r6: only the Linear endpoint is accepted, and a redirect is ref
   await assert.rejects(c.query("query { viewer { id } }"), (e) => e instanceof LinearError && e.code === "bad-response" && /redirect/.test(e.message));
   assert.deepEqual(seen, [[LINEAR_ENDPOINT, "manual"]], "one call, to the fixed endpoint, with redirects not followed");
 });
+
+test("Codex PR35-r8: a body cut off or timed out after the headers stays network/timeout and is retried for reads; bad JSON is bad-response", async () => {
+  const broken = (name) => () => new Response(new ReadableStream({ start(ctl) { ctl.enqueue(new TextEncoder().encode('{"data":')); ctl.error(Object.assign(new Error("x"), { name })); } }), { status: 200 });
+  let r = client([broken("TypeError"), broken("TypeError"), res(200, { data: { ok: 1 } })]);
+  assert.deepEqual(await r.c.query("query { ok }"), { ok: 1 });
+  assert.equal(r.calls.length, 3, "a reset body is retried like a reset connection");
+  r = client([broken("TimeoutError"), broken("TimeoutError"), broken("TimeoutError")]);
+  await assert.rejects(r.c.query("query { ok }"), (e) => e instanceof LinearError && e.code === "timeout");
+  assert.equal(r.calls.length, 3);
+  r = client([broken("TypeError")]);
+  await assert.rejects(r.c.mutate("mutation { x }"), (e) => e instanceof LinearError && e.code === "network");
+  assert.equal(r.calls.length, 1, "mutations are never retried");
+  r = client([new Response("not json", { status: 200 })]);
+  await assert.rejects(r.c.query("query { ok }"), (e) => e instanceof LinearError && e.code === "bad-response");
+  assert.equal(r.calls.length, 1, "bad JSON is not retried");
+});

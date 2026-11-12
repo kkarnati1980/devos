@@ -115,8 +115,17 @@ export class LinearClient {
       const retryMs = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 60_000) : undefined;   // bounded
       throw new LinearError("http", `Linear answered HTTP ${res.status}${code === "RATELIMITED" ? " (rate limited)" : ""}`, status, retryMs);
     }
+    // Codex PR35-r8: fetch resolves at the headers, so the body read can still reset or hit the timeout. Those stay
+    // network/timeout (reads retry them); only text that arrived whole but is not JSON is bad-response.
+    let text: string;
+    try { text = await res.text(); } catch (e) {
+      const name = (e as { name?: string })?.name;
+      throw new LinearError(name === "TimeoutError" || name === "AbortError" ? "timeout" : "network",
+        name === "TimeoutError" || name === "AbortError" ? "Linear call timed out while reading the answer" : "Linear answer was cut off");
+    }
     let body: { data?: T; errors?: { message?: string; extensions?: { code?: string } }[] };
-    try { body = (await res.json()) as typeof body; } catch { throw new LinearError("bad-response", "Linear answered with invalid JSON"); }
+    try { body = JSON.parse(text) as typeof body; } catch { throw new LinearError("bad-response", "Linear answered with invalid JSON"); }
+    if (!body || typeof body !== "object") throw new LinearError("bad-response", "Linear answered with invalid JSON");
     if (body.errors?.length) {
       const code = body.errors[0]?.extensions?.code;
       if (code === "RATELIMITED") throw new LinearError("http", "Linear rate limited the request", 429);
