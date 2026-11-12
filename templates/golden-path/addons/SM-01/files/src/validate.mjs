@@ -173,7 +173,10 @@ export function validated(schemas, handler, opts = {}) {
     const details = [];
     const check = (where, schema, value) => {
       if (!schema) {
-        if (value !== undefined && !(kindOf(value) === "object" && Object.keys(value).length === 0)) details.push({ in: where, path: "(root)", message: "is not accepted on this route" });
+        // Query and params are always objects (empty when absent); a body is `undefined` only when none was sent, so
+        // any body at all, even `{}`, is refused on a route without a body schema (Codex PR63-r1).
+        const empty = where === "body" ? value === undefined : kindOf(value) === "object" && Object.keys(value).length === 0;
+        if (!empty) details.push({ in: where, path: "(root)", message: "is not accepted on this route" });
         return;
       }
       for (const e of validate(schema, value)) details.push({ in: where, ...e });
@@ -233,6 +236,7 @@ export function invalidCases(schema, valid) {
     if ((s.type === "integer" || s.type === "number") && s.min !== undefined) cases.push({ name: `${k} below min`, value: { ...valid, [k]: s.min - 1 } });
     if ((s.type === "integer" || s.type === "number") && s.max !== undefined) cases.push({ name: `${k} above max`, value: { ...valid, [k]: s.max + 1 } });
     if (s.type === "integer") cases.push({ name: `${k} not an integer`, value: { ...valid, [k]: 1.5 } });
+    if (s.type === "array" && s.minItems && Array.isArray(valid[k])) cases.push({ name: `${k} too few items`, value: { ...valid, [k]: valid[k].slice(0, s.minItems - 1) } });
     if (s.type === "array") cases.push({ name: `${k} too many items`, value: { ...valid, [k]: Array.from({ length: (s.maxItems ?? DEFAULT_MAX_ITEMS) + 1 }, () => null) } });
   }
   // Keep only cases the schema really refuses (e.g. a permissive pattern may accept the probe value).

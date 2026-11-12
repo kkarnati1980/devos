@@ -12,7 +12,7 @@ const NOTE = {
   properties: {
     title: { type: "string", minLength: 1, maxLength: 80 },
     priority: { type: "integer", min: 1, max: 5 },
-    tags: { type: "array", items: { type: "string", maxLength: 20 }, maxItems: 5 },
+    tags: { type: "array", items: { type: "string", maxLength: 20 }, minItems: 1, maxItems: 5 },
     status: { type: "string", enum: ["open", "done"] },
     pinned: { type: "boolean" },
   },
@@ -42,6 +42,7 @@ test("SM-01-L1: contract tests: every invalid body generated from the schema get
   const reached = [];
   const cases = invalidCases(NOTE, VALID);
   assert.ok(cases.length >= 15, `cases: ${cases.length}`);
+  assert.ok(cases.some((c) => c.name === "tags too few items"), "minItems is broken too (Codex PR63-r1)");
   await withRoutes(noteRoutes(reached), async (base) => {
     for (const c of cases) {
       const r = await post(base, c.value);
@@ -72,6 +73,15 @@ test("SM-01-L1: the query is validated too (types coerced from text), and an une
     assert.equal((await post(base, VALID)).status, 201);
     const withQuery = await fetch(`${base}/notes?x=1`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(VALID) });
     assert.equal(withQuery.status, 400);
+    // A route with no body schema refuses any body, even {} (Codex PR63-r1).
+    for (const b of ["{}", "[]", "null"]) {
+      const r2 = await new Promise((resolve, reject) => {
+        const u = new URL(`${base}/notes`);
+        const q = http.request({ host: u.hostname, port: u.port, path: "/notes", method: "GET", headers: { "content-type": "application/json", "content-length": String(b.length) } }, (res) => { res.resume(); resolve(res.statusCode); });
+        q.on("error", reject); q.end(b);
+      });
+      assert.equal(r2, 400, `GET with body ${b}`);
+    }
     assert.equal(reached.length, 3);
   });
 });
