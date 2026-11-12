@@ -18,7 +18,7 @@ const API = "https://api.github.com";
 
 export class CannotRun extends Error {}
 
-// DEVOS-148 (ADR-0011 §9): bounded exponential backoff with full jitter between GET attempts. Attempt i (from 1)
+// DEVOS-148 (ADR-0011 §9): bounded exponential backoff with equal jitter between GET attempts. Attempt i (from 1)
 // waits a random time in [delay/2, delay], delay = min(BACKOFF_BASE_MS * 2^(i-1), BACKOFF_CAP_MS).
 export const BACKOFF_BASE_MS = 500;
 export const BACKOFF_CAP_MS = 4_000;

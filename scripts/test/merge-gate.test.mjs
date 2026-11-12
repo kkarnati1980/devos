@@ -208,7 +208,7 @@ test("AT9 cannot run → exit 2, never a merge; the token never appears in outpu
   assert.equal(await main(["7", "--repo", "bad repo"], { env: { GH_TOKEN: TOKEN }, log }), 2);
   assert.equal(await main(["7", "--repo", "../.."], { env: { GH_TOKEN: TOKEN }, log }), 2);
   const down = async () => { throw new TypeError("fetch failed"); };
-  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: down, log }), 2);
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: down, log, sleep: async () => {} }), 2);
   const f = fakeGitHub({ fail5xx: 2 });
   assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: f.fetchImpl, log, sleep: f.sleep }), 0, "two 502s on GET are retried");
   assert.ok(f.calls.every((c) => c.hasSignal), "every call carries a timeout signal");
@@ -243,7 +243,7 @@ test("DEVOS-148 GET retries wait with bounded exponential backoff and jitter; th
   assert.ok(f.sleeps[0] >= 250 && f.sleeps[0] <= 500, `first wait ${f.sleeps[0]}`);
   assert.ok(f.sleeps[1] >= 500 && f.sleeps[1] <= 1000, `second wait ${f.sleeps[1]}`);
   assert.equal(merges(f).length, 1);
-  // Network errors back off too; a run with no failures never waits.
+  // A run with no failures never waits.
   const ok = fakeGitHub();
   assert.equal((await run(ok)).code, 0);
   assert.deepEqual(ok.sleeps, []);
