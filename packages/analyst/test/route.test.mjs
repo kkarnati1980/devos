@@ -55,6 +55,15 @@ test("RT1 classification: non-technical topics win over technical ones; unclear 
   // Whole words only: "dbase" / "userland" are not "db" / "user".
   assert.equal(cls("Is dbase ok?").reason, "default-non-technical");
   assert.equal(cls("Is userland ok?").reason, "default-non-technical");
+  // Everyday words are not technical signals; money and scope words send a question to KK (pre-review r2).
+  for (const q of [
+    "Should we include the rest of the reports in phase 1?",
+    "Should we charge per API call?",
+    "Which package tiers do we offer on the free plan?",
+    "Do we need a test period with the client before go-live?",
+    "Can a worker see other workers' shifts?",
+    "How long should a coaching session last?",
+  ]) assert.equal(cls(q).class, "non-technical", q);
   // The whole text is classified: a non-technical word after 4,000+ characters still sends it to KK.
   assert.equal(cls("Which database " + "x ".repeat(2500) + "fits the budget?").class, "non-technical");
 });
@@ -79,7 +88,8 @@ test("RT2 plan: non-technical questions become decision cards, technical ones go
     assert.match(c.card.reason, /spec version 3/);
   }
   // Every question is routed exactly once.
-  assert.equal(p.cards.length + p.technical.length, a.openQuestions.length);
+  const routed = [...p.cards, ...p.technical].flatMap((x) => x.questionIds).sort();
+  assert.deepEqual(routed, a.openQuestions.map((q) => q.id).sort());
 });
 
 test("RT3 cards block only what depends on them (DV-FR-012)", () => {
@@ -114,6 +124,16 @@ test("RT3 cards block only what depends on them (DV-FR-012)", () => {
 - Password rules TBD
 `);
   assert.deepEqual(p4.cards.map((c) => c.blocks), [["FR-1"]]);
+  // A TBD criterion under a rejected duplicate heading belongs to nothing: the kept FR-1 is not blocked.
+  const { p: p5 } = plan(`### FR-1: Login
+
+- works
+
+### FR-1: Login again
+
+- Password rules TBD
+`);
+  assert.deepEqual(p5.cards.map((c) => c.blocks), [[]]);
 });
 
 test("RT4 stable targets: the same question in a later spec version dedupes in M2.3; repeats in one spec merge", () => {
@@ -124,8 +144,13 @@ test("RT4 stable targets: the same question in a later spec version dedupes in M
 
 - Who pays for SMS?
 - who pays   for SMS?
+- Which database?
+- which database?
 `);
   assert.equal(p.cards.length, 1);
+  assert.deepEqual(p.cards[0].questionIds, ["Q-1", "Q-2"]);
+  assert.equal(p.technical.length, 1);
+  assert.deepEqual(p.technical[0].questionIds, ["Q-3", "Q-4"]);
 });
 
 test("RT5 spec text stays inert: one-line, clipped, and the Architect log escapes Markdown/HTML", () => {
@@ -182,4 +207,16 @@ test("RT6 raising: one failure never stops the rest; a secret refusal retries on
   assert.match(p.cards.find((c) => c.card.target === "spec-acceptance:FR-2").card.reason, /title in the spec: "Export"/);
   // Failure codes never carry error messages.
   assert.ok(!JSON.stringify(r).includes("SECRET"));
+});
+
+test("RT6b the withheld retry runs exactly once and records its own failure code", async () => {
+  const { p } = plan(`## Open questions\n\n- Who pays for SMS?\n`);
+  let n = 0;
+  const r = await raiseQuestionCards(p, async () => {
+    n += 1;
+    throw Object.assign(new Error("m"), { code: n === 1 ? "card-contains-secret" : "db-down" });
+  });
+  assert.equal(n, 2);
+  assert.deepEqual(r.failed, [{ questionId: "Q-1", code: "db-down" }]);
+  assert.deepEqual(r.raised, []);
 });

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { escapeInert } from "@devos/intake";
-import type { Analysis, OpenQuestion } from "./analyze.js";
+import type { Analysis, OpenQuestion, Requirement } from "./analyze.js";
 
 /**
  * M2.2-c question router (DEVOS-123). Each open question is either `non-technical` (a decision card for KK
@@ -30,6 +30,9 @@ const NON_TECHNICAL = new RegExp(
       "content", "copy", "wording", "text", "tone", "brand", "branding", "logo", "name", "naming", "colour", "colours",
       "color", "colors", "scope", "priority", "priorities", "mvp", "deadline", "deadlines", "launch", "date", "dates",
       "account", "accounts", "pilot", "market", "markets", "region", "regions", "country", "countries",
+      "charge", "charges", "charging", "free", "plan", "plans", "tier", "tiers", "revenue", "refund", "refunds",
+      "discount", "discounts", "include", "includes", "exclude", "excludes", "phase", "phases", "feature", "features",
+      "client", "clients", "staff", "shift", "shifts", "period", "live",
     ].join("|") +
     ")\\b",
   "i",
@@ -39,14 +42,13 @@ const TECHNICAL = new RegExp(
   "\\b(" +
     [
       "database", "databases", "db", "postgres", "postgresql", "mysql", "sqlite", "redis", "mongodb", "orm", "schema",
-      "schemas", "migration", "migrations", "index", "indexes", "framework", "frameworks", "library", "libraries",
-      "package", "packages", "sdk", "api", "apis", "endpoint", "endpoints", "rest", "graphql", "grpc", "websocket",
-      "websockets", "protocol", "stack", "architecture", "cache", "caching", "queue", "queues", "worker", "workers",
-      "cron", "hosting", "server", "servers", "container", "containers", "docker", "kubernetes", "cdn", "deploy",
-      "deployment", "ci", "test", "tests", "testing", "typescript", "javascript", "node", "python", "react", "vue",
-      "nextjs", "css", "html", "oauth", "jwt", "session", "sessions", "encryption", "hashing", "latency",
-      "performance", "throughput", "pagination", "polling", "webhook", "webhooks", "retry", "retries", "timeout",
-      "timeouts", "logging", "monitoring",
+      "schemas", "migration", "migrations", "framework", "frameworks", "library", "libraries",
+      "sdk", "api", "apis", "endpoint", "endpoints", "graphql", "grpc", "websocket",
+      "websockets", "protocol", "architecture", "cache", "caching", "queue", "queues",
+      "cron", "hosting", "container", "containers", "docker", "kubernetes", "cdn", "deploy",
+      "deployment", "ci", "typescript", "javascript", "python", "react", "vue",
+      "nextjs", "css", "html", "oauth", "jwt", "encryption", "hashing", "latency",
+      "throughput", "pagination", "polling", "webhook", "webhooks",
     ].join("|") +
     ")\\b",
   "i",
@@ -66,6 +68,8 @@ export function classifyQuestion(q: Pick<OpenQuestion, "kind" | "text">): Classi
 /** A decision card ready for M2.3 `raiseCard` (gate `decision`), plus the requirement keys it blocks. */
 export interface QuestionCardDraft {
   questionId: string;
+  /** Every open question this card answers (repeats of the same question merge into one card). */
+  questionIds: string[];
   card: { gate: "decision"; action: string; target: string; reason: string; projectId: string | null };
   /** Used instead of `card.reason` when the approvals core refuses spec text (`card-contains-secret`). */
   fallbackReason: string;
@@ -76,6 +80,7 @@ export interface QuestionCardDraft {
 
 export interface TechnicalEntry {
   questionId: string;
+  questionIds: string[];
   text: string;
   source: number;
   blocks: string[];
@@ -122,9 +127,9 @@ export function questionFingerprint(text: string): string {
  * from (a TBD title or criterion, `owner`). Never by block index: all rows of one table share a block, so
  * one TBD cell would block every row (pre-review). Keys not in the requirements (out of scope) block nothing.
  */
-function dependents(q: OpenQuestion, analysis: Analysis): string[] {
+function dependents(q: OpenQuestion, reqByKey: ReadonlyMap<string, Requirement>): string[] {
   const key = q.kind === "missing-acceptance" ? q.requirement : q.owner;
-  return key && analysis.requirements.some((r) => r.key === key) ? [key] : [];
+  return key && reqByKey.has(key) ? [key] : [];
 }
 
 const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -133,32 +138,45 @@ const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan {
   const cards: QuestionCardDraft[] = [];
   const technical: TechnicalEntry[] = [];
-  const seen = new Set<string>();
+  // Maps keep the plan linear in the number of questions (F3).
+  const cardByTarget = new Map<string, QuestionCardDraft>();
+  const techByFp = new Map<string, TechnicalEntry>();
+  const reqByKey = new Map(analysis.requirements.map((r) => [r.key, r] as const));
   for (const q of analysis.openQuestions) {
     const c = classifyQuestion(q);
-    const blocks = dependents(q, analysis);
+    const blocks = dependents(q, reqByKey);
     if (c.class === "technical") {
-      technical.push({ questionId: q.id, text: q.text, source: q.source, blocks, reason: c.reason });
+      const fp = questionFingerprint(q.text);
+      const prev = techByFp.get(fp);
+      if (prev) {
+        prev.questionIds.push(q.id);
+        prev.blocks = [...new Set([...prev.blocks, ...blocks])];
+      } else {
+        const entry: TechnicalEntry = { questionId: q.id, questionIds: [q.id], text: q.text, source: q.source, blocks, reason: c.reason };
+        technical.push(entry);
+        techByFp.set(fp, entry);
+      }
       continue;
     }
     const key = q.kind === "missing-acceptance" && q.requirement && SAFE_KEY.test(q.requirement) ? q.requirement : null;
     const target = key ? `spec-acceptance:${key}` : `spec-question:${questionFingerprint(q.text)}`;
     // The same question twice in one spec is one card; its blockers are merged.
-    if (seen.has(target)) {
-      const prev = cards.find((d) => d.card.target === target);
-      if (prev) prev.blocks = [...new Set([...prev.blocks, ...blocks])];
+    const prev = cardByTarget.get(target);
+    if (prev) {
+      prev.questionIds.push(q.id);
+      prev.blocks = [...new Set([...prev.blocks, ...blocks])];
       continue;
     }
-    seen.add(target);
     const action = key ? `Confirm acceptance criteria for ${key}` : "Answer an open question in the spec";
     const head = `${q.id}, spec version ${meta.specVersion}, block ${q.source}.`;
-    const req = q.requirement ? analysis.requirements.find((r) => r.key === q.requirement) : undefined;
+    const req = q.requirement ? reqByKey.get(q.requirement) : undefined;
     const reason =
       q.kind === "missing-acceptance"
         ? `${head} The spec gives no acceptance criteria for this requirement. Its title in the spec: "${clip(oneLine(req?.title ?? ""), QUOTE_MAX)}"`
         : `${head} The spec leaves this open: "${clip(oneLine(q.text), QUOTE_MAX)}"`;
-    cards.push({
+    const draft: QuestionCardDraft = {
       questionId: q.id,
+      questionIds: [q.id],
       card: {
         gate: "decision",
         action: clip(action, CARD_LINE_MAX),
@@ -169,7 +187,9 @@ export function planQuestions(analysis: Analysis, meta: PlanMeta): QuestionPlan 
       fallbackReason: `${head} The question text is withheld because the approvals inbox could not accept it (it may look like a secret); open the spec to read it.`,
       blocks,
       reason: c.reason,
-    });
+    };
+    cards.push(draft);
+    cardByTarget.set(target, draft);
   }
   return { cards, technical };
 }
@@ -188,7 +208,7 @@ export function renderArchitectLog(plan: QuestionPlan, meta: PlanMeta & { genera
     return out.join("\n");
   }
   for (const t of plan.technical) {
-    out.push(`## ${escapeInert(t.questionId)}`, "");
+    out.push(`## ${t.questionIds.map(escapeInert).join(", ")}`, "");
     out.push(`- **Question:** ${escapeInert(oneLine(t.text))}`);
     out.push(`- **Source block:** ${t.source}`);
     out.push(`- **Affects:** ${t.blocks.length ? t.blocks.map(escapeInert).join(", ") : "no single requirement"}`);

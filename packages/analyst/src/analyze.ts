@@ -286,7 +286,8 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   });
   // An unresolved criterion (TBD/TBC or a trailing "?") is an open question, not a criterion (PR53-r1).
   const addCriterion = (req: Requirement, text: string, source: number) => {
-    if (isQuestionText(text)) stated.push({ text, source, owner: req.key });
+    // A rejected duplicate's sink shares the kept requirement's key; its questions own nothing (pre-review).
+    if (isQuestionText(text)) stated.push(byKey.get(req.key) === req ? { text, source, owner: req.key } : { text, source });
     else req.acceptance.push(text);
   };
   const isCriterionId = (key: string) => /^AC(?![A-Z])/.test(key);
