@@ -169,23 +169,28 @@ export async function release(gh, { repo, pr, dryRun = false, config = DEFAULT_C
     return { code: 1, ...v };
   }
   if (dryRun) { log(`OK PR #${pr} at ${v.sha.slice(0, 7)}: would merge (dry run)`); return { code: 0, ...v }; }
+  // An ambiguous outcome (network error or timeout, a 5xx from a gateway, or a 2xx without a readable "merged")
+  // may hide a merge GitHub already accepted: read the PR back, never re-send the PUT (Codex PR67-r1).
+  async function readBack(cause) {
+    const after = await gh.get(`/repos/${repo}/pulls/${pr}`).catch(() => null);
+    if (after?.merged && after.head?.sha === v.sha) {
+      log(`MERGED PR #${pr}: head ${v.sha} -> merge ${after.merge_commit_sha} (confirmed after: ${cause})`);
+      return { code: 0, mergeSha: after.merge_commit_sha, ...v };
+    }
+    if (after && !after.merged) throw new CannotRun(`${cause}; PR #${pr} is not merged yet; read the PR again before retrying`);
+    throw new CannotRun(`${cause}; MERGE OUTCOME UNKNOWN for PR #${pr}, read the PR before retrying`);
+  }
   let r;
   try {
     r = await gh.call("PUT", `/repos/${repo}/pulls/${pr}/merge`, { sha: v.sha, merge_method: "merge" });
   } catch (err) {
-    // The PUT may have reached GitHub before the timeout: read the PR back instead of guessing.
-    const after = await gh.get(`/repos/${repo}/pulls/${pr}`).catch(() => null);
-    if (after?.merged && after.head?.sha === v.sha) {
-      log(`MERGED PR #${pr}: head ${v.sha} -> merge ${after.merge_commit_sha} (confirmed after: ${err.message})`);
-      return { code: 0, mergeSha: after.merge_commit_sha, ...v };
-    }
-    if (after && !after.merged) throw new CannotRun(`${err.message}; PR #${pr} is not merged yet; read the PR again before retrying`);
-    throw new CannotRun(`${err.message}; MERGE OUTCOME UNKNOWN for PR #${pr}, read the PR before retrying`);
+    return readBack(err.message);
   }
-  if (r.status === 200 && r.json?.merged) {
+  if (r.status === 200 && r.json?.merged === true) {
     log(`MERGED PR #${pr}: head ${v.sha} -> merge ${r.json.sha}`);
     return { code: 0, mergeSha: r.json.sha, ...v };
   }
+  if (r.status >= 500 || (r.status >= 200 && r.status < 300)) return readBack(`merge PUT answered HTTP ${r.status} without a confirmed merge`);
   const why = r.status === 409 ? "the head moved after the check (a new commit voids the PASS)" : `HTTP ${r.status}: ${String(r.json?.message ?? "").slice(0, 120)}`;
   log(`REFUSED PR #${pr}: GitHub did not merge: ${why}`);
   return { code: 1, ...v, reasons: [why] };

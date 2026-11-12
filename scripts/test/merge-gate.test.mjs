@@ -49,6 +49,10 @@ function fakeGitHub(over = {}) {
     if (path === `/repos/${REPO}/git/ref/heads/main`) return reply(200, { object: { sha: state.mainSha } });
     if (path === `/repos/${REPO}/compare/${MAIN}...${HEAD}`) return reply(200, { status: state.compare });
     if (path === `/repos/${REPO}/pulls/7/merge` && init.method === "PUT") {
+      if (state.putStatus) {
+        if (state.putMerges) state.pr = { ...state.pr, merged: true, state: "closed", merge_commit_sha: "e".repeat(40) };
+        return { status: state.putStatus, text: async () => state.putBody ?? "" };
+      }
       if (state.putThrows) { if (state.putThrows === "merged") state.pr = { ...state.pr, merged: true, state: "closed", merge_commit_sha: "e".repeat(40) }; throw new TypeError("socket hang up"); }
       return state.mergeStatus === 200 ? reply(200, { merged: true, sha: "c".repeat(40) }) : reply(state.mergeStatus, { message: "Head branch was modified" });
     }
@@ -212,4 +216,19 @@ test("AT9 cannot run → exit 2, never a merge; the token never appears in outpu
   assert.equal(merges(g).length, 0);
   assert.ok(!out.join("\n").includes(TOKEN), "token never printed");
   assert.ok(out.some((l) => l.startsWith("MERGED PR #7")));
+});
+
+test("AT5c Codex PR67-r1: a 5xx or an unreadable 200 on the merge PUT is read back, never reported as a refusal or re-sent", async () => {
+  const log = () => {};
+  for (const [putStatus, putBody] of [[502, "{}"], [504, ""], [200, "<html>"], [200, "{}"]]) {
+    const merged = fakeGitHub({ putStatus, putBody, putMerges: true });
+    assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: merged.fetchImpl, log }), 0, `${putStatus} ${putBody}: merged → 0`);
+    assert.equal(merges(merged).length, 1);
+    const notMerged = fakeGitHub({ putStatus, putBody });
+    assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: notMerged.fetchImpl, log }), 2, `${putStatus} ${putBody}: not merged → 2`);
+    assert.equal(merges(notMerged).length, 1);
+  }
+  // A definite refusal (405 not mergeable, 409 head moved) stays exit 1 without a read-back merge claim.
+  const refused = fakeGitHub({ putStatus: 405, putBody: JSON.stringify({ message: "Pull Request is not mergeable" }) });
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: refused.fetchImpl, log }), 1);
 });
