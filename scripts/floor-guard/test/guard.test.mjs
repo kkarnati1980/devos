@@ -98,6 +98,8 @@ const VIOLATIONS = [
   // PR70-r10: entries added under an existing *-ignore list, or a `!` exclusion under an allow-list
   ["ci-trigger-narrowed (entry added under paths-ignore)", { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths-ignore:\n      - docs/**\n") }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths-ignore:\n      - docs/**\n").replace("      - docs/**\n", "      - docs/**\n      - packages/**\n") }],
   ["ci-trigger-narrowed (! exclusion added under paths)", { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths:\n      - '**'\n") }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    paths:\n      - '**'\n      - '!packages/**'\n") }],
+  // PR70-r11: a script name with a dot (or any character but a quote) after the colon
+  ["test-script-changed (test:unit.browser)", { "packages/x/package.json": '{ "scripts": {\n  "test:unit.browser": "vitest run"\n} }\n' }, { "packages/x/package.json": '{ "scripts": {\n  "test:unit.browser": "echo ok"\n} }\n' }],
   ["tests-excluded (quoted jest key in package.json)", { "packages/x/package.json": '{ "jest": {\n} }\n' }, { "packages/x/package.json": '{ "jest": {\n  "testPathIgnorePatterns": ["slow"]\n} }\n' }],
   ["lint-rule-off (unquoted key)", { "packages/x/eslint.config.mjs": "export default [{ rules: {} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'off',\n} }];\n" }],
   ["lint-rule-off (error to warn)", { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'error',\n} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'warn',\n} }];\n" }],
@@ -204,6 +206,17 @@ test("dispositions: Keep only from a Codex verdict on the same SHA naming id and
   assert.equal(applyDispositions(r, { sha: r.sha, source: "builder", text: keep }).exit, 1, "the Builder cannot dispose of its own hit");
   assert.equal(applyDispositions(r, { sha: r.sha, source: "codex", text: `FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line + 1}` }).exit, 1, "wrong line");
   assert.equal(applyDispositions({ ...r, exit: 2 }, { sha: r.sha, source: "codex", text: keep }).exit, 2, "exit 2 cannot be disposed of");
+});
+
+test("dispositions: a Keep names a file with spaces exactly; a longer line number or a prefix of the name is not a match (PR70-r11)", () => {
+  const sp = "packages/x/test/my test.test.ts";
+  const r = check({ [sp]: testSrc("expect(1).toBe(1);") }, { [sp]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
+  const [h] = r.hits;
+  assert.equal(h.file, sp);
+  assert.deepEqual(applyDispositions(r, { sha: r.sha, source: "codex", text: `FLOOR-GUARD KEEP ${h.id} ${sp}:${h.line} upstream flake` }), { exit: 0, open: [] });
+  assert.deepEqual(applyDispositions(r, { sha: r.sha, source: "codex", text: `FLOOR-GUARD KEEP ${h.id} ${sp}:${h.line}` }).exit, 0, "line end");
+  assert.equal(applyDispositions(r, { sha: r.sha, source: "codex", text: `FLOOR-GUARD KEEP ${h.id} ${sp}:${h.line}0 x` }).exit, 1, "a longer line number");
+  assert.equal(applyDispositions(r, { sha: r.sha, source: "codex", text: `FLOOR-GUARD KEEP ${h.id} test.test.ts:${h.line} x` }).exit, 1, "a suffix of the name");
 });
 
 test("workflowShape reads jobs, step identities and triggers", () => {

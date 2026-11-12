@@ -288,7 +288,7 @@ export function analyse(files, show) {
 
     if (p.endsWith("package.json")) {
       // any position on the line, so a one-line package.json is read too (PR70-r2)
-      const scripts = (ls) => new Map(ls.flatMap((l) => [...l.text.matchAll(/"((?:test|lint|typecheck|check)(?::[\w:-]+)?)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)]).map((m) => [m[1], m[2]]));
+      const scripts = (ls) => new Map(ls.flatMap((l) => [...l.text.matchAll(/"((?:test|lint|typecheck|check)(?::(?:[^"\\]|\\.)+)?)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)]).map((m) => [m[1], m[2]]));
       const was = scripts(f.removed), now = scripts(f.added);
       for (const [k, v] of was) if (now.get(k) !== v) hit("test-script-changed", p, 0, `script "${k}": "${v}" -> ${now.has(k) ? `"${now.get(k)}"` : "removed"}`);
     }
@@ -333,9 +333,15 @@ export function analyse(files, show) {
 export function applyDispositions(report, verdict) {
   if (!report || report.exit === 2) return { exit: 2, open: report?.hits ?? [] };
   if (!verdict || verdict.sha !== report.sha || verdict.source !== "codex") return { exit: report.hits.length ? 1 : 0, open: report.hits };
-  const keeps = new Set();
-  for (const m of String(verdict.text).matchAll(/^\s*FLOOR-GUARD KEEP (fg-[0-9a-f]{10}) (\S+):(\d+)\b/gm)) keeps.add(`${m[1]} ${m[2]}:${m[3]}`);
-  const open = report.hits.filter((h) => !keeps.has(`${h.id} ${h.file}:${h.line}`));
+  // The rest of each KEEP line after the id; a hit is kept when that rest starts with its exact "<file>:<line>"
+  // followed by whitespace or the line end, so file names with spaces work (PR70-r11).
+  const keeps = [];
+  for (const m of String(verdict.text).matchAll(/^\s*FLOOR-GUARD KEEP (fg-[0-9a-f]{10}) (.+)$/gm)) keeps.push([m[1], m[2]]);
+  const kept = (h) => keeps.some(([id, rest]) => {
+    const loc = `${h.file}:${h.line}`;
+    return id === h.id && rest.startsWith(loc) && (rest.length === loc.length || /\s/.test(rest[loc.length]));
+  });
+  const open = report.hits.filter((h) => !kept(h));
   return { exit: open.length ? 1 : 0, open };
 }
 
