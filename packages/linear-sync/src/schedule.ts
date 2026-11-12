@@ -27,7 +27,7 @@ export interface SweepResult { synced: string[]; skipped: string[]; inactive: st
 
 export interface SweepDeps {
   list: () => Promise<string[]>;
-  /** Sync one project; resolves `skipped` when another holder has its lock. */
+  /** Sync one project; resolves `skipped` when another holder has its lock, `inactive` when it was archived or purged. */
   syncOne: (projectId: string) => Promise<Exclude<ProjectOutcome, "failed">>;
   log?: (line: string) => void;
 }
