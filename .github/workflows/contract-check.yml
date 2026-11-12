@@ -1,0 +1,28 @@
+name: contract-check
+# DEVOS-142 (gate integrity Part 2). Contract: docs/modules/GI-2.md.
+# Every module contract added or changed in the PR must carry a program-checkable "## Pass rule".
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: contract-check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  pass-rule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Pass rule in changed contracts
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/contracts/check-pass-rule.mjs --base "$BASE" --head "$HEAD"
