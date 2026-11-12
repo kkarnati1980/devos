@@ -214,12 +214,17 @@ export function analyse(files, show) {
 
     // thresholds: CI timeout-minutes and test timeouts past the ceiling; coverage lowered; retries / max-warnings raised.
     if (WORKFLOW.test(p)) for (const a of f.added) { const m = /timeout-minutes\s*:\s*(\d+)/.exec(a.text); if (m && +m[1] > CEILINGS.ciTimeoutMinutes) hit("timeout-past-ceiling", p, a.ln, a.text); }
-    if (test || TEST_CONFIG.test(p)) for (const a of f.added) for (const m of a.text.matchAll(/\b(testTimeout|hookTimeout|timeout)\s*[:=]\s*(\d[\d_]*)/g)) if (+m[2].replace(/_/g, "") > CEILINGS.testTimeoutMs) hit("timeout-past-ceiling", p, a.ln, a.text);
+    if (test || TEST_CONFIG.test(p)) for (const a of f.added) for (const m of a.text.matchAll(/\b(testTimeout|hookTimeout|timeout)["']?\s*[:=]\s*(\d[\d_]*)/g)) if (+m[2].replace(/_/g, "") > CEILINGS.testTimeoutMs) hit("timeout-past-ceiling", p, a.ln, a.text);
     if (TEST_CONFIG.test(p) || test || WORKFLOW.test(p)) {
       const cov = /\b(lines|branches|functions|statements|threshold|perFile)\b["']?\s*[:=]\s*(\d+(?:\.\d+)?)/g;
       const was = numbers(f.removed, cov), now = numbers(f.added, cov);
-      for (const n of now) { const o = was.find((w) => w.key === n.key); if (o && n.v < o.v) hit("coverage-lowered", p, n.l.ln, n.l.text); }
-      for (const o of was) if (!now.some((n) => n.key === o.key)) hit("coverage-lowered", p, o.l.ln, `removed: ${o.l.text}`);
+      // pair the k-th new occurrence of a key with its k-th old one, so nested/per-path thresholds compare in place (PR70-r2)
+      const byKey = (xs) => xs.reduce((m, x) => (m[x.key] ??= []).push(x) && m, {});
+      const wk = byKey(was), nk = byKey(now);
+      for (const [key, olds] of Object.entries(wk)) {
+        const news = nk[key] ?? [];
+        olds.forEach((o, k) => { const n = news[k]; if (!n) hit("coverage-lowered", p, o.l.ln, `removed: ${o.l.text}`); else if (n.v < o.v) hit("coverage-lowered", p, n.l.ln, n.l.text); });
+      }
       // boolean coverage switches: perFile / all / enabled turned off or removed
       const on = /\b(perFile|all|enabled|reportOnFailure)\b["']?\s*[:=]\s*true\b/;
       const onKeys = (ls) => ls.map((l) => [l, on.exec(l.text)]).filter(([, m]) => m);
@@ -238,7 +243,8 @@ export function analyse(files, show) {
     }
 
     if (p.endsWith("package.json")) {
-      const scripts = (ls) => new Map(ls.map((l) => /^\s*"((?:test|lint|typecheck|check)(?::[\w:-]+)?)"\s*:\s*"(.*)"\s*,?\s*$/.exec(l.text)).filter(Boolean).map((m) => [m[1], m[2]]));
+      // any position on the line, so a one-line package.json is read too (PR70-r2)
+      const scripts = (ls) => new Map(ls.flatMap((l) => [...l.text.matchAll(/"((?:test|lint|typecheck|check)(?::[\w:-]+)?)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)]).map((m) => [m[1], m[2]]));
       const was = scripts(f.removed), now = scripts(f.added);
       for (const [k, v] of was) if (now.get(k) !== v) hit("test-script-changed", p, 0, `script "${k}": "${v}" -> ${now.has(k) ? `"${now.get(k)}"` : "removed"}`);
     }

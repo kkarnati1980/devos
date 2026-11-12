@@ -21,12 +21,12 @@
 | `test-skipped` | an added line in a test file with `.skip(`, `.only(`, `.todo(`, `.fixme(`, `xit(`, `xdescribe(`, `xtest(`, `fit(`, `fdescribe(`, `skipIf(`, `runIf(`, a `skip:`/`todo:`/`only:` option (inline or on its own line), or an early `return` guarded by an env/platform/CI/skip condition (one line, or an `if (…) {` line followed by `return`) |
 | `trivial-assertion` | a net-new (not merely moved) `expect(true|false|1|0|null|undefined|"")`, `assert(true)`/`assert.ok(true)`, or `assert.equal`/`strictEqual`/`deepEqual` of two equal literals in a test file (an assertion swapped for one that cannot fail) |
 | `assertions-lost` | net loss of `expect(`/`assert…(` calls across a changed test file's removed vs added lines |
-| `coverage-lowered` | a coverage key (`lines`, `branches`, `functions`, `statements`, `threshold`, `perFile`) lowered, or removed without replacement, or a boolean switch (`perFile`, `all`, `enabled`, `reportOnFailure`) turned from `true` to `false` or removed, in a test config, test file or workflow |
+| `coverage-lowered` | (compared occurrence by occurrence per key, so per-path thresholds on one line count) a coverage key (`lines`, `branches`, `functions`, `statements`, `threshold`, `perFile`) lowered, or removed without replacement, or a boolean switch (`perFile`, `all`, `enabled`, `reportOnFailure`) turned from `true` to `false` or removed, in a test config, test file or workflow |
 | `tests-excluded` | an added `exclude`, `testPathIgnorePatterns`, `testIgnore`, `modulePathIgnorePatterns` or `coveragePathIgnorePatterns` in a test config or test file |
-| `test-script-changed` | a `test`, `lint`, `typecheck` or `check` script (or `test:…` etc.) in a `package.json` changed or removed |
+| `test-script-changed` | a `test`, `lint`, `typecheck` or `check` script (or `test:…` etc.) in a `package.json` changed or removed, wherever it sits on the line |
 | `lint-rule-off` | an added rule set to `"off"`/`0` or downgraded to `"warn"`/`1` (quoted or unquoted key), or an added `ignores`, in an ESLint config |
 | `max-warnings-raised` | `--max-warnings N` raised, set negative (unlimited), or removed, in a test config or workflow |
-| `timeout-past-ceiling` | an added `timeout-minutes` above **30** in a workflow, or a `testTimeout`/`hookTimeout`/`timeout` above **120 000 ms** in a test file or test config (the documented ceilings, `CEILINGS`) |
+| `timeout-past-ceiling` | an added `timeout-minutes` above **30** in a workflow, or a `testTimeout`/`hookTimeout`/`timeout` (quoted key or not) above **120 000 ms** in a test file or test config (the documented ceilings, `CEILINGS`) |
 | `retries-raised` | `retries`/`retry`/`maxRetries` raised in a test config, test file or workflow, or a new non-zero one in a test config/test file (`--health-retries` is excluded) |
 | `suppression-added` | an added `eslint-disable`, `@ts-ignore`, `@ts-expect-error`, `@ts-nocheck`, `istanbul ignore`, `c8 ignore`, `nosec`, `gitleaks:allow` in a code/config file |
 | `gitleaksignore-added` | any added non-comment line in `.gitleaksignore` |
