@@ -15,6 +15,8 @@ const TABLES = [
   "run_event", "run_error",
   // ADR-0008
   "run_telemetry", "artifact", "log_receipt", "mechanism_flag", "guard_metric",
+  // M2.4 (docs/modules/M2.4.md)
+  "provision_step",
 ];
 
 // Unique keys the contract names (table -> column lists).
@@ -38,6 +40,7 @@ const UNIQUES = {
   policy_state: [["singleton"]],
   policy_decision: [["chain", "seq"], ["hash"]],
   run_event: [["run_id", "seq"]],
+  provision_step: [["project_id", "key"]],
   mechanism_flag: [["role", "mechanism"]],
 };
 
@@ -49,6 +52,7 @@ const CHECKS = [
   "approval_grant_uses", "approval_grant_expiry", "capability_envelope_limits", "budget_reservation_reconciled_has_actuals",
   "run_event_seq_positive", "run_error_not_an_attempt", "artifact_values", "guard_metric_values",
   "capability_envelope_paths_canonical", "milestone_closed_has_gate_approval",
+  "provision_step_done_has_external_id", "provision_step_attempts_nonnegative", "provision_step_last_error_short",
 ];
 const TRIGGERS = [
   "requirements_doc_one_approved", "vault_secret_global_unique", "deploy_requires_pass",
