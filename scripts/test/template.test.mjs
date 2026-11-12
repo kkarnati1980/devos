@@ -68,6 +68,8 @@ test("AT3: F2-1 catches aliased, required and socket-level clients anywhere outs
     "src/req.cjs": 'const { get } = require("https");\nmodule.exports = get;\n',
     "src/sock.mjs": 'import { createConnection } from "node:net";\nexport default createConnection;\n',
     "src/h2.mjs": 'import { connect } from "node:http2";\nexport default connect;\n',
+    "src/split.mjs": 'import { request } from\n"node:https";\nrequest("https://example.com");\n',   // Codex PR32-r3
+    "src/splitreq.cjs": 'const { get } = require(\n  "node:http"\n);\nget("http://10.0.0.1/");\n',
     "src/dyn.mjs": 'export const m = await import("node:https");\n',
     "src/ws.mjs": "export const ws = (u) => new WebSocket(u);\n",
     "src/build/f.mjs": "export const f = (u) => fetch(u);\n",
@@ -146,6 +148,10 @@ test("AT3: src/server.mjs may serve with node:http but never use its client side
     destructure: 'import http from "node:http";\nconst { request } = http;\nexport default request;\n',
     passed: 'import http from "node:http";\nexport const leak = (f) => f(http);\n',
     interpolated: 'import http from "node:http";\nexport const leak = (u) => `${http.request(u)}`;\n',
+    // Codex PR32-r3: a second node:http import under another name, and imports split over lines
+    secondImport: 'import client from "node:http";\nimport http from "node:http";\nhttp.createServer(() => {});\nclient.request("http://169.254.169.254/").end();\n',
+    multilineNamed: 'import http from "node:http";\nimport { request } from\n"node:https";\nrequest("https://example.com");\n',
+    multilineDefault: 'import client from\n  "node:http";\nclient.request("http://10.0.0.1/");\n',
   })) {
     const out = fresh(`server-${name}`);
     write(out, "src/server.mjs", code);

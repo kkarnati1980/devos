@@ -53,14 +53,20 @@ export function floorCheck(dir) {
     if (posix !== "src/safe-fetch.mjs" && !isTest && !posix.startsWith("public/")) {
       for (const [re, what] of RAW_CLIENT) if (re.test(src)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${what}) outside src/safe-fetch.mjs`);
       const serving = posix === "src/server.mjs";
-      const lines = src.split("\n");
-      let binding = null;
-      for (const line of lines) {
-        const mm = line.match(NET_MODULE);
-        if (!mm) continue;
-        if (serving && mm[3] === "http" && SERVER_HTTP_OK.test(line.trim())) {
-          const b = line.match(/^\s*import\s+(?:\*\s+as\s+)?(\w+)\s+from/); if (b) binding = b[1];
-          continue;
+      // Codex PR32-r3: matched on the whole source, not line by line, so an import split over lines
+      // (`import { request } from\n"node:https"`) is still found (\s in NET_MODULE spans newlines). src/server.mjs
+      // gets exactly ONE serving import of node:http, written on one line; any second network-module reference,
+      // including a second node:http import under another name, is a finding.
+      let binding = null, allowedLine = null;
+      for (const mm of src.matchAll(new RegExp(NET_MODULE.source, "g"))) {
+        if (serving && mm[3] === "http" && allowedLine === null) {
+          const ls = src.lastIndexOf("\n", mm.index) + 1, le = src.indexOf("\n", mm.index);
+          const line = src.slice(ls, le < 0 ? undefined : le);
+          if (SERVER_HTTP_OK.test(line.trim())) {
+            allowedLine = line;
+            const b = line.match(/^\s*import\s+(?:\*\s+as\s+)?(\w+)\s+from/); if (b) binding = b[1];
+            continue;
+          }
         }
         fails.push(`FAIL F2-1 ${posix}: imports node:${mm[3]} outside src/safe-fetch.mjs`);
       }
@@ -70,7 +76,8 @@ export function floorCheck(dir) {
       if (binding) {
         // Comments, plain string literals and template literals without interpolation are blanked first, so a URL
         // string like "http://…" is not a use; an interpolated template literal is kept and checked.
-        const body = lines.filter((l) => !(l.match(NET_MODULE) && SERVER_HTTP_OK.test(l.trim()))).join("\n")
+        const lines = src.split("\n"); lines.splice(lines.indexOf(allowedLine), 1);   // only the one allowed import
+        const body = lines.join("\n")
           .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\$])*`/g, (x) => " ".repeat(x.length));
         for (const u of body.matchAll(new RegExp(`(^|[^.\\w$])${binding}(?![\\w$])`, "g"))) {
           const after = body.slice(u.index + u[0].length);
