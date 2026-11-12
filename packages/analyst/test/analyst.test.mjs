@@ -374,3 +374,28 @@ test("AT10c (PR53-r4) one bare-ID item with 100k distinct IDs stays linear; trai
 `);
   assert.deepEqual(a.requirements.map((r) => r.title), ["FR-5 export", "x-FR-6"]);
 });
+
+test("AT10d (PR53-r5) IDs-only items with a separator are references; unresolved stack table rows are questions", () => {
+  const { a } = analyze(`## Requirements
+
+- FR-1 — FR-2
+- FR-1. FR-2
+FR-3: FR-4
+
+### FR-5 – FR-6
+
+- FR-1: Login
+- FR-2: Export
+
+## Stack
+
+| Component | Choice |
+|---|---|
+| Hosting | TBD |
+| Database | Postgres |
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.title]), [["FR-1", "Login"], ["FR-2", "Export"]]);
+  assert.equal(a.warnings.filter((w) => w.code === "duplicate-id").length, 0);
+  assert.deepEqual(a.stack.map((s) => s.text), ["Hosting — TBD", "Database — Postgres"]);
+  assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), ["Hosting — TBD"]);
+});

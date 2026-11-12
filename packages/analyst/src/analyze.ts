@@ -301,6 +301,10 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
         open = null;
         return;
       }
+      if (id && isBareIdReference(b.text, prefixes)) {
+        open = null; // an IDs-only heading is a reference: no requirement, section unchanged (PR53-r5)
+        return;
+      }
       if (id) {
         const prMatch = PRIORITY_SUFFIX.exec(id.rest);
         const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;
@@ -317,7 +321,13 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
       open = null;
       const cols = tableColumns(b.rows, prefixes);
       if (!cols) {
-        if (section === "stack") for (const row of b.rows.slice(1)) stack.push({ text: row.filter(Boolean).join(" — "), source: i });
+        // Unresolved stack rows (`Hosting | TBD`) are also stated questions, like list and paragraph items (PR53-r5).
+        if (section === "stack")
+          for (const row of b.rows.slice(1)) {
+            const text = row.filter(Boolean).join(" — ");
+            stack.push({ text, source: i });
+            if (isQuestionText(text)) stated.push({ text, source: i });
+          }
         return;
       }
       for (const row of b.rows.slice(cols.hasHeader ? 1 : 0)) {
@@ -357,6 +367,11 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     }
 
     const id = leadingId(text, prefixes);
+    // `FR-1 — FR-2` or `FR-1. FR-2` holds only IDs: a reference, never a definition of FR-1 (PR53-r5).
+    if (id && (b.type === "list-item" || b.type === "paragraph") && isBareIdReference(text, prefixes)) {
+      open = null;
+      return;
+    }
     if (id && (b.type === "list-item" || b.type === "paragraph")) {
       const prMatch = PRIORITY_SUFFIX.exec(id.rest);
       const title = prMatch ? id.rest.slice(0, prMatch.index).trim() : id.rest;
