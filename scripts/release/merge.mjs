@@ -62,9 +62,9 @@ async function allCheckRuns(gh, repo, sha) {
   for (let page = 1; page <= 20; page++) {
     const j = await gh.get(`/repos/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100&page=${page}`);
     runs.push(...(j.check_runs ?? []));
-    if (runs.length >= (j.total_count ?? 0) || (j.check_runs ?? []).length === 0) break;
+    if (runs.length >= (j.total_count ?? 0) || (j.check_runs ?? []).length === 0) return runs;
   }
-  return runs;
+  throw new CannotRun("more than 2,000 check runs; refusing to judge a partial list");
 }
 
 async function allStatuses(gh, repo, sha) {
@@ -72,9 +72,24 @@ async function allStatuses(gh, repo, sha) {
   for (let page = 1; page <= 20; page++) {
     const j = await gh.get(`/repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
     statuses.push(...(j.statuses ?? []));
-    if (statuses.length >= (j.total_count ?? 0) || (j.statuses ?? []).length === 0) break;
+    if (statuses.length >= (j.total_count ?? 0) || (j.statuses ?? []).length === 0) return statuses;
   }
-  return statuses;
+  throw new CannotRun("more than 2,000 statuses; refusing to judge a partial list");
+}
+
+// GitHub Actions check suites (one per triggered workflow). Jobs not created yet (needs:) are invisible as check
+// runs, but their suite is still queued or in progress. Suites of other apps are ignored: some apps leave suites
+// queued forever.
+async function actionsSuites(gh, repo, sha) {
+  const suites = [];
+  for (let page = 1; page <= 20; page++) {
+    const j = await gh.get(`/repos/${repo}/commits/${sha}/check-suites?per_page=100&page=${page}`);
+    suites.push(...(j.check_suites ?? []));
+    if (suites.length >= (j.total_count ?? 0) || (j.check_suites ?? []).length === 0) {
+      return suites.filter((s) => s.app?.slug === "github-actions");
+    }
+  }
+  throw new CannotRun("more than 2,000 check suites; refusing to judge a partial list");
 }
 
 // Reads every stored result for the PR's current head and returns { ok, sha, reasons[] }. Never merges.
@@ -96,6 +111,10 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG }) {
     else if (!OK_CONCLUSIONS.has(r.conclusion)) reasons.push(`check "${r.name}" concluded ${r.conclusion}`);
   }
   if (runs.length > 0 && !runs.some((r) => r.conclusion === "success")) reasons.push("no CI check run succeeded");
+  for (const s of await actionsSuites(gh, repo, sha)) {
+    if (s.status !== "completed") reasons.push(`a CI workflow (check suite ${s.id}) is ${s.status}`);
+    else if (!OK_CONCLUSIONS.has(s.conclusion)) reasons.push(`a CI workflow (check suite ${s.id}) concluded ${s.conclusion}`);
+  }
   for (const name of config.requiredCheckRuns) {
     const r = runs.find((x) => x.name === name);
     if (!r) reasons.push(`required check "${name}" has not reported on the head SHA`);
@@ -112,6 +131,7 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG }) {
   const codex = latest.get(config.codexContext);
   const desc = String(codex?.description ?? "");
   if (!codex) reasons.push(`no ${config.codexContext} status on the head SHA (not reviewed yet)`);
+  else if (codex.creator?.login !== config.codexCreator) reasons.push(`${config.codexContext} was posted by ${codex.creator?.login ?? "an unknown account"}, not the review watcher (${config.codexCreator})`);
   else if (codex.state !== "success" || !desc.startsWith("Codex PASS")) reasons.push(`${config.codexContext} is ${codex.state} ("${desc.slice(0, 80)}"), not a PASS`);
   else {
     const label = desc.match(/\bPR(\d+)-r\d+\b/);
@@ -143,7 +163,19 @@ export async function release(gh, { repo, pr, dryRun = false, config = DEFAULT_C
     return { code: 1, ...v };
   }
   if (dryRun) { log(`OK PR #${pr} at ${v.sha.slice(0, 7)}: would merge (dry run)`); return { code: 0, ...v }; }
-  const r = await gh.call("PUT", `/repos/${repo}/pulls/${pr}/merge`, { sha: v.sha, merge_method: "merge" });
+  let r;
+  try {
+    r = await gh.call("PUT", `/repos/${repo}/pulls/${pr}/merge`, { sha: v.sha, merge_method: "merge" });
+  } catch (err) {
+    // The PUT may have reached GitHub before the timeout: read the PR back instead of guessing.
+    const after = await gh.get(`/repos/${repo}/pulls/${pr}`).catch(() => null);
+    if (after?.merged && after.head?.sha === v.sha) {
+      log(`MERGED PR #${pr}: head ${v.sha} -> merge ${after.merge_commit_sha} (confirmed after: ${err.message})`);
+      return { code: 0, mergeSha: after.merge_commit_sha, ...v };
+    }
+    if (after && !after.merged) throw new CannotRun(`${err.message}; PR #${pr} is not merged`);
+    throw new CannotRun(`${err.message}; MERGE OUTCOME UNKNOWN for PR #${pr}, read the PR before retrying`);
+  }
   if (r.status === 200 && r.json?.merged) {
     log(`MERGED PR #${pr}: head ${v.sha} -> merge ${r.json.sha}`);
     return { code: 0, mergeSha: r.json.sha, ...v };
@@ -170,7 +202,7 @@ export function parseArgs(argv) {
     else throw new CannotRun(`unknown argument: ${a}`);
   }
   if (!out.pr) throw new CannotRun("usage: merge.mjs <pr> [--repo owner/name] [--dry-run]");
-  if (!/^[\w.-]+\/[\w.-]+$/.test(out.repo ?? "")) throw new CannotRun("--repo must be owner/name");
+  if (!/^[\w.-]+\/[\w.-]+$/.test(out.repo ?? "") || out.repo.split("/").some((seg) => /^\.+$/.test(seg))) throw new CannotRun("--repo must be owner/name");
   return out;
 }
 

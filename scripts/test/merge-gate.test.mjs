@@ -2,12 +2,14 @@
 // all on the PR's current head SHA, and merges pinned to that SHA (docs/modules/GI-3.md, AT1–AT9).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { githubClient, main, release } from "../release/merge.mjs";
+import { DEFAULT_CONFIG, githubClient, main, release } from "../release/merge.mjs";
 
 const REPO = "kkarnati1980/devos";
 const HEAD = "a".repeat(40);
 const MAIN = "b".repeat(40);
+const OLD = "d".repeat(40);
 const TOKEN = "ghp_" + "X".repeat(36);
+const WATCHER = { login: "kkarnati1980" };
 
 // A fake GitHub. `state` is mutated per test; every request is recorded.
 function fakeGitHub(over = {}) {
@@ -17,7 +19,9 @@ function fakeGitHub(over = {}) {
       { name: "build", status: "completed", conclusion: "success" },
       { name: "e2e", status: "completed", conclusion: "skipped" },
     ],
-    statuses: [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r2)", updated_at: "2026-11-12T10:00:00Z" }],
+    statuses: [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r2)", creator: WATCHER, updated_at: "2026-11-12T10:00:00Z" }],
+    suites: [{ id: 1, app: { slug: "github-actions" }, status: "completed", conclusion: "success" }, { id: 2, app: { slug: "claude" }, status: "queued", conclusion: null }],
+    oldShaStatuses: [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r1)", creator: WATCHER }],
     mainSha: MAIN,
     compare: "ahead",
     mergeStatus: 200,
@@ -36,9 +40,12 @@ function fakeGitHub(over = {}) {
       return reply(200, { total_count: state.checkRuns.length, check_runs: slice });
     }
     if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)) return reply(200, { total_count: state.statuses.length, statuses: state.statuses });
+    if (path.startsWith(`/repos/${REPO}/commits/${OLD}/status`)) return reply(200, { total_count: 1, statuses: state.oldShaStatuses });
+    if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/check-suites`)) return reply(200, { total_count: state.suites.length, check_suites: state.suites });
     if (path === `/repos/${REPO}/git/ref/heads/main`) return reply(200, { object: { sha: state.mainSha } });
     if (path === `/repos/${REPO}/compare/${MAIN}...${HEAD}`) return reply(200, { status: state.compare });
     if (path === `/repos/${REPO}/pulls/7/merge` && init.method === "PUT") {
+      if (state.putThrows) { if (state.putThrows === "merged") state.pr = { ...state.pr, merged: true, state: "closed", merge_commit_sha: "e".repeat(40) }; throw new TypeError("socket hang up"); }
       return state.mergeStatus === 200 ? reply(200, { merged: true, sha: "c".repeat(40) }) : reply(state.mergeStatus, { message: "Head branch was modified" });
     }
     return reply(404, { message: "not found" });
@@ -59,10 +66,13 @@ test("AT1 all green: merges once, pinned to the evaluated head SHA, merge method
 test("AT2 no Codex PASS (missing, CHANGES_REQUESTED, pending, or a PASS labelled for another PR): refused, no merge", async () => {
   const cases = [
     [],
-    [{ context: "codex-review", state: "failure", description: "Codex CHANGES_REQUESTED (PR7-r2)" }],
-    [{ context: "codex-review", state: "pending", description: "runner busy" }],
-    [{ context: "codex-review", state: "success", description: "Codex PASS (PR8-r1)" }],
-    [{ context: "codex-review", state: "success", description: "looks fine" }],
+    [{ context: "codex-review", state: "failure", description: "Codex CHANGES_REQUESTED (PR7-r2)", creator: WATCHER }],
+    [{ context: "codex-review", state: "pending", description: "runner busy", creator: WATCHER }],
+    [{ context: "codex-review", state: "success", description: "Codex PASS (PR8-r1)", creator: WATCHER }],
+    [{ context: "codex-review", state: "success", description: "looks fine", creator: WATCHER }],
+    // A PASS forged by a workflow (GITHUB_TOKEN posts as github-actions[bot]) or with no creator is refused.
+    [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r1)", creator: { login: "github-actions[bot]" } }],
+    [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r1)" }],
   ];
   for (const statuses of cases) {
     const f = fakeGitHub({ statuses });
@@ -89,6 +99,17 @@ test("AT3 red or unfinished CI on the head SHA: refused, no merge", async () => 
   }
 });
 
+test("AT3b an Actions workflow still queued or running (jobs not created yet) refuses; other apps' suites are ignored", async () => {
+  for (const status of ["queued", "in_progress"]) {
+    const f = fakeGitHub({ suites: [{ id: 9, app: { slug: "github-actions" }, status, conclusion: null }] });
+    assert.equal((await run(f)).code, 1, status);
+    assert.equal(merges(f).length, 0);
+  }
+  const f = fakeGitHub({ suites: [{ id: 9, app: { slug: "github-actions" }, status: "completed", conclusion: "failure" }] });
+  assert.equal((await run(f)).code, 1);
+  assert.equal((await run(fakeGitHub())).code, 0, "a queued suite of another app does not block");
+});
+
 test("AT4 main not an ancestor of the head (behind or diverged): refused, no merge", async () => {
   for (const compare of ["behind", "diverged"]) {
     const f = fakeGitHub({ compare });
@@ -107,10 +128,29 @@ test("AT5 GC5: a commit after the PASS voids it — the head moved between check
   assert.equal(merges(f).length, 1, "the merge PUT is never retried");
   // And a PASS that only exists on the old SHA does not count for the new head: statuses are read per head SHA.
   assert.ok(f.calls.some((c) => c.path.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)));
+  // The PASS sits on the old SHA; the PR's head is a new commit with no review yet: refused, and the old SHA is never read.
+  const g = fakeGitHub({ statuses: [] });
+  const r2 = await run(g);
+  assert.equal(r2.code, 1);
+  assert.match(r2.reasons.join("\n"), /no codex-review status/);
+  assert.ok(!g.calls.some((c) => c.path.includes(OLD)));
+  assert.equal(merges(g).length, 0);
+});
+
+test("AT5b a merge PUT that fails in flight is read back: merged → exit 0; not merged → exit 2; never retried", async () => {
+  const log = () => {};
+  const f = fakeGitHub({ putThrows: "merged" });
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: f.fetchImpl, log }), 0);
+  assert.equal(merges(f).length, 1);
+  const g = fakeGitHub({ putThrows: "lost" });
+  const out = [];
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: g.fetchImpl, log: (l) => out.push(l) }), 2);
+  assert.equal(merges(g).length, 1);
+  assert.match(out.join("\n"), /not merged/);
 });
 
 test("AT6 a required check run (e.g. the CI aggregator or floor guard once listed) must report success", async () => {
-  const config = { baseBranch: "main", codexContext: "codex-review", requiredCheckRuns: ["floor-guard"] };
+  const config = { ...DEFAULT_CONFIG, requiredCheckRuns: ["floor-guard"] };
   let f = fakeGitHub();
   assert.equal((await run(f, { config })).code, 1, "missing required check");
   f = fakeGitHub({ checkRuns: [{ name: "build", status: "completed", conclusion: "success" }, { name: "floor-guard", status: "completed", conclusion: "skipped" }] });
@@ -133,8 +173,10 @@ test("AT7 not open, draft, wrong base, fork head, or another failing status: ref
     assert.equal((await run(f)).code, 1, JSON.stringify(pr));
     assert.equal(merges(f).length, 0);
   }
-  const f = fakeGitHub({ statuses: [...fakeGitHub().state.statuses, { context: "other", state: "failure" }] });
-  assert.equal((await run(f)).code, 1);
+  for (const state of ["failure", "error", "pending"]) {
+    const f = fakeGitHub({ statuses: [...fakeGitHub().state.statuses, { context: "other", state }] });
+    assert.equal((await run(f)).code, 1, state);
+  }
 });
 
 test("AT8 --dry-run never merges; paginated check runs beyond page 1 are judged", async () => {
@@ -152,6 +194,7 @@ test("AT9 cannot run → exit 2, never a merge; the token never appears in outpu
   const log = (l) => out.push(l);
   assert.equal(await main([], { env: { GH_TOKEN: TOKEN }, log }), 2);
   assert.equal(await main(["7", "--repo", "bad repo"], { env: { GH_TOKEN: TOKEN }, log }), 2);
+  assert.equal(await main(["7", "--repo", "../.."], { env: { GH_TOKEN: TOKEN }, log }), 2);
   const down = async () => { throw new TypeError("fetch failed"); };
   assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: down, log }), 2);
   const f = fakeGitHub({ fail5xx: 2 });
