@@ -31,7 +31,7 @@ test("AT2/AT4/AT5: the generated core's own tests pass (F2-2 corpus, caps, /heal
   const out = fresh("core-tests");
   const r = spawnSync(process.execPath, ["--test", "test/safe-fetch.test.mjs", "test/server.test.mjs"], { cwd: out, encoding: "utf8", timeout: 60_000, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT")) });
   assert.equal(r.status, 0, r.stdout.slice(-3000) + r.stderr.slice(-2000));
-  assert.match(r.stdout, /# pass 20/);
+  assert.match(r.stdout, /# pass 21/);
   assert.match(r.stdout, /# fail 0/);
 });
 
@@ -79,6 +79,8 @@ test("AT3: F2-1 catches aliased, required and socket-level clients anywhere outs
     "src/cp.mjs": 'import { execFile } from "node:child_process";\nexport default execFile;\n',
     "src/cr.mjs": 'import { createRequire } from "node:module";\nexport default createRequire;\n',
     "src/dm.mjs": "const m = 'node:' + 'http';\nexport const x = await import(m);\n",
+    "src/tl.mjs": "const name = 'http';\nconst c = await import(`node:${name}`);\nexport default c;\n",
+    "src/rq.cjs": "const n = 'https';\nmodule.exports = require(n);\n",
   };
   for (const [f, c] of Object.entries(cases)) write(out, f, c);
   write(out, "public/app.js", 'fetch("/api/items");\n');
@@ -140,6 +142,10 @@ test("AT3: src/server.mjs may serve with node:http but never use its client side
     bracket: 'import http from "node:http";\nexport const leak = (u) => http["request"](u);\n',
     dot: 'import http from "node:http";\nexport const leak = (u) => http.get(u);\n',
     https: 'import https from "node:https";\nexport default https;\n',
+    bareAlias: 'import http from "node:http";\nconst client = http;\nexport const leak = (u) => client.request(u);\n',
+    destructure: 'import http from "node:http";\nconst { request } = http;\nexport default request;\n',
+    passed: 'import http from "node:http";\nexport const leak = (f) => f(http);\n',
+    interpolated: 'import http from "node:http";\nexport const leak = (u) => `${http.request(u)}`;\n',
   })) {
     const out = fresh(`server-${name}`);
     write(out, "src/server.mjs", code);

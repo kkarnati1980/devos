@@ -22,6 +22,9 @@ const RAW_CLIENT = [
   [/\bglobalThis\s*(\.\s*fetch\b|\[)/, "globalThis.fetch"],
   [/(\bfrom|\bimport|\brequire)\s*\(?\s*["'`](node:)?(module|child_process|worker_threads)["'`]/, "module loader / child process (can reach the network indirectly)"],
   [/\bimport\s*\(\s*[^"'`\s)]/, "dynamic import of a computed module name"],
+  // A template literal with an interpolation is computed too (Codex PR32-r1): import(`node:${name}`).
+  [/\b(import|require)\s*\(\s*`[^`]*\$\{/, "dynamic import of a computed module name"],
+  [/\brequire\s*\(\s*[^"'`\s)]/, "require of a computed module name"],
 ];
 // src/server.mjs may take only the server side of node:http: a default/namespace import or { createServer }.
 const SERVER_HTTP_OK = /^import\s+(\w+|\*\s+as\s+\w+|\{\s*createServer\s*\})\s+from\s+["'](node:)?http["'];?\s*$/;
@@ -61,9 +64,19 @@ export function floorCheck(dir) {
         }
         fails.push(`FAIL F2-1 ${posix}: imports node:${mm[3]} outside src/safe-fetch.mjs`);
       }
-      // The serving binding may only be used for createServer / STATUS_CODES / METHODS.
-      if (binding) for (const u of src.matchAll(new RegExp(`\\b${binding}\\s*(\\.\\s*(\\w+)|\\[)`, "g"))) {
-        if (!["createServer", "STATUS_CODES", "METHODS"].includes(u[2])) { fails.push(`FAIL F2-1 ${posix}: node:http used for more than serving (${binding}${u[1]})`); break; }
+      // The serving binding may only be used as `<binding>.createServer|STATUS_CODES|METHODS` (Codex PR32-r1):
+      // any other use of the bare binding (an alias `const c = http`, destructuring `const { request } = http`,
+      // passing it to a function, computed access) is a finding, so the client half can never escape.
+      if (binding) {
+        // Comments, plain string literals and template literals without interpolation are blanked first, so a URL
+        // string like "http://…" is not a use; an interpolated template literal is kept and checked.
+        const body = lines.filter((l) => !(l.match(NET_MODULE) && SERVER_HTTP_OK.test(l.trim()))).join("\n")
+          .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\$])*`/g, (x) => " ".repeat(x.length));
+        for (const u of body.matchAll(new RegExp(`(^|[^.\\w$])${binding}(?![\\w$])`, "g"))) {
+          const after = body.slice(u.index + u[0].length);
+          const ok = after.match(/^\s*\.\s*(createServer|STATUS_CODES|METHODS)(?![\w$])/);
+          if (!ok) { fails.push(`FAIL F2-1 ${posix}: node:http used for more than serving (${binding}${after.slice(0, 20).split("\n")[0]})`); break; }
+        }
       }
     }
     if (posix.startsWith("public/") && /process\.env/.test(src)) fails.push(`FAIL F1-4 ${posix}: client code reads process.env`);

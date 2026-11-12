@@ -113,7 +113,11 @@ export async function safeFetch(input, opts = {}) {
     if ([301, 302, 303, 307, 308].includes(res.status) && res.headers.location) {
       if (hop >= maxRedirects) throw new SafeFetchError("redirects", "too many redirects");
       try { url = new URL(res.headers.location, url); } catch { throw new SafeFetchError("url", "invalid redirect location"); }
-      if (res.status === 303 || ((res.status === 301 || res.status === 302) && m !== "GET" && m !== "HEAD")) { m = "GET"; b = undefined; }
+      if (res.status === 303 || ((res.status === 301 || res.status === 302) && m !== "GET" && m !== "HEAD")) {
+        m = "GET"; b = undefined;
+        // The body is dropped, so its headers go too (Codex PR32-r1): a GET must not declare body bytes it never sends.
+        h = Object.fromEntries(Object.entries(h).filter(([k]) => !/^(content-(length|type|encoding|language|location)|transfer-encoding)$/i.test(k)));
+      }
       h = redirectHeaders(h, origin0, url.origin);
       continue;
     }

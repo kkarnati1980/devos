@@ -16,6 +16,8 @@ before(async () => {
     if (req.url === "/to-declared") { res.writeHead(302, { location: `http://stub.test:${port}/ok` }); res.end(); return; }
     if (req.url === "/to-other-origin") { res.writeHead(307, { location: `http://other.test:${port}/echo` }); res.end(); return; }
     if (req.url === "/to-same-origin") { res.writeHead(308, { location: "/echo" }); res.end(); return; }
+    if (req.url === "/see-other") { res.writeHead(303, { location: "/echo-headers" }); res.end(); return; }
+    if (req.url === "/echo-headers") { res.end(JSON.stringify({ method: req.method, cl: req.headers["content-length"] || null, ct: req.headers["content-type"] || null, te: req.headers["transfer-encoding"] || null })); return; }
     if (req.url === "/echo") { let b = ""; req.on("data", (d) => (b += d)); req.on("end", () => res.end(JSON.stringify({ method: req.method, body: b, auth: req.headers.authorization || null, cookie: req.headers.cookie || null, accept: req.headers.accept || null }))); return; }
     res.writeHead(404); res.end();
   });
@@ -86,6 +88,11 @@ test("credential headers are dropped when a redirect changes origin; 307/308 kee
   await assert.rejects(safeFetch(`http://stub.test:${port}/to-other-origin`, { ...opts, headers: hdr }), (e) => e.code === "blocked-address");
   const same = JSON.parse((await safeFetch(`http://stub.test:${port}/to-same-origin`, { ...opts, method: "POST", body: "x=1", headers: hdr })).text());
   assert.deepEqual(same, { method: "POST", body: "x=1", auth: "Bearer app-token", cookie: "s=1", accept: "application/json" });
+});
+test("a 303 after a POST becomes a GET without the body or its headers (Codex PR32-r1)", async () => {
+  const r = await safeFetch(`http://stub.test:${port}/see-other`, { ...stub, method: "POST", body: "abc", timeoutMs: 2000,
+    headers: { "Content-Length": "3", "content-type": "text/plain", accept: "application/json" } });
+  assert.deepEqual(JSON.parse(r.text()), { method: "GET", cl: null, ct: null, te: null });
 });
 test("credentials are dropped when the origin changes, kept within the origin", () => {
   const h = { authorization: "Bearer x", cookie: "c", "x-api-key": "k", "x-service-token": "t", "proxy-authorization": "p", api_key: "k", "x-auth": "a", "x-functions-key": "f", "x-session": "s", accept: "a", "user-agent": "u" };
