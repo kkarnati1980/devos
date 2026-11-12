@@ -290,3 +290,49 @@ test("AB5b a fenced JSON reply is accepted", async () => {
   const r = await assistAnalysis(blocks, a, async () => ({ output: "```json\n" + JSON.stringify({ requirements: [{ block: menu, title: "Owner publishes daily menu" }] }) + "\n```" }));
   assert.equal(r.analysis.requirements.filter((x) => x.proposed).length, 1);
 });
+
+test("AB8b (PR56-r1) a table row belongs to the ID that opens it; emphasised ID cells are found", async () => {
+  const md = `| ID | Requirement |
+|---|---|
+| FR-1 | FR-2 integration exports orders |
+| FR-2 | Print shipping labels |
+| **FR-3** | Send weekly sales email |
+`;
+  const blocks = blocksOf(md);
+  const a = analyzeSpec(blocks);
+  const calls = [];
+  await assistAnalysis(blocks, a, fake({ requirements: [], criteria: [] }, calls));
+  const lines = calls[0].prompt.split("\n").filter((l) => l.startsWith("{\"block\""));
+  const line = (k) => lines.find((l) => l.includes(`"requirement":"${k}"`));
+  assert.ok(line("FR-1").includes("integration"));
+  assert.ok(line("FR-2").includes("Print shipping labels"));
+  assert.ok(!line("FR-2").includes("integration"), "FR-2 is grounded on its own row, not FR-1's");
+  assert.ok(line("FR-3") && line("FR-3").includes("weekly sales email"), "an emphasised ID cell is found");
+});
+
+test("AB9b (PR56-r1) a proposal inherits the nearest milestone heading, even a repeated name", async () => {
+  const md = `## Phase 1
+
+- FR-1: Login
+  - works
+
+## Phase 2
+
+- FR-2: Export
+  - works
+
+## Phase 1
+
+The shop owner can publish a daily menu with prices for each bread.
+`;
+  const blocks = blocksOf(md);
+  const a = analyzeSpec(blocks);
+  const para = idx(blocks, "daily menu");
+  const r = await assistAnalysis(blocks, a, fake({
+    requirements: [{ block: para, title: "Owner publishes daily menu with bread prices" }],
+    criteria: [],
+  }));
+  const p = r.analysis.requirements.find((x) => x.proposed);
+  assert.ok(p, JSON.stringify(r.warnings));
+  assert.equal(p.milestone, "Phase 1");
+});

@@ -3,7 +3,7 @@
 // tie to a cited candidate block. Spec text is untrusted (ADR-0011 §2): it goes to the model
 // inside a data envelope, and nothing the model returns is executed or treated as an instruction.
 import { DEFAULT_ID_PREFIXES, extractRequirementIds, type Block } from "@devos/intake";
-import type { Analysis, OpenQuestion, Requirement } from "./analyze.js";
+import { MILESTONE_HEADING, type Analysis, type OpenQuestion, type Requirement } from "./analyze.js";
 
 /** One model call. M2.2-d wires this to the M1.5 run engine; tests pass a fake. */
 export type ModelRunner = (request: { prompt: string; tag: "analyst_assist" }) => Promise<{ output: string }>;
@@ -71,11 +71,25 @@ function blockText(b: Block): string {
  * Text the model sees and grounds against for a requirement: its own table row (cells joined) for a
  * table requirement, else its source block's text (PR pre-review: never the whole table).
  */
-export function requirementText(blocks: readonly Block[], r: Requirement): string {
+export function requirementText(
+  blocks: readonly Block[],
+  r: Requirement,
+  prefixes: readonly string[] = DEFAULT_ID_PREFIXES,
+): string {
   const b = blocks[r.source];
   if (!b) return "";
   if (b.type !== "table") return b.text;
-  const row = b.rows.find((cells) => cells.some((c) => c.trim() === r.key || c.trim().startsWith(r.key + " ")));
+  // A row belongs to the ID that opens its first ID-bearing cell (emphasis ignored), never to an ID that
+  // only appears inside another row's title (PR56-r1).
+  const rowKey = (cells: readonly string[]): string | null => {
+    for (const c of cells) {
+      const plain = c.replace(/[*_`]/g, "").trim();
+      const first = extractRequirementIds(plain, prefixes)[0]?.id;
+      if (first) return plain.startsWith(first) ? first : null;
+    }
+    return null;
+  };
+  const row = b.rows.find((cells) => rowKey(cells) === r.key);
   return row ? row.join(" ") : "";
 }
 
@@ -301,6 +315,7 @@ export async function assistAnalysis(
 
   // New requirements proposed from prose blocks.
   const added: Requirement[] = [];
+  const headingMilestone = milestoneByBlock(blocks, analysis);
   if (Array.isArray(parsed.requirements)) {
     for (const item of parsed.requirements as unknown[]) {
       if (!item || typeof item !== "object") continue;
@@ -339,7 +354,7 @@ export async function assistAnalysis(
         title: t,
         priority: "must",
         acceptance: crit,
-        milestone: nearestMilestone(blocks, analysis, block),
+        milestone: headingMilestone[block] ?? null,
         assigned: true,
         source: block,
         proposed: true,
@@ -372,10 +387,22 @@ export async function assistAnalysis(
   };
 }
 
-function nearestMilestone(blocks: readonly Block[], analysis: Analysis, source: number): string | null {
-  let best: string | null = null;
-  // Same rule as the deterministic pass: the nearest milestone *heading* above (table milestone columns
-  // apply only to their own rows).
-  for (const m of analysis.milestones) if (m.source <= source && blocks[m.source]?.type === "heading") best = m.name;
-  return best;
+/**
+ * For each block, the nearest milestone heading at or above it — the same rule as the deterministic pass
+ * (table milestone columns apply only to their own rows). Computed from the blocks, not from
+ * `analysis.milestones`, which keeps only each name's first source, so a repeated `Phase 1` heading or a
+ * name first seen in a table column still counts (PR56-r1). One linear pass.
+ */
+function milestoneByBlock(blocks: readonly Block[], analysis: Analysis): (string | null)[] {
+  const names = new Set(analysis.milestones.map((m) => m.name));
+  const out: (string | null)[] = [];
+  let current: string | null = null;
+  blocks.forEach((b) => {
+    if (b.type === "heading") {
+      const t = b.text.trim();
+      if (MILESTONE_HEADING.test(t) && names.has(t)) current = t;
+    }
+    out.push(current);
+  });
+  return out;
 }
