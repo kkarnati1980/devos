@@ -72,9 +72,21 @@ export function graphqlApi(client: LinearClient): LinearApi {
         `mutation($id: String!, $i: ProjectUpdateInput!) { projectUpdate(id: $id, input: $i) { success } }`, { id, i: input })).projectUpdate, "project update");
     },
     async milestones(projectId) {
-      const d = await client.query<{ project: { projectMilestones: Conn<{ id: string; name: string; description: string | null }> } }>(
-        `query($id: String!) { project(id: $id) { projectMilestones(first: 250) { nodes { id name description } } } }`, { id: projectId });
-      return d.project.projectMilestones.nodes;
+      // Every page (Codex PR35-r3): a partial list would make the sync re-create milestones it did not see.
+      type M = { id: string; name: string; description: string | null };
+      const out: M[] = [];
+      let after: string | null = null;
+      for (let p = 0; p < MAX_PAGES; p++) {
+        const d: { project: { projectMilestones: Conn<M> } } = await client.query(
+          `query($id: String!, $after: String) { project(id: $id) { projectMilestones(first: ${PAGE}, after: $after) { nodes { id name description } pageInfo { hasNextPage endCursor } } } }`,
+          { id: projectId, after });
+        out.push(...d.project.projectMilestones.nodes);
+        const pi = d.project.projectMilestones.pageInfo;
+        if (!pi?.hasNextPage) return out;
+        if (!pi.endCursor) throw new LinearError("bad-response", "Linear milestone page without a cursor");
+        after = pi.endCursor;
+      }
+      throw new LinearError("bad-response", "too many milestones in one Linear project");
     },
     async createMilestone(input) {
       const d = await client.mutate<{ projectMilestoneCreate: { success: boolean; projectMilestone: { id: string } } }>(

@@ -17,6 +17,8 @@ export interface LinearClientOptions {
   apiKey: () => Promise<string> | string;
   endpoint?: string;
   timeoutMs?: number;
+  /** Bound on reading the key from the vault (Codex PR35-r3): key + call stay inside the lock's write margin. */
+  keyTimeoutMs?: number;
   maxAttempts?: number;
   baseDelayMs?: number;
   /** Below this many remaining requests, calls fail with rate-limited until the reset time. */
@@ -32,7 +34,7 @@ export class LinearClient {
 
   constructor(opts: LinearClientOptions) {
     this.o = {
-      endpoint: LINEAR_ENDPOINT, timeoutMs: 15_000, maxAttempts: 3, baseDelayMs: 500, minRemaining: 50,
+      endpoint: LINEAR_ENDPOINT, timeoutMs: 15_000, keyTimeoutMs: 10_000, maxAttempts: 3, baseDelayMs: 500, minRemaining: 50,
       fetchImpl: fetch, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => Date.now(), ...opts,
     };
   }
@@ -69,7 +71,19 @@ export class LinearClient {
 
   private async once<T>(query: string, variables: Record<string, unknown>): Promise<T> {
     let key: string;
-    try { key = await this.o.apiKey(); } catch { throw new LinearError("bad-response", "Linear API key is not available from the vault"); }
+    // Bounded (Codex PR35-r3): a stalled vault read must not let a fenced write start after the lock is gone.
+    // Worst case for one write: keyTimeoutMs + timeoutMs = 25 s, inside WRITE_MARGIN_MS (60 s).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      key = await Promise.race([
+        Promise.resolve().then(() => this.o.apiKey()),
+        new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("key-timeout")), this.o.keyTimeoutMs); }),
+      ]);
+    } catch (e) {
+      throw (e as Error)?.message === "key-timeout"
+        ? new LinearError("timeout", "Linear API key read from the vault timed out")
+        : new LinearError("bad-response", "Linear API key is not available from the vault");
+    } finally { if (timer) clearTimeout(timer); }
     let res: Response;
     try {
       res = await this.o.fetchImpl(this.o.endpoint, {

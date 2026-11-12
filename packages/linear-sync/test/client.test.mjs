@@ -92,3 +92,19 @@ test("a rate-limit error on a 4xx is retried as 429; Retry-After is capped; a va
   const v = new LinearClient({ apiKey: () => { throw new Error(KEY); }, fetchImpl: async () => res(200, { data: {} }), sleep: async () => {} });
   await assert.rejects(v.query("query { x }"), (e) => e.code === "bad-response" && !e.message.includes(KEY));
 });
+
+test("a stalled vault read fails the call before any request starts (Codex PR35-r3: write after lock expiry)", async () => {
+  const calls = [];
+  const c = new LinearClient({ apiKey: () => new Promise(() => {}), keyTimeoutMs: 50,
+    fetchImpl: async () => { calls.push(1); return res(200, { data: {} }); }, sleep: async () => {} });
+  const t0 = Date.now();
+  await assert.rejects(c.mutate("mutation { x }"), (e) => e instanceof LinearError && e.code === "timeout" && /vault timed out/.test(e.message));
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(calls.length, 0, "no mutation sent after the key timeout");
+});
+
+test("the default key bound plus the call timeout fits inside the sync lock's write margin", async () => {
+  const { WRITE_MARGIN_MS } = await import("../dist/index.js");
+  const c = new LinearClient({ apiKey: () => KEY });
+  assert.ok(c["o"].keyTimeoutMs + c["o"].timeoutMs < WRITE_MARGIN_MS);
+});

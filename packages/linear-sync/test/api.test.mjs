@@ -45,3 +45,18 @@ test("team: the lowest-position state of a type wins; labels include workspace o
   assert.deepEqual(t.labels.map((l) => l.name), ["Module", "Human"], "another team's label is not usable");
   assert.equal(calls.length, 3);
 });
+
+test("milestones are read across every page (Codex PR35-r3: a partial list would re-create milestones)", async () => {
+  const m = (id) => ({ id, name: id, description: null });
+  const { a, calls } = api((b) => b.variables.after
+    ? { project: { projectMilestones: { nodes: [m("m2")], pageInfo: { hasNextPage: false, endCursor: null } } } }
+    : { project: { projectMilestones: { nodes: [m("m1")], pageInfo: { hasNextPage: true, endCursor: "c1" } } } });
+  assert.deepEqual((await a.milestones("p1")).map((x) => x.id), ["m1", "m2"]);
+  assert.equal(calls.length, 2); assert.equal(calls[1].variables.after, "c1");
+  assert.match(calls[0].query, /pageInfo \{ hasNextPage endCursor \}/);
+});
+
+test("a milestone page that claims more but gives no cursor is refused, not treated as complete", async () => {
+  const { a } = api(() => ({ project: { projectMilestones: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } } }));
+  await assert.rejects(a.milestones("p1"), /milestone page without a cursor/);
+});
