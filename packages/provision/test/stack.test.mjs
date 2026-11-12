@@ -20,9 +20,10 @@ function setup(fake = fakeProviders(), store = new MemoryStore()) {
 test("AT1/AT2 environments and ports are created once, recorded, and a re-run creates nothing", async () => {
   const s = setup();
   const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
-  assert.deepEqual(out.map((o) => o.outcome), ["created", "created", "created", "created", "created", "created"]);
+  // Coolify creates `production` with the project, so that step adopts it.
+  assert.deepEqual(out.map((o) => o.outcome), ["created", "created", "created", "adopted", "created", "created"]);
   const proj = [...s.fake.projects.values()][0];
-  assert.deepEqual(proj.environments, ["preview", "production"]);
+  assert.deepEqual([...proj.environments].sort(), ["preview", "production"]);
   const kinds = s.store.resources.map((r) => `${r.kind}:${r.externalId}`);
   assert.ok(kinds.includes(`environment:${proj.uuid}/preview`) && kinds.includes(`environment:${proj.uuid}/production`));
   assert.ok(kinds.includes("port:20000") && kinds.includes("port:20001"), kinds.join(","));
@@ -45,7 +46,7 @@ test("AT4 an environment create that times out after succeeding is adopted, neve
   s.fake.faults.push({ match: (m, p) => m === "POST" && p.endsWith("/environments"), action: "timeout-after" });
   const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
   assert.equal(out[2].outcome, "adopted");
-  assert.equal(s.fake.creates().filter((c) => c.path.endsWith("/environments")).length, 2, "one POST per environment");
+  assert.equal(s.fake.creates().filter((c) => c.path.endsWith("/environments")).length, 1, "one POST (preview); production came with the project");
 });
 
 test("AT10 two projects get distinct, stable ports; preview even, production odd; an exhausted range fails cleanly", async () => {

@@ -116,3 +116,19 @@ test("AT10 on Postgres: two projects provisioned at once get distinct ports and 
   const again = await db.resource.findMany({ where: { projectId: p.id, kind: "port" }, select: { externalId: true }, orderBy: { externalId: "asc" } });
   assert.deepEqual(again.map((r) => r.externalId), ports.filter((r) => r.projectId === p.id).map((r) => r.externalId).sort());
 });
+
+test("AT10 on Postgres: a port another project takes between our read and our insert is skipped, never shared", async () => {
+  const { portStep } = await import("../dist/index.js");
+  const p = await seed(); const q = await seed(); const store = new PrismaStore(db, { databaseUrl: url });
+  const from = 21000 + 2 * Math.floor(Math.random() * 20000); const range = { from, to: from + 9 };
+  const orig = store.listResources.bind(store); let first = true;
+  store.listResources = async (...a) => {
+    const r = await orig(...a);
+    if (first) { first = false; await new PrismaStore(db, { databaseUrl: url }).recordResource(q.id, { provider: "coolify", kind: "port", externalId: String(from), name: `${q.slug}/preview` }); }
+    return r;
+  };
+  const got = await portStep(store, p, "preview", range).create();
+  assert.equal(got.externalId, String(from + 2));
+  const row = await db.resource.findFirst({ where: { provider: "coolify", kind: "port", externalId: String(from) } });
+  assert.equal(row.projectId, q.id);
+});

@@ -70,7 +70,8 @@ export function fakeProviders() {
     if (method === "POST" && path === "/api/v1/projects") {
       const b = JSON.parse(init.body);
       const uuid = `cf${randomUUID().replace(/-/g, "").slice(0, 20)}`;
-      projects.set(uuid, { uuid, name: b.name, description: b.description ?? null });
+      // Coolify v4 creates a `production` environment with every new project (M0.4 04b checks for it first).
+      projects.set(uuid, { uuid, name: b.name, description: b.description ?? null, environments: ["production"] });
       return json(201, { uuid });
     }
     return json(404, { message: "Not Found" });
