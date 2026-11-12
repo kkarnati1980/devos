@@ -77,19 +77,25 @@ async function allStatuses(gh, repo, sha) {
   throw new CannotRun("more than 2,000 statuses; refusing to judge a partial list");
 }
 
-// GitHub Actions check suites (one per triggered workflow). Jobs not created yet (needs:) are invisible as check
-// runs, but their suite is still queued or in progress. Suites of other apps are ignored: some apps leave suites
-// queued forever.
-async function actionsSuites(gh, repo, sha) {
-  const suites = [];
+// The latest GitHub Actions run of every workflow on the head SHA (as the review watcher judges CI). Jobs not created
+// yet (needs:) are invisible as check runs, but their workflow run is still queued or in progress. Older runs of the
+// same workflow (e.g. cancelled by concurrency after a reopen) are superseded and ignored.
+async function latestWorkflowRuns(gh, repo, sha) {
+  const all = [];
   for (let page = 1; page <= 20; page++) {
-    const j = await gh.get(`/repos/${repo}/commits/${sha}/check-suites?per_page=100&page=${page}`);
-    suites.push(...(j.check_suites ?? []));
-    if (suites.length >= (j.total_count ?? 0) || (j.check_suites ?? []).length === 0) {
-      return suites.filter((s) => s.app?.slug === "github-actions");
+    const j = await gh.get(`/repos/${repo}/actions/runs?head_sha=${sha}&per_page=100&page=${page}`);
+    all.push(...(j.workflow_runs ?? []));
+    if (all.length >= (j.total_count ?? 0) || (j.workflow_runs ?? []).length === 0) {
+      const latest = new Map();
+      for (const r of all) {
+        const prev = latest.get(r.workflow_id);
+        const newer = !prev || r.run_number > prev.run_number || (r.run_number === prev.run_number && (r.run_attempt ?? 1) > (prev.run_attempt ?? 1));
+        if (newer) latest.set(r.workflow_id, r);
+      }
+      return [...latest.values()];
     }
   }
-  throw new CannotRun("more than 2,000 check suites; refusing to judge a partial list");
+  throw new CannotRun("more than 2,000 workflow runs; refusing to judge a partial list");
 }
 
 // Reads every stored result for the PR's current head and returns { ok, sha, reasons[] }. Never merges.
@@ -111,9 +117,9 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG }) {
     else if (!OK_CONCLUSIONS.has(r.conclusion)) reasons.push(`check "${r.name}" concluded ${r.conclusion}`);
   }
   if (runs.length > 0 && !runs.some((r) => r.conclusion === "success")) reasons.push("no CI check run succeeded");
-  for (const s of await actionsSuites(gh, repo, sha)) {
-    if (s.status !== "completed") reasons.push(`a CI workflow (check suite ${s.id}) is ${s.status}`);
-    else if (!OK_CONCLUSIONS.has(s.conclusion)) reasons.push(`a CI workflow (check suite ${s.id}) concluded ${s.conclusion}`);
+  for (const w of await latestWorkflowRuns(gh, repo, sha)) {
+    if (w.status !== "completed") reasons.push(`workflow "${w.name}" (run ${w.id}) is ${w.status}`);
+    else if (!OK_CONCLUSIONS.has(w.conclusion)) reasons.push(`workflow "${w.name}" (run ${w.id}) concluded ${w.conclusion}`);
   }
   for (const name of config.requiredCheckRuns) {
     const r = runs.find((x) => x.name === name);
@@ -173,7 +179,7 @@ export async function release(gh, { repo, pr, dryRun = false, config = DEFAULT_C
       log(`MERGED PR #${pr}: head ${v.sha} -> merge ${after.merge_commit_sha} (confirmed after: ${err.message})`);
       return { code: 0, mergeSha: after.merge_commit_sha, ...v };
     }
-    if (after && !after.merged) throw new CannotRun(`${err.message}; PR #${pr} is not merged`);
+    if (after && !after.merged) throw new CannotRun(`${err.message}; PR #${pr} is not merged yet; read the PR again before retrying`);
     throw new CannotRun(`${err.message}; MERGE OUTCOME UNKNOWN for PR #${pr}, read the PR before retrying`);
   }
   if (r.status === 200 && r.json?.merged) {

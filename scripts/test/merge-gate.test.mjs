@@ -20,7 +20,11 @@ function fakeGitHub(over = {}) {
       { name: "e2e", status: "completed", conclusion: "skipped" },
     ],
     statuses: [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r2)", creator: WATCHER, updated_at: "2026-11-12T10:00:00Z" }],
-    suites: [{ id: 1, app: { slug: "github-actions" }, status: "completed", conclusion: "success" }, { id: 2, app: { slug: "claude" }, status: "queued", conclusion: null }],
+    workflowRuns: [
+      { id: 11, workflow_id: 1, name: "ci", run_number: 5, status: "completed", conclusion: "cancelled" },
+      { id: 12, workflow_id: 1, name: "ci", run_number: 6, status: "completed", conclusion: "success" },
+      { id: 13, workflow_id: 2, name: "db", run_number: 3, status: "completed", conclusion: "success" },
+    ],
     oldShaStatuses: [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r1)", creator: WATCHER }],
     mainSha: MAIN,
     compare: "ahead",
@@ -41,7 +45,7 @@ function fakeGitHub(over = {}) {
     }
     if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)) return reply(200, { total_count: state.statuses.length, statuses: state.statuses });
     if (path.startsWith(`/repos/${REPO}/commits/${OLD}/status`)) return reply(200, { total_count: 1, statuses: state.oldShaStatuses });
-    if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/check-suites`)) return reply(200, { total_count: state.suites.length, check_suites: state.suites });
+    if (path.startsWith(`/repos/${REPO}/actions/runs?head_sha=${HEAD}`)) return reply(200, { total_count: state.workflowRuns.length, workflow_runs: state.workflowRuns });
     if (path === `/repos/${REPO}/git/ref/heads/main`) return reply(200, { object: { sha: state.mainSha } });
     if (path === `/repos/${REPO}/compare/${MAIN}...${HEAD}`) return reply(200, { status: state.compare });
     if (path === `/repos/${REPO}/pulls/7/merge` && init.method === "PUT") {
@@ -99,15 +103,17 @@ test("AT3 red or unfinished CI on the head SHA: refused, no merge", async () => 
   }
 });
 
-test("AT3b an Actions workflow still queued or running (jobs not created yet) refuses; other apps' suites are ignored", async () => {
-  for (const status of ["queued", "in_progress"]) {
-    const f = fakeGitHub({ suites: [{ id: 9, app: { slug: "github-actions" }, status, conclusion: null }] });
-    assert.equal((await run(f)).code, 1, status);
+test("AT3b the latest run of a workflow still queued, running or failed refuses; a superseded cancelled run does not", async () => {
+  for (const [status, conclusion] of [["queued", null], ["in_progress", null], ["completed", "failure"], ["completed", "cancelled"]]) {
+    const runs = [...fakeGitHub().state.workflowRuns, { id: 14, workflow_id: 2, name: "db", run_number: 4, status, conclusion }];
+    const f = fakeGitHub({ workflowRuns: runs });
+    assert.equal((await run(f)).code, 1, `${status}/${conclusion}`);
     assert.equal(merges(f).length, 0);
   }
-  const f = fakeGitHub({ suites: [{ id: 9, app: { slug: "github-actions" }, status: "completed", conclusion: "failure" }] });
-  assert.equal((await run(f)).code, 1);
-  assert.equal((await run(fakeGitHub())).code, 0, "a queued suite of another app does not block");
+  assert.equal((await run(fakeGitHub())).code, 0, "ci run 5 (cancelled) is superseded by run 6 (success)");
+  const rerun = [{ id: 11, workflow_id: 1, name: "ci", run_number: 6, run_attempt: 1, status: "completed", conclusion: "failure" },
+    { id: 11, workflow_id: 1, name: "ci", run_number: 6, run_attempt: 2, status: "completed", conclusion: "success" }];
+  assert.equal((await run(fakeGitHub({ workflowRuns: rerun }))).code, 0, "a successful re-run attempt supersedes the failed attempt");
 });
 
 test("AT4 main not an ancestor of the head (behind or diverged): refused, no merge", async () => {

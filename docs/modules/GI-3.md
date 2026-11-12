@@ -15,7 +15,7 @@ Every merge into `main` goes through one function that refuses unless the stored
 
 ## Behaviour — `node scripts/release/merge.mjs <pr> [--repo owner/name] [--dry-run]`
 1. Read the PR. Refuse if it is not open, is a draft, does not target `main`, or its head is not in this repository.
-2. **Green CI on the head SHA:** read every check run (latest per name, all pages). Refuse if there are none, if any is not completed, if any concluded other than success/skipped/neutral, or if none succeeded. Every GitHub Actions check suite on the SHA must be completed with success/skipped/neutral, so a workflow whose later jobs (`needs:`) do not exist yet still refuses; other apps' suites are ignored (some stay queued forever). Every name in `requiredCheckRuns` must be present and `success` (a skipped required check is refused).
+2. **Green CI on the head SHA:** read every check run (latest per name, all pages). Refuse if there are none, if any is not completed, if any concluded other than success/skipped/neutral, or if none succeeded. The latest GitHub Actions run of every workflow on the SHA (highest run number, then attempt) must be completed with success/skipped/neutral, as the review watcher judges CI: a workflow whose later jobs (`needs:`) do not exist yet still refuses, and an older run superseded by a newer one (e.g. cancelled by concurrency after a reopen) is ignored. Every name in `requiredCheckRuns` must be present and `success` (a skipped required check is refused).
 3. **Codex PASS on the head SHA:** the latest `codex-review` status must be `success`, must have been posted by the review watcher's account (`codexCreator` in `required-checks.json`, so a workflow's `GITHUB_TOKEN` cannot forge it), its description must start `Codex PASS`, and its `PR<n>-r<k>` label must name this PR. Any other status context on the SHA that is not `success` refuses.
 4. **Main in the head (ADR-0013):** read the current `main` SHA; `compare main...head` must be `ahead` or `identical`.
 5. **Floor guard:** once DEVOS-141 lands, its check name is added to `requiredCheckRuns` (step 2). Dispositions (spec §4.4) are handled with Part 1.
@@ -29,7 +29,7 @@ Every merge into `main` goes through one function that refuses unless the stored
 | AT1 | All green: exactly one merge call, pinned to the evaluated head SHA, method `merge` |
 | AT2 | A missing, failed, pending, non-PASS or other-PR `codex-review` status, or a PASS posted by any account other than `codexCreator` (e.g. `github-actions[bot]`) or with no creator, refuses, with no merge call |
 | AT3 | Failed, cancelled, timed-out, in-progress, absent or all-skipped CI refuses, with no merge call |
-| AT3b | An Actions check suite that is queued, in progress or failed refuses; another app's queued suite does not block |
+| AT3b | A workflow whose latest run is queued, in progress, failed or cancelled refuses; an older cancelled run superseded by a successful one, or a failed attempt superseded by a successful re-run, does not block |
 | AT4 | `main` behind or diverged from the head refuses, with no merge call |
 | AT5 | GC5: a head that moved between check and merge (GitHub 409) is refused and the merge is not retried; statuses are read for the head SHA only |
 | AT5b | A merge PUT that fails in flight is read back: merged → exit 0, not merged → exit 2; the PUT is sent once. A PASS on an older SHA is never read for the new head |
