@@ -301,3 +301,24 @@ test("M2.6-b decision 3: a human task reopened in Linear after DevOS took it as 
   assert.ok(r.log.some((l) => /reopened in Linear \(unstarted\) but done in DevOS/.test(l)), r.log.join("\n"));
   assert.equal(r.writes, 0); assert.equal(r.inbound.length, 0);
 });
+
+test("DEVOS-162: tasks of kind `analysis` are never created, updated or adopted in Linear", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  const analysis = [
+    { id: u(41), moduleId: u(22), title: "Analyst pass 1", kind: "analysis", assignee: "agent", status: "failed", linearIssue: null },
+    { id: u(42), moduleId: null, title: "Analyst pass 2", kind: "analysis", assignee: "agent", status: "done", linearIssue: null },
+  ];
+  plan.tasks.push(...analysis);
+  const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const baseline = fakeLinear(); const clean = throwaway();
+  await syncProject(clean, baseline.api, memoryStore(clean));
+  assert.equal(L.issues.length, baseline.issues.length, "same issues as a plan with no analysis tasks");
+  for (const a of analysis) {
+    assert.ok(!L.issues.some((i) => (i.description ?? "").includes(a.id) || i.title === a.title), `${a.title} is not in Linear`);
+    assert.equal(a.linearIssue, null, "no Linear id stored for an analysis task");
+  }
+  L.writes.length = 0;
+  await syncProject(plan, L.api, store);
+  assert.equal(L.writes.length, 0, "a second sync writes nothing");
+});

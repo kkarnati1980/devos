@@ -26,12 +26,19 @@ export function taskState(s: TaskStatus): { type: StateType; deadlocked: boolean
 
 const viewerCache = new WeakMap<LinearApi, string>();
 
+/**
+ * Task kinds that are internal bookkeeping, never planned work, so they are never mirrored to Linear (DEVOS-162):
+ * `analysis` records one analyst model-pass run (M2.2-d3b). They are dropped before any read or write.
+ */
+export const INTERNAL_TASK_KINDS: readonly string[] = ["analysis"];
+
 export interface SyncResult { writes: number; created: string[]; updated: string[]; log: string[]; inbound: string[] }
 export interface SyncOptions { teamKey?: string; kkUserId?: string }
 
 const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
 
-export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncStore, opts: SyncOptions = {}): Promise<SyncResult> {
+export async function syncProject(fullPlan: DevosPlan, api: LinearApi, store: SyncStore, opts: SyncOptions = {}): Promise<SyncResult> {
+  const plan: DevosPlan = { ...fullPlan, tasks: fullPlan.tasks.filter((t) => !INTERNAL_TASK_KINDS.includes(t.kind)) };
   const r: SyncResult = { writes: 0, created: [], updated: [], log: [], inbound: [] };
   const team = await api.team(opts.teamKey ?? "DEVOS");
   const stateId = (type: StateType) => {
