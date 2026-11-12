@@ -48,6 +48,11 @@ export function coolifyEnvironmentOps(cf: CoolifyClient, projectId: string): Res
         await cf.http.write("DELETE", `/api/v1/projects/${uuid}/environments/${env}`);
       } catch (e) {
         if (!gone(e)) throw e;
+        // Pre-review: Coolify answers an unknown route with 404 too, so a 404 counts as "gone" only when the
+        // environment list confirms it. A wrong path then stops the purge instead of being read as a delete.
+        if ((await listEnvironments(cf, uuid)).some((x) => x.name === env)) {
+          throw new ProviderError("coolify", "bad-response", "coolify DELETE environment answered 404 but the environment is still listed", 404);
+        }
       }
     },
   };

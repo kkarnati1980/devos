@@ -118,6 +118,7 @@ test("M2.5-a3: an environment whose project lost the marker is not deleted (owne
   );
   assert.ok(!s.fake.deletes().some((d) => d.path.includes("/environments/")), "no environment deleted");
   assert.equal(coolifyProject(s).environments.length, 2);
+  assert.ok(s.store.resources.filter((r) => r.kind === "port").every((r) => !r.deletedAt), "a stopped purge keeps the port reservations");
 });
 
 test("M2.5-a3: an environment already gone, or under a project already gone, is marked deleted without a delete call", async () => {
@@ -145,7 +146,18 @@ test("M2.5-a3: an inconclusive environment lookup (a 200 that is not a list) sto
   s.fake.faults.push({ match: (m, p) => m === "GET" && /\/environments$/.test(p), status: 200 });
   await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => e instanceof TeardownError && e.code === "provider_error");
   assert.equal(s.fake.deletes().length, 0);
-  assert.ok(s.store.resources.filter((r) => r.kind === "environment").every((r) => !r.deletedAt));
+  assert.ok(s.store.resources.filter((r) => r.kind === "environment" || r.kind === "port").every((r) => !r.deletedAt));
+});
+
+test("M2.5-a3 pre-review: a DELETE that answers 404 while the environment is still listed stops the purge", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.fake.faults.push({ match: (m, p) => m === "DELETE" && /\/environments\//.test(p), status: 404 });
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => e instanceof TeardownError && e.code === "provider_error" && e.resource.kind === "environment");
+  assert.equal(coolifyProject(s).environments.length, 2);
+  assert.ok(!s.fake.deletes().some((d) => /^\/api\/v1\/projects\/[^/]+$/.test(d.path)), "the project is not deleted");
+  assert.ok(s.store.resources.every((r) => !r.deletedAt), "no row marked deleted");
 });
 
 test("M2.5-a3: malformed environment and port ids are refused before any call", async () => {
