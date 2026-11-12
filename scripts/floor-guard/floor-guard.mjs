@@ -203,9 +203,9 @@ function numbers(lines, rx) {
   return out;
 }
 
-/** `"key": v` / `'key': v` → `key: v`, keeping the indentation and any `- ` list marker (PR70-r18). */
+/** `"key": v` / `'key': v` → `key: v` anywhere on the line (block or flow mapping), keeping indentation and `- ` markers (PR70-r18, PR70-r19). */
 function unquoteKey(text) {
-  return text.replace(/^(\s*(?:-\s*)?)(["'])([\w.-]+)\2(\s*:)/, "$1$3$4");
+  return text.replace(/(^|[\s{,\[-])(["'])([\w.-]+)\2(\s*:)/g, "$1$3$4");
 }
 
 /** True when an `if:` value is constant-false, quoted or not, bare or in ${{ }} (PR70-r12, PR70-r13). */
@@ -281,6 +281,9 @@ export function analyse(files, show) {
 
   for (const f of files) {
     const p = f.path;
+    // workflows: a quoted key (`"timeout-minutes":`, `'if':`) is the same YAML key, so every workflow rule reads
+    // the changed lines with key quotes removed (PR70-r18, PR70-r19)
+    if (WORKFLOW.test(p)) for (const side of ["added", "removed"]) f[side] = f[side].map((l) => ({ ...l, text: unquoteKey(l.text) }));
     if (isGuard(p) || isGuard(f.oldPath)) continue;
     const test = isTest(p), oldTest = isTest(f.oldPath);
     const code = CODE.test(p) || p.endsWith(".gitleaksignore");
