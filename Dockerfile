@@ -15,6 +15,7 @@ COPY apps/api/package.json apps/api/
 COPY apps/dashboard/package.json apps/dashboard/
 COPY packages/db/package.json packages/db/
 COPY packages/policy/package.json packages/policy/
+COPY packages/provision/package.json packages/provision/
 COPY packages/run-engine/package.json packages/run-engine/
 COPY packages/shared/package.json packages/shared/
 RUN pnpm install --frozen-lockfile
