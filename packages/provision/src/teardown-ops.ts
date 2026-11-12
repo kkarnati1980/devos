@@ -179,3 +179,29 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
     },
   };
 }
+
+/**
+ * M2.5-a2 purge preflight (M2.5 pre-review finding 2): GitHub answers 404 for a private repo the token cannot see,
+ * so a token narrowed to selected repositories could make a repo look gone. The token must see every repo its
+ * account owns: the owned-repo listing must hold at least `public_repos + owned_private_repos` from `GET /user`.
+ * Throws `github-token-scope` otherwise (the purge stops with `provider_forbidden`, nothing deleted).
+ */
+export function githubTokenScopeCheck(gh: GitHubClient, opts: { maxPages?: number } = {}): () => Promise<void> {
+  const maxPages = opts.maxPages ?? 20;
+  return async () => {
+    const http = await gh.http.pinned();
+    const u = await http.get<{ public_repos?: number; owned_private_repos?: number }>("/user");
+    const pub = u.body?.public_repos; const priv = u.body?.owned_private_repos;
+    if (u.status !== 200 || typeof pub !== "number" || typeof priv !== "number") {
+      throw new Error("github-token-scope: the token cannot read its account's repository counts");
+    }
+    let seen = 0;
+    for (let page = 1; page <= maxPages; page++) {
+      const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
+      if (r.status !== 200 || !Array.isArray(r.body)) throw new Error("github-token-scope: the repository list is unreadable");
+      seen += r.body.length;
+      if (r.body.length < 100) break;
+    }
+    if (seen < pub + priv) throw new Error(`github-token-scope: the token sees ${seen} of ${pub + priv} owned repositories; give it access to all repositories`);
+  };
+}

@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   allowAll, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, runProvision,
-  githubRepoOps, coolifyProjectOps, githubScanner, coolifyScanner,
+  githubRepoOps, coolifyProjectOps, githubScanner, coolifyScanner, githubTokenScopeCheck,
 } from "@devos/provision";
 import { archiveProject, restoreProject, purgeProject, inventoryScanner, MemoryTeardownStore, TeardownError } from "../dist/index.js";
 import { fakeProviders } from "../../provision/test/fakes.mjs";
@@ -316,4 +316,21 @@ test("Codex PR48-r1: an inconclusive lookup (204, empty 200, JSON null, wrong sh
     assert.equal(s.fake.repos.size, 1);
     assert.ok(s.store.resources.some((r) => r.provider === "github" && !r.deletedAt), "the repo row stays active");
   }
+});
+
+test("M2.5-a2: the GitHub token-scope preflight stops a purge when the token cannot see every owned repo", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  // GET /user says the account owns 3 repos; the token lists only 1.
+  s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 1, owned_private_repos: 2 }) } });
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] }),
+    (e) => e instanceof TeardownError && e.code === "provider_forbidden" && /sees 1 of 3/.test(e.message),
+  );
+  assert.equal(s.fake.deletes().length, 0);
+  // A token that sees them all passes.
+  s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 1 }) } });
+  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh)] });
+  assert.equal(out.purged, true);
 });

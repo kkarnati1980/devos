@@ -94,6 +94,8 @@ export interface ArchiveOptions extends TeardownOptions {
 
 export interface PurgeOptions extends TeardownOptions {
   scanners: LeftoverScanner[];
+  /** Checks run after the policy check and before any delete (e.g. the GitHub token scope, M2.5-a2). */
+  preflight?: (() => Promise<void>)[];
 }
 
 export interface PurgeResult {
@@ -265,6 +267,14 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
     const needed = new Set(["inventory", ...opts.ops.map((o) => o.provider), ...rows.map((r) => r.provider)]);
     const missing = [...needed].filter((n) => !names.has(n)).sort();
     if (missing.length) throw new TeardownError("scan_incomplete", false, `purge needs leftover scanners for: ${missing.join(", ")}`);
+    for (const check of opts.preflight ?? []) {
+      try {
+        await check();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "preflight failed";
+        throw new TeardownError("provider_forbidden", false, `purge preflight: ${msg.slice(0, 200)}`);
+      }
+    }
     // Pre-review finding 1: reset the step journal before the first delete, so a purge that stops half way (then
     // Restore) can never leave a stale `done` step for a resource that is gone. Safe under the shared lock:
     // provisioning always looks a resource up before trusting or creating it.
