@@ -324,6 +324,9 @@ test("Codex PR48-r4: a malformed repo or project entry makes the scan inconclusi
     { gh: [{ full_name: "kkarnati1980/devos-acme", name: "other", description: null }] }, // name ≠ full_name
     { gh: [{ full_name: "kkarnati1980/devos-acme", name: "devos-acme", description: 7 }] },
     { cf: [{ uuid: "cf1", name: "x", description: { marker: true } }] },
+    // Codex PR48-r5: an omitted description (a different name, so only the marker could match) is inconclusive.
+    { gh: [{ full_name: "kkarnati1980/other", name: "other" }] },
+    { cf: [{ uuid: "cf2", name: "other" }] },
   ];
   for (const b of bad) {
     const s = setup();

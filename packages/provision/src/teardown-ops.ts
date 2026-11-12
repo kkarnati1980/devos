@@ -143,7 +143,8 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
         }
         for (const x of r.body) {
           // Codex PR48-r4: every field the match reads must be well-formed, or the whole scan is inconclusive.
-          const okDesc = x && (x.description === null || x.description === undefined || typeof x.description === "string");
+          // Codex PR48-r5: the field must be present (string or null); an omitted description is inconclusive.
+          const okDesc = x && (x.description === null || typeof x.description === "string");
           if (!x || typeof x.full_name !== "string" || typeof x.name !== "string" || !okDesc || x.full_name.split("/")[1] !== x.name) {
             throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);
           }
@@ -172,7 +173,7 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
       }
       const hits: LeftoverHit[] = [];
       for (const x of r.body) {
-        if (!x || typeof x.uuid !== "string" || typeof x.name !== "string" || !(x.description == null || typeof x.description === "string")) {
+        if (!x || typeof x.uuid !== "string" || typeof x.name !== "string" || !(x.description === null || typeof x.description === "string")) {
           throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/projects returned a malformed project entry", r.status);
         }
         if (x.name === `devos-${p.slug}` || (x.description ?? "").includes(marker)) {
