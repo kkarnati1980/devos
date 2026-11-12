@@ -67,6 +67,8 @@ const VIOLATIONS = [
   ["ci-disabled (job-level if: '${{ false }}')", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: '${{ false }}'\n") }],
   ["ci-disabled (step if: \"false\")", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: \"false\"\n")) }],
   ["ci-disabled (if: ${{ false && github.event_name == 'push' }})", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: ${{ false && github.event_name == 'push' }}\n") }],
+  // PR70-r14: precedence — every || operand false, or a false && term inside a parenthesised operand
+  ["ci-disabled (if: ${{ (false && a) || false }})", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: ${{ (false && github.ref == 'x') || false }}\n") }],
   // PR70-r13: numeric separators and other literal forms are read at their real value
   ["retries-raised (1 -> 1_000)", { "apps/d/playwright.config.ts": "export default { retries: 1 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 1_000 };\n" }],
   ["retries-raised (1 -> 0x10)", { "apps/d/playwright.config.ts": "export default { retries: 1 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 0x10 };\n" }],
@@ -264,4 +266,16 @@ test("exit 0: a real condition is not ci-disabled, and a lowered literal retry i
   const r = check({ [WF]: wf(STEPS), "apps/d/playwright.config.ts": "export default { retries: 1_0 };\n" },
     { [WF]: wf(STEPS, "    if: \"${{ github.event_name != 'schedule' && !cancelled() }}\"\n    timeout-minutes: '15'\n"), "apps/d/playwright.config.ts": "export default { retries: 2 };\n" });
   assert.deepEqual(r.hits, []);
+});
+
+test("exit 0: a false && term ORed with a live condition is not ci-disabled (PR70-r14)", () => {
+  for (const cond of [
+    "${{ false && github.event_name == 'schedule' || github.event_name == 'pull_request' }}",
+    "${{ (false) || (github.event_name == 'push') }}",
+    "${{ github.event_name == 'push' || (false && always()) }}",
+    "${{ contains(github.ref, '||') && false || github.event_name == 'push' }}",
+  ]) {
+    const r = check({ [WF]: wf(STEPS) }, { [WF]: wf(STEPS, `    if: ${cond}\n`) });
+    assert.deepEqual(r.hits, [], cond);
+  }
 });

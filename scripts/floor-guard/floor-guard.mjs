@@ -177,10 +177,54 @@ function constFalseIf(text) {
   for (let i = 0; i < 3; i++) {
     const q = /^(["'])(.*)\1$/.exec(e); if (q) e = q[2].trim();
     const x = /^\$\{\{(.*)\}\}$/.exec(e); if (x) e = x[1].trim();
-    const pr = /^\((.*)\)$/.exec(e); if (pr) e = pr[1].trim();
   }
-  const F = String.raw`(?:false|0|''|""|null|!\s*true)`;
-  return new RegExp(`^${F}$`).test(e) || new RegExp(`(^|&&)\\s*${F}\\s*(&&|$)`).test(e);
+  return constFalseExpr(e);
+}
+
+/** Splits an expression at top-level `op` (outside parentheses and quoted strings). */
+function splitTop(e, op) {
+  const out = [];
+  let depth = 0, quote = null, start = 0;
+  for (let i = 0; i < e.length; i++) {
+    const ch = e[i];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (depth === 0 && e.startsWith(op, i)) { out.push(e.slice(start, i)); start = i + op.length; i += op.length - 1; }
+  }
+  out.push(e.slice(start));
+  return out.map((x) => x.trim());
+}
+
+/** `( x )` → `x` only when the outer parentheses are one matching pair (not `(a) || (b)`); otherwise null. */
+function unwrap(e) {
+  if (!e.startsWith("(") || !e.endsWith(")")) return null;
+  let depth = 0, quote = null;
+  for (let i = 0; i < e.length; i++) {
+    const ch = e[i];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === "(") depth++;
+    else if (ch === ")" && --depth === 0 && i < e.length - 1) return null;
+  }
+  return e.slice(1, -1).trim();
+}
+
+/**
+ * Constant-false with GitHub expression precedence (`&&` binds tighter than `||`, PR70-r14): an `||` chain is false
+ * only when every operand is; an `&&` chain is false when any operand is; parentheses are unwrapped.
+ */
+function constFalseExpr(e, depth = 0) {
+  e = e.trim();
+  if (depth > 20) return false;
+  const or = splitTop(e, "||");
+  if (or.length > 1) return or.every((x) => constFalseExpr(x, depth + 1));
+  const and = splitTop(e, "&&");
+  if (and.length > 1) return and.some((x) => constFalseExpr(x, depth + 1));
+  const inner = unwrap(e);
+  if (inner !== null) return constFalseExpr(inner, depth + 1);
+  return /^(?:false|0|''|""|null|!\s*true)$/.test(e);
 }
 
 /**
