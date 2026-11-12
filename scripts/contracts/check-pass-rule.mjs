@@ -18,9 +18,9 @@ const ANCHORS = [
   new RegExp("(?<!`)`(?!`)\\s*(" + TOOLS + ")\\s[^`\\n]*`(?!`)"), // a command in an inline code span (tool first, with arguments)
   /`[^`]*\.(test|spec)\.[cm]?[jt]sx?`/,                 // a named test file
   /\b(AT|AB|GC)\d+[a-z]?\b|\bAT-[A-Z]+\d+\b/,           // an acceptance-test or green-condition id
-  /\bexit(s| code| status)?\s*(0|1|2|non-?zero)\b/i,    // an exit code
+  /\bexit(s| code| status)?\s*(\d{1,3}|non-?zero)\b/i,    // an exit code
   /\bHTTP\s*[1-5]\d\d\b|\b(returns|responds(\s+with)?|status( code)?)\s+[1-5]\d\d\b/i, // an HTTP status
-  /((?<![-=<>])(≤|≥|<=|>=|<|>)|\b(at most|at least|under|within|exactly)\b)\s*\d[\d.,_]*\s*(ms|s|seconds?|minutes?|%|kb|mb|gb|lines?|rows?|requests?|pixels?|px|violations?|findings?|errors?|hits?)\b/i, // a threshold with a unit
+  /((?<![-=<>])(≤|≥|<=|>=|<|>)|\b(at most|at least|under|within|exactly)\b)\s*\d[\d.,_]*\s*(%|(ms|s|seconds?|minutes?|kb|mb|gb|lines?|rows?|requests?|pixels?|px|violations?|findings?|errors?|hits?)\b)/i, // a threshold with a unit
   /\bscreenshot diff\b|\bchecklist script\b/i,          // the UI allowances of spec §5
 ];
 

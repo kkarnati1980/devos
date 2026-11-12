@@ -102,6 +102,7 @@ test("pre-review: no false rejects — fenced commands, plural heading, pytest/a
   for (const good of [
     "## Pass rule\n- the smoke script exits 0:\n```bash\n# run it\nbash scripts/smoke.sh --strict\n```\n",
     "## Pass rules\n- AT1 passes\n",
+    "## Pass rule\n- The CLI exits 3 when skipped\n", "## Pass rule\n- Error rate ≤ 5%\n",
     "## Pass rule\n- Run the acceptance suite:\n```sh\npnpm test\n```\n",
     "## Pass rule\n### Part a\n- AT1 passes\n",
     "## Pass rule\n- `pytest -q tests/` exits 0\n", "## Pass rule\n- `axe http://localhost` reports at most 0 violations\n",
