@@ -86,15 +86,15 @@ function endstreamAt(text: string, pos: number): boolean {
 function streamEnd(buf: Buffer, text: string, dict: string, start: number, ints: ReadonlyMap<number, readonly number[]>): number {
   // The indirect form is tried first, and the direct number must be a whole integer token that is not followed by
   // a generation number and R, so "/Length 19 0 R" can never read as a direct length of 1 (PR30-r10).
-  const indirect = /\/Length\s+(\d{1,10})\s+\d{1,5}\s+R(?![A-Za-z0-9])/.exec(dict);
-  const direct = indirect ? null : /\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R(?![A-Za-z0-9]))/.exec(dict);
+  const indirect = /^\/Length\s+(\d{1,10})\s+\d{1,5}\s+R(?![A-Za-z0-9])/m.exec(dict);
+  const direct = indirect ? null : /^\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R(?![A-Za-z0-9]))/m.exec(dict);
   const lens = direct ? [Number(direct[1])] : indirect ? ints.get(Number(indirect[1])) ?? [] : [];
   // A length is used only when `endstream` really follows it (PR30-r13: a decoy candidate never passes this).
   for (const len of lens) {
     if (start + len <= buf.length && endstreamAt(text, start + len)) return start + len;
   }
   // An unfiltered (text) stream is scanned token by token, skipping strings and comments, to its real endstream.
-  if (!/\/Filter\b/.test(dict)) {
+  if (!/^\/Filter\b/m.test(dict)) {
     const end = scanPlainStreamEnd(text, start);
     if (end >= 0) return end;
   }
@@ -290,7 +290,7 @@ interface PdfFile {
 
 /** Inflate one stream under the limits; undefined (with a warning) when its filter is unsupported or it is damaged. */
 function decodeStream(dict: string, raw: Uint8Array, limits: IngestLimits, warnings: Set<string>, budget: { total: number }): Uint8Array | undefined {
-  const filterM = /\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/.exec(dict);
+  const filterM = /^\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/m.exec(dict);
   const filters = filterM ? (filterM[1] ?? "").match(/\/[A-Za-z0-9]+/g) ?? [] : [];
   if (filters.length > 1 || (filters.length === 1 && filters[0] !== "/FlateDecode")) {
     warnings.add("pdf-filter-unsupported");
@@ -376,24 +376,94 @@ function scanObjectBody(text: string, from: number): { kind: "stream"; keyword: 
  * dictionary's own depth. Input is already string- and comment-blanked.
  */
 function topLevel(s: string): string {
-  const keep = /^\s*<</.test(s) ? 1 : 0;
-  let depth = 0;
-  let out = "";
-  for (let i = 0; i < s.length; ) {
-    if (s.startsWith("<<", i)) {
-      depth++;
-      out += depth > keep ? "  " : "<<";
-      i += 2;
-    } else if (s.startsWith(">>", i)) {
-      out += depth > keep ? "  " : ">>";
-      depth--;
+  // PR30-r17: a real key/value parse. The result has one `/Key value` entry per line (values on one line), so
+  // every structural lookup is anchored at a line start and can only match a key, never a name inside an array
+  // value. Nested dictionary values are reduced to `<< >>`; arrays keep their contents (on the key's line).
+  const t = s.trim();
+  let body: string;
+  if (t.startsWith("<<")) {
+    const inner = readDict(t, 0);
+    if (inner === null) return t.replace(/\s+/g, " ");
+    body = inner;
+  } else if (t.startsWith("/")) {
+    body = t; // a trailer's inner text
+  } else {
+    return t.replace(/\s+/g, " "); // not a dictionary (integer, array, …)
+  }
+  const lines: string[] = [];
+  let i = 0;
+  const n = body.length;
+  const ws = () => {
+    while (i < n && /\s/.test(body[i] ?? "")) i++;
+  };
+  const balanced = (open: string, close: string): string => {
+    const start = i;
+    let depth = 0;
+    while (i < n) {
+      if (body.startsWith(open, i)) {
+        depth++;
+        i += open.length;
+      } else if (body.startsWith(close, i)) {
+        depth--;
+        i += close.length;
+        if (depth === 0) break;
+      } else if (open === "[" && body.startsWith("<<", i)) {
+        const inner = readDict(body, i);
+        i = inner === null ? n : i + inner.length + 4;
+      } else i++;
+    }
+    return body.slice(start, i);
+  };
+  const token = (): string => {
+    const start = i;
+    if (body[i] === "/") {
+      i++;
+      while (i < n && !DELIM.test(body[i] ?? " ")) i++;
+    } else {
+      while (i < n && !DELIM.test(body[i] ?? " ")) i++;
+    }
+    if (i === start) i++; // a stray delimiter: consume it
+    return body.slice(start, i);
+  };
+  while (i < n) {
+    ws();
+    if (i >= n) break;
+    if (body[i] !== "/") {
+      token(); // junk where a key should be: skip it
+      continue;
+    }
+    const key = token();
+    ws();
+    let value = "";
+    if (body.startsWith("<<", i)) {
+      const inner = readDict(body, i);
+      i = inner === null ? n : i + inner.length + 4;
+      value = "<< >>";
+    } else if (body[i] === "[") {
+      value = balanced("[", "]");
+    } else if (body[i] === "/") {
+      value = token();
+    } else if (body.startsWith("()", i) || body.startsWith("<>", i)) {
+      value = body.slice(i, i + 2); // a blanked string
       i += 2;
     } else {
-      out += depth > keep ? " " : s[i];
-      i++;
+      value = token();
+      // An indirect reference: `n g R`.
+      const save = i;
+      ws();
+      const g = /^\d{1,5}(?=[\s\/\[\]<>()%]|$)/.exec(body.slice(i, i + 6));
+      if (/^\d+$/.test(value) && g) {
+        i += g[0].length;
+        ws();
+        if (body[i] === "R" && (i + 1 >= n || DELIM.test(body[i + 1] ?? " "))) {
+          i++;
+          value = `${value} ${g[0]} R`;
+        } else i = save;
+      } else i = save;
     }
+    lines.push(`${key} ${value.replace(/\s+/g, " ").trim()}`);
   }
-  return out;
+  return lines.join("\n");
 }
 
 /** Blank out strings and comments so structural lookups (/Kids, /Contents, /Length, /Root…) never match inside them. */
@@ -408,7 +478,9 @@ function stripStrings(s: string): string {
     }
     const skip = skipOpaque(s, i);
     if (skip >= 0) {
-      out += s.slice(last, i) + " ";
+      // A string stays a value (`()` / `<>`, PR30-r17) so a key followed by a string keeps its value slot; a
+      // comment becomes white space.
+      out += s.slice(last, i) + (s[i] === "(" ? " () " : s[i] === "<" ? " <> " : " ");
       i = last = skip;
     } else i++;
   }
@@ -487,12 +559,12 @@ function collectObjects(
       objs.set(num, { dict, data, pos });
       re.lastIndex = end;
       gapStart = end;
-      if (/\/Type\s*\/ObjStm\b/.test(dict)) {
+      if (/^\/Type\s*\/ObjStm\b/m.test(dict)) {
         const dec = decodeStream(dict, data, limits, warnings, budget);
         if (dec) {
           const s = latin1(dec);
-          const n = Number(/\/N\s+(\d+)/.exec(dict)?.[1] ?? 0);
-          const first = Number(/\/First\s+(\d+)/.exec(dict)?.[1] ?? 0);
+          const n = Number(/^\/N\s+(\d+)/m.exec(dict)?.[1] ?? 0);
+          const first = Number(/^\/First\s+(\d+)/m.exec(dict)?.[1] ?? 0);
           const head = s.slice(0, first).trim().split(/\s+/).map(Number);
           for (let k = 0; k < Math.min(n, head.length / 2); k++) {
             const on = head[2 * k] ?? NaN;
@@ -524,16 +596,16 @@ function pageContents(file: PdfFile): number[][] | null {
   let rootNum = NaN;
   let rootPos = -1;
   const consider = (pos: number, dict: string) => {
-    const r = /\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(dict);
+    const r = /^\/Root\s+(\d{1,10})\s+\d{1,5}\s+R\b/m.exec(dict);
     if (r && pos > rootPos) {
       rootPos = pos;
       rootNum = Number(r[1]);
     }
   };
   for (const t of file.trailers) consider(t.pos, t.dict);
-  for (const o of objs.values()) if (o.data && /\/Type\s*\/XRef\b/.test(o.dict)) consider(o.pos, o.dict);
+  for (const o of objs.values()) if (o.data && /^\/Type\s*\/XRef\b/m.test(o.dict)) consider(o.pos, o.dict);
   const catalog = objs.get(rootNum)?.dict;
-  const pagesRef = catalog ? /\/Pages\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(catalog) : null;
+  const pagesRef = catalog ? /^\/Pages\s+(\d{1,10})\s+\d{1,5}\s+R\b/m.exec(catalog) : null;
   if (!pagesRef) return null;
   const pages: number[][] = [];
   const seen = new Set<number>();
@@ -543,8 +615,8 @@ function pageContents(file: PdfFile): number[][] | null {
     const d = objs.get(num)?.dict;
     if (d === undefined) return false;
     // /Kids may be a direct array or an indirect reference to one (PR30-r3).
-    const direct = /\/Kids\s*\[([^\]]*)\]/.exec(d);
-    const indirect = direct ? null : /\/Kids\s+(\d{1,10})\s+\d{1,5}\s+R\b/.exec(d);
+    const direct = /^\/Kids\s*\[([^\]]*)\]/m.exec(d);
+    const indirect = direct ? null : /^\/Kids\s+(\d{1,10})\s+\d{1,5}\s+R\b/m.exec(d);
     if (direct || indirect) {
       const arr = direct ? direct[1] ?? "" : /\[([^\]]*)\]/.exec(objs.get(Number(indirect?.[1]))?.dict ?? "")?.[1];
       if (arr === undefined) return false; // unresolvable /Kids: fall back to file order
@@ -552,8 +624,8 @@ function pageContents(file: PdfFile): number[][] | null {
       return true;
     }
     // A leaf must be a page; anything else means the tree is not understood (file-order fallback).
-    if (!/\/Type\s*\/Page(?![A-Za-z])/.test(d) && !/\/Contents\b/.test(d)) return false;
-    const c = /\/Contents\s*(\[[^\]]*\]|\d{1,10}\s+\d{1,5}\s+R\b)/.exec(d);
+    if (!/^\/Type\s*\/Page(?![A-Za-z])/m.test(d) && !/^\/Contents\b/m.test(d)) return false;
+    const c = /^\/Contents\s*(\[[^\]]*\]|\d{1,10}\s+\d{1,5}\s+R\b)/m.exec(d);
     let list = c ? refs(c[1] ?? "") : [];
     // /Contents may point to an indirect array of streams.
     if (list.length === 1 && objs.get(list[0] as number) && !objs.get(list[0] as number)?.data) {
@@ -594,8 +666,8 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
       }
       const open = text.indexOf("<<", trailerAt);
       const tdict = topLevel(stripStrings(open >= 0 ? readDict(text, open) ?? "" : ""));
-      const prevM = /\/Prev\s+(\d{1,12})/.exec(tdict);
-      const stm = /\/XRefStm\s+(\d{1,12})/.exec(tdict);
+      const prevM = /^\/Prev\s+(\d{1,12})/m.exec(tdict);
+      const stm = /^\/XRefStm\s+(\d{1,12})/m.exec(tdict);
       if (stm) readXrefStream(Number(stm[1]));
       prev = prevM ? Number(prevM[1]) : -1;
     } else {
@@ -614,8 +686,8 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
     if (body.kind !== "stream") return -1;
     const full = stripStrings(text.slice(pos + head[0].length, body.keyword));
     const dict = topLevel(full); // own keys; /DecodeParms (nested) is read from `full`
-    if (!/\/Type\s*\/XRef\b/.test(dict)) return -1;
-    const len = /\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R)/.exec(dict);
+    if (!/^\/Type\s*\/XRef\b/m.test(dict)) return -1;
+    const len = /^\/Length\s+(\d{1,12})(?![\d.])(?!\s+\d+\s+R)/m.exec(dict);
     if (!len) return -1;
     const raw = buf.subarray(body.dataStart, body.dataStart + Number(len[1]));
     let data: Uint8Array | undefined;
@@ -628,13 +700,13 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
     const dpAt = /\/DecodeParms\s*(?=<<)/.exec(full);
     const parms = dpAt ? readDict(full, dpAt.index + dpAt[0].length) ?? "" : "";
     const pred = Number(/\/Predictor\s+(\d+)/.exec(parms)?.[1] ?? 1);
-    const w = (/\/W\s*\[([^\]]*)\]/.exec(dict)?.[1] ?? "").trim().split(/\s+/).map(Number);
+    const w = (/^\/W\s*\[([^\]]*)\]/m.exec(dict)?.[1] ?? "").trim().split(/\s+/).map(Number);
     if (w.length !== 3 || w.some((x) => !Number.isInteger(x) || x < 0 || x > 8)) return -1;
     const rowLen = (w[0] ?? 0) + (w[1] ?? 0) + (w[2] ?? 0);
     if (rowLen === 0) return -1;
     if (pred >= 10) data = unPng(data, Number(/\/Columns\s+(\d+)/.exec(parms)?.[1] ?? rowLen));
-    const size = Number(/\/Size\s+(\d+)/.exec(dict)?.[1] ?? 0);
-    const index = (/\/Index\s*\[([^\]]*)\]/.exec(dict)?.[1] ?? `0 ${size}`).trim().split(/\s+/).map(Number);
+    const size = Number(/^\/Size\s+(\d+)/m.exec(dict)?.[1] ?? 0);
+    const index = (/^\/Index\s*\[([^\]]*)\]/m.exec(dict)?.[1] ?? `0 ${size}`).trim().split(/\s+/).map(Number);
     let row = 0;
     const field = (off: number, width: number, dflt: number) => {
       if (width === 0) return dflt;
@@ -652,7 +724,7 @@ function readXref(buf: Buffer, text: string, limits: IngestLimits): Map<number, 
         if (type === 1 && !offsets.has(first + j)) offsets.set(first + j, f2);
       }
     }
-    const prevM = /\/Prev\s+(\d{1,12})/.exec(dict);
+    const prevM = /^\/Prev\s+(\d{1,12})/m.exec(dict);
     return prevM ? Number(prevM[1]) : -1;
   }
 }
@@ -743,13 +815,13 @@ export function parsePdf(bytes: Uint8Array, limits: IngestLimits, warnings: Set<
     // Only real stream objects found by the structural scan, in file order — never byte patterns (PR30-r7).
     const streams = [...objs.values()].filter((o): o is PdfObject & { data: Uint8Array } => !!o.data).sort((x, y) => x.pos - y.pos);
     for (const st of streams) {
-      if (/\/(Type\s*\/XObject|Subtype\s*\/Image|Type\s*\/XRef|Type\s*\/ObjStm|Subtype\s*\/Type1C|Length1|Length2)/.test(st.dict)) continue;
+      if (/^\/(Type\s*\/XObject|Subtype\s*\/Image|Type\s*\/XRef|Type\s*\/ObjStm|Subtype\s*\/Type1C|Length1|Length2)/m.test(st.dict)) continue;
       const dec = decodeStream(st.dict, st.data, limits, warnings, budget);
       if (!dec) continue;
       const content = latin1(dec);
       // A CMap program (ToUnicode / embedded CMap) is identified structurally: its dictionary says /Type /CMap
       // or the program starts with the /CIDInit procset — never by searching page text.
-      if (/\/Type\s*\/CMap\b/.test(st.dict) || /^\s*(%[^\n]*\n\s*)*\/CIDInit\s*\/ProcSet\s+findresource\b/.test(content)) continue;
+      if (/^\/Type\s*\/CMap\b/m.test(st.dict) || /^\s*(%[^\n]*\n\s*)*\/CIDInit\s*\/ProcSet\s+findresource\b/.test(content)) continue;
       emit(content);
     }
   }

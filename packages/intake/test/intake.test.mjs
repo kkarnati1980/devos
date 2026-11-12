@@ -794,3 +794,20 @@ test("AT4q structural keys are read at the dictionary's own depth, never from ne
   assert.deepEqual(ids(r), ["FR-001"]);
   assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
 });
+
+// ---------- PR30-r17 ----------
+test("AT4r names inside array values are never read as dictionary keys", () => {
+  const doc = pdfObjects(
+    [
+      [4, { stream: "BT (FR-001 real page) Tj ET" }],
+      [9, { stream: "BT (FR-999 decoy) Tj ET" }],
+      [1, "<< /Type /Catalog /Ext [/Pages 8 0 R] /Pages 2 0 R >>"],
+      [2, "<< /Type /Pages /Meta [/Kids [9 0 R]] /Kids [3 0 R] >>"],
+      [3, "<< /Type /Page /Custom [/Contents 9 0 R] /Note (x) /Arr [[/Contents 9 0 R] << /Contents 9 0 R >>] /Contents 4 0 R >>"],
+    ],
+    1,
+  );
+  const r = parseSpec(doc, "arrays.pdf");
+  assert.deepEqual(ids(r), ["FR-001"]);
+  assert.ok(!r.warnings.includes("pdf-page-order-unknown"));
+});
