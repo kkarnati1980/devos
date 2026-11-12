@@ -43,11 +43,22 @@ test("AT-MR6 task (kind analysis) and analyst run rows satisfy the FKs; text eve
   assert.equal(run.task.kind, "analysis");
   assert.equal(run.task.assignee, "agent");
   assert.equal(run.task.status, "done");
+  const env = await db.capabilityEnvelope.findFirst({ where: { runId } });
+  assert.deepEqual([env.tools, env.readPaths, env.writePaths, env.network, env.networkAllowList], [[], [], [], false, null], "deny-all envelope");
+  assert.equal(Number(env.maxCostUsd), 0.5);
 
   const failing = { execute: async () => ({ status: "limit_hit" }) };
   await assert.rejects(runEngineModelRunner(rows, failing)({ prompt: "p", tag: "analyst_assist", projectId: p.id }), /analyst-run-limit_hit/);
   const tasks = await db.task.findMany({ where: { projectId: p.id }, orderBy: { createdAt: "asc" } });
   assert.deepEqual(tasks.map((t) => t.status).sort(), ["done", "failed"]);
+
+  // An engine that throws leaves the run queued; the runner closes it as failed (it is never re-queued).
+  let thrownRun;
+  const throwing = { execute: async (input) => { thrownRun = input.runId; throw new Error("store down"); } };
+  await assert.rejects(runEngineModelRunner(rows, throwing)({ prompt: "p", tag: "analyst_assist", projectId: p.id }), /store down/);
+  const abandoned = await db.run.findUnique({ where: { id: thrownRun } });
+  assert.deepEqual([abandoned.status, abandoned.error], ["failed", "analyst-run-abandoned"]);
+  assert.ok(abandoned.endedAt);
 });
 
 test("AT-MR6 an unknown project is refused by the FK and leaves no task", async () => {

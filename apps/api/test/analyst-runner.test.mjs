@@ -3,6 +3,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { ClaudeAgentSdkAdapter, MemoryRunStore, RunEngine } from "@devos/run-engine";
 import { MemoryRequirementsStore } from "@devos/analyst";
@@ -34,6 +36,7 @@ function memoryRows(runStore) {
       const taskId = `task-${++n}`;
       tasks.set(taskId, { kind: "analysis", assignee: "agent", status: "running", title: input.title, projectId: input.projectId });
       const runId = `run-${randomBytes(4).toString("hex")}`;
+      runStore.envelopes.set(runId, input.envelope);
       runStore.runs.set(runId, { id: runId, taskId, projectId: input.projectId, role: "analyst", model: input.model, attempt: 1, status: "queued", maxTurns: input.maxTurns, maxSeconds: input.maxSeconds, maxCostUsd: input.maxCostUsd, turns: 0 });
       this.created.push({ runId, ...input });
       return runId;
@@ -47,9 +50,9 @@ function memoryRows(runStore) {
   };
 }
 
-/** A fake Agent SDK query: one assistant turn whose text is `text`, then a result with `cost`. */
-function sdk(text, { cost = 0.02, fail = false } = {}) {
-  return () => (async function* () {
+/** A fake Agent SDK query: one assistant turn whose text is `text`, then a result with `cost`. Records its options. */
+function sdk(text, { cost = 0.02, fail = false, calls = [] } = {}) {
+  return ({ options }) => (calls.push({ ...options, cwdExisted: existsSync(options.cwd) }), async function* () {
     yield { type: "system", subtype: "init", session_id: "s1" };
     if (fail) throw Object.assign(new Error("bad request"), { status: 400 });
     yield { type: "assistant", message: { model: ANALYST_MODEL, content: [{ type: "text", text }], usage: { input_tokens: 100, output_tokens: 50 } } };
@@ -59,15 +62,17 @@ function sdk(text, { cost = 0.02, fail = false } = {}) {
 
 function setup({ text = "", budgets = [], fail = false, mode = "observe" } = {}) {
   const runStore = new MemoryRunStore();
-  const policy = new PolicyEngine({ store: new MemoryPolicyStore({ mode }), hmacKey: randomBytes(32), budgets });
-  const engine = new RunEngine({ store: runStore, policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: sdk(text, { fail }) }) });
+  const pstore = new MemoryPolicyStore({ mode });
+  const policy = new PolicyEngine({ store: pstore, hmacKey: randomBytes(32), budgets });
+  const calls = [];
+  const engine = new RunEngine({ store: runStore, policy, adapterFor: () => new ClaudeAgentSdkAdapter({ query: sdk(text, { fail, calls }) }) });
   const rows = memoryRows(runStore);
   const reqStore = new MemoryRequirementsStore();
   reqStore.addProject({ id: P1, name: "Shop", stage: "intake" });
   const approvalStore = new MemoryApprovalStore();
   const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
   const svc = requirementsServices(reqStore, approvals, approvalStore, runEngineModelRunner(rows, engine));
-  return { runStore, rows, reqStore, svc };
+  return { runStore, rows, reqStore, svc, pstore, calls };
 }
 
 const proposal = (blocks) => JSON.stringify({ requirements: [{ block: blocks, title: "Owner publishes daily menu with prices" }], criteria: [] });
@@ -89,6 +94,17 @@ test("AT-MR1 one analysis task and one analyst run (Sonnet, max_turns 2, one tur
   assert.equal(s.runStore.finished.get(c.runId).turns, 1);
   const task = s.rows.tasks.get(run.taskId);
   assert.deepEqual([task.kind, task.assignee, task.status], ["analysis", "agent", "done"]);
+  // Pre-review finding 1: the run's envelope is deny-all, so the model may only answer in text, and it works in a
+  // private empty directory that is removed afterwards.
+  const env = s.runStore.envelopes.get(c.runId);
+  assert.deepEqual([env.tools, env.readPaths, env.writePaths, env.network, env.networkAllowList], [[], [], [], false, null]);
+  assert.equal(env.maxCostUsd, 0.5);
+  assert.equal(s.calls.length, 1);
+  assert.deepEqual(s.calls[0].allowedTools, [], "the adapter is given the envelope's empty tool list");
+  assert.equal(s.calls[0].model, "claude-sonnet-5-5");
+  assert.ok(s.calls[0].cwd.startsWith(tmpdir()) && s.calls[0].cwd !== tmpdir() && /devos-analyst-/.test(s.calls[0].cwd));
+  assert.equal(s.calls[0].cwdExisted, true);
+  assert.equal(existsSync(s.calls[0].cwd), false, "the working directory is removed");
 });
 
 test("AT-MR2 the engine records the cost (one cost_entry for the run); the runner adds none of its own", async () => {
@@ -101,6 +117,10 @@ test("AT-MR2 the engine records the cost (one cost_entry for the run); the runne
   assert.ok(Math.abs(costs[0].usd - 0.02) < 1e-9);
   assert.equal(s.runStore.costs.length, 1);
   assert.equal(s.runStore.finished.get(c.runId).status, "succeeded");
+  const res = s.pstore.reservations.filter((x) => x.runId === c.runId);
+  assert.equal(res.length, 1, "one M1.7 reservation for the run");
+  assert.equal(res[0].status, "reconciled");
+  assert.ok(Math.abs(res[0].actualUsd - 0.02) < 1e-9);
 });
 
 test("AT-MR3 an adapter error and a budget stop each give assist-failed with the deterministic requirements kept", async () => {
@@ -139,7 +159,8 @@ test("AT-MR5 buildRuntime keeps the model pass off without loadAnalystEngine; wi
   const tx = {
     $queryRaw: async () => [],
     task: { create: async (a) => (writes.push(["task.create", a.data]), { id: "t1" }), update: async (a) => writes.push(["task.update", a.where, a.data]) },
-    run: { create: async (a) => (writes.push(["run.create", a.data]), { id: "r1" }), findUnique: async () => ({ taskId: "t1" }) },
+    run: { create: async (a) => (writes.push(["run.create", a.data]), { id: "r1" }), findUnique: async () => ({ taskId: "t1" }), updateMany: async (a) => writes.push(["run.updateMany", a.where, a.data.status, a.data.error]) },
+    capabilityEnvelope: { create: async (a) => writes.push(["capabilityEnvelope.create", a.data]) },
     runEvent: { findMany: async (a) => (writes.push(["runEvent.findMany", a.where, a.orderBy]), [{ payload: { text: "{" } }, { payload: { text: "}" } }]) },
   };
   const db = { $transaction: async (fn) => fn(tx) };
@@ -158,7 +179,19 @@ test("AT-MR5 buildRuntime keeps the model pass off without loadAnalystEngine; wi
   assert.deepEqual(await runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), { output: "{}" });
   assert.deepEqual(writes[0], ["task.create", { projectId: P1, kind: "analysis", assignee: "agent", title: "Analyst assist", status: "running" }]);
   assert.deepEqual(writes[1], ["run.create", { taskId: "t1", projectId: P1, role: "analyst", model: "claude-sonnet-5-5", maxTurns: 2, maxSeconds: 90, maxCostUsd: "0.500000" }]);
+  const envRow = writes[2][1];
+  assert.equal(writes[2][0], "capabilityEnvelope.create");
+  assert.deepEqual({ ...envRow, expiresAt: undefined }, { runId: "r1", tools: [], readPaths: [], writePaths: [], network: false, networkAllowList: null, maxCostUsd: "0.500000", maxTokens: 200000, maxConcurrency: 1, expiresAt: undefined, depth: 0 });
+  assert.ok(envRow.expiresAt instanceof Date && envRow.expiresAt.getTime() > Date.now());
+  assert.match(seen[1].cwd, /devos-analyst-/);
   assert.deepEqual(seen[1], { runId: "r1", provider: "anthropic", prompt: "p", cwd: seen[1].cwd, tag: "analyst_assist" });
-  assert.deepEqual(writes[2], ["runEvent.findMany", { runId: "r1", type: "text" }, { seq: "asc" }]);
-  assert.deepEqual(writes[3], ["task.update", { id: "t1" }, { status: "done" }]);
+  assert.deepEqual(writes[3], ["runEvent.findMany", { runId: "r1", type: "text" }, { seq: "asc" }]);
+  assert.deepEqual(writes[4], ["task.update", { id: "t1" }, { status: "done" }]);
+  assert.equal(writes.length, 5, "a succeeded run is not touched");
+
+  // Pre-review finding 2: an engine that throws (in-process, never re-queued) leaves no run queued or running.
+  writes.length = 0;
+  const thrown = await buildRuntime(env, { ...opts, loadAnalystEngine: async () => ({ execute: async () => { throw new Error("store down"); } }) });
+  await assert.rejects(thrown.requirements.pipeline.ports.runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /store down/);
+  assert.deepEqual(writes.slice(-2), [["task.update", { id: "t1" }, { status: "failed" }], ["run.updateMany", { id: "r1", status: { in: ["queued", "running"] } }, "failed", "analyst-run-abandoned"]]);
 });
