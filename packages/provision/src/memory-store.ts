@@ -45,6 +45,12 @@ export class MemoryStore implements ProvisionStore {
     this.upsert(projectId, spec, { status: "failed", lastError: error.slice(0, 300) });
   }
 
+  async listResources(provider: string, kind: string) {
+    return this.resources
+      .filter((r) => r.provider === provider && r.kind === kind)
+      .map((r) => ({ projectId: r.projectId, externalId: r.externalId, name: r.name, active: !(r as { deletedAt?: unknown }).deletedAt }));
+  }
+
   async recordResource(projectId: string, r: ResourceRecord): Promise<void> {
     const hit = this.resources.find((x) => x.provider === r.provider && x.kind === r.kind && x.externalId === r.externalId);
     if (hit) {
