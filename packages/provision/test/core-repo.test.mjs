@@ -209,3 +209,22 @@ test("template files: core-only check, path guard, symlinks refused", () => {
   assert.equal(blobSha(Buffer.from("")), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"); // git's empty blob
   assert.ok(FILES.length > 5 && FILES.some((f) => f.path === ".devos/template.json"));
 });
+
+test("pre-review r2: the root-commit path: a ref create that times out after it happened is adopted with one POST", async () => {
+  const fake = fakeProviders();
+  fake.state.gitEmpty409 = false;
+  const s = setup(fake);
+  fake.faults.push({ match: (m, p) => m === "POST" && p.endsWith("/git/refs"), action: "timeout-after" });
+  const out = await s.run();
+  assert.equal(out[1].outcome, "adopted");
+  assert.equal(fake.calls.filter((c) => c.method === "POST" && c.path.endsWith("/git/refs")).length, 1);
+});
+
+test("pre-review r2: a 409 'empty' on a Git Data write after the bootstrap is retryable, and the re-run finishes", async () => {
+  const s = setup();
+  s.fake.faults.push({ match: (m, p) => m === "POST" && p.endsWith("/git/trees"), action: { status: 409 } });
+  await assert.rejects(s.run(), (e) => e instanceof StepError && e.code === "create_unconfirmed" && e.retryable);
+  const out = await s.run();
+  assert.equal(out[1].outcome, "created");
+  assert.equal(s.fake.calls.filter((c) => c.method === "PUT").length, 1);
+});

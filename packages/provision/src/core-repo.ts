@@ -207,9 +207,18 @@ export function githubCoreStep(
           parent = await boot();
         }
       }
-      if (!blobsDone) for (const f of files) await repo.createBlob(f);
-      const tree = await repo.createTree(files);
-      const commit = await repo.createCommit(message, tree, parent ? [parent] : []);
+      let tree: string;
+      let commit: string;
+      try {
+        if (!blobsDone) for (const f of files) await repo.createBlob(f);
+        tree = await repo.createTree(files);
+        commit = await repo.createCommit(message, tree, parent ? [parent] : []);
+      } catch (e) {
+        // GitHub can still call the repo empty just after the bootstrap commit: transient, the next run goes on
+        // from the bootstrap (pre-review r2).
+        if (isEmptyRepo(e)) throw new ProviderError("github", "network", "github Git Data: repo still reported empty after the bootstrap");
+        throw e;
+      }
       await assertLock();
       try {
         if (parent) await repo.fastForwardMain(commit);

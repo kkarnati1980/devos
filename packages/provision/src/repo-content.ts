@@ -16,8 +16,9 @@ export interface RepoFile {
   sha: string;
 }
 
-/** Limits that keep a template push small and bounded (the core is about 12 files and 80 KB). */
-export const REPO_LIMITS = { maxFiles: 500, maxFileBytes: 1_000_000, maxTotalBytes: 10_000_000 } as const;
+/** Limits that keep a template push small and bounded (the core is about 12 files and 80 KB). 100 files stays
+ * well under GitHub's secondary limit on content-creating requests (about 80 a minute is the documented guide). */
+export const REPO_LIMITS = { maxFiles: 100, maxFileBytes: 1_000_000, maxTotalBytes: 10_000_000 } as const;
 
 export const blobSha = (content: Buffer): string =>
   createHash("sha1").update(`blob ${content.length}\0`).update(content).digest("hex");
