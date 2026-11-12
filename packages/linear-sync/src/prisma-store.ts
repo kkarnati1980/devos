@@ -6,7 +6,7 @@ import type { DevosPlan, LinearApi, SyncStore } from "./types.js";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Delegate = any;
 export interface PrismaLike {
-  project: Delegate; milestone: Delegate; module: Delegate; moduleDependency: Delegate; task: Delegate; resource: Delegate;
+  project: Delegate; milestone: Delegate; module: Delegate; moduleDependency: Delegate; task: Delegate; resource: Delegate; auditEvent: Delegate;
   $transaction<T>(fn: (tx: any) => Promise<T>, options?: { timeout?: number; maxWait?: number }): Promise<T>;
 }
 
@@ -78,6 +78,15 @@ export class PrismaSyncStore implements SyncStore {
   setMilestoneId(milestoneId: string, linearMilestoneId: string) { return this.upsertResource("milestone", milestoneId, linearMilestoneId); }
   async setModuleIssue(moduleId: string, issueId: string) { await bounded(this.db, (tx) => tx.module.update({ where: { id: moduleId }, data: { linearIssue: issueId } })); }
   async setTaskIssue(taskId: string, issueId: string) { await bounded(this.db, (tx) => tx.task.update({ where: { id: taskId }, data: { linearIssue: issueId } })); }
+  /** Only a human task of this project that is not yet done changes; the change and its audit row commit together. */
+  async completeHumanTask(taskId: string, how: "completed" | "canceled") {
+    await bounded(this.db, async (tx) => {
+      const n = await tx.task.updateMany({ where: { id: taskId, projectId: this.projectId, assignee: "kk", status: { not: "done" } }, data: { status: "done" } });
+      if (!n.count) return;
+      await tx.auditEvent.create({ data: { actor: "kk", projectId: this.projectId, action: how === "canceled" ? "task.canceled_in_linear" : "task.completed_in_linear",
+        summary: how === "canceled" ? "Human task cancelled in Linear; marked done" : "Human task completed in Linear; marked done", details: { taskId, how } } });
+    });
+  }
 }
 
 /** Throws when the sync lock can no longer be trusted to outlive the next outbound write (Codex PR35-r1). */
@@ -103,6 +112,7 @@ function fencedStore(store: SyncStore, guard: LockGuard): SyncStore {
     setMilestoneId: async (a, b) => { await guard(); return store.setMilestoneId(a, b); },
     setModuleIssue: async (a, b) => { await guard(); return store.setModuleIssue(a, b); },
     setTaskIssue: async (a, b) => { await guard(); return store.setTaskIssue(a, b); },
+    completeHumanTask: async (a, b) => { await guard(); return store.completeHumanTask(a, b); },
   };
 }
 

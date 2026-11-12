@@ -26,13 +26,13 @@ export function taskState(s: TaskStatus): { type: StateType; deadlocked: boolean
 
 const viewerCache = new WeakMap<LinearApi, string>();
 
-export interface SyncResult { writes: number; created: string[]; updated: string[]; log: string[] }
+export interface SyncResult { writes: number; created: string[]; updated: string[]; log: string[]; inbound: string[] }
 export interface SyncOptions { teamKey?: string; kkUserId?: string }
 
 const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
 
 export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncStore, opts: SyncOptions = {}): Promise<SyncResult> {
-  const r: SyncResult = { writes: 0, created: [], updated: [], log: [] };
+  const r: SyncResult = { writes: 0, created: [], updated: [], log: [], inbound: [] };
   const team = await api.team(opts.teamKey ?? "DEVOS");
   const stateId = (type: StateType) => {
     const s = team.states.find((x) => x.type === type);
@@ -129,6 +129,7 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     if (existing.title !== want.title) patch.title = want.title;
     if (!sameText(existing.description, want.description)) patch.description = want.description;
     // Human tasks: Linear owns their state after creation (KK completes them there; M2.6-b reads it back).
+    // An agent-owned issue moved by hand in Linear is put back (DevOS owns its state) and the revert is logged (AT6).
     if (!want.keepLinearState && existing.stateType !== want.state) { patch.stateId = stateId(want.state); r.log.push(`${what}: state ${existing.stateType} -> ${want.state}`); }
     if (!sameSet(existing.labelNames, want.labels)) patch.labelIds = lids;
     if (existing.parentId !== want.parentId) patch.parentId = want.parentId;
@@ -157,6 +158,12 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     const st = taskState(t.status);
     const human = t.assignee === "kk";
     const existing = find(t.linearIssue, "task", t.id);
+    // M2.6-b inbound (AT6): Linear owns a human task's state after creation. Completed or cancelled there → the
+    // DevOS task becomes done (cancel is recorded as such), which the scheduler sees as an unblocked dependency.
+    if (human && existing && t.status !== "done" && (existing.stateType === "completed" || existing.stateType === "canceled")) {
+      await store.completeHumanTask(t.id, existing.stateType);
+      r.inbound.push(`task ${t.title.slice(0, 40)}: ${existing.stateType} in Linear -> done`);
+    }
     const mod = t.moduleId ? plan.modules.find((m) => m.id === t.moduleId) : undefined;
     const id = await upsert(`task ${t.title.slice(0, 40)}`, existing, {
       title: t.title,

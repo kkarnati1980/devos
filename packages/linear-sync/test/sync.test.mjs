@@ -98,7 +98,7 @@ test("AT5 (sync level): a Linear failure during sync carries no key, and nothing
   const fetchImpl = async () => new Response(JSON.stringify({ errors: [{ message: `echo ${KEY}` }] }), { status: 200 });
   const api = graphqlApi(new LinearClient({ apiKey: () => KEY, fetchImpl, sleep: async () => {} }));
   const plan = throwaway(); const stored = [];
-  const store = { setProjectId: async (...a) => stored.push(a), setMilestoneId: async (...a) => stored.push(a), setModuleIssue: async (...a) => stored.push(a), setTaskIssue: async (...a) => stored.push(a) };
+  const store = { setProjectId: async (...a) => stored.push(a), setMilestoneId: async (...a) => stored.push(a), setModuleIssue: async (...a) => stored.push(a), setTaskIssue: async (...a) => stored.push(a), completeHumanTask: async (...a) => stored.push(a) };
   const err = await syncProject(plan, api, store).catch((e) => e);
   assert.ok(err instanceof Error);
   assert.ok(!JSON.stringify({ m: err.message, s: err.stack, stored, plan }).includes(KEY));
@@ -232,4 +232,52 @@ test("DEVOS-132: the issues query stays under Linear's complexity limit", async 
   const { ISSUES_QUERY_COST, LINEAR_MAX_COMPLEXITY, ISSUE_PAGE } = await import("../dist/index.js");
   assert.ok(ISSUES_QUERY_COST <= LINEAR_MAX_COMPLEXITY, `${ISSUES_QUERY_COST} > ${LINEAR_MAX_COMPLEXITY}`);
   assert.ok(ISSUE_PAGE >= 10, "pages are not so small that a project needs hundreds of reads");
+});
+
+test("AT6: KK completing a human task in Linear makes the DevOS task done within one sync; a second sync changes nothing", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const human = L.issues.find((i) => i.title === "Create the API key");
+  human.stateId = "s-c"; L.writes.length = 0;
+  const r = await syncProject(plan, L.api, store);
+  assert.deepEqual(store.completed, [[u(33), "completed"]]);
+  assert.equal(plan.tasks.find((t) => t.id === u(33)).status, "done");
+  assert.equal(r.inbound.length, 1); assert.equal(r.writes, 0, "inbound sync writes nothing to Linear");
+  const r2 = await syncProject(plan, L.api, store);
+  assert.equal(store.completed.length, 1); assert.equal(r2.inbound.length, 0); assert.equal(r2.writes, 0);
+});
+
+test("AT6: a cancelled human task becomes done, recorded as cancelled", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  L.issues.find((i) => i.title === "Create the API key").stateId = "s-x";
+  await syncProject(plan, L.api, store);
+  assert.deepEqual(store.completed, [[u(33), "canceled"]]);
+});
+
+test("AT6: completing an agent issue in Linear is reverted on the next sync and logged; no inbound change", async () => {
+  const plan = throwaway(); const L = fakeLinear(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const agentTasks = plan.tasks.filter((t) => t.assignee !== "kk" && t.status !== "done");
+  assert.ok(agentTasks.length);
+  const issue = L.issues.find((i) => i.id === agentTasks[0].linearIssue);
+  const before = issue.stateId; issue.stateId = "s-c"; L.writes.length = 0;
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(issue.stateId, before, "state put back");
+  assert.ok(r.log.some((l) => /: state completed -> /.test(l)), r.log.join("\n"));
+  assert.deepEqual(store.completed, []); assert.equal(agentTasks[0].status === "done", false);
+});
+
+test("AT6: the fenced store checks the lock guard before completing a human task", async () => {
+  const { syncProjectLocked } = await import("../dist/index.js");
+  let guarded = 0;
+  const tx = { $queryRawUnsafe: async (q) => (q.includes("pg_try_advisory_xact_lock") ? [{ ok: true }] : [{}]) };
+  const inner = { $executeRawUnsafe: async () => {}, task: { updateMany: async () => ({ count: 0 }) }, auditEvent: { create: async () => {} },
+    project: { findUnique: async () => ({ id: "p", name: "P" }) }, milestone: { findMany: async () => [] }, module: { findMany: async () => [] }, task2: {}, resource: { findMany: async () => [] }, moduleDependency: { findMany: async () => [] } };
+  inner.task.findMany = async () => [];
+  let depth = 0;
+  const db = { $transaction: async (fn) => { depth++; try { return await fn(depth === 1 ? tx : inner); } finally { depth--; } } };
+  const origQuery = tx.$queryRawUnsafe; tx.$queryRawUnsafe = async (q, ...a) => { if (q === "SELECT 1") guarded++; return origQuery(q, ...a); };
+  await syncProjectLocked(db, "p", async (_plan, store) => { await store.completeHumanTask("t", "completed"); });
+  assert.equal(guarded, 1);
 });
