@@ -105,7 +105,7 @@ gh_all_runs() {  # sha -> all workflow runs for the SHA, every page (max 30 page
     if (( n < 100 )) || (( page >= 30 )); then break; fi
     page=$((page + 1))
   done
-  cat "$acc"; rm -f "$acc" "$chunk"
+  local rc=0; cat "$acc" || rc=1; rm -f "$acc" "$chunk"; return "$rc"
 }
 ci_state() {  # sha -> prints green | pending | red ; returns 1 if workflow runs cannot be read
   local runs

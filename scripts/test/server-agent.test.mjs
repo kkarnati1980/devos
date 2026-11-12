@@ -653,6 +653,7 @@ printf '%s %s %s\\n' "$(jq length <<<"$r")" "$(jq '[.[].id] | unique | length' <
   const f = path.join(dir, "h.sh");
   fs.writeFileSync(f, harness);
   const [runs, unique, bytes] = execFileSync("bash", [f], { cwd: ROOT, encoding: "utf8" }).trim().split(" ").map(Number);
+  fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(runs, 103);
   assert.equal(unique, 103);
   assert.ok(bytes > 131072, `first page must exceed 128 KiB, was ${bytes}`);
@@ -666,14 +667,17 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 REPO=x/y
 gh(){ case "$2" in
   *page=1) jq -nc '{workflow_runs: [range(100) | {id: .}]}';;
-  *) return 1;;
+  *page=2) [[ "\${BAD:-}" == json ]] && { echo 'not json'; return 0; }; return 1;;
   esac; }
 eval "$(sed -n '/^gh_all_runs() {/,/^}/p' scripts/server/server-agent.sh)"
+if out="$(gh_all_runs abc)"; then echo "ok \${#out}"; else echo "fail $(ls "$TMP" | wc -l)"; fi
+BAD=json
 if out="$(gh_all_runs abc)"; then echo "ok \${#out}"; else echo "fail $(ls "$TMP" | wc -l)"; fi
 `;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sa-runs-"));
   const f = path.join(dir, "h.sh");
   fs.writeFileSync(f, harness);
   const out = execFileSync("bash", [f], { cwd: ROOT, encoding: "utf8" }).trim();
-  assert.equal(out, "fail 0", "a failed page read must fail the call and leave no temp files");
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(out, "fail 0\nfail 0", "a failed or non-JSON page must fail the call and leave no temp files");
 });
