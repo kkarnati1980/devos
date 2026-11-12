@@ -13,6 +13,18 @@ export {
 } from "./analyze.js";
 export { renderRequirementsMd, type RenderMeta } from "./render.js";
 export {
+  assistAnalysis,
+  assistCandidates,
+  buildAssistPrompt,
+  grounding,
+  type AssistOptions,
+  type AssistRejectReason,
+  type AssistResult,
+  type AssistWarning,
+  type AssistWarningCode,
+  type ModelRunner,
+} from "./assist.js";
+export {
   classifyQuestion,
   planQuestions,
   questionFingerprint,
