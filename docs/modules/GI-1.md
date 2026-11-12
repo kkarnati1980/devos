@@ -1,0 +1,77 @@
+# GI-1 — Gate integrity Part 1: floor guard (contract)
+
+- **Linear:** DEVOS-141 (parent DEVOS-140) · P2 · Lane A · High
+- **Source:** KK's spec `claude/devos-gate-integrity-spec-v1.0.0.md` §4 (12 Nov 2026). The patterns of §4.2 are a minimum: the Architect may add patterns, never remove one.
+- **Applies:** D1 (Codex PASS on the same SHA), ADR-0013 (runner decides technical design; one task = one PR), ADR-0011 (no new network egress), C1 (no new third-party Action), C2 (under 2 minutes).
+- **Owned files (the guard paths):** `scripts/floor-guard/**`, `scripts/test/floor-guard.test.mjs`, `.github/workflows/floor-guard.yml`; plus this contract and `docs/decisions/0017-floor-guard.md`.
+
+## Interface
+- `node scripts/floor-guard/floor-guard.mjs --base <rev> --head <rev> [--report <file.json>]` diffs `merge-base(base, head)..head` with `git diff --unified=0 --find-renames`. It reads the diff and the base/head copies of changed files only; never a PR description.
+- Output: one `HIT <id> <rule> <file>:<line> <text>` line per hit, a summary line, and (with `--report`) JSON `{ sha, base, exit, hits: [{ id, rule, file, line, text }], error? }`.
+- **Exit codes:** `0` clean · `1` violation · `2` could not run (bad ref, not a repo, unreadable diff, unreadable base contract, missing arguments, report not writable). Exit 2 is never clean.
+- Hit ids are `fg-` + 10 hex of SHA-256(rule, file, trimmed text): stable when lines shift, distinct per finding.
+- Module exports for tests and Part 3: `run`, `analyse`, `parseDiff`, `workflowShape`, `applyDispositions`, `CEILINGS`, `GUARD_PATHS`.
+- Zero dependencies (node built-ins and `git` only), so CI can run the base copy without an install.
+
+## Rules (each a hit)
+| Rule | Fires on |
+|---|---|
+| `test-file-deleted` | a test file (`*.test.*`, `*.spec.*`, or a JS/TS file under `test/`, `tests/`, `__tests__/`, `test-db/`, `e2e/`) deleted, or renamed to a non-test path |
+| `test-skipped` | an added line in a test file with `.skip(`, `.only(`, `.todo(`, `xit(`, `xdescribe(`, `xtest(`, `fit(`, `fdescribe(`, `skipIf(`, `runIf(`, a `skip:`/`todo:`/`only:` option, or an early `return` guarded by an env/platform/CI/skip condition |
+| `assertions-lost` | net loss of `expect(`/`assert…(` calls across a changed test file's removed vs added lines |
+| `coverage-lowered` | a coverage key (`lines`, `branches`, `functions`, `statements`, `threshold`, `perFile`) lowered in a test config, test file or workflow |
+| `max-warnings-raised` | `--max-warnings N` raised, or removed, in a test config or workflow |
+| `timeout-past-ceiling` | an added `timeout-minutes` above **30** in a workflow, or a `testTimeout`/`hookTimeout`/`timeout` above **120 000 ms** in a test file or test config (the documented ceilings, `CEILINGS`) |
+| `retries-raised` | `retries`/`retry`/`maxRetries` raised in a test config, test file or workflow, or a new non-zero one in a test config/test file (`--health-retries` is excluded) |
+| `suppression-added` | an added `eslint-disable`, `@ts-ignore`, `@ts-expect-error`, `@ts-nocheck`, `istanbul ignore`, `c8 ignore`, `nosec`, `gitleaks:allow` in a code/config file |
+| `gitleaksignore-added` | any added non-comment line in `.gitleaksignore` |
+| `ci-workflow-deleted`, `ci-job-removed`, `ci-step-removed`, `ci-trigger-removed` | a workflow file deleted; a job, or a step (identified by `name`, else `uses`, else `run`) missing from the head; an `on:` trigger dropped (a required check that stops reporting) |
+| `ci-continue-on-error`, `ci-disabled` | an added `continue-on-error: true` (or an expression); an added `if: false` |
+| `failure-swallowed` | an added `|| true`, `set +e` or `|| exit 0` in a workflow or `package.json`, or in a shell script on a line that runs a test/check tool |
+| `stub-marker` | an added `TODO`, `FIXME` or `not implemented` in non-test source (every DevOS PR is one module or task, so every PR claims a task done) |
+| `stub-body` | a hunk in non-test source that removes ≥ 3 logic lines and adds exactly one line that only throws or returns a constant |
+| `contract-weakened` | a removed or reworded line in an `Acceptance…`, `Pass rule` or `Green…` section of a `docs/modules/*.md` that already exists on the base (its first PR has opened) |
+| `policy-weakened` | a net loss of deny / require_approval / gate / default-deny / wouldBlock / budget-exceeded references in `packages/policy/src` (non-test), the file deleted, or any removed line under `packages/policy/rules/` |
+| `guard-change-not-isolated` | a change to a guard path together with any file other than guard paths, `docs/decisions/*.md` and this contract |
+
+Guard paths are exempt from the content rules (their tests hold the very patterns), which is safe only because a guard change must come alone and needs a Codex PASS naming it (§4.5).
+
+## CI job (`.github/workflows/floor-guard.yml`)
+- On every `pull_request` to `main`; check name `floor-guard`; `timeout-minutes: 5`; `contents: read`.
+- Runs the guard file **from the PR's base commit** (`git show $BASE:scripts/floor-guard/floor-guard.mjs`), so a PR that edits the guard is judged by the previous version. Only when the base has no guard (this bootstrap PR) does it run the head copy.
+- Prints the wall time and writes the hits and the JSON report to the job summary. No new Action (checkout and setup-node only).
+
+## Dispositions (spec §4.4) — runner decisions, 12 Nov 2026 (ADR-0013)
+- **Restore:** revert the weakening; the next push re-runs the guard.
+- **Keep:** `applyDispositions(report, verdict)` accepts a hit only when the verdict is from Codex (`source: "codex"`), is for the same SHA as the report, and has a line `FLOOR-GUARD KEEP <id> <file>:<line> <reason>` naming that hit. A Builder's note never counts; a new commit (new SHA) voids every Keep; an exit-2 report cannot be disposed of.
+- **Escalate to KK:** only for money, data deletion, security scanning, legal, D11 or D13 hits; the card goes out under the normal HARD RULE.
+- **Split (size check):** reading the Codex verdict for a SHA and letting the merge path accept a failing `floor-guard` check with valid Keeps is wiring, not detection, and belongs with the Release merge path (DEVOS-143). It is filed as **GI-1b** (follow-up). Until it lands, a hit blocks the runner's merge outright: the runner restores the weakening or obtains a Codex Keep and records it in the PR's merge evidence.
+
+## Not in scope
+- Making `floor-guard` a required check in the `main` ruleset (DEVOS-145, GI-3b) and adding it to `required-checks.json` (DEVOS-143).
+- The pass-rule field and validator (DEVOS-142).
+
+## Pass rule
+- `node --test scripts/test/floor-guard.test.mjs` (part of `pnpm test`) exits 0. It holds one fixture diff per rule above expecting exit 1 and the rule's name, a clean diff expecting exit 0, forced errors (unknown ref, not a repository, missing arguments, unreadable diff) expecting exit 2, the isolation rule, dispositions, and the CLI.
+- The `floor-guard` job on this PR's head SHA succeeds, and its log shows `wall: <n>s` with n ≤ 120.
+
+## Acceptance tests
+| # | Pass when |
+|---|---|
+| AT1 | Every §4.2 pattern has a fixture diff that exits 1 with the matching rule (pass rule, first bullet) |
+| AT2 | A clean diff (new code, new tests, more assertions, a contract row added, a timeout raised within the ceiling, a test renamed) exits 0 |
+| AT3 | A forced error exits 2, and `applyDispositions` keeps exit 2 (exit 2 ≠ clean) — GC2 |
+| AT4 | Adding `.skip` to an existing test exits 1 with `test-skipped` on the right file and line — GC1, detection half |
+| AT5 | A Keep is honoured only from Codex, on the same SHA, naming id and file:line |
+| AT6 | A guard change mixed with any other change is a hit; alone with a decision note it is not |
+| AT7 | The CI job runs the base copy of the guard and finishes in ≤ 120 s |
+
+## Green (stored on DEVOS-140 after merge)
+- **GC1:** a throwaway PR adding `.skip` to an existing test gets `floor-guard` exit 1. "Cannot merge" is enforced by the Release path (DEVOS-143) and the ruleset (DEVOS-145) once `floor-guard` is a required check.
+- **GC2:** a throwaway PR whose guard run is forced to error gets exit 2 and a failed check.
+
+## Calibration (dry run, 12 Nov 2026)
+Run over the last 15 merged PRs on main: 12 clean; 3 with hits — two `eslint-disable` lines in Prisma stores (#35, #55) and two reworded acceptance rows in `server-agent.md` (#31). All three are what §4.2 asks to catch; each would have needed a Codex Keep. Two noisy rules found in that run were narrowed before this PR: `|| true` in shell scripts counts only on lines that run a test/check tool, and an early `return` in a test counts only behind an env/platform/CI/skip condition.
+
+## Build record
+- Pre-review and evidence: see the PR body and the merge evidence comment on DEVOS-141.

@@ -1,0 +1,153 @@
+// DEVOS-141 floor guard: one fixture diff per §4.2 pattern (exit 1), a clean diff (exit 0), forced errors (exit 2),
+// dispositions, guard isolation, and the CLI. Contract: docs/modules/GI-1.md.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { run, applyDispositions, parseDiff, workflowShape } from "../floor-guard.mjs";
+
+const GUARD = path.resolve(import.meta.dirname, "../floor-guard.mjs");
+const g = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+
+/** A repo with `base` files committed on main and `head` changes (null = delete) committed on a branch. */
+function repo(base, head) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "devos-fg-"));
+  g(dir, "init", "-q", "-b", "main");
+  g(dir, "config", "user.email", "t@example.invalid"); g(dir, "config", "user.name", "t");
+  const write = (files) => { for (const [p, c] of Object.entries(files)) { const f = path.join(dir, p); if (c === null) fs.rmSync(f); else { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, c); } } };
+  write({ "README.md": "x\n", ...base }); g(dir, "add", "-A"); g(dir, "commit", "-qm", "base");
+  g(dir, "switch", "-qc", "pr"); write(head); g(dir, "add", "-A"); g(dir, "commit", "-qm", "head", "--allow-empty");
+  return dir;
+}
+const check = (base, head) => run({ cwd: repo(base, head), base: "main", head: "pr" });
+const rules = (r) => r.hits.map((h) => h.rule);
+
+const T = "packages/x/test/a.test.ts";
+const testSrc = (body) => `import { it, expect } from "vitest";\nit("a", () => {\n${body}\n});\n`;
+const WF = ".github/workflows/ci.yml";
+const wf = (steps, extra = "") => `name: CI\non:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n${extra}    steps:\n${steps}`;
+const STEPS = `      - uses: actions/checkout@v4\n      - name: Lint\n        run: pnpm lint\n      - name: Test\n        run: pnpm test\n`;
+
+const VIOLATIONS = [
+  ["test-file-deleted", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: null }],
+  ["test-skipped (.skip)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') }],
+  ["test-skipped (.only)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.only("a"') }],
+  ["test-skipped (.todo)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);") + 'it.todo("b");\n' }],
+  ["test-skipped (xit)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'xit("a"') }],
+  ["test-skipped (xdescribe)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);") + 'xdescribe("d", () => {});\n' }],
+  ["test-skipped (describe.skip)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);") + 'describe.skip("d", () => {});\n' }],
+  ["test-skipped (skipIf)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skipIf(!process.env.DB)("a"') }],
+  ["test-skipped (node:test skip option)", { "scripts/test/b.test.mjs": 'test("a", () => { assert.ok(1); });\n' }, { "scripts/test/b.test.mjs": 'test("a", { skip: !process.env.DB }, () => { assert.ok(1); });\n' }],
+  ["test-skipped (early return)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("if (!process.env.DB) return;\nexpect(1).toBe(1);") }],
+  ["assertions-lost", { [T]: testSrc("expect(1).toBe(1);\nexpect(2).toBe(2);") }, { [T]: testSrc("expect(1).toBe(1);") }],
+  ["coverage-lowered", { "packages/x/vitest.config.ts": "export default { test: { coverage: { thresholds: { lines: 90 } } } };\n" }, { "packages/x/vitest.config.ts": "export default { test: { coverage: { thresholds: { lines: 70 } } } };\n" }],
+  ["max-warnings-raised", { "packages/x/package.json": '{ "scripts": { "lint": "eslint . --max-warnings 0" } }\n' }, { "packages/x/package.json": '{ "scripts": { "lint": "eslint . --max-warnings 50" } }\n' }],
+  ["timeout-past-ceiling (CI)", { [WF]: wf(STEPS, "    timeout-minutes: 10\n") }, { [WF]: wf(STEPS, "    timeout-minutes: 90\n") }],
+  ["timeout-past-ceiling (test)", { "packages/x/vitest.config.ts": "export default { test: { testTimeout: 5000 } };\n" }, { "packages/x/vitest.config.ts": "export default { test: { testTimeout: 600000 } };\n" }],
+  ["retries-raised", { "apps/d/playwright.config.ts": "export default { retries: 0 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 3 };\n" }],
+  ["suppression-added (eslint-disable)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "// eslint-disable-next-line\nexport const a = 1;\n" }],
+  ["suppression-added (@ts-ignore)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "// @ts-ignore\nexport const a = 1;\n" }],
+  ["suppression-added (@ts-expect-error)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "// @ts-expect-error\nexport const a = 1;\n" }],
+  ["suppression-added (@ts-nocheck)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "// @ts-nocheck\nexport const a = 1;\n" }],
+  ["suppression-added (istanbul ignore)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "/* istanbul ignore next */\nexport const a = 1;\n" }],
+  ["suppression-added (nosec)", { "scripts/a.py": "x = 1\n" }, { "scripts/a.py": "x = 1  # nosec\n" }],
+  ["suppression-added (gitleaks:allow)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "export const a = 1; // gitleaks:allow\n" }],
+  ["gitleaksignore-added", { ".gitleaksignore": "# fingerprints\n" }, { ".gitleaksignore": "# fingerprints\nabc123:src/a.ts:generic-api-key:1\n" }],
+  ["ci-step-removed", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n        run: pnpm test\n", "")) }],
+  ["ci-job-removed", { [WF]: wf(STEPS) + "  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pnpm e2e\n" }, { [WF]: wf(STEPS) }],
+  ["ci-workflow-deleted", { [WF]: wf(STEPS) }, { [WF]: null }],
+  ["ci-trigger-removed (required check no longer reports on PRs)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "") }],
+  ["ci-continue-on-error", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("        run: pnpm test\n", "        run: pnpm test\n        continue-on-error: true\n")) }],
+  ["ci-disabled (if: false)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: false\n")) }],
+  ["failure-swallowed (|| true)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm test", "run: pnpm test || true")) }],
+  ["failure-swallowed (set +e)", { "scripts/t.sh": "#!/usr/bin/env bash\nset -e\nnode --test\n" }, { "scripts/t.sh": "#!/usr/bin/env bash\nset +e; pnpm test\nnode --test\n" }],
+  ["stub-marker", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "export const a = 1;\n// TODO: real logic\n" }],
+  ["stub-marker (not implemented)", { "packages/x/src/a.ts": "export const a = 1;\n" }, { "packages/x/src/a.ts": "export const a = 1;\nexport function b() { throw new Error('not implemented'); }\n" }],
+  ["stub-body", { "packages/x/src/a.ts": "export function f(x: number) {\n  const y = x * 2;\n  if (y > 10) return y - 1;\n  return y + 1;\n}\n" }, { "packages/x/src/a.ts": "export function f(x: number) {\n  return 0;\n}\n" }],
+  ["contract-weakened", { "docs/modules/M9.md": "# M9\n## Acceptance tests\n| # | Pass when |\n|---|---|\n| AT1 | parses 10 rows |\n| AT2 | rejects bad input |\n" }, { "docs/modules/M9.md": "# M9\n## Acceptance tests\n| # | Pass when |\n|---|---|\n| AT1 | parses rows |\n" }],
+  ["contract-weakened (pass rule)", { "docs/modules/M9.md": "# M9\n## Pass rule\n- `pnpm --filter x test` exits 0\n" }, { "docs/modules/M9.md": "# M9\n## Pass rule\n- works as expected\n" }],
+  ["policy-weakened", { "packages/policy/src/evaluator.ts": "const deny = matched.find((r) => r.effect === \"deny\");\nconst outcome = deny ? \"deny\" : \"allow\";\n" }, { "packages/policy/src/evaluator.ts": "const outcome = \"allow\";\n" }],
+];
+
+for (const [name, base, head] of VIOLATIONS) {
+  test(`exit 1: ${name}`, () => {
+    const r = check(base, head);
+    assert.equal(r.exit, 1, JSON.stringify(r));
+    assert.ok(rules(r).includes(name.split(" ")[0]), `${name}: got ${rules(r)}`);
+    for (const h of r.hits) assert.match(h.id, /^fg-[0-9a-f]{10}$/);
+  });
+}
+
+test("exit 0: a clean diff (new code, new tests, more assertions, a contract row added, a timeout within the ceiling)", () => {
+  const r = check(
+    { [T]: testSrc("expect(1).toBe(1);"), [WF]: wf(STEPS, "    timeout-minutes: 10\n"), "docs/modules/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n", "packages/x/src/a.ts": "export const a = 1;\n" },
+    { [T]: testSrc("expect(1).toBe(1);\nexpect(2).toBe(2);"), [WF]: wf(STEPS + "      - name: Build\n        run: pnpm build\n", "    timeout-minutes: 20\n"),
+      "docs/modules/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n| AT2 | b |\n", "packages/x/src/a.ts": "export const a = 1;\nexport const b = () => a + 1;\n", "packages/x/test/b.test.ts": testSrc("expect(2).toBe(2);") },
+  );
+  assert.deepEqual(r.hits, []);
+  assert.equal(r.exit, 0);
+});
+
+test("exit 0: a test file renamed to another test file is not a deletion; a new contract is free to write", () => {
+  const r = check({ [T]: testSrc("expect(1).toBe(1);") }, { [T]: null, "packages/x/test/renamed.test.ts": testSrc("expect(1).toBe(1);"), "docs/modules/M10.md": "# M10\n## Acceptance tests\n| AT1 | x |\n" });
+  assert.deepEqual(r.hits, []);
+});
+
+test("exit 0: a non-env early return in a test helper, and || true on a non-test shell line", () => {
+  const r = check({ [T]: testSrc("expect(1).toBe(1);"), "scripts/s.sh": "x=1\n" },
+    { [T]: testSrc("const m = (o) => { if (o.hang) return; };\nexpect(1).toBe(1);"), "scripts/s.sh": "x=1\nv=\"$(sed -n 1p f 2>/dev/null || true)\"\n" });
+  assert.deepEqual(r.hits, []);
+});
+
+test("exit 2: an unknown head ref (could not run) is never clean", () => {
+  const r = run({ cwd: repo({}, {}), base: "main", head: "no-such-ref" });
+  assert.equal(r.exit, 2); assert.match(r.error, /git rev-parse/);
+});
+
+test("exit 2: not a git repository, and missing arguments", () => {
+  assert.equal(run({ cwd: fs.mkdtempSync(path.join(os.tmpdir(), "devos-fg-nogit-")), base: "main", head: "HEAD" }).exit, 2);
+  assert.equal(run({ cwd: repo({}, {}), base: "main" }).exit, 2);
+});
+
+test("exit 2: an unreadable diff throws a GuardError (parseDiff)", () => {
+  assert.throws(() => parseDiff("garbage before any header\n"), /unreadable diff/);
+  assert.throws(() => parseDiff("diff --git a/x b/x\n@@ nonsense @@\n"), /unreadable hunk/);
+});
+
+test("guard isolation: a guard change beside any other change is a hit; alone (plus a decision note) it is not", () => {
+  const mixed = check({ "scripts/floor-guard/floor-guard.mjs": "a\n" }, { "scripts/floor-guard/floor-guard.mjs": "b\n", "packages/x/src/a.ts": "export const a = 2;\n" });
+  assert.ok(rules(mixed).includes("guard-change-not-isolated"));
+  const alone = check({ "scripts/floor-guard/floor-guard.mjs": "a\n" }, { "scripts/floor-guard/floor-guard.mjs": "b // @ts-ignore\n", "docs/decisions/0099-x.md": "note\n" });
+  assert.deepEqual(alone.hits, []);
+});
+
+test("dispositions: Keep only from a Codex verdict on the same SHA naming id and file:line; a new SHA voids it", () => {
+  const r = check({ [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
+  const [h] = r.hits;
+  const keep = `FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} flaky upstream, tracked in DEVOS-1`;
+  assert.deepEqual(applyDispositions(r, { sha: r.sha, source: "codex", text: keep }), { exit: 0, open: [] });
+  assert.equal(applyDispositions(r, { sha: "0".repeat(40), source: "codex", text: keep }).exit, 1, "other SHA");
+  assert.equal(applyDispositions(r, { sha: r.sha, source: "builder", text: keep }).exit, 1, "the Builder cannot dispose of its own hit");
+  assert.equal(applyDispositions(r, { sha: r.sha, source: "codex", text: `FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line + 1}` }).exit, 1, "wrong line");
+  assert.equal(applyDispositions({ ...r, exit: 2 }, { sha: r.sha, source: "codex", text: keep }).exit, 2, "exit 2 cannot be disposed of");
+});
+
+test("workflowShape reads jobs, step identities and triggers", () => {
+  const s = workflowShape(wf(STEPS));
+  assert.deepEqual(s.jobs, { build: ["uses:actions/checkout@v4", "name:Lint", "name:Test"] });
+  assert.ok(s.on.includes("pull_request") && s.on.includes("push"));
+});
+
+test("CLI: exit codes, HIT lines and the JSON report", () => {
+  const dir = repo({ [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
+  const out = path.join(dir, "report.json");
+  const r = spawnSync(process.execPath, [GUARD, "--base", "main", "--head", "pr", "--report", out], { cwd: dir, encoding: "utf8" });
+  assert.equal(r.status, 1); assert.match(r.stdout, /HIT fg-[0-9a-f]{10} test-skipped packages\/x\/test\/a\.test\.ts:2/);
+  assert.equal(JSON.parse(fs.readFileSync(out, "utf8")).hits.length, 1);
+  const bad = spawnSync(process.execPath, [GUARD, "--base", "main", "--head", "nope"], { cwd: dir, encoding: "utf8" });
+  assert.equal(bad.status, 2); assert.match(bad.stderr, /could not run/);
+  g(dir, "switch", "-q", "main");
+  assert.equal(spawnSync(process.execPath, [GUARD, "--base", "main", "--head", "main"], { cwd: dir }).status, 0);
+});
