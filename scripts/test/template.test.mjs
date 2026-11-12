@@ -180,9 +180,12 @@ test("AT6: apply refuses unknown, floor or opt-in IDs and a non-empty output, wr
   assert.equal(cli.status, 2); assert.match(cli.stderr, /refused/); assert.ok(!fs.existsSync(path.join(tmp, "cli")));
 });
 
-test("the template ships no add-on yet, and no secret or env file", () => {
+test("the template ships only built add-ons (each with addon.json and files/), and no secret or env file", () => {
   const addons = path.join(ROOT, "templates/golden-path/addons");
-  assert.deepEqual(fs.readdirSync(addons).filter((n) => n !== ".gitkeep"), []);
+  for (const id of fs.readdirSync(addons).filter((n) => n !== ".gitkeep")) {
+    assert.match(id, /^SM-\d{2}$/, id);
+    assert.ok(fs.existsSync(path.join(addons, id, "addon.json")) && fs.existsSync(path.join(addons, id, "files")), id);
+  }
   const core = execFileSync("git", ["ls-files", "templates/golden-path"], { cwd: ROOT, encoding: "utf8" });
   assert.ok(!/\.env(\.|$)/m.test(core));
 });
@@ -282,4 +285,33 @@ test("Codex PR32-r12 / decision v0.1.12: public/ markup is also scanned as raw t
   const f = floorCheck(out);
   for (const name of ["a.html", "b.html", "c.html", "d.mjs", "e.mjs"]) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 public/${name}:`)), `${name} in\n${f.join("\n")}`);
   assert.ok(!f.some((l) => l.includes("public/ok.html")), f.join("\n"));
+});
+
+// S3-b … S3-d (docs/modules/S3.md): per add-on, applied alone onto the core, the repo passes floor-check, the
+// add-on's own tests pass and cover each of its Lite check IDs, and no other add-on comes with it.
+test("add-ons: each applied alone passes floor-check and its own tests, covers its Lite checks, and adds nothing else", async () => {
+  const { parse } = await import("yaml");
+  const cat = parse(fs.readFileSync(path.join(ROOT, "docs/standards/build-standard.yaml"), "utf8"));
+  const addonsDir = path.join(ROOT, "templates/golden-path/addons");
+  const built = fs.readdirSync(addonsDir).filter((n) => n !== ".gitkeep");
+  const core = fresh("addon-core-ref");
+  const coreFiles = new Set(execFileSync("find", [".", "-type", "f"], { cwd: core, encoding: "utf8" }).split("\n").filter(Boolean));
+  for (const id of built) {
+    const meta = JSON.parse(fs.readFileSync(path.join(addonsDir, id, "addon.json"), "utf8"));
+    assert.equal(meta.id, id);
+    const out = fresh(`addon-${id}`, [id]);
+    const m = JSON.parse(fs.readFileSync(path.join(out, ".devos/template.json"), "utf8"));
+    assert.deepEqual([m.selected, m.applied, m.pending], [[id], [id], []], id);
+    assert.deepEqual(floorCheck(out), [], `${id}: floor-check`);
+    const added = execFileSync("find", [".", "-type", "f"], { cwd: out, encoding: "utf8" }).split("\n").filter((f) => f && !coreFiles.has(f));
+    assert.deepEqual(added.map((f) => f.slice(2)).sort(), [...meta.files].sort(), `${id}: adds exactly its own files`);
+    const lite = cat.modules.find((x) => x.id === id).lite.checks.map((c) => c.id);
+    for (const check of lite) {
+      const file = meta.checks?.[check];
+      assert.ok(file && fs.readFileSync(path.join(out, file), "utf8").includes(check), `${id}: a test names ${check}`);
+    }
+    const tests = fs.readdirSync(path.join(out, "test")).filter((f) => f.endsWith(".test.mjs")).map((f) => `test/${f}`);
+    const r = spawnSync(process.execPath, ["--test", ...tests], { cwd: out, encoding: "utf8", timeout: 120_000, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT")) });
+    assert.equal(r.status, 0, `${id}: its tests\n${r.stdout.slice(-3000)}${r.stderr.slice(-1000)}`);
+  }
 });
