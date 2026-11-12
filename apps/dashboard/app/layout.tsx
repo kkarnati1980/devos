@@ -24,6 +24,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             <a href="/setup">Setup</a>
             <a href="/settings">Settings</a>
             <a href="/notifications">Notifications</a>
+            <a href="/dead-letters">Failed runs</a>
             <span className="mode">mock data</span>
           </nav>
         </header>
