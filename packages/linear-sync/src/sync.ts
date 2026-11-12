@@ -81,7 +81,22 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   }
 
   // Issues: modules, then tasks (sub-issues need their parent's id).
-  const issues = await api.issues(projectId);
+  let issues = await api.issues(projectId);
+  // An agent issue someone moved out of the project (or whose project was cleared) is not in the list, and neither is
+  // its marker, so it would be created again. A stored id missing from the list is looked up by id: if the issue still
+  // exists it is moved back into the project (a manual edit is overwritten, never duplicated); only a gone issue is
+  // created again. The list is read once more after a move.
+  const listed = new Set(issues.map((i) => i.id));
+  let moved = 0;
+  for (const stored of [...plan.modules.map((m) => m.linearIssue), ...plan.tasks.map((t) => t.linearIssue)]) {
+    if (!stored || listed.has(stored)) continue;
+    const ref = await api.issueRef(stored);
+    if (ref && ref.projectId !== projectId) {
+      await api.updateIssue(ref.id, { projectId });
+      r.writes++; r.updated.push(`issue ${ref.id} moved back into the project`); moved++;
+    }
+  }
+  if (moved) issues = await api.issues(projectId);
   const byId = new Map(issues.map((i) => [i.id, i]));
   const find = (stored: string | null, kind: "module" | "task", id: string): LinearIssue | undefined =>
     (stored ? byId.get(stored) : undefined) ?? issues.find((i) => readMarker(i.description, kind) === id);

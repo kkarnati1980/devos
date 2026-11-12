@@ -172,3 +172,24 @@ test("Codex PR35-r7: when a label create fails, no other Linear write is still i
   assert.equal(inflight, 0, "a label write outlived the sync");
   assert.equal(maxInflight, 1, "label writes ran concurrently");
 });
+
+test("DEVOS-132: an agent issue moved to another Linear project is moved back on the next sync, never duplicated", async () => {
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  const mod = L.issues.find((x) => x.id === plan.modules[0].linearIssue);
+  const count = L.issues.length;
+  mod.projectId = "p-somewhere-else"; mod.description = "edited by hand";
+  L.writes.length = 0;
+  await syncProject(plan, L.api, store);
+  assert.equal(L.issues.length, count, "no issue created");
+  assert.equal(L.writes.filter((w) => w.op === "createIssue").length, 0);
+  assert.equal(mod.projectId, L.projects[0].id, "moved back into the project");
+  assert.match(mod.description, /devos-ref: module\//, "the manual edit is overwritten");
+  assert.equal(plan.modules[0].linearIssue, mod.id, "the stored id is kept");
+});
+
+test("DEVOS-132: the issues query stays under Linear's complexity limit", async () => {
+  const { ISSUES_QUERY_COST, LINEAR_MAX_COMPLEXITY, ISSUE_PAGE } = await import("../dist/index.js");
+  assert.ok(ISSUES_QUERY_COST <= LINEAR_MAX_COMPLEXITY, `${ISSUES_QUERY_COST} > ${LINEAR_MAX_COMPLEXITY}`);
+  assert.ok(ISSUE_PAGE >= 10, "pages are not so small that a project needs hundreds of reads");
+});

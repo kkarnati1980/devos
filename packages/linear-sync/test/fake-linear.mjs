@@ -24,6 +24,7 @@ export function fakeLinear({ failCreateIssueAfterWrite = null } = {}) {
     updateMilestone: async (mid, i) => { Object.assign(L.milestones.find((m) => m.id === mid), i); w("updateMilestone", i); },
     issues: async (pid) => L.issues.filter((x) => x.projectId === pid).map((x) => ({ id: x.id, title: x.title, description: x.description, stateType: typeOf(x.stateId),
       labelNames: labelNames(x.labelIds), parentId: x.parentId, milestoneId: x.milestoneId, assigneeId: x.assigneeId, blockedBy: [...x.blockedBy] })),
+    issueRef: async (iid) => { const x = L.issues.find((y) => y.id === iid); return x ? { id: x.id, projectId: x.projectId ?? null } : null; },
     createIssue: async (i) => {
       const x = { id: id("i"), blockedBy: [], ...i }; L.issues.push(x); w("createIssue", i);
       if (failCreateIssueAfterWrite !== null && L.issues.length === failCreateIssueAfterWrite) throw new Error("connection reset after create");
