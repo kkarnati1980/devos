@@ -345,11 +345,12 @@ FR-1
   assert.deepEqual(a.stack.map((s) => s.text), ["Hosting TBD"]);
 });
 
-test("AT10b (PR53-r2) bare ID list items are references; an ID-less item with TBD is a requirement and a question", () => {
+test("AT10b (PR53-r2, r3) bare ID list items (also overlapping IDs) are references; an ID-less item with TBD is a requirement and a question", () => {
   const { a } = analyze(`## Requirements
 
 - FR-1
 - **FR-2**, FR-3
+- FR-1, FR-10, FR-1.2
 - Users can export reports; format TBD
   - Export downloads
 `);

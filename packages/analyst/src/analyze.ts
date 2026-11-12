@@ -184,7 +184,8 @@ function isBareIdReference(text: string, prefixes: readonly string[]): boolean {
   const ids = extractRequirementIds(text, prefixes);
   if (ids.length === 0) return false;
   let rest = text;
-  for (const { id } of ids) rest = rest.split(id).join(" ");
+  // Longest first, so removing FR-1 cannot eat the prefix of FR-10 or FR-1.2 (PR53-r3).
+  for (const { id } of [...ids].sort((x, y) => y.id.length - x.id.length)) rest = rest.split(id).join(" ");
   return !/[\p{L}\p{N}]/u.test(rest.replace(/\b(and|or|see)\b/gi, " "));
 }
 
