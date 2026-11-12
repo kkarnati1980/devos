@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [] });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0 });
 
 before(async () => {
   reset();
@@ -31,6 +31,7 @@ before(async () => {
       if (p === "/repos/kkarnati1980/devos/commits/main" && M.hangMain) return; // never answers
       if (p === "/repos/kkarnati1980/devos/commits/main") return M.failMain ? send(502, {}) : send(200, { sha: MAIN });
       if (p === "/repos/kkarnati1980/devos/actions/runs") {
+        if (M.runsDelayMs) { const d = M.runsDelayMs; return void setTimeout(() => send(200, { workflow_runs: [{ workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "completed", conclusion: "success" }] }), d); }
         return send(200, { workflow_runs: [M.green
           ? { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "completed", conclusion: "success" }
           : { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
@@ -196,7 +197,7 @@ test("AT18: the main loop checks trust before draft, publication, stored-verdict
   assert.ok(!src.includes("$RUNNER"), "the runner is never called inside the PR loop");
   const all = fs.readFileSync(WATCH, "utf8");
   assert.equal((all.match(/"\$RUNNER"/g) || []).length, 1, "one runner call site");
-  assert.match(all, /review_one "\$pr" "\$sha" "\$contract"\n[\s\S]*done < <\(printf '%s\\n' "\$\{cands\[@\]\}"/);
+  assert.match(all, /review_one "\$pr" "\$sha" "\$contract" <\/dev\/null\n[\s\S]*done < <\(printf '%s\\n' "\$\{cands\[@\]\}"/);
   assert.match(src, /external PR, not reviewed/);
 });
 
@@ -234,4 +235,12 @@ test("AT19: with three green waiting heads, the one green longest is reviewed fi
   assert.match(r.out, /PR #11 2222222: WOULD review/, "a tie on the first-green time goes to the lower PR number");
   assert.match(r.out, /PR #12 1111111: queued/);
   assert.equal(fs.existsSync(path.join(ws, `${sha("1")}.green`)), false);
+  // Pre-review 1: heads first seen green in one slow tick (each CI read takes > 1 s) all get the tick's time, so
+  // the lower PR number still wins; a future first-green time (clock stepped back) is reset to now.
+  reset(); M.green = true; M.runsDelayMs = 1100; M.prs = [pr(22, "3"), pr(21, "4")];
+  fs.writeFileSync(path.join(ws, `${sha("3")}.green`), String(now + 86400));
+  const r5 = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(r5.code, 0, r5.out);
+  assert.equal(order().at(-1), sha("4"), "PR #21 (lower number) first despite being listed and timed second");
+  assert.equal(fs.readFileSync(path.join(ws, `${sha("3")}.green`), "utf8").trim(), fs.readFileSync(path.join(ws, `${sha("4")}.green`), "utf8").trim());
 });

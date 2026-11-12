@@ -94,3 +94,8 @@ Run the existing Codex review automatically on every new PR head, so a review no
   - AT19: three green heads listed newest first are reviewed oldest-green first, one per tick; a tie goes to the lower PR number; `--dry-run` stores nothing.
   - AT18's structural check now follows the new shape: trust comes before `cands+=`, and there is exactly one runner call site.
 - **Deployment:** the server agent installs the merged script (allow-list); KK does nothing.
+- **Pre-review (1 medium, 3 low; 3 fixed):**
+  - The clock is read once per tick, so heads first seen green in the same tick tie, and the lower PR number wins (medium). Test: a slow mock, with each CI read taking more than 1 s.
+  - A future first-green time (the clock stepped back) is reset to now.
+  - The runner and `publish` get `</dev/null`, so they can never read the candidate list.
+  - Not changed: per-SHA state files, `.green` among them, are not pruned (as before).

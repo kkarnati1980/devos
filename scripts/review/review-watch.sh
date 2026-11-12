@@ -159,6 +159,7 @@ verdict_msg() {  # sha label contract -> writes <sha>.msg and <sha>.state from t
 
 waiting=0           # PRs whose CI is not green yet (heartbeat)
 unreadable=0        # PRs whose workflow runs could not be read (heartbeat)
+tick_now="$(date +%s)" # DEVOS-116 pre-review: one clock read per tick, so heads first seen green together tie
 cands=()            # DEVOS-116: green, unreviewed heads: "<first-green epoch> <pr> <sha> <contract>"
 declare -A tried=() # SHAs whose publication was attempted this tick
 prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
@@ -215,8 +216,9 @@ for i in $(seq 0 $((count - 1))); do
   # DEVOS-116: green and unreviewed. Remember when this SHA was first seen green (kept across ticks), and
   # review the longest-waiting candidate after the loop, not the first one GitHub happens to list.
   since="$(cat "$STATE/$sha.green" 2>/dev/null || true)"
-  if [[ ! "$since" =~ ^[0-9]{1,12}$ ]]; then
-    since="$(date +%s)"
+  # A missing, malformed or future value (clock stepped back) is replaced by this tick's time.
+  if [[ ! "$since" =~ ^[0-9]{1,12}$ ]] || (( since > tick_now )); then
+    since="$tick_now"
     [[ $DRY -eq 1 ]] || echo "$since" > "$STATE/$sha.green"
   fi
   cands+=("$since $pr $sha $contract")
@@ -264,7 +266,8 @@ review_one() {  # pr sha contract
 if (( ${#cands[@]} > 0 )); then
   first=1
   while read -r since pr sha contract; do
-    if (( first )); then first=0; review_one "$pr" "$sha" "$contract"
+    # stdin is the candidate list: the runner and publish must never read it.
+    if (( first )); then first=0; review_one "$pr" "$sha" "$contract" </dev/null
     else log "PR #$pr ${sha:0:7}: queued for the next tick (one review per tick, oldest first)"; fi
   done < <(printf '%s\n' "${cands[@]}" | sort -k1,1n -k2,2n)
 fi
