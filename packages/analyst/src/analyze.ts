@@ -373,7 +373,9 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     const id = leadingId(text, prefixes);
     // `FR-1 — FR-2` or `FR-1. FR-2` holds only IDs: a reference, never a definition of FR-1 (PR53-r5).
     if (id && (b.type === "list-item" || b.type === "paragraph") && isBareIdReference(text, prefixes)) {
-      open = null;
+      // A heading requirement's criteria run until the next heading, so a reference inside them keeps
+      // that scope open (PR53-r10); a list requirement's scope already ended above.
+      if (open?.kind !== "heading") open = null;
       return;
     }
     if (id && (b.type === "list-item" || b.type === "paragraph")) {
