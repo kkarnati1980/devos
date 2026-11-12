@@ -95,9 +95,24 @@ function hitId(rule, file, text) {
   return "fg-" + createHash("sha256").update(`${rule}\0${file}\0${String(text).trim()}`).digest("hex").slice(0, 10);
 }
 
+/** Drops a trailing ` # comment` (outside quotes) and unquotes a leading mapping key (after an optional `- `). */
+function normaliseYamlLine(raw) {
+  let quote = null, cut = raw.length;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if ((ch === '"' || ch === "'") && (i === 0 || /[\s:\[{,-]/.test(raw[i - 1]))) quote = ch;
+    else if (ch === "#" && (i === 0 || /\s/.test(raw[i - 1]))) { cut = i; break; }
+  }
+  const line = raw.slice(0, cut).replace(/\s+$/, "");
+  return line.replace(/^(\s*(?:-\s+)?)(["'])([^"']*)\2(\s*:)/, "$1$3$4");
+}
+
 /** Workflow structure, line-based (no YAML dependency): jobs → step identities, plus the trigger names. */
 export function workflowShape(src) {
-  const lines = src.split("\n");
+  // YAML comments and quoted keys are normalised first (PR70-r15): `steps: # checks` is `steps:`, `"build":` is
+  // `build:`. Base and head are normalised alike, so a comment-only edit is not a change.
+  const lines = src.split("\n").map(normaliseYamlLine);
   const indent = (s) => s.length - s.trimStart().length;
   const jobs = {};
   const on = new Set(), onLines = [], onStack = [];
