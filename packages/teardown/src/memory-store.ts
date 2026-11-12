@@ -87,11 +87,11 @@ export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
     return names.length;
   }
 
-  /** A vault leftover scanner over `secrets`, shaped like the Postgres `vaultScanner`. */
+  /** A vault leftover scanner over `secrets` (test stand-in for the Postgres `vaultScanner`; ids are synthetic). */
   vaultScanner(): { name: string; scan: (p: { id: string }) => Promise<{ provider: string; kind: string; externalId: string; name: string }[]> } {
     return {
       name: "vault",
-      scan: async (p) => this.secrets.filter((x) => x.projectId === p.id).map((x) => ({ provider: "vault", kind: "secret", externalId: x.name, name: x.name })),
+      scan: async (p) => this.secrets.filter((x) => x.projectId === p.id).map((x) => ({ provider: "vault", kind: "secret", externalId: `mem-${x.projectId}-${x.name}`, name: x.name })),
     };
   }
 
