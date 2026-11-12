@@ -85,7 +85,7 @@ export function startSchedule(tick: () => Promise<unknown>, opts: { intervalMs?:
   if (!(intervalMs > 0)) throw new Error("linear-sync: schedule interval must be positive");
   let stopped = false;
   let running: Promise<void> | null = null;
-  let timer: NodeJS.Timeout | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   const arm = () => {
     if (stopped) return;
     timer = setTimeout(() => {
