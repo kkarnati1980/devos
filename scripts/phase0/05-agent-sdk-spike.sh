@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS M0.5 — Agent SDK spike (unattended run in a container, tool allow-list, hook deny, time + cost)
-# Version: 1.0.2
+# Version: 1.0.3
+# v1.0.3 (DEVOS-55, Codex r3 74ab524 low): AT7 requires a numeric, non-negative `costUSD` for every
+# `modelUsage` entry; a missing or non-numeric per-model cost now fails instead of being omitted.
+# Numbers must be finite (NaN/Infinity rejected, also for total_cost_usd); boolean token counts fail.
 # v1.0.2 (Codex r2 2488aa6): AT6 requires the exact `touch` attempt (by tool_use_id) and its deny;
 # AT7 requires duration_api_ms and per-model token usage and stores per-model usage in the summary.
 # v1.0.1 (Codex r1 063a32a): AT6 requires the deny marker in the tool_result of the forbidden
@@ -103,7 +106,7 @@ for r in $(seq 1 "$ROUNDS"); do
   sed 's/^/    /' "$RD/stdout.log"; [[ -s "$RD/stderr.log" ]] && tail -n 5 "$RD/stderr.log" | sed 's/^/    stderr: /'
 
   python3 -I - "$RD" "$EXPECT" "$rc" "$wall" "$MAX_BUDGET_USD" "$SDKV" "$MODEL" >> "$SUMMARY" <<'PY' || fail "round $r acceptance checks failed (evidence: $RD)"
-import json, os, sys
+import json, math, os, sys
 rd, expect, rc, wall, cap, sdkv, model = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5]), sys.argv[6], sys.argv[7]
 TOOLS = {"Read", "Write", "Glob", "Bash"}
 MARK = "DEVOS-POLICY-DENY"
@@ -174,7 +177,7 @@ if allowed_off_list: die(f"AT6 off-list tool allowed: {allowed_off_list}")
 ok(f"AT6 hook saw all {len(uses)} tool calls; denied {len(denies)} ({', '.join(sorted({h['reason'] for h in denies}))}); forbidden.flag absent")
 
 TK = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
-isnum = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+isnum = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 for f in ("duration_ms", "duration_api_ms", "total_cost_usd"):
     if not isnum(res.get(f)) or res[f] <= 0: die(f"AT7 {f} missing or not positive: {res.get(f)!r}")
 cost = float(res["total_cost_usd"])
@@ -182,10 +185,11 @@ mu = res.get("modelUsage")
 if not isinstance(mu, dict) or not mu: die("AT7 modelUsage (per-model tokens) missing")
 per_model = {}
 for name, v in mu.items():
-    if not isinstance(v, dict) or not all(isinstance(v.get(k), int) and v[k] >= 0 for k in TK):
+    if not isinstance(v, dict) or not all(isinstance(v.get(k), int) and not isinstance(v[k], bool) and v[k] >= 0 for k in TK):
         die(f"AT7 modelUsage[{name}] lacks integer token fields {TK}")
     if v["inputTokens"] + v["outputTokens"] <= 0: die(f"AT7 modelUsage[{name}] has no tokens")
-    per_model[name] = {k: v[k] for k in TK} | ({"costUSD": v["costUSD"]} if isnum(v.get("costUSD")) else {})
+    if not isnum(v.get("costUSD")) or v["costUSD"] < 0: die(f"AT7 modelUsage[{name}] costUSD missing or not a non-negative number: {v.get('costUSD')!r}")
+    per_model[name] = {k: v[k] for k in TK} | {"costUSD": v["costUSD"]}
 tok = {k: sum(m[k] for m in per_model.values()) for k in TK}
 if cost > cap: die(f"AT7 cost ${cost:.4f} above cap ${cap}")
 pm_txt = ", ".join("%s in %d out %d" % (k, v["inputTokens"], v["outputTokens"]) for k, v in per_model.items())
@@ -203,10 +207,10 @@ done
 
 say "5/5 Evidence"
 [[ -z "$(find "$TMP" -type f -name key)" ]] || fail "AT8 per-run key files left behind"
-echo "----- M0.5 evidence v1.0.2 $(date -u +%FT%TZ) -----"
+echo "----- M0.5 evidence v1.0.3 $(date -u +%FT%TZ) -----"
 echo "image $IMAGE | agent-sdk $SDKV | model $MODEL | caps: \$$MAX_BUDGET_USD/run, $MAX_TURNS turns, 300 s"
 jq -r '"\(.run): \(.turns) turns | sdk \(.duration_ms) ms (api \(.duration_api_ms) ms) | wall \(.wall_ms) ms | $\(.cost_usd) | in \(.tokens.inputTokens) out \(.tokens.outputTokens) cache-r \(.tokens.cacheReadInputTokens) cache-w \(.tokens.cacheCreationInputTokens) | tools \(.tool_calls), hook denies \(.hook_denies), sdk denials \(.permission_denials) | cc \(.claude_code)"' "$SUMMARY"
-jq -r '.run as $r | .model_usage | to_entries[] | "  \($r) \(.key): in \(.value.inputTokens) out \(.value.outputTokens) cache-r \(.value.cacheReadInputTokens) cache-w \(.value.cacheCreationInputTokens) $\(.value.costUSD // "n/a")"' "$SUMMARY"
+jq -r '.run as $r | .model_usage | to_entries[] | "  \($r) \(.key): in \(.value.inputTokens) out \(.value.outputTokens) cache-r \(.value.cacheReadInputTokens) cache-w \(.value.cacheCreationInputTokens) $\(.value.costUSD)"' "$SUMMARY"
 jq -s -r '"total: \(length) runs, $\((map(.cost_usd) | add) * 10000 | round / 10000)"' "$SUMMARY"
 echo "AT9 repeat: $ROUNDS rounds passed with no manual step"
 echo "AT8 secrets: $ENVF mode $(stat -c %a "$ENVF"), $DIR mode $(stat -c %a "$DIR"); key never printed, not in container env, not in evidence; per-run key files removed"

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.2.0
-# v1.2.0 (DEVOS-105, after the DEVOS-101 stall): heartbeat. About once an hour (HEARTBEAT_SECONDS, default 3600)
+# Version: 1.3.0
+# v1.3.0 (DEVOS-105, after the DEVOS-101 stall): heartbeat. About once an hour (HEARTBEAT_SECONDS, default 3600)
 # a completed tick sets the commit status `codex-review-watch` = success on the head of main, with the time, the
 # open-PR count and how many wait for green CI. A heartbeat older than 2 hours means the watcher is down, which the
 # runners can see without server access. A failed heartbeat post never fails the tick; --dry-run posts nothing.
 # Every GitHub call now has a timeout (ADR-0011: connect 10 s, total GH_TIMEOUT, default 30 s).
+# v1.2.0 (DEVOS-115, 12 Nov 2026): the repo is public, so only PRs whose head is in kkarnati1980/devos and
+# whose author is on REVIEW_AUTHORS (default: kkarnati1980) are reviewed or published on. A fork or
+# stranger's PR is logged once per head as "external PR, not reviewed" and nothing is posted on it.
 # v1.1.3 (DEVOS-113): gh_all merges list pages through temp files, never as a jq argument (128 KiB limit).
 # v1.1.2 (Codex PR9-r4): a stored manual verdict records its PR number before publishing, so the drain can
 # complete it after the PR moves on.
@@ -21,9 +24,10 @@
 # captured into variables; an unreadable check-runs API is reported as a token problem, not as "CI not green".
 #
 # Runs on the DevOS server from a systemd timer (installed by install-review-watch.sh). Each tick:
-#   1. lists open, non-draft PRs on kkarnati1980/devos;
+#   1. lists open, non-draft PRs on kkarnati1980/devos whose head is in that repo and whose author is on
+#      REVIEW_AUTHORS (v1.2.0); any other PR is logged once and nothing is posted on it;
 #   2. for each PR whose head SHA has no stored verdict yet, and whose CI check runs have all
-#      completed successfully (Codex never sees failing code — PRD build loop step 4), reads the
+#      completed successfully per the Actions API (Codex never sees failing code — PRD build loop step 4), reads the
 #      contract path from the PR body line `Review-Contract: docs/modules/<id>.md`;
 #   3. runs /root/.devos/bin/review-commit.sh main <sha> <contract> PR<n>-r<k> (unchanged M0.3 runner:
 #      read-only deploy key, pristine checkout, schema-validated verdict per SHA);
@@ -47,6 +51,12 @@ DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 GH_TIMEOUT="${GH_TIMEOUT:-30}"; [[ "$GH_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || GH_TIMEOUT=30
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+REVIEW_AUTHORS="${REVIEW_AUTHORS:-kkarnati1980}"   # space-separated GitHub logins whose PRs are reviewed
+trusted_pr() {  # one PR object on stdin -> 0 only when its head is in $REPO and its author is on REVIEW_AUTHORS
+  jq -e --arg r "$REPO" --arg a " $REVIEW_AUTHORS " \
+    '((.head.repo.full_name // "") == $r) and ((.user.login // "") as $u | $u != "" and ($u | test("^[A-Za-z0-9-]+$"))
+      and ($a | contains(" " + $u + " ")))' >/dev/null
+}
 die() { log "ERROR $*"; exit 1; }
 install -d -m 700 "$STATE"
 exec 8>"$STATE/watch.lock"
@@ -158,6 +168,14 @@ for i in $(seq 0 $((count - 1))); do
   draft="$(jq -r ".[$i].draft" <<<"$prs")"
   contract="$(jq -r ".[$i].body // \"\"" <<<"$prs" | sed -n 's/^[[:space:]]*Review-Contract:[[:space:]]*\(docs\/[A-Za-z0-9._/-]*\.md\)[[:space:]]*$/\1/p' | head -n1)"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { log "PR #$pr: bad head sha"; continue; }
+  # DEVOS-115: never review, publish or drain for a PR from a fork or an author not on REVIEW_AUTHORS.
+  if ! jq -c ".[$i]" <<<"$prs" | trusted_pr; then
+    if [[ ! -e "$STATE/$sha.external" ]]; then
+      log "PR #$pr ${sha:0:7}: external PR, not reviewed"
+      [[ $DRY -eq 1 ]] || : > "$STATE/$sha.external"
+    fi
+    continue
+  fi
   if [[ "$draft" == "true" ]]; then log "PR #$pr ${sha:0:7}: draft, skipped"; continue; fi
   if published "$sha"; then log "PR #$pr ${sha:0:7}: already reviewed and published"; continue; fi
 
