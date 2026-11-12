@@ -362,6 +362,11 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     // Criteria under an open requirement.
     const cur = open as typeof open;
     if (cur) {
+      // An IDs-only item (`- FR-2`, `- FR-2, FR-3`) is a reference, never a criterion, under either kind of
+      // requirement; it keeps a heading requirement's scope open (PR53-r10, r11).
+      if (b.type === "list-item" && (cur.kind === "heading" || b.depth > cur.depth) && isBareIdReference(text, prefixes)) {
+        return;
+      }
       if (cur.kind === "list" && b.type === "list-item" && b.depth > cur.depth) {
         addCriterion(cur.req, text, i);
         return;
@@ -381,7 +386,9 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     const id = leadingId(text, prefixes);
     // `FR-1 — FR-2` or `FR-1. FR-2` holds only IDs: a reference, never a definition of FR-1 (PR53-r5).
     if (id && (b.type === "list-item" || b.type === "paragraph") && isBareIdReference(text, prefixes)) {
-      open = null;
+      // A heading requirement's criteria run until the next heading, so a reference inside them keeps
+      // that scope open (PR53-r10); a list requirement's scope already ended above.
+      if (open?.kind !== "heading") open = null;
       return;
     }
     if (id && (b.type === "list-item" || b.type === "paragraph")) {

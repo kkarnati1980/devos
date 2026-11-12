@@ -437,3 +437,47 @@ test("AT10f (PR53-r8) a non-requirement table inside a heading requirement keeps
   assert.deepEqual(a.requirements.map((r) => [r.key, r.acceptance]), [["FR-1", ["Login succeeds"]]]);
   assert.equal(a.openQuestions.filter((q) => q.kind === "missing-acceptance").length, 0);
 });
+
+test("AT10g (PR53-r10) an IDs-only reference inside a heading requirement keeps its criteria scope", () => {
+  const md = [
+    "## Requirements",
+    "",
+    "### FR-1: Login",
+    "",
+    "- FR-2 — FR-3",
+    "- Login succeeds",
+    "",
+    "FR-2. FR-3",
+    "",
+    "- Session lasts 12 hours",
+    "",
+    "### FR-2: Export",
+    "",
+    "- CSV download",
+  ].join("\n");
+  const { a } = analyze(md);
+  assert.deepEqual(a.requirements.map((r) => r.key), ["FR-1", "FR-2"]);
+  assert.deepEqual(a.requirements[0].acceptance, ["Login succeeds", "Session lasts 12 hours"]);
+  assert.deepEqual(a.requirements[1].acceptance, ["CSV download"]);
+  assert.ok(!a.requirements.some((r) => r.assigned));
+  assert.ok(!a.openQuestions.some((q) => q.kind === "missing-acceptance"));
+  assert.ok(!a.warnings.some((w) => w.code === "duplicate-id"));
+});
+
+test("AT10h (PR53-r11) IDs-only items under a requirement are references, not criteria", () => {
+  const { a } = analyze(`## Requirements
+
+### FR-1: Login
+
+- FR-2
+- FR-2, FR-3
+
+- FR-4: Export
+  - FR-5
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.acceptance]), [["FR-1", []], ["FR-4", []]]);
+  assert.deepEqual(
+    a.openQuestions.filter((q) => q.kind === "missing-acceptance").map((q) => q.requirement),
+    ["FR-1", "FR-4"],
+  );
+});
