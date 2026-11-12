@@ -263,8 +263,10 @@ test("Codex PR32-r9: browser code inline in public/ HTML is scanned for F1-4; ma
   write(out, "public/a.html", "<!doctype html><p>Hello</p><script>const token = process.env.API_TOKEN;</script>\n");
   write(out, "public/b.htm", '<button onclick="alert(process.env.X)">x</button>\n');
   write(out, "public/c.html", "<SCRIPT type=module>\n  const t = process\n  .env.X;\n</SCRIPT>\n");
+  write(out, "public/d.html", `<a href="javascript:console.log('hello');alert(process.env.API_TOKEN)">go</a>\n`);
+  write(out, "public/e.html", `<a href='javascript:alert("x"),process.env.T'>go</a>\n`);
   write(out, "public/ok.html", "<p>Our review process takes a day.</p><script>const n = 1;</script>\n");
   const f = floorCheck(out);
-  for (const name of ["public/a.html", "public/b.htm", "public/c.html"]) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 ${name}:`)), `${name} in\n${f.join("\n")}`);
+  for (const name of ["public/a.html", "public/b.htm", "public/c.html", "public/d.html", "public/e.html"]) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 ${name}:`)), `${name} in\n${f.join("\n")}`);
   assert.ok(!f.some((l) => l.includes("public/ok.html")), f.join("\n"));
 });

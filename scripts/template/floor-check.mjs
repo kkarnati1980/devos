@@ -43,7 +43,9 @@ export function inlineScripts(html) {
   const parts = [];
   for (const m of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)) parts.push(m[1]);
   for (const m of html.matchAll(/\son[a-z]+\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi)) parts.push(m[2] ?? m[3] ?? m[4]);
-  for (const m of html.matchAll(/(?:href|src|action)\s*=\s*["']?\s*javascript:([^"'>]*)/gi)) parts.push(m[1]);
+  // Codex PR32-r11: the value runs to its own closing delimiter, so a quote of the other kind inside it does not end it.
+  for (const m of html.matchAll(/(?:href|src|action|formaction|xlink:href)\s*=\s*(?:"\s*javascript:([^"]*)"|'\s*javascript:([^']*)'|javascript:([^\s>]*))/gi))
+    parts.push(m[1] ?? m[2] ?? m[3]);
   return parts.join("\n;\n");
 }
 
