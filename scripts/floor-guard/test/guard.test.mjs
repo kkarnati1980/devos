@@ -74,6 +74,12 @@ const VIOLATIONS = [
   ["ci-step-changed (jobs: # comment)", { [WF]: wf(STEPS).replace("jobs:\n", "jobs: # all\n") }, { [WF]: wf(STEPS).replace("jobs:\n", "jobs: # all\n").replace("run: pnpm test", "run: echo ok") }],
   ["ci-step-removed (quoted job id)", { [WF]: wf(STEPS).replace("  build:\n", '  "build":\n') }, { [WF]: wf(STEPS.replace(/      - name: Test\n[^]*$/, "")).replace("  build:\n", '  "build":\n') }],
   // PR70-r16: a flow-style step list fails closed as one opaque step
+  // PR70-r17: an inline job mapping, a top-level flow `jobs:` and a multi-line flow step list all fail closed
+  ["ci-step-changed (inline job mapping)", { [WF]: "on: push\njobs:\n  build: {runs-on: ubuntu-latest, steps: [{name: Test, run: 'pnpm test'}]}\n" }, { [WF]: "on: push\njobs:\n  build: {runs-on: ubuntu-latest, steps: [{name: Test, run: 'echo green'}]}\n" }],
+  ["ci-step-removed (inline job mapping becomes block)", { [WF]: "on: push\njobs:\n  build: {runs-on: ubuntu-latest, steps: [{name: Test, run: 'pnpm test'}]}\n" }, { [WF]: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo green\n" }],
+  ["ci-step-changed (flow jobs mapping)", { [WF]: "on: push\njobs: {build: {runs-on: ubuntu-latest, steps: [{run: pnpm test}]}}\n" }, { [WF]: "on: push\njobs: {build: {runs-on: ubuntu-latest, steps: [{run: echo green}]}}\n" }],
+  ["ci-step-changed (multi-line flow job)", { [WF]: "on: push\njobs:\n  build: {runs-on: ubuntu-latest,\n    steps: [{name: Test, run: 'pnpm test'}]}\n" }, { [WF]: "on: push\njobs:\n  build: {runs-on: ubuntu-latest,\n    steps: [{name: Test, run: 'echo green'}]}\n" }],
+  ["ci-step-changed (multi-line flow steps)", { [WF]: wf("").replace("    steps:\n", "    steps: [\n      {name: Test, run: 'pnpm test'}]\n") }, { [WF]: wf("").replace("    steps:\n", "    steps: [\n      {name: Test, run: 'echo green'}]\n") }],
   ["ci-step-changed (flow-style steps)", { [WF]: wf("").replace("    steps:\n", "    steps: [{name: Test, run: 'pnpm test'}]\n") }, { [WF]: wf("").replace("    steps:\n", "    steps: [{name: Test, run: 'echo green'}]\n") }],
   // PR70-r13: numeric separators and other literal forms are read at their real value
   ["retries-raised (1 -> 1_000)", { "apps/d/playwright.config.ts": "export default { retries: 1 };\n" }, { "apps/d/playwright.config.ts": "export default { retries: 1_000 };\n" }],

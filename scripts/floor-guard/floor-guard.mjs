@@ -116,10 +116,19 @@ export function workflowShape(src) {
   const indent = (s) => s.length - s.trimStart().length;
   const jobs = {};
   const on = new Set(), onLines = [], onStack = [];
-  let jobsIndent = -1, jobIndent = -1, job = null, stepsIndent = -1, itemIndent = -1, step = null, onIndent = -1;
+  let jobsIndent = -1, jobIndent = -1, job = null, stepsIndent = -1, itemIndent = -1, step = null, onIndent = -1, opaque = null;
   for (const raw of lines) {
     if (!raw.trim() || raw.trimStart().startsWith("#")) continue;
     const ind = indent(raw), t = raw.trim();
+    if (ind === 0 && /^jobs\s*:\s*\S/.test(t)) {
+      // A flow-style `jobs: {…}` mapping is not parsed: it fails closed as one opaque job and step, continuation
+      // lines included, so any edit is ci-step-changed and its removal ci-step-removed (PR70-r17).
+      jobsIndent = -1; onIndent = -1; job = null; stepsIndent = -1;
+      opaque = { id: "inline-jobs", body: [t.replace(/^jobs\s*:\s*/, "")], ind: 0 }; jobs["(inline-jobs)"] = [opaque]; continue;
+    }
+    // continuation lines of an opaque flow value (deeper than the line that opened it) belong to it
+    if (opaque && ind > opaque.ind) { opaque.body.push(t); continue; }
+    opaque = null;
     if (ind === 0) { jobsIndent = t === "jobs:" ? 0 : -1; onIndent = /^(on|"on"|'on'):/.test(t) ? 0 : -1; job = null; stepsIndent = -1;
       if (onIndent === 0) { onLines.push(t); onStack.length = 0; }
       const inline = /^(?:on|"on"|'on'):\s*(.+)$/.exec(t); if (inline) inline[1].replace(/[[\]]/g, "").split(",").forEach((x) => x.trim() && on.add(x.trim()));
@@ -134,13 +143,19 @@ export function workflowShape(src) {
     }
     if (jobsIndent !== 0) continue;
     if (jobIndent < 0) jobIndent = ind;
-    if (ind === jobIndent) { const m = /^([\w-]+)\s*:/.exec(t); job = m ? m[1] : null; if (job) jobs[job] = []; stepsIndent = -1; continue; }
+    if (ind === jobIndent) {
+      const m = /^([\w-]+)\s*:\s*(.*)$/.exec(t); job = m ? m[1] : null; if (job) jobs[job] = []; stepsIndent = -1;
+      // A job given as an inline flow mapping (`build: {runs-on: …, steps: […]}`) is not parsed: it fails closed as one
+      // opaque step holding the whole value, continuation lines included (PR70-r17).
+      if (job && m[2]) { opaque = { id: "inline-job", body: [m[2]], ind }; jobs[job].push(opaque); }
+      continue;
+    }
     if (!job) continue;
     if (t === "steps:") { stepsIndent = ind; itemIndent = -1; continue; }
     // A flow-style or other inline step list is not parsed into steps: it fails closed as one opaque step, so any
     // edit to it is a ci-step-changed hit and its removal a ci-step-removed hit (PR70-r16).
     const inl = /^steps\s*:\s*(\S.*)$/.exec(t);
-    if (inl) { jobs[job].push({ id: "inline-steps", body: [inl[1]] }); stepsIndent = -1; continue; }
+    if (inl) { opaque = { id: "inline-steps", body: [inl[1]], ind }; jobs[job].push(opaque); stepsIndent = -1; continue; }
     // YAML allows the step list at the same indentation as "steps:"; anything else at or above that indent ends it
     if (stepsIndent >= 0 && (ind < stepsIndent || (ind === stepsIndent && !t.startsWith("- ")))) stepsIndent = -1;
     if (stepsIndent < 0) continue;
