@@ -205,7 +205,12 @@ record() {  # block -> installed.rules + live fingerprint
 }
 install_block() {  # block text in $1 -> live, in one transaction with the jump changes
   ipt -S DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (M0.1 not applied?)"; return 1; }
-  { grep -vx 'COMMIT' <<<"$1"; jump_ops; echo COMMIT; } | timeout 15 iptables-restore -w 5 --noflush
+  # The whole transaction is built BEFORE iptables-restore starts (Codex PR54-r1): on the legacy backend restore
+  # holds the xtables lock from *filter to COMMIT, so jump_ops' `iptables -S` queries must not run inside it.
+  local tx ops
+  ops="$(jump_ops)" || return 1
+  tx="$(grep -vx 'COMMIT' <<<"$1")"$'\n'"${ops:+$ops$'\n'}COMMIT"
+  printf '%s\n' "$tx" | timeout 15 iptables-restore -w 5 --noflush
 }
 selftest() {  # every target host:port must accept a TCP connection within 3 s
   local t targets ts_ip api

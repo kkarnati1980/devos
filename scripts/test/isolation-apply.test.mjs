@@ -20,7 +20,10 @@ before(async () => {
   fs.mkdirSync(bin);
   const w = (n, body) => { fs.writeFileSync(path.join(bin, n), `#!/usr/bin/env bash\n${body}\n`); fs.chmodSync(path.join(bin, n), 0o755); };
   // iptables: each chain is a file in $FAKE_NF (one rule per line, "-A CHAIN ..."); -w N is ignored.
-  w("iptables", `[[ "$1" == -w ]] && shift 2
+  // Both fakes take one xtables lock file like the legacy backend (Codex PR54-r1): restore holds it for its whole
+  // run, so an iptables query issued while a restore is running fails (exit 4) instead of answering.
+  w("iptables", `exec 8>"$FAKE_LOG/xtables.lock"; flock -w 1 8 || { echo "xtables lock held" >&2; exit 4; }
+[[ "$1" == -w ]] && shift 2
 echo "$*" >> "$FAKE_LOG/iptables.log"
 op="$1" ch="$2"; shift 2; f="$FAKE_NF/$ch"
 case "$op" in
@@ -36,7 +39,7 @@ esac`);
   // iptables-restore --noflush: all-or-nothing like the real one (FAKE_RESTORE_RC != 0 fails before any
   // change); declared chains are (re)created empty, then -A / -D / -I lines are applied in order. When
   // FAKE_KILL_PID is set, that process (a self-test listener) is killed after a successful restore.
-  w("iptables-restore", `in="$(cat)"; n=$(ls "$FAKE_LOG" | grep -c '^restore\\.' ); printf '%s\\n' "$in" > "$FAKE_LOG/restore.$n"
+  w("iptables-restore", `exec 8>"$FAKE_LOG/xtables.lock"; flock 8; sleep 0.2; in="$(cat)"; n=$(ls "$FAKE_LOG" | grep -c '^restore\\.' ); printf '%s\\n' "$in" > "$FAKE_LOG/restore.$n"
 [[ "\${FAKE_RESTORE_RC:-0}" == 0 ]] || exit "$FAKE_RESTORE_RC"
 while IFS= read -r l; do
   c="$(cut -d' ' -f2 <<<"$l")"; f="$FAKE_NF/$c"
