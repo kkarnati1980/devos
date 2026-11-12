@@ -45,10 +45,11 @@ export interface AnalystRunRows {
   /** The run's `text` event payloads, in seq order. */
   textEvents(runId: string): Promise<string[]>;
   /**
-   * Closes the intake task once the call has ended, and marks the run `failed` (`analyst-run-abandoned`) if the
-   * engine left it queued or running: this run is in-process and is never re-queued (pre-review finding 2).
+   * Closes the intake task once the call has ended, and marks the run `failed` (`analyst-run-<why>`: `abandoned`, or
+   * `paused` for a paused project) if the engine left it queued or running: this run is in-process and is never
+   * re-queued (pre-review finding 2).
    */
-  finishTask(runId: string, ok: boolean): Promise<void>;
+  finishTask(runId: string, ok: boolean, why?: string): Promise<void>;
 }
 
 /** The part of M1.5's RunEngine this module uses. */
@@ -76,12 +77,17 @@ export function runEngineModelRunner(rows: AnalystRunRows, engine: RunExecutor, 
       envelope: analystEnvelope(now()),
     });
     let ok = false;
-    // A private, empty working directory per run, removed afterwards; never the shared temp dir.
-    const cwd = await mkdtemp(join(tmpdir(), "devos-analyst-"));
+    let ended: string = "abandoned";
+    let cwd: string | null = null;
     try {
+      // A private, empty working directory per run, removed afterwards; never the shared temp dir. Created inside
+      // the try, so a failure here still closes the task and run (pre-review round 2, finding 3).
+      cwd = await mkdtemp(join(tmpdir(), "devos-analyst-"));
       // The engine's own deadlines (max_seconds, idle and result timeouts) bound this call; no retry here:
       // a paid model call is not a safe operation (ADR-0011 §9).
       const outcome = await engine.execute({ runId, provider: "anthropic", prompt, cwd, tag });
+      // A paused project makes the engine return without starting or finishing the run (M1.5); record that.
+      if (outcome.status === "paused") ended = "paused";
       if (outcome.status !== "succeeded") throw new AnalystRunError(`analyst-run-${outcome.status}`);
       const parts = await rows.textEvents(runId);
       let bytes = 0;
@@ -93,8 +99,8 @@ export function runEngineModelRunner(rows: AnalystRunRows, engine: RunExecutor, 
       return { output: parts.join("") };
     } finally {
       // Best effort: a task left open does not change the analysis, and its run row already holds the outcome.
-      await rows.finishTask(runId, ok).catch(() => undefined);
-      await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
+      await rows.finishTask(runId, ok, ended).catch(() => undefined);
+      if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
     }
   };
 }
@@ -152,7 +158,7 @@ export class PrismaAnalystRunRows implements AnalystRunRows {
     });
   }
 
-  finishTask(runId: string, ok: boolean): Promise<void> {
+  finishTask(runId: string, ok: boolean, why = "abandoned"): Promise<void> {
     return this.tx(async (tx) => {
       const run = await tx.run.findUnique({ where: { id: runId }, select: { taskId: true } });
       if (!run) return;
@@ -160,7 +166,7 @@ export class PrismaAnalystRunRows implements AnalystRunRows {
       if (!ok) {
         await tx.run.updateMany({
           where: { id: runId, status: { in: ["queued", "running"] } },
-          data: { status: "failed", error: "analyst-run-abandoned", endedAt: new Date() },
+          data: { status: "failed", error: `analyst-run-${why === "paused" ? "paused" : "abandoned"}`, endedAt: new Date() },
         });
       }
     });

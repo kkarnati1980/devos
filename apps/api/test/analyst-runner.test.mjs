@@ -140,13 +140,16 @@ test("AT-MR3 an adapter error and a budget stop each give assist-failed with the
 });
 
 test("AT-MR4 output over 256 KiB is refused before the validator", async () => {
-  const s = setup({ text: "x".repeat(ANALYST_MAX_OUTPUT_BYTES + 1) });
+  // Valid JSON the validator would accept, padded past the cap: only the byte cap can refuse it.
+  const s = setup({ text: `{"requirements":[],"criteria":[],"pad":"${"x".repeat(ANALYST_MAX_OUTPUT_BYTES)}"}` });
   const r = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
   assert.deepEqual(r.warnings, ["assist-failed"]);
   const runner = runEngineModelRunner(s.rows, { execute: async () => ({ status: "succeeded" }) });
   s.rows.textEvents = async () => ["é".repeat(ANALYST_MAX_OUTPUT_BYTES / 2 + 1)];
   s.rows.createRun = async () => "r-x";
   s.rows.finishTask = async () => {};
+  const ok = setup({ text: '{"requirements":[],"criteria":[],"pad":"x"}' });
+  assert.deepEqual((await ok.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC })).warnings, [], "the same output under the cap is accepted");
   await assert.rejects(runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /analyst-output-too-long/, "bytes, not characters");
   await assert.rejects(runner({ prompt: "p", tag: "analyst_assist" }), /analyst-run-no-project/);
 });
@@ -194,4 +197,10 @@ test("AT-MR5 buildRuntime keeps the model pass off without loadAnalystEngine; wi
   const thrown = await buildRuntime(env, { ...opts, loadAnalystEngine: async () => ({ execute: async () => { throw new Error("store down"); } }) });
   await assert.rejects(thrown.requirements.pipeline.ports.runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /store down/);
   assert.deepEqual(writes.slice(-2), [["task.update", { id: "t1" }, { status: "failed" }], ["run.updateMany", { id: "r1", status: { in: ["queued", "running"] } }, "failed", "analyst-run-abandoned"]]);
+
+  // A paused project: the engine returns without running; the run is closed as paused, not abandoned (round 2, 2).
+  writes.length = 0;
+  const paused = await buildRuntime(env, { ...opts, loadAnalystEngine: async () => ({ execute: async () => ({ status: "paused" }) }) });
+  await assert.rejects(paused.requirements.pipeline.ports.runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /analyst-run-paused/);
+  assert.deepEqual(writes.at(-1), ["run.updateMany", { id: "r1", status: { in: ["queued", "running"] } }, "failed", "analyst-run-paused"]);
 });
