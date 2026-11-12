@@ -79,12 +79,13 @@ export class PrismaSyncStore implements SyncStore {
   async setModuleIssue(moduleId: string, issueId: string) { await bounded(this.db, (tx) => tx.module.update({ where: { id: moduleId }, data: { linearIssue: issueId } })); }
   async setTaskIssue(taskId: string, issueId: string) { await bounded(this.db, (tx) => tx.task.update({ where: { id: taskId }, data: { linearIssue: issueId } })); }
   /** Only a human task of this project that is not yet done changes; the change and its audit row commit together. */
-  async completeHumanTask(taskId: string, how: "completed" | "canceled") {
-    await bounded(this.db, async (tx) => {
+  async completeHumanTask(taskId: string, how: "completed" | "canceled"): Promise<boolean> {
+    return bounded(this.db, async (tx) => {
       const n = await tx.task.updateMany({ where: { id: taskId, projectId: this.projectId, assignee: "kk", status: { not: "done" } }, data: { status: "done" } });
-      if (!n.count) return;
+      if (!n.count) return false;
       await tx.auditEvent.create({ data: { actor: "kk", projectId: this.projectId, action: how === "canceled" ? "task.canceled_in_linear" : "task.completed_in_linear",
         summary: how === "canceled" ? "Human task cancelled in Linear; marked done" : "Human task completed in Linear; marked done", details: { taskId, how } } });
+      return true;
     });
   }
 }

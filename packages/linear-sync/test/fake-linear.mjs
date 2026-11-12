@@ -42,6 +42,6 @@ export function memoryStore(plan) {
     setModuleIssue: async (m, v) => { plan.modules.find((x) => x.id === m).linearIssue = v; },
     setTaskIssue: async (t, v) => { plan.tasks.find((x) => x.id === t).linearIssue = v; },
     completed: [],
-    async completeHumanTask(t, how) { const x = plan.tasks.find((y) => y.id === t); if (x.assignee === "kk" && x.status !== "done") { x.status = "done"; this.completed.push([t, how]); } },
+    async completeHumanTask(t, how) { const x = plan.tasks.find((y) => y.id === t); if (x.assignee === "kk" && x.status !== "done") { x.status = "done"; this.completed.push([t, how]); return true; } return false; },
   };
 }

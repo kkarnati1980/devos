@@ -97,19 +97,30 @@ test("Codex PR35-r4: an id write blocked by a row lock gives up within the bound
   assert.equal(row.linearIssue, null, "the blocked write never committed");
 });
 
-test("M2.6-b AT6 on Postgres: completeHumanTask marks only this project's human task done, once, with an audit row", async () => {
+test("M2.6-b AT6 on Postgres: completeHumanTask marks only this project's open human task done, once, with an audit row", async () => {
   const pid = await seed();
   const human = await db.task.findFirst({ where: { projectId: pid, assignee: "kk" }, select: { id: true } });
-  const agent = await db.task.findFirst({ where: { projectId: pid, assignee: "agent", status: { not: "done" } }, select: { id: true } });
-  const store = new PrismaSyncStore(db, pid);
-  await store.completeHumanTask(human.id, "canceled");
-  await store.completeHumanTask(human.id, "canceled");   // idempotent: no second audit row
-  if (agent) await store.completeHumanTask(agent.id, "completed");
-  assert.equal((await db.task.findUnique({ where: { id: human.id } })).status, "done");
-  if (agent) assert.notEqual((await db.task.findUnique({ where: { id: agent.id } })).status, "done", "an agent task is never completed from Linear");
-  const audits = await db.auditEvent.findMany({ where: { projectId: pid, action: { startsWith: "task." } } });
-  assert.equal(audits.length, 1); assert.equal(audits[0].action, "task.canceled_in_linear"); assert.equal(audits[0].actor, "kk");
+  const agent = await db.task.create({ data: { projectId: pid, kind: "build", title: "Open agent task", status: "ready" } });
+  // Another project's store, tried first while the human task is still open: the projectId guard alone must stop it.
   const other = new PrismaSyncStore(db, await seed());
-  await other.completeHumanTask(human.id, "completed");   // another project's store cannot touch this task
-  assert.equal((await db.auditEvent.count({ where: { action: "task.completed_in_linear", details: { path: ["taskId"], equals: human.id } } })), 0);
+  assert.equal(await other.completeHumanTask(human.id, "completed"), false);
+  assert.notEqual((await db.task.findUnique({ where: { id: human.id } })).status, "done", "another project's store cannot touch this task");
+  const store = new PrismaSyncStore(db, pid);
+  assert.equal(await store.completeHumanTask(agent.id, "completed"), false);
+  assert.equal((await db.task.findUnique({ where: { id: agent.id } })).status, "ready", "an agent task is never completed from Linear");
+  assert.equal(await store.completeHumanTask(human.id, "canceled"), true);
+  assert.equal(await store.completeHumanTask(human.id, "canceled"), false, "idempotent");
+  assert.equal((await db.task.findUnique({ where: { id: human.id } })).status, "done");
+  const audits = await db.auditEvent.findMany({ where: { action: { startsWith: "task." }, details: { path: ["taskId"], equals: human.id } } });
+  assert.equal(audits.length, 1); assert.equal(audits[0].action, "task.canceled_in_linear"); assert.equal(audits[0].actor, "kk"); assert.equal(audits[0].projectId, pid);
+});
+
+test("M2.6-b AT6 end to end on Postgres: KK completes the human task in Linear; one sync makes it done", async () => {
+  const pid = await seed(); const L = fakeLinear(); const store = new PrismaSyncStore(db, pid);
+  await syncProject(await loadPlan(db, pid), L.api, store);
+  L.issues.find((i) => i.title === "Create the key").stateId = "s-c";
+  const r = await syncProject(await loadPlan(db, pid), L.api, store);
+  assert.equal(r.inbound.length, 1);
+  const t = await db.task.findFirst({ where: { projectId: pid, assignee: "kk" } });
+  assert.equal(t.status, "done");
 });

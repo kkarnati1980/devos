@@ -43,5 +43,5 @@ export interface SyncStore {
   setModuleIssue(moduleId: string, issueId: string): Promise<void>;
   setTaskIssue(taskId: string, issueId: string): Promise<void>;
   /** M2.6-b (AT6): KK completed or cancelled a human task in Linear; the DevOS task becomes done (audited). */
-  completeHumanTask(taskId: string, how: "completed" | "canceled"): Promise<void>;
+  completeHumanTask(taskId: string, how: "completed" | "canceled"): Promise<boolean>;   // true when a row changed
 }

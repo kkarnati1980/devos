@@ -129,8 +129,12 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
     // M2.6-b inbound (AT6): Linear owns a human task's state after creation. Completed or cancelled there → the
     // DevOS task becomes done (cancel is recorded as such), which the scheduler sees as an unblocked dependency.
     if (human && existing && t.status !== "done" && (existing.stateType === "completed" || existing.stateType === "canceled")) {
-      await store.completeHumanTask(t.id, existing.stateType);
-      r.inbound.push(`task ${t.title.slice(0, 40)}: ${existing.stateType} in Linear -> done`);
+      if (await store.completeHumanTask(t.id, existing.stateType)) r.inbound.push(`task ${t.title.slice(0, 40)}: ${existing.stateType} in Linear -> done`);
+    }
+    // M2.6-b decision 3: a human task reopened in Linear after DevOS took it as done stays done (dependent work may
+    // have started); the divergence is logged on every sync so it is visible, and nothing is written.
+    if (human && existing && t.status === "done" && existing.stateType !== "completed" && existing.stateType !== "canceled") {
+      r.log.push(`task ${t.title.slice(0, 40)}: reopened in Linear (${existing.stateType}) but done in DevOS; left as is`);
     }
     const mod = t.moduleId ? plan.modules.find((m) => m.id === t.moduleId) : undefined;
     const id = await upsert(`task ${t.title.slice(0, 40)}`, existing, {
