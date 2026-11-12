@@ -9,3 +9,5 @@ export { graphqlApi, ISSUE_PAGE, NESTED, ISSUES_QUERY_COST, LINEAR_MAX_COMPLEXIT
 export { loadPlan, PrismaSyncStore, syncProjectLocked, fencedApi, bounded, WRITE_MARGIN_MS, STORE_OP_MS, STORE_WAIT_MS } from "./prisma-store.js";
 export type { LockGuard } from "./prisma-store.js";
 export type { PrismaLike } from "./prisma-store.js";
+export { listActiveProjects, syncActiveProjects, lockedSyncOne, startSchedule, SYNC_INTERVAL_MS, INACTIVE_STAGES } from "./schedule.js";
+export type { SweepResult, SweepDeps, Schedule, ProjectOutcome } from "./schedule.js";
