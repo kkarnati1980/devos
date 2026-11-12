@@ -192,6 +192,23 @@ test("authorize is required (ADR-0006): a run without it fails before any create
   assert.equal(fake.creates().length, 0);
 });
 
+test("The owner check and the repo create use one token snapshot (PR44-r5)", async () => {
+  const seen = [];
+  let tok = "tok-owner";
+  const fetchImpl = async (url, init) => {
+    const u = new URL(url); seen.push([init.method, u.pathname, init.headers.authorization]);
+    if (u.pathname === "/user") { tok = "tok-other"; return new Response(JSON.stringify({ login: "kkarnati1980" }), { status: 200 }); }
+    return new Response(JSON.stringify({ id: 1, name: "devos-acme", full_name: "kkarnati1980/devos-acme", private: true, description: "x" }), { status: 201 });
+  };
+  const gh = new GitHubClient({ token: () => tok, fetchImpl, sleep: noSleep });
+  await gh.createOwnedRepo("kkarnati1980", "devos-acme", "x");
+  assert.deepEqual(seen.map((c) => c[1]), ["/user", "/user/repos"]);
+  assert.equal(seen[0][2], "Bearer tok-owner"); assert.equal(seen[1][2], "Bearer tok-owner", "the create uses the checked token, not the swapped one");
+  // and the next create re-checks (no cached login)
+  seen.length = 0; await assert.rejects(gh.createOwnedRepo("someone-else", "devos-acme", "x"), /github-owner-mismatch/);
+  assert.deepEqual(seen.map((c) => c[1]), ["/user"], "a mismatch never POSTs");
+});
+
 test("A lost project lock stops the run before the create", async () => {
   const { fake, steps, store } = setup();
   store.lockLost = true;

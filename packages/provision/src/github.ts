@@ -37,15 +37,24 @@ export class GitHubClient {
     return r.body;
   }
 
-  /** The token's own login: `POST /user/repos` always creates under it. Read once per client. */
-  private login?: Promise<string>;
-  whoami(): Promise<string> {
-    this.login ??= this.http.get<{ login: string }>("/user").then((r) => {
-      if (!r.body || typeof r.body.login !== "string") throw new Error("github-user-unknown");
-      return r.body.login;
-    });
-    this.login.catch(() => { this.login = undefined; });
-    return this.login;
+  /** The token's own login: `POST /user/repos` always creates under it. Not cached: the vault token can change. */
+  async whoami(http: Transport = this.http): Promise<string> {
+    const r = await http.get<{ login: string }>("/user");
+    if (!r.body || typeof r.body.login !== "string") throw new Error("github-user-unknown");
+    return r.body.login;
+  }
+
+  /**
+   * Checks the token's account is `owner`, then creates the repo, both with one token snapshot (Codex PR44-r5), so a
+   * token swapped in the vault between the check and the create can never create a repo in another account.
+   */
+  async createOwnedRepo(owner: string, name: string, description: string): Promise<RepoBody> {
+    if (!NAME_RE.test(owner) || !NAME_RE.test(name)) throw new Error("github-name-invalid");
+    const http = await this.http.pinned();
+    const login = await this.whoami(http);
+    if (login.toLowerCase() !== owner.toLowerCase()) throw new Error("github-owner-mismatch: the token's account is not the configured owner");
+    const r = await http.write<RepoBody>("POST", "/user/repos", { name, description, private: true, auto_init: false, has_wiki: false });
+    return r.body;
   }
 
   /** `POST /user/repos`: a private, empty repo (no auto-init) for the token's own account. */
@@ -77,10 +86,9 @@ export function githubRepoStep(gh: GitHubClient, p: { id: string; slug: string; 
       return r ? toFound(p.id, r) : null;
     },
     create: async () => {
-      // Check the owner before creating, so a mismatch can never leave an orphan repo on the token's account.
-      const login = await gh.whoami();
-      if (login.toLowerCase() !== owner.toLowerCase()) throw new Error("github-owner-mismatch: the token's account is not the configured owner");
-      const r = await gh.createRepo(repo, `${label} (DevOS project) ${ownershipMarker(p.id)}`);
+      // The owner is checked before creating, with the same token snapshot as the create, so a mismatch can never
+      // leave an orphan repo on another account.
+      const r = await gh.createOwnedRepo(owner, repo, `${label} (DevOS project) ${ownershipMarker(p.id)}`);
       if (r.full_name.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) throw new Error("github-repo-owner-mismatch");
       return toFound(p.id, r);
     },

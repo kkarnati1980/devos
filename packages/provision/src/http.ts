@@ -67,6 +67,33 @@ export class Transport {
     };
   }
 
+  /**
+   * A transport that uses one token snapshot, read now, for every request it makes (Codex PR44-r5): a check made
+   * with it (e.g. "whose token is this?") and the write that depends on that check use the same credential, even if
+   * the vault's token is replaced in between.
+   */
+  async pinned(): Promise<Transport> {
+    const snap = await this.readToken();
+    return new Transport({ provider: this.provider, origin: this.origin, ...this.o, token: () => snap });
+  }
+
+  private async readToken(): Promise<string> {
+    let token: string;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      token = await Promise.race([
+        Promise.resolve(this.o.token()),
+        new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("token-timeout")), Math.min(this.o.timeoutMs, 10_000)); }),
+      ]);
+    } catch {
+      throw new ProviderError(this.provider, "no-token", `${this.provider} token is not available from the vault`);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!token) throw new ProviderError(this.provider, "no-token", `${this.provider} token is not available from the vault`);
+    return token;
+  }
+
   /** GET; 404 is returned to the caller (a lookup miss), other non-2xx throw. Retried when transient. */
   async get<T>(path: string): Promise<HttpResult<T | null>> {
     let last: ProviderError | undefined;
@@ -93,19 +120,7 @@ export class Transport {
     if (!path.startsWith("/") || path.startsWith("//")) throw new Error(`transport-path-invalid: ${this.provider}`);
     const url = new URL(path, this.origin);
     if (url.origin !== this.origin) throw new Error(`transport-path-invalid: ${this.provider}`);
-    let token: string;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      token = await Promise.race([
-        Promise.resolve(this.o.token()),
-        new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("token-timeout")), Math.min(this.o.timeoutMs, 10_000)); }),
-      ]);
-    } catch {
-      throw new ProviderError(this.provider, "no-token", `${this.provider} token is not available from the vault`);
-    } finally {
-      clearTimeout(timer);
-    }
-    if (!token) throw new ProviderError(this.provider, "no-token", `${this.provider} token is not available from the vault`);
+    const token = await this.readToken();
     let res: Response;
     try {
       res = await this.o.fetchImpl(url, {
