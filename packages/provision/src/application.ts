@@ -9,7 +9,7 @@ import type { CoolifyClient } from "./coolify.js";
 import { CoreRepo } from "./core-repo.js";
 import type { GitHubClient } from "./github.js";
 import { ProviderError } from "./http.js";
-import { ownershipMarker, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
+import { ownershipMarker, StepError, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
 import { STACK_ENVS, type PortRange, type StackEnv } from "./stack.js";
 
 const UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
@@ -19,6 +19,8 @@ const PORT_RE = /^[1-9]\d{3,4}$/;
 export const COMPOSE_PATH = "compose.yaml";
 /** A Compose file larger than this is refused before parsing (the core's is under 1 KB). */
 export const COMPOSE_MAX_BYTES = 64 * 1024;
+/** The S4 hook runs while the project lock is held, so it is bounded like every other await (ADR-0011 §9). */
+export const HOOK_TIMEOUT_MS = 30_000;
 
 /** S4 names the production stack `live` (packages/isolation, StackEnv); M2.4 keeps Coolify's `production`. */
 export const hookEnvName = (env: StackEnv): "preview" | "live" => (env === "production" ? "live" : "preview");
@@ -78,6 +80,8 @@ export interface ApplicationOptions {
   serverUuid: string;
   range: PortRange;
   hooks: ProvisionHooks;
+  /** Tests only: a shorter hook bound. */
+  hookTimeoutMs?: number;
 }
 
 /**
@@ -106,8 +110,11 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
     action: "provision.coolify.application",
     lookup: async () => {
       const all = (await listApplications(cf)).filter((a) => a.name === name);
-      // Prefer one we own; a same-named application that is not ours is a conflict (decision 2).
-      const pick = all.find((a) => toFound(a).owned) ?? all[0];
+      // Prefer one we own; a same-named application that is not ours is a conflict (decision 2). Two owned ones
+      // (an earlier duplicate) are inconclusive: adopting either could hide the other (pre-review).
+      const owned = all.filter((a) => toFound(a).owned);
+      if (owned.length > 1) throw new ProviderError("coolify", "bad-response", `coolify lists ${owned.length} applications named ${name} for this project`, 200);
+      const pick = owned[0] ?? all[0];
       return pick ? toFound(pick) : null;
     },
     create: async () => {
@@ -123,11 +130,13 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
       if (!entry) throw new Error("compose-missing: the core commit has no compose.yaml");
       const compose = parseCompose(await repo.blobContent(entry.sha));
       // S4 hardens the Compose (limits, project network, allow-list) or refuses; a refusal creates nothing.
-      const hardened = await opts.hooks.afterStack(
-        { id: p.id, slug: p.slug },
-        { name: hookEnvName(env), port: Number(port), portRangeStart: opts.range.from, compose },
-      );
-      if (!hardened || typeof hardened.compose !== "object" || hardened.compose === null) throw new Error("after-stack-no-compose");
+      const ms = opts.hookTimeoutMs ?? HOOK_TIMEOUT_MS;
+      let timer: NodeJS.Timeout | undefined;
+      const hardened = await Promise.race([
+        opts.hooks.afterStack({ id: p.id, slug: p.slug }, { name: hookEnvName(env), port: Number(port), portRangeStart: opts.range.from, compose }),
+        new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new StepError(`coolify/application/${env}`, "provider_error", true, true, `afterStack hook did not finish within ${ms} ms`)), ms); }),
+      ]).finally(() => clearTimeout(timer));
+      if (!hardened || typeof hardened.compose !== "object" || hardened.compose === null || Array.isArray(hardened.compose)) throw new Error("after-stack-no-compose");
 
       // The reads and the hook above are awaits after the runner's last lock check (Codex PR50-r1): check again.
       await store.assertLockHeld(p.id);
@@ -142,7 +151,8 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
       });
       const uuid = r.body?.uuid;
       if (typeof uuid !== "string" || !UUID_RE.test(uuid)) {
-        throw new ProviderError("coolify", "bad-response", "coolify POST /api/v1/applications/dockercompose returned no uuid", r.status);
+        // The POST answered 2xx, so the application probably exists: transient, so the runner looks it up (pre-review).
+        throw new ProviderError("coolify", "timeout", "coolify POST /api/v1/applications/dockercompose returned no uuid", r.status);
       }
       // Read back by listing, so the marker that proves ownership is the one Coolify stored.
       const got = (await listApplications(cf)).find((a) => a.uuid === uuid);

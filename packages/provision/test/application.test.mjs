@@ -152,7 +152,7 @@ test("missing inputs fail before any write: no core commit, no compose.yaml, a l
   const hook = u.hook.afterStack;
   u.opts.hooks.afterStack = async (...a) => { const r = await hook(...a); u.store.lockLost = true; return r; };
   const steps = [...u.steps().slice(0, 6), ...applicationSteps(u.cf, u.gh, u.store, P, u.opts)];
-  await assert.rejects(runProvision(P.id, steps, { store: u.store, authorize: allowAll }));
+  await assert.rejects(runProvision(P.id, steps, { store: u.store, authorize: allowAll }), (e) => e instanceof StepError && e.code === "provider_error");
   assert.equal(appCreates(u.fake).length, 0, "the lock is checked after the hook, right before the POST");
 });
 
@@ -195,4 +195,59 @@ test("c1 note 2: a DB failure while allocating a port is retryable; the re-run k
   const out = await runProvision(P.id, [portStep(store, P, "preview", RANGE)], { store, authorize: allowAll });
   assert.deepEqual(out.map((o) => [o.outcome, o.externalId]), [["adopted", "20000"]]);
   assert.equal(store.resources.filter((r) => r.kind === "port").length, 1);
+});
+
+test("pre-review: not listed after the create → create_unconfirmed with one POST; the next run adopts", async () => {
+  const s = await setup();
+  const real = s.fake.fetchImpl;
+  let hide = true;
+  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, sleep: noSleep,
+    fetchImpl: async (url, init = {}) => {
+      const res = await real(url, init);
+      if (hide && (init.method ?? "GET") === "GET" && new URL(url).pathname === "/api/v1/applications") return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      return res;
+    } });
+  const steps = [...s.steps().slice(0, 6), ...applicationSteps(cf, s.gh, s.store, P, s.opts)];
+  await assert.rejects(runProvision(P.id, steps, { store: s.store, authorize: allowAll }), (e) => e.code === "create_unconfirmed" && e.retryable === true);
+  assert.equal(appCreates(s.fake).length, 1);
+  hide = false;
+  const out = await runProvision(P.id, steps, { store: s.store, authorize: allowAll });
+  assert.equal(out.at(-2).outcome, "adopted");
+  assert.equal(appCreates(s.fake).length, 2, "one POST per environment");
+});
+
+test("pre-review: a 2xx POST with no uuid is looked up and adopted, never POSTed again", async () => {
+  const s = await setup();
+  const real = s.fake.fetchImpl;
+  let once = true;
+  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, sleep: noSleep,
+    fetchImpl: async (url, init = {}) => {
+      const res = await real(url, init);
+      if (once && init.method === "POST" && new URL(url).pathname === "/api/v1/applications/dockercompose") { once = false; return new Response("{}", { status: 201, headers: { "content-type": "application/json" } }); }
+      return res;
+    } });
+  const out = await runProvision(P.id, [...s.steps().slice(0, 6), ...applicationSteps(cf, s.gh, s.store, P, s.opts)], { store: s.store, authorize: allowAll });
+  assert.equal(out.at(-2).outcome, "adopted");
+  assert.equal(appCreates(s.fake).length, 2);
+});
+
+test("pre-review: two owned applications with our name are inconclusive; nothing is created or adopted", async () => {
+  const s = await setup();
+  for (const id of ["apdup0001", "apdup0002"]) s.fake.apps.set(id, { uuid: id, name: "devos-acme-preview", description: `x devos:${P.id}` });
+  await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }), (e) => e.code === "provider_error");
+  assert.equal(appCreates(s.fake).length, 0);
+  assert.equal(s.store.resources.filter((r) => r.kind === "application").length, 0);
+});
+
+test("pre-review: a hook that hangs fails retryable within its bound; a hook returning an array is refused; nothing is created", async () => {
+  const s = await setup();
+  const hang = { afterStack: () => new Promise(() => {}) };
+  const t0 = Date.now();
+  await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), ...applicationSteps(s.cf, s.gh, s.store, P, { ...s.opts, hooks: hang, hookTimeoutMs: 50 })], { store: s.store, authorize: allowAll }),
+    (e) => e instanceof StepError && e.code === "provider_error" && e.retryable === true);
+  assert.ok(Date.now() - t0 < 5000);
+  const arr = { afterStack: async () => ({ compose: [] }) };
+  await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), ...applicationSteps(s.cf, s.gh, s.store, P, { ...s.opts, hooks: arr })], { store: s.store, authorize: allowAll }),
+    (e) => e.code === "provider_error" && e.retryable === false);
+  assert.equal(appCreates(s.fake).length, 0);
 });
