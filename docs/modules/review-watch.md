@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-60 · P1 · Lane C (ops tooling; bootstrap until M3.4 Codex reviewer replaces it)
 - **Depends on:** M0.3 (review runner `scripts/review/review-commit.sh` v1.0.2, Codex CLI, read-only deploy key, verdict schema on the server)
-- **Owned files:** `scripts/review/review-watch.sh` (v1.1.3), `scripts/review/install-review-watch.sh` (v1.1.0), this contract.
+- **Owned files:** `scripts/review/review-watch.sh` (v1.1.3), `scripts/review/install-review-watch.sh` (v1.1.0), `scripts/test/review-watch.test.mjs` (AT14 regression test), this contract.
 - **Approved by KK:** 4 Nov 2026 (build plan v1.0.0, section 7).
 
 ## Goal
