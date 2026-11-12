@@ -45,14 +45,23 @@ function clean(s: string, max: number): string {
 }
 
 /**
- * Only M1.5's fixed failure codes (`run-<type>`) are shown. Any other failedReason is a raw error
+ * Only M1.5's fixed failure codes (`REASON_CODES`) are shown. Any other failedReason is a raw error
  * message (a store, adapter or driver error rethrown by the worker) and is replaced by `run-failed`,
  * so no queue or store message leaves the API (behaviour 4, F1).
  */
-const REASON_CODE = /^run-[a-z][a-z0-9_-]{0,63}$/;
+// Explicit allow-list (PR36-r1): `run-<RunErrorType>` from M1.5's worker (`run-${type}`), its limit
+// messages and its fixed thrown codes. A pattern match is not enough — `run-secret-token-123` is not a code.
+// Keep in step with RunErrorType in packages/run-engine/src/types.ts (a test pins the list).
+export const REASON_CODES: ReadonlySet<string> = new Set([
+  "run-failed",
+  "run-provider_error", "run-rate_limited", "run-policy_denied", "run-budget_exceeded", "run-timeout",
+  "run-cancelled", "run-missing_input", "run-sandbox_error", "run-internal",
+  "run-max-turns", "run-max-seconds", "run-max-cost", "run-max-cost-reached",
+  "run-id-invalid", "run-not-found",
+]);
 export function reasonCode(raw: string): string {
   const s = String(raw ?? "").trim();
-  return REASON_CODE.test(s) ? s : "run-failed";
+  return REASON_CODES.has(s) ? s : "run-failed";
 }
 
 export function toView(d: { jobId: string; runId: string; reason: string; attemptsMade: number; failedAt: number | null }): DeadLetterView {

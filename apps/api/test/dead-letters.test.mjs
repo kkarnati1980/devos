@@ -7,7 +7,7 @@ import { createApp } from "../dist/app.js";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { loadConfig, startupErrorCode } from "../dist/config.js";
 import { buildRuntime, parseRedisUrl } from "../dist/runtime.js";
-import { DEAD_LETTER_LIMIT, isJobId, reasonCode, toView } from "../dist/dead-letters.js";
+import { DEAD_LETTER_LIMIT, isJobId, REASON_CODES, reasonCode, toView } from "../dist/dead-letters.js";
 
 const KK = "kk@example.com";
 const ORIGIN = "http://devos:3000";
@@ -211,7 +211,7 @@ test("DL AT7: REDIS_URL parsing and runtime wiring (absent â†’ off; malformed â†
   assert.equal(parseRedisUrl("  "), null);
   assert.equal(parseRedisUrl("redis://redis:6379"), "redis://redis:6379");
   assert.equal(parseRedisUrl("rediss://h:6380/0"), "rediss://h:6380/0");
-  for (const bad of ["http://redis:6379", "redis:6379", "redis://a b"]) {
+  for (const bad of ["http://redis:6379", "redis:6379", "redis://a b", "redis://redis:bad", "redis:///", "redis://", "redis://h:0", "redis://h:70000"]) {
     assert.throws(() => parseRedisUrl(bad), (e) => startupErrorCode(e) === "config-redis-url-invalid", bad);
   }
   const fakeDb = { $transaction: async (fn) => fn({ auditEvent: { create: async () => ({}) } }) };
@@ -233,6 +233,8 @@ test("DL AT8: only fixed run-* codes are shown as the reason; raw messages becom
   assert.equal(v.reason, "run-failed");
   assert.equal(reasonCode("run-provider_error"), "run-provider_error");
   assert.equal(reasonCode("run-max-turns"), "run-max-turns");
+  assert.equal(reasonCode("run-secret-token-123"), "run-failed"); // PR36-r1: pattern-shaped is not a code
+  for (const t of ["provider_error", "rate_limited", "policy_denied", "budget_exceeded", "timeout", "cancelled", "missing_input", "sandbox_error", "internal"]) assert.ok(REASON_CODES.has(`run-${t}`), t);
   for (const raw of ["Invalid prisma.run.update() invocation: password=TESTONLY", "queue-retry-timeout", "run-x \n secret", "", "run-" + "a".repeat(80)]) assert.equal(reasonCode(raw), "run-failed", raw);
   assert.equal(v.attemptsMade, 0);
   assert.equal(v.failedAt, null);

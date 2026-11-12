@@ -118,6 +118,18 @@ export async function buildRuntime(
 export function parseRedisUrl(v: string | undefined): string | null {
   const s = (v ?? "").trim();
   if (!s) return null;
-  if (!/^rediss?:\/\/[^\s]+$/.test(s)) throw new Error("config-redis-url-invalid");
+  // Parsed, not pattern-matched (PR36-r1): scheme redis/rediss, a host, and a port that is absent or
+  // 1–65535. `redis://redis:bad` and `redis:///` are rejected here, not by the driver at connect time.
+  const bad = () => new Error("config-redis-url-invalid");
+  if (/\s/.test(s)) throw bad();
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    throw bad();
+  }
+  if (u.protocol !== "redis:" && u.protocol !== "rediss:") throw bad();
+  if (!u.hostname) throw bad();
+  if (u.port && !(/^\d{1,5}$/.test(u.port) && Number(u.port) >= 1 && Number(u.port) <= 65535)) throw bad();
   return s;
 }
