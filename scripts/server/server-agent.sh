@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.3.0
+# Version: 1.3.1
+# v1.3.1 (DEVOS-114): gh_all_runs merges workflow-run pages through temp files (a page over 128 KiB broke jq).
 # v1.3.0 (DEVOS-87, R3-d): the allow-list gains scripts/server/cert-renew.sh, run once a day at the start of a
 # tick (never while a deployment is in flight); a failure is retried after an hour. An allow-listed file missing
 # from bin/ (the list grew) is installed again from the already-installed, D1-passed SHA.
@@ -90,17 +91,21 @@ gh() { http "$TMP/gh.auth" "$1" "$API$2" "${3:-}"; }
 cf() { http "$TMP/cf.auth" "$1" "$COOLIFY_API$2" "${3:-}"; }
 
 
+# v1.3.1 (DEVOS-114): pages are merged through temp files, never passed as a jq argument, as in review-watch
+# v1.1.3 (DEVOS-113). A page over the kernel's 128 KiB per-argument limit made `jq --argjson` fail.
 gh_all_runs() {  # sha -> all workflow runs for the SHA, every page (max 30 pages of 100)
-  local page=1 chunk n acc='[]'
+  local page=1 n acc chunk
+  acc="$(mktemp "$TMP/runs.XXXXXX")"; chunk="$(mktemp "$TMP/page.XXXXXX")"
+  printf '[]' > "$acc"
   while :; do
-    chunk="$(gh GET "/repos/$REPO/actions/runs?head_sha=$1&per_page=100&page=$page")" || return 1
-    chunk="$(jq -c '.workflow_runs' <<<"$chunk")" || return 1
-    acc="$(jq -c --argjson c "$chunk" '. + $c' <<<"$acc")"
-    n="$(jq 'length' <<<"$chunk")"
+    gh GET "/repos/$REPO/actions/runs?head_sha=$1&per_page=100&page=$page" > "$chunk" || { rm -f "$acc" "$chunk"; return 1; }
+    jq -c '.workflow_runs' "$chunk" > "$chunk.k" && mv "$chunk.k" "$chunk" || { rm -f "$acc" "$chunk" "$chunk.k"; return 1; }
+    jq -c -s '.[0] + .[1]' "$acc" "$chunk" > "$acc.n" && mv "$acc.n" "$acc" || { rm -f "$acc" "$acc.n" "$chunk"; return 1; }
+    n="$(jq 'length' "$chunk")" || { rm -f "$acc" "$chunk"; return 1; }
     if (( n < 100 )) || (( page >= 30 )); then break; fi
     page=$((page + 1))
   done
-  printf '%s' "$acc"
+  local rc=0; cat "$acc" || rc=1; rm -f "$acc" "$chunk"; return "$rc"
 }
 ci_state() {  # sha -> prints green | pending | red ; returns 1 if workflow runs cannot be read
   local runs
