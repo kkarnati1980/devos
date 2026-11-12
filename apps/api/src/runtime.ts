@@ -6,9 +6,14 @@ import { withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore, writeAudit } from "./settings.js";
 import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
+import { Approvals, PrismaApprovalStore, type GrantIssuer } from "./approvals.js";
+import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js";
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
 import { parseSmtpConfig } from "./smtp.js";
+import { RequirementsPipeline } from "@devos/analyst";
+import { PrismaRequirementsStore } from "./requirements-store.js";
+import type { RequirementsServices } from "./requirements.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -38,6 +43,12 @@ export function dbReadiness(db: DbClient, timeoutMs: number): ReadinessProbe {
     ).then(() => undefined);
 }
 
+/**
+ * M2.2-d3a (pre-review finding 1): a spec save upserts up to 2 000 requirement rows in one transaction, so it gets
+ * its own bound instead of the short outbound timeout; the same 30 s the spec route allows for the body.
+ */
+export const REQUIREMENTS_TX_MS = 30_000;
+
 export interface Runtime {
   grants: GrantService | null;
   readiness: ReadinessProbe;
@@ -47,6 +58,10 @@ export interface Runtime {
   notify: NotifyServices;
   /** DEVOS-77: the dead-letter view needs `REDIS_URL` (the run queue) and the database (audit). */
   deadLetters: DeadLetterServices;
+  /** M2.3-b1: the approvals inbox needs the database and the policy engine. */
+  approvals: ApprovalRouteServices;
+  /** M2.2-d3a: spec intake needs the database and the approvals core (its cards). */
+  requirements: RequirementsServices;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -80,18 +95,22 @@ export async function buildRuntime(
   const noSetup: SetupServices = { settings: null, vault: null };
   const noNotify: NotifyServices = { notifier: null };
   const noDead: DeadLetterServices = { queue: null, audit: null };
-  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead };
-  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead };
+  const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
+  const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements };
+  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
+  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
   const setup: SetupServices = {
     settings: new PrismaSettingsStore(db, opts.outboundTimeoutMs),
     vault: vaultKey ? new Vault(new PrismaVaultStore(db, opts.outboundTimeoutMs), vaultKey, vaultKeyVersion) : null,
   };
-  const grants = new PolicyEngine({
+  const engine = new PolicyEngine({
     store: new PrismaPolicyStore(db),
     hmacKey: Buffer.from(hmac, "utf8"),
     verifyKkSession: opts.kkSessions.verify,
-  }) as unknown as GrantService;
+  });
+  const grants = engine as unknown as GrantService;
   const vault = setup.vault;
   const notifier = new Notifier(new PrismaNotificationStore(db, opts.outboundTimeoutMs), {
     // The bell key and SMTP password are vault secrets (entered in the wizard), read at send time.
@@ -111,7 +130,64 @@ export async function buildRuntime(
           audit: (entry) => db.$transaction((tx: any) => writeAudit(tx, entry), { timeout: t, maxWait: t }),
         }
       : noDead;
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters };
+  // M2.3-b1: the approvals core over Postgres, the same engine for grants, and M1.6 for the "new card" notice.
+  const approvalStore = new PrismaApprovalStore(db, t);
+  const approvalsCore = new Approvals({
+    store: approvalStore,
+    grants: engine as unknown as GrantIssuer,
+    notifier,
+    verifyKkSession: opts.kkSessions.verify,
+  });
+  const approvals: ApprovalRouteServices = {
+    approvals: approvalsCore,
+    grantsFor: (approvalId) => grantsForApproval(db, approvalId, t),
+    revokeGrant: (session, grantId) => engine.revokeGrant(session as Parameters<PolicyEngine["revokeGrant"]>[0], grantId),
+  };
+  const requirements = requirementsServices(new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS)), approvalsCore, approvalStore);
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements };
+}
+
+/**
+ * M2.2-d3a (contract M2.2, "M2.2-d3a — Behaviour"): the analyst pipeline over Postgres, raising its cards through
+ * the M2.3 approvals core (dedupe against a pending twin, the KK notice) and reading decisions from the same store.
+ * Question cards block no task (no tasks exist at intake, and the core accepts only task ids); the model pass is
+ * off until M2.2-d3b binds the run engine, so analysis is deterministic only.
+ */
+export function requirementsServices(
+  store: NonNullable<RequirementsServices["store"]>,
+  approvals: Pick<Approvals, "raiseCard">,
+  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> },
+): RequirementsServices {
+  const pipeline = new RequirementsPipeline({
+    store,
+    raiseRequirementsCard: async (card) => ({ id: (await approvals.raiseCard(card)).id }),
+    raiseQuestionCard: async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }),
+    runner: null,
+  });
+  return { pipeline, store, cards: { get: (id) => cards.get(id) } };
+}
+
+/**
+ * M1.7's grant rows for one card, newest first, bounded like every other read (ADR-0011 §9). Codex PR60-r1: the
+ * live grants (not revoked, not expired) are read in full, separately from the 20 newest history rows, so a burst
+ * of revoked race losers can never push a live grant out of the window the summary and the revoke route see.
+ */
+export function grantsForApproval(db: DbClient, approvalId: string, timeoutMs: number, now: () => number = Date.now): Promise<GrantSummary[]> {
+  const select = { id: true, scopeAction: true, scopeResource: true, projectId: true, sha: true, issuedAt: true, expiresAt: true, maxUses: true, uses: true, revokedAt: true };
+  const orderBy = [{ issuedAt: "desc" }, { id: "desc" }];
+  return db.$transaction(
+    async (tx: any) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
+      const live = await tx.approvalGrant.findMany({ where: { approvalId, revokedAt: null, expiresAt: { gt: new Date(now()) } }, orderBy, select });
+      const recent = await tx.approvalGrant.findMany({ where: { approvalId }, orderBy, take: 20, select });
+      const byId = new Map<string, GrantSummary & { issuedAt: Date }>();
+      for (const g of [...live, ...recent]) byId.set(g.id, g);
+      return [...byId.values()]
+        .sort((a, b) => b.issuedAt.getTime() - a.issuedAt.getTime() || (a.id < b.id ? 1 : -1))
+        .map(({ issuedAt: _i, ...g }) => g);
+    },
+    { timeout: timeoutMs, maxWait: timeoutMs },
+  );
 }
 
 /** `REDIS_URL`: absent → null (no dead-letter view); anything but redis:// or rediss:// stops start-up. */

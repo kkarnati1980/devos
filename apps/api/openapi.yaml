@@ -244,6 +244,64 @@ paths:
         "404": { description: "`project-not-found`" }
         "409": { description: "`project-archived`" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/{id}/spec:
+    post:
+      operationId: submitSpec
+      summary: "M2.2-d2: new spec version (upload or paste) → requirements draft + one requirements card"
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Devos-Filename, in: header, required: false, description: "Required for a file upload", schema: { type: string, maxLength: 200 } }
+      requestBody:
+        required: true
+        content:
+          text/markdown: { schema: { type: string, maxLength: 500000 } }
+          application/octet-stream: { schema: { type: string, format: binary, maxLength: 10485760 } }
+      responses:
+        "201": { description: "`{ result: SubmitResult }`: versions, approvalId, counts, warnings, inert requirements.md and Architect log" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "408": { description: "`body-timeout`" }
+        "409": { description: "`project-not-in-intake`, `requirements-already-approved`" }
+        "413": { description: "`spec-too-large` and M2.1 size refusals" }
+        "415": { description: "`body-unsupported-type`" }
+        "422": { description: "M2.1 conversion faults (`parse-timeout`, `parse-memory`, `parse-failed`)" }
+        "500": { description: "`requirements-store-error`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/{id}/requirements:
+    get:
+      operationId: getRequirements
+      summary: "M2.2-d2: newest requirements doc and requirement rows (read-only)"
+      x-devos-access: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ doc: DocRow | null, requirements: RequirementRow[] }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "500": { description: "`requirements-store-error`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/{id}/requirements/sync:
+    post:
+      operationId: syncRequirementsApproval
+      summary: "M2.2-d2: apply the decided requirements card to the newest draft (idempotent)"
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ doc: DocRow | null }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "500": { description: "`requirements-store-error`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /vault/secrets:
     get:
       operationId: listSecrets
@@ -335,4 +393,109 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: "`dead-letter-not-found`: no failed job with that id", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /approvals:
+    get:
+      operationId: listApprovals
+      x-devos-access: session
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [pending, approved, rejected, expired] } }
+        - { name: projectId, in: query, required: false, schema: { type: string, format: uuid } }
+        - { name: cursor, in: query, required: false, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "M2.3-b1: `{ approvals: (card + blockedTasks count + newest grant summary)[], nextCursor }`, newest first, 50 per page" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /approvals/{id}:
+    get:
+      operationId: getApproval
+      x-devos-access: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ approval, comments, blockedTasks: { id, title, status }[], grant }` (grant: scope, expiry, uses/maxUses, revoked)" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`card-not-found`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /approvals/{id}/approve:
+    post:
+      operationId: approveApproval
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                expiresInHours: { type: integer, minimum: 1, maximum: 2160 }
+                maxUses: { type: integer, minimum: 1, maximum: 100 }
+                sha: { type: string, pattern: "^[0-9a-f]{40}$" }
+                confirmation: { type: string, description: "Gate 5 (purge): the typed phrase" }
+      responses:
+        "200": { description: "`{ approval, grantId }`: KK's decision; one scoped grant issued" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`card-not-found`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "`card-not-pending` or `purge-confirmation-mismatch`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /approvals/{id}/reject:
+    post:
+      operationId: rejectApproval
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false, properties: { comment: { type: string } } }
+      responses:
+        "200": { description: "`{ approval }`: rejected; no grant; tasks stay blocked" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`card-not-found`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "`card-not-pending`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /approvals/{id}/comments:
+    post:
+      operationId: commentApproval
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false, required: [body], properties: { body: { type: string } } }
+      responses:
+        "201": { description: "`{ comment }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`card-not-found`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /approvals/{id}/grant/revoke:
+    post:
+      operationId: revokeApprovalGrant
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ revoked, grantIds }`: M1.7 revokeGrant on every live grant of the card (not revoked, not expired, uses left); audited (`approval.grant_revoke_requested`) first" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`card-not-found` or `grant-not-found` (no live grant)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/Unavailable" }
