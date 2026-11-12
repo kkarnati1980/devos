@@ -244,6 +244,48 @@ paths:
         "404": { description: "`project-not-found`" }
         "409": { description: "`project-archived`" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/{id}/spec:
+    post:
+      operationId: submitSpec
+      summary: "M2.2-d2: new spec version (upload or paste) → requirements draft + one requirements card"
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Devos-Filename, in: header, required: false, description: "Required for a file upload", schema: { type: string, maxLength: 200 } }
+      requestBody:
+        required: true
+        content:
+          text/markdown: { schema: { type: string, maxLength: 500000 } }
+          application/octet-stream: { schema: { type: string, format: binary, maxLength: 10485760 } }
+      responses:
+        "201": { description: "`{ result: SubmitResult }`: versions, approvalId, counts, warnings, inert requirements.md and Architect log" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "408": { description: "`body-timeout`" }
+        "409": { description: "`project-not-in-intake`, `requirements-already-approved`" }
+        "413": { description: "`spec-too-large` and M2.1 size refusals" }
+        "415": { description: "`body-unsupported-type`" }
+        "422": { description: "M2.1 conversion faults (`parse-timeout`, `parse-memory`, `parse-failed`)" }
+        "500": { description: "`requirements-store-error`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/{id}/requirements:
+    get:
+      operationId: getRequirements
+      summary: "M2.2-d2: newest requirements doc (decided card applied) and requirement rows"
+      x-devos-access: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ doc: DocRow | null, requirements: RequirementRow[] }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "500": { description: "`requirements-store-error`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /vault/secrets:
     get:
       operationId: listSecrets

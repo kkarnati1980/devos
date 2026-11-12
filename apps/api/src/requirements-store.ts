@@ -140,6 +140,19 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
+  /** Stored requirement rows in key order (for the requirements view). */
+  rows(projectId: string): Promise<{ key: string; title: string; priority: string; acceptance: string; milestone: number | null }[]> {
+    return this.tx(async (tx) => {
+      const rs = await tx.requirement.findMany({
+        where: { projectId },
+        orderBy: { key: "asc" },
+        take: 5000,
+        select: { key: true, title: true, priority: true, acceptance: true, milestone: { select: { ordinal: true } } },
+      });
+      return rs.map((r: any) => ({ key: r.key, title: r.title, priority: String(r.priority), acceptance: r.acceptance, milestone: r.milestone?.ordinal ?? null }));
+    });
+  }
+
   linkApproval(docId: string, approvalId: string): Promise<boolean> {
     return this.tx(async (tx) => {
       const n = await tx.requirementsDoc.updateMany({ where: { id: docId, status: "draft", approvalId: null }, data: { approvalId } });
