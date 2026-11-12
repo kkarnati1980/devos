@@ -30,7 +30,7 @@ const viewerCache = new WeakMap<LinearApi, string>();
  * Task kinds that are internal bookkeeping, never planned work, so they are never mirrored to Linear (DEVOS-162):
  * `analysis` records one analyst model-pass run (M2.2-d3b). They are dropped before any read or write.
  */
-export const INTERNAL_TASK_KINDS: readonly string[] = ["analysis"];
+export const INTERNAL_TASK_KINDS: readonly string[] = Object.freeze(["analysis"]);
 
 export interface SyncResult { writes: number; created: string[]; updated: string[]; log: string[]; inbound: string[] }
 export interface SyncOptions { teamKey?: string; kkUserId?: string }
