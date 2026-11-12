@@ -20,6 +20,7 @@ COPY packages/policy/package.json packages/policy/
 COPY packages/provision/package.json packages/provision/
 COPY packages/run-engine/package.json packages/run-engine/
 COPY packages/shared/package.json packages/shared/
+COPY packages/teardown/package.json packages/teardown/
 RUN pnpm install --frozen-lockfile
 COPY apps apps
 COPY packages packages
