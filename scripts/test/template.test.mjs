@@ -145,6 +145,22 @@ test("AT6: a trailing slash stages beside the output; the CLIs work from a path 
   assert.match(m.devosSha, /^[0-9a-f]{40}$/, "the DevOS SHA is recorded by default");
 });
 
+test("AT4/AT6: the generated server starts with `node src/server.mjs` from a path with a space and answers /health (Codex PR32-r6)", async () => {
+  const out = path.join(tmp, "my app");
+  assert.equal(apply({ out, select: [], sha: "b".repeat(40) }).code, 0);
+  const { spawn } = await import("node:child_process");
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const child = spawn(process.execPath, ["src/server.mjs"], { cwd: out, env: { PATH: process.env.PATH, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    let body = null;
+    for (let i = 0; i < 50 && body === null; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try { const r = await fetch(`http://127.0.0.1:${port}/health`); if (r.status === 200) body = await r.json(); } catch { /* not up yet */ }
+    }
+    assert.ok(body, "the server never answered /health");
+  } finally { child.kill(); }
+});
+
 test("AT6: apply refuses unknown, floor or opt-in IDs and a non-empty output, writing nothing; a module with no add-on is pending", () => {
   for (const sel of [["SM-99"], ["F2"], ["SM-C3"], ["SM-01", "bogus"]]) {
     const out = path.join(tmp, `refused-${sel.join("-")}`);

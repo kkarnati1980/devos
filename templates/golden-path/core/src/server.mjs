@@ -1,6 +1,8 @@
 // Core HTTP server: /health (liveness), /ready (readiness checks), deny by default (404 everywhere else),
 // one JSON log line per request with its request ID.
 import http from "node:http";
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.mjs";
 import { log, requestId } from "./log.mjs";
 
@@ -31,7 +33,8 @@ export function createApp({ config = loadConfig(), readyChecks = [], routes = {}
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Entry point: compare encoded file URLs (Codex PR32-r6), so a project under a path with a space or a symlink starts.
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   const config = loadConfig();
   createApp({ config }).listen(config.server.port, config.server.host, () => log({ level: "info", msg: "listening", port: config.server.port }));
 }
