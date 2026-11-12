@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-60 · P1 · Lane C (ops tooling; bootstrap until M3.4 Codex reviewer replaces it)
 - **Depends on:** M0.3 (review runner `scripts/review/review-commit.sh` v1.0.2, Codex CLI, read-only deploy key, verdict schema on the server)
-- **Owned files:** `scripts/review/review-watch.sh` (v1.2.0), `scripts/review/install-review-watch.sh` (v1.1.0), `scripts/test/review-watch.test.mjs`, this contract.
+- **Owned files:** `scripts/review/review-watch.sh` (v1.2.0), `scripts/review/install-review-watch.sh` (v1.1.0), `scripts/test/review-watch.test.mjs` (AT14–AT17), this contract.
 - **Approved by KK:** 4 Nov 2026 (build plan v1.0.0, section 7).
 
 ## Goal
@@ -41,9 +41,10 @@ Run the existing Codex review automatically on every new PR head, so a review no
 | AT11 | A SHA whose publication failed is published on a later tick even after its PR moved to a new head |
 | AT12 | With two green SHAs waiting, one tick runs one review and logs the other as queued; the next tick runs it |
 | AT13 | A token or `sk-` key inside a verdict summary or finding never appears in the posted comment |
-| AT14 | Heartbeat: a tick posts one `codex-review-watch` status on main with the counts; another tick inside the interval posts none; after the interval a new one is posted |
-| AT15 | A failed heartbeat read or post never fails the tick and is retried on the next tick |
-| AT16 | `--dry-run` posts no heartbeat and writes no heartbeat state; the token never appears in output |
+| AT14 | `gh_all` lists a page larger than the 128 KiB per-argument limit in full (105 PRs with 3 KB bodies; 103 workflow runs), and never passes page data as a jq argument (`scripts/test/review-watch.test.mjs`) |
+| AT15 | Heartbeat: a tick posts one `codex-review-watch` status on main with the counts; another tick inside the interval posts none; after the interval a new one is posted |
+| AT16 | A failed heartbeat read or post never fails the tick and is retried on the next tick |
+| AT17 | `--dry-run` posts no heartbeat and writes no heartbeat state; the token never appears in output |
 | AT8 | **Live (merge gate):** after install on the server, one real PR receives an automatic verdict comment and status on its head SHA. Recorded on DEVOS-60 |
 
 **Builder verification:** AT1–AT5 were exercised locally against a mock GitHub API and a stub runner. The posted comments contained no leaked token pattern. `shellcheck -S warning` and `bash -n` pass.
@@ -71,4 +72,9 @@ Run the existing Codex review automatically on every new PR head, so a review no
 
 **v1.1.2 (5 Nov 2026, Codex PR9-r4, medium):** a stored manual verdict was published without recording its PR number, so the drain could not finish it after the PR moved on. The number is now written before publishing. **Mock test:** a manual PASS has its status post fail; the PR then moves to a new head; the next tick completes the publication ("no longer the PR head"). No review was run for that SHA.
 
-**v1.2.0 (11 Nov 2026, DEVOS-105, runner-b):** the watcher stopped for about 6 hours on 11 Nov (DEVOS-101), and nothing on GitHub showed it. It now posts an hourly heartbeat status on main (behaviour 11). The state file is `watch/heartbeat.last` (epoch seconds) and the interval is `HEARTBEAT_SECONDS`. Design choices: a status on main rather than a comment, so nothing notifies people and the latest value is easy to read; at most hourly, well under GitHub's 1,000-statuses-per-SHA limit, and main moves on with each merge; the local state file instead of a status read, so one fewer API call per tick. **Tests:** `scripts/test/review-watch.test.mjs` (AT14–AT16) against a mock GitHub API, 3/3, including an aged and a future state file, a GitHub call that never answers (cut off by the timeout), and no token in output. Pre-review: round 1 found 1 medium (no timeouts on GitHub calls) and 3 low, all fixed; round 2 PASS with 2 low (value checks, fixed) and 1 low deferred to DEVOS-106 (a comment POST that GitHub completes after the timeout can be posted twice on retry). `bash -n` and `shellcheck -S warning` pass. Deployment: the server agent installs the merged script into `/root/.devos/bin/` (allow-list); KK does nothing.
+**v1.1.3 (12 Nov 2026, DEVOS-113, outage fix):** from 15:34 IST on 11 Nov, no PR was reviewed. Every tick logged `jq: Argument list too long` at the page merge in `gh_all`, saw an empty PR list and exited 0. With 15 open PRs whose bodies are long, one page of `GET /pulls` exceeded Linux's 128 KiB limit for a single argument, and the page was passed to `jq --argjson`. Pages are now merged through temp files (`jq -s '.[0] + .[1]' acc page`), so page size is unbounded.
+- **Test:** AT14. The old code reproduces the error on the same 330 KB page.
+- **Emergency install (KK, 12 Nov):** the watcher reviews its own fix, so v1.1.3 was installed on the server from this PR's branch before its Codex review. The review then runs as normal; if it requests changes, the corrected version replaces it through the same path.
+- **Same pattern, still to fix:** `server-agent.sh` `gh_all_runs` has the same jq-argument page merge (DEVOS-114).
+
+**v1.2.0 (11 Nov 2026, DEVOS-105, runner-b):** the watcher stopped for about 6 hours on 11 Nov (DEVOS-101), and nothing on GitHub showed it. It now posts an hourly heartbeat status on main (behaviour 11). The state file is `watch/heartbeat.last` (epoch seconds) and the interval is `HEARTBEAT_SECONDS`. Design choices: a status on main rather than a comment, so nothing notifies people and the latest value is easy to read; at most hourly, well under GitHub's 1,000-statuses-per-SHA limit, and main moves on with each merge; the local state file instead of a status read, so one fewer API call per tick. **Tests:** `scripts/test/review-watch.test.mjs` (AT15–AT17; renumbered after AT14 went to the DEVOS-113 outage fix) against a mock GitHub API, 3/3, including an aged and a future state file, a GitHub call that never answers (cut off by the timeout), and no token in output. Pre-review: round 1 found 1 medium (no timeouts on GitHub calls) and 3 low, all fixed; round 2 PASS with 2 low (value checks, fixed) and 1 low deferred to DEVOS-106 (a comment POST that GitHub completes after the timeout can be posted twice on retry). `bash -n` and `shellcheck -S warning` pass. Deployment: the server agent installs the merged script into `/root/.devos/bin/` (allow-list); KK does nothing.

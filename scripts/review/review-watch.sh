@@ -6,6 +6,7 @@
 # open-PR count and how many wait for green CI. A heartbeat older than 2 hours means the watcher is down, which the
 # runners can see without server access. A failed heartbeat post never fails the tick; --dry-run posts nothing.
 # Every GitHub call now has a timeout (ADR-0011: connect 10 s, total GH_TIMEOUT, default 30 s).
+# v1.1.3 (DEVOS-113): gh_all merges list pages through temp files, never as a jq argument (128 KiB limit).
 # v1.1.2 (Codex PR9-r4): a stored manual verdict records its PR number before publishing, so the drain can
 # complete it after the PR moves on.
 # v1.1.1 (Codex PR9-r3): pending publications are drained for every stored SHA, including ones a PR has
@@ -66,17 +67,22 @@ gh_api() {  # method path [json-body-file] -> body on stdout; non-2xx is an erro
 redact() { sed -E 's/(sk-[A-Za-z0-9_*.-]{6})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g'; }
 
 # All pages of a list endpoint. path must already contain '?'. key: JSON field holding the array ('' = top level).
+# v1.1.3: pages are merged through temp files, never passed as a jq argument. A page larger than the kernel's
+# per-argument limit (128 KiB; 15 open PRs with long bodies on 11 Nov) made `jq --argjson` fail with
+# "Argument list too long", the list came back empty, and no PR was reviewed (DEVOS-113).
 gh_all() {
-  local path="$1" key="$2" page=1 chunk n acc='[]'
+  local path="$1" key="$2" page=1 n acc chunk
+  acc="$(mktemp "$TMP/all.XXXXXX")"; chunk="$(mktemp "$TMP/page.XXXXXX")"
+  printf '[]' > "$acc"
   while :; do
-    chunk="$(gh_api GET "${path}&per_page=100&page=${page}")" || return 1
-    if [[ -n "$key" ]]; then chunk="$(jq -c ".${key}" <<<"$chunk")"; fi
-    acc="$(jq -c --argjson c "$chunk" '. + $c' <<<"$acc")"
-    n="$(jq 'length' <<<"$chunk")"
+    gh_api GET "${path}&per_page=100&page=${page}" > "$chunk" || { rm -f "$acc" "$chunk"; return 1; }
+    if [[ -n "$key" ]]; then jq -c ".${key}" "$chunk" > "$chunk.k" && mv "$chunk.k" "$chunk" || { rm -f "$acc" "$chunk"; return 1; }; fi
+    jq -c -s '.[0] + .[1]' "$acc" "$chunk" > "$acc.n" && mv "$acc.n" "$acc" || { rm -f "$acc" "$chunk"; return 1; }
+    n="$(jq 'length' "$chunk")"
     if (( n < 100 )) || (( page >= 30 )); then break; fi
     page=$((page + 1))
   done
-  printf '%s' "$acc"
+  cat "$acc"; rm -f "$acc" "$chunk"
 }
 
 ci_green() {  # sha -> 0 green; 1 not green; 3 cannot read workflow runs (token lacks Actions: Read)

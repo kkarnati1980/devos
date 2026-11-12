@@ -2,7 +2,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -112,4 +112,36 @@ test("HB3 --dry-run posts nothing and writes no heartbeat state; the token never
   assert.equal(M.statuses.length, 0);
   assert.equal(fs.existsSync(path.join(dir, "watch", "heartbeat.last")), false);
   assert.ok(!r.out.includes(TOKEN));
+});
+
+// DEVOS-113 (review-watch v1.1.3, AT14): a page bigger than the kernel's 128 KiB per-argument limit is listed in full.
+const AT14_HARNESS = `set -euo pipefail
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+log(){ echo "$*" >&2; }
+gh_api(){ case "$2" in
+  *pulls*page=1) jq -nc '[range(100) | {number: ., body: ("x" * 3000)}]';;
+  *pulls*page=2) jq -nc '[range(5) | {number: (. + 100), body: "short"}]';;
+  *runs*page=1) jq -nc '{workflow_runs: [range(100) | {id: ., pad: ("y" * 2000)}]}';;
+  *runs*page=2) jq -nc '{workflow_runs: [range(3) | {id: (. + 100)}]}';;
+  esac; }
+eval "$(sed -n '/^gh_all() {/,/^}/p' scripts/review/review-watch.sh)"
+p="$(gh_all "/repos/x/pulls?state=open" '')"
+r="$(gh_all "/repos/x/actions/runs?head_sha=abc" workflow_runs)"
+printf '%s %s %s\\n' "$(jq length <<<"$p")" "$(jq length <<<"$r")" "\${#p}"
+`;
+
+test("AT14: gh_all lists a page larger than 128 KiB in full (two pages, top-level and keyed)", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "rw-"));
+  const f = path.join(d, "h.sh");
+  fs.writeFileSync(f, AT14_HARNESS);
+  const [prs, runs, bytes] = execFileSync("bash", [f], { cwd: ROOT, encoding: "utf8" }).trim().split(" ").map(Number);
+  fs.rmSync(d, { recursive: true, force: true });
+  assert.equal(prs, 105);
+  assert.equal(runs, 103);
+  assert.ok(bytes > 131072, `first page must exceed 128 KiB, was ${bytes}`);
+});
+
+test("AT14: gh_all never passes page data as a jq argument", () => {
+  const src = execFileSync("sed", ["-n", "/^gh_all() {/,/^}/p", "scripts/review/review-watch.sh"], { cwd: ROOT, encoding: "utf8" });
+  assert.doesNotMatch(src, /--argjson|--arg /);
 });
