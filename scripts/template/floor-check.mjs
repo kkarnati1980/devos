@@ -13,23 +13,45 @@ import { parse } from "yaml";
 // F2-1 patterns. Network modules are matched by import/require of the module itself (named, namespace,
 // default, dynamic or require), so aliases cannot slip through; only src/safe-fetch.mjs may import them, and
 // src/server.mjs may import node:http to serve (never its client calls).
-const NET_MODULE = /(\bfrom|\bimport|\brequire)\s*\(?\s*["'`](node:)?(https?|http2|net|tls|dgram)["'`]/;
+// G is the gap between tokens: whitespace or comments (Codex PR32-r4), matched even where a comment was not
+// blanked (e.g. after an odd regex literal confused the string scanner).
+const G = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*`;
+const NET_MODULE = new RegExp(String.raw`(\bfrom|\bimport|\brequire)${G}\(?${G}["'\`](node:)?(https?|http2|net|tls|dgram)["'\`]`);
 const RAW_CLIENT = [
-  [/\bfetch\s*\(/, "fetch("],
+  [new RegExp(String.raw`\bfetch${G}\(`), "fetch("],
   [/["'`](axios|undici|got|node-fetch|superagent|needle|ky|cross-fetch|isomorphic-fetch|ws)["'`]/, "HTTP client package"],
   [/\bnew\s+(XMLHttpRequest|WebSocket|EventSource)\s*\(/, "XMLHttpRequest/WebSocket/EventSource"],
   [/^\s*(import|from)\s+(requests|httpx|urllib3?|aiohttp|http\.client|socket)\b/m, "Python HTTP client"],
   [/\bglobalThis\s*(\.\s*fetch\b|\[)/, "globalThis.fetch"],
-  [/(\bfrom|\bimport|\brequire)\s*\(?\s*["'`](node:)?(module|child_process|worker_threads)["'`]/, "module loader / child process (can reach the network indirectly)"],
-  [/\bimport\s*\(\s*[^"'`\s)]/, "dynamic import of a computed module name"],
+  [new RegExp(String.raw`(\bfrom|\bimport|\brequire)${G}\(?${G}["'\`](node:)?(module|child_process|worker_threads)["'\`]`), "module loader / child process (can reach the network indirectly)"],
+  [new RegExp(String.raw`\bimport${G}\(${G}[^"'\`\s)/]`), "dynamic import of a computed module name"],
   // A template literal with an interpolation is computed too (Codex PR32-r1): import(`node:${name}`).
   [/\b(import|require)\s*\(\s*`[^`]*\$\{/, "dynamic import of a computed module name"],
-  [/\brequire\s*\(\s*[^"'`\s)]/, "require of a computed module name"],
+  [new RegExp(String.raw`\brequire${G}\(${G}[^"'\`\s)/]`), "require of a computed module name"],
 ];
 // src/server.mjs may take only the server side of node:http: a default/namespace import or { createServer }.
 const SERVER_HTTP_OK = /^import\s+(\w+|\*\s+as\s+\w+|\{\s*createServer\s*\})\s+from\s+["'](node:)?http["'];?\s*$/;
 const SECRET_SHAPE = /(SECRET|TOKEN|KEY|PASSWORD|PASSWD|PRIVATE|CREDENTIAL)/i;
 const CODE = /\.(m?js|cjs|ts|tsx|jsx|py)$/;
+
+// Codex PR32-r4: comments are blanked before F2-1 matching (string literals are kept, newlines and offsets are
+// preserved), so `import { request } from /* client */ "node:https"` is still an import of node:https.
+const STRING_OR_COMMENT = /("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
+export function blankComments(src) {
+  return src.replace(STRING_OR_COMMENT, (x, str) => (str !== undefined ? x : x.replace(/[^\n]/g, " ")));
+}
+
+// Codex PR32-r4: a limit counts only when it actually limits. Compose reads `pids_limit: -1` (and 0) as
+// unlimited and `cpus: "0"` as no CPU limit, so each value must parse as a positive number.
+const POS_NUMBER = /^\s*(\d+(\.\d+)?|\.\d+)\s*$/;
+const MEM_SIZE = /^\s*(\d+(\.\d+)?)\s*([bkmgt]i?b?)?\s*$/i;
+const PIDS = /^\s*\d+\s*$/;
+function positive(v, re) {
+  if (typeof v === "number") return Number.isFinite(v) && v > 0 && (re !== PIDS || Number.isInteger(v));
+  if (typeof v !== "string") return false;
+  const m = v.match(re);
+  return !!m && parseFloat(m[1] ?? m[0]) > 0;
+}
 
 function walk(dir, rel = "") {
   const out = [];
@@ -48,7 +70,8 @@ export function floorCheck(dir) {
   for (const f of files.filter((x) => CODE.test(x))) {
     const posix = f.split(path.sep).join("/");
     const isTest = posix.startsWith("test/");   // only the root test/ folder may use fetch against local stubs
-    const src = fs.readFileSync(path.join(dir, f), "utf8");
+    const raw = fs.readFileSync(path.join(dir, f), "utf8");
+    const src = /\.py$/.test(posix) ? raw : blankComments(raw);
     // F2 is server-side: browser code under public/ talks to its own origin and is covered by F1-4.
     if (posix !== "src/safe-fetch.mjs" && !isTest && !posix.startsWith("public/")) {
       for (const [re, what] of RAW_CLIENT) if (re.test(src)) fails.push(`FAIL F2-1 ${posix}: raw HTTP client (${what}) outside src/safe-fetch.mjs`);
@@ -98,9 +121,9 @@ export function floorCheck(dir) {
     for (const [name, raw] of Object.entries((doc && doc.services) || {})) {
       const svc = raw && typeof raw === "object" ? raw : {};
       const lim = (svc && svc.deploy && svc.deploy.resources && svc.deploy.resources.limits) || {};
-      if (!(svc.cpus || lim.cpus)) fails.push(`FAIL F3-2 ${f}: service ${name} has no CPU limit`);
-      if (!(svc.mem_limit || lim.memory)) fails.push(`FAIL F3-2 ${f}: service ${name} has no memory limit`);
-      if (!(svc.pids_limit || lim.pids)) fails.push(`FAIL F3-2 ${f}: service ${name} has no pid limit`);
+      if (!(positive(svc.cpus, POS_NUMBER) || positive(lim.cpus, POS_NUMBER))) fails.push(`FAIL F3-2 ${f}: service ${name} has no CPU limit`);
+      if (!(positive(svc.mem_limit, MEM_SIZE) || positive(lim.memory, MEM_SIZE))) fails.push(`FAIL F3-2 ${f}: service ${name} has no memory limit`);
+      if (!(positive(svc.pids_limit, PIDS) || positive(lim.pids, PIDS))) fails.push(`FAIL F3-2 ${f}: service ${name} has no pid limit`);
       if (svc.network_mode === "host") fails.push(`FAIL F3-2 ${f}: service ${name} uses the host network`);
     }
   }

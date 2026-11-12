@@ -83,6 +83,11 @@ test("AT3: F2-1 catches aliased, required and socket-level clients anywhere outs
     "src/dm.mjs": "const m = 'node:' + 'http';\nexport const x = await import(m);\n",
     "src/tl.mjs": "const name = 'http';\nconst c = await import(`node:${name}`);\nexport default c;\n",
     "src/rq.cjs": "const n = 'https';\nmodule.exports = require(n);\n",
+    // Codex PR32-r4: comments between the tokens of an import, require or fetch call.
+    "src/cm.mjs": 'import { request } from /* client */ "node:https";\nrequest("http://169.254.169.254/").end();\n',
+    "src/cl.mjs": 'import { get } from // line comment\n  "node:http";\nget("http://10.0.0.1/");\n',
+    "src/cr2.cjs": 'const h = require(/* x */ "node:https");\nmodule.exports = h;\n',
+    "src/cf.mjs": 'export const f = (u) => fetch /* x */ (u);\n',
   };
   for (const [f, c] of Object.entries(cases)) write(out, f, c);
   write(out, "public/app.js", 'fetch("/api/items");\n');
@@ -91,6 +96,30 @@ test("AT3: F2-1 catches aliased, required and socket-level clients anywhere outs
   for (const file of Object.keys(cases)) assert.ok(f.some((l) => l.startsWith(`FAIL F2-1 ${file}:`)), `${file} in\n${f.join("\n")}`);
   assert.ok(!f.some((l) => l.includes("public/app.js")), "same-origin browser fetch is not F2-1");
   assert.ok(f.some((l) => /F3-2 compose\.yaml: service app has no CPU limit/.test(l)), "a null service is a finding, not a crash");
+});
+
+test("AT3: F3-2 counts only limits that limit: -1, 0 and \"0\" are findings; positive values pass (Codex PR32-r4)", () => {
+  const out = fresh("limits");
+  fs.writeFileSync(path.join(out, "compose.yaml"), [
+    "services:",
+    "  unlimited:", '    cpus: "0"', "    mem_limit: 0", "    pids_limit: -1",
+    "  zeros:", "    cpus: 0", '    mem_limit: "0m"', "    pids_limit: 0",
+    "  junk:", '    cpus: "lots"', '    mem_limit: "-512m"', '    pids_limit: "1.5"',
+    "  deploy-zero:", "    deploy:", "      resources:", "        limits:", '          cpus: "0.0"', '          memory: "0"', "          pids: -1",
+    "  good:", '    cpus: "0.5"', '    mem_limit: "512m"', "    pids_limit: 200",
+    "  good-deploy:", "    deploy:", "      resources:", "        limits:", "          cpus: 1", "          memory: 268435456", '          pids: "100"',
+    "",
+  ].join("\n"));
+  const f = floorCheck(out).filter((l) => l.includes("F3-2"));
+  for (const svc of ["unlimited", "zeros", "junk", "deploy-zero"])
+    for (const what of ["CPU", "memory", "pid"]) assert.ok(f.some((l) => l.includes(`service ${svc} has no ${what} limit`)), `${svc} ${what} in\n${f.join("\n")}`);
+  assert.ok(!f.some((l) => /service good(-deploy)? /.test(l)), f.join("\n"));
+});
+
+test("AT1: comments do not hide imports, and URLs inside strings are not comments (Codex PR32-r4)", () => {
+  const out = fresh("comments");
+  write(out, "src/ok.mjs", 'export const u = "http://example.com/a//b"; // a "quoted" note\n/* import x from "node:https" is only text here */\n');
+  assert.deepEqual(floorCheck(out), []);
 });
 
 test("AT6: a trailing slash stages beside the output; the CLIs work from a path with a space", () => {
