@@ -27,9 +27,11 @@
 | AT8 | Only fixed `run-*` codes are shown as the reason (a raw message becomes `run-failed`); a missing time is null | DL AT8 |
 | AT9 | The dashboard page lists dead letters with a hostile reason shown as text (no script runs), retries one with the session's CSRF token, has no CSP violation and no horizontal scroll at 390 px | `apps/dashboard/test/e2e/setup.e2e.mjs` DL AT9 |
 | AT10 | `openapi.yaml` lists both routes with their access level (M1.2 AT1 contract test) | `apps/api/test/api.test.mjs` AT1 |
+| AT11 | `openapi.yaml` names only audit actions the code writes (`run.dead_letter.retry_requested`) | DL AT11 |
 
 ## Decisions (runner, ADR-0013)
 - The API reaches M1.5's queue directly rather than through the worker, because `RunQueue` already bounds every call and the worker has no HTTP surface; a second service would add a hop and nothing else.
 - Audit before retry (behaviour 3), because a retry without a record is worse than a record of a retry that did not happen.
 - One PR: about 450 changed lines, one concern (the view), so no split.
 - 12 Nov 2026, Codex PR36-r1 (2 medium; both accepted): the reason shown is checked against an explicit allow-list of M1.5's fixed codes (`REASON_CODES`), not a `run-*` pattern; `REDIS_URL` is parsed with `URL` (scheme, host, port 1–65535), so `redis://redis:bad` and `redis:///` fail with `config-redis-url-invalid`. New assertions in DL AT7/AT8.
+- 12 Nov 2026, DEVOS-119 (Codex PR36-r2 low): the retry's OpenAPI description named `run.dead_letter.retried`, an action never written; it now names `run.dead_letter.retry_requested`, and DL AT11 checks that the spec names only actions the code writes.
