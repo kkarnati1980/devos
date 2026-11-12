@@ -16,17 +16,18 @@ test("AT8: every listed project is synced, strictly one at a time, in list order
     syncOne: async (id) => { inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await new Promise((x) => setTimeout(x, 5)); order.push(id); inFlight--; return "synced"; },
   });
   assert.equal(maxInFlight, 1); assert.deepEqual(order, ["p1", "p2", "p3"]);
-  assert.deepEqual(r, { synced: ["p1", "p2", "p3"], skipped: [], failed: [] });
+  assert.deepEqual(r, { synced: ["p1", "p2", "p3"], skipped: [], inactive: [], failed: [] });
 });
 
 test("AT8: a failing project is logged and the rest still sync; a held lock is reported as skipped", async () => {
   const logs = [];
   const r = await syncActiveProjects({
-    list: async () => ["p1", "p2", "p3"],
-    syncOne: async (id) => { if (id === "p1") throw new Error("linear 500"); return id === "p2" ? "skipped" : "synced"; },
+    list: async () => ["p1", "p2", "p3", "p4"],
+    syncOne: async (id) => { if (id === "p1") throw new Error("linear 500"); return id === "p2" ? "skipped" : id === "p4" ? "inactive" : "synced"; },
     log: (l) => logs.push(l),
   });
   assert.deepEqual(r.synced, ["p3"]); assert.deepEqual(r.skipped, ["p2"]);
+  assert.deepEqual(r.inactive, ["p4"]);
   assert.deepEqual(r.failed, [{ projectId: "p1", error: "linear 500" }]);
   assert.match(logs[0], /p1 failed: linear 500/);
 });

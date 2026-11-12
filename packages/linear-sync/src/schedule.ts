@@ -21,8 +21,9 @@ export async function listActiveProjects(db: PrismaLike): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
-export type ProjectOutcome = "synced" | "skipped" | "failed";
-export interface SweepResult { synced: string[]; skipped: string[]; failed: { projectId: string; error: string }[] }
+/** `skipped`: another holder has the project's lock. `inactive`: archived or purged after the list was read. */
+export type ProjectOutcome = "synced" | "skipped" | "inactive" | "failed";
+export interface SweepResult { synced: string[]; skipped: string[]; inactive: string[]; failed: { projectId: string; error: string }[] }
 
 export interface SweepDeps {
   list: () => Promise<string[]>;
@@ -33,11 +34,11 @@ export interface SweepDeps {
 
 /** One pass over the active projects, strictly one project at a time. */
 export async function syncActiveProjects(deps: SweepDeps): Promise<SweepResult> {
-  const out: SweepResult = { synced: [], skipped: [], failed: [] };
+  const out: SweepResult = { synced: [], skipped: [], inactive: [], failed: [] };
   for (const projectId of await deps.list()) {
     try {
       const r = await deps.syncOne(projectId);
-      (r === "skipped" ? out.skipped : out.synced).push(projectId);
+      out[r].push(projectId);
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
       out.failed.push({ projectId, error });
@@ -47,18 +48,36 @@ export async function syncActiveProjects(deps: SweepDeps): Promise<SweepResult> 
   return out;
 }
 
-/** The production `syncOne`: plan read, fenced Linear writes and fenced id writes under the project's lock. */
-export function lockedSyncOne(db: PrismaLike, api: LinearApi, opts: SyncOptions = {}): SweepDeps["syncOne"] {
+/**
+ * The production `syncOne`: plan read, fenced Linear writes and fenced id writes under the project's lock. The
+ * project's stage is read again under the lock, so a project archived or purged after the sweep listed it is not
+ * synced (pre-review). Each sync's divergence log and inbound completions go to `log`.
+ */
+export function lockedSyncOne(db: PrismaLike, api: LinearApi, opts: SyncOptions & { log?: (line: string) => void } = {}): SweepDeps["syncOne"] {
+  const { log, ...syncOpts } = opts;
   return async (projectId) => {
-    const r = await syncProjectLocked(db, projectId, (plan, store, guard) => syncProject(plan, fencedApi(api, guard), store, opts));
-    return r.skipped ? "skipped" : "synced";
+    let inactive = false;
+    const r = await syncProjectLocked(db, projectId, async (plan, store, guard) => {
+      if (!(await isActive(db, projectId))) { inactive = true; return; }
+      const res = await syncProject(plan, fencedApi(api, guard), store, syncOpts);
+      for (const line of res.log) log?.(`linear-sync: project ${projectId}: ${line}`);
+      for (const line of res.inbound) log?.(`linear-sync: project ${projectId} inbound: ${line}`);
+    });
+    if (r.skipped) return "skipped";
+    return inactive ? "inactive" : "synced";
   };
+}
+
+async function isActive(db: PrismaLike, projectId: string): Promise<boolean> {
+  const p: { stage: string; archivedAt: Date | null } | null = await bounded(db, (tx) => tx.project.findUnique({ where: { id: projectId }, select: { stage: true, archivedAt: true } }));
+  return !!p && !(INACTIVE_STAGES as readonly string[]).includes(p.stage) && p.archivedAt === null;
 }
 
 export interface Schedule { stop: () => Promise<void> }
 
 /**
- * Run `tick` every `intervalMs`, first after one interval. A tick that throws is logged; the schedule keeps going.
+ * Run `tick` `intervalMs` after the previous tick ended (so ticks never overlap; the period is the interval plus
+ * the sweep's own time), the first one interval after the start. A tick that throws is logged; the schedule keeps going.
  * `stop()` cancels the next tick and resolves once a running tick has finished.
  */
 export function startSchedule(tick: () => Promise<unknown>, opts: { intervalMs?: number; log?: (line: string) => void } = {}): Schedule {

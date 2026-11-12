@@ -39,15 +39,28 @@ test("AT8 on Postgres: the sweep syncs every active project under its lock and s
   let release; const held = new Promise((r) => { release = r; });
   let locked; const isLocked = new Promise((r) => { locked = r; });
   const holder = db.$transaction(async (tx) => {
-    await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('devos:linear-sync'), hashtext($1))`, b);
+    // Wrapped so the row has a typed column: the pg adapter cannot read pg_advisory_xact_lock's void result.
+    await tx.$queryRawUnsafe(`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:linear-sync'), hashtext($1))) AS l`, b);
     locked(); await held;
   }, { timeout: 30_000 });
   await isLocked;
   const r = await syncActiveProjects({ list: async () => (await listActiveProjects(db)).filter((id) => only.has(id)), syncOne: lockedSyncOne(db, L.api) });
   release(); await holder;
-  assert.deepEqual(r.synced, [a]); assert.deepEqual(r.skipped, [b]); assert.deepEqual(r.failed, []);
+  assert.deepEqual(r.synced, [a]); assert.deepEqual(r.skipped, [b]); assert.deepEqual(r.inactive, []); assert.deepEqual(r.failed, []);
   assert.equal((await db.resource.count({ where: { projectId: a, provider: "linear", kind: "project" } })), 1);
   assert.equal((await db.resource.count({ where: { projectId: skipped, provider: "linear" } })), 0);
   const again = await syncActiveProjects({ list: async () => [b], syncOne: lockedSyncOne(db, L.api) });
   assert.deepEqual(again.synced, [b], "b syncs once its lock is free");
+});
+
+test("AT8 on Postgres: a project archived after the sweep listed it is re-checked under its lock and not synced", async () => {
+  const c = await project({ stage: "building" });
+  const L = fakeLinear(); const logs = [];
+  const r = await syncActiveProjects({
+    list: async () => { const ids = (await listActiveProjects(db)).filter((id) => id === c); await db.project.update({ where: { id: c }, data: { stage: "archived", archivedAt: new Date() } }); return ids; },
+    syncOne: lockedSyncOne(db, L.api, { log: (l) => logs.push(l) }),
+  });
+  assert.deepEqual(r.inactive, [c]); assert.deepEqual(r.synced, []);
+  assert.equal(L.writes.length, 0, "no Linear write for an archived project");
+  assert.equal((await db.resource.count({ where: { projectId: c, provider: "linear" } })), 0);
 });
