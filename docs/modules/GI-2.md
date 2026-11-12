@@ -21,7 +21,7 @@
    - a threshold with a comparator and a unit (`≤ 120 s`, `at most 300 ms`, `at most 0 violations`);
    - for UI, a `screenshot diff` or a `checklist script`.
 
-   An item is a bullet plus its indented continuation lines. A blank line ends it, and any other line is an item of its own, so a paragraph of judgement text never borrows a neighbour's anchor. A fenced code block belongs to the item above it. HTML comments are ignored, and headings inside code fences are not sections. `Pass rules` (plural) is accepted.
+   An item is a bullet plus its indented continuation lines. A blank line ends it, and any other line is an item of its own, so a paragraph of judgement text never borrows a neighbour's anchor. A fenced code block belongs to the item above it: every non-blank, non-comment line in it must start with a tool (a command), and such a fence anchors its item. Prose inside a fence is rejected, and fence delimiters never count as inline code spans (PR71-r1). HTML comments are ignored, and headings inside code fences are not sections. `Pass rules` (plural) is accepted.
 
    An item without an anchor is rejected. The error names any judgement words it found (`works`, `looks good`, `no errors`, `as expected`, `model is confident` …).
 3. **Missing or empty sections are rejected:** `no "## Pass rule" section`, or `… is empty`.

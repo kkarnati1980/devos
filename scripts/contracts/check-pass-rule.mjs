@@ -15,7 +15,7 @@ export const JUDGEMENT = ["looks good", "works", "working", "no errors", "model 
 // A bullet passes when it carries at least one measurable anchor.
 const TOOLS = "pnpm|npm|npx|node|bash|sh|curl|git|gh|psql|docker|playwright|vitest|jest|tsc|eslint|python3?|pytest|make|axe|k6";
 const ANCHORS = [
-  new RegExp("`\\s*(" + TOOLS + ")\\s[^`]*`"),          // a command in a code span (tool first, with arguments)
+  new RegExp("(?<!`)`(?!`)\\s*(" + TOOLS + ")\\s[^`\\n]*`(?!`)"), // a command in an inline code span (tool first, with arguments)
   /`[^`]*\.(test|spec)\.[cm]?[jt]sx?`/,                 // a named test file
   /\b(AT|AB|GC)\d+[a-z]?\b|\bAT-[A-Z]+\d+\b/,           // an acceptance-test or green-condition id
   /\bexit(s| code| status)?\s*(0|1|2|non-?zero)\b/i,    // an exit code
@@ -46,8 +46,10 @@ export function validateContract(text, file = "contract") {
   for (const s of starts) {
     const level = HEADING.exec(lines[s].l)[1].length;
     // items: a bullet starts one; an indented line continues it; a blank line ends it; any other line is its own item.
-    // A fenced block belongs to the item above it (or is its own item).
+    // A fenced block belongs to the item above it (or is its own item) and is checked on its own terms: every
+    // non-blank, non-comment line in it must be a command, and a fence with a command anchors its item.
     const items = [];
+    const fences = new Map(); // item index -> array of fence bodies
     let open = false;
     for (let i = s + 1; i < lines.length; i++) {
       const { l, fenced } = lines[i];
@@ -55,15 +57,25 @@ export function validateContract(text, file = "contract") {
       if (!fenced && m && m[1].length <= level) break;
       if (!fenced && m) { open = false; continue; } // a deeper sub-heading inside the section is structure, not an item
       // a fenced block is an item of its own: its text never lends an anchor to, or borrows one from, a neighbour
-      if (fenced) { if (lines[i].edge && lines[i].opened) items.push(""); items[items.length - 1] += l + "\n"; open = false; continue; }
+      if (fenced) {
+        if (lines[i].edge) { if (lines[i].opened) { if (!items.length) items.push(""); const k = items.length - 1; fences.set(k, [...(fences.get(k) ?? []), []]); } continue; }
+        fences.get(items.length - 1).at(-1).push(l); open = false; continue;
+      }
       if (!l.trim()) { open = false; continue; }
       if (/^\s*([-*]|\d+\.)\s+/.test(l)) { items.push(l.replace(/^\s*([-*]|\d+\.)\s+/, "")); open = true; }
       else if (open && /^\s+\S/.test(l)) items[items.length - 1] += " " + l.trim();
       else { items.push(l.trim()); open = true; }
     }
     if (!items.length) { errors.push(`${file}:${s + 1}: "${lines[s].l.trim()}" is empty`); continue; }
-    for (const b of items) {
-      if (ANCHORS.some((r) => r.test(b))) continue;
+    const cmd = new RegExp("^\\s*(\\$\\s*)?(" + TOOLS + ")(\\s|$)");
+    for (const [k, b] of items.entries()) {
+      let fenceCmd = false, fenceBad = null;
+      for (const body of fences.get(k) ?? []) for (const l of body) {
+        if (!l.trim() || /^\s*#/.test(l)) continue;
+        if (cmd.test(l)) fenceCmd = true; else fenceBad ??= l.trim();
+      }
+      if (fenceBad) { errors.push(`${file}:${s + 1}: fenced block line "${fenceBad.slice(0, 80)}" is not a command`); continue; }
+      if (fenceCmd || ANCHORS.some((r) => r.test(b))) continue;
       const judged = JUDGEMENT.filter((w) => new RegExp(`\\b${w.replace(/ /g, "\\s+")}\\b`, "i").test(b));
       errors.push(`${file}:${s + 1}: pass rule "${b.replace(/\s+/g, " ").slice(0, 100)}" references no command, test or measurable output` +
         (judged.length ? ` (judgement words only: ${judged.join(", ")})` : ""));
