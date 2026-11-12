@@ -220,7 +220,8 @@ export function analyse(files, show) {
     if (WORKFLOW.test(p)) {
       for (const a of f.added) {
         if (/continue-on-error\s*:\s*(true|\$\{\{)/.test(a.text)) hit("ci-continue-on-error", p, a.ln, a.text);
-        if (/^\s*(-\s*)?if\s*:\s*(false|\$\{\{\s*false\s*\}\})\s*$/.test(a.text)) hit("ci-disabled", p, a.ln, a.text);
+        // a trailing YAML comment is still `if: false` (PR70-r12); job-level and step-level alike
+        if (/^\s*(-\s*)?if\s*:\s*(false|\$\{\{\s*false\s*\}\})\s*(#.*)?$/.test(a.text)) hit("ci-disabled", p, a.ln, a.text);
       }
       const before = f.status === "A" ? null : show("base", f.oldPath), after = show("head", p);
       if (after == null || (before == null && f.status !== "A")) throw new GuardError(`cannot read workflow ${p} at base/head`);

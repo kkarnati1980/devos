@@ -60,6 +60,9 @@ const VIOLATIONS = [
   ["ci-workflow-deleted", { [WF]: wf(STEPS) }, { [WF]: null }],
   ["ci-trigger-removed (required check no longer reports on PRs)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "") }],
   ["ci-continue-on-error", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("        run: pnpm test\n", "        run: pnpm test\n        continue-on-error: true\n")) }],
+  // PR70-r12: a job-level `if: false` with a trailing comment
+  ["ci-disabled (job-level if: false # comment)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS, "    if: false # temporarily disabled\n") }],
+  ["ci-disabled (step if: ${{ false }} # comment)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: ${{ false }}  # later\n")) }],
   ["ci-disabled (if: false)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("      - name: Test\n", "      - name: Test\n        if: false\n")) }],
   ["failure-swallowed (|| true)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm test", "run: pnpm test || true")) }],
   ["failure-swallowed (set +e)", { "scripts/t.sh": "#!/usr/bin/env bash\nset -e\nnode --test\n" }, { "scripts/t.sh": "#!/usr/bin/env bash\nset +e; pnpm test\nnode --test\n" }],
