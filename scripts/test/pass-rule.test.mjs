@@ -93,13 +93,15 @@ test("pre-review: no false accepts — paragraphs after a bullet, template comme
     "## Pass rule\n- the `git` history looks clean\n", "## Pass rule\n- the `make` button works properly\n", "## Pass rule\n- GCP2 is fine\n",
   ];
   for (const b of bad) assert.equal(validateContract(c(b)).ok, false, b);
+  assert.equal(validateContract(c("## Pass rule\n- `pnpm test` exits 0\n```\nand the UI looks good\n```\n")).ok, false, "a fence is its own item");
   assert.equal(validateContract(c("## Example\n```md\n## Pass rule\n- AT1 passes\n```\n")).ok, false, "a heading inside a code fence is not a section");
 });
 
 test("pre-review: no false rejects — fenced commands, plural heading, pytest/axe, a bare status after 'returns'", () => {
   for (const good of [
-    "## Pass rule\n- the smoke script exits 0:\n```bash\n# run it\nbash scripts/smoke.sh\n```\n",
+    "## Pass rule\n- the smoke script exits 0:\n```bash\n# run it\nbash scripts/smoke.sh --strict\n```\n",
     "## Pass rules\n- AT1 passes\n",
+    "## Pass rule\n### Part a\n- AT1 passes\n",
     "## Pass rule\n- `pytest -q tests/` exits 0\n", "## Pass rule\n- `axe http://localhost` reports at most 0 violations\n",
     "## Pass rule\n- `GET /health` returns 200\n",
   ]) assert.deepEqual(validateContract(c(good)).errors, [], good);

@@ -53,7 +53,9 @@ export function validateContract(text, file = "contract") {
       const { l, fenced } = lines[i];
       const m = /^(#+)\s/.exec(l);
       if (!fenced && m && m[1].length <= level) break;
-      if (fenced) { if (open || items.length) { items[items.length - 1] += "\n" + l; open = true; } else { items.push(l); open = true; } continue; }
+      if (!fenced && m) { open = false; continue; } // a deeper sub-heading inside the section is structure, not an item
+      // a fenced block is an item of its own: its text never lends an anchor to, or borrows one from, a neighbour
+      if (fenced) { if (lines[i].edge && lines[i].opened) items.push(""); items[items.length - 1] += l + "\n"; open = false; continue; }
       if (!l.trim()) { open = false; continue; }
       if (/^\s*([-*]|\d+\.)\s+/.test(l)) { items.push(l.replace(/^\s*([-*]|\d+\.)\s+/, "")); open = true; }
       else if (open && /^\s+\S/.test(l)) items[items.length - 1] += " " + l.trim();
