@@ -1,7 +1,7 @@
 // M2.4-a Coolify client (docs/modules/M2.4.md; endpoints confirmed by the M0.4 spike on Coolify 4.5.3).
 // Ownership marker: the project description carries `devos:<project id>`, set in the create call itself.
 
-import { Transport, type TransportOptions } from "./http.js";
+import { ProviderError, Transport, type TransportOptions } from "./http.js";
 import { ownershipMarker, type Found, type StepSpec } from "./runner.js";
 
 interface ProjectBody {
@@ -21,7 +21,11 @@ export class CoolifyClient {
   /** Coolify has no lookup by name: list and filter. Names are unique per DevOS project by construction. */
   async findProjectsByName(name: string): Promise<ProjectBody[]> {
     const r = await this.http.get<ProjectBody[]>("/api/v1/projects");
-    if (!Array.isArray(r.body)) return [];
+    // Codex PR44-r1: only a 200 with an array proves absence. A 404 or any other shape is an inconclusive lookup,
+    // never "no project", or the runner would POST a duplicate (Coolify allows duplicate names).
+    if (r.status !== 200 || !Array.isArray(r.body)) {
+      throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/projects returned an unexpected response (${r.status})`, r.status);
+    }
     return r.body.filter((x) => x && x.name === name && typeof x.uuid === "string");
   }
 

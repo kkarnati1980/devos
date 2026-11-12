@@ -136,7 +136,18 @@ export class Transport {
       throw new ProviderError(this.provider, "http", `${this.provider} ${method} ${url.pathname} returned ${res.status}`, res.status);
     }
     if (res.status === 204) return { status: 204, body: null };
-    const text = await res.text();
+    // Codex PR44-r1: the body is read under the same timeout signal. A body that stalls or breaks is a transient
+    // timeout/network error (a GET is retried; a write goes to the runner's lookup-before-recreate), never a raw error.
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (e) {
+      const name = (e as { name?: string }).name;
+      if (name === "TimeoutError" || name === "AbortError") {
+        throw new ProviderError(this.provider, "timeout", `${this.provider} ${method} ${url.pathname} timed out reading the response`);
+      }
+      throw new ProviderError(this.provider, "network", `${this.provider} ${method} ${url.pathname} response could not be read`);
+    }
     if (!text) return { status: res.status, body: null };
     try {
       return { status: res.status, body: JSON.parse(text) as T };

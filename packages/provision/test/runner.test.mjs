@@ -240,3 +240,49 @@ test("runStep on a done step makes no provider calls", async () => {
   assert.equal(r.outcome, "recorded");
   assert.equal(fake.calls.length, n);
 });
+
+test("Codex PR44-r1: an inconclusive Coolify project list (404, object, null) fails the lookup and creates nothing", async () => {
+  for (const body of [{ status: 404 }, { status: 200, obj: { data: [] } }, { status: 200, empty: true }]) {
+    const fake = fakeProviders();
+    const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, sleep: noSleep,
+      fetchImpl: async (u, init = {}) => {
+        const url = new URL(u);
+        if ((init.method ?? "GET") === "GET" && url.pathname === "/api/v1/projects") {
+          fake.calls.push({ method: "GET", path: url.pathname });
+          if (body.status === 404) return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+          return new Response(body.empty ? "" : JSON.stringify(body.obj), { status: 200 });
+        }
+        return fake.fetchImpl(u, init);
+      } });
+    const store = new MemoryStore();
+    await assert.rejects(runProvision(P.id, [coolifyProjectStep(cf, P)], { store, authorize: allowAll }),
+      (e) => e instanceof StepError && e.code === "provider_error");
+    assert.equal(fake.creates().filter((c) => c.path === "/api/v1/projects").length, 0, `no POST after ${JSON.stringify(body)}`);
+    assert.equal(fake.projects.size, 0);
+  }
+});
+
+test("Codex PR44-r1: a response body that stalls past the timeout is a transient timeout; a GET is retried, a POST is reconciled", async () => {
+  const stalled = (signal) => new Response(new ReadableStream({ start(c) { signal.addEventListener("abort", () => c.error(signal.reason)); } }), { status: 200 });
+  const keepAlive = setTimeout(() => {}, 5000);
+  // GET: retried on a body timeout, then succeeds.
+  let gets = 0;
+  const t = new Transport({ provider: "github", origin: "https://api.github.com", token: () => TOKEN, timeoutMs: 50, maxAttempts: 2, sleep: noSleep,
+    fetchImpl: async (u, init) => (++gets === 1 ? stalled(init.signal) : new Response(JSON.stringify({ ok: 1 }), { status: 200 })) });
+  assert.deepEqual((await t.get("/x")).body, { ok: 1 });
+  assert.equal(gets, 2);
+  const w = new Transport({ provider: "github", origin: "https://api.github.com", token: () => TOKEN, timeoutMs: 50, maxAttempts: 1, sleep: noSleep,
+    fetchImpl: async (u, init) => stalled(init.signal) });
+  await assert.rejects(w.write("POST", "/x", {}), (e) => e instanceof ProviderError && e.code === "timeout" && e.transient);
+  // POST whose create happened but whose body stalls: looked up and adopted, never POSTed again (AT4).
+  const fake = fakeProviders();
+  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, sleep: noSleep, timeoutMs: 50,
+    fetchImpl: async (u, init = {}) => {
+      const res = await fake.fetchImpl(u, init);
+      return (init.method === "POST") ? stalled(init.signal) : res;
+    } });
+  const out = await runProvision(P.id, [coolifyProjectStep(cf, P)], { store: new MemoryStore(), authorize: allowAll });
+  clearTimeout(keepAlive);
+  assert.equal(out[0].outcome, "adopted");
+  assert.equal(fake.creates().filter((c) => c.path === "/api/v1/projects").length, 1);
+});
