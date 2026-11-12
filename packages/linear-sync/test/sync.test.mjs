@@ -154,3 +154,21 @@ test("Codex PR35-r4: every PrismaSyncStore write and the plan read run in a boun
   assert.equal(seen.filter((x) => x === "SET LOCAL statement_timeout = 10000").length, 5);
   assert.equal(seen.filter((x) => x === "SET LOCAL lock_timeout = 10000").length, 5);
 });
+
+test("Codex PR35-r7: when a label create fails, no other Linear write is still in flight after the sync returns", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  L.team.labels = []; // "Module" and "Lane A" are both missing, so the first module needs two label creates
+  let inflight = 0, maxInflight = 0;
+  const orig = L.api.createLabel;
+  L.api.createLabel = async (t, name) => {
+    inflight++; maxInflight = Math.max(maxInflight, inflight);
+    try {
+      await new Promise((res) => setTimeout(res, name.startsWith("Lane") ? 5 : 30));
+      if (name.startsWith("Lane")) throw new Error("label create failed");
+      return await orig(t, name);
+    } finally { inflight--; }
+  };
+  await assert.rejects(syncProject(plan, L.api, memoryStore(plan)), /label create failed/);
+  assert.equal(inflight, 0, "a label write outlived the sync");
+  assert.equal(maxInflight, 1, "label writes ran concurrently");
+});

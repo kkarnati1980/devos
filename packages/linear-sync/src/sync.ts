@@ -88,7 +88,10 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
 
   const upsert = async (what: string, existing: LinearIssue | undefined, want: { title: string; description: string; state: StateType;
     labels: string[]; parentId: string | null; milestoneId: string | null; assigneeId: string | null; keepLinearState?: boolean }) => {
-    const lids = await Promise.all(want.labels.map(label));
+    // Sequential on purpose (Codex PR35-r7): a parallel Promise.all rejects on the first failure while other label
+    // writes are still in flight, and those could outlive the per-project lock. One at a time, nothing is left running.
+    const lids: string[] = [];
+    for (const name of want.labels) lids.push(await label(name));
     if (!existing) {
       const id = await api.createIssue({ teamId: team.id, projectId: projectId!, milestoneId: want.milestoneId, parentId: want.parentId, title: want.title,
         description: want.description, stateId: stateId(want.state), labelIds: lids, assigneeId: want.assigneeId });
