@@ -13,44 +13,57 @@ export const JUDGEMENT = ["looks good", "works", "working", "no errors", "model 
   "fine", "ok", "okay", "good", "reasonable", "sensible", "acceptable", "clean", "nice", "should", "seems", "appears"];
 
 // A bullet passes when it carries at least one measurable anchor.
+const TOOLS = "pnpm|npm|npx|node|bash|sh|curl|git|gh|psql|docker|playwright|vitest|jest|tsc|eslint|python3?|pytest|make|axe|k6";
 const ANCHORS = [
-  /`[^`]*\b(pnpm|npm|npx|node|bash|sh|curl|git|gh|psql|docker|playwright|vitest|jest|tsc|eslint|python3?|make)\b[^`]*`/, // a command in a code span
-  /`[^`]*\.(test|spec)\.[cm]?[jt]sx?[^`]*`/,           // a named test file
-  /\b(AT|AB|GC|IT|E2E)[-\w]*\d+\b/,                     // an acceptance-test or green-condition id
-  /\bexit(s| code)?\s*(0|1|2|non-?zero)\b/i,            // an exit code
-  /\bHTTP\s*\d{3}\b|\b[1-5]\d\d\b\s*(status|response)/i, // an HTTP status
-  /(≤|≥|<=|>=|<|>|at most|at least|under|within)\s*\d[\d.,_]*\s*(ms|s|seconds?|minutes?|%|kb|mb|gb|lines?|rows?|requests?)?\b/i, // a threshold
+  new RegExp("`\\s*(" + TOOLS + ")\\s[^`]*`"),          // a command in a code span (tool first, with arguments)
+  /`[^`]*\.(test|spec)\.[cm]?[jt]sx?`/,                 // a named test file
+  /\b(AT|AB|GC)\d+[a-z]?\b|\bAT-[A-Z]+\d+\b/,           // an acceptance-test or green-condition id
+  /\bexit(s| code| status)?\s*(0|1|2|non-?zero)\b/i,    // an exit code
+  /\bHTTP\s*[1-5]\d\d\b|\b(returns|responds(\s+with)?|status( code)?)\s+[1-5]\d\d\b/i, // an HTTP status
+  /((?<![-=<>])(≤|≥|<=|>=|<|>)|\b(at most|at least|under|within|exactly)\b)\s*\d[\d.,_]*\s*(ms|s|seconds?|minutes?|%|kb|mb|gb|lines?|rows?|requests?|pixels?|px|violations?|findings?|errors?|hits?)\b/i, // a threshold with a unit
   /\bscreenshot diff\b|\bchecklist script\b/i,          // the UI allowances of spec §5
 ];
 
-const SECTION = /^#{2,4}\s+Pass rule\b.*$/im;
+const HEADING = /^(#{2,4})\s+Pass rules?\b/i;
+
+/** Lines with HTML comments blanked and a flag for lines inside fenced code blocks. */
+function scan(text) {
+  const clean = text.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, " "));
+  let fence = null;
+  return clean.split("\n").map((l) => {
+    const f = /^\s*(```|~~~)/.exec(l);
+    if (f) { const was = fence; fence = fence ? (l.trim().startsWith(fence) ? null : fence) : f[1]; return { l, fenced: true, edge: true, opened: !was }; }
+    return { l, fenced: !!fence };
+  });
+}
 
 /** Returns { ok, errors[] } for one contract's text. */
 export function validateContract(text, file = "contract") {
   const errors = [];
-  const lines = text.split("\n");
-  const starts = lines.flatMap((l, i) => (/^#{2,4}\s+Pass rule\b/i.test(l) ? [i] : []));
-  if (!starts.length || !SECTION.test(text)) return { ok: false, errors: [`${file}: no "## Pass rule" section`] };
+  const lines = scan(text);
+  const starts = lines.flatMap((x, i) => (!x.fenced && HEADING.test(x.l) ? [i] : []));
+  if (!starts.length) return { ok: false, errors: [`${file}: no "## Pass rule" section`] };
   for (const s of starts) {
-    const level = /^#+/.exec(lines[s])[0].length;
-    const body = [];
+    const level = HEADING.exec(lines[s].l)[1].length;
+    // items: a bullet starts one; an indented line continues it; a blank line ends it; any other line is its own item.
+    // A fenced block belongs to the item above it (or is its own item).
+    const items = [];
+    let open = false;
     for (let i = s + 1; i < lines.length; i++) {
-      const m = /^(#+)\s/.exec(lines[i]);
-      if (m && m[1].length <= level) break;
-      body.push(lines[i]);
+      const { l, fenced } = lines[i];
+      const m = /^(#+)\s/.exec(l);
+      if (!fenced && m && m[1].length <= level) break;
+      if (fenced) { if (open || items.length) { items[items.length - 1] += "\n" + l; open = true; } else { items.push(l); open = true; } continue; }
+      if (!l.trim()) { open = false; continue; }
+      if (/^\s*([-*]|\d+\.)\s+/.test(l)) { items.push(l.replace(/^\s*([-*]|\d+\.)\s+/, "")); open = true; }
+      else if (open && /^\s+\S/.test(l)) items[items.length - 1] += " " + l.trim();
+      else { items.push(l.trim()); open = true; }
     }
-    // bullets (continuation lines join the bullet above); a body with no bullets is checked as one paragraph
-    const bullets = [];
-    for (const l of body) {
-      if (/^\s*([-*]|\d+\.)\s+/.test(l)) bullets.push(l.replace(/^\s*([-*]|\d+\.)\s+/, ""));
-      else if (l.trim() && bullets.length) bullets[bullets.length - 1] += " " + l.trim();
-      else if (l.trim()) bullets.push(l.trim());
-    }
-    if (!bullets.length) { errors.push(`${file}:${s + 1}: "${lines[s].trim()}" is empty`); continue; }
-    for (const b of bullets) {
+    if (!items.length) { errors.push(`${file}:${s + 1}: "${lines[s].l.trim()}" is empty`); continue; }
+    for (const b of items) {
       if (ANCHORS.some((r) => r.test(b))) continue;
       const judged = JUDGEMENT.filter((w) => new RegExp(`\\b${w.replace(/ /g, "\\s+")}\\b`, "i").test(b));
-      errors.push(`${file}:${s + 1}: pass rule "${b.slice(0, 100)}" references no command, test or measurable output` +
+      errors.push(`${file}:${s + 1}: pass rule "${b.replace(/\s+/g, " ").slice(0, 100)}" references no command, test or measurable output` +
         (judged.length ? ` (judgement words only: ${judged.join(", ")})` : ""));
     }
   }
@@ -59,12 +72,13 @@ export function validateContract(text, file = "contract") {
 
 const isContract = (p) => /^docs\/modules\/[^/]+\.md$/.test(p) && !/\/_template\.md$/.test(p);
 
-/** Contracts added or modified between merge-base(base, head) and head; deleted ones are the floor guard's job. */
+/** Contracts added, modified or renamed between merge-base(base, head) and head. A deleted or moved-away contract is
+ *  caught by the floor guard (scripts/floor-guard, rule contract-weakened, DEVOS-141). */
 export function changedContracts(cwd, base, head) {
   const git = (args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   const mb = git(["merge-base", base, head]).trim();
-  return git(["-c", "core.quotePath=false", "diff", "--name-only", "--diff-filter=AMR", mb, head, "--", "docs/modules"])
-    .split("\n").filter(Boolean).filter(isContract);
+  return git(["diff", "-z", "--name-only", "--diff-filter=AMR", mb, head, "--", "docs/modules"])
+    .split("\0").filter(Boolean).filter(isContract);
 }
 
 export function run({ cwd = process.cwd(), base, head, files }) {
@@ -83,8 +97,10 @@ export function run({ cwd = process.cwd(), base, head, files }) {
 function main(argv) {
   const arg = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
   let files;
-  if (argv.includes("--all")) files = fs.readdirSync("docs/modules").map((f) => `docs/modules/${f}`).filter(isContract);
-  else if (argv.length && !argv[0].startsWith("--")) files = argv;
+  try {
+    if (argv.includes("--all")) files = fs.readdirSync("docs/modules").map((f) => `docs/modules/${f}`).filter(isContract);
+    else if (argv.length && !argv[0].startsWith("--")) files = argv;
+  } catch (e) { console.log(`pass-rule: could not run: ${e.message}`); return 2; }
   const r = run({ base: arg("--base"), head: arg("--head"), files });
   for (const e of r.errors) console.log(e);
   console.log(`pass-rule: exit ${r.exit} (${r.checked.length} contract(s) checked${r.checked.length ? ": " + r.checked.join(", ") : ""})`);

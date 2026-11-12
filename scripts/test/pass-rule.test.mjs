@@ -83,3 +83,29 @@ test("the contract template and the backfilled current-phase Lane A contracts pa
     assert.deepEqual(r.errors, [], f);
   }
 });
+
+test("pre-review: no false accepts — paragraphs after a bullet, template comments, loose anchors, fenced headings", () => {
+  const bad = [
+    "## Pass rule\n- `pnpm test` exits 0\n\nThe dashboard looks good and the model is confident.\n",
+    "## Pass rule\nThe suite `pnpm test` runs.\nAlso the UI looks good.\n",
+    "## Pass rule\n<!-- run `node scripts/contracts/check-pass-rule.mjs` -->\n",
+    "## Pass rule\n- works for > 1 user\n", "## Pass rule\n- upgrade v1 -> 2 works as expected\n", "## Pass rule\n- looks good within 2 days\n",
+    "## Pass rule\n- the `git` history looks clean\n", "## Pass rule\n- the `make` button works properly\n", "## Pass rule\n- GCP2 is fine\n",
+  ];
+  for (const b of bad) assert.equal(validateContract(c(b)).ok, false, b);
+  assert.equal(validateContract(c("## Example\n```md\n## Pass rule\n- AT1 passes\n```\n")).ok, false, "a heading inside a code fence is not a section");
+});
+
+test("pre-review: no false rejects — fenced commands, plural heading, pytest/axe, a bare status after 'returns'", () => {
+  for (const good of [
+    "## Pass rule\n- the smoke script exits 0:\n```bash\n# run it\nbash scripts/smoke.sh\n```\n",
+    "## Pass rules\n- AT1 passes\n",
+    "## Pass rule\n- `pytest -q tests/` exits 0\n", "## Pass rule\n- `axe http://localhost` reports at most 0 violations\n",
+    "## Pass rule\n- `GET /health` returns 200\n",
+  ]) assert.deepEqual(validateContract(c(good)).errors, [], good);
+});
+
+test("CLI --all outside a repository root exits 2, not 1", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "devos-pr-none-"));
+  assert.equal(spawnSync(process.execPath, [CLI, "--all"], { cwd: dir }).status, 2);
+});
