@@ -140,9 +140,16 @@ export function workflowShape(src) {
   };
 }
 
+/** The heading chain above a line (nearest first, then each shallower ancestor), so a subsection of an acceptance
+ * section is still inside it (PR70-r8). */
 function sectionOf(baseLines, ln) {
-  for (let i = Math.min(ln, baseLines.length) - 1; i >= 0; i--) if (/^#{1,6}\s/.test(baseLines[i])) return baseLines[i];
-  return "";
+  const chain = [];
+  let level = 7;
+  for (let i = Math.min(ln, baseLines.length) - 1; i >= 0 && level > 1; i--) {
+    const m = /^(#{1,6})\s/.exec(baseLines[i]);
+    if (m && m[1].length < level) { chain.push(baseLines[i]); level = m[1].length; }
+  }
+  return chain.join("\n");
 }
 
 function numbers(lines, rx) {
@@ -255,11 +262,13 @@ export function analyse(files, show) {
       // pair the k-th new occurrence of a key with its k-th old one, as for coverage (PR70-r4)
       const rwk = byKey(rw), seen = {};
       for (const n of rn) { const k = (seen[n.key] = (seen[n.key] ?? -1) + 1); const o = rwk[n.key]?.[k]; if ((o && n.v > o.v) || (!o && n.v > 0 && !WORKFLOW.test(p))) hit("retries-raised", p, n.l.ln, n.l.text); }
-      const mw = /--max-warnings[=\s]+(-?\d+)/;
+      // every occurrence counts, paired k-th old to k-th new, so a later limit on the same line is read too (PR70-r8)
+      const mw = /--max-warnings[=\s]+(-?\d+)/g;
       const val = (m) => (+m[1] < 0 ? Infinity : +m[1]);
-      const mwOld = f.removed.map((l) => mw.exec(l.text)).filter(Boolean), mwNew = f.added.map((l) => [l, mw.exec(l.text)]).filter(([, m]) => m);
-      for (const [l, m] of mwNew) if (val(m) === Infinity || mwOld.some((o) => val(m) > val(o))) hit("max-warnings-raised", p, l.ln, l.text);
-      if (mwOld.length && !mwNew.length && !f.added.some((l) => l.text.includes("--max-warnings"))) hit("max-warnings-raised", p, 0, "--max-warnings removed");
+      const mwOld = f.removed.flatMap((l) => [...l.text.matchAll(mw)].map((m) => [l, m]));
+      const mwNew = f.added.flatMap((l) => [...l.text.matchAll(mw)].map((m) => [l, m]));
+      mwNew.forEach(([l, m], k) => { const o = mwOld[k]; if (val(m) === Infinity || (o && val(m) > val(o[1]))) hit("max-warnings-raised", p, l.ln, l.text); });
+      if (mwNew.length < mwOld.length) hit("max-warnings-raised", p, mwOld[mwNew.length][0].ln, `--max-warnings removed: ${mwOld[mwNew.length][0].text}`);
     }
 
     if (p.endsWith("package.json")) {
