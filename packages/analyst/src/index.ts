@@ -42,3 +42,24 @@ export {
   type RouteResult,
   type TechnicalEntry,
 } from "./route.js";
+export {
+  PASTE_MAX_CHARS,
+  PipelineError,
+  REPO_PATH,
+  RequirementsPipeline,
+  requirementsCard,
+  type DocRow,
+  type DocStatus,
+  type PipelinePorts,
+  type PipelineWarningCode,
+  type ProjectRow,
+  type RequirementRowInput,
+  type RequirementsCard,
+  type RequirementsStore,
+  type SaveAnalysisInput,
+  type SaveAnalysisResult,
+  type SpecInput,
+  type SpecSourceFormat,
+  type SubmitResult,
+} from "./pipeline.js";
+export { MemoryRequirementsStore, type MemoryRequirement, type MemorySpec } from "./memory-store.js";

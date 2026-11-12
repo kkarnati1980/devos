@@ -1,0 +1,297 @@
+// M2.2-d1 (docs/modules/M2.2.md): the Analyst pipeline service. Spec upload or paste → `ingest` → new `spec`
+// version → analysis (+ optional model pass) → `requirement`, `milestone` and `requirements_doc` rows → one
+// `requirements` card for KK, plus the open-question cards. Persistence and card raising are ports, so this file
+// stays free of the DB and the API (M2.2-d2 binds them to Prisma and to M2.3 `Approvals`).
+import { ingest as defaultIngest, IngestError, type IngestResult, type SpecFileFormat } from "@devos/intake";
+import { analyzeSpec, type Analysis, type Priority } from "./analyze.js";
+import { assistAnalysis, type ModelRunner } from "./assist.js";
+import { renderRequirementsMd } from "./render.js";
+import { planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
+
+export type SpecSourceFormat = SpecFileFormat | "paste";
+export type DocStatus = "draft" | "approved" | "superseded";
+
+export class PipelineError extends Error {
+  constructor(readonly code: string, readonly status = 400) {
+    super(code);
+  }
+}
+
+export type SpecInput =
+  | { kind: "file"; bytes: Uint8Array; originalName: string }
+  | { kind: "paste"; text: string };
+
+export interface ProjectRow {
+  id: string;
+  name: string;
+  stage: string;
+}
+
+export interface RequirementRowInput {
+  key: string;
+  title: string;
+  priority: Priority;
+  /** Criteria joined by "\n" (the `requirement.acceptance` column is one text). */
+  acceptance: string;
+  /** Milestone ordinal in this analysis, or null. */
+  milestoneOrdinal: number | null;
+}
+
+export interface SaveAnalysisInput {
+  projectId: string;
+  spec: { sourceFormat: SpecSourceFormat; originalName: string | null; fileSha256: string; text: string };
+  requirements: RequirementRowInput[];
+  milestones: { ordinal: number; name: string; gateName: string }[];
+  repoPath: string;
+}
+
+export interface SaveAnalysisResult {
+  specId: string;
+  specVersion: number;
+  docId: string;
+  docVersion: number;
+  /** Keys / ordinals stored by an earlier version and absent now. They are kept (no deletion: that is KK's call). */
+  droppedKeys: string[];
+  droppedMilestones: number[];
+}
+
+export interface DocRow {
+  id: string;
+  projectId: string;
+  version: number;
+  status: DocStatus;
+  approvalId: string | null;
+}
+
+/**
+ * Persistence port. `saveAnalysis` is ONE transaction that locks the project row, so two submissions for the same
+ * project serialise: it refuses with `requirements-already-approved` when an approved doc exists, assigns the next
+ * spec and doc versions, supersedes earlier draft docs, upserts requirements by key and milestones by ordinal.
+ */
+export interface RequirementsStore {
+  project(projectId: string): Promise<ProjectRow | null>;
+  saveAnalysis(input: SaveAnalysisInput): Promise<SaveAnalysisResult>;
+  /** The newest doc of the project, or null. */
+  latestDoc(projectId: string): Promise<DocRow | null>;
+  docForApproval(approvalId: string): Promise<DocRow | null>;
+  /** Sets `approval_id` only while it is null and the doc is a draft; false otherwise. */
+  linkApproval(docId: string, approvalId: string): Promise<boolean>;
+  /** Compare-and-set on status; false when the doc is not in `from`. */
+  setDocStatus(docId: string, from: DocStatus, to: DocStatus): Promise<boolean>;
+}
+
+/** An M2.3 `CardInput` for the requirements gate; the port is `Approvals.raiseCard(card, [])`. */
+export interface RequirementsCard {
+  gate: "requirements";
+  action: string;
+  target: string;
+  reason: string;
+  projectId: string;
+}
+
+export interface PipelinePorts {
+  store: RequirementsStore;
+  raiseRequirementsCard: (card: RequirementsCard) => Promise<{ id: string }>;
+  raiseQuestionCard: RaiseCard;
+  /** M1.5 run-engine binding (role Analyst); null/absent = deterministic only. */
+  runner?: ModelRunner | null;
+  ingest?: (bytes: Uint8Array, originalName: string) => Promise<IngestResult>;
+  now?: () => Date;
+}
+
+export type PipelineWarningCode = "assist-failed" | "card-failed" | "card-link-failed";
+
+export interface SubmitResult {
+  specId: string;
+  specVersion: number;
+  docId: string;
+  docVersion: number;
+  approvalId: string | null;
+  /** docs/requirements.md content (inert); M2.2-d2 commits it to the app repo. */
+  markdown: string;
+  /** docs/decisions/analyst-questions.md content: technical questions for the Architect. */
+  architectLog: string;
+  counts: { requirements: number; milestones: number; openQuestions: number; proposed: number };
+  questionCards: RouteResult;
+  droppedKeys: string[];
+  droppedMilestones: number[];
+  analysisWarnings: Analysis["warnings"];
+  warnings: PipelineWarningCode[];
+}
+
+export const REPO_PATH = "docs/requirements.md";
+export const PASTE_MAX_CHARS = 500_000;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const OPEN_STAGES = new Set(["intake"]);
+
+function isoDate(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/** The requirements card. No spec text: only counts and the version, so it never trips the secret check. */
+export function requirementsCard(projectId: string, docVersion: number, a: Analysis): RequirementsCard {
+  const by = { must: 0, should: 0, could: 0 };
+  for (const r of a.requirements) by[r.priority] += 1;
+  const proposed = a.requirements.filter((r) => r.proposed).length;
+  const lines = [
+    `${a.requirements.length} requirements (${by.must} must, ${by.should} should, ${by.could} could), ${a.milestones.length} milestones, ${a.openQuestions.length} open questions.`,
+    proposed > 0 ? `${proposed} requirements were proposed by the model from spec text; check them before approving.` : null,
+    `Approving accepts ${REPO_PATH} version ${docVersion} as the plan the build follows. Rejecting keeps it as a draft for a revised spec.`,
+  ].filter((l): l is string => l !== null);
+  return {
+    gate: "requirements",
+    action: "requirements.approve",
+    target: `project ${projectId} ${REPO_PATH} v${docVersion}`,
+    reason: lines.join("\n"),
+    projectId,
+  };
+}
+
+export class RequirementsPipeline {
+  private readonly now: () => Date;
+  private readonly ingest: (bytes: Uint8Array, name: string) => Promise<IngestResult>;
+  constructor(private readonly ports: PipelinePorts) {
+    this.now = ports.now ?? (() => new Date());
+    this.ingest = ports.ingest ?? ((b, n) => defaultIngest(b, n));
+  }
+
+  async submitSpec(projectId: string, input: SpecInput): Promise<SubmitResult> {
+    if (typeof projectId !== "string" || !UUID.test(projectId)) throw new PipelineError("invalid-input");
+    const project = await this.ports.store.project(projectId);
+    if (!project) throw new PipelineError("project-not-found", 404);
+    if (!OPEN_STAGES.has(project.stage)) throw new PipelineError("project-not-in-intake", 409);
+    // Cheap pre-check; saveAnalysis re-checks under the project lock.
+    const prior = await this.ports.store.latestDoc(projectId);
+    if (prior?.status === "approved") throw new PipelineError("requirements-already-approved", 409);
+
+    let bytes: Uint8Array;
+    let name: string;
+    let sourceFormat: SpecSourceFormat;
+    if (input?.kind === "file" && input.bytes instanceof Uint8Array && typeof input.originalName === "string") {
+      bytes = input.bytes;
+      name = input.originalName;
+      sourceFormat = "md"; // replaced by the sniffed format below
+    } else if (input?.kind === "paste" && typeof input.text === "string") {
+      if (input.text.trim().length === 0) throw new PipelineError("empty-spec");
+      if (input.text.length > PASTE_MAX_CHARS) throw new PipelineError("spec-too-large", 413);
+      bytes = new TextEncoder().encode(input.text);
+      name = "pasted-spec.md";
+      sourceFormat = "paste";
+    } else {
+      throw new PipelineError("invalid-input");
+    }
+
+    let ingested: IngestResult;
+    try {
+      ingested = await this.ingest(bytes, name);
+    } catch (e) {
+      if (e instanceof IngestError) throw new PipelineError(e.code, e.code === "too-large" || e.code === "text-too-long" ? 413 : 400);
+      throw e;
+    }
+    if (sourceFormat !== "paste") sourceFormat = ingested.format;
+
+    const warnings: PipelineWarningCode[] = [];
+    let analysis = analyzeSpec(ingested.blocks);
+    if (this.ports.runner) {
+      try {
+        analysis = (await assistAnalysis(ingested.blocks, analysis, this.ports.runner)).analysis;
+      } catch {
+        // assistAnalysis reports model failures itself; anything thrown here is a bug or a cap stop. The
+        // deterministic analysis still stands (it never invents a requirement).
+        warnings.push("assist-failed");
+      }
+    }
+
+    const ordinals = new Map(analysis.milestones.map((m) => [m.name, m.ordinal]));
+    const saved = await this.ports.store.saveAnalysis({
+      projectId,
+      spec: {
+        sourceFormat,
+        originalName: sourceFormat === "paste" ? null : ingested.specRow.originalName,
+        fileSha256: ingested.sha256,
+        text: ingested.text,
+      },
+      requirements: analysis.requirements.map((r) => ({
+        key: r.key,
+        title: r.title,
+        priority: r.priority,
+        acceptance: r.acceptance.join("\n"),
+        milestoneOrdinal: r.milestone === null ? null : (ordinals.get(r.milestone) ?? null),
+      })),
+      milestones: analysis.milestones.map((m) => ({ ordinal: m.ordinal, name: m.name, gateName: `G${m.ordinal}` })),
+      repoPath: REPO_PATH,
+    });
+
+    const at = this.now();
+    const markdown = renderRequirementsMd(analysis, {
+      projectName: project.name,
+      specVersion: saved.specVersion,
+      specSha256: ingested.sha256,
+      date: isoDate(at),
+    });
+    const meta = { projectId, specVersion: saved.specVersion };
+    const plan = planQuestions(analysis, meta);
+    const architectLog = renderArchitectLog(plan, { ...meta, generatedAt: isoDate(at) });
+
+    const approvalId = await this.ensureCardFor(saved.docId, projectId, saved.docVersion, analysis, warnings);
+    // Question cards never wait on the requirements card, and one failure never stops the others (DV-FR-012).
+    const questionCards = await raiseQuestionCards(plan, this.ports.raiseQuestionCard);
+
+    return {
+      specId: saved.specId,
+      specVersion: saved.specVersion,
+      docId: saved.docId,
+      docVersion: saved.docVersion,
+      approvalId,
+      markdown,
+      architectLog,
+      counts: {
+        requirements: analysis.requirements.length,
+        milestones: analysis.milestones.length,
+        openQuestions: analysis.openQuestions.length,
+        proposed: analysis.requirements.filter((r) => r.proposed).length,
+      },
+      questionCards,
+      droppedKeys: saved.droppedKeys,
+      droppedMilestones: saved.droppedMilestones,
+      analysisWarnings: analysis.warnings,
+      warnings,
+    };
+  }
+
+  private async ensureCardFor(
+    docId: string,
+    projectId: string,
+    docVersion: number,
+    analysis: Analysis,
+    warnings: PipelineWarningCode[],
+  ): Promise<string | null> {
+    let id: string;
+    try {
+      ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis)));
+    } catch {
+      // The doc stays a draft with no card and the result says so; submitting the spec again raises a fresh one.
+      warnings.push("card-failed");
+      return null;
+    }
+    if (!(await this.ports.store.linkApproval(docId, id))) {
+      warnings.push("card-link-failed");
+      return null;
+    }
+    return id;
+  }
+
+  /**
+   * Called after M2.3 decides a card. Only a `requirements` card linked to the project's NEWEST doc changes
+   * anything: approved → the doc is approved (KK approves once). A rejected or expired card, or a card for a
+   * superseded version, leaves the docs as they are.
+   */
+  async applyDecision(card: { id: string; gate: string; status: string }): Promise<"approved" | "ignored"> {
+    if (card.gate !== "requirements" || card.status !== "approved") return "ignored";
+    const doc = await this.ports.store.docForApproval(card.id);
+    if (!doc || doc.status !== "draft") return "ignored";
+    const latest = await this.ports.store.latestDoc(doc.projectId);
+    if (!latest || latest.id !== doc.id) return "ignored";
+    return (await this.ports.store.setDocStatus(doc.id, "draft", "approved")) ? "approved" : "ignored";
+  }
+}
