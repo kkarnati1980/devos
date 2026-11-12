@@ -138,6 +138,25 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
+  /**
+   * M2.2-d3c1: projects whose newest doc is a draft linked to a card, oldest draft first, at most `limit` (the sync
+   * job's batch). Read-only; the job applies each decision through `syncApproval`.
+   */
+  draftsAwaitingDecision(limit: number): Promise<string[]> {
+    const n = Math.max(1, Math.min(1000, Math.trunc(limit)));
+    return this.tx(async (tx) => {
+      const rows: { project_id: string }[] = await tx.$queryRaw`
+        SELECT d.project_id::text AS project_id FROM (
+          SELECT DISTINCT ON (project_id) project_id, status, approval_id, created_at
+          FROM requirements_doc ORDER BY project_id, version DESC
+        ) d
+        WHERE d.status = 'draft' AND d.approval_id IS NOT NULL
+        ORDER BY d.created_at, d.project_id
+        LIMIT ${n}`;
+      return rows.map((r) => r.project_id);
+    });
+  }
+
   docForApproval(approvalId: string): Promise<DocRow | null> {
     return this.tx(async (tx) => {
       const r = await tx.requirementsDoc.findFirst({ where: { approvalId }, orderBy: { version: "desc" }, select: DOC_SELECT });

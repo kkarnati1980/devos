@@ -2,7 +2,7 @@
 // Secrets are read by name only and never logged.
 import { PolicyEngine, PrismaPolicyStore, type PrismaLike } from "@devos/policy";
 import type { KkSessionRegistry } from "./auth.js";
-import { withTimeout } from "./http.js";
+import { stdoutSink, withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore, writeAudit } from "./settings.js";
 import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
@@ -14,6 +14,7 @@ import { parseSmtpConfig } from "./smtp.js";
 import { RequirementsPipeline } from "@devos/analyst";
 import { PrismaRequirementsStore } from "./requirements-store.js";
 import type { RequirementsServices } from "./requirements.js";
+import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -62,6 +63,8 @@ export interface Runtime {
   approvals: ApprovalRouteServices;
   /** M2.2-d3a: spec intake needs the database and the approvals core (its cards). */
   requirements: RequirementsServices;
+  /** M2.2-d3c1: the periodic `syncApproval` job, present only when spec intake is wired; main.ts starts it. */
+  requirementsSync: RequirementsSyncJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -97,7 +100,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -143,8 +146,10 @@ export async function buildRuntime(
     grantsFor: (approvalId) => grantsForApproval(db, approvalId, t),
     revokeGrant: (session, grantId) => engine.revokeGrant(session as Parameters<PolicyEngine["revokeGrant"]>[0], grantId),
   };
-  const requirements = requirementsServices(new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS)), approvalsCore, approvalStore);
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements };
+  const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore);
+  const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
 }
 
 /**
@@ -156,12 +161,13 @@ export async function buildRuntime(
 export function requirementsServices(
   store: NonNullable<RequirementsServices["store"]>,
   approvals: Pick<Approvals, "raiseCard">,
-  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> },
+  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister,
 ): RequirementsServices {
   const pipeline = new RequirementsPipeline({
     store,
     raiseRequirementsCard: async (card) => ({ id: (await approvals.raiseCard(card)).id }),
-    raiseQuestionCard: async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }),
+    // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
+    raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
     runner: null,
   });
   return { pipeline, store, cards: { get: (id) => cards.get(id) } };

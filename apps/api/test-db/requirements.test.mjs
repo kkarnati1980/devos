@@ -148,3 +148,25 @@ test("AT-D4 concurrent submission and approval serialise on the project lock: ne
   await rejectsCode(store.saveAnalysis({ projectId: late.id, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "project-not-in-intake");
   await rejectsCode(store.saveAnalysis({ projectId: "00000000-0000-4000-8000-000000000000", expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "project-not-found");
 });
+
+test("AT-S4 draftsAwaitingDecision: only projects whose newest doc is a linked draft, oldest first, bounded", async () => {
+  const store = new PrismaRequirementsStore(db, 30_000);
+  const p = pipeline(store);
+  const linked1 = await project();
+  const approvedP = await project();
+  const linked2 = await project();
+  const unlinkedNewest = await project();
+  await p.submitSpec(linked1.id, { kind: "paste", text: SPEC });
+  const ra = await p.submitSpec(approvedP.id, { kind: "paste", text: SPEC });
+  await store.approveDoc(ra.docId);
+  await p.submitSpec(linked2.id, { kind: "paste", text: SPEC });
+  await p.submitSpec(unlinkedNewest.id, { kind: "paste", text: SPEC });
+  // A newer version whose card could not be linked hides the older linked draft.
+  await db.requirementsDoc.updateMany({ where: { projectId: unlinkedNewest.id }, data: { status: "superseded" } });
+  await db.requirementsDoc.create({ data: { projectId: unlinkedNewest.id, version: 99, repoPath: "docs/requirements.md", status: "draft" } });
+
+  const all = await store.draftsAwaitingDecision(1000);
+  const mine = all.filter((id) => [linked1.id, approvedP.id, linked2.id, unlinkedNewest.id].includes(id));
+  assert.deepEqual(mine, [linked1.id, linked2.id]);
+  assert.ok((await store.draftsAwaitingDecision(1)).length <= 1);
+});
