@@ -116,7 +116,7 @@ export function workflowShape(src) {
     if (t.startsWith("- ") && (itemIndent < 0 || ind === itemIndent)) { itemIndent = ind; step = { id: null, body: [] }; jobs[job].push(step); }
     if (step && !/^-?\s*name\s*:/.test(t)) step.body.push(t.replace(/^-\s+/, ""));
     const m = /^-?\s*(name|uses|run)\s*:\s*(.*)$/.exec(t);
-    if (step && m && (step.key !== "name")) { if (m[1] === "name" || !step.id) { step.id = `${m[1]}:${m[2].replace(/^["']|["']$/g, "").trim()}`; step.key = m[1]; } }
+    if (step && m && (step.key !== "name")) { if (m[1] === "name" || !step.id) { step.id = `${m[1]}:${m[2].replace(/^["']|["']$/g, "").trim().replace(m[1] === "uses" ? /@[^@\s]*$/ : /$^/, "")}`; step.key = m[1]; } }
   }
   return {
     jobs: Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.map((s) => s.id || "?")])),
@@ -162,10 +162,11 @@ export function analyse(files, show) {
     if (f.binary) { if (code || test || oldTest || /^packages\/policy\//.test(p)) hit("binary-code-change", p, 0, `${p} changed as binary`); continue; }
 
     if (test) {
+      const removedTrim = new Set(f.removed.map((r) => r.text.trim()));
       f.added.forEach((a, i) => {
         if (RX.skip.some((r) => r.test(a.text))) hit("test-skipped", p, a.ln, a.text);
         else if (RX.envIf.test(a.text) && /^\s*return\b/.test(f.added[i + 1]?.text ?? "") && f.added[i + 1].ln === a.ln + 1) hit("test-skipped", p, a.ln, a.text);
-        if (RX.trivial.test(a.text)) hit("trivial-assertion", p, a.ln, a.text);
+        if (RX.trivial.test(a.text) && !removedTrim.delete(a.text.trim())) hit("trivial-assertion", p, a.ln, a.text);
       });
       const count = (ls) => ls.reduce((n, l) => n + [...l.text.matchAll(RX.assert)].length, 0);
       const lost = count(f.removed) - count(f.added);
@@ -198,7 +199,7 @@ export function analyse(files, show) {
         for (const t of b.on) if (!h.on.includes(t)) hit("ci-trigger-removed", p, 0, `trigger ${t} removed`);
         const left = [...h.onLines];
         for (const l of b.onLines) { const i = left.indexOf(l); if (i >= 0) left.splice(i, 1); else hit("ci-trigger-narrowed", p, 0, `trigger line "${l}" changed or removed`); }
-        for (const l of h.onLines) if (/^(paths|paths-ignore|branches-ignore|tags-ignore)\s*:/.test(l) && !b.onLines.includes(l)) hit("ci-trigger-narrowed", p, 0, `trigger filter "${l}" added`);
+        for (const l of left) if (/^(types|branches|tags|paths|paths-ignore|branches-ignore|tags-ignore)\s*:/.test(l)) hit("ci-trigger-narrowed", p, 0, `trigger filter "${l}" added`);
       }
     }
 
@@ -210,7 +211,7 @@ export function analyse(files, show) {
       const was = numbers(f.removed, cov), now = numbers(f.added, cov);
       for (const n of now) { const o = was.find((w) => w.key === n.key); if (o && n.v < o.v) hit("coverage-lowered", p, n.l.ln, n.l.text); }
       for (const o of was) if (!now.some((n) => n.key === o.key)) hit("coverage-lowered", p, o.l.ln, `removed: ${o.l.text}`);
-      for (const a of f.added) if (/\b(exclude|testPathIgnorePatterns|testIgnore|modulePathIgnorePatterns|coveragePathIgnorePatterns)\b\s*[:=]/.test(a.text) && !WORKFLOW.test(p)) hit("tests-excluded", p, a.ln, a.text);
+      for (const a of f.added) if (/\b(exclude|testPathIgnorePatterns|testIgnore|modulePathIgnorePatterns|coveragePathIgnorePatterns)\b["']?\s*[:=]/.test(a.text) && !WORKFLOW.test(p)) hit("tests-excluded", p, a.ln, a.text);
       const retry = /(?<![\w-])(retries|retry|maxRetries)["']?\s*[:=\s]\s*(\d+)/g;
       const rw = numbers(f.removed, retry), rn = numbers(f.added, retry);
       for (const n of rn) { const o = rw.find((w) => w.key === n.key); if ((o && n.v > o.v) || (!o && n.v > 0 && !WORKFLOW.test(p))) hit("retries-raised", p, n.l.ln, n.l.text); }
@@ -226,7 +227,7 @@ export function analyse(files, show) {
       const was = scripts(f.removed), now = scripts(f.added);
       for (const [k, v] of was) if (now.get(k) !== v) hit("test-script-changed", p, 0, `script "${k}": "${v}" -> ${now.has(k) ? `"${now.get(k)}"` : "removed"}`);
     }
-    if (LINT_CONFIG.test(p)) for (const a of f.added) if (/["'][@\w/-]+["']\s*:\s*\[?\s*(["']off["']|0\s*[,\]}]|0\s*$)/.test(a.text) || /\bignores?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
+    if (LINT_CONFIG.test(p)) for (const a of f.added) if (/[@\w/-]+["']?\s*:\s*\[?\s*(["'](off|warn)["']|[01]\s*[,\]}]|[01]\s*$)/.test(a.text) || /\bignores?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
 
     // stubs in non-test source
     if (code && !test && !WORKFLOW.test(p) && !p.endsWith(".json") && !p.startsWith("docs/")) {

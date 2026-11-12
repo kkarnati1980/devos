@@ -19,18 +19,18 @@
 |---|---|
 | `test-file-deleted` | a test file (`*.test.*`, `*.spec.*`, or a JS/TS file under `test/`, `tests/`, `__tests__/`, `test-db/`, `e2e/`) deleted, or renamed to a non-test path |
 | `test-skipped` | an added line in a test file with `.skip(`, `.only(`, `.todo(`, `.fixme(`, `xit(`, `xdescribe(`, `xtest(`, `fit(`, `fdescribe(`, `skipIf(`, `runIf(`, a `skip:`/`todo:`/`only:` option (inline or on its own line), or an early `return` guarded by an env/platform/CI/skip condition (one line, or an `if (…) {` line followed by `return`) |
-| `trivial-assertion` | an added `expect(true|false|1|0|null|undefined|"")`, `assert(true)`/`assert.ok(true)`, or `assert.equal(<same literal>, <same literal>)` in a test file (an assertion swapped for one that cannot fail) |
+| `trivial-assertion` | a net-new (not merely moved) `expect(true|false|1|0|null|undefined|"")`, `assert(true)`/`assert.ok(true)`, or `assert.equal(<same literal>, <same literal>)` in a test file (an assertion swapped for one that cannot fail) |
 | `assertions-lost` | net loss of `expect(`/`assert…(` calls across a changed test file's removed vs added lines |
 | `coverage-lowered` | a coverage key (`lines`, `branches`, `functions`, `statements`, `threshold`, `perFile`) lowered, or removed without replacement, in a test config, test file or workflow |
 | `tests-excluded` | an added `exclude`, `testPathIgnorePatterns`, `testIgnore`, `modulePathIgnorePatterns` or `coveragePathIgnorePatterns` in a test config or test file |
 | `test-script-changed` | a `test`, `lint`, `typecheck` or `check` script (or `test:…` etc.) in a `package.json` changed or removed |
-| `lint-rule-off` | an added rule set to `"off"`/`0`, or an added `ignores`, in an ESLint config |
+| `lint-rule-off` | an added rule set to `"off"`/`0` or downgraded to `"warn"`/`1` (quoted or unquoted key), or an added `ignores`, in an ESLint config |
 | `max-warnings-raised` | `--max-warnings N` raised, set negative (unlimited), or removed, in a test config or workflow |
 | `timeout-past-ceiling` | an added `timeout-minutes` above **30** in a workflow, or a `testTimeout`/`hookTimeout`/`timeout` above **120 000 ms** in a test file or test config (the documented ceilings, `CEILINGS`) |
 | `retries-raised` | `retries`/`retry`/`maxRetries` raised in a test config, test file or workflow, or a new non-zero one in a test config/test file (`--health-retries` is excluded) |
 | `suppression-added` | an added `eslint-disable`, `@ts-ignore`, `@ts-expect-error`, `@ts-nocheck`, `istanbul ignore`, `c8 ignore`, `nosec`, `gitleaks:allow` in a code/config file |
 | `gitleaksignore-added` | any added non-comment line in `.gitleaksignore` |
-| `ci-workflow-deleted`, `ci-job-removed`, `ci-step-removed`, `ci-step-changed`, `ci-trigger-removed`, `ci-trigger-narrowed` | a workflow file deleted or moved away; a job, or a step (identified by `name`, else `uses`, else `run`) missing from the head; a kept step whose other lines (`run`, `uses`, `with`, `env`, `if` …) changed; an `on:` trigger dropped; an `on:` line changed or removed, or a `paths`/`paths-ignore`/`branches-ignore`/`tags-ignore` filter added (a required check that stops reporting) |
+| `ci-workflow-deleted`, `ci-job-removed`, `ci-step-removed`, `ci-step-changed`, `ci-trigger-removed`, `ci-trigger-narrowed` | a workflow file deleted or moved away; a job, or a step (identified by `name`, else `uses`, else `run`) missing from the head; a kept step whose other lines (`run`, `uses`, `with`, `env`, `if` …) changed; an `on:` trigger dropped; an `on:` line changed or removed, or a `types`/`branches`/`tags`/`paths`/`paths-ignore`/`branches-ignore`/`tags-ignore` filter line added (a required check that stops reporting). Any edit to a trigger line, widening included, therefore needs a Keep. Unnamed steps are keyed by `uses` without its `@version`, so an action bump shows as `ci-step-changed` |
 | `ci-continue-on-error`, `ci-disabled` | an added `continue-on-error: true` (or an expression); an added `if: false` |
 | `failure-swallowed` | an added `|| true`, `|| :`, `set +e` or `|| exit 0` in a workflow or `package.json`, or in a shell script on a line that runs a test/check tool |
 | `stub-marker` | an added `TODO`, `FIXME` or `not implemented` in non-test source (every DevOS PR is one module or task, so every PR claims a task done) |
@@ -55,6 +55,9 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 - **Keep:** `applyDispositions(report, verdict)` accepts a hit only when the verdict is from Codex (`source: "codex"`), is for the same SHA as the report, and has a line `FLOOR-GUARD KEEP <id> <file>:<line> <reason>` naming that hit. A Builder's note never counts; a new commit (new SHA) voids every Keep; an exit-2 report cannot be disposed of.
 - **Escalate to KK:** only for money, data deletion, security scanning, legal, D11 or D13 hits; the card goes out under the normal HARD RULE.
 - **Split (size check):** reading the Codex verdict for a SHA and letting the merge path accept a failing `floor-guard` check with valid Keeps is wiring, not detection, and belongs with the Release merge path (DEVOS-143). It is filed as **GI-1b** (follow-up), together with the guard-path refusal above. Until it lands, a hit blocks the runner's merge outright: the runner restores the weakening or obtains a Codex Keep and records it in the PR's merge evidence.
+
+## Follow-ups (pre-review round 2, filed as GI-1c)
+- `pre`/`post` hooks of test scripts in `package.json`; a ternary skip such as `(cond ? it : it.skip)`; `tsconfig` `strict` relaxed; paths containing ` b/`; the `binary-code-change` rule is defence in depth only (with `--text` git never reports a binary file).
 
 ## Not in scope
 - Making `floor-guard` a required check in the `main` ruleset (DEVOS-145, GI-3b) and adding it to `required-checks.json` (DEVOS-143).

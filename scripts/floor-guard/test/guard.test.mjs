@@ -92,6 +92,11 @@ const VIOLATIONS = [
   ["ci-step-changed", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm test", "run: echo ok")) }],
   ["ci-trigger-narrowed (paths filter)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    paths: ['docs/**']\n") }],
   ["ci-trigger-narrowed (branches)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [nope]\n") }],
+  ["ci-trigger-narrowed (types added)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    types: [closed]\n") }],
+  ["tests-excluded (quoted jest key in package.json)", { "packages/x/package.json": '{ "jest": {\n} }\n' }, { "packages/x/package.json": '{ "jest": {\n  "testPathIgnorePatterns": ["slow"]\n} }\n' }],
+  ["lint-rule-off (unquoted key)", { "packages/x/eslint.config.mjs": "export default [{ rules: {} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'off',\n} }];\n" }],
+  ["lint-rule-off (error to warn)", { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'error',\n} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'warn',\n} }];\n" }],
+  ["ci-step-changed (action version bump of an unnamed step)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("checkout@v4", "checkout@v5")) }],
   ["gitattributes-changed", { "packages/x/src/a.ts": "export const a = 1;\n" }, { ".gitattributes": "*.ts binary\n", "packages/x/src/a.ts": "export const a = 2;\n" }],
   ["contract-weakened (Green section)", { "docs/modules/M9.md": "# M9\n## Green\n- GC1: x exits 1\n" }, { "docs/modules/M9.md": "# M9\n## Green\n- GC1: x runs\n" }],
   ["contract-weakened (moved out of docs/modules)", { "docs/modules/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n" }, { "docs/modules/M9.md": null, "docs/old/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n" }],
@@ -131,6 +136,11 @@ test("exit 0: a non-env early return in a test helper, and || true on a non-test
   assert.deepEqual(r.hits, []);
 });
 
+test("exit 0: a trivial assertion only moved or re-indented is not new", () => {
+  const r = check({ [T]: testSrc("expect(f()).toBe(3);\n  expect(null).toBe(g());") }, { [T]: testSrc("expect(null).toBe(g());\nexpect(f()).toBe(3);") });
+  assert.deepEqual(r.hits, []);
+});
+
 test("exit 2: an unknown head ref (could not run) is never clean", () => {
   const r = run({ cwd: repo({}, {}), base: "main", head: "no-such-ref" });
   assert.equal(r.exit, 2); assert.match(r.error, /git rev-parse/);
@@ -166,7 +176,7 @@ test("dispositions: Keep only from a Codex verdict on the same SHA naming id and
 
 test("workflowShape reads jobs, step identities and triggers", () => {
   const s = workflowShape(wf(STEPS));
-  assert.deepEqual(s.jobs, { build: ["uses:actions/checkout@v4", "name:Lint", "name:Test"] });
+  assert.deepEqual(s.jobs, { build: ["uses:actions/checkout", "name:Lint", "name:Test"] });
   assert.ok(s.on.includes("pull_request") && s.on.includes("push"));
 });
 
