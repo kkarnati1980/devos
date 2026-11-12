@@ -34,7 +34,9 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
 
   // Only the newest detail request may fill the panel, so a slow earlier click never replaces the chosen card.
   const showSeq = useRef(0);
+  const chosen = useRef<string | null>(null); // the card KK picked last, even while its read is in flight
   const show = useCallback(async (id: string) => {
+    chosen.current = id;
     const mine = ++showSeq.current;
     const r = await api.approval(id);
     if (mine !== showSeq.current) return;
@@ -56,15 +58,16 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
     setBusy(true);
     const r = await run();
     setBusy(false);
-    if (!r.ok) {
-      fail(r.code ?? "unknown");
-      return false;
+    const ok = r.ok;
+    if (ok) {
+      setMsg(done);
+      window.dispatchEvent(new Event(APPROVALS_CHANGED_EVENT)); // the nav's pending count
     }
-    setMsg(done);
-    window.dispatchEvent(new Event(APPROVALS_CHANGED_EVENT)); // the nav's pending count
+    // Re-read after a failure too: a card decided elsewhere (card-not-pending) must stop offering Approve.
     await load();
-    if (open) await show(open.approval.id);
-    return true;
+    if (chosen.current) await show(chosen.current);
+    if (!ok) fail(r.code ?? "unknown");
+    return ok;
   }
 
   if (!rows) return msg ? <p className="panel" role="alert">{msg}</p> : <p className="muted">Loading…</p>;
@@ -116,7 +119,7 @@ function Detail({ d, busy, act, api }: {
         <dt>Status</dt><dd data-testid="detail-status">{c.status}{c.decidedBy ? ` by ${c.decidedBy}` : ""}</dd>
         {d.grant ? (
           <><dt>Grant</dt><dd data-testid="detail-grant">
-            {d.grant.scopeAction} on {d.grant.scopeResource} · {d.grant.uses}/{d.grant.maxUses} uses
+            {d.grant.scopeAction}{d.grant.scopeResource ? ` on ${d.grant.scopeResource}` : ""} · {d.grant.uses}/{d.grant.maxUses} uses
             {d.grant.expiresAt ? ` · until ${new Date(d.grant.expiresAt).toLocaleString()}` : ""}{d.grant.revoked ? " · revoked" : ""}
           </dd></>
         ) : null}
@@ -137,7 +140,7 @@ function Detail({ d, busy, act, api }: {
       ) : null}
       {pending ? (
         <form onSubmit={(e) => { e.preventDefault(); void act(() => api.reject(c.id, comment.trim() || undefined), "Rejected."); }}>
-          <label>Why (optional) <input value={comment} onChange={(e) => setComment(e.target.value)} data-testid="reject-comment" /></label>
+          <label>Why (optional) <input value={comment} maxLength={2000} onChange={(e) => setComment(e.target.value)} data-testid="reject-comment" /></label>
           <button type="submit" disabled={busy} data-testid="reject">Reject</button>
         </form>
       ) : null}
@@ -152,7 +155,7 @@ function CommentForm({ busy, onSend }: { busy: boolean; onSend: (body: string) =
   const [body, setBody] = useState("");
   return (
     <form onSubmit={(e) => { e.preventDefault(); if (body.trim()) void onSend(body.trim()).then((ok) => { if (ok) setBody(""); }); }}>
-      <label>Comment <textarea value={body} onChange={(e) => setBody(e.target.value)} data-testid="comment-body" /></label>
+      <label>Comment <textarea value={body} maxLength={2000} onChange={(e) => setBody(e.target.value)} data-testid="comment-body" /></label>
       <button type="submit" disabled={busy || !body.trim()} data-testid="comment-send">Add comment</button>
     </form>
   );
