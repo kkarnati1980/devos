@@ -176,7 +176,9 @@ test("AT3: unsafe Compose options are refused with compose_unsafe", () => {
 });
 
 test("AT2: invalid limit settings (0, negative, NaN) are refused rather than meaning unlimited", () => {
-  const bad = (patch) => ({ defaults: { live: { ...DEFAULT_LIMITS.defaults.live, ...patch }, preview: DEFAULT_LIMITS.defaults.preview }, caps: DEFAULT_LIMITS.caps });
+  // Every other setting is valid (spread from DEFAULT_LIMITS), so each case fails on its own patched value.
+  const bad = (patch) => ({ ...DEFAULT_LIMITS, defaults: { live: { ...DEFAULT_LIMITS.defaults.live, ...patch }, preview: DEFAULT_LIMITS.defaults.preview } });
+  assert.doesNotThrow(() => hardenCompose({ services: { app: { image: "a" } } }, "live", net, bad({})), "the unpatched settings are valid");
   for (const p of [{ cpus: 0 }, { memBytes: -1 }, { pids: NaN }, { cpus: Infinity }, { pids: 1.5 }]) {
     assert.throws(() => hardenCompose({ services: { app: { image: "a" } } }, "live", net, bad(p)), code("limits_missing"), JSON.stringify(p));
   }
@@ -267,4 +269,16 @@ test("AT9 (static): the built package imports no Node builtin that can reach the
       assert.ok(spec && spec.startsWith("./"), `${f} imports ${spec ?? "require()"}`);
     }
   }
+});
+
+test("S4-a1 pre-review: a YAML merge key at any depth is refused (labels, environment, deploy, top level)", () => {
+  const reserved = { "traefik.enable": "true", "coolify.managed": "true" };
+  const docs = [
+    { services: { app: { image: "a", labels: { "<<": reserved } } } },
+    { services: { app: { image: "a", labels: [{ "<<": reserved }] } } },
+    { services: { app: { image: "a", environment: { "<<": { A: "1" } } } } },
+    { services: { app: { image: "a", deploy: { resources: { "<<": { limits: { cpus: "64" } } } } } } },
+    { "<<": { services: {} }, services: { app: { image: "a" } } },
+  ];
+  for (const d of docs) assert.throws(() => hardenCompose(d, "live", net), code("compose_unsafe"), JSON.stringify(d).slice(0, 80));
 });

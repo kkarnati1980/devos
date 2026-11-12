@@ -234,6 +234,21 @@ function fillLimits(asked: Map<string, Asked>, d: Limits, budget: Limits, env: S
 }
 
 /**
+ * A literal `<<` key anywhere (e.g. `labels: {<<: *reserved}`) would be written back as a YAML merge and resolved by
+ * Docker Compose after validation, smuggling reserved labels or keys past every check. Refused at any depth
+ * (pre-review S4-a1, high). Depth is bounded so a cyclic or absurdly deep document cannot hang the walk.
+ */
+function refuseMergeKeys(v: unknown, where: string, depth: number): void {
+  if (depth > 64) throw unsafe(where, "is nested too deeply");
+  if (Array.isArray(v)) { v.forEach((x, i) => refuseMergeKeys(x, `${where}[${i}]`, depth + 1)); return; }
+  if (!isObj(v)) return;
+  for (const [k, x] of Object.entries(v)) {
+    if (k.startsWith("<<")) throw unsafe(where.slice(0, 80), "a YAML merge key (<<) is not allowed");
+    refuseMergeKeys(x, `${where}.${k.slice(0, 40)}`, depth + 1);
+  }
+}
+
+/**
  * Validates and rewrites a parsed Compose document for one stack. The input must be the parsed document with
  * YAML anchors and merge keys already resolved (a literal `<<` key is refused). Returns a new document (the input
  * is not changed). Throws IsolationError compose_unsafe / limits_missing; nothing is handed on after a throw.
@@ -241,6 +256,7 @@ function fillLimits(asked: Map<string, Asked>, d: Limits, budget: Limits, env: S
 export function hardenCompose(input: unknown, env: StackEnv, net: StackNetwork, settings: LimitSettings = DEFAULT_LIMITS): Obj {
   checkSettings(settings);
   if (!isObj(input)) throw unsafe("document", "the Compose document is not a mapping");
+  refuseMergeKeys(input, "document", 0);
   const doc: Obj = structuredClone(input);
   const volumes = checkTop(doc);
   const services = doc.services;
