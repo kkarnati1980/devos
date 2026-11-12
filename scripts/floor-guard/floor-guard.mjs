@@ -100,16 +100,23 @@ export function workflowShape(src) {
   const lines = src.split("\n");
   const indent = (s) => s.length - s.trimStart().length;
   const jobs = {};
-  const on = new Set(), onLines = [];
+  const on = new Set(), onLines = [], onStack = [];
   let jobsIndent = -1, jobIndent = -1, job = null, stepsIndent = -1, itemIndent = -1, step = null, onIndent = -1;
   for (const raw of lines) {
     if (!raw.trim() || raw.trimStart().startsWith("#")) continue;
     const ind = indent(raw), t = raw.trim();
     if (ind === 0) { jobsIndent = t === "jobs:" ? 0 : -1; onIndent = /^(on|"on"|'on'):/.test(t) ? 0 : -1; job = null; stepsIndent = -1;
-      if (onIndent === 0) onLines.push(t);
+      if (onIndent === 0) { onLines.push(t); onStack.length = 0; }
       const inline = /^(?:on|"on"|'on'):\s*(.+)$/.exec(t); if (inline) inline[1].replace(/[[\]]/g, "").split(",").forEach((x) => x.trim() && on.add(x.trim()));
       continue; }
-    if (onIndent === 0 && ind > 0) { onLines.push(t); const m = /^-?\s*([\w-]+)\s*:?/.exec(t); if (m && (jobIndent < 0 || ind <= 2)) on.add(m[1]); continue; }
+    if (onIndent === 0 && ind > 0) {
+      // keep each trigger line's parent keys, so moving a filter from one event to another is a change (PR70-r9)
+      while (onStack.length && onStack.at(-1).ind >= ind) onStack.pop();
+      onLines.push(onStack.map((k) => k.key + " > ").join("") + t);
+      const key = /^([\w-]+)\s*:/.exec(t); if (key) onStack.push({ ind, key: key[1] });
+      const m = /^-?\s*([\w-]+)\s*:?/.exec(t); if (m && (jobIndent < 0 || ind <= 2)) on.add(m[1]);
+      continue;
+    }
     if (jobsIndent !== 0) continue;
     if (jobIndent < 0) jobIndent = ind;
     if (ind === jobIndent) { const m = /^([\w-]+)\s*:/.exec(t); job = m ? m[1] : null; if (job) jobs[job] = []; stepsIndent = -1; continue; }
@@ -229,7 +236,7 @@ export function analyse(files, show) {
         for (const t of b.on) if (!h.on.includes(t)) hit("ci-trigger-removed", p, 0, `trigger ${t} removed`);
         const left = [...h.onLines];
         for (const l of b.onLines) { const i = left.indexOf(l); if (i >= 0) left.splice(i, 1); else hit("ci-trigger-narrowed", p, 0, `trigger line "${l}" changed or removed`); }
-        for (const l of left) if (/^(types|branches|tags|paths|paths-ignore|branches-ignore|tags-ignore)\s*:/.test(l)) hit("ci-trigger-narrowed", p, 0, `trigger filter "${l}" added`);
+        for (const l of left) if (/^(types|branches|tags|paths|paths-ignore|branches-ignore|tags-ignore)\s*:/.test(l.split(" > ").at(-1))) hit("ci-trigger-narrowed", p, 0, `trigger filter "${l}" added`);
       }
     }
 

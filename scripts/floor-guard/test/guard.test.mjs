@@ -93,6 +93,8 @@ const VIOLATIONS = [
   ["ci-trigger-narrowed (paths filter)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    paths: ['docs/**']\n") }],
   ["ci-trigger-narrowed (branches)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [nope]\n") }],
   ["ci-trigger-narrowed (types added)", { [WF]: wf(STEPS) }, { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    types: [closed]\n") }],
+  // PR70-r9: the same filter line moved from push to an unrestricted pull_request narrows PR runs
+  ["ci-trigger-narrowed (filter moved between events)", { [WF]: wf(STEPS).replace("  pull_request:\n    branches: [main]\n", "  pull_request:\n") }, { [WF]: wf(STEPS).replace("  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n", "  push:\n  pull_request:\n    branches: [main]\n") }],
   ["tests-excluded (quoted jest key in package.json)", { "packages/x/package.json": '{ "jest": {\n} }\n' }, { "packages/x/package.json": '{ "jest": {\n  "testPathIgnorePatterns": ["slow"]\n} }\n' }],
   ["lint-rule-off (unquoted key)", { "packages/x/eslint.config.mjs": "export default [{ rules: {} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'off',\n} }];\n" }],
   ["lint-rule-off (error to warn)", { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'error',\n} }];\n" }, { "packages/x/eslint.config.mjs": "export default [{ rules: {\n  eqeqeq: 'warn',\n} }];\n" }],
