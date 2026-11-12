@@ -21,7 +21,8 @@ export interface LinearApi {
   createLabel(teamId: string, name: string): Promise<string>;
   findProject(teamId: string, devosProjectId: string): Promise<{ id: string; name: string; description: string } | null>;
   createProject(input: { teamId: string; name: string; description: string }): Promise<string>;
-  projectExists(id: string): Promise<boolean>;
+  /** The project by id, or null when it no longer exists. */
+  project(id: string): Promise<{ id: string; name: string; description: string | null } | null>;
   updateProject(id: string, input: { name?: string; description?: string }): Promise<void>;
   milestones(projectId: string): Promise<{ id: string; name: string; description: string | null }[]>;
   createMilestone(input: { projectId: string; name: string; description: string; sortOrder: number }): Promise<string>;

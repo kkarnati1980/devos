@@ -51,12 +51,17 @@ export async function syncProject(plan: DevosPlan, api: LinearApi, store: SyncSt
   // Linear's project description is a short summary field: keep it fixed and short (no project name), ~60 chars.
   const projDesc = withMarker("Mirrored by DevOS.", "project", plan.project.id);
   let projectId = plan.project.linearProjectId;
-  if (projectId && !(await api.projectExists(projectId))) { r.log.push("stored Linear project id not found; searching by marker"); projectId = null; }
+  let curProject: { name: string; description: string | null } | null = projectId ? await api.project(projectId) : null;
+  if (projectId && !curProject) { r.log.push("stored Linear project id not found; searching by marker"); projectId = null; }
   if (!projectId) {
     const found = await api.findProject(team.id, plan.project.id);
-    if (found) { projectId = found.id; r.log.push("project adopted by marker"); }
+    if (found) { projectId = found.id; curProject = found; r.log.push("project adopted by marker"); }
     else { projectId = await api.createProject({ teamId: team.id, name: plan.project.name, description: projDesc }); r.writes++; r.created.push("project"); }
     await store.setProjectId(plan.project.id, projectId);
+  }
+  // Codex PR35-r1: DevOS owns the project's name and summary; a rename (or a hand edit in Linear) is synced back.
+  if (curProject && (curProject.name !== plan.project.name || !sameText(curProject.description, projDesc))) {
+    await api.updateProject(projectId, { name: plan.project.name, description: projDesc }); r.writes++; r.updated.push("project");
   }
 
   // Milestones.

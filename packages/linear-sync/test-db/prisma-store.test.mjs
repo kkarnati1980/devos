@@ -53,14 +53,26 @@ test("AT3 on Postgres: an id lost before it was saved is adopted by marker; no d
 });
 
 test("two concurrent locked syncs of one project: one runs, the other is skipped; one Linear project", async () => {
-  const { syncProjectLocked } = await import("../dist/index.js");
+  const { syncProjectLocked, fencedApi } = await import("../dist/index.js");
   const pid = await seed(); const L = fakeLinear();
   let release; const gate = new Promise((r) => { release = r; });
-  const first = syncProjectLocked(db, pid, async (plan, store) => { await gate; return syncProject(plan, L.api, store); });
+  const first = syncProjectLocked(db, pid, async (plan, store, guard) => { await gate; return syncProject(plan, fencedApi(L.api, guard), store); });
   await new Promise((r) => setTimeout(r, 300));
   const second = await syncProjectLocked(db, pid, (plan, store) => syncProject(plan, L.api, store));
   release();
   assert.deepEqual(await first, { skipped: false });
   assert.deepEqual(second, { skipped: true });
   assert.equal(L.projects.length, 1);
+});
+
+test("Codex PR35-r1: a sync whose lock is about to expire makes no Linear write", async () => {
+  const { syncProjectLocked, fencedApi, WRITE_MARGIN_MS } = await import("../dist/index.js");
+  const pid = await seed(); const L = fakeLinear();
+  let t = 1_000_000;
+  const timeout = WRITE_MARGIN_MS + 5_000;
+  await assert.rejects(syncProjectLocked(db, pid, async (plan, store, guard) => {
+    t += 10_000; // the reads took 10 s: fewer than WRITE_MARGIN_MS left
+    return syncProject(plan, fencedApi(L.api, guard), store);
+  }, timeout, () => t), /linear-sync-lock-expiring/);
+  assert.equal(L.projects.length, 0);
 });

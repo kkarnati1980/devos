@@ -16,7 +16,7 @@ export function fakeLinear({ failCreateIssueAfterWrite = null } = {}) {
     team: async () => ({ ...L.team, labels: [...L.team.labels] }),
     createLabel: async (_t, name) => { const l = { id: id("l"), name }; L.team.labels.push(l); w("createLabel", name); return l.id; },
     findProject: async (_t, pid) => L.projects.find((p) => p.description.includes(`devos-ref: project/${pid}`)) || null,
-    projectExists: async (pid) => L.projects.some((p) => p.id === pid),
+    project: async (pid) => L.projects.find((p) => p.id === pid) || null,
     createProject: async (i) => { const p = { id: id("p"), ...i }; L.projects.push(p); w("createProject", i); return p.id; },
     updateProject: async (pid, i) => { Object.assign(L.projects.find((p) => p.id === pid), i); w("updateProject", i); },
     milestones: async (pid) => L.milestones.filter((m) => m.projectId === pid).map(({ id, name, description }) => ({ id, name, description })),

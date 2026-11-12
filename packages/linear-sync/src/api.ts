@@ -61,10 +61,11 @@ export function graphqlApi(client: LinearClient): LinearApi {
         `mutation($i: ProjectCreateInput!) { projectCreate(input: $i) { success project { id } } }`, { i: { teamIds: [teamId], name, description } });
       return ok(d.projectCreate, "project create").project.id;
     },
-    async projectExists(id) {
+    async project(id) {
       // A filtered list answers "not found" with an empty list instead of an error, whatever status Linear uses.
-      const d = await client.query<{ projects: Conn<{ id: string }> }>(`query($id: ID!) { projects(filter: { id: { eq: $id } }, includeArchived: true) { nodes { id } } }`, { id });
-      return d.projects.nodes.some((p) => p.id === id);
+      const d = await client.query<{ projects: Conn<{ id: string; name: string; description: string | null }> }>(
+        `query($id: ID!) { projects(filter: { id: { eq: $id } }, includeArchived: true) { nodes { id name description } } }`, { id });
+      return d.projects.nodes.find((p) => p.id === id) ?? null;
     },
     async updateProject(id, input) {
       ok((await client.mutate<{ projectUpdate: { success: boolean } }>(

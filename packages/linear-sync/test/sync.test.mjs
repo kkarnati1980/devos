@@ -1,7 +1,7 @@
 // M2.6-a AT1–AT3: outbound sync against an in-memory Linear.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { syncProject } from "../dist/index.js";
+import { syncProject, fencedApi } from "../dist/index.js";
 import { fakeLinear, memoryStore } from "./fake-linear.mjs";
 
 const u = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
@@ -105,4 +105,27 @@ test("AT5 (sync level): a Linear failure during sync carries no key, and nothing
   // and a successful sync's log never holds descriptions or headers
   const L = fakeLinear(); const r = await syncProject(throwaway(), L.api, memoryStore(throwaway()));
   assert.ok(r.log.every((l) => !/devos-ref|Bearer|lin_api_/.test(l)));
+});
+
+test("Codex PR35-r1: renaming the DevOS project renames the Linear project on the next sync; unchanged makes no write", async () => {
+  const L = fakeLinear(); const plan = throwaway(); const store = memoryStore(plan);
+  await syncProject(plan, L.api, store);
+  plan.project.name = "Throwaway renamed";
+  const r = await syncProject(plan, L.api, store);
+  assert.equal(L.projects[0].name, "Throwaway renamed");
+  assert.deepEqual(r.updated, ["project"]);
+  assert.equal((await syncProject(plan, L.api, store)).writes, 0);
+  // An adopted project (found by marker) with an old name is renamed too.
+  const plan2 = throwaway(); plan2.project.name = "Adopted new name";
+  const r2 = await syncProject(plan2, L.api, memoryStore(plan2));
+  assert.equal(L.projects.length, 1); assert.equal(L.projects[0].name, "Adopted new name"); assert.ok(r2.updated.includes("project"));
+});
+
+test("Codex PR35-r1: fencedApi checks the lock guard before every Linear write and stops the sync when it fails", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  let checks = 0; let allow = 3;
+  const guard = async () => { checks++; if (allow-- <= 0) throw new Error("linear-sync-lock-expiring"); };
+  await assert.rejects(syncProject(plan, fencedApi(L.api, guard), memoryStore(plan)), /linear-sync-lock-expiring/);
+  assert.equal(checks, 4, "one check per write; the fourth refused");
+  assert.equal(L.writes.length, 3);
 });
