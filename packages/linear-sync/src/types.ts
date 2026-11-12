@@ -28,6 +28,8 @@ export interface LinearApi {
   createMilestone(input: { projectId: string; name: string; description: string; sortOrder: number }): Promise<string>;
   updateMilestone(id: string, input: { name?: string; description?: string }): Promise<void>;
   issues(projectId: string): Promise<LinearIssue[]>;
+  /** One issue by id, archived included, with its project; null when it no longer exists (DEVOS-132: moved issues). */
+  issueRef(id: string): Promise<{ id: string; projectId: string | null } | null>;
   createIssue(input: IssueInput): Promise<string>;
   updateIssue(id: string, input: Partial<IssueInput>): Promise<void>;
   addBlockedBy(issueId: string, blockerId: string): Promise<void>;
