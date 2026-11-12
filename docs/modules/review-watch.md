@@ -99,3 +99,18 @@ Run the existing Codex review automatically on every new PR head, so a review no
   - A future first-green time (the clock stepped back) is reset to now.
   - The runner and `publish` get `</dev/null`, so they can never read the candidate list.
   - Not changed: per-SHA state files, `.green` among them, are not pruned (as before).
+
+**v1.4.1 (12 Nov 2026, DEVOS-106, runner-b): no duplicate verdict comment.**
+- **Problem.** A comment POST that GitHub completes after our 30 s timeout used to be posted again on the next tick.
+- **Fix.** Before each comment POST, the watcher writes `watch/<sha>.comment-tried`. On a retry, when that marker exists, it first reads the PR's comments (all pages, bounded like every GitHub call). A comment that starts with the same first line (`### Codex review <label> — **<verdict>**`) and carries `- **Commit:** \`<sha>\`` counts as posted. The watcher then only sets the status. Normal ticks make no extra call.
+- **Tests:** AT20.
+  - A POST that GitHub stores but never answers leaves exactly one comment after the retry tick, and the PR is published.
+  - A tried comment with no copy on GitHub is posted once.
+  - `review-watch.test.mjs`: 10/10.
+- **Pre-review (2 medium, 2 low; all fixed):**
+  - **A failed comment read posts nothing.** It is now its own outcome (return code 2): the watcher logs it, skips the comment POST for that tick and still sets the status. So a slow GitHub can no longer cause a duplicate.
+  - **Only the watcher's own comment counts.** The comment must be authored by `REVIEW_BOT_LOGIN` (default `kkarnati1980`, the account whose token posts), so another user's forged copy cannot suppress the real verdict.
+  - **The query string is now `?per_page=100`**, replacing the no-op `sort=created`.
+  - **AT20 covers more cases:** a failed comment read, a forged comment by another login, and an own comment that belongs to a different SHA.
+- **Codex PR52-r2 (1 medium, accepted):** runner-failure reports ("could not run") had no commit line, so a retry could not recognise one that GitHub had stored. They now carry `- **Commit:** \`<sha>\`` like verdicts do, and the same duplicate check covers them. Test: a failure report whose POST timed out is not posted again (review-watch 11/11).
+- **Codex PR52-r5 (1 medium, accepted):** `gh_all` stops after 30 pages. A comment list that reaches 3,000 entries may be truncated, so it now counts as indeterminate (return 2): the POST waits instead of risking a duplicate. Test: every page full → no POST, nothing marked posted (review-watch 12/12).
