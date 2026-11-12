@@ -1,0 +1,125 @@
+// M2.2-d2 AT-D1…D4: the Postgres RequirementsStore behind the M2.2-d1 pipeline, against real Postgres with the
+// M1.1 constraints (one approved requirements doc per project) applied.
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { createDb } from "@devos/db";
+import { PipelineError, RequirementsPipeline } from "@devos/analyst";
+import { PrismaRequirementsStore } from "../dist/requirements-store.js";
+
+const url = process.env.DATABASE_URL;
+if (!url) throw new Error("DATABASE_URL is required for test:db");
+const db = createDb(url);
+after(() => db.$disconnect());
+
+const SPEC = `# Shop
+
+## Phase 1: Launch
+
+| ID | Requirement | Priority | Acceptance |
+|---|---|---|---|
+| FR-1 | Owner login | Must | Login works; Logout works |
+| FR-2 | Menu page | Should | Menu shows prices |
+
+## Phase 2: Payments
+
+- FR-3: Online payment
+
+## Open questions
+
+- Which payment provider should we pay for?
+`;
+
+async function project(stage = "intake") {
+  const slug = `m22d-${randomBytes(6).toString("hex")}`;
+  return db.project.create({ data: { slug, name: slug, stage } });
+}
+
+function pipeline(store) {
+  const card = (gate) => async (c) => {
+    const row = await db.approval.create({ data: { gate, action: c.action ?? c.card.action, target: c.target ?? c.card.target, reason: "test", projectId: c.projectId ?? c.card.projectId } });
+    return { id: row.id };
+  };
+  return new RequirementsPipeline({
+    store,
+    raiseRequirementsCard: card("requirements"),
+    raiseQuestionCard: (draft) => card("decision")(draft),
+  });
+}
+
+const rejectsCode = (p, code) => assert.rejects(p, (e) => e instanceof PipelineError && e.code === code);
+
+test("AT-D1 a submission writes spec, doc, requirement and milestone rows in one transaction, linked to its card", async () => {
+  const p = await project();
+  const store = new PrismaRequirementsStore(db, 5000);
+  const r = await pipeline(store).submitSpec(p.id, { kind: "paste", text: SPEC });
+  assert.equal(r.specVersion, 1);
+  const spec = await db.spec.findFirst({ where: { projectId: p.id } });
+  assert.equal(spec.sourceFormat, "paste");
+  assert.equal(spec.originalName, null);
+  const reqs = await db.requirement.findMany({ where: { projectId: p.id }, orderBy: { key: "asc" }, include: { milestone: true } });
+  assert.deepEqual(reqs.map((x) => [x.key, x.priority, x.milestone?.ordinal ?? null]), [["FR-1", "must", 1], ["FR-2", "should", 1], ["FR-3", "must", 2]]);
+  assert.equal(reqs[0].acceptance, "Login works\nLogout works");
+  const ms = await db.milestone.findMany({ where: { projectId: p.id }, orderBy: { ordinal: "asc" } });
+  assert.deepEqual(ms.map((m) => m.gateName), ["G1", "G2"]);
+  const doc = await db.requirementsDoc.findFirst({ where: { projectId: p.id } });
+  assert.deepEqual([doc.status, doc.approvalId, doc.repoPath], ["draft", r.approvalId, "docs/requirements.md"]);
+  assert.equal(await db.auditEvent.count({ where: { projectId: p.id, action: "requirements.analysed" } }), 1);
+});
+
+test("AT-D2 a second version supersedes the draft, upserts rows and keeps dropped ones", async () => {
+  const p = await project();
+  const store = new PrismaRequirementsStore(db, 5000);
+  const pl = pipeline(store);
+  await pl.submitSpec(p.id, { kind: "paste", text: SPEC });
+  const r2 = await pl.submitSpec(p.id, { kind: "paste", text: SPEC.replace("| FR-2 | Menu page | Should | Menu shows prices |\n", "").replace("Owner login", "Owner sign-in") });
+  assert.deepEqual([r2.specVersion, r2.docVersion], [2, 2]);
+  assert.deepEqual(r2.droppedKeys, ["FR-2"]);
+  const docs = await db.requirementsDoc.findMany({ where: { projectId: p.id }, orderBy: { version: "asc" } });
+  assert.deepEqual(docs.map((d) => d.status), ["superseded", "draft"]);
+  assert.equal(await db.requirement.count({ where: { projectId: p.id } }), 3, "FR-2 is kept");
+  assert.equal((await db.requirement.findFirst({ where: { projectId: p.id, key: "FR-1" } })).title, "Owner sign-in");
+});
+
+test("AT-D3 approval: only the newest draft, once; then the store refuses a new version and stores nothing", async () => {
+  const p = await project();
+  const store = new PrismaRequirementsStore(db, 5000);
+  const pl = pipeline(store);
+  const r1 = await pl.submitSpec(p.id, { kind: "paste", text: SPEC });
+  const r2 = await pl.submitSpec(p.id, { kind: "paste", text: SPEC });
+  assert.equal(await pl.applyDecision({ id: r1.approvalId, gate: "requirements", status: "approved" }), "ignored");
+  assert.equal(await store.approveDoc(r1.docId), false);
+  assert.equal(await pl.applyDecision({ id: r2.approvalId, gate: "requirements", status: "approved" }), "approved");
+  assert.equal(await pl.applyDecision({ id: r2.approvalId, gate: "requirements", status: "approved" }), "ignored");
+  assert.equal(await db.requirementsDoc.count({ where: { projectId: p.id, status: "approved" } }), 1);
+  assert.equal(await db.auditEvent.count({ where: { projectId: p.id, action: "requirements.approved" } }), 1);
+  const specs = await db.spec.count({ where: { projectId: p.id } });
+  await rejectsCode(store.saveAnalysis({ projectId: p.id, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "requirements-already-approved");
+  assert.equal(await db.spec.count({ where: { projectId: p.id } }), specs, "the refused save rolled back");
+});
+
+test("AT-D4 concurrent submission and approval serialise on the project lock: never two approved docs", async () => {
+  const p = await project();
+  const store = new PrismaRequirementsStore(db, 5000);
+  const pl = pipeline(store);
+  const r1 = await pl.submitSpec(p.id, { kind: "paste", text: SPEC });
+  const results = await Promise.allSettled([
+    pl.applyDecision({ id: r1.approvalId, gate: "requirements", status: "approved" }),
+    pl.submitSpec(p.id, { kind: "paste", text: SPEC }),
+  ]);
+  const approved = await db.requirementsDoc.findMany({ where: { projectId: p.id, status: "approved" } });
+  assert.ok(approved.length <= 1);
+  if (results[0].status === "fulfilled" && results[0].value === "approved") {
+    // Approval won: the submission was refused and stored nothing.
+    assert.equal(results[1].status, "rejected");
+    assert.equal(await db.spec.count({ where: { projectId: p.id } }), 1);
+  } else {
+    // Submission won: v1 is superseded and stays unapproved.
+    assert.equal(results[1].status, "fulfilled");
+    assert.equal(approved.length, 0);
+  }
+  // Stage re-check under the lock and unknown project.
+  const late = await project("building");
+  await rejectsCode(store.saveAnalysis({ projectId: late.id, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "project-not-in-intake");
+  await rejectsCode(store.saveAnalysis({ projectId: "00000000-0000-4000-8000-000000000000", expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "project-not-found");
+});
