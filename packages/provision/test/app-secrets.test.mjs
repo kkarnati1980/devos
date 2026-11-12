@@ -75,7 +75,7 @@ test("AT7/AT1 each stack gets every secret as a Coolify env var and a sealed vau
     const preview = app.name.endsWith("-preview");
     for (const n of APP_SECRET_NAMES) {
       const e = app.envs.find((x) => x.key === n);
-      assert.ok(e && e.is_preview === preview && e.is_literal === true, `${app.name} ${n}`);
+      assert.ok(e && e.is_preview === false && e.is_literal === true, `${app.name} ${n}: set for the normal deployment, not PR previews`);
       assert.equal(e.value, s.vault.rows.get(`${P.id}/${preview ? "preview" : "production"}/${n}`), "the vault holds the same value");
       assert.match(e.value, /^[A-Za-z0-9_-]{43}$/);
       values.push(e.value);
@@ -157,4 +157,27 @@ test("no application, no vault port, a policy deny or a lost lock → no env-var
   u.vault.put = async function (...a) { await put.apply(this, a); u.store.lockLost = true; };
   await assert.rejects(runProvision(P.id, u.all(), { store: u.store, authorize: allowAll }));
   assert.equal(envWrites(u.fake).length, 0, "the lock is checked after the vault write, before the env write");
+});
+
+test("pre-review: a key set only for PR previews (is_preview) does not count; the normal deployment gets its own", async () => {
+  const s = await withApps();
+  const app = [...s.fake.apps.values()].find((a) => a.name.endsWith("-preview"));
+  app.envs = APP_SECRET_NAMES.map((key) => ({ key, value: "pr-preview-only-value-xxxxxxxxxxxx", is_preview: true }));
+  for (const n of APP_SECRET_NAMES) await s.vault.put(P.id, `preview/${n}`, "x".repeat(43));
+  const out = await runProvision(P.id, s.all(), { store: s.store, authorize: allowAll });
+  assert.deepEqual(out.slice(-4).map((o) => o.outcome), ["created", "created", "created", "created"]);
+  for (const n of APP_SECRET_NAMES) assert.equal(app.envs.filter((e) => e.key === n && e.is_preview === false).length, 1);
+});
+
+test("pre-review: a lock lost during the env read writes neither the vault nor Coolify", async () => {
+  const s = await withApps();
+  const real = s.fake.fetchImpl;
+  const { CoolifyClient: C } = await import("../dist/index.js");
+  let gets = 0; // the vault is empty, so the lookup skips the env read: the 1st envs GET is inside create
+  const cf = new C({ origin: "http://coolify.test:8000", token: () => TOKEN, sleep: noSleep,
+    fetchImpl: async (url, init = {}) => { const r = await real(url, init); if (/\/envs$/.test(new URL(url).pathname) && (init.method ?? "GET") === "GET" && ++gets === 1) s.store.lockLost = true; return r; } });
+  const steps = [...s.steps(), ...appSecretSteps(cf, s.store, s.vault, P)];
+  await assert.rejects(runProvision(P.id, steps, { store: s.store, authorize: allowAll }));
+  assert.equal(s.vault.puts.length, 0);
+  assert.equal(envWrites(s.fake).length, 0);
 });

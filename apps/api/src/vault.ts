@@ -249,7 +249,11 @@ export class PrismaVaultStore implements VaultStore {
       return { row: fromRow(row), rotated: Boolean(prev) };
     });
   }
-  /** M2.4-c2b: the unique (project_id, name) index applies (project_id is not NULL), so a plain upsert is race-free. */
+  /**
+   * M2.4-c2b: the unique (project_id, name) index applies (project_id is not NULL), so the upsert is race-free. The
+   * `rotated` flag comes from a read before it, so two concurrent first puts may both audit "saved"; only the flag is
+   * imprecise, never the row (pre-review, accepted).
+   */
   async upsertProject(projectId: string, r: Omit<SealedSecret, "createdAt" | "updatedAt">, audit: (rotated: boolean) => AuditEntry) {
     return this.tx(async (tx: any) => {
       const prev = await tx.vaultSecret.findFirst({ where: { projectId, name: r.name }, select: { id: true } });

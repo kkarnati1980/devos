@@ -86,7 +86,8 @@ test("M2.4-c2b: project app secrets are one row per (project, name), rotated in 
   assert.ok(!JSON.stringify(ev).includes(v1) && !JSON.stringify(ev).includes(v2));
   // Two concurrent first puts leave one row (unique (project_id, name)).
   const n = "production/DB_PASSWORD";
-  await Promise.allSettled([vault.putProject(q.id, n, v1), vault.putProject(q.id, n, v2)]);
+  const both = await Promise.allSettled([vault.putProject(q.id, n, v1), vault.putProject(q.id, n, v2)]);
+  assert.deepEqual(both.map((r) => r.status), ["fulfilled", "fulfilled"], "the native upsert never fails on the race");
   assert.equal(await db.vaultSecret.count({ where: { projectId: q.id, name: n } }), 1);
   await db.vaultSecret.deleteMany({ where: { projectId: { in: [p.id, q.id] } } });
 });

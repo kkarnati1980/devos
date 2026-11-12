@@ -24,8 +24,12 @@ export interface ProjectSecrets {
   put(projectId: string, name: string, value: string): Promise<void>;
 }
 
-/** `GET /applications/{uuid}/envs`: the keys present, read as a list of `{key, is_preview}`; values are never kept. */
-export async function envKeys(cf: CoolifyClient, appUuid: string, preview: boolean): Promise<Set<string>> {
+/**
+ * `GET /applications/{uuid}/envs`: the keys of the application's normal deployment. Coolify's `is_preview` marks a
+ * variable for pull-request preview deployments, not our preview stack (each stack is its own application), so
+ * entries with `is_preview: true` are ignored (pre-review). Values are never kept.
+ */
+export async function envKeys(cf: CoolifyClient, appUuid: string): Promise<Set<string>> {
   if (!UUID_RE.test(appUuid)) throw new Error("coolify-uuid-invalid");
   const r = await cf.http.get<unknown[]>(`/api/v1/applications/${appUuid}/envs`);
   if (r.status !== 200 || !Array.isArray(r.body)) {
@@ -37,7 +41,7 @@ export async function envKeys(cf: CoolifyClient, appUuid: string, preview: boole
     if (!e || typeof e !== "object" || typeof e.key !== "string") {
       throw new ProviderError("coolify", "bad-response", "coolify envs list has a malformed entry", r.status);
     }
-    if (Boolean(e.is_preview) === preview) keys.add(e.key);
+    if (e.is_preview !== true) keys.add(e.key);
   }
   return keys;
 }
@@ -47,7 +51,6 @@ export function appSecretStep(cf: CoolifyClient, store: ProvisionStore, secrets:
   if (!secrets || typeof secrets.has !== "function" || typeof secrets.put !== "function") throw new Error("project-secrets-required");
   const vaultName = `${env}/${secret}`;
   const externalId = `${p.slug}/${env}/${secret}`;
-  const preview = env === "preview";
   const appUuid = async (): Promise<string> => {
     const s = await store.getStep(p.id, `coolify/application/${env}`);
     if (s?.status !== "done" || !s.externalId || !UUID_RE.test(s.externalId)) throw new Error("coolify-application-not-provisioned");
@@ -64,18 +67,21 @@ export function appSecretStep(cf: CoolifyClient, store: ProvisionStore, secrets:
     lookup: async () => {
       const uuid = await appUuid();
       const inVault = await secrets.has(p.id, vaultName);
-      return inVault && (await envKeys(cf, uuid, preview)).has(secret) ? { externalId, name: externalId, owned: true } : null;
+      return inVault && (await envKeys(cf, uuid)).has(secret) ? { externalId, name: externalId, owned: true } : null;
     },
     create: async () => {
       const uuid = await appUuid();
-      const present = (await envKeys(cf, uuid, preview)).has(secret);
+      const present = (await envKeys(cf, uuid)).has(secret);
       // A half-done earlier run (vault written, env var not, or the reverse) is finished by a rotation: nothing is
       // deployed by M2.4, so a new value is harmless, and reading a stored value back is never needed.
       const value = randomBytes(32).toString("base64url");
+      // Pre-review: the reads above are awaits after the runner's last lock check. Check before the vault write too,
+      // or a run that lost the lock could leave the vault and Coolify holding different values.
+      await store.assertLockHeld(p.id);
       await secrets.put(p.id, vaultName, value);
       await store.assertLockHeld(p.id);
       await cf.http.write(present ? "PATCH" : "POST", `/api/v1/applications/${uuid}/envs`, {
-        key: secret, value, is_preview: preview, is_literal: true,
+        key: secret, value, is_preview: false, is_literal: true,
       });
       return { externalId, name: externalId, owned: true };
     },
