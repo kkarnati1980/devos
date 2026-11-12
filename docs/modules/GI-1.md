@@ -65,7 +65,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 
 ## Pass rule
 - `node --test scripts/test/floor-guard.test.mjs` (part of `pnpm test`) exits 0. It holds one fixture diff per rule above expecting exit 1 and the rule's name, a clean diff expecting exit 0, forced errors (unknown ref, not a repository, missing arguments, unreadable diff) expecting exit 2, the isolation rule, dispositions, and the CLI.
-- The `floor-guard` job on this PR's head SHA succeeds, and its log shows `wall: <n>s` with n ≤ 120.
+- AT7: the `floor-guard` job on this PR's head SHA succeeds, and its log (`gh run view --log --job <id>`) shows `wall: <n>s` with n ≤ 120.
 
 ## Acceptance tests
 | # | Pass when |
