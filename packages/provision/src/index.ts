@@ -7,3 +7,4 @@ export * from "./memory-store.js";
 export * from "./prisma-store.js";
 export * from "./teardown-ops.js";
 export * from "./stack.js";
+export * from "./stack-teardown-ops.js";

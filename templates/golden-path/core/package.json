@@ -1,0 +1,12 @@
+{
+  "name": "devos-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "App generated from the DevOS golden-path template (core).",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}
