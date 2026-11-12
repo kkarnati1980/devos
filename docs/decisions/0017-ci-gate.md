@@ -1,0 +1,11 @@
+# 0017 — ci-gate aggregator (DEVOS-139 step 2, DEVOS-152)
+
+- **Status:** accepted (runner B, 12 Nov 2026, ADR-0013 §6, D10). Follows `0016-ci-throughput.md` step 1 (timeouts).
+- **Problem (C2, G4):** the `main` ruleset (DEVOS-143) will require checks. A workflow skipped by a path filter never reports, so a required check would block forever, and an unrequired one could be skipped silently.
+- **Decision:** one always-running workflow, `ci-gate`, whose single job passes only when every PR job on the head SHA succeeded. The ruleset requires `ci-gate` (plus `codex-review` and the floor guard) instead of each job. Contract: `docs/modules/CI-T-b.md`.
+- **Why a polling job rather than `needs:`:** the 11 workflows are separate files; `needs:` works only inside one workflow, and merging them all into one file is a larger change that would also change every check name the runners and Codex rely on. Polling the Checks API with the job's own `GITHUB_TOKEN` (`checks: read`) needs no third-party Action (C3).
+- **Why the expected set is computed from the workflow files, not "whatever reported":** a job that has not started yet would otherwise be missed. Anything the parser cannot reason about yet (path filters, job `if:`, matrices, reusable workflows) fails closed, so the gate can only be stricter than the jobs it watches.
+- **Trust:** the gate script runs from the base commit, so a PR cannot weaken its own gate; only the workflow list comes from the head. The floor guard (DEVOS-141) and Codex review still cover changes to the gate itself.
+- **Cost:** one extra job per push that mostly sleeps (about the length of the slowest check). Accepted: it is what makes the minute-saving path filters safe.
+- **Moved checks:** none. No check is removed, skipped or relaxed (G5).
+- **Next:** DEVOS-145 adds `ci-gate` to the ruleset once it has reported on every open PR; the path-filter step teaches the gate to evaluate `paths` against the PR's changed files.
