@@ -106,6 +106,8 @@ const VIOLATIONS = [
   ["test-script-changed (one-line package.json)", { "packages/x/package.json": '{"scripts":{"test":"vitest run"}}\n' }, { "packages/x/package.json": '{"scripts":{"test":"echo ok"}}\n' }],
   ["timeout-past-ceiling (quoted jest key)", { "packages/x/package.json": '{ "jest": {\n} }\n' }, { "packages/x/package.json": '{ "jest": {\n  "testTimeout": 600000\n} }\n' }],
   ["coverage-lowered (per-path threshold on one line)", { "packages/x/vitest.config.ts": "export default { test: { coverage: { thresholds: { lines: 80, 'src/**': { lines: 95 } } } } };\n" }, { "packages/x/vitest.config.ts": "export default { test: { coverage: { thresholds: { lines: 80, 'src/**': { lines: 90 } } } } };\n" }],
+  ["coverage-lowered (second switch on one line)", { "packages/x/vitest.config.ts": "export default { test: { coverage: { enabled: true, all: true } } };\n" }, { "packages/x/vitest.config.ts": "export default { test: { coverage: { enabled: true, all: false } } };\n" }],
+  ["lint-rule-off (quoted ignores key)", { "packages/x/eslint.config.mjs": "export default [];\n" }, { "packages/x/eslint.config.mjs": 'export default [{ "ignores": ["**/*"] }];\n' }],
   ["gitattributes-changed", { "packages/x/src/a.ts": "export const a = 1;\n" }, { ".gitattributes": "*.ts binary\n", "packages/x/src/a.ts": "export const a = 2;\n" }],
   ["contract-weakened (Green section)", { "docs/modules/M9.md": "# M9\n## Green\n- GC1: x exits 1\n" }, { "docs/modules/M9.md": "# M9\n## Green\n- GC1: x runs\n" }],
   ["contract-weakened (moved out of docs/modules)", { "docs/modules/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n" }, { "docs/modules/M9.md": null, "docs/old/M9.md": "# M9\n## Acceptance tests\n| AT1 | a |\n" }],

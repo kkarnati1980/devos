@@ -226,8 +226,8 @@ export function analyse(files, show) {
         olds.forEach((o, k) => { const n = news[k]; if (!n) hit("coverage-lowered", p, o.l.ln, `removed: ${o.l.text}`); else if (n.v < o.v) hit("coverage-lowered", p, n.l.ln, n.l.text); });
       }
       // boolean coverage switches: perFile / all / enabled turned off or removed
-      const on = /\b(perFile|all|enabled|reportOnFailure)\b["']?\s*[:=]\s*true\b/;
-      const onKeys = (ls) => ls.map((l) => [l, on.exec(l.text)]).filter(([, m]) => m);
+      const on = /\b(perFile|all|enabled|reportOnFailure)\b["']?\s*[:=]\s*true\b/g;
+      const onKeys = (ls) => ls.flatMap((l) => [...l.text.matchAll(on)].map((m) => [l, m])); // every switch on a line (PR70-r3)
       const addedOn = new Set(onKeys(f.added).map(([, m]) => m[1]));
       if (/coverage|c8rc|nycrc/i.test(p) || f.removed.concat(f.added).some((l) => /coverage/.test(l.text)) || TEST_CONFIG.test(p))
         for (const [l, m] of onKeys(f.removed)) if (!addedOn.has(m[1])) hit("coverage-lowered", p, l.ln, `${m[1]} no longer true: ${l.text}`);
@@ -248,7 +248,7 @@ export function analyse(files, show) {
       const was = scripts(f.removed), now = scripts(f.added);
       for (const [k, v] of was) if (now.get(k) !== v) hit("test-script-changed", p, 0, `script "${k}": "${v}" -> ${now.has(k) ? `"${now.get(k)}"` : "removed"}`);
     }
-    if (LINT_CONFIG.test(p)) for (const a of f.added) if (/[@\w/-]+["']?\s*:\s*\[?\s*(["'](off|warn)["']|[01]\s*[,\]}]|[01]\s*$)/.test(a.text) || /\bignores?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
+    if (LINT_CONFIG.test(p)) for (const a of f.added) if (/[@\w/-]+["']?\s*:\s*\[?\s*(["'](off|warn)["']|[01]\s*[,\]}]|[01]\s*$)/.test(a.text) || /\bignores?\b["']?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
 
     // stubs in non-test source
     if (code && !test && !WORKFLOW.test(p) && !p.endsWith(".json") && !p.startsWith("docs/")) {
