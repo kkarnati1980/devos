@@ -13,9 +13,9 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.json && node --test \"test/*.test.mjs\""
+    "build": "pnpm --filter @devos/intake run build && tsc -p tsconfig.json",
+    "typecheck": "pnpm --filter @devos/intake run build && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @devos/intake run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\""
   },
   "dependencies": {
     "@devos/intake": "workspace:*"
