@@ -24,3 +24,21 @@ export {
   type AssistWarningCode,
   type ModelRunner,
 } from "./assist.js";
+export {
+  classifyQuestion,
+  planQuestions,
+  questionFingerprint,
+  raiseQuestionCards,
+  renderArchitectLog,
+  CARD_LINE_MAX,
+  CARD_REASON_MAX,
+  type Classification,
+  type ClassReason,
+  type PlanMeta,
+  type QuestionCardDraft,
+  type QuestionClass,
+  type QuestionPlan,
+  type RaiseCard,
+  type RouteResult,
+  type TechnicalEntry,
+} from "./route.js";

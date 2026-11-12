@@ -107,6 +107,11 @@ export interface PurgeResult {
 const DAY_MS = 86_400_000;
 /** Deletion order across providers: the GitHub repo goes last (decision table); within a rank, newest first. */
 const RANK: Record<string, number> = { coolify: 0, vault: 1, backup_schedule: 2, r2: 3, cloudflare: 4, github: 9 };
+/**
+ * M2.5-a3 pre-review: a host port is a reservation, not a provider resource. It is released after everything else,
+ * so a purge that stops half way (then Restore) keeps the project's stable ports.
+ */
+const rank = (r: InventoryItem): number => (r.provider === "coolify" && r.kind === "port" ? 10 : RANK[r.provider] ?? 5);
 
 const opsKey = (provider: string, kind: string): string => `${provider}/${kind}`;
 
@@ -255,7 +260,7 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
     await check(opts, "teardown.purge", projectId);
     const rows = (await opts.store.activeResources(projectId))
       .map((r, i) => ({ r, i }))
-      .sort((a, b) => (RANK[a.r.provider] ?? 5) - (RANK[b.r.provider] ?? 5) || b.i - a.i)
+      .sort((a, b) => rank(a.r) - rank(b.r) || b.i - a.i)
       .map((x) => x.r);
     // Every row must have ops before anything is deleted: a half purge that stops on an unknown kind is worse.
     for (const r of rows) {

@@ -35,6 +35,8 @@ export interface OpenQuestion {
   kind: "stated" | "missing-acceptance";
   /** For missing-acceptance: the requirement key. */
   requirement?: string;
+  /** For a stated question raised from a requirement's title or criterion: that requirement's key (M2.2-c). */
+  owner?: string;
 }
 
 export interface OutOfScopeItem {
@@ -221,7 +223,7 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   const milestones: Milestone[] = [];
   const milestoneNames = new Set<string>();
   const stack: StackItem[] = [];
-  const stated: { text: string; source: number }[] = [];
+  const stated: { text: string; source: number; owner?: string }[] = [];
   const outOfScope: OutOfScopeItem[] = [];
   const outOfScopeKeys = new Set<string>();
   const warnings: AnalysisWarning[] = [];
@@ -271,9 +273,9 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
     if (pr === null) warnings.push({ code: "priority-defaulted", key, source });
     else priority = pr;
     const kept: string[] = [];
-    for (const c of acceptance) (isQuestionText(c) ? stated.push({ text: c, source }) : kept.push(c));
+    for (const c of acceptance) (isQuestionText(c) ? stated.push({ text: c, source, owner: key }) : kept.push(c));
     const r: Requirement = { key, title, priority, acceptance: kept, milestone, assigned, source };
-    if (isQuestionText(title)) stated.push({ text: `${key}: ${title}`, source });
+    if (isQuestionText(title)) stated.push({ text: `${key}: ${title}`, source, owner: key });
     requirements.push(r);
     byKey.set(key, r);
     return r;
@@ -292,7 +294,8 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   const criteriaBlocks = new Set<number>();
   const addCriterion = (req: Requirement, text: string, source: number) => {
     criteriaBlocks.add(source);
-    if (isQuestionText(text)) stated.push({ text, source });
+    // A rejected duplicate's sink shares the kept requirement's key; its questions own nothing (pre-review).
+    if (isQuestionText(text)) stated.push(byKey.get(req.key) === req ? { text, source, owner: req.key } : { text, source });
     else req.acceptance.push(text);
   };
   const isCriterionId = (key: string) => /^AC(?![A-Z])/.test(key);
@@ -429,7 +432,11 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
   requirements.sort((a, b) => a.source - b.source);
 
   const openQuestions: OpenQuestion[] = [];
-  for (const q of stated) openQuestions.push({ id: `Q-${openQuestions.length + 1}`, text: q.text, source: q.source, kind: "stated" });
+  for (const q of stated) {
+    const item: OpenQuestion = { id: `Q-${openQuestions.length + 1}`, text: q.text, source: q.source, kind: "stated" };
+    if (q.owner) item.owner = q.owner;
+    openQuestions.push(item);
+  }
   for (const r of requirements) {
     if (r.acceptance.length === 0) {
       openQuestions.push({
