@@ -72,7 +72,7 @@ const MILESTONE_HEADERS = new Set(["milestone", "phase", "release"]);
 
 // A milestone heading names a number or a name: "Phase 1", "Release 2.0", "Milestone: MVP", "Stage IV", "Phase one".
 const MILESTONE_HEADING =
-  /^(phase|milestone|stage|release|sprint|iteration)\s*(?:\d|[ivx]+\b|(?:one|two|three|four|five|six|seven|eight|nine|ten)\b|[:\-–—]\s*\S)/i;
+  /^(phase|milestone|stage|release|sprint|iteration)\s*(?:\d|[ivx]+\b|(?:one|two|three|four|five|six|seven|eight|nine|ten)\b|(?:[:–—]|\s-)\s*\S)/i;
 const ACCEPTANCE_PARA = /^(acceptance( criteria)?\s*:|ac\s*:|done when\s*:|given\b|when\b|then\b)/i;
 // A hyphen separates only when followed by a space, so FR-1-2 is not FR-1 titled "2".
 const SEPARATOR = /^\s*(?:[:–—.)]|-(?=\s))\s*/;
@@ -258,7 +258,8 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
       if (ms && !id) {
         addMilestone(b.text.trim(), i);
         currentMilestone = b.text.trim();
-        section = "other";
+        // A milestone heading ends a stack or questions section; a requirements section split by phase continues.
+        if (section === "stack" || section === "questions") section = "other";
         open = null;
         return;
       }

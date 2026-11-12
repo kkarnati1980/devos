@@ -295,3 +295,23 @@ test("AT8b out of scope renders; many assigned IDs stay linear", () => {
   assert.equal(big.requirements.length, 20000);
   assert.ok(Date.now() - t0 < 5000, "20k assigned IDs took too long");
 });
+
+test("AT6c a requirements section split by phase keeps its items; hyphenated words are not milestones", () => {
+  const { a } = analyze(`## Functional requirements
+
+### Phase 1
+
+- Users can sign up
+
+### Phase 2
+
+- Users can export
+
+## Release-ready checklist
+
+- FR-5: Audit log (Must)
+  - Entries kept
+`);
+  assert.deepEqual(a.requirements.map((r) => [r.key, r.milestone]), [["FR-A001", "Phase 1"], ["FR-A002", "Phase 2"], ["FR-5", "Phase 2"]]);
+  assert.deepEqual(a.milestones.map((m) => m.name), ["Phase 1", "Phase 2"]);
+});
