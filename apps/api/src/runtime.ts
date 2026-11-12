@@ -43,6 +43,12 @@ export function dbReadiness(db: DbClient, timeoutMs: number): ReadinessProbe {
     ).then(() => undefined);
 }
 
+/**
+ * M2.2-d3a (pre-review finding 1): a spec save upserts up to 2 000 requirement rows in one transaction, so it gets
+ * its own bound instead of the short outbound timeout; the same 30 s the spec route allows for the body.
+ */
+export const REQUIREMENTS_TX_MS = 30_000;
+
 export interface Runtime {
   grants: GrantService | null;
   readiness: ReadinessProbe;
@@ -137,7 +143,7 @@ export async function buildRuntime(
     grantsFor: (approvalId) => grantsForApproval(db, approvalId, t),
     revokeGrant: (session, grantId) => engine.revokeGrant(session as Parameters<PolicyEngine["revokeGrant"]>[0], grantId),
   };
-  const requirements = requirementsServices(new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], t), approvalsCore, approvalStore);
+  const requirements = requirementsServices(new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS)), approvalsCore, approvalStore);
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements };
 }
 

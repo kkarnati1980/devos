@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { MemoryRequirementsStore } from "@devos/analyst";
 import { Approvals, MemoryApprovalStore } from "../dist/approvals.js";
 import { syncApproval } from "../dist/requirements.js";
-import { buildRuntime, requirementsServices } from "../dist/runtime.js";
+import { buildRuntime, requirementsServices, REQUIREMENTS_TX_MS } from "../dist/runtime.js";
 import { KkSessionRegistry } from "../dist/auth.js";
 
 const P1 = "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d";
@@ -16,6 +16,7 @@ const SPEC = `# Shop
   - Login works
 - FR-2: Menu page
   - Menu shows prices
+- FR-3: Delivery tracking
 
 ## Open questions
 - What monthly budget can we spend on hosting?
@@ -48,6 +49,8 @@ test("AT-W2 question cards go to the inbox as decision cards that block no task"
   assert.equal(decisions.length, r.questionCards.raised.length);
   assert.ok(decisions.length >= 1, "the budget question is a KK card");
   assert.equal(approvalStore.blockers.length, 0);
+  // FR-3 has no acceptance criteria: its card's draft blocks FR-3, and that key is not passed to the core (Behaviour 3).
+  assert.ok(decisions.some((c) => /FR-3/.test(`${c.action} ${c.target} ${c.reason}`)), "the missing-acceptance card for FR-3 is raised");
 });
 
 test("AT-W3 the card reader is the approvals store: an approved requirements card approves the draft via sync", async () => {
@@ -62,7 +65,7 @@ test("AT-W4 a repeat spec while the question card is pending reuses that card (t
   const { svc, approvalStore } = wire();
   await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
   const before = [...approvalStore.cards.values()].filter((c) => c.gate === "decision").length;
-  await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC + "- FR-3: Orders\n  - Orders list\n" });
+  await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC.replace("## Open", "- FR-4: Orders\n  - Orders list\n\n## Open") });
   const after = [...approvalStore.cards.values()].filter((c) => c.gate === "decision").length;
   assert.equal(after, before);
 });
@@ -77,4 +80,5 @@ test("AT-W5 buildRuntime: requirements off without the database or policy key; w
   }
   const rt = await buildRuntime({ DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" }, opts);
   assert.ok(rt.requirements.pipeline && rt.requirements.store && rt.requirements.cards);
+  assert.equal(REQUIREMENTS_TX_MS, 30_000);
 });
