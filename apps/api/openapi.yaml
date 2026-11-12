@@ -377,7 +377,7 @@ paths:
               type: object
               additionalProperties: false
               properties:
-                expiresInHours: { type: integer, minimum: 1 }
+                expiresInHours: { type: integer, minimum: 1, maximum: 2160 }
                 maxUses: { type: integer, minimum: 1, maximum: 100 }
                 sha: { type: string, pattern: "^[0-9a-f]{40}$" }
                 confirmation: { type: string, description: "Gate 5 (purge): the typed phrase" }
@@ -436,7 +436,7 @@ paths:
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
-        "200": { description: "`{ revoked, grantId }`: M1.7 revokeGrant on the card's live grant; audited (`approval.grant_revoke_requested`) first" }
+        "200": { description: "`{ revoked, grantIds }`: M1.7 revokeGrant on every live grant of the card (not revoked, not expired, uses left); audited (`approval.grant_revoke_requested`) first" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: "`card-not-found` or `grant-not-found` (no live grant)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }

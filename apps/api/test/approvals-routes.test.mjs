@@ -8,7 +8,8 @@ import { createApp } from "../dist/app.js";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { loadConfig } from "../dist/config.js";
 import { Approvals, MemoryApprovalStore, purgeConfirmationHash } from "../dist/approvals.js";
-import { mapApprovalError, APPROVALS_PAGE } from "../dist/approvals-routes.js";
+import { mapApprovalError, pickGrant, APPROVALS_PAGE } from "../dist/approvals-routes.js";
+import { ApprovalError } from "../dist/approvals.js";
 
 const KK = "kk@example.com";
 const ORIGIN = "http://devos:3000";
@@ -150,7 +151,7 @@ test("M2.3-b1 AT6 over HTTP: no session → 401, another login → 403 not-kk, a
     r = await call(s.port, "POST", `/approvals/${c.id}/approve`, { headers: { cookie: api.cookie, origin: ORIGIN }, body: {} });
     assert.deepEqual([r.status, r.json.code], [403, "csrf-token-invalid"]);
     r = await api.post(`/approvals/${c.id}/approve`, {}, { origin: "http://evil.example" });
-    assert.equal(r.status, 403);
+    assert.deepEqual([r.status, r.json.code], [403, "csrf-origin-refused"]);
     assert.equal((await s.store.get(c.id)).status, "pending");
     assert.equal(s.policyStore.grants.length, 0);
   } finally {
@@ -158,8 +159,16 @@ test("M2.3-b1 AT6 over HTTP: no session → 401, another login → 403 not-kk, a
   }
   const other = await start({ login: "agent@example.com" });
   try {
-    const r = await call(other.port, "GET", "/approvals");
+    const c = await other.approvals.raiseCard(card(), [T1]);
+    let r = await call(other.port, "GET", "/approvals");
     assert.deepEqual([r.status, r.json.code], [403, "not-kk"]);
+    for (const p of [`/approvals/${c.id}/approve`, `/approvals/${c.id}/reject`, `/approvals/${c.id}/comments`, `/approvals/${c.id}/grant/revoke`]) {
+      r = await call(other.port, "POST", p, { headers: { origin: ORIGIN }, body: { body: "x" } });
+      assert.deepEqual([r.status, r.json.code], [403, "not-kk"], p);
+    }
+    assert.equal((await other.store.get(c.id)).status, "pending");
+    assert.equal(other.store.commentsList.length, 0);
+    assert.equal(other.policyStore.grants.length, 0);
   } finally {
     await other.app.close();
   }
@@ -193,6 +202,13 @@ test("M2.3-b1 AT11 over HTTP: bad input, unknown cards, purge mismatch and store
     assert.deepEqual([r.status, r.json.code], [409, "purge-confirmation-mismatch"]);
     assert.equal((await s.store.get(p.id)).status, "pending");
     assert.ok(purgeConfirmationHash);
+    const secret = `token ${["sk", "live", "abcdef123456"].join("-")}`;
+    r = await api.post(`/approvals/${c.id}/comments`, { body: secret });
+    assert.deepEqual([r.status, r.json.code], [400, "card-contains-secret"]);
+    r = await api.post(`/approvals/${c.id}/reject`, { comment: secret });
+    assert.deepEqual([r.status, r.json.code], [400, "card-contains-secret"]);
+    assert.ok(!r.text.includes("abcdef123456"));
+    assert.equal((await s.store.get(c.id)).status, "pending");
   } finally {
     await s.app.close();
   }
@@ -235,3 +251,54 @@ test("M2.3-b1: the list pages 50 at a time with a cursor; mapApprovalError keeps
   assert.equal(mapApprovalError(new Error("grant-scope-resource")).getStatus(), 400);
   assert.deepEqual(mapApprovalError(new Error("db exploded: secret")).getResponse(), { statusCode: 503, code: "approvals-store-error" });
 });
+
+test("M2.3-b1 pre-review: an exact last page has no cursor; the summary shows the live grant, not a revoked race loser", async () => {
+  const s = await start();
+  try {
+    for (let i = 0; i < APPROVALS_PAGE; i++) await s.approvals.raiseCard(card({ target: `repo:p${i}` }), []);
+    const api = await session(s.port);
+    const r = await api.get("/approvals");
+    assert.equal(r.json.approvals.length, APPROVALS_PAGE);
+    assert.equal(r.json.nextCursor, null, "exactly one full page: no next page");
+    // Two grants on one card, the newer one revoked (the AT7 race loser): the detail shows the live one.
+    const c = await s.approvals.raiseCard(card({ target: "repo:race" }), []);
+    assert.equal((await api.post(`/approvals/${c.id}/approve`, {})).status, 200);
+    const winner = s.policyStore.grants.at(-1);
+    s.policyStore.grants.push({ ...winner, id: "77777777-7777-4777-8777-777777777777", issuedAt: new Date(winner.issuedAt.getTime() + 1), revokedAt: new Date() });
+    const d = await api.get(`/approvals/${c.id}`);
+    assert.equal(d.json.grant.id, winner.id);
+    assert.equal(d.json.grant.revoked, false);
+  } finally {
+    await s.app.close();
+  }
+  const now = Date.now();
+  const g = (id, over = {}) => ({ id, scopeAction: "a", scopeResource: "r", projectId: null, sha: null, expiresAt: new Date(now + 3_600_000), maxUses: 1, uses: 0, revokedAt: null, ...over });
+  assert.equal(pickGrant([g("loser", { revokedAt: new Date(now) }), g("winner")], now).id, "winner");
+  assert.equal(pickGrant([g("used", { uses: 1 }), g("old", { expiresAt: new Date(now - 1) })], now).id, "used");
+  assert.equal(pickGrant([], now), null);
+});
+
+test("M2.3-b1 pre-review: revoke takes every live grant of the card and skips expired or used-up ones", async () => {
+  const s = await start();
+  try {
+    const api = await session(s.port);
+    const c = await s.approvals.raiseCard(card({ target: "repo:two" }), []);
+    let r = await api.post(`/approvals/${c.id}/approve`, { maxUses: 2 });
+    assert.equal(r.status, 200);
+    // A second live grant on the same card, as a failed race-loser revoke leaves behind.
+    const first = s.policyStore.grants[0];
+    s.policyStore.grants.push({ ...first, id: "55555555-5555-4555-8555-555555555555", issuedAt: new Date(first.issuedAt.getTime() + 1) });
+    s.policyStore.grants.push({ ...first, id: "66666666-6666-4666-8666-666666666666", expiresAt: new Date(Date.now() - 1) });
+    r = await api.post(`/approvals/${c.id}/grant/revoke`);
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual([...r.json.grantIds].sort(), [first.id, "55555555-5555-4555-8555-555555555555"].sort());
+    assert.equal(s.policyStore.grants.find((x) => x.id === "66666666-6666-4666-8666-666666666666").revokedAt, null);
+    r = await api.post(`/approvals/${c.id}/grant/revoke`);
+    assert.deepEqual([r.status, r.json.code], [404, "grant-not-found"]);
+  } finally {
+    await s.app.close();
+  }
+  assert.equal(mapApprovalError(new ApprovalError("approvals-store-error", 500)).getStatus(), 503);
+  assert.equal(mapApprovalError(new Error("grant-issuer-not-kk")).getStatus(), 403);
+});
+

@@ -39,8 +39,11 @@ const STATUSES: readonly CardStatus[] = ["pending", "approved", "rejected", "exp
 /** Maps any failure to a fixed code (DEVOS-104 item 3). */
 export function mapApprovalError(e: unknown) {
   if (e instanceof Error && "getStatus" in e) return e;
-  if (e instanceof ApprovalError) return httpError(e.status, e.code);
+  // Pre-review 3: every store failure is 503, whatever status the core chose for it.
+  if (e instanceof ApprovalError) return httpError(e.code === "approvals-store-error" ? 503 : e.status, e.code);
   const msg = e instanceof Error ? e.message : "";
+  // Pre-review 8: the engine's issuer checks are authorisation failures, not bad input.
+  if (msg === "grant-issuer-not-kk" || msg === "grant-issuer-session-unverified") return httpError(403, msg);
   if (/^grant-[a-z0-9-]+$/.test(msg)) return httpError(400, msg);
   return httpError(503, "approvals-store-error");
 }
@@ -51,6 +54,13 @@ async function guarded<T>(fn: () => Promise<T>): Promise<T> {
   } catch (e) {
     throw mapApprovalError(e);
   }
+}
+
+/** A grant that can still lift a decision: not revoked, not expired, uses left. */
+const isLive = (g: GrantSummary, now: number): boolean => g.revokedAt === null && g.expiresAt.getTime() > now && g.uses < g.maxUses;
+/** Pre-review 1: the summary shows the newest live grant (a revoked race loser must not hide it), else the newest. */
+export function pickGrant(grants: readonly GrantSummary[], now = Date.now()): GrantSummary | null {
+  return grants.find((g) => isLive(g, now)) ?? grants[0] ?? null;
 }
 
 const iso = (d: Date | null | undefined): string | null => (d instanceof Date ? d.toISOString() : null);
@@ -114,15 +124,17 @@ export class ApprovalsController {
         ...(status ? { status: status as CardStatus } : {}),
         ...(projectId ? { projectId } : {}),
         ...(cursor ? { cursor } : {}),
-        limit: APPROVALS_PAGE,
+        limit: APPROVALS_PAGE + 1,
       });
+      // Pre-review 4: one extra row decides whether there is a next page.
       const page = cards.slice(0, APPROVALS_PAGE);
       const rows = [];
       for (const c of page) {
         const [blocked, grants] = await Promise.all([approvals.store.blockedTasks(c.id), grantsFor(c.id)]);
-        rows.push({ ...cardView(c), blockedTasks: blocked.length, grant: grants[0] ? grantView(grants[0]) : null });
+        const g = pickGrant(grants);
+        rows.push({ ...cardView(c), blockedTasks: blocked.length, grant: g ? grantView(g) : null });
       }
-      return { approvals: rows, nextCursor: page.length === APPROVALS_PAGE ? page[page.length - 1]!.id : null };
+      return { approvals: rows, nextCursor: cards.length > APPROVALS_PAGE ? page[page.length - 1]!.id : null };
     });
   }
 
@@ -138,7 +150,7 @@ export class ApprovalsController {
         approval: cardView(c),
         comments: comments.map((x) => ({ id: x.id, author: x.author, body: x.body, createdAt: iso(x.createdAt) })),
         blockedTasks: blocked.map((t) => ({ id: t.id, title: t.title, status: t.status })),
-        grant: grants[0] ? grantView(grants[0]) : null,
+        grant: ((g) => (g ? grantView(g) : null))(pickGrant(grants)),
       };
     });
   }
@@ -174,8 +186,9 @@ export class ApprovalsController {
   }
 
   /**
-   * KK revokes the card's live grant (M1.7 `revokeGrant`). The request is audited first; if the audit cannot be
-   * written nothing is revoked. 404 `grant-not-found` when the card has no live grant.
+   * KK revokes the card's live grants (M1.7 `revokeGrant`): every grant of the card that is not revoked, not expired
+   * and has uses left (pre-review 2: a failed race-loser revoke can leave two). The request is audited first; if the
+   * audit cannot be written nothing is revoked. 404 `grant-not-found` when the card has no live grant.
    */
   @Post(":id/grant/revoke")
   @HttpCode(200)
@@ -187,10 +200,15 @@ export class ApprovalsController {
     return guarded(async () => {
       const c = await approvals.store.get(id);
       if (!c) throw new ApprovalError("card-not-found", 404);
-      const live = (await grantsFor(id)).find((g) => g.revokedAt === null);
-      if (!live) throw new ApprovalError("grant-not-found", 404);
-      await approvals.store.recordAudit({ action: "approval.grant_revoke_requested", summary: `Grant revoke requested for: ${c.action}`, details: { approvalId: id, grantId: live.id } });
-      return { revoked: await revokeGrant(this.session(req), live.id), grantId: live.id };
+      const now = Date.now();
+      const live = (await grantsFor(id)).filter((g) => isLive(g, now));
+      if (!live.length) throw new ApprovalError("grant-not-found", 404);
+      const grantIds = live.map((g) => g.id);
+      await approvals.store.recordAudit({ action: "approval.grant_revoke_requested", summary: `Grant revoke requested for: ${c.action}`, details: { approvalId: id, grantIds } });
+      const session = this.session(req);
+      const revoked: string[] = [];
+      for (const g of grantIds) if (await revokeGrant(session, g)) revoked.push(g);
+      return { revoked: revoked.length > 0, grantIds: revoked };
     });
   }
 }
