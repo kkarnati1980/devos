@@ -51,6 +51,18 @@ export function fakeProviders() {
   function coolify(method, path, init) {
     let m;
     if (method === "GET" && path === "/api/v1/projects") return json(200, [...projects.values()].map(({ uuid, name, description }) => ({ uuid, name, description })));
+    if ((m = path.match(/^\/api\/v1\/projects\/([^/]+)\/environments$/))) {
+      const p = projects.get(m[1]);
+      if (!p) return json(404, { message: "Project not found." });
+      p.environments ??= [];
+      if (method === "GET") return json(200, p.environments.map((name, i) => ({ id: i + 1, name })));
+      if (method === "POST") {
+        const b = JSON.parse(init.body);
+        if (p.environments.includes(b.name)) return json(409, { message: "Environment already exists." });
+        p.environments.push(b.name);
+        return json(201, { uuid: `env-${b.name}` });
+      }
+    }
     if (method === "GET" && (m = path.match(/^\/api\/v1\/projects\/([^/]+)$/))) {
       const p = projects.get(m[1]);
       return p ? json(200, p) : json(404, { message: "Project not found." });

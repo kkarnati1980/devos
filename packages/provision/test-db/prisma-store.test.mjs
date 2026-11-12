@@ -4,7 +4,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { createDb } from "@devos/db";
-import { allowAll, PrismaStore, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, runProvision } from "../dist/index.js";
+import { allowAll, PrismaStore, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, runProvision, stackSteps } from "../dist/index.js";
 import { fakeProviders } from "../test/fakes.mjs";
 
 const url = process.env.DATABASE_URL;
@@ -89,4 +89,30 @@ test("DB checks: a done step needs an external id; last_error is bounded", async
   const p = await seed();
   await assert.rejects(db.provisionStep.create({ data: { projectId: p.id, key: "x", provider: "github", kind: "repo", status: "done" } }));
   await assert.rejects(db.provisionStep.create({ data: { projectId: p.id, key: "y", provider: "github", kind: "repo", lastError: "e".repeat(301) } }));
+});
+
+test("AT10 on Postgres: two projects provisioned at once get distinct ports and environments; a re-run keeps them", async () => {
+  const p = await seed(); const q = await seed(); const fake = fakeProviders();
+  // A private range per test run, so earlier runs against the same database never collide.
+  const from = 21000 + 2 * Math.floor(Math.random() * 20000); const range = { from, to: from + 9 };
+  const full = (proj, store) => {
+    const gh = new GitHubClient({ token: () => "t", fetchImpl: fake.fetchImpl, sleep: async () => {} });
+    const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => "t", fetchImpl: fake.fetchImpl, sleep: async () => {} });
+    return [githubRepoStep(gh, proj, "kkarnati1980"), coolifyProjectStep(cf, proj), ...stackSteps(cf, store, proj, range)];
+  };
+  const sp = new PrismaStore(db, { databaseUrl: url }); const sq = new PrismaStore(db, { databaseUrl: url });
+  await Promise.all([
+    runProvision(p.id, full(p, sp), { store: sp, authorize: allowAll }),
+    runProvision(q.id, full(q, sq), { store: sq, authorize: allowAll }),
+  ]);
+  const ports = await db.resource.findMany({ where: { projectId: { in: [p.id, q.id] }, provider: "coolify", kind: "port" }, select: { projectId: true, externalId: true, name: true } });
+  assert.equal(ports.length, 4);
+  assert.equal(new Set(ports.map((r) => r.externalId)).size, 4, "no port shared");
+  for (const r of ports) assert.equal(Number(r.externalId) % 2, r.name.endsWith("/preview") ? 0 : 1);
+  assert.equal(await db.resource.count({ where: { projectId: { in: [p.id, q.id] }, kind: "environment" } }), 4);
+  const before = fake.creates().length;
+  await runProvision(p.id, full(p, sp), { store: sp, authorize: allowAll });
+  assert.equal(fake.creates().length, before);
+  const again = await db.resource.findMany({ where: { projectId: p.id, kind: "port" }, select: { externalId: true }, orderBy: { externalId: "asc" } });
+  assert.deepEqual(again.map((r) => r.externalId), ports.filter((r) => r.projectId === p.id).map((r) => r.externalId).sort());
 });
