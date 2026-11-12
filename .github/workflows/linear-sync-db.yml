@@ -11,6 +11,7 @@ concurrency:
 jobs:
   linear-sync-db:
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # DEVOS-139 G3: p95 under 4 min on 12 Nov; the ceiling only stops a hung job
     services:
       postgres:
         image: postgres:17

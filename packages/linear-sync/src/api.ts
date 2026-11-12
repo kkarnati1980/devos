@@ -8,7 +8,16 @@ import { readMarker } from "./markers.js";
 
 const PAGE = 100, MAX_PAGES = 50;
 /** Page size of lists nested in the issues query (labels, relations), kept small for Linear's query complexity. */
-const NESTED = 50;
+export const NESTED = 50;
+/**
+ * Issues per page of the issues query. Linear scores a query at 1 point per object and 0.1 per field, a connection
+ * multiplying its children by its `first`, and refuses more than 10,000 points. One issue node is about
+ * 5 + NESTED x 1.1 (labels) + NESTED x 2.2 (relations) = 170 points, so 100 per page (~17,000) would be refused on the
+ * first live sync; 25 per page is ~4,250.
+ */
+export const ISSUE_PAGE = 25;
+export const ISSUES_QUERY_COST = Math.ceil(ISSUE_PAGE * (5 + NESTED * 1.1 + NESTED * 2.2) + 10);
+export const LINEAR_MAX_COMPLEXITY = 10_000;
 type Conn<T> = { nodes: T[]; pageInfo?: { hasNextPage: boolean; endCursor: string | null } };
 
 function ok<T>(payload: { success?: boolean } & T, what: string): T {
@@ -129,7 +138,7 @@ export function graphqlApi(client: LinearClient): LinearApi {
       let after: string | null = null;
       for (let p = 0; p < MAX_PAGES; p++) {
         const d: { project: { issues: Conn<N> } } = await client.query(
-          `query($id: String!, $after: String) { project(id: $id) { issues(first: ${PAGE}, after: $after, includeArchived: true) { nodes {
+          `query($id: String!, $after: String) { project(id: $id) { issues(first: ${ISSUE_PAGE}, after: $after, includeArchived: true) { nodes {
              id title description state { type } labels(first: ${NESTED}) { nodes { name } pageInfo { hasNextPage } } parent { id } projectMilestone { id } assignee { id }
              inverseRelations(first: ${NESTED}) { nodes { type issue { id } } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } }`, { id: projectId, after });
         for (const n of d.project.issues.nodes) {
@@ -148,13 +157,21 @@ export function graphqlApi(client: LinearClient): LinearApi {
       }
       throw new LinearError("bad-response", "too many issues in one Linear project");
     },
+    async issueRef(id) {
+      // A filter, not issue(id): a deleted issue is an empty list here, not an "entity not found" error.
+      const d = await client.query<{ issues: { nodes: { id: string; project: { id: string } | null }[] } }>(
+        `query($id: ID!) { issues(filter: { id: { eq: $id } }, first: 1, includeArchived: true) { nodes { id project { id } } } }`, { id });
+      const n = d.issues.nodes[0];
+      return n ? { id: n.id, projectId: n.project?.id ?? null } : null;
+    },
     async createIssue(i) {
       const d = await client.mutate<{ issueCreate: { success: boolean; issue: { id: string } } }>(
         `mutation($i: IssueCreateInput!) { issueCreate(input: $i) { success issue { id } } }`, { i: toInput(i) });
       return ok(d.issueCreate, "issue create").issue.id;
     },
     async updateIssue(id, i) {
-      const { teamId: _t, projectId: _p, ...rest } = toInput(i as IssueInput);
+      // projectId is sent only when set: the sync moves an issue that was taken out of its project back into it.
+      const { teamId: _t, ...rest } = toInput(i as IssueInput);
       ok((await client.mutate<{ issueUpdate: { success: boolean } }>(
         `mutation($id: String!, $i: IssueUpdateInput!) { issueUpdate(id: $id, input: $i) { success } }`, { id, i: rest })).issueUpdate, "issue update");
     },

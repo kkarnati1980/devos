@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
 import "./globals.css";
+import { ApprovalsNavLink } from "./approvals/pending-count";
+import { parseApiOrigin } from "../lib/headers.mjs";
 
 export const dynamic = "force-dynamic"; // every page is rendered per request, so each carries this request's CSP nonce
 
@@ -25,6 +27,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             <a href="/settings">Settings</a>
             <a href="/notifications">Notifications</a>
             <a href="/dead-letters">Failed runs</a>
+            <ApprovalsNavLink apiOrigin={parseApiOrigin(process.env.DEVOS_API_ORIGIN)} />
             <span className="mode">mock data</span>
           </nav>
         </header>
