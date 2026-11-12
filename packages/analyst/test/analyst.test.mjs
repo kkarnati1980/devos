@@ -399,3 +399,26 @@ FR-3: FR-4
   assert.deepEqual(a.stack.map((s) => s.text), ["Hosting — TBD", "Database — Postgres"]);
   assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), ["Hosting — TBD"]);
 });
+
+test("AT10e (PR53-r6) non-requirement tables outside stack: questions-section rows and TBD rows are stated questions", () => {
+  const { a } = analyze(`## Open questions
+
+| Topic | Decision |
+|---|---|
+| Hosting | TBD |
+| Billing | Who pays for SMS |
+
+## Notes
+
+| Item | Status |
+|---|---|
+| Branding | TBC |
+| Logo | Done |
+`);
+  assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), [
+    "Hosting — TBD",
+    "Billing — Who pays for SMS",
+    "Branding — TBC",
+  ]);
+  assert.equal(a.stack.length, 0);
+});

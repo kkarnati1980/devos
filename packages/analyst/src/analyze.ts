@@ -321,13 +321,15 @@ export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = 
       open = null;
       const cols = tableColumns(b.rows, prefixes);
       if (!cols) {
-        // Unresolved stack rows (`Hosting | TBD`) are also stated questions, like list and paragraph items (PR53-r5).
-        if (section === "stack")
-          for (const row of b.rows.slice(1)) {
-            const text = row.filter(Boolean).join(" — ");
-            stack.push({ text, source: i });
-            if (isQuestionText(text)) stated.push({ text, source: i });
-          }
+        // A non-requirement table's rows follow the list-item rules (PR53-r5, r6): under a stack heading each row
+        // is a stack item; under a questions heading each row is a stated question; anywhere, a row with
+        // TBD/TBC or a trailing "?" is a stated question.
+        for (const row of b.rows.slice(1)) {
+          const text = row.filter(Boolean).join(" — ");
+          if (!text) continue;
+          if (section === "stack") stack.push({ text, source: i });
+          if (section === "questions" || isQuestionText(text)) stated.push({ text, source: i });
+        }
         return;
       }
       for (const row of b.rows.slice(cols.hasHeader ? 1 : 0)) {
