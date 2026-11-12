@@ -369,3 +369,44 @@ test("DEVOS-104 item 2: expiry takes effect at the sweep; until then a pending c
   assert.equal(store.tasks.get(T1).status, "ready");
 });
 
+
+// DEVOS-164: expire named pending cards (for M2.2-d3c2).
+test("DEVOS-164 expireCardsById expires a named pending card (one audit row), leaves decided and unknown ids alone", async () => {
+  const { approvals, store, session } = setup({ rules: [approvalRule] });
+  const pending = await approvals.raiseCard(card(), [T1]);
+  const decided = await approvals.raiseCard(card({ target: "repo:other" }), [T2]);
+  await approvals.approve(session, decided.id);
+  const other = await approvals.raiseCard(card({ target: "repo:third" }), [T3]);
+  const before = store.audit.length;
+  const unknown = "99999999-9999-4999-8999-999999999999";
+  const out = await approvals.expireCardsById([pending.id, decided.id, unknown, "not-a-uuid", pending.id], "superseded by requirements v2");
+  assert.deepEqual(out, [pending.id]);
+  assert.equal((await store.get(pending.id)).status, "expired");
+  assert.equal((await store.get(pending.id)).decidedBy, "system:expiry");
+  assert.equal((await store.get(decided.id)).status, "approved");
+  assert.equal((await store.get(other.id)).status, "pending", "an unnamed pending card is untouched");
+  assert.equal(store.tasks.get(T1).status, "blocked", "an expired card keeps its task blocked");
+  const rows = store.audit.slice(before);
+  assert.equal(rows.length, 1);
+  assert.deepEqual(rows[0], { action: "approval.expired", summary: `Expired: ${pending.action}`, details: { gate: "decision", approvalId: pending.id, reason: "superseded by requirements v2" } });
+  // Idempotent: a second call expires nothing and audits nothing.
+  assert.deepEqual(await approvals.expireCardsById([pending.id], "again"), []);
+  assert.equal(store.audit.length, before + 1);
+  await assert.rejects(approvals.approve(session, pending.id), (e) => e.code === "card-not-pending");
+});
+
+test("DEVOS-164 expireCardsById validates its input", async () => {
+  const { approvals, store } = setup();
+  const c = await approvals.raiseCard(card(), [T1]);
+  assert.deepEqual(await approvals.expireCardsById([], "nothing named"), []);
+  for (const bad of [[c.id, 5], "not-an-array", null]) {
+    await assert.rejects(approvals.expireCardsById(bad, "reason"), (e) => e.code === "invalid-input");
+  }
+  for (const reason of ["", "   ", "two\nlines", "x".repeat(501), 7]) {
+    await assert.rejects(approvals.expireCardsById([c.id], reason), (e) => e.code === "invalid-input");
+  }
+  await assert.rejects(approvals.expireCardsById([c.id], "token ghp_" + "a".repeat(36)), (e) => e.code === "card-contains-secret");
+  const many = Array.from({ length: 501 }, (_, i) => `00000000-0000-4000-8000-${(i + 1000).toString(16).padStart(12, "0")}`);
+  await assert.rejects(approvals.expireCardsById(many, "too many"), (e) => e.code === "invalid-input");
+  assert.equal((await store.get(c.id)).status, "pending", "a refused call changes nothing");
+});
