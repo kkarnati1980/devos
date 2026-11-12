@@ -30,6 +30,9 @@ importers:
       '@devos/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@devos/run-engine':
+        specifier: workspace:*
+        version: link:../../packages/run-engine
       '@nestjs/common':
         specifier: 11.2.8
         version: 11.2.8(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -109,6 +112,15 @@ importers:
         specifier: ^5.6.3
         version: 5.9.3
 
+  packages/intake:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.7.0
+        version: 22.20.5
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
   packages/policy:
     devDependencies:
       '@devos/db':
@@ -117,6 +129,25 @@ importers:
       '@types/node':
         specifier: ^22.7.0
         version: 22.20.5
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
+  packages/provision:
+    dependencies:
+      pg:
+        specifier: 8.23.1
+        version: 8.23.1
+    devDependencies:
+      '@devos/db':
+        specifier: workspace:*
+        version: link:../db
+      '@types/node':
+        specifier: ^22.7.0
+        version: 22.20.5
+      '@types/pg':
+        specifier: 8.15.6
+        version: 8.15.6
       typescript:
         specifier: ^5.6.3
         version: 5.9.3

@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.2.0
+# Version: 1.4.0
+# v1.4.0 (DEVOS-116): the longest-waiting head is reviewed first. A head's first-green time is stored
+# (<sha>.green) and the tick reviews the candidate with the oldest one (then the lower PR number), instead of
+# the first one in GitHub's newest-first list, so older PRs no longer starve. Still one review per tick.
+# v1.3.0 (DEVOS-105, after the DEVOS-101 stall): heartbeat. About once an hour (HEARTBEAT_SECONDS, default 3600)
+# a completed tick sets the commit status `codex-review-watch` = success on the head of main, with the time, the
+# open-PR count and how many wait for green CI. A heartbeat older than 2 hours means the watcher is down, which the
+# runners can see without server access. A failed heartbeat post never fails the tick; --dry-run posts nothing.
+# Every GitHub call now has a timeout (ADR-0011: connect 10 s, total GH_TIMEOUT, default 30 s).
 # v1.2.0 (DEVOS-115, 12 Nov 2026): the repo is public, so only PRs whose head is in kkarnati1980/devos and
 # whose author is on REVIEW_AUTHORS (default: kkarnati1980) are reviewed or published on. A fork or
 # stranger's PR is logged once per head as "external PR, not reviewed" and nothing is posted on it.
+# v1.1.3 (DEVOS-113): gh_all merges list pages through temp files, never as a jq argument (128 KiB limit).
 # v1.1.2 (Codex PR9-r4): a stored manual verdict records its PR number before publishing, so the drain can
 # complete it after the PR moves on.
 # v1.1.1 (Codex PR9-r3): pending publications are drained for every stored SHA, including ones a PR has
@@ -42,6 +51,7 @@ VDIR="$DIR/verdicts"
 STATE="$DIR/watch"
 ENVF="$DIR/github-review.env"
 DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
+GH_TIMEOUT="${GH_TIMEOUT:-30}"; [[ "$GH_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || GH_TIMEOUT=30
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 REVIEW_AUTHORS="${REVIEW_AUTHORS:-kkarnati1980}"   # space-separated GitHub logins whose PRs are reviewed
@@ -60,7 +70,7 @@ TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
 ( umask 077; printf 'Authorization: Bearer %s\n' "$(sed -n 's/^GITHUB_REVIEW_TOKEN=//p' "$ENVF" | head -n1 | tr -d '\r\n')" > "$TMP/auth" )
 gh_api() {  # method path [json-body-file] -> body on stdout; non-2xx is an error
   local method="$1" path="$2" body="${3:-}" code
-  local args=(-sS -o "$TMP/resp" -w '%{http_code}' -X "$method" -H @"$TMP/auth"
+  local args=(-sS --connect-timeout 10 --max-time "$GH_TIMEOUT" -o "$TMP/resp" -w '%{http_code}' -X "$method" -H @"$TMP/auth"
               -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
   [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data-binary @"$body")
   code="$(curl "${args[@]}" "$API$path")" || { log "curl failed: $method $path"; return 1; }
@@ -147,7 +157,10 @@ verdict_msg() {  # sha label contract -> writes <sha>.msg and <sha>.state from t
   else echo "failure Codex CHANGES_REQUESTED ($label)" > "$STATE/$sha.state"; fi
 }
 
-reviewed=0          # reviews run this tick (max 1: runner limit 900 s < service limit 1200 s)
+waiting=0           # PRs whose CI is not green yet (heartbeat)
+unreadable=0        # PRs whose workflow runs could not be read (heartbeat)
+tick_now="$(date +%s)" # DEVOS-116 pre-review: one clock read per tick, so heads first seen green together tie
+cands=()            # DEVOS-116: green, unreviewed heads: "<first-green epoch> <pr> <sha> <contract>"
 declare -A tried=() # SHAs whose publication was attempted this tick
 prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
 count="$(jq 'length' <<<"$prs")"
@@ -197,16 +210,27 @@ for i in $(seq 0 $((count - 1))); do
     continue
   fi
   set +e; ci_green "$sha"; ci=$?; set -e
-  if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; continue; fi
-  if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; continue; fi
+  if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; unreadable=$((unreadable + 1)); continue; fi
+  if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; waiting=$((waiting + 1)); continue; fi
 
-  round=1
+  # DEVOS-116: green and unreviewed. Remember when this SHA was first seen green (kept across ticks), and
+  # review the longest-waiting candidate after the loop, not the first one GitHub happens to list.
+  since="$(cat "$STATE/$sha.green" 2>/dev/null || true)"
+  # A missing, malformed or future value (clock stepped back) is replaced by this tick's time.
+  if [[ ! "$since" =~ ^[0-9]{1,12}$ ]] || (( since > tick_now )); then
+    since="$tick_now"
+    [[ $DRY -eq 1 ]] || echo "$since" > "$STATE/$sha.green"
+  fi
+  cands+=("$since $pr $sha $contract")
+done
+
+review_one() {  # pr sha contract
+  local pr="$1" sha="$2" contract="$3" round=1 label rc f
   for f in "$STATE"/*.pr; do
     if [[ -f "$f" && "$(cat "$f")" == "$pr" ]]; then round=$((round + 1)); fi
   done
   label="PR${pr}-r${round}"
-  if (( reviewed >= 1 )); then log "PR #$pr ${sha:0:7}: queued for the next tick (one review per tick)"; continue; fi
-  if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD review as $label against $contract"; continue; fi
+  if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD review as $label against $contract"; return 0; fi
 
   log "PR #$pr ${sha:0:7}: reviewing as $label against $contract"
   set_status "$sha" pending "Codex review $label running" || true
@@ -217,9 +241,8 @@ for i in $(seq 0 $((count - 1))); do
   if grep -q "another review is running" "$TMP/run.safe"; then
     log "PR #$pr: runner busy (manual review in progress); retry next tick"
     set_status "$sha" pending "Codex review queued (runner busy)" || true
-    continue
+    return 0
   fi
-  reviewed=1
   tried[$sha]=1
   echo "$pr" > "$STATE/$sha.pr"
   echo "$label" > "$STATE/$sha.label"
@@ -236,7 +259,18 @@ for i in $(seq 0 $((count - 1))); do
     log "PR #$pr ${sha:0:7}: runner failed (exit $rc)"
   fi
   publish "$pr" "$sha" || true
-done
+}
+
+# DEVOS-116: one review per tick (runner limit 900 s < service limit 1200 s), oldest first-green time first,
+# then the lower PR number. Every other candidate waits for a later tick.
+if (( ${#cands[@]} > 0 )); then
+  first=1
+  while read -r since pr sha contract; do
+    # stdin is the candidate list: the runner and publish must never read it.
+    if (( first )); then first=0; review_one "$pr" "$sha" "$contract" </dev/null
+    else log "PR #$pr ${sha:0:7}: queued for the next tick (one review per tick, oldest first)"; fi
+  done < <(printf '%s\n' "${cands[@]}" | sort -k1,1n -k2,2n)
+fi
 
 # Drain: a SHA reviewed earlier whose comment or status never posted is published even if its PR has since
 # moved to a newer head or closed. The PR number comes from <sha>.pr, recorded when the review ran.
@@ -250,3 +284,25 @@ for m in "$STATE"/*.msg; do
   if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication (no longer the PR head)"; continue; fi
   if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed (no longer the PR head)"; fi
 done
+
+# Heartbeat (v1.2.0): at most one per HEARTBEAT_SECONDS; a failure is logged and retried on the next tick.
+heartbeat() {
+  local every="${HEARTBEAT_SECONDS:-3600}" now last main
+  [[ "$every" =~ ^(0|[1-9][0-9]*)$ ]] || every=3600
+  now="$(date -u +%s)"
+  last="$(cat "$STATE/heartbeat.last" 2>/dev/null || echo 0)"
+  [[ "$last" =~ ^(0|[1-9][0-9]*)$ ]] || last=0
+  (( last <= now )) || last=0   # a clock step back or a bad value never silences the heartbeat
+  (( now - last >= every )) || return 0
+  if [[ $DRY -eq 1 ]]; then log "WOULD post heartbeat"; return 0; fi
+  main="$(gh_api GET "/repos/$REPO/commits/main" | jq -r '.sha // empty')" || { log "heartbeat: cannot read main"; return 1; }
+  [[ "$main" =~ ^[0-9a-f]{40}$ ]] || { log "heartbeat: bad main sha"; return 1; }
+  local d; d="alive at $(date -u +%FT%TZ), $count open PRs, $waiting waiting for green CI"
+  (( unreadable == 0 )) || d="$d, $unreadable CI unreadable (token)"
+  jq -n --arg d "$d" \
+    '{state: "success", context: "codex-review-watch", description: $d}' > "$TMP/heartbeat.json"
+  gh_api POST "/repos/$REPO/statuses/$main" "$TMP/heartbeat.json" >/dev/null || { log "heartbeat: post failed; will retry"; return 1; }
+  echo "$now" > "$STATE/heartbeat.last" || { log "heartbeat: cannot write state"; return 1; }
+  log "heartbeat posted on main ${main:0:7}"
+}
+heartbeat || true
