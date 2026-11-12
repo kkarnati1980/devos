@@ -159,7 +159,8 @@ test("AT4/AT6: the generated server starts with `node src/server.mjs` from a pat
     const timer = setTimeout(() => finish("timeout"), 30_000);
     child.stdout.on("data", (d) => { stdout += d; if (/"msg":"listening"/.test(stdout)) finish("listening"); });
     child.stderr.on("data", (d) => { stderr += d; });
-    child.on("exit", () => finish("exited"));
+    child.on("close", () => finish("exited"));
+    child.on("error", (e) => { stderr += String(e && e.message); finish("exited"); });
   });
   let started;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -172,7 +173,9 @@ test("AT4/AT6: the generated server starts with `node src/server.mjs` from a pat
     const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(10_000) });
     assert.equal(r.status, 200, "the server never answered /health");
     assert.ok(await r.json(), "the /health body is JSON");
-  } finally { child.kill(); }
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) { const closed = new Promise((r) => child.once("close", r)); child.kill(); await closed; }
+  }
 });
 
 test("AT6: apply refuses unknown, floor or opt-in IDs and a non-empty output, writing nothing; a module with no add-on is pending", () => {
