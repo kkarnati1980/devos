@@ -12,7 +12,7 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadDb: async (url) => {
@@ -49,11 +49,16 @@ async function main(): Promise<void> {
     notify,
     deadLetters,
     approvals,
+    requirements,
     tls,
   });
   app.enableShutdownHooks();
   await app.listen(config.port, config.host);
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null });
+  // M2.2-d3c1: decided requirements cards are applied without waiting for the sync POST; stopped with the process.
+  requirementsSync?.start();
+  process.once("SIGTERM", () => requirementsSync?.stop());
+  process.once("SIGINT", () => requirementsSync?.stop());
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null });
 }
 
 main().catch((e: unknown) => {

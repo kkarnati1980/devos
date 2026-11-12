@@ -1,0 +1,7 @@
+{
+  "id": "SM-01",
+  "name": "API input and contracts",
+  "files": ["src/validate.mjs", "test/sm-01-validate.test.mjs"],
+  "checks": { "SM-01-L1": "test/sm-01-validate.test.mjs" },
+  "usage": "Wrap each route handler with validated({ body, query, params }, handler). Invalid input gets 400 (413 too large, 415 not JSON) and never reaches the handler. Use invalidCases(schema, validExample) in contract tests (top-level fields; write nested cases by hand) and assertAllValidated(routes) in an app test."
+}

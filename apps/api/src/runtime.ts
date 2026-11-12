@@ -2,7 +2,7 @@
 // Secrets are read by name only and never logged.
 import { PolicyEngine, PrismaPolicyStore, type PrismaLike } from "@devos/policy";
 import type { KkSessionRegistry } from "./auth.js";
-import { withTimeout } from "./http.js";
+import { stdoutSink, withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore, writeAudit } from "./settings.js";
 import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
@@ -11,7 +11,13 @@ import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js"
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
 import { parseSmtpConfig } from "./smtp.js";
+import { RequirementsPipeline } from "@devos/analyst";
+import { PrismaRequirementsStore } from "./requirements-store.js";
+import type { RequirementsServices } from "./requirements.js";
+import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
+import type { ModelRunner } from "@devos/analyst";
+import { PrismaAnalystRunRows, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
 export interface DbClient extends PrismaLike {
@@ -40,6 +46,12 @@ export function dbReadiness(db: DbClient, timeoutMs: number): ReadinessProbe {
     ).then(() => undefined);
 }
 
+/**
+ * M2.2-d3a (pre-review finding 1): a spec save upserts up to 2 000 requirement rows in one transaction, so it gets
+ * its own bound instead of the short outbound timeout; the same 30 s the spec route allows for the body.
+ */
+export const REQUIREMENTS_TX_MS = 30_000;
+
 export interface Runtime {
   grants: GrantService | null;
   readiness: ReadinessProbe;
@@ -51,6 +63,10 @@ export interface Runtime {
   deadLetters: DeadLetterServices;
   /** M2.3-b1: the approvals inbox needs the database and the policy engine. */
   approvals: ApprovalRouteServices;
+  /** M2.2-d3a: spec intake needs the database and the approvals core (its cards). */
+  requirements: RequirementsServices;
+  /** M2.2-d3c1: the periodic `syncApproval` job, present only when spec intake is wired; main.ts starts it. */
+  requirementsSync: RequirementsSyncJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -70,6 +86,12 @@ export async function buildRuntime(
     loadDb: (url: string) => Promise<DbClient>;
     /** DEVOS-77: opens M1.5's RunQueue on `REDIS_URL` (absent → no dead-letter view). */
     loadQueue?: (redisUrl: string) => Promise<DeadLetterQueue>;
+    /**
+     * M2.2-d3b1: builds M1.5's RunEngine (with the Anthropic adapter) over this database and policy engine for the
+     * analyst model pass. Absent → model pass off. M2.2-d3b2 supplies it from main.ts, importing the run engine at
+     * runtime like @devos/db, so the API typechecks on its own.
+     */
+    loadAnalystEngine?: (db: DbClient, policy: PolicyEngine) => Promise<RunExecutor>;
   },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
@@ -85,8 +107,10 @@ export async function buildRuntime(
   const noNotify: NotifyServices = { notifier: null };
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
-  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals };
-  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals };
+  const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null };
+  if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
+  if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
   const setup: SetupServices = {
     settings: new PrismaSettingsStore(db, opts.outboundTimeoutMs),
@@ -118,17 +142,48 @@ export async function buildRuntime(
         }
       : noDead;
   // M2.3-b1: the approvals core over Postgres, the same engine for grants, and M1.6 for the "new card" notice.
+  const approvalStore = new PrismaApprovalStore(db, t);
+  const approvalsCore = new Approvals({
+    store: approvalStore,
+    grants: engine as unknown as GrantIssuer,
+    notifier,
+    verifyKkSession: opts.kkSessions.verify,
+  });
   const approvals: ApprovalRouteServices = {
-    approvals: new Approvals({
-      store: new PrismaApprovalStore(db, t),
-      grants: engine as unknown as GrantIssuer,
-      notifier,
-      verifyKkSession: opts.kkSessions.verify,
-    }),
+    approvals: approvalsCore,
     grantsFor: (approvalId) => grantsForApproval(db, approvalId, t),
     revokeGrant: (session, grantId) => engine.revokeGrant(session as Parameters<PolicyEngine["revokeGrant"]>[0], grantId),
   };
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals };
+  // M2.2-d3b1: the model pass is one M1.5 run per call (role analyst, Sonnet); the engine reserves, meters and records cost.
+  const runner: ModelRunner | null = opts.loadAnalystEngine
+    ? runEngineModelRunner(new PrismaAnalystRunRows(db as unknown as AnalystRowsDb, t), await opts.loadAnalystEngine(db, engine))
+    : null;
+  const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner);
+  const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
+}
+
+/**
+ * M2.2-d3a (contract M2.2, "M2.2-d3a — Behaviour"): the analyst pipeline over Postgres, raising its cards through
+ * the M2.3 approvals core (dedupe against a pending twin, the KK notice) and reading decisions from the same store.
+ * Question cards block no task (no tasks exist at intake, and the core accepts only task ids). The model pass runs
+ * only when a run-backed runner is supplied (M2.2-d3b1); without one, analysis is deterministic only.
+ */
+export function requirementsServices(
+  store: NonNullable<RequirementsServices["store"]>,
+  approvals: Pick<Approvals, "raiseCard">,
+  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister,
+  runner: ModelRunner | null = null,
+): RequirementsServices {
+  const pipeline = new RequirementsPipeline({
+    store,
+    raiseRequirementsCard: async (card) => ({ id: (await approvals.raiseCard(card)).id }),
+    // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
+    raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
+    runner,
+  });
+  return { pipeline, store, cards: { get: (id) => cards.get(id) } };
 }
 
 /**
