@@ -175,20 +175,36 @@ function blockText(b: Block): string {
   return b.text;
 }
 
+/** Strips leading/trailing dots and hyphens by index (no regex, so no backtracking on long runs). */
+function trimEdgePunct(s: string): string {
+  let i = 0;
+  let j = s.length;
+  while (i < j && (s[i] === "." || s[i] === "-")) i++;
+  while (j > i && (s[j - 1] === "." || s[j - 1] === "-")) j--;
+  return s.slice(i, j);
+}
+
+const CONNECTOR_WORDS: ReadonlySet<string> = new Set(["and", "or", "see"]);
+
+/** True when the text is only requirement IDs plus punctuation/emphasis (a reference list item). */
+function isBareIdReference(text: string, prefixes: readonly string[]): boolean {
+  const ids = new Set(extractRequirementIds(text, prefixes).map((r) => r.id));
+  if (ids.size === 0) return false;
+  // One linear pass over the item's tokens (PR53-r4: no per-ID rescans). A token is a run of letters, digits,
+  // dots and hyphens; edge dots/hyphens are punctuation. Each token must be an extracted ID or a connector word,
+  // or carry no letter/digit at all. Whole-token matching also keeps FR-1 from eating FR-10 or FR-1.2 (PR53-r3).
+  for (const raw of text.split(/[^\p{L}\p{N}.\-]+/u)) {
+    const tok = trimEdgePunct(raw);
+    if (tok === "" || ids.has(tok) || CONNECTOR_WORDS.has(tok.toLowerCase())) continue;
+    if (/[\p{L}\p{N}]/u.test(tok)) return false;
+  }
+  return true;
+}
+
 /**
  * Deterministic Analyst pass (M2.2-a): spec blocks → requirements, milestones, stack and open questions.
  * Every item points at the block it came from; nothing is produced from outside the blocks.
  */
-/** True when the text is only requirement IDs plus punctuation/emphasis (a reference list item). */
-function isBareIdReference(text: string, prefixes: readonly string[]): boolean {
-  const ids = extractRequirementIds(text, prefixes);
-  if (ids.length === 0) return false;
-  let rest = text;
-  // Longest first, so removing FR-1 cannot eat the prefix of FR-10 or FR-1.2 (PR53-r3).
-  for (const { id } of [...ids].sort((x, y) => y.id.length - x.id.length)) rest = rest.split(id).join(" ");
-  return !/[\p{L}\p{N}]/u.test(rest.replace(/\b(and|or|see)\b/gi, " "));
-}
-
 export function analyzeSpec(blocks: readonly Block[], options: AnalyzeOptions = {}): Analysis {
   const prefixes = options.idPrefixes ?? DEFAULT_ID_PREFIXES;
   const assignPrefix = options.assignPrefix ?? "FR";

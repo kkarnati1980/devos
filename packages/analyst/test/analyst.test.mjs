@@ -359,3 +359,18 @@ test("AT10b (PR53-r2, r3) bare ID list items (also overlapping IDs) are referenc
   assert.deepEqual(a.openQuestions.filter((q) => q.kind === "stated").map((q) => q.text), ["FR-A001: Users can export reports; format TBD"]);
   assert.equal(a.openQuestions.filter((q) => q.kind === "missing-acceptance").length, 0);
 });
+
+test("AT10c (PR53-r4) one bare-ID item with 100k distinct IDs stays linear; trailing dots and emphasis are punctuation", () => {
+  const ids = Array.from({ length: 100000 }, (_, i) => `FR-${i + 1}`).join(", ");
+  const t0 = Date.now();
+  const big = analyze(`## Requirements\n\n- ${ids}\n- Users can sign up\n`).a;
+  assert.ok(Date.now() - t0 < 5000, "100k IDs in one item took too long");
+  assert.deepEqual(big.requirements.map((r) => r.title), ["Users can sign up"]);
+  const { a } = analyze(`## Requirements
+
+- *FR-3* and FR-4, FR-1.2.
+- FR-5 export
+- x-FR-6
+`);
+  assert.deepEqual(a.requirements.map((r) => r.title), ["FR-5 export", "x-FR-6"]);
+});
