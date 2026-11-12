@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "DevOS Analyst (M2.2-a): deterministic spec blocks to requirements, milestones, stack and open questions; requirements.md renderer.",
+  "description": "DevOS Analyst (M2.2-a/b): deterministic spec blocks to requirements, milestones, stack and open questions; validated model-assisted pass; requirements.md renderer.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {

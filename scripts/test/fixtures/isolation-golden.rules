@@ -1,0 +1,27 @@
+*filter
+:DEVOS-ISO-FWD - [0:0]
+:DEVOS-ISO-IN - [0:0]
+-A DEVOS-ISO-FWD ! -s 10.208.0.0/14 -j RETURN
+-A DEVOS-ISO-FWD -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DEVOS-ISO-FWD -s 10.208.0.0/24 -d 10.208.0.0/24 -m comment --comment "alpha/preview" -j RETURN
+-A DEVOS-ISO-FWD -s 10.208.0.0/24 -d 100.101.102.103/32 -m comment --comment "alpha/preview tailnet" -j RETURN
+-A DEVOS-ISO-FWD -s 10.209.1.0/24 -d 10.209.1.0/24 -m comment --comment "beta/live" -j RETURN
+-A DEVOS-ISO-FWD -d 10.0.0.0/8 -j DROP
+-A DEVOS-ISO-FWD -d 172.16.0.0/12 -j DROP
+-A DEVOS-ISO-FWD -d 192.168.0.0/16 -j DROP
+-A DEVOS-ISO-FWD -d 100.64.0.0/10 -j DROP
+-A DEVOS-ISO-FWD -d 169.254.0.0/16 -j DROP
+-A DEVOS-ISO-FWD -d 127.0.0.0/8 -j DROP
+-A DEVOS-ISO-FWD -d 0.0.0.0/8 -j DROP
+-A DEVOS-ISO-FWD -d 224.0.0.0/4 -j DROP
+-A DEVOS-ISO-FWD -d 240.0.0.0/4 -j DROP
+-A DEVOS-ISO-FWD -s 10.209.1.0/24 -m comment --comment "beta/live egress" -j RETURN
+-A DEVOS-ISO-FWD -j DROP
+-A DEVOS-ISO-IN ! -s 10.208.0.0/14 -j RETURN
+-A DEVOS-ISO-IN -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DEVOS-ISO-IN -s 10.208.0.0/24 -d 10.208.0.1 -p udp --dport 53 -j ACCEPT
+-A DEVOS-ISO-IN -s 10.208.0.0/24 -d 10.208.0.1 -p tcp --dport 53 -j ACCEPT
+-A DEVOS-ISO-IN -s 10.209.1.0/24 -d 10.209.1.1 -p udp --dport 53 -j ACCEPT
+-A DEVOS-ISO-IN -s 10.209.1.0/24 -d 10.209.1.1 -p tcp --dport 53 -j ACCEPT
+-A DEVOS-ISO-IN -j DROP
+COMMIT

@@ -25,6 +25,12 @@ export interface StepSpec {
   action: string;
   lookup(): Promise<Found | null>;
   create(): Promise<Found>;
+  /**
+   * M2.4-b: `false` for a step whose result is not a deletable resource (the core commit lives inside the repo,
+   * which is the inventory row). The step is still journalled; nothing is written to `resource`, so M2.5's purge
+   * never meets a kind it cannot delete.
+   */
+  inventory?: false;
 }
 
 export type StepStatus = "pending" | "done" | "failed";
@@ -133,7 +139,9 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
 
   const record = async (f: Found): Promise<void> => {
     try {
-      await store.recordResource(projectId, { provider: spec.provider, kind: spec.kind, externalId: f.externalId, name: f.name });
+      if (spec.inventory !== false) {
+        await store.recordResource(projectId, { provider: spec.provider, kind: spec.kind, externalId: f.externalId, name: f.name });
+      }
     } catch (e) {
       if (e instanceof Error && e.message === "resource_owned_elsewhere") {
         const err = new StepError(spec.key, "resource_owned_elsewhere", false, true,
