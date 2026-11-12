@@ -79,6 +79,10 @@ export function requirementText(
   const b = blocks[r.source];
   if (!b) return "";
   if (b.type !== "table") return b.text;
+  // The key's own prefix always counts, so a spec analysed with custom `idPrefixes` (`SHOP-1`) still finds
+  // its rows without the caller passing them again (PR56-r3).
+  const own = /^[A-Za-z][A-Za-z0-9]*(?=[-_.]?\d)/.exec(r.key)?.[0];
+  if (own && /^[A-Z][A-Z0-9]{0,9}$/.test(own) && !prefixes.includes(own)) prefixes = [...prefixes, own];
   // A row belongs to the ID that opens its first ID-bearing cell (emphasis ignored), never to an ID that
   // only appears inside another row's title (PR56-r1).
   const rowKey = (cells: readonly string[]): string | null => {

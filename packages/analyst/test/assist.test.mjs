@@ -357,3 +357,22 @@ The shop owner can publish a daily menu with prices for each bread.
   assert.ok(!r.analysis.requirements.some((x) => x.proposed));
   assert.ok(r.warnings.some((w) => w.code === "proposal-rejected" && w.reason === "source-not-candidate"));
 });
+
+test("AB8d (PR56-r3) a table requirement with a custom ID prefix is still sent for criteria", async () => {
+  const md = `| ID | Requirement |
+|---|---|
+| SHOP-1 | Export orders to CSV |
+| SHOP-2 | SHOP-1 style import of products |
+`;
+  const blocks = blocksOf(md);
+  const a = analyzeSpec(blocks, { idPrefixes: ["SHOP"] });
+  assert.deepEqual(a.requirements.map((r) => r.key), ["SHOP-1", "SHOP-2"]);
+  const calls = [];
+  const r = await assistAnalysis(blocks, a, fake({ requirements: [], criteria: [] }, calls));
+  assert.equal(r.called, true);
+  const lines = calls[0].prompt.split("\n").filter((l) => l.startsWith("{\"block\""));
+  const line = (k) => lines.find((l) => l.includes(`"requirement":"${k}"`));
+  assert.ok(line("SHOP-1").includes("Export orders to CSV"));
+  assert.ok(line("SHOP-2").includes("import of products"));
+  assert.ok(!line("SHOP-1").includes("import"), "SHOP-1 is grounded on its own row");
+});
