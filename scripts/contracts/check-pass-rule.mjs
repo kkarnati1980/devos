@@ -50,7 +50,7 @@ export function validateContract(text, file = "contract") {
     // non-blank, non-comment line in it must be a command, and a fence with a command anchors its item.
     const items = [];
     const fences = new Map(); // item index -> array of fence bodies
-    let open = false;
+    let open = false, inItem = false;
     for (let i = s + 1; i < lines.length; i++) {
       const { l, fenced } = lines[i];
       const m = /^(#+)\s/.exec(l);
@@ -58,8 +58,14 @@ export function validateContract(text, file = "contract") {
       if (!fenced && m) { open = false; continue; } // a deeper sub-heading inside the section is structure, not an item
       // a fenced block is an item of its own: its text never lends an anchor to, or borrows one from, a neighbour
       if (fenced) {
-        if (lines[i].edge) { if (lines[i].opened) { if (!items.length) items.push(""); const k = items.length - 1; fences.set(k, [...(fences.get(k) ?? []), []]); } continue; }
-        fences.get(items.length - 1).at(-1).push(l); open = false; continue;
+        if (lines[i].edge) {
+          // an indented fence inside an open bullet is part of that bullet, so an indented line after it still
+          // continues the bullet; any other fence ends it (PR71-r3)
+          if (lines[i].opened) { inItem = open && /^\s+\S/.test(l); if (!items.length) items.push(""); const k = items.length - 1; fences.set(k, [...(fences.get(k) ?? []), []]); }
+          else open = inItem;
+          continue;
+        }
+        fences.get(items.length - 1).at(-1).push(l); continue;
       }
       if (!l.trim()) { open = false; continue; }
       if (/^\s*([-*]|\d+\.)\s+/.test(l)) { items.push(l.replace(/^\s*([-*]|\d+\.)\s+/, "")); open = true; }

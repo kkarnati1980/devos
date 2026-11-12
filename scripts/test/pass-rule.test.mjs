@@ -84,6 +84,11 @@ test("the contract template and the backfilled current-phase Lane A contracts pa
   }
 });
 
+test("PR71-r3: a top-level fence ends the bullet, so a following indented-less line is its own item and needs an anchor", () => {
+  const r = validateContract(c("## Pass rule\n- Run the suite\n```sh\npnpm test\n```\nworks as expected\n"));
+  assert.equal(r.ok, false);
+});
+
 test("pre-review: no false accepts — paragraphs after a bullet, template comments, loose anchors, fenced headings", () => {
   const bad = [
     "## Pass rule\n- `pnpm test` exits 0\n\nThe dashboard looks good and the model is confident.\n",
@@ -107,6 +112,8 @@ test("pre-review: no false rejects — fenced commands, plural heading, pytest/a
     "## Pass rule\n### Part a\n- AT1 passes\n",
     "## Pass rule\n- `pytest -q tests/` exits 0\n", "## Pass rule\n- `axe http://localhost` reports at most 0 violations\n",
     "## Pass rule\n- `GET /health` returns 200\n",
+    // PR71-r3: an indented fence inside a bullet, then an indented continuation of the same bullet
+    "## Pass rule\n- Run the suite\n  ```sh\n  pnpm test\n  ```\n  with all fixtures enabled.\n",
   ]) assert.deepEqual(validateContract(c(good)).errors, [], good);
 });
 
