@@ -157,7 +157,9 @@ function request(url, addr, { method, headers, body, deadline, maxBytes }) {
     }); } catch (e) { reject(new SafeFetchError("request", `invalid request: ${e && e.code ? e.code : "error"}`)); return; }
     const timer = setTimeout(() => fail(new SafeFetchError("timeout", "timed out")), Math.max(1, deadline - Date.now()));
     req.on("error", (e) => fail(e instanceof SafeFetchError ? e : new SafeFetchError("network", `request failed: ${e && e.code ? e.code : "error"}`)));
-    if (body !== undefined) req.write(body);
-    req.end();
+    // write/end can throw synchronously (Codex PR32-r8); every failure is a SafeFetchError and the request and its
+    // timer are cleaned up through fail(), never left running behind a native rejection.
+    try { if (body !== undefined) req.write(body); req.end(); }
+    catch (e) { fail(new SafeFetchError("request", `invalid request body: ${e && e.code ? e.code : "error"}`)); }
   });
 }

@@ -116,3 +116,12 @@ test("IPv6 forms that embed an internal IPv4 address are refused", () => {
   for (const a of ["::ffff:0:7f00:1", "::ffff:0:a9fe:a9fe", "2002:7f00:1::1", "2002:a9fe:a9fe::", "fec0::1", "100::1", "::ffff:10.0.0.1"]) assert.equal(isBlockedAddress(a), true, a);
   assert.equal(isBlockedAddress("2002:5db8:d822::1"), false, "6to4 of a public address");
 });
+
+test("an unsupported body is a SafeFetchError with a code, and nothing is left running (Codex PR32-r8)", async () => {
+  const before = process.getActiveResourcesInfo().filter((x) => x === "Timeout" || x === "TCPSocketWrap").length;
+  await assert.rejects(safeFetch(`http://stub.test:${port}/echo`, { ...stub, method: "POST", body: { not: "a buffer" }, timeoutMs: 2000 }),
+    (e) => e.name === "SafeFetchError" && e.code === "request");
+  await new Promise((r) => setTimeout(r, 50));   // let a destroyed socket finish closing
+  const after = process.getActiveResourcesInfo().filter((x) => x === "Timeout" || x === "TCPSocketWrap").length;
+  assert.ok(after <= before, `resources left: ${before} -> ${after}`);
+});

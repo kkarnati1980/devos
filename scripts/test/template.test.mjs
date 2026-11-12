@@ -31,7 +31,7 @@ test("AT2/AT4/AT5: the generated core's own tests pass (F2-2 corpus, caps, /heal
   const out = fresh("core-tests");
   const r = spawnSync(process.execPath, ["--test", "test/safe-fetch.test.mjs", "test/server.test.mjs"], { cwd: out, encoding: "utf8", timeout: 60_000, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT")) });
   assert.equal(r.status, 0, r.stdout.slice(-3000) + r.stderr.slice(-2000));
-  assert.match(r.stdout, /# pass 21/);
+  assert.match(r.stdout, /# pass 22/);
   assert.match(r.stdout, /# fail 0/);
 });
 
@@ -210,4 +210,21 @@ test("AT3: src/server.mjs may serve with node:http but never use its client side
     write(out, "src/server.mjs", code);
     assert.ok(floorCheck(out).some((l) => l.startsWith("FAIL F2-1 src/server.mjs:")), name);
   }
+});
+
+test("Codex PR32-r8: F1-4 flags any use of process in browser code, however it is spelled; comments and plain strings are not uses", () => {
+  const out = fresh("f14");
+  const bad = {
+    "public/a.js": "const token = process . env.API_TOKEN;\n",
+    "public/b.js": "const t = process\n  .env.API_TOKEN;\n",
+    "public/c.js": "const p = process; export const t = p.env.X;\n",
+    "public/d.js": 'export const t = globalThis["process"].env.X;\n',
+    "public/e.js": "export const t = `${process.env.X}`;\n",
+    "public/f.js": "const t = process/* gap */.env.X;\n",
+  };
+  const good = { "public/ok.js": '// process.env is not read here\nconst label = "process.env"; job.process(); export { label };\n' };
+  for (const [f, src] of Object.entries({ ...bad, ...good })) write(out, f, src);
+  const f = floorCheck(out);
+  for (const name of Object.keys(bad)) assert.ok(f.some((l) => l.startsWith(`FAIL F1-4 ${name}:`)), `${name} in\n${f.join("\n")}`);
+  assert.ok(!f.some((l) => l.includes("public/ok.js")), f.join("\n"));
 });

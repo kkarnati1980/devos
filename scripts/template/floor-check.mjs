@@ -115,7 +115,14 @@ export function floorCheck(dir) {
         }
       }
     }
-    if (posix.startsWith("public/") && /process\.env/.test(src)) fails.push(`FAIL F1-4 ${posix}: client code reads process.env`);
+    // F1-4 (Codex PR32-r8): browser code has no reason to touch `process` at all, so any use of the identifier is a
+    // finding, however it is spelled (`process . env`, `process\n.env`, `const p = process`), once comments and
+    // strings are blanked (an interpolated template literal is kept and checked). A string that is exactly "process" is flagged too, for computed access (`globalThis["process"]`).
+    if (posix.startsWith("public/")) {
+      const code = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`/g,
+        (x) => (/^(["'`])process\1$/.test(x) ? "process" : x[0] === "`" && x.includes("${") ? x : " ".repeat(x.length)));
+      if (/(^|[^.\w$])process(?![\w$])/.test(code)) fails.push(`FAIL F1-4 ${posix}: client code reads process.env`);
+    }
     const m = src.match(/CLIENT_CONFIG_KEYS\s*=\s*\[([^\]]*)\]/);
     if (m) for (const k of m[1].match(/["'][^"']+["']/g) || []) if (SECRET_SHAPE.test(k)) fails.push(`FAIL F1-4 ${posix}: secret-shaped client config key ${k}`);
   }
