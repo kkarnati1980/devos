@@ -5,7 +5,7 @@
 
 import type { GitHubClient } from "./github.js";
 import { ProviderError, type Transport } from "./http.js";
-import { TEMPLATE_MANIFEST, assertRepoPath, type RepoFile } from "./repo-content.js";
+import { TEMPLATE_MANIFEST, assertRepoPath, blobSha, type RepoFile } from "./repo-content.js";
 import { StepError, type Found, type StepSpec } from "./runner.js";
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
@@ -31,17 +31,28 @@ export class CoreRepo {
     this.base = `/repos/${owner}/${repo}`;
   }
 
-  /** The commit `main` points at; null when the branch (or any commit) does not exist yet. */
-  async mainHead(): Promise<string | null> {
+  /**
+   * The commit `main` points at; "empty" when GitHub says the repo has no commits (409), null when the branch does
+   * not exist (404). Any other answer is inconclusive (a `bad-response`), never "absent" (Codex PR44-r1 pattern).
+   */
+  async mainHead(): Promise<string | null | "empty"> {
     try {
       const r = await this.http.get<{ object?: { sha?: unknown; type?: unknown } }>(`${this.base}/git/ref/heads/main`);
-      if (r.status === 404 || r.body === null) return null;
-      if (r.body.object?.type !== "commit") throw badResponse("GET git/ref/heads/main", r.status);
+      if (r.status === 404) return null;
+      if (r.status !== 200 || !r.body || r.body.object?.type !== "commit") throw badResponse("GET git/ref/heads/main", r.status);
       return sha(r.body.object.sha, "GET git/ref/heads/main", r.status);
     } catch (e) {
-      if (isEmptyRepo(e)) return null;
+      if (isEmptyRepo(e)) return "empty";
       throw e;
     }
+  }
+
+  async blobContent(id: string): Promise<Buffer> {
+    const r = await this.http.get<{ content?: unknown; encoding?: unknown }>(`${this.base}/git/blobs/${sha(id, "blob id")}`);
+    if (r.status !== 200 || !r.body || r.body.encoding !== "base64" || typeof r.body.content !== "string") throw badResponse("GET git/blobs", r.status);
+    const buf = Buffer.from(r.body.content.replace(/\s/g, ""), "base64");
+    if (blobSha(buf) !== id) throw badResponse("GET git/blobs (content does not match its id)", r.status);
+    return buf;
   }
 
   /** Every blob of a commit's tree, by path. A truncated listing is inconclusive, never "different". */
@@ -101,18 +112,41 @@ export class CoreRepo {
   }
 }
 
-type MainState = { kind: "absent" } | { kind: "core"; head: string } | { kind: "bootstrap"; head: string } | { kind: "other"; head: string };
+type MainState = { kind: "absent" } | { kind: "empty" } | { kind: "core"; head: string } | { kind: "bootstrap"; head: string } | { kind: "other"; head: string };
 
-/** Compares `main` with the core: equal tree (paths, modes and blob ids), only the bootstrap file, or other content. */
+/** The manifest without `devosSha`: a redeploy between two runs changes only that field (pre-review r1). */
+const manifestKey = (content: Buffer): string | null => {
+  try {
+    const m = JSON.parse(content.toString("utf8")) as Record<string, unknown>;
+    if (m.template !== "golden-path" || !Array.isArray(m.selected) || m.selected.length || !Array.isArray(m.applied) || m.applied.length) return null;
+    const { devosSha: _ignored, ...rest } = m;
+    return JSON.stringify(Object.keys(rest).sort().map((k) => [k, rest[k]]));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Compares `main` with the core. Every file but `.devos/template.json` must match exactly (paths, modes, blob ids);
+ * the manifest must be a core-only golden-path manifest, equal to ours apart from `devosSha`, so a push made by an
+ * earlier DevOS build is still recognised as ours. Only the manifest present = our bootstrap commit.
+ */
 export async function mainState(repo: CoreRepo, files: RepoFile[]): Promise<MainState> {
   const head = await repo.mainHead();
-  if (!head) return { kind: "absent" };
+  if (head === null) return { kind: "absent" };
+  if (head === "empty") return { kind: "empty" };
   const tree = await repo.treeOf(head);
-  const same = (want: RepoFile[]): boolean =>
-    tree.size === want.length && want.every((f) => tree.get(f.path)?.sha === f.sha && tree.get(f.path)?.mode === f.mode);
-  if (same(files)) return { kind: "core", head };
-  const manifest = files.find((f) => f.path === TEMPLATE_MANIFEST);
-  if (manifest && same([manifest])) return { kind: "bootstrap", head };
+  const manifest = files.find((f) => f.path === TEMPLATE_MANIFEST)!;
+  const got = tree.get(TEMPLATE_MANIFEST);
+  let manifestOk = false;
+  if (got && got.mode === manifest.mode) {
+    manifestOk = got.sha === manifest.sha || (manifestKey(await repo.blobContent(got.sha)) ?? "x") === manifestKey(manifest.content);
+  }
+  const rest = files.filter((f) => f !== manifest);
+  if (manifestOk && tree.size === files.length && rest.every((f) => tree.get(f.path)?.sha === f.sha && tree.get(f.path)?.mode === f.mode)) {
+    return { kind: "core", head };
+  }
+  if (manifestOk && tree.size === 1) return { kind: "bootstrap", head };
   return { kind: "other", head };
 }
 
@@ -121,7 +155,15 @@ export async function mainState(repo: CoreRepo, files: RepoFile[]): Promise<Main
  * marker). External id: the commit `main` points at. Journalled but not an inventory row (`inventory: false`):
  * the commit is deleted with the repo.
  */
-export function githubCoreStep(gh: GitHubClient, p: { slug: string }, owner: string, files: RepoFile[], version: string): StepSpec {
+export function githubCoreStep(
+  gh: GitHubClient,
+  p: { slug: string },
+  owner: string,
+  files: RepoFile[],
+  version: string,
+  /** Re-checks the project lock before each ref-moving write (as c1 does after its reads, Codex PR50-r1). */
+  assertLock: () => Promise<void>,
+): StepSpec {
   if (!files.some((f) => f.path === TEMPLATE_MANIFEST)) throw new Error("template-manifest-missing");
   for (const f of files) assertRepoPath(f.path);
   const repoName = `devos-${p.slug}`;
@@ -148,7 +190,13 @@ export function githubCoreStep(gh: GitHubClient, p: { slug: string }, owner: str
       if (s.kind === "other") {
         throw new StepError("github/core", "name_conflict", false, true, `${name} already has content that is not the template core`);
       }
-      let parent = s.kind === "bootstrap" ? s.head : null;
+      const manifest = files.find((f) => f.path === TEMPLATE_MANIFEST)!;
+      // Empty repo: one Contents API commit holding only `.devos/template.json`, then the full core on top.
+      const boot = async (): Promise<string> => {
+        await assertLock();
+        return repo.bootstrap(manifest, `${message} (bootstrap)`);
+      };
+      let parent = s.kind === "bootstrap" ? s.head : s.kind === "empty" ? await boot() : null;
       let blobsDone = false;
       if (!parent) {
         try {
@@ -156,17 +204,25 @@ export function githubCoreStep(gh: GitHubClient, p: { slug: string }, owner: str
           blobsDone = true;
         } catch (e) {
           if (!isEmptyRepo(e)) throw e;
-          // Empty repo: one Contents API commit holding only `.devos/template.json`, then the full core on top.
-          parent = await repo.bootstrap(files.find((f) => f.path === TEMPLATE_MANIFEST)!, `${message} (bootstrap)`);
+          parent = await boot();
         }
       }
       if (!blobsDone) for (const f of files) await repo.createBlob(f);
       const tree = await repo.createTree(files);
       const commit = await repo.createCommit(message, tree, parent ? [parent] : []);
-      if (parent) await repo.fastForwardMain(commit);
-      else await repo.createMain(commit);
+      await assertLock();
+      try {
+        if (parent) await repo.fastForwardMain(commit);
+        else await repo.createMain(commit);
+      } catch (e) {
+        // A ref create refused because the repo still counts as empty: the next run bootstraps first.
+        if (isEmptyRepo(e)) throw new ProviderError("github", "network", "github POST git/refs: repo still empty; bootstrap on the next run");
+        throw e;
+      }
       s = await mainState(repo, files);
-      if (s.kind !== "core" || s.head !== commit) throw badResponse("main after the core push");
+      // A stale read right after the write is not a failure of the push: transient, so the runner looks up again
+      // and adopts, or ends `create_unconfirmed` (retryable), never a permanent error (pre-review r1).
+      if (s.kind !== "core" || s.head !== commit) throw new ProviderError("github", "network", "github main not yet showing the core push");
       return { externalId: commit, name, owned: true };
     },
   };

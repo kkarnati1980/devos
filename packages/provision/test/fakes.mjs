@@ -81,6 +81,10 @@ export function fakeProviders() {
       const c = g.commits.get(m[1]);
       return c ? json(200, { sha: m[1], tree: { sha: c.tree }, parents: c.parents.map((sha) => ({ sha })) }) : json(404, { message: "Not Found" });
     }
+    if (method === "GET" && (m = sub.match(/^git\/blobs\/([0-9a-f]{40})$/))) {
+      const b64 = g.blobs.get(m[1]);
+      return b64 ? json(200, { sha: m[1], encoding: "base64", content: b64.toString("base64").replace(/(.{60})/g, "$1\n") }) : json(404, { message: "Not Found" });
+    }
     if (method === "GET" && (m = sub.match(/^git\/trees\/([0-9a-f]{40})$/))) {
       const t = g.trees.get(m[1]);
       return t ? json(200, { sha: m[1], tree: t, truncated: false }) : json(404, { message: "Not Found" });

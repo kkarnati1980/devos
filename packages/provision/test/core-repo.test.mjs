@@ -16,8 +16,8 @@ const FILES = coreTemplateFiles(apply, { devosSha: "0".repeat(40) });
 
 function setup(fake = fakeProviders(), store = new MemoryStore()) {
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: noSleep });
-  const steps = () => [githubRepoStep(gh, P, "kkarnati1980"), githubCoreStep(gh, P, "kkarnati1980", FILES, "0.1.0")];
-  return { fake, store, steps, run: () => runProvision(P.id, steps(), { store, authorize: allowAll }) };
+  const steps = (files = FILES) => [githubRepoStep(gh, P, "kkarnati1980"), githubCoreStep(gh, P, "kkarnati1980", files, "0.1.0", () => store.assertLockHeld(P.id))];
+  return { fake, store, steps, run: (files) => runProvision(P.id, steps(files), { store, authorize: allowAll }) };
 }
 
 const mainTree = (fake) => {
@@ -128,7 +128,52 @@ test("AT5 main with other content is never adopted or overwritten: name_conflict
   assert.match((await s.store.getStep(P.id, "github/core")).lastError, /^name_conflict/);
 });
 
-test("a blob id that differs from the content hash stops the push before any ref moves", async () => {
+test("a blob id that differs from the content hash (valid sha, wrong value) stops the push before any ref moves", async () => {
+  const fake = fakeProviders();
+  fake.state.gitEmpty409 = false;
+  const s = setup(fake);
+  const real = fake.fetchImpl;
+  let first = true;
+  fake.fetchImpl = async (url, init = {}) => {
+    const r = await real(url, init);
+    if (first && init.method === "POST" && String(url).endsWith("/git/blobs")) { first = false; return new Response(JSON.stringify({ sha: "c".repeat(40) }), { status: 201 }); }
+    return r;
+  };
+  const s2 = setup(fake, s.store);
+  await assert.rejects(s2.run(), (e) => e instanceof StepError && e.code === "provider_error");
+  assert.equal(fake.calls.filter((c) => c.path.includes("/git/refs") && c.method !== "GET").length, 0);
+  assert.equal(fake.gitOf(FULL).main, null);
+});
+
+test("pre-review r1: a redeploy (new devosSha) between runs still recognises DevOS's own bootstrap and core commits", async () => {
+  const s = setup();
+  s.fake.faults.push({ match: (m, p) => m === "PUT" && p.includes("/contents/"), action: "timeout-after" });
+  await assert.rejects(s.run(), (e) => e.code === "create_unconfirmed");
+  const NEW = coreTemplateFiles(apply, { devosSha: "1".repeat(40) });
+  assert.notEqual(NEW.find((f) => f.path === ".devos/template.json").sha, FILES.find((f) => f.path === ".devos/template.json").sha);
+  const out = await s.run(NEW);
+  assert.equal(out[1].outcome, "created");
+  // A lost journal after another redeploy adopts the core pushed under the previous sha.
+  const fresh = new MemoryStore();
+  fresh.resources.push(...s.store.resources);
+  const writes = s.fake.creates().length;
+  const out2 = await setup(s.fake, fresh).run(FILES);
+  assert.deepEqual(out2.map((o) => o.outcome), ["adopted", "adopted"]);
+  assert.equal(s.fake.creates().length, writes);
+});
+
+test("pre-review r1: losing the lock before the ref write moves no ref", async () => {
+  const s = setup();
+  let n = 0;
+  const orig = s.store.assertLockHeld.bind(s.store);
+  s.store.assertLockHeld = async (id) => { if (++n > 5) throw new Error("provision_lock_lost"); return orig(id); }; // 2 checks per runner step, then the bootstrap check
+  await assert.rejects(s.run(), (e) => e instanceof StepError && e.step === "github/core"); // as in c1: the lost lock stops the step
+  assert.equal(s.fake.calls.filter((c) => c.method === "PUT").length, 1);
+  assert.equal(s.fake.calls.filter((c) => c.method === "POST" && c.path.endsWith("/git/commits")).length, 1);
+  assert.equal(s.fake.calls.filter((c) => c.path.includes("/git/refs") && c.method !== "GET").length, 0);
+});
+
+test("a 201 with no blob id stops the push before any ref moves", async () => {
   const fake = fakeProviders();
   fake.state.gitEmpty409 = false;
   const s = setup(fake);
