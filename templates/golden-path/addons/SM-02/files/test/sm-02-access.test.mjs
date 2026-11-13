@@ -127,8 +127,9 @@ test("the guard refuses a bad set-up: no callers, plain-text tokens, bad names",
   assert.throws(() => createGuard({ tailnetLogins: [KK], trustedProxies: LOOPBACK }), /identityProxy/);
   assert.throws(() => createGuard({ tailnetLogins: [KK], identityProxy: "tailscale-serve" }), /need trustedProxies/);
   assert.throws(() => createGuard({ tailnetLogins: [KK], identityProxy: "tailscale-serve", trustedProxies: ["172.17.0.1"] }), /nonLoopbackProxy/);
-  for (const bad of ["10.0.0.0/8", "", "proxy.local", "1.2.3"]) assert.throws(() => createGuard({ serviceTokens: svc, tailnetLogins: [KK], identityProxy: "tailscale-serve", trustedProxies: [bad] }), /IP addresses/, bad);
+  for (const bad of ["10.0.0.0/8", "", "proxy.local", "1.2.3", "::1]:80/[::1", "0:0:0:0:0:0:0:1", "::FFFF:127.0.0.1", "FE80::1"]) assert.throws(() => createGuard({ serviceTokens: svc, tailnetLogins: [KK], identityProxy: "tailscale-serve", trustedProxies: [bad] }), /IP addresses/, bad);
   assert.throws(() => createGuard({ serviceTokens: svc, trustedProxies: LOOPBACK }), /without tailnetLogins/);
+  assert.doesNotThrow(() => createGuard({ tailnetLogins: [KK], identityProxy: "tailscale-serve", trustedProxies: ["172.17.0.1", "fd7a:115c:a1e0::1", "::ffff:10.0.0.2"], nonLoopbackProxy: true }));
   assert.throws(() => createGuard({ serviceTokens: { worker: TOKEN } }), /SHA-256 hex digest/);
   assert.throws(() => createGuard({ serviceTokens: { "Bad Name": tokenDigest(TOKEN) } }), /bad service name/);
   assert.throws(() => createGuard({ tailnetLogins: ["a b"], identityProxy: "tailscale-serve", trustedProxies: LOOPBACK }), /bad tailnet login/);

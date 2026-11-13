@@ -15,11 +15,13 @@
 import crypto from "node:crypto";
 
 const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+// Written as Node reports a peer address (req.socket.remoteAddress), so a listed entry can actually match.
 const isIp = (a) => {
   if (typeof a !== "string") return false;
   if (IPV4.test(a)) return true;
-  if (!a.includes(":")) return false;
-  try { new URL(`http://[${a}]/`); return true; } catch { return false; }
+  if (a.startsWith("::ffff:") && IPV4.test(a.slice(7))) return true;
+  if (!a.includes(":") || /[^0-9a-f:]/.test(a)) return false;
+  try { return new URL(`http://[${a}]/`).hostname === `[${a}]`; } catch { return false; }
 };
 
 // Markers are module-private, so a handler cannot claim to be guarded by setting a property.
