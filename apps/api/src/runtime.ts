@@ -6,7 +6,7 @@ import { stdoutSink, withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore, writeAudit } from "./settings.js";
 import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
-import { Approvals, PrismaApprovalStore, gateFromRules, type GateName, type GrantIssuer } from "./approvals.js";
+import { Approvals, ApprovalError, PrismaApprovalStore, gateFromRules, type GateName, type GrantIssuer } from "./approvals.js";
 import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js";
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
@@ -219,7 +219,7 @@ export function grantsForApproval(db: DbClient, approvalId: string, timeoutMs: n
 export async function gateForRulesFromDb(db: DbClient, ids: readonly string[], timeoutMs: number): Promise<GateName | null> {
   const unique = [...new Set(ids.filter((x) => typeof x === "string" && x.length > 0))];
   if (unique.length === 0) return null;
-  if (unique.length > 100) throw new Error("gate-rules-too-many");
+  if (unique.length > 100) throw new ApprovalError("gate-rules-too-many", 500);
   const rows = await db.$transaction(
     async (tx: any) => {
       await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
