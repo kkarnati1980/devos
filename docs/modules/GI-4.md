@@ -16,13 +16,14 @@ Runner A approves G2, G3 or G4 only when a program, reading stored results, says
    2. every server check on the deployed main SHA is `success` (a skipped check fails), with at least one stored;
    3. every gate criterion is met, each with a link;
    4. no open KK card, `deadlocked` label or stop-and-ask item, with a link to the query;
-   5. for every merged PR, the floor guard is exit 0 with no hits on its head SHA, or exit 1 with every hit disposed on that SHA (spec §4.4). A Keep is GI-1's `applyDispositions`: a Codex verdict for the same SHA naming the hit's id and `file:line`. Hits spec §4.4 sends to KK (`gitleaksignore-added`, `policy-weakened`, and `suppression-added` of `gitleaks:allow` or `nosec`) are never cleared by Codex: they need KK's recorded answer (`decision: "keep"` with a link). A pending escalation pauses the gate. Exit 2 is never clean; a Builder cannot dispose of its own hit; an exit 0 report with hits, or exit 1 without, pauses as inconsistent;
+   5. for every merged PR, the floor guard is exit 0 with no hits on its head SHA, or exit 1 with every hit occurrence disposed on that SHA (spec §4.4). A Keep is GI-1's `applyDispositions`, applied per occurrence: a Codex verdict for the same SHA naming the hit's id and `file:line`. Hits spec §4.4 sends to KK are never cleared by Codex and need KK's recorded answer (`decision: "keep"` with a link, matched by id and `file:line`): `gitleaksignore-added`, `policy-weakened`, `suppression-added` of `gitleaks:allow`, `nosec` or a `security/` lint rule, and `ci-*` hits in or about security, secret, scan, audit or licence steps; a hit text cut at 200 characters is treated as KK-only. Any KK record that is not a single `keep` (restore, pending, conflicting) pauses, whatever the rule. Exit 2 is never clean; a Builder cannot dispose of its own hit; an exit 0 report with hits, or exit 1 without, pauses as inconsistent;
    6. every module has a pass-rule result `pass` on its merged SHA;
-   7. every merged PR has CI `success` and `codex-review` `success` on the same head SHA, and a merge-gate record showing the Release path merged that head (GI-3). Every PR a module lists must be among the merged PRs, and no PR or module is listed twice, so a PR cannot be left out of the manifest unnoticed.
+   7. every merged PR has CI `success` and `codex-review` `success` on the same head SHA, and a merge-gate record showing the Release path merged that head (GI-3), with its merge SHA. A module's merged SHA must be the merge commit of one of its own PRs. Every PR a module lists must be among the merged PRs, and no PR or module is listed twice, so a PR cannot be left out of the manifest unnoticed.
 3. Every result must carry an `https://` link without whitespace or `()[]<>`, or it counts as missing. Labels are escaped in the comment, so evidence text cannot forge a link.
 4. `decision` is `approve` only with nothing missing. Otherwise `paused`, with each missing item named and tagged with its condition number.
-5. `--comment` writes the gate-issue comment: `[runner] G<n> APPROVED …` listing each condition with the links of its results (GC7), or `[runner] G<n> PAUSED <iso>: missing …` (GC6).
-6. Exit codes: `0` approve · `1` paused · `2` could not run (bad arguments, unreadable or malformed evidence, or a gate other than G2–G4). Exit 2 is never an approval.
+5. `--comment` writes the gate-issue comment: `[runner] G<n> APPROVED …` listing each condition with the links of its results, including every Codex Keep and KK answer used (GC7), or `[runner] G<n> PAUSED <iso>: missing …` (GC6).
+6. The CLI resolves symlinks when deciding it was run directly, so it never exits 0 without evaluating.
+7. Exit codes: `0` approve · `1` paused · `2` could not run (bad arguments, unreadable or malformed evidence, or a gate other than G2–G4). Exit 2 is never an approval.
 
 ## Floor-guard self-match
 The security-suppression pattern in `evaluate-gate.mjs` is written `gitleaks[:]allow|\bnose[c]\b`, and the AT4 fixture builds its text by concatenation, so the floor guard (GI-1) does not flag these pattern strings as new suppressions. They match the same text and suppress nothing; nothing in this PR changes what the floor guard detects.
@@ -42,13 +43,13 @@ The security-suppression pattern in `evaluate-gate.mjs` is written `gitleaks[:]a
 |---|---|
 | AT1 | Complete evidence returns `approve`; the CLI exits 0 |
 | AT2 | GC6: evidence lacking one PR's floor-guard result returns `paused` naming that PR; the CLI exits 1 and the comment is a `PAUSED` line saying no KK card |
-| AT3 | Floor guard exit 2, exit 1 with an open hit, a Keep on another SHA, a Builder-sourced Keep, a Codex Keep on a KK-only hit, a pending escalation, an inconsistent report, a report on another SHA, or one without a link, all pause |
-| AT4 | A Codex Keep naming id and `file:line` on the same SHA, and KK's recorded keep on a KK-only hit, count as clean |
+| AT3 | Floor guard exit 2, exit 1 with an open hit, a Keep on another SHA, a Builder-sourced Keep, a Codex Keep on a KK-only hit (including a security-scan CI step removal and a cut-off suppression text), a pending escalation, a KK `restore` or conflicting answers on any hit, one Keep for two identical-line occurrences, an inconsistent report, a report on another SHA, or one without a link, all pause |
+| AT4 | A Codex Keep naming id and `file:line` on the same SHA, and KK's recorded keep on a KK-only hit, count as clean, and the comment links both |
 | AT5 | A module with no pass-rule result, a failing one, or one on another SHA pauses |
 | AT6 | CI or `codex-review` missing, not success, on another SHA or without a link; a missing or other-SHA merge-gate record; or a short head SHA, pauses |
-| AT7 | ADR-0013's four conditions: a blocker not Done, a skipped server check, no server checks, an unmet criterion, an open KK item, no merged PRs, a server check off the deployed SHA, no deployed SHA, a module PR left out of `mergedPrs`, a duplicate PR or module, or a module with no PR numbers, each pause |
+| AT7 | ADR-0013's four conditions: a blocker not Done, a skipped server check, no server checks, an unmet criterion, an open KK item, no merged PRs, a server check off the deployed SHA, no deployed SHA, a module PR left out of `mergedPrs`, a duplicate PR or module, a module with no PR numbers, a module merged SHA that is not one of its PRs' merge commits, or a merge-gate record with no merge SHA, each pause |
 | AT8 | GC7: the approval comment has a section for every condition and contains every stored result's link; a link with `)[` is rejected and labels are escaped |
-| AT9 | G5, malformed evidence, an unreadable or invalid file and missing arguments exit 2 |
+| AT9 | G5, malformed evidence, an unreadable or invalid file and missing arguments exit 2, also when run through a symlinked path |
 
 ## Pass rule
 - `node --test scripts/test/gate-evaluator.test.mjs` exits 0 with 9 tests passing (AT1–AT9); it runs under `pnpm test`.

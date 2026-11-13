@@ -14,7 +14,7 @@
      **Not delegated:** G5 (the pilot is on hold); the first production launch of a real app for users (a business decision); anything involving money, data deletion, legal, D11 or D13.
 
      **Amendment — gate integrity, final form (KK, 12 Nov 2026; applied 13 Nov 2026 by DEVOS-144, note 0019).** In addition to the four conditions above, approval needs these stored results, none of them produced by the runner's own judgement:
-     - the floor guard is clean (exit 0) for every PR merged in the phase, or every hit has a valid disposition (a Codex Keep or a KK escalation on that SHA);
+     - the floor guard is clean (exit 0) for every PR merged in the phase, or every hit has a valid disposition on that SHA: a Codex Keep, or for hits §4.4 sends to KK, KK's recorded keep (a Codex Keep never clears those, and a pending escalation pauses);
      - every module has a pass rule, and its stored result passes on the merged SHA;
      - every merged PR has green CI and a Codex PASS on the same head SHA, as recorded by the merge gate (`scripts/release/merge.mjs`).
 

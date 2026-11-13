@@ -27,9 +27,9 @@ function complete() {
     openKkQuery: L("kk-query"),
     mergedPrs: [
       { number: 70, headSha: H1, ci: { sha: H1, conclusion: "success", link: L("ci70") }, codex: { sha: H1, state: "success", link: L("cx70") },
-        floorGuard: fgClean(H1, L("fg70")), mergeGate: { exit: 0, headSha: H1, link: L("mg70") } },
+        floorGuard: fgClean(H1, L("fg70")), mergeGate: { exit: 0, headSha: H1, mergeSha: "e".repeat(40), link: L("mg70") } },
       { number: 71, headSha: H2, ci: { sha: H2, conclusion: "success", link: L("ci71") }, codex: { sha: H2, state: "success", link: L("cx71") },
-        floorGuard: fgClean(H2, L("fg71")), mergeGate: { exit: 0, headSha: H2, link: L("mg71") } },
+        floorGuard: fgClean(H2, L("fg71")), mergeGate: { exit: 0, headSha: H2, mergeSha: M1, link: L("mg71") } },
     ],
   };
 }
@@ -71,6 +71,16 @@ test("AT3: floor guard exit 2, open hits, a Keep on another SHA or by the Builde
     [(fg) => { const h = hitOf("gitleaksignore-added"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { const h = hitOf("policy-weakened"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.kkResolutions = [{ hit: h.id, sha: H1, decision: "escalated", link: L("card") }]; }, /needs KK's recorded answer/],
     [(fg) => { fg.report.hits = [hitOf("test-skipped")]; }, /exit 0 but hits stored/],
+    // one Keep naming line 3 does not clear an identical line 9 (GI-1 ids repeat for identical text)
+    [(fg) => { Object.assign(fg.report, { exit: 1, hits: [hitOf("test-skipped"), hitOf("test-skipped", undefined, "a.test.ts", 9)] }); fg.verdict = keep(H1); }, /a\.test\.ts:9\) without a valid disposition/],
+    // KK's restore, a pending escalation or conflicting answers override a Codex Keep on any hit
+    [(fg) => { const h = hitOf("test-skipped", undefined, "billing.test.ts"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h);
+      fg.kkResolutions = [{ hit: h.id, file: h.file, line: h.line, sha: H1, decision: "restore", link: L("kk") }]; }, /KK's recorded answer is not keep \(restore\)/],
+    [(fg) => { const h = hitOf("policy-weakened"); Object.assign(fg.report, { exit: 1, hits: [h] });
+      fg.kkResolutions = [{ hit: h.id, file: h.file, line: h.line, sha: H1, decision: "keep", link: L("k1") }, { hit: h.id, file: h.file, line: h.line, sha: H1, decision: "restore", link: L("k2") }]; }, /not keep \(keep, restore\)/],
+    // security-scanning CI removals and cut-off suppression texts are KK-only
+    [(fg) => { const h = hitOf("ci-step-removed", undefined, ".github/workflows/security.yml", 12, "- run: gitleaks detect"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    [(fg) => { const h = hitOf("suppression-added", undefined, "src/x.ts", 4, "x".repeat(200)); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { fg.report.exit = 1; }, /exit 1 with no hits/],
     [(fg) => { fg.report.sha = H2; }, /floor-guard result is not for head/],
     [(fg) => { delete fg.link; }, /floor-guard result has no link/],
@@ -90,9 +100,12 @@ test("AT4: a Codex Keep naming id and file:line on the same SHA, and KK's record
   Object.assign(ev.mergedPrs[0].floorGuard, {
     report: { sha: H1, exit: 1, hits: [h1, h2] },
     verdict: { sha: H1, source: "codex", text: `Codex PASS\nFLOOR-GUARD KEEP ${h1.id} ${h1.file}:${h1.line} reason`, link: L("v") },
-    kkResolutions: [{ hit: h2.id, sha: H1, decision: "keep", link: L("kk-answer") }],
+    kkResolutions: [{ hit: h2.id, file: h2.file, line: h2.line, sha: H1, decision: "keep", link: L("kk-answer") }],
   });
-  assert.deepEqual(evaluateGate(ev).missing, []);
+  const r = evaluateGate(ev);
+  assert.deepEqual(r.missing, []);
+  const c = renderComment(r, "t");
+  assert.ok(c.includes(L("v")) && c.includes(L("kk-answer")), "GC7: the comment links the Codex Keep and KK's answer");
 });
 
 test("AT5: a module with no pass-rule result, a failing one, or one on another SHA pauses", () => {
@@ -144,6 +157,8 @@ test("AT7: ADR-0013's four conditions — not Done, a failed or skipped server c
     [(ev) => { ev.mergedPrs.push(ev.mergedPrs[0]); }, /merged PR listed twice: 70/],
     [(ev) => { ev.modules.push({ ...ev.modules[0] }); }, /module listed twice: M2\.1/],
     [(ev) => { delete ev.modules[0].prs; }, /no merged PR numbers listed/],
+    [(ev) => { const x = "f".repeat(40); ev.modules[0].mergedSha = x; ev.modules[0].passRule.sha = x; }, /is not the merge commit of any of its PRs/],
+    [(ev) => { delete ev.mergedPrs[0].mergeGate.mergeSha; }, /merge-gate record has no merge SHA/],
   ];
   for (const [mut, re] of muts) {
     const ev = complete();
@@ -179,6 +194,10 @@ test("AT9: G5 or an unknown gate, malformed evidence, unreadable files and bad a
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gate-"));
   fs.writeFileSync(path.join(dir, "bad.json"), "{not json");
   fs.writeFileSync(path.join(dir, "g5.json"), JSON.stringify({ ...complete(), gate: "G5" }));
+  const link = path.join(dir, "link");
+  fs.symlinkSync(path.join(ROOT, "scripts"), link);
+  const viaLink = spawnSync(process.execPath, [path.join(link, "gates/evaluate-gate.mjs"), path.join(dir, "g5.json")], { encoding: "utf8" });
+  assert.equal(viaLink.status, 2, "a symlinked path still evaluates (never a silent exit 0)");
   for (const args of [[], [path.join(dir, "nope.json")], [path.join(dir, "bad.json")], [path.join(dir, "g5.json")]]) {
     const p = spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8" });
     assert.equal(p.status, 2, `args ${args}: ${p.stdout}${p.stderr}`);

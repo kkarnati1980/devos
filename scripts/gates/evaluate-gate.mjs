@@ -8,7 +8,7 @@
 // Exit codes: 0 approve · 1 paused (one or more results missing or failed; the missing items are printed) ·
 // 2 could not run (bad arguments, unreadable or malformed evidence, a gate that is never delegated).
 // Exit 2 is never an approval. Zero dependencies.
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { applyDispositions } from "../floor-guard/floor-guard.mjs";
 
@@ -19,9 +19,18 @@ const LINK = /^https:\/\/[^\s()[\]<>]+$/;
 // Secret-scanning and security-linter suppressions. Written with a one-character class so the floor guard does not
 // flag this pattern itself as a new suppression; it matches the same text and suppresses nothing (GI-4 contract).
 const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
-// Hits spec §4.4 sends to KK (security scanning, policy): a Codex Keep never clears them, only KK's recorded answer.
-export const KK_ONLY = (h) => h.rule === "gitleaksignore-added" || h.rule === "policy-weakened"
-  || (h.rule === "suppression-added" && SECURITY_SUPPRESSION.test(String(h.text ?? "")));
+// Removals in CI files that run security scanning or the D13 licence check.
+const SECURITY_CI = /secur|gitleaks|secret|scan|licen[cs]e|audit|codeql|trivy|semgrep/i;
+// GI-1 cuts hit text to 200 characters; a token past the cut cannot be ruled out, so a full-length text fails closed.
+const CUT = 200;
+// Hits spec §4.4 sends to KK (security scanning, policy, D13): a Codex Keep never clears them, only KK's recorded answer.
+export const KK_ONLY = (h) => {
+  const text = String(h.text ?? "");
+  if (h.rule === "gitleaksignore-added" || h.rule === "policy-weakened") return true;
+  if (h.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text) || text.length >= CUT;
+  if (/^ci-/.test(h.rule ?? "")) return SECURITY_CI.test(`${h.file ?? ""} ${text}`) || text.length >= CUT;
+  return false;
+};
 
 export class CannotRun extends Error {}
 
@@ -48,9 +57,10 @@ function assertShape(ev) {
  * Floor guard for one merged PR (spec §4.4, GI-1). `fg` is { report, link, verdict?, kkResolutions? }:
  * report is floor-guard.mjs's JSON report; verdict is the Codex verdict for that SHA ({ sha, source, text, link });
  * kkResolutions are KK's recorded answers to escalated hits ({ hit, sha, decision: "keep", link }).
- * Returns the list of problems (empty when clean or validly disposed).
+ * kkResolutions are matched by hit id and file:line. Returns the list of problems (empty when clean or validly
+ * disposed) and pushes the link of every disposition used onto dispLinks, for the approval comment (GC7).
  */
-export function floorGuardProblems(fg, headSha) {
+export function floorGuardProblems(fg, headSha, dispLinks = []) {
   if (!isObj(fg) || !isObj(fg.report)) return ["no stored floor-guard result"];
   const rep = fg.report;
   if (!sameSha(rep.sha, headSha)) return [`floor-guard result is not for head ${headSha}`];
@@ -65,14 +75,21 @@ export function floorGuardProblems(fg, headSha) {
   const verdictOk = isObj(v) && linkOk(v.link);
   const { exit, open } = applyDispositions(rep, verdictOk ? v : null);
   if (exit === 2) return ["floor guard exit 2 (could not run is never clean)"];
-  const keptByCodex = new Set(rep.hits.filter((h) => !open.includes(h)).map((h) => h.id));
   const kk = Array.isArray(fg.kkResolutions) ? fg.kkResolutions : [];
-  const kkKept = (h) => kk.some((r) => isObj(r) && r.hit === h.id && sameSha(r.sha, headSha) && r.decision === "keep" && linkOk(r.link));
+  // KK's answers for one hit occurrence (id and file:line, since GI-1 ids repeat for identical lines) on this SHA.
+  const answers = (h) => kk.filter((r) => isObj(r) && r.hit === h.id && r.file === h.file && r.line === h.line && sameSha(r.sha, headSha));
   const problems = [];
   for (const h of rep.hits) {
     const where = `${h.id} (${h.rule ?? "?"} ${h.file ?? "?"}:${h.line ?? "?"})`;
-    if (KK_ONLY(h)) { if (!kkKept(h)) problems.push(`hit ${where} needs KK's recorded answer (escalated or pending)`); }
-    else if (!keptByCodex.has(h.id)) problems.push(`hit ${where} without a valid disposition`);
+    const a = answers(h);
+    // Any KK record other than a single linked "keep" — restore, pending, conflicting — overrides a Codex Keep.
+    if (a.length && !(a.every((r) => r.decision === "keep") && a.every((r) => linkOk(r.link)))) {
+      problems.push(`hit ${where}: KK's recorded answer is not keep (${a.map((r) => r.decision ?? "?").join(", ")})`);
+    } else if (KK_ONLY(h)) {
+      if (!a.length) problems.push(`hit ${where} needs KK's recorded answer (escalated or pending)`);
+      else dispLinks.push(...a.map((r) => ({ label: `KK keep ${h.id} ${h.file}:${h.line}`, link: r.link })));
+    } else if (open.includes(h)) problems.push(`hit ${where} without a valid disposition`);
+    else dispLinks.push({ label: `Codex Keep ${h.id} ${h.file}:${h.line}`, link: v.link });
   }
   return problems;
 }
@@ -136,9 +153,13 @@ export function evaluateGate(ev) {
   for (const pr of ev.mergedPrs) {
     const n = `PR #${pr?.number ?? "?"}`;
     if (!isObj(pr) || !shaOk(pr.headSha)) { fail(c5, `${n}: no head SHA`); fail(c7, `${n}: no head SHA`); continue; }
-    const fgp = floorGuardProblems(pr.floorGuard, pr.headSha);
+    const disp = [];
+    const fgp = floorGuardProblems(pr.floorGuard, pr.headSha, disp);
     if (fgp.length) for (const m of fgp) fail(c5, `${n}: ${m}`);
-    else c5.results.push({ label: `${n} floor guard ${pr.floorGuard.report.hits.length ? "hits all disposed" : "exit 0"} on ${pr.headSha}`, link: pr.floorGuard.link });
+    else {
+      c5.results.push({ label: `${n} floor guard ${pr.floorGuard.report.hits.length ? "hits all disposed" : "exit 0"} on ${pr.headSha}`, link: pr.floorGuard.link });
+      for (const d of disp) c5.results.push({ label: `${n} ${d.label}`, link: d.link });
+    }
 
     const ci = pr.ci, cx = pr.codex;
     if (!isObj(ci) || ci.conclusion !== "success") fail(c7, `${n}: CI ${ci?.conclusion ?? "missing"}`);
@@ -156,6 +177,7 @@ export function evaluateGate(ev) {
     const mg = pr.mergeGate;
     if (!isObj(mg) || mg.exit !== 0) fail(c7, `${n}: no merge-gate record (scripts/release/merge.mjs exit 0)`);
     else if (!sameSha(mg.headSha, pr.headSha)) fail(c7, `${n}: merge-gate record is not for head ${pr.headSha}`);
+    else if (!shaOk(mg.mergeSha)) fail(c7, `${n}: merge-gate record has no merge SHA`);
     else if (!linkOk(mg.link)) fail(c7, `${n}: merge-gate record has no link`);
     else c7.results.push({ label: `${n} merged by the Release path at ${pr.headSha}`, link: mg.link });
   }
@@ -170,7 +192,12 @@ export function evaluateGate(ev) {
   for (const m of ev.modules) {
     if (!isObj(m)) continue;
     if (!Array.isArray(m.prs) || !m.prs.length) fail(c7, `${m.id ?? "?"}: no merged PR numbers listed`);
-    else for (const num of m.prs) if (!prNums.includes(num)) fail(c7, `${m.id ?? "?"}: PR #${num} is not among the merged PRs`);
+    else {
+      for (const num of m.prs) if (!prNums.includes(num)) fail(c7, `${m.id ?? "?"}: PR #${num} is not among the merged PRs`);
+      // The module's merged SHA must be the merge commit of one of its own PRs, so the pass rule ran on real code.
+      const merges = ev.mergedPrs.filter((p) => isObj(p) && m.prs.includes(p.number)).map((p) => p.mergeGate?.mergeSha);
+      if (shaOk(m.mergedSha) && !merges.includes(m.mergedSha)) fail(c6, `${m.id ?? "?"}: merged SHA ${m.mergedSha} is not the merge commit of any of its PRs`);
+    }
   }
 
   for (const m of ev.modules) {
@@ -224,5 +251,6 @@ export function main(argv, { now = () => new Date().toISOString(), log = console
   }
 }
 
-const isMain = () => process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// Resolve symlinks on both sides, so a symlinked path still runs the evaluator and never exits 0 silently.
+const isMain = () => { try { return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1] ?? ""); } catch { return false; } };
 if (isMain()) process.exit(main(process.argv.slice(2)));
