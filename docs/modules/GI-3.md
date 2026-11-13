@@ -21,7 +21,7 @@ Every merge into `main` goes through one function that refuses unless the stored
 5. **Floor guard:** once DEVOS-141 lands, its check name is added to `requiredCheckRuns` (step 2). Dispositions (spec §4.4) are handled with Part 1.
 6. Merge with `PUT …/pulls/<n>/merge`, `sha=<evaluated head>`, `merge_method=merge`. GitHub refuses with 409 if the head moved; the script reports the refusal and **never retries the merge**. If the PUT's outcome is ambiguous (timeout or network error, a 5xx, or a 2xx without a readable `merged: true`), the PR is read back and the PUT is never re-sent: merged on the same head → exit 0; not merged → exit 2; unreadable → exit 2 with "merge outcome unknown". Lists longer than 20 pages refuse to be judged (exit 2).
 7. Exit codes: `0` merged (or would merge, `--dry-run`) · `1` refused · `2` could not run. Exit 2 never merges.
-8. Token from `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`; never printed. Every call has a 30 s timeout (ADR-0011); GETs are retried twice on 5xx or network errors, the merge PUT never.
+8. Token from `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`; never printed. Every call has a 30 s timeout (ADR-0011); GETs are retried twice on 5xx or network errors, the merge PUT never. Between GET attempts the script waits with bounded exponential backoff and jitter (DEVOS-148, ADR-0011 §9): before retry *i* a random wait in [d/2, d] with d = min(500 ms × 2^(i−1), 4 s), so the default two retries wait at most 1.5 s in all. The PUT never waits.
 
 ## Acceptance tests (`scripts/test/merge-gate.test.mjs`)
 | # | Pass when |
@@ -45,3 +45,8 @@ Every merge into `main` goes through one function that refuses unless the stored
 ## Green (DEVOS-143)
 - **GC5** is AT5 (script side).
 - **GC4** (direct merge refused, direct push rejected) is completed by GI-3b's ruleset; evidence goes on DEVOS-140.
+
+## DEVOS-148: backoff between GET retries (runner-b, 13 Nov 2026, ADR-0013)
+- Codex PR67-r2 (low): `githubClient` retried a failed GET at once, so a short GitHub blip used up every retry together. Now each retry waits `backoffMs(i)`: base 500 ms doubling per attempt, capped at 4 s, with "equal jitter" (a random point in the upper half), so retries from two runners do not line up and the wait is never near zero. A random source outside [0, 1] or NaN is clamped. **Runner decision:** equal rather than full jitter, because a full-jitter wait of ~0 ms is the immediate retry this issue removes.
+- The sleep and the random source are injectable (`githubClient({ sleep, random })`, `main(argv, { sleep })`); tests never wait for real.
+- **Tests** (`scripts/test/merge-gate.test.mjs`): two 502s then success → two waits, in [250, 500] and [500, 1000] ms; no failures → no wait; a GET network error → retried after one wait; the merge PUT failing in flight → no wait and no retry (read back); exact schedule at jitter 0 and 1, the cap, and clamping of bad random values. AT9 passes the fake sleep.
