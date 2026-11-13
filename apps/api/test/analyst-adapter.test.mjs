@@ -129,6 +129,7 @@ test("AT-CA4 failures end the run failed and the call assist-failed, with no ret
     { name: "max_tokens stop", respond: () => reply({ stop: "max_tokens" }), requests: 1, charged: "usage" },
     { name: "bad JSON", respond: () => new Response("not json", { status: 200 }), requests: 1, charged: "reservation" },
     { name: "no content", respond: () => ({ id: "m", stop_reason: "end_turn", usage: {} }), requests: 1, charged: "reservation" },
+    { name: "no usage", respond: () => ({ ...reply(), usage: undefined }), requests: 1, charged: "reservation" },
     { name: "too large", respond: () => new Response("x".repeat(MAX_RESPONSE_BYTES + 1), { status: 200 }), requests: 1, charged: "reservation" },
     { name: "connection lost", respond: () => { throw Object.assign(new Error("socket hang up"), { name: "TypeError" }); }, requests: 1, charged: "reservation" },
   ];
@@ -138,7 +139,7 @@ test("AT-CA4 failures end the run failed and the call assist-failed, with no ret
     assert.equal(calls.length, c.requests, `${c.name}: requests`);
     const run = [...runStore.runs.values()][0];
     assert.equal(run.status, "failed", c.name);
-    assert.doesNotMatch(JSON.stringify([...runStore.runs.values(), ...runStore.events]), /secret-ish|oops|not json|socket hang up/, `${c.name}: no response text stored`);
+    assert.doesNotMatch(JSON.stringify([...runStore.runs.values(), ...runStore.events]), /secret-ish|oops|not json|socket hang up|requirements/, `${c.name}: no response text stored`);
     const usd = runStore.costs.reduce((a, r) => a + r.usd, 0);
     if (c.charged === "none") assert.equal(usd, 0, `${c.name}: not charged`);
     if (c.charged === "usage") assert.ok(Math.abs(usd - 0.007) < 1e-9, `${c.name}: charged its usage (${usd})`);
@@ -160,6 +161,13 @@ test("AT-CA5 a request past its timeout is aborted and typed timeout; an engine 
   const p = (async () => { for await (const _ of q2({ prompt: "p", options: { abortController: ac, model: ANALYST_MODEL } })) void _; })();
   setTimeout(() => ac.abort(), 20);
   await assert.rejects(p, (e) => e.name === "AbortError");
+  // Round 2, finding 4: a signal already aborted before the request sends nothing and charges nothing.
+  const pre = new AbortController();
+  pre.abort();
+  const q3 = messagesQuery({ apiKey: async () => KEY, timeoutMs: 60_000, fetch: async () => assert.fail("no request after an abort") });
+  const seen3 = [];
+  await assert.rejects(async () => { for await (const m of q3({ prompt: "p", options: { abortController: pre, model: ANALYST_MODEL } })) seen3.push(m); }, /cancelled/);
+  assert.deepEqual(seen3, [], "no usage reported for a call never sent");
   // Pre-review finding 4: the engine's cancel reaches the request, and the run is charged fail-closed, not $0.
   let seenSignal = null;
   const cancelled = setupWith(async (url, init) => ((seenSignal = init.signal), hang(url, init)));

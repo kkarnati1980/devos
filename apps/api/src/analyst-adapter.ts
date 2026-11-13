@@ -93,6 +93,8 @@ export function messagesQuery(o: MessagesQueryOptions): (args: QueryArgs) => Asy
     const signal = AbortSignal.any([options.abortController.signal, AbortSignal.timeout(o.timeoutMs)]);
     const requestBody = JSON.stringify({ model: options.model, max_tokens: ANALYST_ANSWER_MAX_TOKENS, messages: [{ role: "user", content: prompt }] });
     let body: { id?: unknown; model?: unknown; content?: unknown; usage?: Usage; stop_reason?: unknown };
+    // Cancelled before anything was sent: nothing to charge (round 2, finding 4).
+    if (signal.aborted) throw isTimeout(signal.reason) ? Object.assign(new AnalystApiError("timeout"), { name: "TimeoutError" }) : new AnalystApiError("cancelled");
     try {
       const res = await doFetch(ANTHROPIC_MESSAGES_URL, {
         method: "POST",
@@ -109,6 +111,9 @@ export function messagesQuery(o: MessagesQueryOptions): (args: QueryArgs) => Asy
       try {
         body = JSON.parse(await readCapped(res, MAX_RESPONSE_BYTES)) as typeof body;
         if (!body || typeof body !== "object" || !Array.isArray(body.content)) throw new AnalystApiError("analyst-bad-response");
+        // A billed reply always reports its token counts; without them the cost would be a $0 guess (round 2, finding 3).
+        const u = body.usage as Usage | undefined;
+        if (typeof u?.input_tokens !== "number" || typeof u?.output_tokens !== "number") throw new AnalystApiError("analyst-bad-response");
       } catch (e) {
         if (e instanceof AnalystApiError || isAbort(e)) throw e;
         throw new AnalystApiError("analyst-bad-response");
@@ -128,10 +133,11 @@ export function messagesQuery(o: MessagesQueryOptions): (args: QueryArgs) => Asy
     const id = typeof body.id === "string" ? body.id : "";
     const usage = body.usage ?? {};
     // A tool_use block cannot occur without tools; if one did, it is dropped here, never forwarded as a call.
-    const content = (body.content as unknown[]).filter((b) => (b as { type?: unknown })?.type === "text");
+    const ok = body.stop_reason === "end_turn" || body.stop_reason === "stop_sequence";
+    // A failed stop (e.g. max_tokens) keeps its usage, so its cost is metered, but none of its text (§6; round 2, 2).
+    const content = ok ? (body.content as unknown[]).filter((b) => (b as { type?: unknown })?.type === "text") : [];
     yield { type: "system", session_id: id };
     yield { type: "assistant", message: { content, usage, model: typeof body.model === "string" ? body.model : options.model } };
-    const ok = body.stop_reason === "end_turn" || body.stop_reason === "stop_sequence";
     yield {
       type: "result",
       subtype: ok ? "success" : `stop-${String(body.stop_reason)}`,
