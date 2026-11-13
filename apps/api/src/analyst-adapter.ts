@@ -6,8 +6,11 @@ import type { CapabilityEnvelope } from "@devos/policy";
 
 export const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
 export const ANTHROPIC_VERSION = "2023-06-01";
-/** Output-token cap of one answer: 32 000 × $10/MTok = $0.32, inside the run's $0.50 cap with the prompt. */
-export const ANALYST_ANSWER_MAX_TOKENS = 32_000;
+/**
+ * Output-token cap of one answer (thinking included): 8 000 × $10/MTok = $0.08. Sized so a full answer can finish
+ * inside the 90 s request deadline (pre-review finding 1); a longer answer stops `max_tokens` → assist-failed.
+ */
+export const ANALYST_ANSWER_MAX_TOKENS = 8_000;
 /** Vault name of the Anthropic key (M1.4 SECRET_NAMES). */
 export const ANTHROPIC_KEY_NAME = "anthropic_api_key";
 
@@ -42,7 +45,7 @@ export function analystModelPass(env: NodeJS.ProcessEnv): boolean {
   return env.DEVOS_ANALYST_MODEL_PASS === "on";
 }
 
-/** Largest response body read (one 32 000-token answer is well under 1 MiB of JSON). */
+/** Largest response body read (one 8 000-token answer is far under 1 MiB of JSON). */
 export const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 async function readCapped(res: Response, cap: number): Promise<string> {
@@ -62,6 +65,9 @@ async function readCapped(res: Response, cap: number): Promise<string> {
   }
   return Buffer.concat(chunks).toString("utf8");
 }
+
+const isTimeout = (e: unknown): boolean => (e as { name?: string })?.name === "TimeoutError";
+const isAbort = (e: unknown): boolean => isTimeout(e) || (e as { name?: string })?.name === "AbortError";
 
 type SdkMessage = { type: string; [k: string]: unknown };
 type QueryArgs = { prompt: string; options: { abortController: AbortController; model: string; allowedTools?: string[] } };
@@ -85,35 +91,44 @@ export function messagesQuery(o: MessagesQueryOptions): (args: QueryArgs) => Asy
     const key = await o.apiKey();
     if (!key) throw new AnalystApiError("analyst-key-missing");
     const signal = AbortSignal.any([options.abortController.signal, AbortSignal.timeout(o.timeoutMs)]);
-    let res: Response;
+    const requestBody = JSON.stringify({ model: options.model, max_tokens: ANALYST_ANSWER_MAX_TOKENS, messages: [{ role: "user", content: prompt }] });
+    let body: { id?: unknown; model?: unknown; content?: unknown; usage?: Usage; stop_reason?: unknown };
     try {
-      res = await doFetch(ANTHROPIC_MESSAGES_URL, {
+      const res = await doFetch(ANTHROPIC_MESSAGES_URL, {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": ANTHROPIC_VERSION },
-        body: JSON.stringify({ model: options.model, max_tokens: ANALYST_ANSWER_MAX_TOKENS, messages: [{ role: "user", content: prompt }] }),
+        body: requestBody,
         signal,
         redirect: "error",
       });
+      if (!res.ok) {
+        // An error reply carries no answer and is not billed: no usage, no charge. Its body is never read.
+        await res.body?.cancel().catch(() => undefined);
+        throw new AnalystApiError(`http-${res.status}`, res.status);
+      }
+      try {
+        body = JSON.parse(await readCapped(res, MAX_RESPONSE_BYTES)) as typeof body;
+        if (!body || typeof body !== "object" || !Array.isArray(body.content)) throw new AnalystApiError("analyst-bad-response");
+      } catch (e) {
+        if (e instanceof AnalystApiError || isAbort(e)) throw e;
+        throw new AnalystApiError("analyst-bad-response");
+      }
     } catch (e) {
-      const name = (e as { name?: string })?.name;
-      throw name === "TimeoutError" ? Object.assign(new AnalystApiError("timeout"), { name: "TimeoutError" }) : e;
+      if (e instanceof AnalystApiError && e.status !== undefined) throw e;
+      // Pre-review finding 1: the request was sent, so the provider may bill a generation we never read (timeout,
+      // cancel, a lost connection, an oversize or unreadable body). Report the upper bound of its tokens (every
+      // request byte as an input token, the full answer cap as output) with no cost, so M1.5 settles fail-closed:
+      // it charges the run's reservation instead of $0 (ADR-0006). Then the typed error ends the run.
+      yield {
+        type: "assistant",
+        message: { content: [], model: options.model, usage: { input_tokens: Buffer.byteLength(requestBody, "utf8"), output_tokens: ANALYST_ANSWER_MAX_TOKENS } },
+      };
+      throw isTimeout(e) ? Object.assign(new AnalystApiError("timeout"), { name: "TimeoutError" }) : e;
     }
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => undefined);
-      throw new AnalystApiError(`http-${res.status}`, res.status);
-    }
-    let body: { id?: unknown; model?: unknown; content?: unknown; usage?: Usage; stop_reason?: unknown };
-    try {
-      body = JSON.parse(await readCapped(res, MAX_RESPONSE_BYTES)) as typeof body;
-    } catch (e) {
-      if (e instanceof AnalystApiError) throw e;
-      throw new AnalystApiError("analyst-bad-response");
-    }
-    if (!body || typeof body !== "object" || !Array.isArray(body.content)) throw new AnalystApiError("analyst-bad-response");
     const id = typeof body.id === "string" ? body.id : "";
     const usage = body.usage ?? {};
     // A tool_use block cannot occur without tools; if one did, it is dropped here, never forwarded as a call.
-    const content = body.content.filter((b) => (b as { type?: unknown })?.type === "text");
+    const content = (body.content as unknown[]).filter((b) => (b as { type?: unknown })?.type === "text");
     yield { type: "system", session_id: id };
     yield { type: "assistant", message: { content, usage, model: typeof body.model === "string" ? body.model : options.model } };
     const ok = body.stop_reason === "end_turn" || body.stop_reason === "stop_sequence";

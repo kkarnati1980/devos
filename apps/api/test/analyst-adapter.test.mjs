@@ -54,6 +54,11 @@ function memoryRows(runStore) {
 
 /** buildAnalystEngine with the real run-engine module, the memory run store in place of Postgres. */
 function setup({ respond, key = KEY } = {}) {
+  const { f, calls } = fakeFetch(respond ?? (() => reply()));
+  return { ...setupWith(f, key), calls };
+}
+
+function setupWith(f, key = KEY) {
   const runStore = new MemoryRunStore();
   const adapters = [];
   const m = {
@@ -64,11 +69,10 @@ function setup({ respond, key = KEY } = {}) {
     },
   };
   const policy = new PolicyEngine({ store: new MemoryPolicyStore({ mode: "observe" }), hmacKey: randomBytes(32) });
-  const { f, calls } = fakeFetch(respond ?? (() => reply()));
   const keyReads = [];
   const engine = buildAnalystEngine(m, {}, policy, { apiKey: async () => (keyReads.push(1), key), timeoutMs: 5_000, fetch: f });
   const runner = runEngineModelRunner(memoryRows(runStore), engine);
-  return { runStore, runner, calls, adapters, keyReads, engine };
+  return { runStore, runner, adapters, keyReads, engine };
 }
 
 test("AT-CA1 one Messages API request: the vault key by header, the analyst model, a bounded answer, no tools, no redirects", async () => {
@@ -116,13 +120,17 @@ test("AT-CA3 every tool call is refused: the tool gate denies, allowedTools is r
 });
 
 test("AT-CA4 failures end the run failed and the call assist-failed, with no retry and no response text kept", async () => {
+  // charged: "none" = no cost (no request, or an unbilled error reply); "usage" = the reply's usage × price;
+  // "reservation" = the request was sent but no usable reply came back, so the engine settles fail-closed.
   const cases = [
-    { name: "no key", key: null, respond: () => assert.fail("no request without a key"), requests: 0 },
-    { name: "HTTP 429", respond: () => new Response('{"error":{"message":"secret-ish detail"}}', { status: 429 }), requests: 1 },
-    { name: "HTTP 500", respond: () => new Response("oops", { status: 500 }), requests: 1 },
-    { name: "max_tokens stop", respond: () => reply({ stop: "max_tokens" }), requests: 1 },
-    { name: "bad JSON", respond: () => new Response("not json", { status: 200 }), requests: 1 },
-    { name: "too large", respond: () => new Response("x".repeat(MAX_RESPONSE_BYTES + 1), { status: 200 }), requests: 1 },
+    { name: "no key", key: null, respond: () => assert.fail("no request without a key"), requests: 0, charged: "none" },
+    { name: "HTTP 429", respond: () => new Response('{"error":{"message":"secret-ish detail"}}', { status: 429 }), requests: 1, charged: "none" },
+    { name: "HTTP 500", respond: () => new Response("oops", { status: 500 }), requests: 1, charged: "none" },
+    { name: "max_tokens stop", respond: () => reply({ stop: "max_tokens" }), requests: 1, charged: "usage" },
+    { name: "bad JSON", respond: () => new Response("not json", { status: 200 }), requests: 1, charged: "reservation" },
+    { name: "no content", respond: () => ({ id: "m", stop_reason: "end_turn", usage: {} }), requests: 1, charged: "reservation" },
+    { name: "too large", respond: () => new Response("x".repeat(MAX_RESPONSE_BYTES + 1), { status: 200 }), requests: 1, charged: "reservation" },
+    { name: "connection lost", respond: () => { throw Object.assign(new Error("socket hang up"), { name: "TypeError" }); }, requests: 1, charged: "reservation" },
   ];
   for (const c of cases) {
     const { runner, runStore, calls } = setup({ respond: c.respond, key: c.key === undefined ? KEY : c.key });
@@ -130,7 +138,11 @@ test("AT-CA4 failures end the run failed and the call assist-failed, with no ret
     assert.equal(calls.length, c.requests, `${c.name}: requests`);
     const run = [...runStore.runs.values()][0];
     assert.equal(run.status, "failed", c.name);
-    assert.doesNotMatch(JSON.stringify([...runStore.runs.values(), ...runStore.events]), /secret-ish|oops|not json/, `${c.name}: no response text stored`);
+    assert.doesNotMatch(JSON.stringify([...runStore.runs.values(), ...runStore.events]), /secret-ish|oops|not json|socket hang up/, `${c.name}: no response text stored`);
+    const usd = runStore.costs.reduce((a, r) => a + r.usd, 0);
+    if (c.charged === "none") assert.equal(usd, 0, `${c.name}: not charged`);
+    if (c.charged === "usage") assert.ok(Math.abs(usd - 0.007) < 1e-9, `${c.name}: charged its usage (${usd})`);
+    if (c.charged === "reservation") assert.ok(usd >= 0.5 - 1e-9, `${c.name}: charged fail-closed, not $0 (${usd})`);
   }
   // An unpriced model is refused before any request, so the meter never gets a guess.
   const q = messagesQuery({ apiKey: async () => KEY, timeoutMs: 1000, fetch: async () => assert.fail("no request") });
@@ -148,6 +160,17 @@ test("AT-CA5 a request past its timeout is aborted and typed timeout; an engine 
   const p = (async () => { for await (const _ of q2({ prompt: "p", options: { abortController: ac, model: ANALYST_MODEL } })) void _; })();
   setTimeout(() => ac.abort(), 20);
   await assert.rejects(p, (e) => e.name === "AbortError");
+  // Pre-review finding 4: the engine's cancel reaches the request, and the run is charged fail-closed, not $0.
+  let seenSignal = null;
+  const cancelled = setupWith(async (url, init) => ((seenSignal = init.signal), hang(url, init)));
+  const call = cancelled.runner({ prompt: "p", tag: "analyst_assist", projectId: P1 });
+  while (!seenSignal) await new Promise((r) => setTimeout(r, 5));
+  const runId = [...cancelled.runStore.runs.keys()][0];
+  assert.equal(await cancelled.engine.cancel(runId), true);
+  await assert.rejects(call, /analyst-run-cancelled/);
+  assert.equal(seenSignal.aborted, true, "the fetch signal is aborted by the engine's cancel");
+  assert.equal(cancelled.runStore.runs.get(runId).status, "cancelled");
+  assert.ok(cancelled.runStore.costs.reduce((a, r) => a + r.usd, 0) >= 0.5 - 1e-9, "a cancelled, dispatched call is charged fail-closed");
   clearInterval(keepAlive);
 });
 
@@ -166,4 +189,26 @@ test("AT-CA6 opt-in: only DEVOS_ANALYST_MODEL_PASS=on enables the pass; buildRun
   });
   assert.equal(typeof reader, "function");
   assert.equal(await reader(), null, "no vault configured → no key → the call fails assist-failed");
+
+  // Pre-review finding 5: with a vault, the reader returns the secret stored under `anthropic_api_key`, read each call.
+  const rows = [];
+  const tx = {
+    vaultSecret: {
+      findFirst: async ({ where }) => rows.find((r) => r.projectId === where.projectId && r.name === where.name) ?? null,
+      create: async ({ data }) => { const r = { id: `v${rows.length}`, createdAt: new Date(), updatedAt: new Date(), ...data }; rows.push(r); return r; },
+      update: async ({ where, data }) => Object.assign(rows.find((r) => r.id === where.id), data, { updatedAt: new Date() }),
+    },
+    auditEvent: { create: async () => ({}) },
+  };
+  const db = { $transaction: async (fn) => fn(tx) };
+  const withVault = { ...env, DEVOS_VAULT_KEY: randomBytes(32).toString("base64") };
+  const rt = await buildRuntime(withVault, {
+    outboundTimeoutMs: 500, kkSessions: new KkSessionRegistry(), loadDb: async () => db,
+    loadAnalystEngine: async (_db, _policy, apiKey) => ((reader = apiKey), { execute: async () => ({ status: "succeeded" }) }),
+  });
+  assert.equal(await reader(), null, "no key stored yet");
+  await rt.setup.vault.put(ANTHROPIC_KEY_NAME, "test-only-key-one-0123456789");
+  assert.equal(await reader(), "test-only-key-one-0123456789");
+  await rt.setup.vault.put(ANTHROPIC_KEY_NAME, "test-only-key-two-0123456789");
+  assert.equal(await reader(), "test-only-key-two-0123456789", "a rotation applies at the next call");
 });
