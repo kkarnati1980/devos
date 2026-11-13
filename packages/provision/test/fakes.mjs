@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 export function fakeProviders() {
   const repos = new Map(); // full_name -> body
   const projects = new Map(); // uuid -> body
+  const apps = new Map(); // uuid -> application body (M2.4-c2a)
   const calls = [];
   let n = 0;
   // inject: list of { match(method, path) -> bool, action: "timeout-after" | "timeout-before" | {status} , once }
@@ -127,6 +128,38 @@ export function fakeProviders() {
 
   function coolify(method, path, init) {
     let m;
+    if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)\/envs$/))) {
+      // M2.4-c2b: like Coolify, the list returns values too; POST adds a key, PATCH updates an existing one.
+      const a = apps.get(m[1]);
+      if (!a) return json(404, { message: "Application not found." });
+      a.envs ??= [];
+      if (method === "GET") return json(200, a.envs.map((e) => ({ ...e })));
+      const b = JSON.parse(init.body);
+      if (typeof b.key !== "string" || typeof b.value !== "string") return json(422, { message: "Validation failed." });
+      const prev = a.envs.find((e) => e.key === b.key && e.is_preview === Boolean(b.is_preview));
+      if (method === "POST") {
+        if (prev) return json(409, { message: "Environment variable already exists." });
+        a.envs.push({ uuid: `ev${++n}`, key: b.key, value: b.value, is_preview: Boolean(b.is_preview), is_literal: Boolean(b.is_literal) });
+        return json(201, { uuid: `ev${n}` });
+      }
+      if (method === "PATCH") {
+        if (!prev) return json(404, { message: "Environment variable not found." });
+        prev.value = b.value;
+        return json(201, { uuid: prev.uuid });
+      }
+    }
+    if (method === "GET" && path === "/api/v1/applications") return json(200, [...apps.values()].map(({ uuid, name, description }) => ({ uuid, name, description })));
+    if (method === "POST" && path === "/api/v1/applications/dockercompose") {
+      const b = JSON.parse(init.body);
+      const p = projects.get(b.project_uuid);
+      if (!p || !(p.environments ?? []).includes(b.environment_name)) return json(404, { message: "Project or environment not found." });
+      if (typeof b.docker_compose_raw !== "string" || !b.server_uuid) return json(422, { message: "Validation failed." });
+      // Like Coolify, a domain is generated unless the create turns it off (decision 1 forbids one).
+      if (b.autogenerate_domain !== false) b.fqdn = `http://${b.name}.sslip.io`;
+      const uuid = `ap${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+      apps.set(uuid, { uuid, name: b.name, description: b.description ?? null, ...b });
+      return json(201, { uuid });
+    }
     if (method === "GET" && path === "/api/v1/projects") return json(200, [...projects.values()].map(({ uuid, name, description }) => ({ uuid, name, description })));
     if ((m = path.match(/^\/api\/v1\/projects\/([^/]+)\/environments$/))) {
       const p = projects.get(m[1]);
@@ -155,5 +188,5 @@ export function fakeProviders() {
   }
 
   const creates = () => calls.filter((c) => c.method !== "GET");
-  return { fetchImpl, calls, creates, repos, projects, faults, state, git, gitOf };
+  return { fetchImpl, calls, creates, repos, projects, apps, faults, state, git, gitOf };
 }

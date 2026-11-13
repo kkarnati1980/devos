@@ -116,7 +116,9 @@ export function portStep(store: ProvisionStore, p: { id: string; slug: string },
           return { externalId: id, name, owned: true };
         } catch (e) {
           if (e instanceof Error && e.message === "resource_owned_elsewhere") continue; // taken concurrently
-          throw e;
+          // c1 pre-review note 2 (fixed in M2.4-c2a): any other inventory failure (e.g. a DB timeout) is retryable.
+          // If the insert did commit, the next run's lookup finds this project's row and keeps the port.
+          throw new StepError(key, "provider_error", true, true, `inventory write failed while allocating the ${env} port`);
         }
       }
       throw new StepError(key, "port_range_exhausted", false, true, `no free ${env} port in ${range.from}–${range.to}`);
