@@ -20,6 +20,9 @@ export class ApprovalError extends Error {
 export const ACTION_MAX = 200;
 export const REASON_MAX = 2000;
 export const COMMENT_MAX = 2000;
+/** DEVOS-164: most cards one expireCardsById call may name, and the longest expiry reason. */
+export const EXPIRE_IDS_MAX = 500;
+export const EXPIRE_REASON_MAX = 500;
 export const DEFAULT_GRANT_HOURS = 24;
 export const MAX_GRANT_HOURS = 90 * 24;
 export const DEFAULT_CARD_WINDOW_MS = 7 * 24 * 3600 * 1000;
@@ -134,6 +137,12 @@ export interface ApprovalStore {
   comment(approvalId: string, author: string, body: string, at: Date): Promise<CardComment | null>;
   /** Pending cards created before `before` become expired (audited); their tasks stay blocked. */
   expire(before: Date, at: Date): Promise<string[]>;
+  /**
+   * DEVOS-164: each named card that is still pending becomes expired (one audit row each, `reason` in the details);
+   * decided or missing cards are left alone, and tasks stay blocked as for age expiry. Waits for (does not skip) a
+   * concurrent `decide` on the same row, so a card is either decided or expired, never both. Returns the ids expired.
+   */
+  expireIds(ids: readonly string[], at: Date, reason: string): Promise<string[]>;
   /** One audit_event outside any decision (e.g. a grant that could not be revoked). */
   recordAudit(a: AuditEntry): Promise<void>;
 }
@@ -388,6 +397,25 @@ export class Approvals {
     const now = this.now();
     return this.deps.store.expire(new Date(now - windowMs), new Date(now));
   }
+
+  /**
+   * DEVOS-164 (for M2.2-d3c2): expire specific pending cards, e.g. those of a superseded requirements version.
+   * Ids that are not UUIDs, unknown, or no longer pending are ignored; duplicates count once. Returns the ids that
+   * this call expired. System-only: there is no route to it.
+   */
+  async expireCardsById(ids: readonly string[], reason: string): Promise<string[]> {
+    // Raw bound first (BS-A01), so an oversized call is refused before any per-id work.
+    if (!Array.isArray(ids) || ids.length > 4 * EXPIRE_IDS_MAX || ids.some((i) => typeof i !== "string" || i.length > 64)) {
+      throw new ApprovalError("invalid-input");
+    }
+    const why = text(reason, EXPIRE_REASON_MAX, false);
+    if (!why) throw new ApprovalError("invalid-input");
+    if (looksSecret(why)) throw new ApprovalError("card-contains-secret");
+    const unique = [...new Set(ids.map((i) => i.toLowerCase()).filter((i) => UUID.test(i)))].sort();
+    if (unique.length > EXPIRE_IDS_MAX) throw new ApprovalError("invalid-input");
+    if (!unique.length) return [];
+    return this.deps.store.expireIds(unique, new Date(this.now()), why);
+  }
 }
 
 /** In-memory store for tests and local runs: same semantics as the Postgres store, serialised by a promise lock. */
@@ -531,6 +559,22 @@ export class MemoryApprovalStore implements ApprovalStore {
         }
       }
       return ids;
+    });
+  }
+
+  expireIds(ids: readonly string[], at: Date, reason: string) {
+    return this.serial(() => {
+      const out: string[] = [];
+      for (const id of [...new Set(ids)].sort()) {
+        const c = this.cards.get(id);
+        if (!c || c.status !== "pending") continue;
+        c.status = "expired";
+        c.decidedAt = at;
+        c.decidedBy = "system:expiry";
+        out.push(id);
+        this.audit.push({ action: "approval.expired", summary: `Expired: ${c.action}`, details: { gate: c.gate, approvalId: id, reason } });
+      }
+      return out;
     });
   }
 }
@@ -736,6 +780,32 @@ export class PrismaApprovalStore implements ApprovalStore {
         ids.push(id);
       }
       return ids;
+    });
+  }
+
+  expireIds(ids: readonly string[], at: Date, reason: string) {
+    const sorted = [...new Set(ids)].sort();
+    return this.tx(async (tx) => {
+      // FOR UPDATE (not SKIP LOCKED) in id order: a concurrent decide on one of these rows finishes first, and the
+      // WHERE is re-checked on the committed row, so a card it approved or rejected is not selected here.
+      const rows: { id: string; action: string; gate: string; projectId: string | null }[] = await tx.$queryRaw`
+        SELECT id::text AS id, action, gate::text AS gate, project_id::text AS "projectId"
+        FROM approval WHERE id = ANY(${sorted}::uuid[]) AND status = 'pending' ORDER BY id FOR UPDATE`;
+      if (!rows.length) return [];
+      // One update and one audit insert for the whole batch (pre-review: 500 cards x 2 round trips could outrun the
+      // transaction timeout).
+      const out = rows.map((r) => r.id);
+      await tx.approval.updateMany({ where: { id: { in: out } }, data: { status: "expired", decidedAt: at, decidedBy: "system:expiry" } });
+      await tx.auditEvent.createMany({
+        data: rows.map((r) => ({
+          actor: "system",
+          action: "approval.expired",
+          summary: `Expired: ${r.action}`.slice(0, 500),
+          details: { gate: r.gate, approvalId: r.id, reason },
+          projectId: r.projectId ?? null,
+        })),
+      });
+      return out;
     });
   }
 }
