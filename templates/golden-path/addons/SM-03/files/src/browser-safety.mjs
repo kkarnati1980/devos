@@ -147,12 +147,14 @@ class MarkupState {
           const name = this.tagName;
           const closing = this.tag.startsWith("</");
           const selfClose = /\/\s*>$/.test(this.tag);
+          // tagName is parsed from "<name"; a closing tag "</name" leaves it "-", so read the close name directly.
+          const closeName = closing ? (/^<\/\s*([a-zA-Z][^\s/>"']*)/.exec(this.tag)?.[1] ?? "").toLowerCase() : "";
           // Track SVG/MathML foreign content. Inside it, <title>/<textarea> are NOT RCDATA: their children are
           // parsed as markup (SVG <title>/<desc>/<foreignObject> are HTML integration points), so a nested
           // <a href="${…}"> is a real attribute that must be URL-validated, not RCDATA text. Treating the whole
           // foreign subtree as markup only ever adds validation, never removes it, which is the safe direction.
           if (!closing && !selfClose && (name === "svg" || name === "math")) this.foreign++;
-          else if (closing && (name === "svg" || name === "math") && this.foreign > 0) this.foreign--;
+          else if (closing && (closeName === "svg" || closeName === "math") && this.foreign > 0) this.foreign--;
           const rcdata = this.foreign === 0 && RCDATA.has(name);
           this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && rcdata ? "rcdata" : "text";
           if (this.mode !== "text") this.raw = name;
@@ -198,6 +200,13 @@ export function html(strings, ...values) {
     const piece = renderValue(values[i]) + strings[i + 1];
     state.feed(piece);
     out += piece;
+  }
+  // Each result must be balanced: it may not end inside a tag, attribute, comment, raw-text element or an open
+  // SVG/MathML subtree. Otherwise an unbalanced fragment could smuggle an interpolated value into an attribute
+  // that a composing parent closes and reads as static — e.g. html`<a href="${userUrl}` spliced before `">` —
+  // skipping the close-time URL check (which fires only when the quote holds an interpolated value).
+  if (state.mode !== "text" || state.foreign !== 0) {
+    throw new TypeError("html: the template must be balanced — it may not end inside a tag, attribute, comment, raw-text element or SVG/MathML subtree");
   }
   return new SafeHtml(out);
 }

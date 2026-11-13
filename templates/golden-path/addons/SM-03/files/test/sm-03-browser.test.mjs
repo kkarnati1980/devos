@@ -172,6 +172,16 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.equal(String(html`<p>a < b, ${"c"}</p>`), "<p>a < b, c</p>"); // a "<" followed by a space is text
   // After a closed raw-text element, values are allowed again.
   assert.equal(String(html`<script src="/a.js"></script><p>${"<"}</p>`), '<script src="/a.js"></script><p>&lt;</p>');
+  // A result must be balanced: an unbalanced fragment that ends inside a tag/attribute/comment/raw element or an
+  // open SVG subtree is refused, so composition cannot smuggle an un-validated URL into a parent-closed attribute.
+  assert.throws(() => html`<a href="${"javascript:alert(1)"}`, /balanced/);
+  assert.throws(() => html`<div class="x"`, /balanced/);
+  assert.throws(() => html`<svg><title>`, /balanced/);
+  assert.throws(() => html`<script>${""}`, /no value may be placed inside/); // open raw still caught earlier
+  // Balanced nested results still compose and are each validated at their own close.
+  const row = html`<a href="${"/x"}">x</a>`;
+  assert.equal(String(html`<ul>${row}</ul>`), '<ul><a href="/x">x</a></ul>');
+  assert.throws(() => html`<ul>${html`<a href="${"javascript:alert(1)"}">x</a>`}</ul>`, /URL attribute/);
   // The result is branded; a look-alike object is not accepted.
   assert.ok(isSafeHtml(html`<p></p>`));
   assert.ok(!isSafeHtml({ toString: () => "<p></p>" }));
