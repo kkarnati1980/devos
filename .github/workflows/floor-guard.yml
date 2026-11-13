@@ -1,0 +1,43 @@
+name: floor-guard
+# DEVOS-141 (gate integrity Part 1). Contract: docs/modules/GI-1.md. Reads the PR diff only.
+# Runs the guard from the PR's BASE commit (spec §4.5: the guard checks its own changes with the previous version).
+# Only when the base has no guard yet (the bootstrap PR) does it fall back to the head's copy.
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: floor-guard-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  floor-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Floor guard (base version)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          if git cat-file -e "$BASE:scripts/floor-guard/floor-guard.mjs" 2>/dev/null; then
+            git show "$BASE:scripts/floor-guard/floor-guard.mjs" > "$RUNNER_TEMP/floor-guard.mjs"
+            echo "guard version: base $BASE"
+          else
+            cp scripts/floor-guard/floor-guard.mjs "$RUNNER_TEMP/floor-guard.mjs"
+            echo "guard version: head $HEAD (bootstrap: base has no guard)"
+          fi
+          rc=0
+          node "$RUNNER_TEMP/floor-guard.mjs" --base "$BASE" --head "$HEAD" --report "$RUNNER_TEMP/floor-guard-report.json" | tee "$RUNNER_TEMP/floor-guard.log" || rc=$?
+          echo "wall: $(( $(date +%s) - start ))s, exit $rc"
+          { echo "### floor-guard: exit $rc"; echo '```'; cat "$RUNNER_TEMP/floor-guard.log"; echo '```'; echo '```json'; cat "$RUNNER_TEMP/floor-guard-report.json" 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
