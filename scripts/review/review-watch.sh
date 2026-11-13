@@ -6,7 +6,11 @@
 # default 3) stores <sha>.fails=k and <sha>.retry_at = now + REVIEW_RETRY_BASE * 2^(k-1) seconds (default 600,
 # capped at REVIEW_RETRY_CAP, default 3600) and sets `codex-review` = pending; no comment is posted and the round
 # number is not used up. The head is a candidate again once retry_at has passed. Only the last attempt posts the
-# "could not run" report and the final `error` status, as before.
+# "could not run" report and the final `error` status, as before. Only a FAST failure is retried (the runner ran
+# under REVIEW_RETRY_FAST seconds, default 120: quota, auth, fetch errors, before Codex answers). A slow failure
+# (Codex ran, then timed out or its verdict failed validation) was a paid run, so it stays final at once
+# (pre-review finding 1, review cost rule). A pending retry whose SHA is no longer any open PR's head is closed
+# with an `error` status, so no stale "retry in …" status is left behind.
 # v1.4.1 (DEVOS-106): a verdict comment whose POST timed out on our side is not posted again if GitHub completed
 # it: before a retry, the PR's comments are read, and one with the same first line and commit counts as posted.
 # v1.4.0 (DEVOS-116): the longest-waiting head is reviewed first. A head's first-green time is stored
@@ -63,6 +67,7 @@ GH_TIMEOUT="${GH_TIMEOUT:-30}"; [[ "$GH_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || GH_T
 
 REVIEW_RETRY_MAX="${REVIEW_RETRY_MAX:-3}";   [[ "$REVIEW_RETRY_MAX" =~ ^[1-9]$ ]] || REVIEW_RETRY_MAX=3
 REVIEW_RETRY_BASE="${REVIEW_RETRY_BASE:-600}"; [[ "$REVIEW_RETRY_BASE" =~ ^[1-9][0-9]{0,4}$ ]] || REVIEW_RETRY_BASE=600
+REVIEW_RETRY_FAST="${REVIEW_RETRY_FAST:-120}"; [[ "$REVIEW_RETRY_FAST" =~ ^[0-9]{1,4}$ ]] || REVIEW_RETRY_FAST=120
 REVIEW_RETRY_CAP="${REVIEW_RETRY_CAP:-3600}";  [[ "$REVIEW_RETRY_CAP" =~ ^[1-9][0-9]{0,5}$ ]] || REVIEW_RETRY_CAP=3600
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 REVIEW_AUTHORS="${REVIEW_AUTHORS:-kkarnati1980}"   # space-separated GitHub logins whose PRs are reviewed
@@ -137,6 +142,7 @@ comment() {  # pr markdown-file
 #   <sha>.commented, <sha>.statused   publication steps that succeeded (each done exactly once)
 #   <sha>.published          both done; <sha>.done is the v1.0.x equivalent
 #   <sha>.fails, <sha>.retry_at   v1.5.0: failed attempts so far, and the epoch before which no retry runs
+#   <sha>.retry-closed       v1.5.0: the pending retry of a superseded SHA was closed with an error status
 published() { [[ -e "$STATE/$1.published" || -e "$STATE/$1.done" ]]; }
 already_commented() {  # pr sha -> 0 posted; 1 not on the PR; 2 cannot read the comments (do not POST this tick)
   # Only a comment by the watcher's own account counts (REVIEW_BOT_LOGIN, default the repo owner whose token posts),
@@ -199,6 +205,7 @@ unreadable=0        # PRs whose workflow runs could not be read (heartbeat)
 tick_now="$(date +%s)" # DEVOS-116 pre-review: one clock read per tick, so heads first seen green together tie
 cands=()            # DEVOS-116: green, unreviewed heads: "<first-green epoch> <pr> <sha> <contract>"
 declare -A tried=() # SHAs whose publication was attempted this tick
+declare -A heads=() # DEVOS-172: head SHAs of open, trusted PRs this tick
 prs="$(gh_all "/repos/$REPO/pulls?state=open" '')" || die "cannot list PRs"
 count="$(jq 'length' <<<"$prs")"
 log "open PRs: $count"
@@ -217,6 +224,7 @@ for i in $(seq 0 $((count - 1))); do
     fi
     continue
   fi
+  heads[$sha]=1
   if [[ "$draft" == "true" ]]; then log "PR #$pr ${sha:0:7}: draft, skipped"; continue; fi
   if published "$sha"; then log "PR #$pr ${sha:0:7}: already reviewed and published"; continue; fi
 
@@ -278,9 +286,11 @@ review_one() {  # pr sha contract
 
   log "PR #$pr ${sha:0:7}: reviewing as $label against $contract"
   set_status "$sha" pending "Codex review $label running" || true
+  local started=$SECONDS elapsed
   set +e
   "$RUNNER" main "$sha" "$contract" "$label" > "$TMP/run.log" 2>&1; rc=$?
   set -e
+  elapsed=$(( SECONDS - started ))
   redact < "$TMP/run.log" > "$TMP/run.safe"
   if grep -q "another review is running" "$TMP/run.safe"; then
     log "PR #$pr: runner busy (manual review in progress); retry next tick"
@@ -292,16 +302,18 @@ review_one() {  # pr sha contract
   if (( ! ok )); then
     fails="$(cat "$STATE/$sha.fails" 2>/dev/null || true)"; [[ "$fails" =~ ^[0-9]{1,3}$ ]] || fails=0
     fails=$((fails + 1))
-    if (( fails < REVIEW_RETRY_MAX )); then
+    if (( fails < REVIEW_RETRY_MAX && elapsed < REVIEW_RETRY_FAST )); then
       # DEVOS-172: not final yet. No comment, no .pr/.label (the round number is kept for the retry).
       wait=$(( REVIEW_RETRY_BASE << (fails - 1) )); (( wait <= REVIEW_RETRY_CAP )) || wait=$REVIEW_RETRY_CAP
       echo "$fails" > "$STATE/$sha.fails"
       echo "$(( $(date +%s) + wait ))" > "$STATE/$sha.retry_at"
       set_status "$sha" pending "Codex review $label could not run (attempt $fails of $REVIEW_RETRY_MAX); retry in $((wait / 60)) min" || true
-      log "PR #$pr ${sha:0:7}: runner failed (exit $rc), attempt $fails of $REVIEW_RETRY_MAX; retry in ${wait}s"
+      log "PR #$pr ${sha:0:7}: runner failed (exit $rc) after ${elapsed}s, attempt $fails of $REVIEW_RETRY_MAX; retry in ${wait}s"
       return 0
     fi
+    (( elapsed < REVIEW_RETRY_FAST )) || log "PR #$pr ${sha:0:7}: runner failed after ${elapsed}s (Codex may have run): final, not retried"
     echo "$fails" > "$STATE/$sha.fails"
+    (( fails <= REVIEW_RETRY_MAX )) || fails=$REVIEW_RETRY_MAX  # report never reads "2 of 1" after a lowered max
   fi
   tried[$sha]=1
   echo "$pr" > "$STATE/$sha.pr"
@@ -344,6 +356,20 @@ for m in "$STATE"/*.msg; do
   [[ "$pr" =~ ^[0-9]+$ ]] || { log "${sha:0:7}: pending publication has no PR number; skipped"; continue; }
   if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication (no longer the PR head)"; continue; fi
   if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed (no longer the PR head)"; fi
+done
+
+# DEVOS-172: a non-final retry whose SHA is no longer the head of any open PR is never retried; close its pending
+# status so no stale "retry in …" is left (done once, marker <sha>.retry-closed). A later reappearance as a head
+# would make it a candidate again and the status is overwritten by that review.
+for f in "$STATE"/*.retry_at; do
+  [[ -e "$f" ]] || continue
+  sha="$(basename "$f" .retry_at)"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+  [[ -n "${heads[$sha]:-}" || -s "$STATE/$sha.msg" || -e "$STATE/$sha.retry-closed" ]] && continue
+  if [[ $DRY -eq 1 ]]; then log "${sha:0:7}: WOULD close the pending retry (no longer a PR head)"; continue; fi
+  if set_status "$sha" error "Codex review could not run; not retried: no longer a PR head"; then
+    : > "$STATE/$sha.retry-closed"; log "${sha:0:7}: pending retry closed (no longer a PR head)"
+  else log "${sha:0:7}: could not close the pending retry; will try again"; fi
 done
 
 # Heartbeat (v1.2.0): at most one per HEARTBEAT_SECONDS; a failure is logged and retried on the next tick.

@@ -398,9 +398,10 @@ test("AT21: a retry that succeeds publishes the verdict with the first attempt's
   const runner = path.join(dir, "runner42.sh");
   fs.writeFileSync(runner, `#!/usr/bin/env bash\nif [[ -e "${flag}" ]]; then rm -f "${flag}"; echo 'ERROR: Quota exceeded.'; exit 1; fi\nprintf '{"verdict":"PASS","summary":"ok","findings":[]}' > "${dir}/verdicts/$2.json"\n`, { mode: 0o755 });
   const ws = path.join(dir, "watch");
+  const t0 = Math.floor(Date.now() / 1000);
   await tick([], { REVIEW_RUNNER: runner, REVIEW_RETRY_BASE: "60" });
   const ra = Number(fs.readFileSync(path.join(ws, `${sha}.retry_at`), "utf8"));
-  assert.ok(ra - Math.floor(Date.now() / 1000) <= 60, "REVIEW_RETRY_BASE sets the first back-off");
+  assert.ok(ra >= t0 + 60 && ra <= Math.floor(Date.now() / 1000) + 60, "REVIEW_RETRY_BASE sets the first back-off");
   // A value far beyond the cap (clock stepped back, or a bad file) is treated as due.
   fs.writeFileSync(path.join(ws, `${sha}.retry_at`), String(Math.floor(Date.now() / 1000) + 99999));
   const r = await tick([], { REVIEW_RUNNER: runner });
@@ -409,4 +410,57 @@ test("AT21: a retry that succeeds publishes the verdict with the first attempt's
   assert.match(M.comments[0].body, /^### Codex review PR42-r1 — \*\*PASS\*\*/);
   assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "success"));
   assert.ok(fs.existsSync(path.join(ws, `${sha}.published`)));
+});
+
+test("AT21 (pre-review 1): a slow failure (Codex may have run) is final at once; rc 0 without a verdict is a failure", async () => {
+  reset();
+  M.green = true;
+  const sha = "2".repeat(40);
+  M.prs = [{ number: 43, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M43.md" }];
+  const slow = path.join(dir, "runner-slow43.sh");
+  fs.writeFileSync(slow, "#!/usr/bin/env bash\nsleep 2\necho 'codex exec failed (timeout)'\nexit 1\n", { mode: 0o755 });
+  const r = await tick([], { REVIEW_RUNNER: slow, REVIEW_RETRY_FAST: "1" });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /Codex may have run\): final, not retried/);
+  assert.equal(M.comments.length, 1, "reported at once, no retry of a paid run");
+  assert.match(M.comments[0].body, /- \*\*Attempts:\*\* 1 of 3/);
+  assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "error"));
+  assert.equal(fs.existsSync(path.join(dir, "watch", `${sha}.retry_at`)), false);
+  // rc 0 with no verdict file is a failure (a fast one, so it is retried, not published as a verdict).
+  reset(); M.green = true;
+  const sha2 = "1".repeat(40);
+  M.prs = [{ number: 44, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha2, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M44.md" }];
+  const r2 = await tick([], { REVIEW_RUNNER: "/bin/true" });
+  assert.equal(r2.code, 0, r2.out);
+  assert.equal(M.comments.length, 0);
+  assert.ok(M.statuses.some((x) => x.sha === sha2 && x.state === "pending" && /attempt 1 of 3/.test(x.description)));
+  assert.ok(!M.statuses.some((x) => x.sha === sha2 && x.state === "success"), "never a PASS without a verdict (D1)");
+});
+
+test("AT21 (pre-review L2): a pending retry whose SHA is no longer a PR head is closed once; --dry-run writes nothing", async () => {
+  reset();
+  M.green = true;
+  const old = "e".repeat(39) + "1";
+  const ws = path.join(dir, "watch");
+  M.prs = [{ number: 45, draft: false, user: { login: "kkarnati1980" }, head: { sha: old, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M45.md" }];
+  await tick([], { REVIEW_RUNNER: "/bin/false" });
+  assert.ok(fs.existsSync(path.join(ws, `${old}.retry_at`)));
+  // --dry-run while the retry waits: no state written, no status posted.
+  const before = M.statuses.length;
+  const files = fs.readdirSync(ws).filter((f) => f.startsWith(old)).sort();
+  const rd = await tick(["--dry-run"], { REVIEW_RUNNER: "/bin/false" });
+  assert.match(rd.out, /retry after/);
+  M.prs = [];
+  const rd2 = await tick(["--dry-run"], { REVIEW_RUNNER: "/bin/false" });
+  assert.match(rd2.out, /WOULD close the pending retry/);
+  assert.deepEqual(fs.readdirSync(ws).filter((f) => f.startsWith(old)).sort(), files);
+  assert.equal(M.statuses.filter((x) => x.context === "codex-review").length, M.statuses.slice(0, before).filter((x) => x.context === "codex-review").length);
+  // The PR moved on: the old SHA's pending status is closed with an error, exactly once.
+  const r = await tick([], { REVIEW_RUNNER: "/bin/false" });
+  assert.equal(r.code, 0, r.out);
+  const closes = () => M.statuses.filter((x) => x.sha === old && x.state === "error" && /no longer a PR head/.test(x.description));
+  assert.equal(closes().length, 1);
+  await tick([], { REVIEW_RUNNER: "/bin/false" });
+  assert.equal(closes().length, 1, "closed once");
+  assert.equal(M.comments.length, 0);
 });

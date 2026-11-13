@@ -65,7 +65,7 @@ if [[ "${RETRY_FAILED:-0}" == 1 ]]; then
     sha="$(basename "${f%.*}")"
     [[ -s "$DIR/verdicts/$sha.json" ]] && continue
     [[ -e "$DIR/watch/$sha.pr" || -e "$DIR/watch/$sha.done" || -e "$DIR/watch/$sha.msg" || -e "$DIR/watch/$sha.fails" ]] || continue
-    rm -f "$DIR/watch/$sha".{done,pr,label,msg,state,commented,statused,published,fails,retry_at}
+    rm -f "$DIR/watch/$sha".{done,pr,label,msg,state,commented,statused,published,fails,retry_at,retry-closed}
     echo "  cleared failed attempt for ${sha:0:7}"
   done
 fi
