@@ -223,7 +223,10 @@ export function sendHtml(res, page, status = 200) {
 // (so a sink split over lines is found) and reported at the line where it starts.
 const j = (...p) => p.join("");
 const TEMPLATES = /\.(?:html?|xhtml|svg|vue|svelte|hbs|handlebars|mustache|njk|jinja2?|j2|ejs|liquid|twig)$/i;
-const ASSIGN = "\\s*(?:=(?!=)|\\+=|\\|\\|=|\\?\\?=|&&=)"; // =, +=, ||=, ??=, &&= (JSX and Vue-bind keys use =)
+// The gap before the operator may hold whitespace and JS block or line comments, which still leave an
+// assignment to the HTML property. A false positive here is cheap; a missed sink is not.
+const GAP = "(?:\\s|/\\*[\\s\\S]*?\\*/|//[^\\n]*\\n)*";
+const ASSIGN = GAP + "(?:=(?!=)|\\+=|\\|\\|=|\\?\\?=|&&=)"; // =, +=, ||=, ??=, &&= (JSX and Vue-bind keys use =)
 export const SINKS = [
   ["react-dangerously-set", new RegExp(j("dangerously", "SetInner", "HTML"))],
   ["inner-html", new RegExp(j("\\binner", "HTML\\b['\"`]?\\]?", ASSIGN))],

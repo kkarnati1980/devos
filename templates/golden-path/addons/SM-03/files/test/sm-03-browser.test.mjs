@@ -246,6 +246,8 @@ test("SM-03-L2: the raw-HTML sink check finds every sink kind and passes this ap
     ["document-write", "public/r12.js", P("frame.contentDocument.", "write(x);")],
     ["template-raw-filter", "src/r13.twig", P("{{ body |", "raw }}")],
     ["template-autoescape-off", "src/r14.njk", P("{% auto", "escape false %}{{ body }}")],
+    ["inner-html", "src/r15.mjs", P("el.inner", "HTML /* render response */ = userText;")],
+    ["inner-html", "src/r16.mjs", P("el.inner", "HTML // set\\n  = userText;")],
   ];
   assert.deepEqual(Object.keys(cases).sort(), SINKS.map(([n]) => n).sort(), "every sink kind has a fixture");
   for (const [, [rel, text]] of Object.entries(cases)) write(rel, `const a = 1;\n${text}\n`);
