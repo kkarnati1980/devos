@@ -268,6 +268,7 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
   // 2b. Floor guard (GI-1b): guard-path changes must be named by the PASS; a failing floor guard is set aside
   //     only when every hit it finds on this SHA has a valid Codex Keep (spec §4.4, GI-1 Dispositions).
   const fg = config.floorGuard;
+  let mainSha = null; // read once: the guard re-run and the compare in step 3 judge the same main
   const fgFailed = fg ? red.filter((x) => x.check === fg.check && x.failed) : [];
   const otherFgRed = fg ? red.filter((x) => (x.check === fg.check || x.path === fg.workflowPath) && !x.failed) : [];
   const guardFiles = await guardPathsTouched(gh, repo, pr, p.changed_files);
@@ -284,7 +285,8 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
     if (fgFailed.length > 0 && otherFgRed.length === 0) {
       if (!verdictText) reasons.push(`floor guard failed on ${sha.slice(0, 7)} and there is no Codex PASS comment for this SHA to hold Keeps`);
       else {
-        const { report, applyDispositions } = await guardReport({ mainSha: await mainHead(gh, repo, config), sha });
+        mainSha ??= await mainHead(gh, repo, config);
+        const { report, applyDispositions } = await guardReport({ mainSha, sha });
         if (report.sha !== sha) reasons.push(`floor-guard report is for ${String(report.sha).slice(0, 7)}, not the head ${sha.slice(0, 7)}`);
         else if (report.exit === 2) reasons.push(`floor guard could not run on ${sha.slice(0, 7)} (exit 2 is never clean): ${report.error ?? "unknown error"}`);
         else if (report.hits.length === 0) reasons.push(`floor guard failed in CI on ${sha.slice(0, 7)} but finds no hit on a re-run; re-run the check, a red check is never set aside without a hit`);
@@ -305,7 +307,7 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
   for (const x of red) if (!setAside(x)) reasons.push(x.msg);
 
   // 3. origin/main is already in the head (ADR-0013).
-  const mainSha = await mainHead(gh, repo, config);
+  mainSha ??= await mainHead(gh, repo, config);
   const cmp = await gh.get(`/repos/${repo}/compare/${mainSha}...${sha}`);
   if (cmp.status !== "ahead" && cmp.status !== "identical") {
     reasons.push(`${config.baseBranch} ${mainSha.slice(0, 7)} is not in the head (compare: ${cmp.status}); merge ${config.baseBranch} in first`);

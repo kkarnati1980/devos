@@ -46,7 +46,8 @@ Codex cannot run scripts, so it does not see floor-guard hit ids unless they rea
 | B11 | A red workflow named `floor-guard` from another file is never set aside |
 
 ## Pre-review (13 Nov 2026)
-7 findings, 6 fixed: markers from the Summary line only (B9), KK-only hits never kept (B10), earliest unedited comment (B9), workflows by file (B11), the CI-exit-2 decision recorded above, plain-marker wording in rules.md. Not changed: `localGuardReport`'s fetch path is not unit-tested against a remote (it needs `origin`); its argument check is (B8), and any failure in it is exit 2.
+Round 1: 7 findings, 6 fixed: markers from the Summary line only (B9), KK-only hits never kept (B10), earliest unedited comment (B9), workflows by file (B11), the CI-exit-2 decision recorded above, plain-marker wording in rules.md. Not changed: `localGuardReport`'s fetch path is not unit-tested against a remote (it needs `origin`); its argument check is (B8), and any failure in it is exit 2.
+Round 2: 5 low findings, 1 fixed (main is read once, so the guard re-run and the compare judge the same main); the rest fail safe and are left as is.
 
 ## Pass rule
 `node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 11 tests passing, `node --test scripts/test/merge-gate.test.mjs` exits 0 with 14 tests passing, and `pnpm check:rules` exits 0.
