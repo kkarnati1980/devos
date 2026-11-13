@@ -1,7 +1,13 @@
 {
   "id": "SM-02",
   "name": "Access control",
-  "files": ["src/access.mjs", "test/sm-02-access.test.mjs"],
-  "checks": { "SM-02-L1": "test/sm-02-access.test.mjs", "SM-02-L2": "test/sm-02-access.test.mjs" },
-  "usage": "Build one guard with createGuard({ tailnetLogins, serviceTokens: serviceTokensFromEnv() }) and pass every app route through guard.protectAll(routes); only /health and /ready stay open. Callers are a tailnet login sent by the local Tailscale proxy (set trustedProxies if the proxy is not on loopback) or a bearer token whose SHA-256 digest is in SERVICE_TOKEN_SHA256_<NAME>. Wrap each route that takes an ID with owned(loadOwner, handler) so another owner's resource answers 404. Call assertAllGuarded(routes) in an app test; routeInventory(routes) is the route list for review."
+  "files": [
+    "src/access.mjs",
+    "test/sm-02-access.test.mjs"
+  ],
+  "checks": {
+    "SM-02-L1": "test/sm-02-access.test.mjs",
+    "SM-02-L2": "test/sm-02-access.test.mjs"
+  },
+  "usage": "Build one guard with createGuard({ serviceTokens: serviceTokensFromEnv() }) and pass every app route through guard.protectAll(routes); only /health and /ready stay open. Service callers send a bearer token whose SHA-256 digest is in SERVICE_TOKEN_SHA256_<NAME>. Tailnet callers are opt-in: tailnetLogins plus identityProxy: \"tailscale-serve\" and an explicit trustedProxies IP list (nonLoopbackProxy: true for a non-loopback address); only tailscale serve may ever connect from those addresses, never another reverse proxy. Wrap each route that takes an ID with owned(resolve, handler): resolve reads the ID once (singleParam helps) and returns { id, owner, value } or null; the handler uses only ctx.resource. In an app test call assertAllGuarded(routes) and assertOwned(routes, idRoutes); routeInventory(routes) is the route list for review."
 }

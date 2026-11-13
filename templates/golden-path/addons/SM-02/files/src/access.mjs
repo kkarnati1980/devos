@@ -3,21 +3,30 @@
 // `Tailscale-User-Login`, or a service with a bearer token. A route that takes an ID also checks the owner, so
 // another owner's resource answers 404 (no IDOR). No dependencies.
 //
-//   const guard = createGuard({ tailnetLogins: ["kk@example.com"], serviceTokens: serviceTokensFromEnv() });
+//   const guard = createGuard({ serviceTokens: serviceTokensFromEnv() });   // tailnet callers: see createGuard
 //   const routes = guard.protectAll({
 //     "GET /notes": listNotes,
-//     "GET /note": owned((req, ctx) => ownerOfNote(new URL(req.url, "http://app").searchParams.get("id")), getNote),
+//     "GET /note": owned(resolveNote, (req, res, ctx) => send(ctx.resource.value)),   // use ctx.resource only
 //   });
-//   assertAllGuarded(routes);   // in an app test (SM-02-L1)
+//   assertAllGuarded(routes);                    // in an app test (SM-02-L1)
+//   assertOwned(routes, ["GET /note"]);          // every route that takes an ID (SM-02-L2)
 //
 // Responses never echo what the caller sent (token, login or ID).
 import crypto from "node:crypto";
+
+const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+const isIp = (a) => {
+  if (typeof a !== "string") return false;
+  if (IPV4.test(a)) return true;
+  if (!a.includes(":")) return false;
+  try { new URL(`http://[${a}]/`); return true; } catch { return false; }
+};
 
 // Markers are module-private, so a handler cannot claim to be guarded by setting a property.
 const GUARDED = new WeakSet();
 const OWNED = new WeakSet();
 export const OPEN_ROUTES = Object.freeze(["GET /health", "GET /ready"]);
-export const DEFAULT_TRUSTED_PROXIES = Object.freeze(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+export const LOOPBACK_PROXIES = Object.freeze(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 const TOKEN_SHAPE = /^[A-Za-z0-9._~+/=-]{32,256}$/;
 const NAME_SHAPE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const DIGEST_SHAPE = /^[0-9a-f]{64}$/;
@@ -42,8 +51,22 @@ const send = (res, code, obj, headers = {}) => {
   res.end(JSON.stringify(obj));
 };
 
-export function createGuard({ tailnetLogins = [], serviceTokens = {}, trustedProxies = DEFAULT_TRUSTED_PROXIES } = {}) {
+/**
+ * Tailnet callers are opt-in. The `Tailscale-User-Login` header proves nothing by itself: it is believed only from a
+ * peer in `trustedProxies`, and only `tailscale serve` (which overwrites that header) may ever connect from those
+ * addresses. Any other proxy there (nginx, Traefik, docker-proxy on a published port) forwards a client's header and
+ * would let anyone claim KK's login. So `tailnetLogins` needs `identityProxy: "tailscale-serve"` and an explicit
+ * `trustedProxies` list of IP addresses; a non-loopback entry also needs `nonLoopbackProxy: true`, the app's
+ * statement that nothing but `tailscale serve` can reach it from that address (S4 keeps the project network closed).
+ */
+export function createGuard({ tailnetLogins = [], serviceTokens = {}, trustedProxies = [], identityProxy, nonLoopbackProxy = false } = {}) {
   if (!Array.isArray(tailnetLogins) || !Array.isArray(trustedProxies)) throw new Error("access: tailnetLogins and trustedProxies must be lists");
+  for (const a of trustedProxies) if (!isIp(a)) throw new Error("access: trustedProxies entries must be IP addresses");
+  if (tailnetLogins.length) {
+    if (identityProxy !== "tailscale-serve") throw new Error('access: tailnetLogins need identityProxy: "tailscale-serve"');
+    if (!trustedProxies.length) throw new Error("access: tailnetLogins need trustedProxies (the tailscale serve address)");
+    if (!nonLoopbackProxy && trustedProxies.some((a) => !LOOPBACK_PROXIES.includes(a))) throw new Error("access: a non-loopback trusted proxy needs nonLoopbackProxy: true");
+  } else if (trustedProxies.length) throw new Error("access: trustedProxies without tailnetLogins");
   const logins = new Set(tailnetLogins.map((l) => {
     if (typeof l !== "string" || !LOGIN_SHAPE.test(l)) throw new Error("access: bad tailnet login");
     return l.toLowerCase();
@@ -61,7 +84,7 @@ export function createGuard({ tailnetLogins = [], serviceTokens = {}, trustedPro
     const auth = req.headers.authorization;
     if (auth !== undefined) {
       // A bearer token was offered: it decides alone (no fall-back to the tailnet header).
-      const m = /^Bearer ([^\s]+)$/.exec(String(auth));
+      const m = /^Bearer ([^\s]+)$/i.exec(String(auth));
       if (!m || !TOKEN_SHAPE.test(m[1])) return { status: 401 };
       const got = crypto.createHash("sha256").update(m[1], "utf8").digest();
       let match = null;
@@ -104,20 +127,28 @@ export function createGuard({ tailnetLogins = [], serviceTokens = {}, trustedPro
 }
 
 /**
- * For a route that takes an ID (SM-02-L2). `loadOwner(req, ctx)` returns the owner id of the resource the request
- * names (a caller id such as "tailnet:kk@example.com"), or null when there is none. A missing resource and another
- * owner's resource both answer 404, so a caller cannot tell them apart. Without a caller (route not guarded) it is 401.
+ * For a route that takes an ID (SM-02-L2). `resolve(req, ctx)` reads the ID once and returns
+ * `{ id, owner, value? }` (owner is a caller id such as "service:worker") or null when there is no such resource.
+ * The handler gets that result as `ctx.resource` and must use only `ctx.resource.id` / `.value`, never re-read the
+ * ID from the request, so the check and the use cannot disagree. A missing resource and another owner's resource both
+ * answer 404, so a caller cannot tell them apart. Without a caller (route not guarded) it is 401: fail closed.
  */
-export function owned(loadOwner, handler) {
-  if (typeof loadOwner !== "function" || typeof handler !== "function") throw new Error("access: owned(loadOwner, handler)");
+export function owned(resolve, handler) {
+  if (typeof resolve !== "function" || typeof handler !== "function") throw new Error("access: owned(resolve, handler)");
   const wrapped = async (req, res, ctx = {}) => {
     if (!ctx.caller) return send(res, 401, { error: "unauthenticated" }, { "www-authenticate": "Bearer" });
-    const owner = await loadOwner(req, ctx);
-    if (owner == null || owner !== ctx.caller.id) return send(res, 404, { error: "not-found" });
-    return handler(req, res, ctx);
+    const r = await resolve(req, ctx);
+    if (r == null || typeof r !== "object" || r.owner == null || r.owner !== ctx.caller.id) return send(res, 404, { error: "not-found" });
+    return handler(req, res, { ...ctx, resource: Object.freeze({ id: r.id, owner: r.owner, value: r.value }) });
   };
   OWNED.add(wrapped);
   return wrapped;
+}
+
+/** Reads a query parameter that must appear exactly once; a missing or repeated key gives null. */
+export function singleParam(req, name) {
+  const all = new URL(req.url || "/", "http://app").searchParams.getAll(name);
+  return all.length === 1 && all[0] !== "" ? all[0] : null;
 }
 
 /** SM-02-L1 evidence (`route_list`): every route with whether it is open, guarded and owner-checked. */
@@ -126,6 +157,13 @@ export function routeInventory(routes) {
     ...OPEN_ROUTES.map((route) => ({ route, open: true, guarded: false, ownerChecked: false })),
     ...Object.entries(routes).map(([route, h]) => ({ route, open: false, guarded: GUARDED.has(h), ownerChecked: OWNED.has(h) })),
   ];
+}
+
+/** Throws, naming each listed route that takes an ID but is not wrapped with owned() (SM-02-L2). */
+export function assertOwned(routes, idRoutes) {
+  const inv = new Map(routeInventory(routes).map((r) => [r.route, r]));
+  const bad = idRoutes.filter((r) => !inv.get(r)?.ownerChecked);
+  if (bad.length) throw new Error(`access: ID routes without an owner check: ${bad.join(", ")}`);
 }
 
 /** Throws, naming each route that is not behind the guard. */
