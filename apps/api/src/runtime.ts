@@ -17,6 +17,7 @@ import type { RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 import type { ModelRunner } from "@devos/analyst";
+import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
 import { PrismaAnalystRunRows, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -88,10 +89,10 @@ export async function buildRuntime(
     loadQueue?: (redisUrl: string) => Promise<DeadLetterQueue>;
     /**
      * M2.2-d3b1: builds M1.5's RunEngine (with the Anthropic adapter) over this database and policy engine for the
-     * analyst model pass. Absent → model pass off. M2.2-d3b2 supplies it from main.ts, importing the run engine at
-     * runtime like @devos/db, so the API typechecks on its own.
+     * analyst model pass. Absent → model pass off. M2.2-d3b2 supplies it from main.ts when `DEVOS_ANALYST_MODEL_PASS=on`,
+     * importing the run engine at runtime like @devos/db, so the API typechecks on its own. `apiKey` reads the vault.
      */
-    loadAnalystEngine?: (db: DbClient, policy: PolicyEngine) => Promise<RunExecutor>;
+    loadAnalystEngine?: (db: DbClient, policy: PolicyEngine, apiKey: () => Promise<string | null>) => Promise<RunExecutor>;
   },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
@@ -156,7 +157,11 @@ export async function buildRuntime(
   };
   // M2.2-d3b1: the model pass is one M1.5 run per call (role analyst, Sonnet); the engine reserves, meters and records cost.
   const runner: ModelRunner | null = opts.loadAnalystEngine
-    ? runEngineModelRunner(new PrismaAnalystRunRows(db as unknown as AnalystRowsDb, t), await opts.loadAnalystEngine(db, engine))
+    ? runEngineModelRunner(
+        new PrismaAnalystRunRows(db as unknown as AnalystRowsDb, t),
+        // M2.2-d3b2: the Anthropic key is read from the vault by name at call time; no vault → null → assist-failed.
+        await opts.loadAnalystEngine(db, engine, async () => (vault ? vault.reveal(ANTHROPIC_KEY_NAME) : null)),
+      )
     : null;
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
   const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner);

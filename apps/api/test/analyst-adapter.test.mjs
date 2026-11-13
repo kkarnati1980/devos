@@ -1,0 +1,169 @@
+// M2.2-d3b2: the production adapter for the analyst model pass (contract docs/modules/M2.2.md, "M2.2-d3b2").
+// The real RunEngine, M1.7 PolicyEngine and ClaudeAgentSdkAdapter over the memory stores, with a fake fetch in
+// place of the Anthropic Messages API (no network in tests).
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
+import * as runEngineModule from "@devos/run-engine";
+import { MemoryRunStore } from "@devos/run-engine";
+import {
+  ANTHROPIC_MESSAGES_URL, ANTHROPIC_KEY_NAME, ANALYST_ANSWER_MAX_TOKENS, MAX_RESPONSE_BYTES,
+  analystModelPass, buildAnalystEngine, costUsd, messagesQuery,
+} from "../dist/analyst-adapter.js";
+import { runEngineModelRunner, ANALYST_MODEL } from "../dist/analyst-runner.js";
+
+const P1 = "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d";
+const KEY = "test-only-not-a-real-key";
+
+/** A Messages API reply in the real shape: an adaptive-thinking block, then the answer split over two text blocks. */
+function reply({ text = ['{"requirements":', "[]}"], stop = "end_turn", usage = { input_tokens: 1000, output_tokens: 500 }, extra = [] } = {}) {
+  return {
+    id: "msg_test", type: "message", role: "assistant", model: ANALYST_MODEL, stop_reason: stop, usage,
+    content: [{ type: "thinking", thinking: "…", signature: "x" }, ...text.map((t) => ({ type: "text", text: t })), ...extra],
+  };
+}
+
+function fakeFetch(respond) {
+  const calls = [];
+  const f = async (url, init) => {
+    calls.push({ url, init, body: JSON.parse(init.body) });
+    const r = await respond(calls.length);
+    if (r instanceof Response) return r;
+    return new Response(JSON.stringify(r), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  return { f, calls };
+}
+
+/** Memory task/run rows (the Postgres twin is PrismaAnalystRunRows, covered by d3b1's test-db). */
+function memoryRows(runStore) {
+  let n = 0;
+  return {
+    async createRun(input) {
+      const runId = `run-${++n}`;
+      runStore.envelopes.set(runId, input.envelope);
+      runStore.runs.set(runId, { id: runId, taskId: `task-${n}`, projectId: input.projectId, role: "analyst", model: input.model, attempt: 1, status: "queued", maxTurns: input.maxTurns, maxSeconds: input.maxSeconds, maxCostUsd: input.maxCostUsd, turns: 0 });
+      return runId;
+    },
+    async textEvents(runId) {
+      return runStore.events.filter((e) => e.runId === runId && e.type === "text").sort((a, b) => a.seq - b.seq).map((e) => e.payload.text);
+    },
+    async finishTask() {},
+  };
+}
+
+/** buildAnalystEngine with the real run-engine module, the memory run store in place of Postgres. */
+function setup({ respond, key = KEY } = {}) {
+  const runStore = new MemoryRunStore();
+  const adapters = [];
+  const m = {
+    ...runEngineModule,
+    PrismaRunStore: function () { return runStore; },
+    ClaudeAgentSdkAdapter: class extends runEngineModule.ClaudeAgentSdkAdapter {
+      constructor(o) { super(o); adapters.push(o); }
+    },
+  };
+  const policy = new PolicyEngine({ store: new MemoryPolicyStore({ mode: "observe" }), hmacKey: randomBytes(32) });
+  const { f, calls } = fakeFetch(respond ?? (() => reply()));
+  const keyReads = [];
+  const engine = buildAnalystEngine(m, {}, policy, { apiKey: async () => (keyReads.push(1), key), timeoutMs: 5_000, fetch: f });
+  const runner = runEngineModelRunner(memoryRows(runStore), engine);
+  return { runStore, runner, calls, adapters, keyReads, engine };
+}
+
+test("AT-CA1 one Messages API request: the vault key by header, the analyst model, a bounded answer, no tools, no redirects", async () => {
+  const { runner, calls, keyReads } = setup();
+  await runner({ prompt: "spec text", tag: "analyst_assist", projectId: P1 });
+  assert.equal(calls.length, 1, "one request per call, no retry");
+  const { url, init, body } = calls[0];
+  assert.equal(url, ANTHROPIC_MESSAGES_URL);
+  assert.equal(init.method, "POST");
+  assert.equal(init.headers["x-api-key"], KEY);
+  assert.equal(init.headers["anthropic-version"], "2023-06-01");
+  assert.equal(init.redirect, "error");
+  assert.ok(init.signal instanceof AbortSignal, "the request carries an abort/timeout signal");
+  assert.deepEqual(body, { model: ANALYST_MODEL, max_tokens: ANALYST_ANSWER_MAX_TOKENS, messages: [{ role: "user", content: "spec text" }] });
+  assert.equal("tools" in body, false, "no tool is ever offered to the model");
+  assert.equal(keyReads.length, 1, "the key is read at call time");
+  assert.equal(ANTHROPIC_KEY_NAME, "anthropic_api_key");
+});
+
+test("AT-CA2 the real message shape fits one turn: split text blocks join in order, thinking is not output, cost is metered once", async () => {
+  const { runner, runStore } = setup();
+  const out = await runner({ prompt: "p", tag: "analyst_assist", projectId: P1 });
+  assert.deepEqual(out, { output: '{"requirements":[]}' });
+  const run = [...runStore.runs.values()][0];
+  assert.equal(run.status, "succeeded", "not limit_hit: max_turns 2 leaves room for the one answer turn");
+  assert.equal(run.turns, 1);
+  const cost = (1000 * 2 + 500 * 10) / 1_000_000;
+  assert.equal(runStore.costs.length, 1, "one cost_entry, recorded by the engine");
+  assert.ok(Math.abs(runStore.costs[0].usd - cost) < 1e-9, `cost ${runStore.costs[0].usd} = ${cost}`);
+  assert.equal(costUsd(ANALYST_MODEL, { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 1_000_000, cache_read_input_tokens: 1_000_000 }), 2.6);
+});
+
+test("AT-CA3 every tool call is refused: the tool gate denies, allowedTools is refused, a tool_use block is never forwarded", async () => {
+  const { runner, adapters, runStore } = setup({ respond: () => reply({ extra: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "id" } }] }) });
+  await runner({ prompt: "p", tag: "analyst_assist", projectId: P1 });
+  assert.equal(adapters.length, 1);
+  assert.equal(await adapters[0].toolGate("Bash", { command: "id" }), false);
+  assert.equal(await adapters[0].toolGate("Read", {}), false);
+  assert.equal(runStore.events.filter((e) => e.type === "tool_call").length, 0, "no tool_call event");
+  const q = messagesQuery({ apiKey: async () => KEY, timeoutMs: 1000, fetch: async () => assert.fail("no request") });
+  const it = q({ prompt: "p", options: { abortController: new AbortController(), model: ANALYST_MODEL, allowedTools: ["Bash"] } });
+  await assert.rejects(async () => { for await (const _ of it) void _; }, /analyst-tools-refused/);
+  // Any provider other than anthropic is refused.
+  assert.throws(() => buildAnalystEngine({ ...runEngineModule, RunEngine: class { constructor(o) { o.adapterFor("openai"); } } }, {}, {}, { apiKey: async () => KEY, timeoutMs: 1 }), /analyst-provider-refused/);
+});
+
+test("AT-CA4 failures end the run failed and the call assist-failed, with no retry and no response text kept", async () => {
+  const cases = [
+    { name: "no key", key: null, respond: () => assert.fail("no request without a key"), requests: 0 },
+    { name: "HTTP 429", respond: () => new Response('{"error":{"message":"secret-ish detail"}}', { status: 429 }), requests: 1 },
+    { name: "HTTP 500", respond: () => new Response("oops", { status: 500 }), requests: 1 },
+    { name: "max_tokens stop", respond: () => reply({ stop: "max_tokens" }), requests: 1 },
+    { name: "bad JSON", respond: () => new Response("not json", { status: 200 }), requests: 1 },
+    { name: "too large", respond: () => new Response("x".repeat(MAX_RESPONSE_BYTES + 1), { status: 200 }), requests: 1 },
+  ];
+  for (const c of cases) {
+    const { runner, runStore, calls } = setup({ respond: c.respond, key: c.key === undefined ? KEY : c.key });
+    await assert.rejects(runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /analyst-run-failed/, c.name);
+    assert.equal(calls.length, c.requests, `${c.name}: requests`);
+    const run = [...runStore.runs.values()][0];
+    assert.equal(run.status, "failed", c.name);
+    assert.doesNotMatch(JSON.stringify([...runStore.runs.values(), ...runStore.events]), /secret-ish|oops|not json/, `${c.name}: no response text stored`);
+  }
+  // An unpriced model is refused before any request, so the meter never gets a guess.
+  const q = messagesQuery({ apiKey: async () => KEY, timeoutMs: 1000, fetch: async () => assert.fail("no request") });
+  await assert.rejects(async () => { for await (const _ of q({ prompt: "p", options: { abortController: new AbortController(), model: "claude-unknown" } })) void _; }, /analyst-model-unpriced/);
+});
+
+test("AT-CA5 a request past its timeout is aborted and typed timeout; an engine cancel aborts the request", async () => {
+  // AbortSignal.timeout's timer does not hold the event loop open (the API server does); this test does.
+  const keepAlive = setInterval(() => {}, 1000);
+  const hang = async (_url, init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason)));
+  const q = messagesQuery({ apiKey: async () => KEY, timeoutMs: 50, fetch: hang });
+  await assert.rejects(async () => { for await (const _ of q({ prompt: "p", options: { abortController: new AbortController(), model: ANALYST_MODEL } })) void _; }, (e) => e.name === "TimeoutError");
+  const ac = new AbortController();
+  const q2 = messagesQuery({ apiKey: async () => KEY, timeoutMs: 60_000, fetch: hang });
+  const p = (async () => { for await (const _ of q2({ prompt: "p", options: { abortController: ac, model: ANALYST_MODEL } })) void _; })();
+  setTimeout(() => ac.abort(), 20);
+  await assert.rejects(p, (e) => e.name === "AbortError");
+  clearInterval(keepAlive);
+});
+
+test("AT-CA6 opt-in: only DEVOS_ANALYST_MODEL_PASS=on enables the pass; buildRuntime hands the engine a vault key reader", async () => {
+  assert.equal(analystModelPass({}), false);
+  assert.equal(analystModelPass({ DEVOS_ANALYST_MODEL_PASS: "true" }), false);
+  assert.equal(analystModelPass({ DEVOS_ANALYST_MODEL_PASS: "ON" }), false);
+  assert.equal(analystModelPass({ DEVOS_ANALYST_MODEL_PASS: "on" }), true);
+  const { buildRuntime } = await import("../dist/runtime.js");
+  const { KkSessionRegistry } = await import("../dist/auth.js");
+  const env = { DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" };
+  let reader = null;
+  await buildRuntime(env, {
+    outboundTimeoutMs: 500, kkSessions: new KkSessionRegistry(), loadDb: async () => ({}),
+    loadAnalystEngine: async (_db, _policy, apiKey) => ((reader = apiKey), { execute: async () => ({ status: "succeeded" }) }),
+  });
+  assert.equal(typeof reader, "function");
+  assert.equal(await reader(), null, "no vault configured → no key → the call fails assist-failed");
+});
