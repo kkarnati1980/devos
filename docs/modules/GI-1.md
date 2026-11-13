@@ -6,7 +6,7 @@
 - **Owned files (the guard paths):** `scripts/floor-guard/**`, `scripts/test/floor-guard.test.mjs`, `.github/workflows/floor-guard.yml`; plus this contract and `docs/decisions/0017-floor-guard.md`.
 
 ## Interface
-- `node scripts/floor-guard/floor-guard.mjs --base <rev> --head <rev> [--report <file.json>]` diffs `merge-base(base, head)..head` with `git diff --unified=0 --find-renames`. It reads the diff and the base/head copies of changed files only; never a PR description.
+- `node scripts/floor-guard/floor-guard.mjs --base <rev> --head <rev> [--report <file.json>]` diffs `merge-base(base, head)..head` with `git diff --unified=0 --find-renames`, and matches each file header against the `git diff -z --name-status` pairs so paths containing ` b/` split right (GI-1c). It reads the diff and the base/head copies of changed files only; never a PR description.
 - Git runs with `--text --no-textconv -c core.quotePath=false` and fixed `a/`/`b/` prefixes, so a `.gitattributes` in the PR head cannot turn a code change into an unread "binary" one, and non-ASCII paths parse.
 - Output: one `HIT <id> <rule> <file>:<line> <text>` line per hit, a summary line, and (with `--report`) JSON `{ sha, base, exit, hits: [{ id, rule, file, line, text }], error? }`.
 - **Exit codes:** `0` clean · `1` violation · `2` could not run (bad ref, not a repo, unreadable diff or diff header, unreadable base contract or workflow, missing arguments, report not writable). Exit 2 is never clean. The entry point compares real paths, so a symlinked or space-containing path still runs the guard.
@@ -18,12 +18,13 @@
 | Rule | Fires on |
 |---|---|
 | `test-file-deleted` | a test file (`*.test.*`, `*.spec.*`, or a JS/TS file under `test/`, `tests/`, `__tests__/`, `test-db/`, `e2e/`) deleted, or renamed to a non-test path |
-| `test-skipped` | an added line in a test file with `.skip(`, `.only(`, `.todo(`, `.fixme(`, `xit(`, `xdescribe(`, `xtest(`, `fit(`, `fdescribe(`, `skipIf(`, `runIf(`, a `skip:`/`todo:`/`only:` option (inline or on its own line), or an early `return` guarded by an env/platform/CI/skip condition (one line, or an `if (…) {` line followed by `return`, where either the condition or the `return` is the added line — PR70-r6, PR70-r18) |
+| `test-skipped` | an added line in a test file with `.skip(`, `.only(`, `.todo(`, `.fixme(`, `xit(`, `xdescribe(`, `xtest(`, `fit(`, `fdescribe(`, `skipIf(`, `runIf(`, a `skip:`/`todo:`/`only:` option (inline or on its own line), or an early `return` guarded by an env/platform/CI/skip condition (one line, or an `if (…) {` line followed by `return`, where either the condition or the `return` is the added line — PR70-r6, PR70-r18); also a skip referenced without a call (`it.skip`, `it.concurrent.skip`, `test.fixme`, `xit`, … in a ternary branch or a variable — GI-1c) |
 | `trivial-assertion` | a net-new (not merely moved) `expect(true|false|1|0|null|undefined|"")`, `assert(true)`/`assert.ok(true)`, or `assert.equal`/`strictEqual`/`deepEqual` of two equal literals in a test file (an assertion swapped for one that cannot fail) |
 | `assertions-lost` | net loss of `expect(`/`assert…(` calls across a changed test file's removed vs added lines |
 | `coverage-lowered` | (compared occurrence by occurrence per key, so per-path thresholds on one line count) a coverage key (`lines`, `branches`, `functions`, `statements`, `threshold`, `perFile`) lowered, or removed without replacement, or a boolean switch (`perFile`, `all`, `enabled`, `reportOnFailure`) turned from `true` to `false` or removed, in a test config, test file or workflow |
 | `tests-excluded` | an added `exclude`, `testPathIgnorePatterns`, `testIgnore`, `modulePathIgnorePatterns` or `coveragePathIgnorePatterns` in a test config or test file |
-| `test-script-changed` | a `test`, `lint`, `typecheck` or `check` script (or `test:…` etc.) in a `package.json` changed or removed, wherever it sits on the line |
+| `test-script-changed` | a `test`, `lint`, `typecheck` or `check` script (or `test:…` etc.) in a `package.json` changed or removed, wherever it sits on the line; a `pre`/`post` hook of these changed, removed or added, also in a new `package.json` (GI-1c) |
+| `ts-strict-relaxed` | in a `tsconfig*.json` (comments stripped): `strict` or a strictness sub-flag newly set to `false` (beyond the `false` values of that key already removed), a `true` removed without being re-added, or an `extends` removed or retargeted (GI-1c) |
 | `lint-rule-off` | an added rule set to `"off"`/`0` or downgraded to `"warn"`/`1` (quoted or unquoted key), or an added `ignores`, in an ESLint config |
 | `max-warnings-raised` | `--max-warnings N` raised, set negative (unlimited), or removed, in a test config or workflow |
 | `timeout-past-ceiling` | an added `timeout-minutes` above **30** in a workflow, or a `testTimeout`/`hookTimeout`/`timeout` (quoted key or not) above **120 000 ms** in a test file or test config (the documented ceilings, `CEILINGS`) |
@@ -59,7 +60,8 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 ## Follow-ups (pre-review round 2, filed as GI-1c) — done in DEVOS-150 (note 0020)
 - `pre`/`post` hooks of the test, lint, typecheck and check scripts in `package.json`: a changed, removed or new hook is `test-script-changed`.
 - A skip referenced without being called (a ternary `(cond ? it : it.skip)`, or `const t = it.skip`) is `test-skipped`.
-- `tsconfig*.json` strictness relaxed (`strict` or a sub-flag set to `false`, or a `true` removed) is `ts-strict-relaxed`.
+- `tsconfig*.json` strictness relaxed (`strict` or a sub-flag set to `false`, a `true` removed or commented out, or `extends` removed or retargeted) is `ts-strict-relaxed`.
+- New files are read like any other: a hook or an explicit `false` flag in a new `package.json` or `tsconfig` is a hit and needs a restore or a Codex Keep, because a new package can relax as much as an edited one.
 - Paths containing ` b/` are split with the `git diff -z --name-status` pairs, so hits name the real file.
 - `binary-code-change` stays as defence in depth: `run()` diffs with `--text`, so git never reports a binary file, but a caller of `analyse()` might.
 
