@@ -92,6 +92,9 @@ test("AT3: floor guard exit 2, open hits, a Keep on another SHA or by the Builde
     [(fg) => { const h = hitOf("ci-step-removed", undefined, ".github/workflows/ci.yml", 30, "job build: step name:Checks removed"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { const h = hitOf("ci-disabled", undefined, ".github/workflows/ci.yml", 12, "if: false"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { const h = hitOf("suppression-added", undefined, "src/x.ts", 4, "x".repeat(200)); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    // PR84-r4: the 200-character cut applies to every rule, not only suppressions and lint-rule-off
+    [(fg) => { const h = hitOf("failure-swallowed", undefined, "src/x.ts", 5, "y".repeat(200)); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    [(fg) => { const h = hitOf("test-skipped", undefined, "test/x.test.ts", 6, "z".repeat(250)); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { fg.report.exit = 1; }, /exit 1 with no hits/],
     [(fg) => { fg.report.sha = H2; }, /floor-guard result is not for head/],
     [(fg) => { delete fg.link; }, /floor-guard result has no link/],

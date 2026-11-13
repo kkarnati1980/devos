@@ -28,14 +28,16 @@ export const KK_ONLY = (h) => {
   // Checked first, for every rule: a hit whose file or text names security scanning, secrets or licence checks
   // (a lint-rule-off of a "security/…" rule, a suppression in src/security/ or of no-eval) goes to KK (PR84-r2, r3).
   if (SECURITY_WORDS.test(`${h.file ?? ""} ${text}`)) return true;
+  // A full-length (cut) text may hide a security token past the cut, for every rule, so it fails closed (PR84-r4).
+  if (text.length >= CUT) return true;
   if (h.rule === "gitleaksignore-added" || h.rule === "policy-weakened") return true;
-  if (h.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text) || text.length >= CUT;
+  if (h.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text);
   // A CI hit names the step or job, not what it ran, so whether it removed or disabled security scanning cannot be
   // established from the stored result (Codex PR84-r1): every ci-* hit fails closed to KK-only. The usual answer is
   // to restore the change; a Codex Keep alone never clears it.
   if (/^ci-/.test(h.rule ?? "")) return true;
   // Lint ignores can drop files from security linting.
-  if (h.rule === "lint-rule-off") return /\bignores?\b/.test(text) || text.length >= CUT;
+  if (h.rule === "lint-rule-off") return /\bignores?\b/.test(text);
   return false;
 };
 
