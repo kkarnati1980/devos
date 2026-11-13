@@ -2,5 +2,11 @@
   "baseBranch": "main",
   "codexContext": "codex-review",
   "codexCreator": "kkarnati1980",
-  "requiredCheckRuns": []
+  "requiredCheckRuns": ["floor-guard"],
+  "floorGuard": {
+    "check": "floor-guard",
+    "workflow": "floor-guard",
+    "aggregatorCheck": "ci-gate",
+    "aggregatorWorkflow": "ci-gate"
+  }
 }
