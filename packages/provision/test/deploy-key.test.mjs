@@ -79,32 +79,60 @@ test("AT1 fresh: one Coolify private key and one read-only GitHub deploy key tha
     [["coolify", "private_key", coolifyKey(s.fake).uuid], ["github", "deploy_key", `${OWNER}/devos-${P.slug}#${gk[0].id}`]]);
 });
 
-test("F1: the private key appears only in the one Coolify create body: no other request, journal row, inventory, error or output", async () => {
+/** The secret parts of an OpenSSH private key: the seed (base64, base64url, hex) and every base64 line after the first. */
+function secretParts(pem) {
+  const lines = pem.replace(/-----[A-Z ]+-----/g, "").trim().split("\n");
+  const b = Buffer.from(lines.join(""), "base64");
+  // The private section is the last string; its seed sits after check ints (8), "ssh-ed25519" (4+11) and pub (4+32), then the 4-byte length.
+  // Skip the magic, ciphername, kdfname, kdfoptions, the key count and the public blob, then the private section's length.
+  let o = 15; for (let i = 0; i < 3; i++) o += 4 + b.readUInt32BE(o); o += 4; o += 4 + b.readUInt32BE(o); o += 4;
+  const priv = b.subarray(o);
+  const seed = priv.subarray(8 + 15 + 36 + 4, 8 + 15 + 36 + 4 + 32);
+  assert.deepEqual(priv.subarray(8 + 15 + 36 + 4 + 32, 8 + 15 + 36 + 4 + 64), priv.subarray(8 + 15 + 4, 8 + 15 + 36), "seed offset");
+  const parts = [seed.toString("base64").slice(0, 40), seed.toString("base64url").slice(0, 40), seed.toString("hex"), lines.slice(1).join(""), ...lines.slice(1, -1)];
+  return parts.filter((x) => x.length >= 24);
+}
+
+test("F1: the private key appears only in Coolify create bodies: no other request, journal row, inventory, error or output, even on failures", async () => {
   const out = [];
   const orig = { log: console.log, error: console.error, warn: console.warn, sw: process.stdout.write, ew: process.stderr.write };
   const cap = (...a) => { out.push(a.map(String).join(" ")); };
   console.log = console.error = console.warn = cap;
   process.stdout.write = (c, ...r) => { out.push(String(c)); return orig.sw.call(process.stdout, c, ...r); };
   process.stderr.write = (c, ...r) => { out.push(String(c)); return orig.ew.call(process.stderr, c, ...r); };
+  const keyPost = (m, p) => m === "POST" && p === "/api/v1/security/keys";
   let s;
   try {
     s = await setup();
+    // Coolify rejects the create, then times out before it, then times out after it (adopted); then GitHub fails once.
+    s.fake.faults.push({ match: keyPost, action: { status: 422 } });
+    s.fake.faults.push({ match: keyPost, action: "timeout-before" });
+    s.fake.faults.push({ match: keyPost, action: "timeout-after" });
     s.fake.faults.push({ match: (m, p) => m === "POST" && /\/repos\/.+\/keys$/.test(p), action: { status: 500 } });
-    await assert.rejects(s.run(), (e) => { out.push(String(e.message), String(e.stack)); return e instanceof StepError; });
+    for (let i = 0; i < 3; i++) await assert.rejects(s.run(), (e) => { out.push(String(e.message), String(e.stack)); return e instanceof StepError; });
     await s.run();
   } finally {
     Object.assign(console, { log: orig.log, error: orig.error, warn: orig.warn });
     process.stdout.write = orig.sw; process.stderr.write = orig.ew;
   }
-  const secret = coolifyKey(s.fake).private_key;
-  const body = secret.split("\n")[1];
+  const sent = keyPosts(s.fake).map((c) => c.body.private_key);
+  assert.equal(sent.length, 3, "422, timeout-before, timeout-after: three POSTs, the last adopted");
+  assert.equal(s.fake.keys.size, 1);
+  assert.equal(sent.at(-1), coolifyKey(s.fake).private_key);
   const haystacks = [
-    ...s.fake.calls.filter((c) => !(c.method === "POST" && c.path === "/api/v1/security/keys")).map((c) => JSON.stringify(c)),
+    ...s.fake.calls.filter((c) => !keyPost(c.method, c.path)).map((c) => JSON.stringify(c)),
     ...[...s.store.steps.values()].map((r) => JSON.stringify(r)),
     JSON.stringify(s.store.resources), ...out,
   ];
-  for (const h of haystacks) assert.ok(!h.includes(body), "private key material leaked");
-  assert.equal(keyPosts(s.fake).length, 1);
+  for (const pem of sent) {
+    const parts = secretParts(pem);
+    assert.ok(parts.length >= 5);
+    for (const h of haystacks) for (const x of parts) assert.ok(!h.includes(x), "private key material leaked");
+  }
+  // Positive control: the seed parts really are in the key that was sent (so the search can find a leak).
+  const seedHex = secretParts(sent[0])[2];
+  assert.match(seedHex, /^[0-9a-f]{64}$/);
+  assert.ok(Buffer.from(sent[0].replace(/-----[A-Z ]+-----/g, "").replace(/\s+/g, ""), "base64").toString("hex").includes(seedHex));
 });
 
 test("AT2 re-run creates nothing; a lost journal adopts both halves without a new key", async () => {
@@ -253,4 +281,10 @@ test("teardown ops: inspect sees ownership, remove is one DELETE, a second remov
   assert.equal(await gOps.inspect(inv("deploy_key")), null);
   assert.equal(s.fake.creates().filter((c) => c.method === "DELETE").length, 4);
   await assert.rejects(gOps.remove({ ...inv("deploy_key"), externalId: "a/b#x" }), /github-deploy-key-id-invalid/);
+  // Pre-review L2: "." and ".." segments would leave the repo path (`/repos/../user/keys/5` → `/user/keys/5`).
+  for (const bad of ["../user#5", "./x#5", "a/..#5", "../..#5"]) {
+    await assert.rejects(gOps.remove({ ...inv("deploy_key"), externalId: bad }), /github-deploy-key-id-invalid/);
+    await assert.rejects(gOps.inspect({ ...inv("deploy_key"), externalId: bad }), /github-deploy-key-id-invalid/);
+  }
+  assert.throws(() => deployKeySteps(s.gh, s.cf, s.store, P, ".."), /github-name-invalid/);
 });

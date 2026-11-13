@@ -13,7 +13,7 @@ import { ownershipMarker, type Found, type ProvisionStore, type StepSpec } from 
 import type { InventoryItem, ResourceOps } from "./teardown-ops.js";
 
 const UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
-const NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
+const NAME_RE = /^(?!\.+$)[A-Za-z0-9._-]{1,100}$/; // not "." or ".." (a path segment that would leave the repo)
 const PUB_RE = /\bpub:(ssh-ed25519 [A-Za-z0-9+/]{68})(?=\s|$)/;
 /** The step keys, in order. The GitHub half reads the Coolify half's journal row. */
 export const COOLIFY_KEY_STEP = "coolify/deploy_key";
@@ -43,14 +43,16 @@ export function generateDeployKeyPair(comment: string): DeployKeyPair {
   if (pub.length !== 32 || seed.length !== 32) throw new Error("deploy-key-generation-failed");
   const pubBlob = Buffer.concat([sshString("ssh-ed25519"), sshString(pub)]);
   const check = randomBytes(4).readUInt32BE();
-  let priv = Buffer.concat([u32(check), u32(check), sshString("ssh-ed25519"), sshString(pub), sshString(Buffer.concat([seed, pub])), sshString(comment)]);
+  const sk = Buffer.concat([seed, pub]);
+  const unpadded = Buffer.concat([u32(check), u32(check), sshString("ssh-ed25519"), sshString(pub), sshString(sk), sshString(comment)]);
   const pad: number[] = [];
-  for (let i = 1; (priv.length + pad.length) % 8 !== 0; i++) pad.push(i);
-  priv = Buffer.concat([priv, Buffer.from(pad)]);
+  for (let i = 1; (unpadded.length + pad.length) % 8 !== 0; i++) pad.push(i);
+  const priv = Buffer.concat([unpadded, Buffer.from(pad)]);
   const body = Buffer.concat([Buffer.from("openssh-key-v1\0"), sshString("none"), sshString("none"), sshString(""), u32(1), sshString(pubBlob), sshString(priv)]);
   const b64 = body.toString("base64").replace(/(.{70})/g, "$1\n").replace(/\n$/, "");
-  seed.fill(0);
-  priv.fill(0);
+  // Best-effort hygiene: clear the byte buffers that held the seed. The PEM itself is a JS string and cannot be
+  // erased; what keeps it secret is that it is sent once and never stored, returned or logged (F1).
+  for (const x of [seed, sk, unpadded, priv, body]) x.fill(0);
   return {
     publicKey: `ssh-ed25519 ${pubBlob.toString("base64")}`,
     privateKey: `-----BEGIN OPENSSH PRIVATE KEY-----\n${b64}\n-----END OPENSSH PRIVATE KEY-----\n`,
@@ -128,7 +130,7 @@ export function coolifyDeployKeyStep(cf: CoolifyClient, p: { id: string; slug: s
         const r = await cf.http.write<{ uuid?: unknown }>("POST", "/api/v1/security/keys", { name, description, private_key: pair.privateKey });
         uuid = r.body?.uuid;
       } finally {
-        pair = null; // drop the only reference to the private key, whatever happened
+        pair = null; // keep no reference to the private key past the one request (housekeeping; strings cannot be erased)
       }
       // Ownership comes from what Coolify stored: read it back. Not listed yet → transient, so the runner looks up
       // again instead of POSTing a second key.
@@ -244,7 +246,7 @@ export function coolifyPrivateKeyOps(cf: CoolifyClient, projectId: string): Reso
 
 function splitKeyId(externalId: string): [string, string, number] {
   const m = /^([A-Za-z0-9._-]{1,100})\/([A-Za-z0-9._-]{1,100})#([0-9]{1,15})$/.exec(externalId);
-  if (!m) throw new Error("github-deploy-key-id-invalid");
+  if (!m || !NAME_RE.test(m[1]!) || !NAME_RE.test(m[2]!)) throw new Error("github-deploy-key-id-invalid");
   return [m[1]!, m[2]!, Number(m[3])];
 }
 
