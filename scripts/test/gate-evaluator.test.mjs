@@ -80,6 +80,9 @@ test("AT3: floor guard exit 2, open hits, a Keep on another SHA or by the Builde
       fg.kkResolutions = [{ hit: h.id, file: h.file, line: h.line, sha: H1, decision: "keep", link: L("k1") }, { hit: h.id, file: h.file, line: h.line, sha: H1, decision: "restore", link: L("k2") }]; }, /not keep \(keep, restore\)/],
     // security-scanning CI removals and cut-off suppression texts are KK-only
     [(fg) => { const h = hitOf("ci-step-removed", undefined, ".github/workflows/security.yml", 12, "- run: gitleaks detect"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    // PR84-r1: a CI hit names only the step ("Checks" running npm audit), so every ci-* hit is KK-only
+    [(fg) => { const h = hitOf("ci-step-removed", undefined, ".github/workflows/ci.yml", 30, "job build: step name:Checks removed"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    [(fg) => { const h = hitOf("ci-disabled", undefined, ".github/workflows/ci.yml", 12, "if: false"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { const h = hitOf("suppression-added", undefined, "src/x.ts", 4, "x".repeat(200)); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { fg.report.exit = 1; }, /exit 1 with no hits/],
     [(fg) => { fg.report.sha = H2; }, /floor-guard result is not for head/],

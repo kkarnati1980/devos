@@ -19,8 +19,6 @@ const LINK = /^https:\/\/[^\s()[\]<>]+$/;
 // Secret-scanning and security-linter suppressions. Written with a one-character class so the floor guard does not
 // flag this pattern itself as a new suppression; it matches the same text and suppresses nothing (GI-4 contract).
 const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
-// Removals in CI files that run security scanning or the D13 licence check.
-const SECURITY_CI = /secur|gitleaks|secret|scan|licen[cs]e|audit|codeql|trivy|semgrep/i;
 // GI-1 cuts hit text to 200 characters; a token past the cut cannot be ruled out, so a full-length text fails closed.
 const CUT = 200;
 // Hits spec §4.4 sends to KK (security scanning, policy, D13): a Codex Keep never clears them, only KK's recorded answer.
@@ -28,7 +26,10 @@ export const KK_ONLY = (h) => {
   const text = String(h.text ?? "");
   if (h.rule === "gitleaksignore-added" || h.rule === "policy-weakened") return true;
   if (h.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text) || text.length >= CUT;
-  if (/^ci-/.test(h.rule ?? "")) return SECURITY_CI.test(`${h.file ?? ""} ${text}`) || text.length >= CUT;
+  // A CI hit names the step or job, not what it ran, so whether it removed or disabled security scanning cannot be
+  // established from the stored result (Codex PR84-r1): every ci-* hit fails closed to KK-only. The usual answer is
+  // to restore the change; a Codex Keep alone never clears it.
+  if (/^ci-/.test(h.rule ?? "")) return true;
   return false;
 };
 
