@@ -34,6 +34,22 @@ export interface SetupStatus {
 
 const TIMEOUT_MS = 10_000; // ADR-0011 §9: every outbound call has a timeout
 
+/**
+ * M2.3-b2 (DEVOS-135): page-wide signals for the nav's pending-approvals count. The nav never signs in
+ * itself (a second sign-in would rotate the cookie and stale the page's CSRF token, and an unsigned
+ * probe would log a 401), so it waits until a page's DevosApi holds a session, then only reads.
+ */
+export const SESSION_EVENT = "devos:session";
+export const APPROVALS_CHANGED_EVENT = "devos:approvals-changed";
+let sessionSeen = false;
+export function hasSession(): boolean {
+  return sessionSeen;
+}
+function markSession(): void {
+  sessionSeen = true;
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(SESSION_EVENT));
+}
+
 /** M1.6 notifications. */
 export type ChannelKind = "dashboard" | "mybrain" | "email";
 export interface Delivery {
@@ -110,6 +126,7 @@ export class DevosApi {
     const r = await this.once<{ login: string; expiresAt: string; csrfToken: string }>("GET", "/auth/session");
     if (!r.ok) return r;
     this.csrf = r.data.csrfToken;
+    markSession();
     return { ok: true, data: { login: r.data.login, expiresAt: r.data.expiresAt } };
   }
 
@@ -128,6 +145,7 @@ export class DevosApi {
     const r = await this.once<{ login: string; expiresAt: string; csrfToken: string }>("POST", "/auth/session");
     if (!r.ok) return r;
     this.csrf = r.data.csrfToken;
+    markSession();
     return { ok: true, data: { login: r.data.login, expiresAt: r.data.expiresAt } };
   }
 
@@ -168,6 +186,81 @@ export class DevosApi {
   retryDeadLetter(jobId: string) {
     return this.call<{ retried: string }>("POST", `/runs/dead-letters/${encodeURIComponent(jobId)}/retry`);
   }
+  /** M2.3-b2 (DEVOS-135): the approvals inbox over the M2.3-b1 routes. */
+  approvals(query: { status?: ApprovalStatus; cursor?: string } = {}) {
+    const q = new URLSearchParams();
+    if (query.status) q.set("status", query.status);
+    if (query.cursor) q.set("cursor", query.cursor);
+    const qs = q.toString();
+    return this.call<{ approvals: ApprovalRow[]; nextCursor: string | null }>("GET", `/approvals${qs ? `?${qs}` : ""}`);
+  }
+  approval(id: string) {
+    return this.call<ApprovalDetail>("GET", `/approvals/${encodeURIComponent(id)}`);
+  }
+  approve(id: string, body: { expiresInHours?: number; maxUses?: number; confirmation?: string }) {
+    return this.call<{ approval: ApprovalCard; grantId: string }>("POST", `/approvals/${encodeURIComponent(id)}/approve`, body);
+  }
+  reject(id: string, comment?: string) {
+    return this.call<{ approval: ApprovalCard }>("POST", `/approvals/${encodeURIComponent(id)}/reject`, comment ? { comment } : {});
+  }
+  commentApproval(id: string, body: string) {
+    return this.call<{ comment: ApprovalComment }>("POST", `/approvals/${encodeURIComponent(id)}/comments`, { body });
+  }
+  revokeApprovalGrant(id: string) {
+    return this.call<{ revoked: boolean; grantIds: string[] }>("POST", `/approvals/${encodeURIComponent(id)}/grant/revoke`);
+  }
+}
+
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
+
+/** M2.3-b1 `cardView` (apps/api/src/approvals-routes.ts). */
+export interface ApprovalCard {
+  id: string;
+  /** M2.3 gate name (e.g. "decision", "purge"); see apps/api/src/approvals.ts GATES. */
+  gate: string;
+  action: string;
+  target: string;
+  reason: string;
+  consequence: string | null;
+  /** Decimal string, e.g. "12.50". */
+  costUsd: string | null;
+  projectId: string | null;
+  status: ApprovalStatus;
+  createdAt: string | null;
+  decidedAt: string | null;
+  decidedBy: string | null;
+}
+
+/** M2.3-b1 `grantView`: the newest live grant, else the newest. */
+export interface ApprovalGrant {
+  id: string;
+  scopeAction: string;
+  scopeResource: string | null;
+  projectId: string | null;
+  sha: string | null;
+  expiresAt: string | null;
+  maxUses: number;
+  uses: number;
+  revoked: boolean;
+}
+
+export interface ApprovalRow extends ApprovalCard {
+  blockedTasks: number;
+  grant: ApprovalGrant | null;
+}
+
+export interface ApprovalComment {
+  id: string;
+  author: string;
+  body: string;
+  createdAt: string | null;
+}
+
+export interface ApprovalDetail {
+  approval: ApprovalCard;
+  comments: ApprovalComment[];
+  blockedTasks: { id: string; title: string; status: string }[];
+  grant: ApprovalGrant | null;
 }
 
 /** DEVOS-77: a run job that failed for good (M1.5 dead-letter list). */
@@ -201,6 +294,14 @@ export function explain(code: string): string {
   if (code === "dead-letters-not-configured") return "The failed-runs view needs the run queue (REDIS_URL) and the database.";
   if (code === "dead-letters-unavailable") return "The run queue did not answer. Try again in a minute.";
   if (code === "dead-letter-not-found") return "That run is no longer in the failed list (it may have been retried already).";
+  if (code === "approvals-not-configured") return "Approvals need the database and the policy key on the server.";
+  if (code === "approvals-store-error") return "The approvals store did not answer. Try again in a minute.";
+  if (code === "card-not-found") return "That approval card no longer exists.";
+  if (code === "card-not-pending") return "That card was already decided.";
+  if (code === "invalid-input") return "Check the values you entered: whole numbers within the shown limits, and comments up to 2,000 characters.";
+  if (code === "card-contains-secret") return "That text looks like a key or password, so it was not saved. Remove it and try again.";
+  if (code === "purge-confirmation-mismatch") return "The typed phrase does not match. Type it exactly as shown.";
+  if (code === "grant-not-found") return "There is no live grant on this card to revoke.";
   if (code === "vault-not-configured") return "The server vault key is not set yet (DEVOS_VAULT_KEY).";
   if (code.startsWith("invalid:value")) return "That value is not a valid key (16–4,096 characters, no spaces).";
   if (code.startsWith("invalid:") || code.startsWith("missing:")) return `Check the field: ${code.split(":")[1]}.`;

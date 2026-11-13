@@ -285,3 +285,121 @@ test("Codex PR60-r1 (db): a live grant older than 20 newer revoked grants is sti
   assert.equal(await engine.revokeGrant(KK, live), true);
 });
 
+
+test("DEVOS-164 (db): expireCardsById expires named pending cards with one audit row each; decided and unknown ids are left alone", async () => {
+  const { projectId, tasks: [t1, t2] } = await fixture(2);
+  const { approvals, store } = setup();
+  const pending = await approvals.raiseCard(card(projectId), [t1]);
+  const decided = await approvals.raiseCard(card(projectId), [t2]);
+  await approvals.reject(KK, decided.id, "not now");
+  const out = await approvals.expireCardsById([pending.id, decided.id, randomUUID()], "superseded by requirements v2");
+  assert.deepEqual(out, [pending.id]);
+  const row = await store.get(pending.id);
+  assert.deepEqual([row.status, row.decidedBy], ["expired", "system:expiry"]);
+  assert.equal((await store.get(decided.id)).status, "rejected");
+  assert.equal(await status(t1), "blocked");
+  const audits = await db.auditEvent.findMany({ where: { action: "approval.expired", details: { path: ["approvalId"], equals: pending.id } } });
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].details.reason, "superseded by requirements v2");
+  assert.equal(audits[0].projectId, projectId);
+  assert.equal(await db.auditEvent.count({ where: { action: "approval.expired", details: { path: ["approvalId"], equals: decided.id } } }), 0);
+  assert.deepEqual(await approvals.expireCardsById([pending.id], "again"), [], "idempotent");
+});
+
+// Holds a row lock on one approval in its own transaction until release() is called. With `approve`, the held
+// transaction marks the card approved before committing; with `rollback`, it changes nothing and rolls back.
+function holdCardLock(id, { approve = false, rollback = false } = {}) {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let onLocked;
+  let onFail;
+  const locked = new Promise((r, j) => ((onLocked = r), (onFail = j)));
+  const done = db
+    .$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM approval WHERE id = ${id}::uuid FOR UPDATE`;
+        if (approve) await tx.approval.update({ where: { id }, data: { status: "approved", decidedAt: new Date(), decidedBy: "kk:kk@kiot.io" } });
+        onLocked();
+        await gate;
+        if (rollback) throw new Error("rollback");
+      },
+      { timeout: 20_000, maxWait: 20_000 },
+    )
+    .catch((e) => {
+      if (rollback && e.message === "rollback") return;
+      onFail(e); // a hold that fails before locking fails the test at once instead of hanging
+      throw e;
+    });
+  return { locked, release: () => release(), done };
+}
+
+const settledWithin = (p, ms) => Promise.race([p.then(() => true, () => true), new Promise((r) => setTimeout(() => r(false), ms))]);
+
+test("DEVOS-164 (db): expireCardsById waits for a decide holding the row and then leaves the decided card alone", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, store } = setup();
+  const c = await approvals.raiseCard(card(projectId), [t1]);
+  const held = holdCardLock(c.id, { approve: true });
+  await held.locked;
+  const exp = approvals.expireCardsById([c.id], "superseded");
+  assert.equal(await settledWithin(exp, 400), false, "the expiry waits on the row lock (no SKIP LOCKED, no dirty read)");
+  held.release();
+  await held.done;
+  assert.deepEqual(await exp, [], "re-checked on the committed row: approved, so not expired");
+  assert.equal((await store.get(c.id)).status, "approved");
+  assert.equal(await db.auditEvent.count({ where: { action: "approval.expired", details: { path: ["approvalId"], equals: c.id } } }), 0);
+});
+
+test("DEVOS-164 (db): a row lock that changes nothing does not cut the expiry short (not SKIP LOCKED)", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, store } = setup();
+  const c = await approvals.raiseCard(card(projectId), [t1]);
+  const held = holdCardLock(c.id, { rollback: true });
+  await held.locked;
+  const exp = approvals.expireCardsById([c.id], "superseded");
+  assert.equal(await settledWithin(exp, 400), false);
+  held.release();
+  await held.done;
+  assert.deepEqual(await exp, [c.id]);
+  assert.equal((await store.get(c.id)).status, "expired");
+});
+
+test("DEVOS-164 (db): a full batch of 500 named cards expires in one call with 500 audit rows", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals } = setup();
+  const ids = Array.from({ length: 500 }, () => randomUUID());
+  await db.approval.createMany({ data: ids.map((id) => ({ id, projectId, gate: "decision", action: `bulk.${id}`, target: "repo:devos-app", reason: "bulk" })) });
+  const out = await approvals.expireCardsById(ids.map((i) => i.toUpperCase()), "superseded by requirements v3");
+  assert.deepEqual(out, [...ids].sort());
+  assert.equal(await db.approval.count({ where: { id: { in: ids }, status: "expired", decidedBy: "system:expiry" } }), 500);
+  assert.equal(await db.auditEvent.count({ where: { action: "approval.expired", projectId, summary: { startsWith: "Expired: bulk." } } }), 500);
+});
+
+test("DEVOS-164 (db): smoke: expireCardsById racing approve: the card is either approved or expired, never both", async () => {
+  for (let i = 0; i < 5; i++) {
+    const { projectId, tasks: [t1] } = await fixture(1);
+    const { approvals, store } = setup();
+    const c = await approvals.raiseCard(card(projectId), [t1]);
+    const [exp, appr] = await Promise.allSettled([approvals.expireCardsById([c.id], "superseded"), approvals.approve(KK, c.id)]);
+    assert.equal(exp.status, "fulfilled");
+    const final = (await store.get(c.id)).status;
+    const live = await db.approvalGrant.findMany({ where: { approvalId: c.id, revokedAt: null } });
+    const expiredAudits = await db.auditEvent.count({ where: { action: "approval.expired", details: { path: ["approvalId"], equals: c.id } } });
+    const approvedAudits = await db.auditEvent.count({ where: { action: "approval.approved", details: { path: ["approvalId"], equals: c.id } } });
+    if (final === "expired") {
+      assert.deepEqual(exp.value, [c.id]);
+      assert.equal(appr.status, "rejected");
+      assert.equal(appr.reason.code, "card-not-pending");
+      assert.equal(live.length, 0, "the losing approve's grant is revoked");
+      assert.deepEqual([expiredAudits, approvedAudits], [1, 0]);
+      assert.equal(await status(t1), "blocked");
+    } else {
+      assert.equal(final, "approved");
+      assert.deepEqual(exp.value, []);
+      assert.equal(appr.status, "fulfilled");
+      assert.equal(live.length, 1);
+      assert.deepEqual([expiredAudits, approvedAudits], [0, 1]);
+      assert.equal(await status(t1), "ready");
+    }
+  }
+});
