@@ -9,7 +9,7 @@ import * as runEngineModule from "@devos/run-engine";
 import { MemoryRunStore } from "@devos/run-engine";
 import {
   ANTHROPIC_MESSAGES_URL, ANTHROPIC_KEY_NAME, ANALYST_ANSWER_MAX_TOKENS, MAX_RESPONSE_BYTES,
-  analystModelPass, buildAnalystEngine, costUsd, messagesQuery,
+  analystModelPass, buildAnalystEngine, costUsd, messagesQuery, isBlockedAddress, pinnedFetch,
 } from "../dist/analyst-adapter.js";
 import { runEngineModelRunner, ANALYST_MODEL } from "../dist/analyst-runner.js";
 
@@ -219,4 +219,37 @@ test("AT-CA6 opt-in: only DEVOS_ANALYST_MODEL_PASS=on enables the pass; buildRun
   assert.equal(await reader(), "test-only-key-one-0123456789");
   await rt.setup.vault.put(ANTHROPIC_KEY_NAME, "test-only-key-two-0123456789");
   assert.equal(await reader(), "test-only-key-two-0123456789", "a rotation applies at the next call");
+});
+
+test("AT-CA7 (Codex PR92-r2, F2) the production call refuses internal addresses before sending, and is pinned and abortable", async () => {
+  for (const ip of ["127.0.0.1", "10.1.2.3", "172.16.0.9", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
+    "::1", "::", "fc00::1", "fe80::1", "::ffff:127.0.0.1", "64:ff9b::a00:1", "2002:a00:1::", "not-an-ip"]) {
+    assert.equal(isBlockedAddress(ip), true, `${ip} is blocked`);
+  }
+  for (const ip of ["160.79.104.10", "8.8.8.8", "2607:6bc0::10"]) assert.equal(isBlockedAddress(ip), false, `${ip} is public`);
+
+  // The default fetch (no test fetch injected) is the pinned one: an internal resolution is refused with nothing sent,
+  // so no upper-bound charge event is yielded either.
+  let lookups = 0;
+  const events = [];
+  const q = messagesQuery({ apiKey: async () => KEY, timeoutMs: 5_000, lookup: async () => (lookups++, [{ address: "10.0.0.7", family: 4 }]) });
+  await assert.rejects(async () => {
+    for await (const e of q({ prompt: "p", options: { abortController: new AbortController(), model: ANALYST_MODEL } })) events.push(e);
+  }, /analyst-blocked-address/);
+  assert.equal(lookups, 1, "the host is resolved once");
+  assert.deepEqual(events, [], "refused before sending: no usage, no charge");
+
+  // One internal address among public ones is enough to refuse; only https is allowed.
+  const f = pinnedFetch(async () => [{ address: "160.79.104.10", family: 4 }, { address: "127.0.0.1", family: 4 }]);
+  await assert.rejects(f(ANTHROPIC_MESSAGES_URL, { method: "POST" }), /analyst-blocked-address/);
+  await assert.rejects(pinnedFetch(async () => [{ address: "160.79.104.10", family: 4 }])("http://api.anthropic.com/v1/messages"), /analyst-blocked-address/);
+
+  // The caller's signal aborts a slow lookup with its own reason (the timeout and the engine's cancel keep working).
+  const ac = new AbortController();
+  const slow = pinnedFetch(() => new Promise(() => {}));
+  const p = slow(ANTHROPIC_MESSAGES_URL, { method: "POST", signal: ac.signal });
+  const reason = Object.assign(new Error("cancelled"), { name: "AbortError" });
+  ac.abort(reason);
+  await assert.rejects(p, (e) => e === reason);
+  await assert.rejects(slow(ANTHROPIC_MESSAGES_URL, { signal: AbortSignal.abort(reason) }), (e) => e === reason);
 });

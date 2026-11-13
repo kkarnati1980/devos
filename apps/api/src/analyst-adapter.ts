@@ -1,7 +1,12 @@
 // M2.2-d3b2 (docs/modules/M2.2.md, "M2.2-d3b2 — Behaviour"): the production model adapter for the analyst pass.
 // One analyst call is one answer with no tools, so it is one Anthropic Messages API request. It is shaped as the
 // Agent SDK's `query` stream, so M1.5's ClaudeAgentSdkAdapter (events, usage, cancel, error typing) runs it
-// unchanged. No new dependency: Node's fetch, a bounded timeout, the key read from the vault by name at call time.
+// unchanged. No new dependency: Node's https client pinned to a checked address (F2, Codex PR92-r2), a bounded
+// timeout, the key read from the vault by name at call time.
+import dns from "node:dns/promises";
+import https from "node:https";
+import net from "node:net";
+import { Readable } from "node:stream";
 import type { CapabilityEnvelope } from "@devos/policy";
 
 export const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
@@ -66,6 +71,137 @@ async function readCapped(res: Response, cap: number): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+// ---- F2 internal-address block (Codex PR92-r2). Same address rules as the golden-path template's safeFetch
+// (templates/golden-path/core/src/safe-fetch.mjs, DevOS's own code): the host is resolved once, every address is
+// checked, and the socket is pinned to a checked address, so DNS rebinding cannot swap it. ----
+const V4_BLOCKED: ReadonlyArray<[string, number]> = [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16],
+  ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15],
+  ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 3],
+];
+const v4int = (ip: string): number => ip.split(".").reduce((a, o) => a * 256 + Number(o), 0);
+const inV4 = (ip: string, [base, bits]: [string, number]): boolean =>
+  bits === 0 || Math.floor(v4int(ip) / 2 ** (32 - bits)) === Math.floor(v4int(base) / 2 ** (32 - bits));
+function v6words(ip: string): number[] {
+  let s = ip.toLowerCase().split("%")[0] ?? "";
+  const m = s.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (m) { const v = v4int(m[2] ?? ""); s = `${m[1] ?? ""}${(v >>> 16).toString(16)}:${(v & 0xffff).toString(16)}`; }
+  const [head, tail] = s.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail !== undefined && tail ? tail.split(":") : [];
+  const fill = tail !== undefined ? Array(Math.max(0, 8 - h.length - t.length)).fill("0") : [];
+  return [...h, ...fill, ...t].map((w) => parseInt(w || "0", 16));
+}
+/** True when server-side code must never connect to the address (private, loopback, link-local, reserved, …). */
+export function isBlockedAddress(ip: string): boolean {
+  const fam = net.isIP(ip);
+  if (fam === 4) return V4_BLOCKED.some((r) => inV4(ip, r));
+  if (fam !== 6) return true;
+  const words = v6words(ip);
+  const w = (i: number): number => words[i] ?? 0;
+  if (words.length !== 8 || words.some((x) => Number.isNaN(x))) return true;
+  const embedded = (): string => `${w(6) >> 8}.${w(6) & 255}.${w(7) >> 8}.${w(7) & 255}`;
+  if (words.slice(0, 7).every((x) => x === 0) && (w(7) === 0 || w(7) === 1)) return true;
+  if (words.slice(0, 5).every((x) => x === 0) && w(5) === 0xffff) return isBlockedAddress(embedded());
+  if (words.slice(0, 6).every((x) => x === 0)) return isBlockedAddress(embedded());
+  if (w(0) === 0x64 && w(1) === 0xff9b) return isBlockedAddress(embedded());
+  if (words.slice(0, 4).every((x) => x === 0) && w(4) === 0xffff && w(5) === 0) return isBlockedAddress(embedded());
+  if (w(0) === 0x2002) return isBlockedAddress(`${w(1) >> 8}.${w(1) & 255}.${w(2) >> 8}.${w(2) & 255}`);
+  if (w(0) === 0x0100 && words.slice(1, 4).every((x) => x === 0)) return true;
+  if ((w(0) & 0xffc0) === 0xfec0) return true;
+  if ((w(0) & 0xfe00) === 0xfc00) return true;
+  if ((w(0) & 0xffc0) === 0xfe80) return true;
+  if ((w(0) & 0xff00) === 0xff00) return true;
+  if (w(0) === 0x2001 && w(1) === 0x0db8) return true;
+  return false;
+}
+
+export type Lookup = (host: string) => Promise<Array<{ address: string; family: number }>>;
+const systemLookup: Lookup = (host) => dns.lookup(host, { all: true, verbatim: true });
+
+function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+/**
+ * A fetch for the one Messages API call that never reaches an internal address (F2): https only; the host is
+ * resolved once and refused (`analyst-blocked-address`, before anything is sent) if any address is internal; the
+ * socket connects only to the checked address (Host and SNI keep the name); no keep-alive pool or env proxy
+ * (`agent: false`); a redirect is refused like `redirect: "error"`; the caller's signal aborts the lookup, the
+ * request and the body stream with the signal's reason, so the timeout and the engine's cancel keep working.
+ */
+export function pinnedFetch(lookup: Lookup = systemLookup): typeof fetch {
+  return (async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
+    const url = new URL(String(input));
+    if (url.protocol !== "https:") throw new AnalystApiError("analyst-blocked-address");
+    const signal = init.signal ?? undefined;
+    const host = url.hostname.replace(/^\[|\]$/g, "");
+    let addrs: Array<{ address: string; family: number }>;
+    try {
+      addrs = net.isIP(host) ? [{ address: host, family: net.isIP(host) }] : await abortable(lookup(host), signal);
+    } catch (e) {
+      if (signal?.aborted) throw signal.reason;
+      throw Object.assign(new TypeError("fetch failed"), { cause: e });
+    }
+    if (!addrs.length || addrs.some((a) => isBlockedAddress(a.address))) throw new AnalystApiError("analyst-blocked-address");
+    const addr = addrs[0]!;
+    if (signal?.aborted) throw signal.reason;
+    return new Promise<Response>((resolve, reject) => {
+      let settled = false;
+      const req = https.request(
+        {
+          agent: false,
+          hostname: host,
+          port: url.port || undefined,
+          path: url.pathname + url.search,
+          method: init.method ?? "GET",
+          headers: init.headers as Record<string, string>,
+          servername: net.isIP(host) ? undefined : host,
+          lookup: ((_h: string, o: { all?: boolean }, cb: (...a: unknown[]) => void) =>
+            o && o.all ? cb(null, [{ address: addr.address, family: addr.family }]) : cb(null, addr.address, addr.family)) as unknown as net.LookupFunction,
+        },
+        (res) => {
+          const status = res.statusCode ?? 0;
+          if (status >= 300 && status < 400) {
+            res.destroy();
+            settled = true;
+            signal?.removeEventListener("abort", onAbort);
+            reject(new TypeError("fetch failed: redirect refused"));
+            return;
+          }
+          settled = true;
+          resolve(new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, { status: status < 200 || status > 599 ? 502 : status }));
+        },
+      );
+      const onAbort = (): void => {
+        req.destroy(signal!.reason);
+        if (!settled) { settled = true; reject(signal!.reason); }
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      req.on("close", () => setImmediate(() => signal?.removeEventListener("abort", onAbort)));
+      req.on("error", (e) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        reject(signal?.aborted ? signal.reason : Object.assign(new TypeError("fetch failed"), { cause: e }));
+      });
+      try {
+        if (typeof init.body === "string") req.write(init.body);
+        req.end();
+      } catch (e) {
+        req.destroy();
+        if (!settled) { settled = true; reject(Object.assign(new TypeError("fetch failed"), { cause: e })); }
+      }
+    });
+  }) as typeof fetch;
+}
+
 const isTimeout = (e: unknown): boolean => (e as { name?: string })?.name === "TimeoutError";
 const isAbort = (e: unknown): boolean => isTimeout(e) || (e as { name?: string })?.name === "AbortError";
 
@@ -76,7 +212,10 @@ export interface MessagesQueryOptions {
   /** Reads the key by name at call time (rotation applies at once); null → the call fails `analyst-key-missing`. */
   apiKey: () => Promise<string | null>;
   timeoutMs: number;
+  /** Tests only; production uses `pinnedFetch` (F2, Codex PR92-r2). */
   fetch?: typeof fetch;
+  /** Tests only: the resolver `pinnedFetch` checks. */
+  lookup?: Lookup;
 }
 
 /**
@@ -84,7 +223,7 @@ export interface MessagesQueryOptions {
  * answer in text (deny-all envelope, M2.2-d3b §1b); a non-empty allowedTools is refused before the request.
  */
 export function messagesQuery(o: MessagesQueryOptions): (args: QueryArgs) => AsyncIterable<SdkMessage> {
-  const doFetch = o.fetch ?? fetch;
+  const doFetch = o.fetch ?? pinnedFetch(o.lookup);
   return async function* ({ prompt, options }: QueryArgs): AsyncGenerator<SdkMessage> {
     if (options.allowedTools && options.allowedTools.length > 0) throw new AnalystApiError("analyst-tools-refused");
     if (!ANTHROPIC_PRICES[options.model]) throw new AnalystApiError("analyst-model-unpriced");
@@ -120,6 +259,8 @@ export function messagesQuery(o: MessagesQueryOptions): (args: QueryArgs) => Asy
       }
     } catch (e) {
       if (e instanceof AnalystApiError && e.status !== undefined) throw e;
+      // Refused before any byte was sent (F2): nothing to charge.
+      if (e instanceof AnalystApiError && e.message === "analyst-blocked-address") throw e;
       // Pre-review finding 1: the request was sent, so the provider may bill a generation we never read (timeout,
       // cancel, a lost connection, an oversize or unreadable body). Report the upper bound of its tokens (every
       // request byte as an input token, the full answer cap as output) with no cost, so M1.5 settles fail-closed:
