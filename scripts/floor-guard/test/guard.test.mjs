@@ -184,6 +184,8 @@ const VIOLATIONS = [
   ["ts-strict-relaxed (false flag in a new tsconfig)", {}, { "packages/y/tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' }],
   ["test-script-changed (posttest hook removed)", { "package.json": '{ "scripts": { "test": "vitest run", "posttest": "node verify.mjs" } }\n' }, { "package.json": '{ "scripts": { "test": "vitest run" } }\n' }],
   ["test-script-changed (hook in a new package.json)", {}, { "packages/y/package.json": '{ "scripts": { "pretest": "pnpm build" } }\n' }],
+  ["ts-strict-relaxed (strictBuiltinIteratorReturn off, PR85-r1)", { "tsconfig.json": '{"compilerOptions":{"strict":true}}\n' }, { "tsconfig.json": '{"compilerOptions":{"strict":true,"strictBuiltinIteratorReturn":false}}\n' }],
+  ["ts-strict-relaxed (noCheck on)", { "tsconfig.json": '{"compilerOptions":{"strict":true}}\n' }, { "tsconfig.json": '{"compilerOptions":{"strict":true,"noCheck":true}}\n' }],
   ["ts-strict-relaxed (extends retargeted)", { "packages/x/tsconfig.json": '{ "extends": "../../tsconfig.base.json" }\n' }, { "packages/x/tsconfig.json": '{ "extends": "./loose.json" }\n' }],
   ["policy-weakened", { "packages/policy/src/evaluator.ts": "const deny = matched.find((r) => r.effect === \"deny\");\nconst outcome = deny ? \"deny\" : \"allow\";\n" }, { "packages/policy/src/evaluator.ts": "const outcome = \"allow\";\n" }],
 ];

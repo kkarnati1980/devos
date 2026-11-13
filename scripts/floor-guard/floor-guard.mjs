@@ -23,7 +23,10 @@ const SHELL = /\.(sh|bash)$/;
 const TSCONFIG = /(^|\/)tsconfig[\w.-]*\.json$/;
 // TypeScript strictness flags; turning one off (or dropping a `true`) relaxes type checking (GI-1c).
 const TS_STRICT = ["strict", "noImplicitAny", "strictNullChecks", "strictFunctionTypes", "strictBindCallApply", "strictPropertyInitialization",
-  "noImplicitThis", "alwaysStrict", "useUnknownInCatchVariables", "exactOptionalPropertyTypes", "noUncheckedIndexedAccess"];
+  "noImplicitThis", "alwaysStrict", "useUnknownInCatchVariables", "strictBuiltinIteratorReturn", "exactOptionalPropertyTypes",
+  "noUncheckedIndexedAccess"];
+// Options that turn type checking off when set to true (TS 5.5+ `noCheck`).
+const TS_LOOSE = ["noCheck"];
 
 /** Parse JSONC (tsconfig): comments and trailing commas removed outside strings only. Returns null if unreadable. */
 export function parseJsonc(text) {
@@ -485,6 +488,7 @@ export function analyse(files, show) {
           if (bo[k] === true && ho[k] !== true) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": true -> ${ho[k] === undefined ? "removed" : JSON.stringify(ho[k])}`);
           else if (ho[k] === false && bo[k] !== false) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": false`);
         }
+        for (const k of TS_LOOSE) if (ho[k] === true && bo[k] !== true) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": true`);
         // strictness is inherited through "extends": dropping or retargeting it can turn strict off
         if (b.extends !== undefined && JSON.stringify(b.extends) !== JSON.stringify(h.extends)) hit("ts-strict-relaxed", p, lineOf("extends"), `extends ${JSON.stringify(b.extends)} -> ${h.extends === undefined ? "removed" : JSON.stringify(h.extends)}`);
       }
