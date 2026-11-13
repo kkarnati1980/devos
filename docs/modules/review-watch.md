@@ -139,3 +139,8 @@ Run the existing Codex review automatically on every new PR head, so a review no
 - **Deployment:** the server agent installs the merged script (allow-list). KK does nothing.
   - AT21 (pre-review): a failure slower than `REVIEW_RETRY_FAST` is final at once ("Attempts: 1 of 3", `error`, no `retry_at`). A runner exiting 0 with no verdict file counts as a fast failure and is retried, never published as a PASS (D1). A superseded pending retry is closed with `error` exactly once. `--dry-run` writes no state and posts no status, whether a retry is waiting or would be closed.
 - **Pre-review (1 medium, 4 low; all fixed):** (M1) the slow-failure rule above; (L2) the superseded retry is closed; (L3) the attempt count is clamped; (L4) the `REVIEW_RETRY_BASE` test now has a lower bound, plus the new tests above; (L5) the versions under owned files are updated. A runner that reports it is busy still uses up no attempt: that check returns before the retry logic, unchanged.
+
+## Pass rule
+- `node --test --test-concurrency=1 scripts/test/review-watch.test.mjs` exits 0 on the merged SHA (AT14–AT21, HB1–HB3).
+- `bash -n scripts/review/review-watch.sh` and `bash -n scripts/review/install-review-watch.sh` exit 0.
+- After the server agent installs the merged script, the next runner failure that ends in under 120 s shows `codex-review` = pending with "attempt 1 of 3" on that head, and the `codex-review-watch` heartbeat on main is at most 2 hours old.
