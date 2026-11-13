@@ -31,6 +31,11 @@ export interface ExpiryDeps {
   cards: PendingCardLister;
   /** `Approvals.expireCardsById`: returns the ids it expired. */
   expire(ids: readonly string[], reason: string): Promise<string[]>;
+  /**
+   * Runs the pass so that no newer version can be saved meanwhile (`PrismaRequirementsStore.withProjectHeld`;
+   * Codex PR88-r1). Without it (in-memory tests) the pass runs as is.
+   */
+  serialize?<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
 }
 
 export interface ExpiryResult {
@@ -81,7 +86,15 @@ async function expireAll(deps: ExpiryDeps, ids: string[], reason: string): Promi
  *   for that open question. Cards created during the submission belong to this or a concurrent submission and are
  *   left alone; any a concurrent older submission leaves pending are expired by the next submission's pass.
  */
-export async function expireSuperseded(deps: ExpiryDeps, projectId: string, r: SubmitResult, startedAt: Date): Promise<ExpiryResult> {
+export function expireSuperseded(deps: ExpiryDeps, projectId: string, r: SubmitResult, startedAt: Date): Promise<ExpiryResult> {
+  // The newest-version check and the expiry are one step: while the project row is held no newer submission can
+  // save, so a card a newer version would reuse is never expired after the check (Codex PR88-r1). A newer version
+  // saved after the pass raises its questions afresh, because the core reuses only pending twins.
+  const pass = () => expirePass(deps, projectId, r, startedAt);
+  return deps.serialize ? deps.serialize(projectId, pass) : pass();
+}
+
+async function expirePass(deps: ExpiryDeps, projectId: string, r: SubmitResult, startedAt: Date): Promise<ExpiryResult> {
   const result: ExpiryResult = { requirements: [], questions: [], skipped: [] };
   const latest = await deps.latestDoc(projectId);
   if (!latest) return result;

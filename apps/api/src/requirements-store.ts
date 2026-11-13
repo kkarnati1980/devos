@@ -45,6 +45,20 @@ export class PrismaRequirementsStore implements RequirementsStore {
     return rows.length ? rows[0]!.stage : null;
   }
 
+  /**
+   * M2.2-d3c2 (Codex PR88-r1): runs `fn` while holding the project row, so no submission can save a new version
+   * (`saveAnalysis` takes `FOR UPDATE` on the same row) until it returns. `FOR NO KEY UPDATE` still conflicts with
+   * that, but not with the `FOR KEY SHARE` a foreign-key insert takes, so `fn` may write rows that reference the
+   * project (the approvals core's audit rows) from its own transactions without waiting on this one. Bounded by the
+   * store's transaction timeout.
+   */
+  withProjectHeld<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    return this.tx(async (tx) => {
+      await tx.$queryRaw`SELECT 1 AS held FROM project WHERE id = ${projectId}::uuid FOR NO KEY UPDATE`;
+      return fn();
+    });
+  }
+
   project(projectId: string): Promise<ProjectRow | null> {
     return this.tx(async (tx) => {
       const p = await tx.project.findUnique({ where: { id: projectId }, select: { id: true, name: true, stage: true } });

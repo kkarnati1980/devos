@@ -187,10 +187,23 @@ export function requirementsServices(
       raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
       runner,
     },
-    { latestDoc: (id) => store.latestDoc(id), cards, expire: (ids, reason) => approvals.expireCardsById(ids, reason) },
+    {
+      latestDoc: (id) => store.latestDoc(id),
+      cards,
+      expire: (ids, reason) => approvals.expireCardsById(ids, reason),
+      // The Postgres store holds the project row for the pass (Codex PR88-r1); the in-memory store has no lock.
+      serialize: holder(store),
+    },
     expiryLog,
   );
   return { pipeline, store, cards: { get: (id) => cards.get(id) } };
+}
+
+type Held = { withProjectHeld?<T>(projectId: string, fn: () => Promise<T>): Promise<T> };
+/** The store's project hold, when it has one (PrismaRequirementsStore does). */
+function holder(store: object): (<T>(projectId: string, fn: () => Promise<T>) => Promise<T>) | undefined {
+  const s = store as Held;
+  return typeof s.withProjectHeld === "function" ? (id, fn) => s.withProjectHeld!(id, fn) : undefined;
 }
 
 /**

@@ -174,3 +174,52 @@ test("AT-E6 interleaved submissions: an older submission that raises its cards a
   assert.equal(domain.status, "expired", "the next submission's pass clears it");
   assert.ok(c.expired.questions.includes(domain.id));
 });
+
+test("AT-E7 (Codex PR88-r1) a newer version cannot save while an older pass checks and expires, so the newest spec keeps a pending card for its questions", async () => {
+  const { store, svc, approvalStore } = wire();
+  // A store with a project hold, as PrismaRequirementsStore: saveAnalysis waits while the pass holds the project.
+  let tail = Promise.resolve();
+  const hold = (fn) => {
+    const run = tail.then(fn);
+    tail = run.then(() => undefined, () => undefined);
+    return run;
+  };
+  const realSave = store.saveAnalysis.bind(store);
+  const order = [];
+  store.saveAnalysis = (input) => hold(async () => { order.push("save"); return realSave(input); });
+  store.withProjectHeld = (_id, fn) => hold(fn);
+  const svcHeld = requirementsServices(store, new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false }), approvalStore);
+
+  await svcHeld.pipeline.submitSpec(P1, { kind: "paste", text: spec([DOMAIN]) }); // v1 asks Q
+  const q1 = questionByText(approvalStore, DOMAIN)[0];
+  // v2 drops Q. Pause its pass while it holds the project, then start v3, which asks Q again.
+  const realList = approvalStore.list.bind(approvalStore);
+  let release, entered;
+  const gate = new Promise((res) => (release = res));
+  const inPass = new Promise((res) => (entered = res));
+  let pausedOnce = false;
+  approvalStore.list = async (f) => {
+    if (f.status === "pending" && !pausedOnce) {
+      pausedOnce = true;
+      order.push("v2-pass");
+      entered();
+      await gate;
+    }
+    return realList(f);
+  };
+  const v2 = svcHeld.pipeline.submitSpec(P1, { kind: "paste", text: spec([LOGO]) });
+  await inPass;
+  const v3 = svcHeld.pipeline.submitSpec(P1, { kind: "paste", text: spec([DOMAIN]) });
+  for (let i = 0; i < 20; i++) await new Promise((res) => setImmediate(res));
+  assert.deepEqual(order.slice(-2), ["save", "v2-pass"], "v3 has not saved while v2's pass holds the project");
+  release();
+  const [r2, r3] = await Promise.all([v2, v3]);
+  approvalStore.list = realList;
+  assert.equal(q1.status, "expired", "v2 dropped Q, so v1's card expires");
+  const q3 = r3.questionCards.raised.map((q) => approvalStore.cards.get(q.cardId)).filter((c) => c.reason.includes(DOMAIN));
+  assert.equal(q3.length, 1);
+  assert.equal(q3[0].status, "pending", "v3, the newest spec, has a pending card for Q");
+  assert.notEqual(q3[0].id, q1.id);
+  assert.equal(r3.docVersion, 3);
+  assert.deepEqual(r2.expired.questions, [q1.id]);
+});
