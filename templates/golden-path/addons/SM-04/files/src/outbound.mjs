@@ -58,13 +58,78 @@ export function outbound({ name, baseUrl, timeoutMs, ...defaults } = {}) {
   return Object.freeze({ name, timeoutMs, call });
 }
 
-// findUntimedCalls(root): calls of the F2 fetch in src/ whose arguments do not name timeoutMs (its own default
-// is a fallback, not an explicit timeout). Returns [{ file, line }]. Calls through outbound() always carry one.
-// Arguments are read up to the matching parenthesis, so a call split over lines is judged whole. A call whose
-// options come from a variable is reported too: the timeout must be visible at the call.
+// ---------- untimed-call check ----------
+// Code view: comments blanked and string/template text blanked (quotes, offsets and ${…} expressions kept), so
+// words and parentheses inside comments and strings neither hide nor fake a call. Regex literals are not parsed.
+export function codeView(src) {
+  const out = src.split("");
+  const blank = (from, to) => { for (let k = from; k < to; k++) if (out[k] !== "\n") out[k] = " "; };
+  const stack = []; // open template literals: brace depth at which each ${ started
+  let depth = 0;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i], d = src[i + 1];
+    if (c === "/" && d === "/") { const e = src.indexOf("\n", i); const end = e < 0 ? src.length : e; blank(i, end); i = end - 1; continue; }
+    if (c === "/" && d === "*") { const e = src.indexOf("*/", i + 2); const end = e < 0 ? src.length : e + 2; blank(i, end); i = end - 1; continue; }
+    if (c === '"' || c === "'") {
+      let k = i + 1;
+      for (; k < src.length && src[k] !== c && src[k] !== "\n"; k++) if (src[k] === "\\") k++;
+      blank(i + 1, k); i = k; continue;
+    }
+    if (c === "`" || (c === "}" && stack.length && stack[stack.length - 1] === depth)) {
+      if (c === "}") stack.pop();
+      let k = i + 1;
+      for (; k < src.length && src[k] !== "`" && !(src[k] === "$" && src[k + 1] === "{"); k++) if (src[k] === "\\") k++;
+      blank(i + 1, k);
+      if (src[k] === "$") { stack.push(depth); i = k + 1; } else i = k;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+  }
+  return out.join("");
+}
+
+// Splits the text after an opening "(" into top-level arguments; returns { args, end } or null if never closed.
+function topLevelArgs(code, start) {
+  const args = []; let depth = 0, from = start;
+  for (let i = start; i < code.length; i++) {
+    const c = code[i];
+    if ("([{".includes(c)) depth++;
+    else if (")]}".includes(c)) {
+      if (depth === 0) { if (code.slice(from, i).trim()) args.push(code.slice(from, i)); return { args, end: i }; }
+      depth--;
+    } else if (c === "," && depth === 0) { args.push(code.slice(from, i)); from = i + 1; }
+  }
+  return null;
+}
+
+// Why an options argument does not give an explicit, bounded timeout, or "" when it does.
+function timeoutProblem(arg) {
+  const t = arg?.trim();
+  if (!t) return "no options argument with timeoutMs";
+  if (!t.startsWith("{") || !t.endsWith("}")) return "options must be an object literal that names timeoutMs";
+  const props = topLevelArgs(t.slice(1, -1) + ")", 0)?.args ?? [];
+  const prop = props.map((x) => x.trim()).find((x) => /^timeoutMs\s*(?::|$)/.test(x));
+  if (!prop) return "the options do not name timeoutMs";
+  const value = prop.includes(":") ? prop.slice(prop.indexOf(":") + 1).trim() : "timeoutMs";
+  if (/^(?:undefined|null|void\b.*)$/.test(value)) return "timeoutMs is not set";
+  if (/^[\d_.]+(?:e\d+)?$/i.test(value)) {
+    const n = Number(value.replaceAll("_", ""));
+    if (!(n >= 1 && n <= MAX_TIMEOUT_MS)) return `timeoutMs must be from 1 to ${MAX_TIMEOUT_MS}`;
+  }
+  return "";
+}
+
+// findUntimedCalls(root): every use of the F2 fetch in src/ that is not a direct call with an explicit, bounded
+// timeoutMs in an object-literal options argument (shorthand allowed). The fetch's own 10 s default is a fallback,
+// not an explicit timeout. Inverse rules, as for F2-1: any other use of the name (an alias, a value, ?.(), .call,
+// a spread of the arguments) is reported, and so is any reference to the module other than the plain named import.
+// Calls through outbound() always carry a timeout. Returns [{ file, line, reason }].
 export function findUntimedCalls(root, dirs = ["src"]) {
   const hits = [];
-  const callee = ["safe", "Fetch"].join("");
+  const name = ["safe", "Fetch"].join("");
+  const mod = ["safe", "fetch"].join("-");
+  const plainImport = new RegExp(`^[ \\t]*import\\s*\\{\\s*${name}\\s*\\}\\s*from\\s*(["'])\\./${mod}\\.mjs\\1\\s*;?[ \\t]*$`, "gm");
   const walk = (dir) => {
     let names;
     try { names = readdirSync(dir); } catch { return; }
@@ -75,14 +140,22 @@ export function findUntimedCalls(root, dirs = ["src"]) {
       if (st.isDirectory()) { walk(p); continue; }
       if (!/\.(?:m?js|cjs|ts|mts|cts|tsx|jsx)$/.test(n)) continue;
       const file = relative(root, p).split(sep).join("/");
-      if (file === "src/safe-fetch.mjs") continue; // the definition itself
-      const text = readFileSync(p, "utf8");
-      const re = new RegExp(`\\b${callee}\\s*\\(`, "g");
-      for (const m of text.matchAll(re)) {
-        let depth = 1, i = m.index + m[0].length;
-        for (; i < text.length && depth > 0; i++) { if (text[i] === "(") depth++; else if (text[i] === ")") depth--; }
-        const args = text.slice(m.index + m[0].length, i - 1);
-        if (!/\btimeoutMs\s*:/.test(args)) hits.push({ file, line: text.slice(0, m.index).split("\n").length });
+      if (file === `src/${mod}.mjs`) continue; // the definition itself
+      const raw = readFileSync(p, "utf8");
+      const lineOf = (i) => raw.slice(0, i).split("\n").length;
+      const hit = (i, reason) => hits.push({ file, line: lineOf(i), reason });
+      // The plain named import is the one allowed reference to the module; it is blanked before the scans below.
+      const allowed = raw.replace(plainImport, (m) => " ".repeat(m.length));
+      for (const m of allowed.matchAll(new RegExp(`${mod}(?:\\.mjs)?\\b`, "g"))) hit(m.index, "the fetch module may only be imported as { " + name + " }");
+      const code = codeView(allowed);
+      for (const m of code.matchAll(new RegExp(`(?<![\\w$.])${name}(?![\\w$])`, "g"))) {
+        const after = /^\s*\(/.exec(code.slice(m.index + name.length));
+        if (!after) { hit(m.index, "used other than as a direct call"); continue; }
+        const parsed = topLevelArgs(code, m.index + name.length + after[0].length);
+        if (!parsed) { hit(m.index, "call is not closed"); continue; }
+        if (parsed.args.some((x) => x.trim().startsWith("..."))) { hit(m.index, "arguments must not be spread"); continue; }
+        const problem = timeoutProblem(parsed.args[1]);
+        if (problem) hit(m.index, problem);
       }
     }
   };

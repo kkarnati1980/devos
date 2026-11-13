@@ -72,14 +72,46 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sm04-"));
   const write = (rel, text) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fs.writeFileSync(path.join(dir, rel), text); };
   const F = ["safe", "Fetch"].join(""); // fixtures are assembled so this test file holds no call itself
-  write("src/a.mjs", `const a = 1;\nawait ${F}(url);\n`);
-  write("src/b.mjs", `const a = 1;\nawait ${F}(url, { method: "POST", headers: h(x) });\n`);
-  write("src/c.mjs", `const a = 1;\nawait ${F} (\n  url,\n  opts,\n);\n`);
-  write("src/ok.mjs", `await ${F}(url, {\n  method: "GET",\n  timeoutMs: 2000,\n});\nawait ${F}(u, { timeoutMs: cfg.t });\n`);
-  write("src/safe-fetch.mjs", `export async function ${F}(input, opts = {}) {}\n`);
+  const M = ["safe", "fetch"].join("-");
+  const bad = {
+    "src/a.mjs": `await ${F}(url);`,
+    "src/b.mjs": `await ${F}(url, { method: "POST", headers: h(x) });`,
+    "src/c.mjs": `await ${F} (\n  url,\n  opts,\n);`,
+    "src/d.mjs": `import { ${F} as sf } from "./${M}.mjs";`,
+    "src/e.mjs": `const f = ${F};`,
+    "src/f.mjs": `await ${F}?.(url);`,
+    "src/g.mjs": `await ${F}.call(null, url);`,
+    "src/h.mjs": `urls.map(${F});`,
+    "src/i.mjs": `import * as F from "./${M}.mjs";`,
+    "src/j.mjs": `const m = await import("./${M}.mjs");`,
+    "src/k.mjs": `await ${F}(url, { headers: { x: "(" } }); other({ timeoutMs: 5 });`,
+    "src/l.mjs": `await ${F}(url /* timeoutMs: 5000 */);`,
+    "src/m.mjs": `await ${F}(url, { headers: { "x-note": "timeoutMs: 5" } });`,
+    "src/n.mjs": `await ${F}(build({ timeoutMs: 5 }), opts);`,
+    "src/o.mjs": `await ${F}(url, { timeoutMs: undefined });`,
+    "src/p.mjs": `await ${F}(url, { timeoutMs: 2e9 });`,
+    "src/q.mjs": `await ${F}(url, { timeoutMs: 0 });`,
+    "src/r.mjs": `await ${F}(...args);`,
+    "src/s.mjs": `await ${F}(url, { ...opts });`,
+  };
+  for (const [rel, text] of Object.entries(bad)) write(rel, `const a = 1;\n${text}\n`);
+  write("src/ok.mjs", [
+    `import { ${F} } from "./${M}.mjs";`,
+    `await ${F}(url, {\n  method: "GET",\n  timeoutMs: 2000,\n});`,
+    `await ${F}(u, { timeoutMs: cfg.t });`,
+    `const timeoutMs = 2000; await ${F}(url, { timeoutMs });`,
+    `// never call ${F}(url) without a timeout`,
+    `log("${F}(" + u + ") failed");`,
+    `await ${F}(url, { headers: { x: ")" }, timeoutMs: 1000 });`,
+    `await ${F}(\`https://api.example/\${id}\`, { ...base, timeoutMs: 120_000 });`,
+    `const note = \`call ${F}(\${u}) with care\`;`,
+  ].join("\n") + "\n");
+  write(`src/${M}.mjs`, `export async function ${F}(input, opts = {}) {}\n`);
   write("node_modules/x/i.js", `${F}(url);\n`);
   const hits = findUntimedCalls(dir);
-  assert.deepEqual(hits, [{ file: "src/a.mjs", line: 2 }, { file: "src/b.mjs", line: 2 }, { file: "src/c.mjs", line: 2 }]);
+  assert.deepEqual([...new Set(hits.map((h) => h.file))].sort(), Object.keys(bad).sort(), JSON.stringify(hits, null, 1));
+  for (const h of hits) assert.equal(h.line, 2, JSON.stringify(h));
+  assert.ok(hits.every((h) => typeof h.reason === "string" && h.reason), "each hit says why");
   fs.rmSync(dir, { recursive: true, force: true });
   assert.deepEqual(findUntimedCalls(APP_ROOT), []);
 });
