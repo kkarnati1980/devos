@@ -10,18 +10,25 @@
 // Exit 2 is never an approval. Zero dependencies.
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { applyDispositions } from "../floor-guard/floor-guard.mjs";
 
 export const DELEGATED_GATES = new Set(["G2", "G3", "G4"]);
-const SHA = /^[0-9a-f]{7,40}$/;
-const LINK = /^https:\/\/\S+$/;
+const SHA = /^[0-9a-f]{40}$/;
+// No whitespace or Markdown/HTML delimiters, so a link cannot break out of the approval comment (GC7).
+const LINK = /^https:\/\/[^\s()[\]<>]+$/;
+// Hits spec §4.4 sends to KK (security scanning, policy): a Codex Keep never clears them, only KK's recorded answer.
+export const KK_ONLY = (h) => h.rule === "gitleaksignore-added" || h.rule === "policy-weakened"
+  || (h.rule === "suppression-added" && /gitleaks:allow|\bnosec\b/.test(String(h.text ?? "")));
 
 export class CannotRun extends Error {}
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const shaOk = (s) => typeof s === "string" && SHA.test(s);
-// A short SHA matches a full one only as a prefix; both must be at least 7 hex chars.
-const sameSha = (a, b) => shaOk(a) && shaOk(b) && (a.startsWith(b) || b.startsWith(a));
+// Full 40-character SHAs only, compared exactly (as GI-1's dispositions are).
+const sameSha = (a, b) => shaOk(a) && shaOk(b) && a === b;
 const linkOk = (l) => typeof l === "string" && LINK.test(l);
+// Labels go into Markdown link text; escape what could open or close a link.
+const md = (s) => String(s).replace(/[\\`*_[\]()<>!|]/g, (c) => `\\${c}`).replace(/\s+/g, " ");
 
 /** Throws CannotRun when the evidence is not even shaped like evidence (distinct from a missing result). */
 function assertShape(ev) {
@@ -34,10 +41,37 @@ function assertShape(ev) {
   if (!isObj(ev.serverChecks)) throw new CannotRun("evidence.serverChecks must be an object");
 }
 
-/** A floor-guard hit is disposed only by a Codex Keep or a KK escalation, on the same SHA, with a link (spec §4.4). */
-function hitDisposed(hit, dispositions, sha) {
-  return dispositions.some((d) => isObj(d) && d.hit === hit && sameSha(d.sha, sha) && linkOk(d.link)
-    && ((d.kind === "keep" && d.source === "codex") || (d.kind === "escalate" && d.source === "kk")));
+/**
+ * Floor guard for one merged PR (spec §4.4, GI-1). `fg` is { report, link, verdict?, kkResolutions? }:
+ * report is floor-guard.mjs's JSON report; verdict is the Codex verdict for that SHA ({ sha, source, text, link });
+ * kkResolutions are KK's recorded answers to escalated hits ({ hit, sha, decision: "keep", link }).
+ * Returns the list of problems (empty when clean or validly disposed).
+ */
+export function floorGuardProblems(fg, headSha) {
+  if (!isObj(fg) || !isObj(fg.report)) return ["no stored floor-guard result"];
+  const rep = fg.report;
+  if (!sameSha(rep.sha, headSha)) return [`floor-guard result is not for head ${headSha}`];
+  if (!linkOk(fg.link)) return ["floor-guard result has no link"];
+  if (rep.exit === 2) return ["floor guard exit 2 (could not run is never clean)"];
+  if (!Array.isArray(rep.hits) || (rep.exit !== 0 && rep.exit !== 1)) return [`floor guard exit ${rep.exit ?? "?"} with no readable hits`];
+  if (rep.exit === 0 && rep.hits.length) return ["floor guard exit 0 but hits stored (inconsistent result)"];
+  if (rep.exit === 1 && !rep.hits.length) return ["floor guard exit 1 with no hits stored"];
+  if (rep.hits.some((h) => !isObj(h) || typeof h.id !== "string")) return ["floor-guard hits without ids"];
+  if (!rep.hits.length) return [];
+  const v = fg.verdict;
+  const verdictOk = isObj(v) && linkOk(v.link);
+  const { exit, open } = applyDispositions(rep, verdictOk ? v : null);
+  if (exit === 2) return ["floor guard exit 2 (could not run is never clean)"];
+  const keptByCodex = new Set(rep.hits.filter((h) => !open.includes(h)).map((h) => h.id));
+  const kk = Array.isArray(fg.kkResolutions) ? fg.kkResolutions : [];
+  const kkKept = (h) => kk.some((r) => isObj(r) && r.hit === h.id && sameSha(r.sha, headSha) && r.decision === "keep" && linkOk(r.link));
+  const problems = [];
+  for (const h of rep.hits) {
+    const where = `${h.id} (${h.rule ?? "?"} ${h.file ?? "?"}:${h.line ?? "?"})`;
+    if (KK_ONLY(h)) { if (!kkKept(h)) problems.push(`hit ${where} needs KK's recorded answer (escalated or pending)`); }
+    else if (!keptByCodex.has(h.id)) problems.push(`hit ${where} without a valid disposition`);
+  }
+  return problems;
 }
 
 /**
@@ -99,19 +133,9 @@ export function evaluateGate(ev) {
   for (const pr of ev.mergedPrs) {
     const n = `PR #${pr?.number ?? "?"}`;
     if (!isObj(pr) || !shaOk(pr.headSha)) { fail(c5, `${n}: no head SHA`); fail(c7, `${n}: no head SHA`); continue; }
-    const fg = pr.floorGuard;
-    if (!isObj(fg)) fail(c5, `${n}: no stored floor-guard result`);
-    else if (!sameSha(fg.sha, pr.headSha)) fail(c5, `${n}: floor-guard result is not for head ${pr.headSha}`);
-    else if (!linkOk(fg.link)) fail(c5, `${n}: floor-guard result has no link`);
-    else if (fg.exit === 0) c5.results.push({ label: `${n} floor guard exit 0 on ${pr.headSha}`, link: fg.link });
-    else if (fg.exit === 1) {
-      const hits = Array.isArray(fg.hits) ? fg.hits : [];
-      const disp = Array.isArray(fg.dispositions) ? fg.dispositions : [];
-      const open = hits.filter((h) => !hitDisposed(h, disp, pr.headSha));
-      if (!hits.length) fail(c5, `${n}: floor guard exit 1 with no hit ids stored`);
-      else if (open.length) fail(c5, `${n}: floor-guard hit(s) without a valid disposition: ${open.join(", ")}`);
-      else c5.results.push({ label: `${n} floor guard: ${hits.length} hit(s), all disposed on ${pr.headSha}`, link: fg.link });
-    } else fail(c5, `${n}: floor guard exit ${fg.exit ?? "?"} (could not run is never clean)`);
+    const fgp = floorGuardProblems(pr.floorGuard, pr.headSha);
+    if (fgp.length) for (const m of fgp) fail(c5, `${n}: ${m}`);
+    else c5.results.push({ label: `${n} floor guard ${pr.floorGuard.report.hits.length ? "hits all disposed" : "exit 0"} on ${pr.headSha}`, link: pr.floorGuard.link });
 
     const ci = pr.ci, cx = pr.codex;
     if (!isObj(ci) || ci.conclusion !== "success") fail(c7, `${n}: CI ${ci?.conclusion ?? "missing"}`);
@@ -125,6 +149,25 @@ export function evaluateGate(ev) {
       c7.results.push({ label: `${n} CI success on ${pr.headSha}`, link: ci.link });
       c7.results.push({ label: `${n} codex-review success on ${pr.headSha}`, link: cx.link });
     }
+    // The merge went through the single merge path (GI-3), pinned to the evaluated head.
+    const mg = pr.mergeGate;
+    if (!isObj(mg) || mg.exit !== 0) fail(c7, `${n}: no merge-gate record (scripts/release/merge.mjs exit 0)`);
+    else if (!sameSha(mg.headSha, pr.headSha)) fail(c7, `${n}: merge-gate record is not for head ${pr.headSha}`);
+    else if (!linkOk(mg.link)) fail(c7, `${n}: merge-gate record has no link`);
+    else c7.results.push({ label: `${n} merged by the Release path at ${pr.headSha}`, link: mg.link });
+  }
+
+  // Structural checks: no duplicates, and every module's PRs are among the merged PRs (so none is left out).
+  const prNums = ev.mergedPrs.map((p) => p?.number);
+  const dupPr = prNums.filter((x, i) => prNums.indexOf(x) !== i);
+  if (dupPr.length) fail(c7, `merged PR listed twice: ${[...new Set(dupPr)].join(", ")}`);
+  const modIds = ev.modules.map((m) => m?.id);
+  const dupMod = modIds.filter((x, i) => modIds.indexOf(x) !== i);
+  if (dupMod.length) fail(c1, `module listed twice: ${[...new Set(dupMod)].join(", ")}`);
+  for (const m of ev.modules) {
+    if (!isObj(m)) continue;
+    if (!Array.isArray(m.prs) || !m.prs.length) fail(c7, `${m.id ?? "?"}: no merged PR numbers listed`);
+    else for (const num of m.prs) if (!prNums.includes(num)) fail(c7, `${m.id ?? "?"}: PR #${num} is not among the merged PRs`);
   }
 
   for (const m of ev.modules) {
@@ -146,13 +189,13 @@ export function evaluateGate(ev) {
 /** The gate-issue comment: the approval lists every condition with its links (GC7); a pause names what is missing. */
 export function renderComment(result, iso) {
   if (result.decision === "paused") {
-    return [`[runner] ${result.gate} PAUSED ${iso}: missing`, "", ...result.missing.map((m) => `- ${m}`), "",
+    return [`[runner] ${result.gate} PAUSED ${iso}: missing`, "", ...result.missing.map((m) => `- ${md(m)}`), "",
       "Other lanes continue. This is a technical gap, so no KK card."].join("\n");
   }
   const out = [`[runner] ${result.gate} APPROVED under KK's delegation (ADR-0013 §2, final form; gate evaluator exit 0) ${iso}`, ""];
   for (const c of result.conditions) {
-    out.push(`${c.id}. ${c.title}`);
-    for (const r of c.results) out.push(`   - [${r.label}](${r.link})`);
+    out.push(`${c.id}. ${md(c.title)}`);
+    for (const r of c.results) out.push(`   - [${md(r.label)}](${r.link})`);
   }
   return out.join("\n");
 }

@@ -7,6 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import { evaluateGate, renderComment, CannotRun } from "../gates/evaluate-gate.mjs";
 
+const fgClean = (sha, link) => ({ report: { sha, exit: 0, hits: [] }, link });
+const hitOf = (rule, id = "fg-0123456789", file = "a.test.ts", line = 3, text = "x") => ({ id, rule, file, line, text });
+
 const ROOT = path.resolve(import.meta.dirname, "../..");
 const CLI = path.join(ROOT, "scripts/gates/evaluate-gate.mjs");
 const H1 = "a".repeat(40), H2 = "b".repeat(40), M1 = "c".repeat(40), DEP = "d".repeat(40);
@@ -16,7 +19,7 @@ const L = (s) => `https://example.test/${s}`;
 function complete() {
   return {
     gate: "G2",
-    modules: [{ id: "M2.1", status: "Done", link: L("DEVOS-9"), mergedSha: M1, passRule: { result: "pass", sha: M1, link: L("pr-m21") } }],
+    modules: [{ id: "M2.1", status: "Done", link: L("DEVOS-9"), mergedSha: M1, prs: [70, 71], passRule: { result: "pass", sha: M1, link: L("pr-m21") } }],
     blockers: [{ issue: "DEVOS-76", status: "Done", link: L("DEVOS-76") }],
     serverChecks: { sha: DEP, checks: [{ name: "server-check/health", state: "success", sha: DEP, link: L("sc1") }] },
     criteria: [{ text: "intake round-trips a spec", met: true, link: L("crit1") }],
@@ -24,9 +27,9 @@ function complete() {
     openKkQuery: L("kk-query"),
     mergedPrs: [
       { number: 70, headSha: H1, ci: { sha: H1, conclusion: "success", link: L("ci70") }, codex: { sha: H1, state: "success", link: L("cx70") },
-        floorGuard: { sha: H1, exit: 0, link: L("fg70") } },
+        floorGuard: fgClean(H1, L("fg70")), mergeGate: { exit: 0, headSha: H1, link: L("mg70") } },
       { number: 71, headSha: H2, ci: { sha: H2, conclusion: "success", link: L("ci71") }, codex: { sha: H2, state: "success", link: L("cx71") },
-        floorGuard: { sha: H2, exit: 0, link: L("fg71") } },
+        floorGuard: fgClean(H2, L("fg71")), mergeGate: { exit: 0, headSha: H2, link: L("mg71") } },
     ],
   };
 }
@@ -58,31 +61,38 @@ test("AT2 (GC6): one PR lacking a stored floor-guard result pauses and names it 
   assert.match(c, /no KK card/);
 });
 
-test("AT3: floor guard exit 2, exit 1 with open hits, a disposition on another SHA, or a self-disposed Keep all pause", () => {
+test("AT3: floor guard exit 2, open hits, a Keep on another SHA or by the Builder, a KK-only hit kept by Codex, a pending escalation, or inconsistent reports pause", () => {
+  const keep = (sha, source = "codex", h = hitOf("test-skipped")) => ({ sha, source, text: `FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} justified`, link: L("v") });
   const cases = [
-    [(pr) => { pr.floorGuard.exit = 2; }, /floor guard exit 2 \(could not run is never clean\)/],
-    [(pr) => { Object.assign(pr.floorGuard, { exit: 1, hits: ["skip-added:a.test.ts:3"] }); }, /without a valid disposition: skip-added/],
-    [(pr) => { Object.assign(pr.floorGuard, { exit: 1, hits: ["h1"], dispositions: [{ hit: "h1", kind: "keep", source: "codex", sha: H2, link: L("d") }] }); }, /without a valid disposition: h1/],
-    [(pr) => { Object.assign(pr.floorGuard, { exit: 1, hits: ["h1"], dispositions: [{ hit: "h1", kind: "keep", source: "builder", sha: H1, link: L("d") }] }); }, /without a valid disposition: h1/],
-    [(pr) => { pr.floorGuard.sha = H2; }, /floor-guard result is not for head/],
-    [(pr) => { delete pr.floorGuard.link; }, /floor-guard result has no link/],
+    [(fg) => { fg.report.exit = 2; }, /floor guard exit 2 \(could not run is never clean\)/],
+    [(fg) => { Object.assign(fg.report, { exit: 1, hits: [hitOf("test-skipped")] }); }, /without a valid disposition/],
+    [(fg) => { Object.assign(fg.report, { exit: 1, hits: [hitOf("test-skipped")] }); fg.verdict = keep(H2); }, /without a valid disposition/],
+    [(fg) => { Object.assign(fg.report, { exit: 1, hits: [hitOf("test-skipped")] }); fg.verdict = keep(H1, "builder"); }, /without a valid disposition/],
+    [(fg) => { const h = hitOf("gitleaksignore-added"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    [(fg) => { const h = hitOf("policy-weakened"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.kkResolutions = [{ hit: h.id, sha: H1, decision: "escalated", link: L("card") }]; }, /needs KK's recorded answer/],
+    [(fg) => { fg.report.hits = [hitOf("test-skipped")]; }, /exit 0 but hits stored/],
+    [(fg) => { fg.report.exit = 1; }, /exit 1 with no hits/],
+    [(fg) => { fg.report.sha = H2; }, /floor-guard result is not for head/],
+    [(fg) => { delete fg.link; }, /floor-guard result has no link/],
   ];
   for (const [mut, re] of cases) {
     const ev = complete();
-    mut(ev.mergedPrs[0]);
+    mut(ev.mergedPrs[0].floorGuard);
     const r = evaluateGate(ev);
-    assert.equal(r.decision, "paused");
+    assert.equal(r.decision, "paused", String(re));
     assert.match(r.missing.join("\n"), re);
   }
 });
 
-test("AT4: hits disposed by a Codex Keep or a KK escalation on the same SHA count as clean", () => {
+test("AT4: a Codex Keep naming id and file:line on the same SHA, and KK's recorded keep on a KK-only hit, count as clean", () => {
   const ev = complete();
-  Object.assign(ev.mergedPrs[0].floorGuard, { exit: 1, hits: ["h1", "h2"], dispositions: [
-    { hit: "h1", kind: "keep", source: "codex", sha: H1, link: L("d1") },
-    { hit: "h2", kind: "escalate", source: "kk", sha: H1.slice(0, 7), link: L("d2") },
-  ] });
-  assert.equal(evaluateGate(ev).decision, "approve");
+  const h1 = hitOf("test-skipped", "fg-aaaaaaaaaa"), h2 = hitOf("suppression-added", "fg-bbbbbbbbbb", "src/x.ts", 9, "// nosec");
+  Object.assign(ev.mergedPrs[0].floorGuard, {
+    report: { sha: H1, exit: 1, hits: [h1, h2] },
+    verdict: { sha: H1, source: "codex", text: `Codex PASS\nFLOOR-GUARD KEEP ${h1.id} ${h1.file}:${h1.line} reason`, link: L("v") },
+    kkResolutions: [{ hit: h2.id, sha: H1, decision: "keep", link: L("kk-answer") }],
+  });
+  assert.deepEqual(evaluateGate(ev).missing, []);
 });
 
 test("AT5: a module with no pass-rule result, a failing one, or one on another SHA pauses", () => {
@@ -106,6 +116,12 @@ test("AT6: CI or codex-review missing, not success, or on another SHA pauses", (
     [(pr) => { delete pr.codex; }, /codex-review missing/],
     [(pr) => { pr.codex.sha = H2; }, /codex-review is not for head/],
     [(pr) => { pr.ci.sha = H2; }, /CI result is not for head/],
+    [(pr) => { delete pr.ci; }, /CI missing/],
+    [(pr) => { delete pr.ci.link; }, /CI result has no link/],
+    [(pr) => { delete pr.codex.link; }, /codex-review result has no link/],
+    [(pr) => { delete pr.mergeGate; }, /no merge-gate record/],
+    [(pr) => { pr.mergeGate.headSha = H2; }, /merge-gate record is not for head/],
+    [(pr) => { pr.headSha = H1.slice(0, 7); }, /no head SHA/],
   ];
   for (const [mut, re] of muts) {
     const ev = complete();
@@ -122,6 +138,12 @@ test("AT7: ADR-0013's four conditions — not Done, a failed or skipped server c
     [(ev) => { ev.criteria[0].met = false; }, /\(3\) criterion not met/],
     [(ev) => { ev.openKkItems.push({ issue: "DEVOS-4" }); }, /\(4\) open KK item: DEVOS-4/],
     [(ev) => { ev.mergedPrs = []; }, /\(5\) no merged PRs/],
+    [(ev) => { ev.serverChecks.checks[0].sha = H1; }, /not on the deployed SHA/],
+    [(ev) => { delete ev.serverChecks.sha; }, /no deployed main SHA/],
+    [(ev) => { ev.mergedPrs.pop(); }, /\(7\) M2\.1: PR #71 is not among the merged PRs/],
+    [(ev) => { ev.mergedPrs.push(ev.mergedPrs[0]); }, /merged PR listed twice: 70/],
+    [(ev) => { ev.modules.push({ ...ev.modules[0] }); }, /module listed twice: M2\.1/],
+    [(ev) => { delete ev.modules[0].prs; }, /no merged PR numbers listed/],
   ];
   for (const [mut, re] of muts) {
     const ev = complete();
@@ -139,7 +161,13 @@ test("AT8 (GC7): the approval comment links a stored result for every condition"
     const section = c.split(`\n${cond.id}. `)[1];
     assert.ok(section, `condition ${cond.id} missing from comment`);
   }
-  for (const link of ["fg70", "fg71", "pr-m21", "ci70", "cx70", "ci71", "cx71", "sc1", "crit1", "kk-query", "DEVOS-9"]) {
+  const ev = complete();
+  ev.criteria[0].text = "ok](https://evil.test) [";
+  ev.criteria[0].link = "https://x.test/a)[b](c";
+  assert.match(evaluateGate(ev).missing.join("\n"), /no link to a stored result/);
+  ev.criteria[0].link = L("crit1");
+  assert.ok(!renderComment(evaluateGate(ev), "t").includes("[ok](https://evil"), "label is escaped");
+  for (const link of ["mg70", "mg71", "fg70", "fg71", "pr-m21", "ci70", "cx70", "ci71", "cx71", "sc1", "crit1", "kk-query", "DEVOS-9"]) {
     assert.ok(c.includes(L(link)), `comment lacks ${link}`);
   }
 });
