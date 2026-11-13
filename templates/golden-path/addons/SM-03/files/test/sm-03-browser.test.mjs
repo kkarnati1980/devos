@@ -152,6 +152,11 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`</${"p"}>`, /quote every attribute/);
   assert.throws(() => html`<script>var s = "</scripts>"; ${"x"}</script>`, /inside <script>/);
   assert.equal(String(html`<script>var s = "</scripts>";</script>${"<"}`), '<script>var s = "</scripts>";</script>&lt;');
+  // A close tag ended by non-ASCII whitespace (U+00A0) does not end raw text in the browser, so a value after it
+  // is still inside <script> and must be refused.
+  assert.throws(() => html`<script>/* </script > */${"alert(1)"}</script>`, /inside <script>/);
+  // An ASCII-whitespace or "/" delimiter does end the tag, so values after it are allowed again.
+  assert.equal(String(html`<script>x</script\n>${"<"}`), "<script>x</script\n>&lt;");
   assert.throws(() => html`<script><!--<script></script>\n${"alert(1)"}\n</script>`, /<!-- inside <script>/);
   assert.equal(String(html`<textarea><p title="</textarea><img src="/i.png" alt="${"x"}">">`), '<textarea><p title="</textarea><img src="/i.png" alt="x">">');
   assert.throws(() => html`<textarea><p title="</textarea><img src=x onerror=${"alert(1)"}>">`, /quote every attribute/);

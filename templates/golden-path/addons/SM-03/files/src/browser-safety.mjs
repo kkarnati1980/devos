@@ -122,7 +122,9 @@ class MarkupState {
         // An end tag counts only with a terminator after its name, as in the browser (</scripts> does not end it).
         if (this.raw === "script" && s.startsWith("<!--", i)) throw new TypeError("html: <!-- inside <script> is not supported");
         const end = `</${this.raw}`;
-        if (c === "<" && s.slice(i, i + end.length).toLowerCase() === end && /[\s/>]/.test(s[i + end.length] ?? "")) {
+        // Only ASCII whitespace, "/" or ">" ends a raw/RCDATA close tag in the HTML tokenizer. JS \s also matches
+        // U+00A0 and other Unicode spaces, which the browser does NOT accept, so </script > must stay raw.
+        if (c === "<" && s.slice(i, i + end.length).toLowerCase() === end && /[\t\n\f\r />]/.test(s[i + end.length] ?? "")) {
           this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.raw = "";
         }
       } else if (this.mode === "quote") {
