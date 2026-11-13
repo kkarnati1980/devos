@@ -284,6 +284,58 @@ test("M1.4 AT6: AES-256-GCM bound to the secret name and key version; tampering 
   assert.equal(await vault.reveal("github_token"), null);
 });
 
+test("M2.4-c2b AT7: project app secrets are sealed under their project, audited by name only, kept apart from global rows", async () => {
+  const { createDecipheriv } = await import("node:crypto");
+  const store = new MemoryVaultStore();
+  const vault = new Vault(store, KEY, 1);
+  const P1 = "11111111-2222-4333-8444-555555555555";
+  const P2 = "99999999-2222-4333-8444-555555555555";
+  const v1 = randomBytes(32).toString("base64url");
+  const v2 = randomBytes(32).toString("base64url");
+  const port = vault.projectSecrets();
+  assert.equal(await port.has(P1, "preview/SESSION_SECRET"), false);
+  assert.equal(await port.put(P1, "preview/SESSION_SECRET", v1), undefined, "the port returns nothing about the value");
+  assert.deepEqual(await vault.putProject(P1, "preview/SESSION_SECRET", v2), { rotated: true });
+  assert.equal(await port.has(P1, "preview/SESSION_SECRET"), true);
+  assert.equal(await port.has(P2, "preview/SESSION_SECRET"), false, "scoped to its project");
+  assert.equal(store.rows.size, 0, "no global row is written");
+  assert.equal((await vault.list()).filter((m) => m.set).length, 0, "the wizard list shows no app secret");
+  const row = store.projectRows.get(`${P1}\npreview/SESSION_SECRET`);
+  assert.equal(row.hint, null, "no hint for app secrets");
+  assert.ok(!row.ciphertext.includes(Buffer.from(v2)));
+  const open = (projectId) => {
+    const d = createDecipheriv("aes-256-gcm", KEY, row.nonce);
+    d.setAAD(Buffer.from(`devos-vault/v1\nproject:${projectId}\npreview/SESSION_SECRET\n1`, "utf8"));
+    d.setAuthTag(row.ciphertext.subarray(row.ciphertext.length - 16));
+    return Buffer.concat([d.update(row.ciphertext.subarray(0, row.ciphertext.length - 16)), d.final()]).toString("utf8");
+  };
+  assert.equal(open(P1), v2, "sealed with the project-bound AAD");
+  assert.equal(await port.matches(P1, "preview/SESSION_SECRET", v2), true);
+  assert.equal(await port.matches(P1, "preview/SESSION_SECRET", v1), false, "an old value does not match");
+  assert.equal(await port.matches(P2, "preview/SESSION_SECRET", v2), false, "another project has no copy");
+  store.projectRows.set(`${P2}\npreview/SESSION_SECRET`, row);
+  assert.equal(await port.matches(P2, "preview/SESSION_SECRET", v2), false, "a row moved to another project does not open");
+  store.projectRows.delete(`${P2}\npreview/SESSION_SECRET`);
+  assert.equal(await new Vault(store, randomBytes(32), 1).matchesProject(P1, "preview/SESSION_SECRET", v2), false, "a wrong key is false, not a throw");
+  assert.throws(() => open(P2), "a row moved to another project fails to open");
+  assert.deepEqual(store.audits.map((a) => [a.action, a.projectId, a.details.name]),
+    [["vault.app_secret.saved", P1, "preview/SESSION_SECRET"], ["vault.app_secret.rotated", P1, "preview/SESSION_SECRET"]]);
+  assert.ok(!JSON.stringify(store.audits).includes(v1) && !JSON.stringify(store.audits).includes(v2));
+  for (const [pid, name, val, code] of [
+    ["not-a-uuid", "preview/SESSION_SECRET", v1, "invalid:project"],
+    [P1, "anthropic_api_key", v1, "invalid:name"],
+    [P1, "staging/SESSION_SECRET", v1, "invalid:name"],
+    [P1, "preview/session", v1, "invalid:name"],
+    [P1, "preview/SESSION_SECRET", "abc", "invalid:value-too-short"],
+  ]) {
+    await assert.rejects(vault.putProject(pid, name, val), (e) => e.message === code && !e.message.includes(val));
+  }
+  await assert.rejects(vault.hasProject(P1, "../x"), /invalid:name/);
+  store.failAudit = true;
+  await assert.rejects(vault.putProject(P1, "production/DB_PASSWORD", v1));
+  assert.equal(await vault.hasProject(P1, "production/DB_PASSWORD"), false, "a failed audit stores nothing");
+});
+
 test("M1.4 AT7: vault key configuration fails closed with a code, never the value", async () => {
   assert.equal(parseVaultKey(undefined), null);
   assert.equal(parseVaultKey(KEY.toString("base64")).length, 32);
