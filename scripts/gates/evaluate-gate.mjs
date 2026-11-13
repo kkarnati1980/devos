@@ -19,6 +19,7 @@ const LINK = /^https:\/\/[^\s()[\]<>]+$/;
 // Secret-scanning and security-linter suppressions. Written with a one-character class so the floor guard does not
 // flag this pattern itself as a new suppression; it matches the same text and suppresses nothing (GI-4 contract).
 const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
+const SECURITY_WORDS = /secur|secret|gitleaks|\bnose[c]\b|audit|licen[cs]e|codeql|semgrep|trivy|snyk|xss|no-eval|detect-/i;
 // GI-1 cuts hit text to 200 characters; a token past the cut cannot be ruled out, so a full-length text fails closed.
 const CUT = 200;
 // Hits spec §4.4 sends to KK (security scanning, policy, D13): a Codex Keep never clears them, only KK's recorded answer.
@@ -30,6 +31,10 @@ export const KK_ONLY = (h) => {
   // established from the stored result (Codex PR84-r1): every ci-* hit fails closed to KK-only. The usual answer is
   // to restore the change; a Codex Keep alone never clears it.
   if (/^ci-/.test(h.rule ?? "")) return true;
+  // Any hit whose file or text names security scanning, secrets or licence checks (e.g. lint-rule-off of a
+  // "security/…" rule), and any lint ignores (they can drop files from security linting), go to KK (Codex PR84-r2).
+  if (SECURITY_WORDS.test(`${h.file ?? ""} ${text}`)) return true;
+  if (h.rule === "lint-rule-off") return /\bignores?\b/.test(text) || text.length >= CUT;
   return false;
 };
 

@@ -80,6 +80,9 @@ test("AT3: floor guard exit 2, open hits, a Keep on another SHA or by the Builde
       fg.kkResolutions = [{ hit: h.id, file: h.file, line: h.line, sha: H1, decision: "keep", link: L("k1") }, { hit: h.id, file: h.file, line: h.line, sha: H1, decision: "restore", link: L("k2") }]; }, /not keep \(keep, restore\)/],
     // security-scanning CI removals and cut-off suppression texts are KK-only
     [(fg) => { const h = hitOf("ci-step-removed", undefined, ".github/workflows/security.yml", 12, "- run: gitleaks detect"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    // PR84-r2: a security lint rule turned off, and lint ignores, are KK-only; an ordinary lint-rule-off is not
+    [(fg) => { const h = hitOf("lint-rule-off", undefined, "eslint.config.mjs", 7, '"security/detect-eval-with-expression": "off",'); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    [(fg) => { const h = hitOf("lint-rule-off", undefined, "eslint.config.mjs", 7, 'ignores: ["src/**"],'); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     // PR84-r1: a CI hit names only the step ("Checks" running npm audit), so every ci-* hit is KK-only
     [(fg) => { const h = hitOf("ci-step-removed", undefined, ".github/workflows/ci.yml", 30, "job build: step name:Checks removed"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { const h = hitOf("ci-disabled", undefined, ".github/workflows/ci.yml", 12, "if: false"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
@@ -105,6 +108,11 @@ test("AT4: a Codex Keep naming id and file:line on the same SHA, and KK's record
     verdict: { sha: H1, source: "codex", text: `Codex PASS\nFLOOR-GUARD KEEP ${h1.id} ${h1.file}:${h1.line} reason`, link: L("v") },
     kkResolutions: [{ hit: h2.id, file: h2.file, line: h2.line, sha: H1, decision: "keep", link: L("kk-answer") }],
   });
+  const plain = complete();
+  const h3 = hitOf("lint-rule-off", "fg-cccccccccc", "eslint.config.mjs", 5, '"no-console": "off",');
+  Object.assign(plain.mergedPrs[0].floorGuard, { report: { sha: H1, exit: 1, hits: [h3] },
+    verdict: { sha: H1, source: "codex", text: `FLOOR-GUARD KEEP ${h3.id} ${h3.file}:${h3.line} ok`, link: L("v3") } });
+  assert.deepEqual(evaluateGate(plain).missing, [], "an ordinary lint rule off is cleared by a Codex Keep");
   const r = evaluateGate(ev);
   assert.deepEqual(r.missing, []);
   const c = renderComment(r, "t");
