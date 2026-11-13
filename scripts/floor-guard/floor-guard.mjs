@@ -22,7 +22,26 @@ const TEST_CONFIG = /(^|\/)(vitest|jest|playwright|vite)\.config\.[cm]?[jt]s$|(^
 const SHELL = /\.(sh|bash)$/;
 const TSCONFIG = /(^|\/)tsconfig[\w.-]*\.json$/;
 // TypeScript strictness flags; turning one off (or dropping a `true`) relaxes type checking (GI-1c).
-const TS_STRICT = /"(strict|noImplicitAny|strictNullChecks|strictFunctionTypes|strictBindCallApply|strictPropertyInitialization|noImplicitThis|alwaysStrict|useUnknownInCatchVariables|exactOptionalPropertyTypes|noUncheckedIndexedAccess)"\s*:\s*(true|false)\b/g;
+const TS_STRICT = ["strict", "noImplicitAny", "strictNullChecks", "strictFunctionTypes", "strictBindCallApply", "strictPropertyInitialization",
+  "noImplicitThis", "alwaysStrict", "useUnknownInCatchVariables", "exactOptionalPropertyTypes", "noUncheckedIndexedAccess"];
+
+/** Parse JSONC (tsconfig): comments and trailing commas removed outside strings only. Returns null if unreadable. */
+export function parseJsonc(text) {
+  let out = "", i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') { let j = i + 1; while (j < n && text[j] !== '"') j += text[j] === "\\" ? 2 : 1; out += text.slice(i, j + 1); i = j + 1; }
+    else if (c === "/" && text[i + 1] === "/") { while (i < n && text[i] !== "\n") i++; }
+    else if (c === "/" && text[i + 1] === "*") { const e = text.indexOf("*/", i + 2); if (e < 0) return null; out += " "; i = e + 2; }
+    else if (c === ",") { let j = i + 1; while (j < n && /\s/.test(text[j])) j++; if (text[j] !== "}" && text[j] !== "]") out += c; i++; }
+    else { out += c; i++; }
+  }
+  // a comment between a comma and the closing bracket was removed above, so re-check trailing commas once more
+  out = out.replace(/,(\s*[}\]])/g, (m, rest, off) => (inString(out, off) ? m : rest));
+  try { return JSON.parse(out); } catch { return null; }
+}
+function inString(t, off) { let q = false; for (let i = 0; i < off; i++) { if (t[i] === "\\" && q) i++; else if (t[i] === '"') q = !q; } return q; }
 const LINT_CONFIG = /(^|\/)(eslint\.config\.[cm]?[jt]s|\.eslintrc(\.[\w]+)?)$/;
 
 const RX = {
@@ -31,7 +50,8 @@ const RX = {
     /\.fixme\s*\(/, /(^|[{,])\s*(skip|todo|only)\s*:\s*[^,}\s]/,
     // a skip referenced without being called, e.g. a ternary `(cond ? it : it.skip)("a", …)` or `const t = it.skip` (GI-1c)
     /\b(?:it|test|describe|suite)\.(?:(?:concurrent|serial|sequential)\.)?(?:skip|todo|only|fixme)\b(?!\s*\()/,
-    /\b(?:xit|xdescribe|xtest|fit|fdescribe)\b(?!\s*\()/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
+    // bare forms only after an operator, so the word "fit" in a test name or string is not a hit (review GI-1c-r2)
+    /[?:=(,|&]\s*\b(?:xit|xdescribe|xtest|fit|fdescribe)\b(?!\s*\()/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
   ],
   assert: /\bexpect(\.\w+)?\s*\(|\bassert(\.\w+)*\s*\(/g,
   suppress: /eslint-disable|@ts-ignore|@ts-expect-error|@ts-nocheck|istanbul ignore|c8 ignore|\bnosec\b|gitleaks:allow/,
@@ -453,19 +473,21 @@ export function analyse(files, show) {
       for (const [k, v] of now) if (/^(pre|post)/.test(k) && !was.has(k)) hit("test-script-changed", p, 0, `hook "${k}" added: "${v}"`);
     }
     if (TSCONFIG.test(p)) {
-      // JSONC: a commented-out flag is no flag (review GI-1c-r1); strip comments before reading values
-      const unc = (t) => t.replace(/\/\*.*?\*\//g, "").replace(/(^|[^:"])\/\/.*$/, "$1");
-      const flags = (ls, val) => ls.flatMap((l) => [...unc(l.text).matchAll(TS_STRICT)].filter((m) => m[2] === val).map((m) => ({ k: m[1], l })));
-      // a false flag counts only beyond the false flags of the same key removed (a re-touched line is not new)
-      const oldFalse = {};
-      for (const { k } of flags(f.removed, "false")) oldFalse[k] = (oldFalse[k] ?? 0) + 1;
-      for (const { k, l } of flags(f.added, "false")) { if (oldFalse[k] > 0) oldFalse[k]--; else hit("ts-strict-relaxed", p, l.ln, l.text); }
-      const nowTrue = new Set(flags(f.added, "true").map((x) => x.k));
-      for (const { k, l } of flags(f.removed, "true")) if (!nowTrue.has(k)) hit("ts-strict-relaxed", p, l.ln, `removed: ${l.text}`);
-      // strictness is inherited through "extends": dropping or retargeting it can turn strict off
-      const ext = (ls) => ls.flatMap((l) => [...unc(l.text).matchAll(/"extends"\s*:\s*("(?:[^"\\]|\\.)*"|\[[^\]]*\])/g)].map((m) => ({ v: m[1].replace(/\s+/g, ""), l })));
-      const nowExt = new Set(ext(f.added).map((x) => x.v));
-      for (const { v, l } of ext(f.removed)) if (!nowExt.has(v)) hit("ts-strict-relaxed", p, l.ln, `extends changed or removed: ${l.text}`);
+      // Compare the parsed base and head files, so comments (one- or multi-line), strings holding "//" or "/*",
+      // and reformatting cannot hide or fake a change (review GI-1c-r2). An unreadable tsconfig fails closed.
+      const bt = f.status === "A" ? "{}" : show("base", f.oldPath), ht = f.status === "D" ? "{}" : show("head", p);
+      const b = bt == null ? null : parseJsonc(bt), h = ht == null ? null : parseJsonc(ht);
+      const lineOf = (k) => { const i = (ht ?? "").split("\n").findIndex((l) => l.includes(`"${k}"`)); return i < 0 ? 0 : i + 1; };
+      if (!b || !h || typeof b !== "object" || typeof h !== "object") hit("ts-strict-relaxed", p, 0, `${p}: tsconfig unreadable as JSONC (fails closed)`);
+      else {
+        const bo = b.compilerOptions ?? {}, ho = h.compilerOptions ?? {};
+        for (const k of TS_STRICT) {
+          if (bo[k] === true && ho[k] !== true) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": true -> ${ho[k] === undefined ? "removed" : JSON.stringify(ho[k])}`);
+          else if (ho[k] === false && bo[k] !== false) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": false`);
+        }
+        // strictness is inherited through "extends": dropping or retargeting it can turn strict off
+        if (b.extends !== undefined && JSON.stringify(b.extends) !== JSON.stringify(h.extends)) hit("ts-strict-relaxed", p, lineOf("extends"), `extends ${JSON.stringify(b.extends)} -> ${h.extends === undefined ? "removed" : JSON.stringify(h.extends)}`);
+      }
     }
     if (LINT_CONFIG.test(p)) for (const a of f.added) if (/[@\w/-]+["']?\s*:\s*\[?\s*(["'](off|warn)["']|[01]\s*[,\]}]|[01]\s*$)/.test(a.text) || /\bignores?\b["']?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
 

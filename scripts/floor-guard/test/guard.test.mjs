@@ -177,6 +177,13 @@ const VIOLATIONS = [
   ["test-skipped (ternary it.concurrent.skip)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', '(process.env.DB ? it : it.concurrent.skip)("a"') }],
   ["ts-strict-relaxed (strict commented out)", { "tsconfig.json": '{ "compilerOptions": {\n  "strict": true\n} }\n' }, { "tsconfig.json": '{ "compilerOptions": {\n  // "strict": true\n} }\n' }],
   ["ts-strict-relaxed (extends removed)", { "packages/x/tsconfig.json": '{\n  "extends": "../../tsconfig.base.json",\n  "include": ["src"]\n}\n' }, { "packages/x/tsconfig.json": '{\n  "include": ["src"]\n}\n' }],
+  ["ts-strict-relaxed (flag beside a \"@/*\" glob)", { "tsconfig.json": "{}\n" }, { "tsconfig.json": '{ "compilerOptions": { "paths": { "@/*": ["./src/*"] }, "strictNullChecks": false }, "include": ["src/**/*.ts"] }\n' }],
+  ["ts-strict-relaxed (flag after a \"//\" string)", { "tsconfig.json": "{}\n" }, { "tsconfig.json": '{ "compilerOptions": { "outDir": "dist//x", "noImplicitAny": false } }\n' }],
+  ["ts-strict-relaxed (multi-line comment)", { "tsconfig.json": '{ "compilerOptions": {\n  "strict": true\n} }\n' }, { "tsconfig.json": '{ "compilerOptions": {\n  /*\n  "strict": true\n  */\n} }\n' }],
+  ["ts-strict-relaxed (extends array loses an element)", { "packages/x/tsconfig.json": '{ "extends": [\n  "../../tsconfig.base.json",\n  "./strict.json"\n] }\n' }, { "packages/x/tsconfig.json": '{ "extends": [\n  "../../tsconfig.base.json"\n] }\n' }],
+  ["ts-strict-relaxed (false flag in a new tsconfig)", {}, { "packages/y/tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' }],
+  ["test-script-changed (posttest hook removed)", { "package.json": '{ "scripts": { "test": "vitest run", "posttest": "node verify.mjs" } }\n' }, { "package.json": '{ "scripts": { "test": "vitest run" } }\n' }],
+  ["test-script-changed (hook in a new package.json)", {}, { "packages/y/package.json": '{ "scripts": { "pretest": "pnpm build" } }\n' }],
   ["ts-strict-relaxed (extends retargeted)", { "packages/x/tsconfig.json": '{ "extends": "../../tsconfig.base.json" }\n' }, { "packages/x/tsconfig.json": '{ "extends": "./loose.json" }\n' }],
   ["policy-weakened", { "packages/policy/src/evaluator.ts": "const deny = matched.find((r) => r.effect === \"deny\");\nconst outcome = deny ? \"deny\" : \"allow\";\n" }, { "packages/policy/src/evaluator.ts": "const outcome = \"allow\";\n" }],
 ];
@@ -230,6 +237,13 @@ test("GI-1c exit 0: an unchanged hook and tightened strictness are not hits", ()
   // a line that already held a false flag, re-touched to add a key, is not a new relaxation
   const r2 = check({ "tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' }, { "tsconfig.json": '{ "compilerOptions": { "strict": false, "target": "es2022" } }\n' });
   assert.deepEqual(r2.hits, []);
+  // "fit" as an English word in a test name or a string is not a skip
+  const r4 = check({ [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);") + 'it("scales to fit the box", () => { expect(layout("fit")).toBe(2); });\n' });
+  assert.deepEqual(r4.hits, []);
+  // a commented, trailing-comma tsconfig with globs and URLs that changes nothing strict is clean
+  const r5 = check({ "tsconfig.json": '{\n  "$schema": "https://json.schemastore.org/tsconfig",\n  "compilerOptions": { "strict": true },\n}\n' },
+    { "tsconfig.json": '{\n  "$schema": "https://json.schemastore.org/tsconfig",\n  // paths\n  "compilerOptions": { "strict": true, "paths": { "@/*": ["./src/*"] }, },\n  "include": ["src/**/*.ts"], /* all */\n}\n' });
+  assert.deepEqual(r5.hits, []);
   // the same extends, reformatted, is not a change
   const r3 = check({ "packages/x/tsconfig.json": '{ "extends": "../../tsconfig.base.json" }\n' }, { "packages/x/tsconfig.json": '{\n  "extends": "../../tsconfig.base.json",\n  "include": ["src"]\n}\n' });
   assert.deepEqual(r3.hits, []);
