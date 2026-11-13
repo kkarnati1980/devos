@@ -73,6 +73,7 @@ enum TaskKind {
   fix
   maintenance
   human
+  analysis
 
   @@map("task_kind")
 }
