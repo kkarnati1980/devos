@@ -241,16 +241,31 @@ export function renderComment(result, iso) {
 
 export function main(argv, { now = () => new Date().toISOString(), log = console.log, err = console.error } = {}) {
   try {
-    const file = argv.find((a, i) => !a.startsWith("--") && argv[i - 1] !== "--comment");
-    if (!file) throw new CannotRun("usage: evaluate-gate.mjs <evidence.json> [--comment <out.md>]");
+    // PR84-r6: the whole argument list is validated before anything is evaluated or written: exactly one evidence
+    // file and at most one `--comment <path>`; anything else (unknown option, extra positional, a repeat) exits 2.
+    const usage = "usage: evaluate-gate.mjs <evidence.json> [--comment <out.md>]";
+    let file = null;
+    let commentPath = null;
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === "--comment") {
+        if (commentPath !== null) throw new CannotRun(`--comment given twice; ${usage}`);
+        const v = argv[++i];
+        if (!v || v.startsWith("-")) throw new CannotRun("--comment needs a path");
+        commentPath = v;
+      } else if (a.startsWith("-")) {
+        throw new CannotRun(`unknown option ${a}; ${usage}`);
+      } else if (file !== null) {
+        throw new CannotRun(`one evidence file only; ${usage}`);
+      } else {
+        file = a;
+      }
+    }
+    if (!file) throw new CannotRun(usage);
     let ev;
     try { ev = JSON.parse(readFileSync(file, "utf8")); } catch (e) { throw new CannotRun(`cannot read evidence: ${e.message}`); }
     const result = evaluateGate(ev);
-    const ci = argv.indexOf("--comment");
-    if (ci !== -1) {
-      if (!argv[ci + 1]) throw new CannotRun("--comment needs a path");
-      writeFileSync(argv[ci + 1], renderComment(result, now()) + "\n");
-    }
+    if (commentPath !== null) writeFileSync(commentPath, renderComment(result, now()) + "\n");
     log(`gate-evaluator: ${result.gate} ${result.decision}${result.missing.length ? ` (${result.missing.length} missing)` : ""}`);
     for (const m of result.missing) log(`  missing ${m}`);
     return result.decision === "approve" ? 0 : 1;

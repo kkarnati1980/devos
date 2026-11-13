@@ -222,4 +222,17 @@ test("AT9: G5 or an unknown gate, malformed evidence, unreadable files and bad a
     assert.equal(p.status, 2, `args ${args}: ${p.stdout}${p.stderr}`);
     assert.match(p.stderr, /could not run/);
   }
+  // PR84-r6: with complete evidence, a bad argument list still exits 2 and writes no comment.
+  const ok = path.join(dir, "ok.json");
+  fs.writeFileSync(ok, JSON.stringify(complete()));
+  const out = path.join(dir, "out.md");
+  assert.equal(spawnSync(process.execPath, [CLI, ok], { encoding: "utf8" }).status, 0, "the complete evidence approves");
+  for (const args of [[ok, "--comments", out], [ok, ok], [ok, "--comment", out, "--comment", out], [ok, "--comment"], [ok, "--comment", "--x"], ["-v", ok]]) {
+    const p = spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8" });
+    assert.equal(p.status, 2, `args ${args.map((a) => path.basename(a))}: ${p.stdout}${p.stderr}`);
+    assert.match(p.stderr, /could not run/);
+    assert.equal(fs.existsSync(out), false, "no comment is written for a bad invocation");
+  }
+  assert.equal(spawnSync(process.execPath, [CLI, ok, "--comment", out], { encoding: "utf8" }).status, 0);
+  assert.match(fs.readFileSync(out, "utf8"), /APPROVED/);
 });

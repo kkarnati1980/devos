@@ -23,7 +23,7 @@ Runner A approves G2, G3 or G4 only when a program, reading stored results, says
 4. `decision` is `approve` only with nothing missing. Otherwise `paused`, with each missing item named and tagged with its condition number.
 5. `--comment` writes the gate-issue comment: `[runner] G<n> APPROVED …` listing each condition with the links of its results, including every Codex Keep and KK answer used (GC7), or `[runner] G<n> PAUSED <iso>: missing …` (GC6).
 6. The CLI resolves symlinks when deciding it was run directly, so it never exits 0 without evaluating.
-7. Exit codes: `0` approve · `1` paused · `2` could not run (bad arguments, unreadable or malformed evidence, or a gate other than G2–G4). Exit 2 is never an approval.
+7. Exit codes: `0` approve · `1` paused · `2` could not run (bad arguments — the whole argument list is checked first: one evidence file, at most one `--comment <path>`, no other option (Codex PR84-r6) —, unreadable or malformed evidence, or a gate other than G2–G4). Exit 2 is never an approval.
 
 ## Floor-guard self-match
 The security-suppression pattern in `evaluate-gate.mjs` is written `gitleaks[:]allow|\bnose[c]\b`, and the AT4 fixture builds its text by concatenation, so the floor guard (GI-1) does not flag these pattern strings as new suppressions. They match the same text and suppress nothing; nothing in this PR changes what the floor guard detects.
@@ -63,3 +63,4 @@ Reverting this PR returns the gate rule to the interim form of 12 Nov 2026 (ADR-
 
 ## Build record
 - See the PR body and the merge evidence comment on DEVOS-144; GC6 and GC7 evidence goes on DEVOS-140.
+- 13 Nov 2026, build runner A: Codex PR84-r6 (1 medium, accepted): an unknown option, extra positional or repeated `--comment` could still exit 0 and skip the comment. The whole argument list is now validated before evaluation; AT9 extended (`node --test scripts/test/gate-evaluator.test.mjs` → exit 0, 9/9).
