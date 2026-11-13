@@ -11,3 +11,4 @@ export * from "./stack-teardown-ops.js";
 export * from "./repo-content.js";
 export * from "./core-repo.js";
 export * from "./application.js";
+export * from "./app-secrets.js";
