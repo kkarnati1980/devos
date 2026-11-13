@@ -20,12 +20,41 @@ const TEST_FILE = /(^|\/)(test|tests|__tests__|test-db|e2e)\/.*\.(m?[jt]sx?|c[jt
 const WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const TEST_CONFIG = /(^|\/)(vitest|jest|playwright|vite)\.config\.[cm]?[jt]s$|(^|\/)\.(c8rc|nycrc)(\.json)?$|(^|\/)package\.json$/;
 const SHELL = /\.(sh|bash)$/;
+const TSCONFIG = /(^|\/)tsconfig[\w.-]*\.json$/;
+// TypeScript strictness flags; turning one off (or dropping a `true`) relaxes type checking (GI-1c).
+const TS_STRICT = ["strict", "noImplicitAny", "strictNullChecks", "strictFunctionTypes", "strictBindCallApply", "strictPropertyInitialization",
+  "noImplicitThis", "alwaysStrict", "useUnknownInCatchVariables", "strictBuiltinIteratorReturn", "exactOptionalPropertyTypes",
+  "noUncheckedIndexedAccess"];
+// Options that turn type checking off when set to true (TS 5.5+ `noCheck`).
+const TS_LOOSE = ["noCheck"];
+
+/** Parse JSONC (tsconfig): comments and trailing commas removed outside strings only. Returns null if unreadable. */
+export function parseJsonc(text) {
+  let out = "", i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') { let j = i + 1; while (j < n && text[j] !== '"') j += text[j] === "\\" ? 2 : 1; out += text.slice(i, j + 1); i = j + 1; }
+    else if (c === "/" && text[i + 1] === "/") { while (i < n && text[i] !== "\n") i++; }
+    else if (c === "/" && text[i + 1] === "*") { const e = text.indexOf("*/", i + 2); if (e < 0) return null; out += " "; i = e + 2; }
+    else if (c === ",") { let j = i + 1; while (j < n && /\s/.test(text[j])) j++; if (text[j] !== "}" && text[j] !== "]") out += c; i++; }
+    else { out += c; i++; }
+  }
+  // a comment between a comma and the closing bracket was removed above, so re-check trailing commas once more
+  out = out.replace(/,(\s*[}\]])/g, (m, rest, off) => (inString(out, off) ? m : rest));
+  try { return JSON.parse(out); } catch { return null; }
+}
+function inString(t, off) { let q = false; for (let i = 0; i < off; i++) { if (t[i] === "\\" && q) i++; else if (t[i] === '"') q = !q; } return q; }
 const LINT_CONFIG = /(^|\/)(eslint\.config\.[cm]?[jt]s|\.eslintrc(\.[\w]+)?)$/;
 
 const RX = {
   skip: [
     /\.(skip|only|todo)\s*\(/, /\b(xit|xdescribe|xtest|fit|fdescribe)\s*\(/, /\b(skipIf|runIf)\s*\(/,
-    /\.fixme\s*\(/, /(^|[{,])\s*(skip|todo|only)\s*:\s*[^,}\s]/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
+    /\.fixme\s*\(/, /(^|[{,])\s*(skip|todo|only)\s*:\s*[^,}\s]/,
+    // a skip referenced without being called, e.g. a ternary `(cond ? it : it.skip)("a", …)` or `const t = it.skip` (GI-1c)
+    /\b(?:it|test|describe|suite)\.(?:(?:concurrent|serial|sequential)\.)?(?:skip|todo|only|fixme)\b(?!\s*\()/,
+    // bare forms only after an operator, so the word "fit" in a test name or string is not a hit (review GI-1c-r2)
+    /[?:=(,|&]\s*\b(?:xit|xdescribe|xtest|fit|fdescribe)\b(?!\s*\()/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
   ],
   assert: /\bexpect(\.\w+)?\s*\(|\bassert(\.\w+)*\s*\(/g,
   suppress: /eslint-disable|@ts-ignore|@ts-expect-error|@ts-nocheck|istanbul ignore|c8 ignore|\bnosec\b|gitleaks:allow/,
@@ -56,12 +85,15 @@ function git(cwd, args) {
 }
 
 /** Parse `git diff --unified=0` output into files with status, removed and added lines (with line numbers). */
-export function parseDiff(text) {
+export function parseDiff(text, { pairs = null } = {}) {
+  const headers = pairs ? new Map(pairs.map(([o, n]) => [`diff --git a/${o} b/${n}`, [o, n]])) : null;
   const files = [];
   let f = null, oldLn = 0, newLn = 0, inHeader = false;
   for (const line of text.split("\n")) {
     if (line.startsWith("diff --git ")) {
-      const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+      // With the -z name-status pairs, match the header exactly, so a path containing " b/" splits right (GI-1c).
+      const pair = headers?.get(line);
+      const m = pair ? [line, pair[0], pair[1]] : /^diff --git a\/(.+) b\/(.+)$/.exec(line);
       if (!m) throw new GuardError(`unreadable diff header: ${line.slice(0, 120)}`);
       f = { oldPath: m[1], path: m[2], status: "M", removed: [], added: [], hunks: [] };
       files.push(f); inHeader = true;
@@ -325,6 +357,7 @@ export function analyse(files, show) {
     if (WORKFLOW.test(f.oldPath) && (f.status === "D" || (f.status === "R" && !WORKFLOW.test(p)))) { hit("ci-workflow-deleted", f.oldPath, 0, `${f.oldPath} deleted`); continue; }
     if (/^docs\/modules\/[^/]+\.md$/.test(f.oldPath) && (f.status === "D" || (f.status === "R" && f.oldPath !== p))) hit("contract-weakened", f.oldPath, 0, `${f.oldPath} ${f.status === "D" ? "deleted" : "moved to " + p}`);
     if (/(^|\/)\.gitattributes$/.test(p) || /(^|\/)\.gitattributes$/.test(f.oldPath)) { hit("gitattributes-changed", p, 0, "a .gitattributes change can hide diffs from the guard"); continue; }
+    // Defence in depth: run() diffs with --text, so git never reports a binary file; a caller of analyse() might (GI-1c).
     if (f.binary) { if (code || test || oldTest || /^packages\/policy\//.test(p)) hit("binary-code-change", p, 0, `${p} changed as binary`); continue; }
 
     if (test) {
@@ -436,9 +469,29 @@ export function analyse(files, show) {
 
     if (p.endsWith("package.json")) {
       // any position on the line, so a one-line package.json is read too (PR70-r2)
-      const scripts = (ls) => new Map(ls.flatMap((l) => [...l.text.matchAll(/"((?:test|lint|typecheck|check)(?::(?:[^"\\]|\\.)+)?)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)]).map((m) => [m[1], m[2]]));
+      // pre/post hooks of these scripts run with them, so they count too; a new hook is a change (GI-1c)
+      const scripts = (ls) => new Map(ls.flatMap((l) => [...l.text.matchAll(/"((?:pre|post)?(?:test|lint|typecheck|check)(?::(?:[^"\\]|\\.)+)?)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)]).map((m) => [m[1], m[2]]));
       const was = scripts(f.removed), now = scripts(f.added);
       for (const [k, v] of was) if (now.get(k) !== v) hit("test-script-changed", p, 0, `script "${k}": "${v}" -> ${now.has(k) ? `"${now.get(k)}"` : "removed"}`);
+      for (const [k, v] of now) if (/^(pre|post)/.test(k) && !was.has(k)) hit("test-script-changed", p, 0, `hook "${k}" added: "${v}"`);
+    }
+    if (TSCONFIG.test(p)) {
+      // Compare the parsed base and head files, so comments (one- or multi-line), strings holding "//" or "/*",
+      // and reformatting cannot hide or fake a change (review GI-1c-r2). An unreadable tsconfig fails closed.
+      const bt = f.status === "A" ? "{}" : show("base", f.oldPath), ht = f.status === "D" ? "{}" : show("head", p);
+      const b = bt == null ? null : parseJsonc(bt), h = ht == null ? null : parseJsonc(ht);
+      const lineOf = (k) => { const i = (ht ?? "").split("\n").findIndex((l) => l.includes(`"${k}"`)); return i < 0 ? 0 : i + 1; };
+      if (!b || !h || typeof b !== "object" || typeof h !== "object") hit("ts-strict-relaxed", p, 0, `${p}: tsconfig unreadable as JSONC (fails closed)`);
+      else {
+        const bo = b.compilerOptions ?? {}, ho = h.compilerOptions ?? {};
+        for (const k of TS_STRICT) {
+          if (bo[k] === true && ho[k] !== true) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": true -> ${ho[k] === undefined ? "removed" : JSON.stringify(ho[k])}`);
+          else if (ho[k] === false && bo[k] !== false) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": false`);
+        }
+        for (const k of TS_LOOSE) if (ho[k] === true && bo[k] !== true) hit("ts-strict-relaxed", p, lineOf(k), `"${k}": true`);
+        // strictness is inherited through "extends": dropping or retargeting it can turn strict off
+        if (b.extends !== undefined && JSON.stringify(b.extends) !== JSON.stringify(h.extends)) hit("ts-strict-relaxed", p, lineOf("extends"), `extends ${JSON.stringify(b.extends)} -> ${h.extends === undefined ? "removed" : JSON.stringify(h.extends)}`);
+      }
     }
     if (LINT_CONFIG.test(p)) for (const a of f.added) if (/[@\w/-]+["']?\s*:\s*\[?\s*(["'](off|warn)["']|[01]\s*[,\]}]|[01]\s*$)/.test(a.text) || /\bignores?\b["']?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
 
@@ -501,9 +554,15 @@ export function run({ cwd = process.cwd(), base, head }) {
     sha = git(cwd, ["rev-parse", "--verify", `${head}^{commit}`]).trim();
     const mb = git(cwd, ["merge-base", base, sha]).trim();
     const diff = git(cwd, ["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0", "--find-renames", mb, sha]);
+    const ns = git(cwd, ["diff", "-z", "--name-status", "--no-ext-diff", "--find-renames", mb, sha]).split("\0");
+    const pairs = [];
+    for (let i = 0; i < ns.length - 1;) {
+      const st = ns[i];
+      if (/^[RC]/.test(st)) { pairs.push([ns[i + 1], ns[i + 2]]); i += 3; } else if (st) { pairs.push([ns[i + 1], ns[i + 1]]); i += 2; } else i++;
+    }
     const revs = { base: mb, head: sha };
     const show = (rev, p) => { try { return execFileSync("git", ["show", `${revs[rev]}:${p}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 }); } catch { return null; } };
-    const hits = analyse(parseDiff(diff), show);
+    const hits = analyse(parseDiff(diff, { pairs }), show);
     return { sha, base: mb, exit: hits.length ? 1 : 0, hits };
   } catch (e) {
     return { sha, exit: 2, hits: [], error: e instanceof GuardError ? e.message : `internal error: ${e?.message ?? e}` };
