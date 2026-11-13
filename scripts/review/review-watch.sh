@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.4.1
+# Version: 1.5.0
+# v1.5.0 (DEVOS-172): a review that could not run (runner exit without a stored verdict, e.g. "Quota exceeded")
+# is retried with a bounded back-off instead of being final for that SHA. Attempt k failing (k < REVIEW_RETRY_MAX,
+# default 3) stores <sha>.fails=k and <sha>.retry_at = now + REVIEW_RETRY_BASE * 2^(k-1) seconds (default 600,
+# capped at REVIEW_RETRY_CAP, default 3600) and sets `codex-review` = pending; no comment is posted and the round
+# number is not used up. The head is a candidate again once retry_at has passed. Only the last attempt posts the
+# "could not run" report and the final `error` status, as before.
 # v1.4.1 (DEVOS-106): a verdict comment whose POST timed out on our side is not posted again if GitHub completed
 # it: before a retry, the PR's comments are read, and one with the same first line and commit counts as posted.
 # v1.4.0 (DEVOS-116): the longest-waiting head is reviewed first. A head's first-green time is stored
@@ -55,6 +61,9 @@ ENVF="$DIR/github-review.env"
 DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 GH_TIMEOUT="${GH_TIMEOUT:-30}"; [[ "$GH_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || GH_TIMEOUT=30
 
+REVIEW_RETRY_MAX="${REVIEW_RETRY_MAX:-3}";   [[ "$REVIEW_RETRY_MAX" =~ ^[1-9]$ ]] || REVIEW_RETRY_MAX=3
+REVIEW_RETRY_BASE="${REVIEW_RETRY_BASE:-600}"; [[ "$REVIEW_RETRY_BASE" =~ ^[1-9][0-9]{0,4}$ ]] || REVIEW_RETRY_BASE=600
+REVIEW_RETRY_CAP="${REVIEW_RETRY_CAP:-3600}";  [[ "$REVIEW_RETRY_CAP" =~ ^[1-9][0-9]{0,5}$ ]] || REVIEW_RETRY_CAP=3600
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 REVIEW_AUTHORS="${REVIEW_AUTHORS:-kkarnati1980}"   # space-separated GitHub logins whose PRs are reviewed
 trusted_pr() {  # one PR object on stdin -> 0 only when its head is in $REPO and its author is on REVIEW_AUTHORS
@@ -127,6 +136,7 @@ comment() {  # pr markdown-file
 #   <sha>.state              final status to publish: "<success|failure|error> <description>"
 #   <sha>.commented, <sha>.statused   publication steps that succeeded (each done exactly once)
 #   <sha>.published          both done; <sha>.done is the v1.0.x equivalent
+#   <sha>.fails, <sha>.retry_at   v1.5.0: failed attempts so far, and the epoch before which no retry runs
 published() { [[ -e "$STATE/$1.published" || -e "$STATE/$1.done" ]]; }
 already_commented() {  # pr sha -> 0 posted; 1 not on the PR; 2 cannot read the comments (do not POST this tick)
   # Only a comment by the watcher's own account counts (REVIEW_BOT_LOGIN, default the repo owner whose token posts),
@@ -240,6 +250,13 @@ for i in $(seq 0 $((count - 1))); do
   if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; unreadable=$((unreadable + 1)); continue; fi
   if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; waiting=$((waiting + 1)); continue; fi
 
+  # DEVOS-172: a head whose review could not run waits for its back-off. A value further ahead than the cap
+  # (clock stepped back, or a bad file) never blocks it for longer than the cap.
+  retry_at="$(cat "$STATE/$sha.retry_at" 2>/dev/null || true)"
+  if [[ "$retry_at" =~ ^[0-9]{1,12}$ ]] && (( retry_at > tick_now && retry_at <= tick_now + REVIEW_RETRY_CAP )); then
+    log "PR #$pr ${sha:0:7}: review could not run earlier; retry after $(date -u -d "@$retry_at" +%FT%TZ)"
+    continue
+  fi
   # DEVOS-116: green and unreviewed. Remember when this SHA was first seen green (kept across ticks), and
   # review the longest-waiting candidate after the loop, not the first one GitHub happens to list.
   since="$(cat "$STATE/$sha.green" 2>/dev/null || true)"
@@ -270,18 +287,34 @@ review_one() {  # pr sha contract
     set_status "$sha" pending "Codex review queued (runner busy)" || true
     return 0
   fi
+  local ok=0 fails=0 wait
+  [[ $rc -eq 0 || $rc -eq 2 ]] && [[ -s "$VDIR/$sha.json" ]] && ok=1
+  if (( ! ok )); then
+    fails="$(cat "$STATE/$sha.fails" 2>/dev/null || true)"; [[ "$fails" =~ ^[0-9]{1,3}$ ]] || fails=0
+    fails=$((fails + 1))
+    if (( fails < REVIEW_RETRY_MAX )); then
+      # DEVOS-172: not final yet. No comment, no .pr/.label (the round number is kept for the retry).
+      wait=$(( REVIEW_RETRY_BASE << (fails - 1) )); (( wait <= REVIEW_RETRY_CAP )) || wait=$REVIEW_RETRY_CAP
+      echo "$fails" > "$STATE/$sha.fails"
+      echo "$(( $(date +%s) + wait ))" > "$STATE/$sha.retry_at"
+      set_status "$sha" pending "Codex review $label could not run (attempt $fails of $REVIEW_RETRY_MAX); retry in $((wait / 60)) min" || true
+      log "PR #$pr ${sha:0:7}: runner failed (exit $rc), attempt $fails of $REVIEW_RETRY_MAX; retry in ${wait}s"
+      return 0
+    fi
+    echo "$fails" > "$STATE/$sha.fails"
+  fi
   tried[$sha]=1
   echo "$pr" > "$STATE/$sha.pr"
   echo "$label" > "$STATE/$sha.label"
-  if [[ $rc -eq 0 || $rc -eq 2 ]] && [[ -s "$VDIR/$sha.json" ]]; then
+  if (( ok )); then
     verdict_msg "$sha" "$label" "$contract"
     log "PR #$pr ${sha:0:7}: $(jq -r .verdict "$VDIR/$sha.json")"
   else
     {
       # Codex PR52-r2: the commit line makes a runner-failure report recognisable on a retry too (DEVOS-106).
-      printf '### Codex review %s — could not run (exit %s)\n\n- **Commit:** `%s`\n\nNo verdict was stored. Last lines of the runner log:\n\n```\n' "$label" "$rc" "$sha"
+      printf '### Codex review %s — could not run (exit %s)\n\n- **Commit:** `%s`\n- **Attempts:** %s of %s\n\nNo verdict was stored. Last lines of the runner log:\n\n```\n' "$label" "$rc" "$sha" "$fails" "$REVIEW_RETRY_MAX"
       tail -n 15 "$TMP/run.safe"
-      printf '```\nIt will not be retried for this commit; push a new commit, or run the installer with RETRY_FAILED=1.\n'
+      printf '```\nIt will not be retried again for this commit; push a new commit, or run the installer with RETRY_FAILED=1.\n'
     } > "$STATE/$sha.msg"
     echo "error Codex review could not run ($label)" > "$STATE/$sha.state"
     log "PR #$pr ${sha:0:7}: runner failed (exit $rc)"

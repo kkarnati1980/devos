@@ -305,13 +305,14 @@ test("AT20 (Codex PR52-r2): a runner-failure report carries the commit line and 
   M.prs = [{ number: 33, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M33.md" }];
   const failing = path.join(dir, "runner-fail.sh");
   fs.writeFileSync(failing, "#!/usr/bin/env bash\necho 'ERROR: Quota exceeded.'\nexit 1\n", { mode: 0o755 });
-  const r1 = await tick([], { REVIEW_RUNNER: failing, GH_TIMEOUT: "2" });
+  // DEVOS-172: one attempt, so this run is the final one and posts the report (the retry cycle is AT21).
+  const r1 = await tick([], { REVIEW_RUNNER: failing, GH_TIMEOUT: "2", REVIEW_RETRY_MAX: "1" });
   assert.equal(r1.code, 0, r1.out);
   assert.equal(M.comments.length, 1);
   assert.match(M.comments[0].body, /could not run \(exit 1\)/);
   assert.ok(M.comments[0].body.includes("- **Commit:** `" + sha + "`"));
   M.hangComment = false;
-  const r2 = await tick([], { REVIEW_RUNNER: failing });
+  const r2 = await tick([], { REVIEW_RUNNER: failing, REVIEW_RETRY_MAX: "1" });
   assert.equal(r2.code, 0, r2.out);
   assert.match(r2.out, /verdict comment already on the PR/);
   assert.equal(M.comments.length, 1, "the failure report is not duplicated");
@@ -331,4 +332,81 @@ test("AT20 (Codex PR52-r5): a comment list that hits the 30-page cap is indeterm
   assert.match(r.out, /cannot check the PR's comments/);
   assert.equal(M.comments.length, 0, "no POST on a truncated list");
   assert.equal(fs.existsSync(path.join(dir, "watch", `${sha}.commented`)), false);
+});
+
+// DEVOS-172 (review-watch v1.5.0, AT21): a review that could not run is retried with a bounded back-off.
+test("AT21: a head whose review could not run is retried after a growing back-off; only the last attempt posts the report", async () => {
+  reset();
+  M.green = true;
+  const sha = "5".repeat(40);
+  M.prs = [{ number: 41, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M41.md" }];
+  const calls = path.join(dir, "calls41.log");
+  const failing = path.join(dir, "runner-fail41.sh");
+  fs.writeFileSync(failing, `#!/usr/bin/env bash\necho "$4" >> "${calls}"\necho 'ERROR: Quota exceeded.'\nexit 1\n`, { mode: 0o755 });
+  const runs = () => (fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n") : []);
+  const ws = path.join(dir, "watch");
+  const RA = path.join(ws, `${sha}.retry_at`);
+  const st = () => M.statuses.filter((x) => x.sha === sha && x.context === "codex-review");
+  const now = () => Math.floor(Date.now() / 1000);
+
+  const t1 = now();
+  const r1 = await tick([], { REVIEW_RUNNER: failing });
+  assert.equal(r1.code, 0, r1.out);
+  assert.deepEqual(runs(), ["PR41-r1"]);
+  assert.equal(M.comments.length, 0, "no report after a non-final attempt");
+  assert.equal(st().at(-1).state, "pending");
+  assert.match(st().at(-1).description, /could not run \(attempt 1 of 3\); retry in 10 min/);
+  assert.equal(fs.readFileSync(path.join(ws, `${sha}.fails`), "utf8").trim(), "1");
+  const ra1 = Number(fs.readFileSync(RA, "utf8"));
+  assert.ok(ra1 >= t1 + 600 && ra1 <= now() + 600, "first back-off is 600 s");
+  assert.equal(fs.existsSync(path.join(ws, `${sha}.pr`)), false, "the round number is not used up");
+  assert.equal(fs.existsSync(path.join(ws, `${sha}.msg`)), false);
+
+  const r2 = await tick([], { REVIEW_RUNNER: failing });
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.out, /PR #41 5555555: review could not run earlier; retry after/);
+  assert.equal(runs().length, 1, "no retry before the back-off has passed");
+
+  fs.writeFileSync(RA, String(now() - 1));
+  const t3 = now();
+  await tick([], { REVIEW_RUNNER: failing });
+  assert.deepEqual(runs(), ["PR41-r1", "PR41-r1"], "the retry keeps the label");
+  const ra2 = Number(fs.readFileSync(RA, "utf8"));
+  assert.ok(ra2 >= t3 + 1200 && ra2 <= now() + 1200, "the back-off doubles");
+  assert.match(st().at(-1).description, /attempt 2 of 3/);
+
+  fs.writeFileSync(RA, String(now() - 1));
+  await tick([], { REVIEW_RUNNER: failing });
+  assert.equal(runs().length, 3);
+  assert.equal(M.comments.length, 1, "the last attempt posts the report");
+  assert.match(M.comments[0].body, /PR41-r1 — could not run \(exit 1\)/);
+  assert.match(M.comments[0].body, /- \*\*Attempts:\*\* 3 of 3/);
+  assert.equal(st().at(-1).state, "error");
+  await tick([], { REVIEW_RUNNER: failing });
+  assert.equal(runs().length, 3, "never retried after the last attempt");
+  assert.equal(M.comments.length, 1);
+});
+
+test("AT21: a retry that succeeds publishes the verdict with the first attempt's label; a retry time beyond the cap never blocks", async () => {
+  reset();
+  M.green = true;
+  const sha = "0".repeat(40);
+  M.prs = [{ number: 42, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M42.md" }];
+  fs.mkdirSync(path.join(dir, "verdicts"), { recursive: true });
+  const flag = path.join(dir, "fail-once42");
+  fs.writeFileSync(flag, "");
+  const runner = path.join(dir, "runner42.sh");
+  fs.writeFileSync(runner, `#!/usr/bin/env bash\nif [[ -e "${flag}" ]]; then rm -f "${flag}"; echo 'ERROR: Quota exceeded.'; exit 1; fi\nprintf '{"verdict":"PASS","summary":"ok","findings":[]}' > "${dir}/verdicts/$2.json"\n`, { mode: 0o755 });
+  const ws = path.join(dir, "watch");
+  await tick([], { REVIEW_RUNNER: runner, REVIEW_RETRY_BASE: "60" });
+  const ra = Number(fs.readFileSync(path.join(ws, `${sha}.retry_at`), "utf8"));
+  assert.ok(ra - Math.floor(Date.now() / 1000) <= 60, "REVIEW_RETRY_BASE sets the first back-off");
+  // A value far beyond the cap (clock stepped back, or a bad file) is treated as due.
+  fs.writeFileSync(path.join(ws, `${sha}.retry_at`), String(Math.floor(Date.now() / 1000) + 99999));
+  const r = await tick([], { REVIEW_RUNNER: runner });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.comments.length, 1);
+  assert.match(M.comments[0].body, /^### Codex review PR42-r1 — \*\*PASS\*\*/);
+  assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "success"));
+  assert.ok(fs.existsSync(path.join(ws, `${sha}.published`)));
 });
