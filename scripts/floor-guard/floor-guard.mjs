@@ -20,12 +20,17 @@ const TEST_FILE = /(^|\/)(test|tests|__tests__|test-db|e2e)\/.*\.(m?[jt]sx?|c[jt
 const WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const TEST_CONFIG = /(^|\/)(vitest|jest|playwright|vite)\.config\.[cm]?[jt]s$|(^|\/)\.(c8rc|nycrc)(\.json)?$|(^|\/)package\.json$/;
 const SHELL = /\.(sh|bash)$/;
+const TSCONFIG = /(^|\/)tsconfig[\w.-]*\.json$/;
+// TypeScript strictness flags; turning one off (or dropping a `true`) relaxes type checking (GI-1c).
+const TS_STRICT = /"(strict|noImplicitAny|strictNullChecks|strictFunctionTypes|strictBindCallApply|strictPropertyInitialization|noImplicitThis|alwaysStrict|useUnknownInCatchVariables|exactOptionalPropertyTypes|noUncheckedIndexedAccess)"\s*:\s*(true|false)\b/g;
 const LINT_CONFIG = /(^|\/)(eslint\.config\.[cm]?[jt]s|\.eslintrc(\.[\w]+)?)$/;
 
 const RX = {
   skip: [
     /\.(skip|only|todo)\s*\(/, /\b(xit|xdescribe|xtest|fit|fdescribe)\s*\(/, /\b(skipIf|runIf)\s*\(/,
-    /\.fixme\s*\(/, /(^|[{,])\s*(skip|todo|only)\s*:\s*[^,}\s]/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
+    /\.fixme\s*\(/, /(^|[{,])\s*(skip|todo|only)\s*:\s*[^,}\s]/,
+    // a skip referenced without being called, e.g. a ternary `(cond ? it : it.skip)("a", …)` or `const t = it.skip` (GI-1c)
+    /\b(?:it|test|describe|suite)\.(?:skip|todo|only)\b(?!\s*\()/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
   ],
   assert: /\bexpect(\.\w+)?\s*\(|\bassert(\.\w+)*\s*\(/g,
   suppress: /eslint-disable|@ts-ignore|@ts-expect-error|@ts-nocheck|istanbul ignore|c8 ignore|\bnosec\b|gitleaks:allow/,
@@ -56,12 +61,14 @@ function git(cwd, args) {
 }
 
 /** Parse `git diff --unified=0` output into files with status, removed and added lines (with line numbers). */
-export function parseDiff(text) {
+export function parseDiff(text, { pairs = null } = {}) {
   const files = [];
   let f = null, oldLn = 0, newLn = 0, inHeader = false;
   for (const line of text.split("\n")) {
     if (line.startsWith("diff --git ")) {
-      const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+      // With the -z name-status pairs, match the header exactly, so a path containing " b/" splits right (GI-1c).
+      const pair = pairs?.find(([o, n]) => line === `diff --git a/${o} b/${n}`);
+      const m = pair ? [line, pair[0], pair[1]] : /^diff --git a\/(.+) b\/(.+)$/.exec(line);
       if (!m) throw new GuardError(`unreadable diff header: ${line.slice(0, 120)}`);
       f = { oldPath: m[1], path: m[2], status: "M", removed: [], added: [], hunks: [] };
       files.push(f); inHeader = true;
@@ -325,6 +332,7 @@ export function analyse(files, show) {
     if (WORKFLOW.test(f.oldPath) && (f.status === "D" || (f.status === "R" && !WORKFLOW.test(p)))) { hit("ci-workflow-deleted", f.oldPath, 0, `${f.oldPath} deleted`); continue; }
     if (/^docs\/modules\/[^/]+\.md$/.test(f.oldPath) && (f.status === "D" || (f.status === "R" && f.oldPath !== p))) hit("contract-weakened", f.oldPath, 0, `${f.oldPath} ${f.status === "D" ? "deleted" : "moved to " + p}`);
     if (/(^|\/)\.gitattributes$/.test(p) || /(^|\/)\.gitattributes$/.test(f.oldPath)) { hit("gitattributes-changed", p, 0, "a .gitattributes change can hide diffs from the guard"); continue; }
+    // Defence in depth: run() diffs with --text, so git never reports a binary file; a caller of analyse() might (GI-1c).
     if (f.binary) { if (code || test || oldTest || /^packages\/policy\//.test(p)) hit("binary-code-change", p, 0, `${p} changed as binary`); continue; }
 
     if (test) {
@@ -436,9 +444,17 @@ export function analyse(files, show) {
 
     if (p.endsWith("package.json")) {
       // any position on the line, so a one-line package.json is read too (PR70-r2)
-      const scripts = (ls) => new Map(ls.flatMap((l) => [...l.text.matchAll(/"((?:test|lint|typecheck|check)(?::(?:[^"\\]|\\.)+)?)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)]).map((m) => [m[1], m[2]]));
+      // pre/post hooks of these scripts run with them, so they count too; a new hook is a change (GI-1c)
+      const scripts = (ls) => new Map(ls.flatMap((l) => [...l.text.matchAll(/"((?:pre|post)?(?:test|lint|typecheck|check)(?::(?:[^"\\]|\\.)+)?)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)]).map((m) => [m[1], m[2]]));
       const was = scripts(f.removed), now = scripts(f.added);
       for (const [k, v] of was) if (now.get(k) !== v) hit("test-script-changed", p, 0, `script "${k}": "${v}" -> ${now.has(k) ? `"${now.get(k)}"` : "removed"}`);
+      for (const [k, v] of now) if (/^(pre|post)/.test(k) && !was.has(k)) hit("test-script-changed", p, 0, `hook "${k}" added: "${v}"`);
+    }
+    if (TSCONFIG.test(p)) {
+      const flags = (ls, val) => ls.flatMap((l) => [...l.text.matchAll(TS_STRICT)].filter((m) => m[2] === val).map((m) => ({ k: m[1], l })));
+      for (const { k, l } of flags(f.added, "false")) hit("ts-strict-relaxed", p, l.ln, l.text);
+      const nowTrue = new Set(flags(f.added, "true").map((x) => x.k));
+      for (const { k, l } of flags(f.removed, "true")) if (!nowTrue.has(k)) hit("ts-strict-relaxed", p, l.ln, `removed: ${l.text}`);
     }
     if (LINT_CONFIG.test(p)) for (const a of f.added) if (/[@\w/-]+["']?\s*:\s*\[?\s*(["'](off|warn)["']|[01]\s*[,\]}]|[01]\s*$)/.test(a.text) || /\bignores?\b["']?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
 
@@ -501,9 +517,15 @@ export function run({ cwd = process.cwd(), base, head }) {
     sha = git(cwd, ["rev-parse", "--verify", `${head}^{commit}`]).trim();
     const mb = git(cwd, ["merge-base", base, sha]).trim();
     const diff = git(cwd, ["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0", "--find-renames", mb, sha]);
+    const ns = git(cwd, ["diff", "-z", "--name-status", "--no-ext-diff", "--find-renames", mb, sha]).split("\0");
+    const pairs = [];
+    for (let i = 0; i < ns.length - 1;) {
+      const st = ns[i];
+      if (/^[RC]/.test(st)) { pairs.push([ns[i + 1], ns[i + 2]]); i += 3; } else if (st) { pairs.push([ns[i + 1], ns[i + 1]]); i += 2; } else i++;
+    }
     const revs = { base: mb, head: sha };
     const show = (rev, p) => { try { return execFileSync("git", ["show", `${revs[rev]}:${p}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 }); } catch { return null; } };
-    const hits = analyse(parseDiff(diff), show);
+    const hits = analyse(parseDiff(diff, { pairs }), show);
     return { sha, base: mb, exit: hits.length ? 1 : 0, hits };
   } catch (e) {
     return { sha, exit: 2, hits: [], error: e instanceof GuardError ? e.message : `internal error: ${e?.message ?? e}` };

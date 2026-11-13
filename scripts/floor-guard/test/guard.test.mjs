@@ -164,6 +164,14 @@ const VIOLATIONS = [
   ["contract-weakened (line starting with --)", { "docs/modules/M9.md": "# M9\n## Acceptance tests\n-- AT1 must parse\n" }, { "docs/modules/M9.md": "# M9\n## Acceptance tests\n" }],
   ["policy-weakened (rules file)", { "packages/policy/rules/base.json": '{ "id": "r1", "effect": "require_approval" }\n' }, { "packages/policy/rules/base.json": "\n" }],
   ["policy-weakened (file deleted)", { "packages/policy/src/evaluator.ts": "export const x = 1;\n" }, { "packages/policy/src/evaluator.ts": null }],
+  // GI-1c widenings
+  ["test-skipped (ternary skip)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', '(process.env.DB ? it : it.skip)("a"') }],
+  ["test-skipped (skip held in a variable)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: "const t = it.skip;\n" + testSrc("expect(1).toBe(1);").replace('it("a"', 't("a"') }],
+  ["test-script-changed (pretest hook added)", { "package.json": '{ "scripts": { "test": "vitest run" } }\n' }, { "package.json": '{ "scripts": { "pretest": "rm -rf test", "test": "vitest run" } }\n' }],
+  ["test-script-changed (postlint hook changed)", { "package.json": '{ "scripts": { "lint": "eslint .", "postlint": "node check.mjs" } }\n' }, { "package.json": '{ "scripts": { "lint": "eslint .", "postlint": "exit 0" } }\n' }],
+  ["ts-strict-relaxed (strict: false)", { "tsconfig.json": '{ "compilerOptions": { "strict": true } }\n' }, { "tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' }],
+  ["ts-strict-relaxed (sub-flag off)", { "packages/x/tsconfig.build.json": '{ "compilerOptions": {} }\n' }, { "packages/x/tsconfig.build.json": '{ "compilerOptions": { "strictNullChecks": false } }\n' }],
+  ["ts-strict-relaxed (strict: true removed)", { "tsconfig.base.json": '{ "compilerOptions": {\n  "strict": true,\n  "target": "es2022"\n} }\n' }, { "tsconfig.base.json": '{ "compilerOptions": {\n  "target": "es2022"\n} }\n' }],
   ["policy-weakened", { "packages/policy/src/evaluator.ts": "const deny = matched.find((r) => r.effect === \"deny\");\nconst outcome = deny ? \"deny\" : \"allow\";\n" }, { "packages/policy/src/evaluator.ts": "const outcome = \"allow\";\n" }],
 ];
 
@@ -184,6 +192,21 @@ test("exit 0: a clean diff (new code, new tests, more assertions, a contract row
   );
   assert.deepEqual(r.hits, []);
   assert.equal(r.exit, 0);
+});
+
+test("GI-1c: a path containing \" b/\" is split right, so the hit names the real file and line", () => {
+  const P = "packages/x b/test/a.test.ts";
+  const r = check({ [P]: testSrc("expect(1).toBe(1);") }, { [P]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
+  assert.equal(r.exit, 1, JSON.stringify(r));
+  assert.deepEqual(r.hits.map((h) => [h.rule, h.file, h.line]), [["test-skipped", P, 2]]);
+});
+
+test("GI-1c exit 0: an unchanged hook and tightened strictness are not hits", () => {
+  const r = check(
+    { "package.json": '{ "scripts": { "pretest": "node gen.mjs", "test": "vitest run" } }\n', "tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' },
+    { "package.json": '{ "scripts": { "pretest": "node gen.mjs", "test": "vitest run", "build": "tsc" } }\n', "tsconfig.json": '{ "compilerOptions": { "strict": true, "noUncheckedIndexedAccess": true } }\n' },
+  );
+  assert.deepEqual(r.hits, []);
 });
 
 test("exit 0: a test file renamed to another test file is not a deletion; a new contract is free to write", () => {

@@ -56,8 +56,12 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 - **Escalate to KK:** only for money, data deletion, security scanning, legal, D11 or D13 hits; the card goes out under the normal HARD RULE.
 - **Split (size check):** reading the Codex verdict for a SHA and letting the merge path accept a failing `floor-guard` check with valid Keeps is wiring, not detection, and belongs with the Release merge path (DEVOS-143). It is filed as **GI-1b** (follow-up), together with the guard-path refusal above. Until it lands, a hit blocks the runner's merge outright: the runner restores the weakening or obtains a Codex Keep and records it in the PR's merge evidence.
 
-## Follow-ups (pre-review round 2, filed as GI-1c)
-- `pre`/`post` hooks of test scripts in `package.json`; a ternary skip such as `(cond ? it : it.skip)`; `tsconfig` `strict` relaxed; paths containing ` b/`; the `binary-code-change` rule is defence in depth only (with `--text` git never reports a binary file).
+## Follow-ups (pre-review round 2, filed as GI-1c) — done in DEVOS-150 (note 0020)
+- `pre`/`post` hooks of the test, lint, typecheck and check scripts in `package.json`: a changed, removed or new hook is `test-script-changed`.
+- A skip referenced without being called (a ternary `(cond ? it : it.skip)`, or `const t = it.skip`) is `test-skipped`.
+- `tsconfig*.json` strictness relaxed (`strict` or a sub-flag set to `false`, or a `true` removed) is `ts-strict-relaxed`.
+- Paths containing ` b/` are split with the `git diff -z --name-status` pairs, so hits name the real file.
+- `binary-code-change` stays as defence in depth: `run()` diffs with `--text`, so git never reports a binary file, but a caller of `analyse()` might.
 
 ## Not in scope
 - Making `floor-guard` a required check in the `main` ruleset (DEVOS-145, GI-3b) and adding it to `required-checks.json` (DEVOS-143).
