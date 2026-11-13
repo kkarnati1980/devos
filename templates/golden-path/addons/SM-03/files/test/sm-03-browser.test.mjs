@@ -156,6 +156,14 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.equal(String(html`<textarea><p title="</textarea><img src="/i.png" alt="${"x"}">">`), '<textarea><p title="</textarea><img src="/i.png" alt="x">">');
   assert.throws(() => html`<textarea><p title="</textarea><img src=x onerror=${"alert(1)"}>">`, /quote every attribute/);
   assert.equal(String(html`<title>${"<b>"}</title><p>${"&"}</p>`), "<title>&lt;b&gt;</title><p>&amp;</p>");
+  // Foreign content: inside <svg>/<math>, <title>/<textarea> are NOT RCDATA, so nested markup is parsed and
+  // a URL attribute there is validated — the SVG <title> integration point must not become a javascript: bypass.
+  assert.throws(() => html`<svg><title><a href="${"javascript:alert(1)"}">click</a></title></svg>`, /URL attribute/);
+  assert.throws(() => html`<math><title><a href="${"javascript:alert(1)"}">x</a></title></math>`, /URL attribute/);
+  assert.equal(String(html`<svg><title><a href="${"/safe"}">ok</a></title></svg>`), '<svg><title><a href="/safe">ok</a></title></svg>');
+  // A self-closed <svg/> does not open a foreign subtree, and after </svg> HTML RCDATA resumes.
+  assert.equal(String(html`<svg/><title>${"<b>"}</title>`), "<svg/><title>&lt;b&gt;</title>");
+  assert.equal(String(html`<svg></svg><title>${"<b>"}</title>`), "<svg></svg><title>&lt;b&gt;</title>");
   assert.equal(String(html`<p>a < b, ${"c"}</p>`), "<p>a < b, c</p>"); // a "<" followed by a space is text
   // After a closed raw-text element, values are allowed again.
   assert.equal(String(html`<script src="/a.js"></script><p>${"<"}</p>`), '<script src="/a.js"></script><p>&lt;</p>');

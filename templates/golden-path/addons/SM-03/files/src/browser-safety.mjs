@@ -105,7 +105,7 @@ function decodeEntities(s) {
 class MarkupState {
   mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment
   tag = ""; // current tag source since "<"
-  tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false;
+  tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false; foreign = 0; // SVG/MathML subtree depth
   feed(s) {
     for (let i = 0; i < s.length; i++) {
       const c = s[i];
@@ -144,7 +144,15 @@ class MarkupState {
         } else if (c === ">") {
           const name = this.tagName;
           const closing = this.tag.startsWith("</");
-          this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && RCDATA.has(name) ? "rcdata" : "text";
+          const selfClose = /\/\s*>$/.test(this.tag);
+          // Track SVG/MathML foreign content. Inside it, <title>/<textarea> are NOT RCDATA: their children are
+          // parsed as markup (SVG <title>/<desc>/<foreignObject> are HTML integration points), so a nested
+          // <a href="${…}"> is a real attribute that must be URL-validated, not RCDATA text. Treating the whole
+          // foreign subtree as markup only ever adds validation, never removes it, which is the safe direction.
+          if (!closing && !selfClose && (name === "svg" || name === "math")) this.foreign++;
+          else if (closing && (name === "svg" || name === "math") && this.foreign > 0) this.foreign--;
+          const rcdata = this.foreign === 0 && RCDATA.has(name);
+          this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && rcdata ? "rcdata" : "text";
           if (this.mode !== "text") this.raw = name;
           this.tag = ""; this.tagName = "";
         }
