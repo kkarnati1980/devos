@@ -6,7 +6,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { run, applyDispositions, parseDiff, workflowShape } from "../floor-guard.mjs";
+import { run, applyDispositions, parseDiff, workflowShape, analyse } from "../floor-guard.mjs";
 
 const GUARD = path.resolve(import.meta.dirname, "../floor-guard.mjs");
 const g = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -172,6 +172,12 @@ const VIOLATIONS = [
   ["ts-strict-relaxed (strict: false)", { "tsconfig.json": '{ "compilerOptions": { "strict": true } }\n' }, { "tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' }],
   ["ts-strict-relaxed (sub-flag off)", { "packages/x/tsconfig.build.json": '{ "compilerOptions": {} }\n' }, { "packages/x/tsconfig.build.json": '{ "compilerOptions": { "strictNullChecks": false } }\n' }],
   ["ts-strict-relaxed (strict: true removed)", { "tsconfig.base.json": '{ "compilerOptions": {\n  "strict": true,\n  "target": "es2022"\n} }\n' }, { "tsconfig.base.json": '{ "compilerOptions": {\n  "target": "es2022"\n} }\n' }],
+  ["test-skipped (ternary xit)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', '(process.env.DB ? it : xit)("a"') }],
+  ["test-skipped (ternary test.fixme)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', '(process.env.DB ? it : test.fixme)("a"') }],
+  ["test-skipped (ternary it.concurrent.skip)", { [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', '(process.env.DB ? it : it.concurrent.skip)("a"') }],
+  ["ts-strict-relaxed (strict commented out)", { "tsconfig.json": '{ "compilerOptions": {\n  "strict": true\n} }\n' }, { "tsconfig.json": '{ "compilerOptions": {\n  // "strict": true\n} }\n' }],
+  ["ts-strict-relaxed (extends removed)", { "packages/x/tsconfig.json": '{\n  "extends": "../../tsconfig.base.json",\n  "include": ["src"]\n}\n' }, { "packages/x/tsconfig.json": '{\n  "include": ["src"]\n}\n' }],
+  ["ts-strict-relaxed (extends retargeted)", { "packages/x/tsconfig.json": '{ "extends": "../../tsconfig.base.json" }\n' }, { "packages/x/tsconfig.json": '{ "extends": "./loose.json" }\n' }],
   ["policy-weakened", { "packages/policy/src/evaluator.ts": "const deny = matched.find((r) => r.effect === \"deny\");\nconst outcome = deny ? \"deny\" : \"allow\";\n" }, { "packages/policy/src/evaluator.ts": "const outcome = \"allow\";\n" }],
 ];
 
@@ -201,12 +207,32 @@ test("GI-1c: a path containing \" b/\" is split right, so the hit names the real
   assert.deepEqual(r.hits.map((h) => [h.rule, h.file, h.line]), [["test-skipped", P, 2]]);
 });
 
+test("GI-1c: a rename into a \" b/\" path and a \" b/\" delete name the real files", () => {
+  const P = "packages/x b/test/a.test.ts";
+  const ren = check({ [T]: testSrc("expect(1).toBe(1);") }, { [T]: null, [P]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
+  assert.deepEqual(ren.hits.map((h) => [h.rule, h.file]), [["test-skipped", P]]);
+  const del = check({ [P]: testSrc("expect(1).toBe(1);") }, { [P]: null });
+  assert.deepEqual(del.hits.map((h) => [h.rule, h.file]), [["test-file-deleted", P]]);
+});
+
+test("GI-1c: binary-code-change is still raised for a binary code file handed to analyse()", () => {
+  const files = parseDiff("diff --git a/src/a.ts b/src/a.ts\nindex 1..2 100644\nBinary files a/src/a.ts and b/src/a.ts differ\n");
+  const hits = analyse(files, () => "");
+  assert.deepEqual(hits.map((h) => h.rule), ["binary-code-change"]);
+});
+
 test("GI-1c exit 0: an unchanged hook and tightened strictness are not hits", () => {
   const r = check(
     { "package.json": '{ "scripts": { "pretest": "node gen.mjs", "test": "vitest run" } }\n', "tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' },
     { "package.json": '{ "scripts": { "pretest": "node gen.mjs", "test": "vitest run", "build": "tsc" } }\n', "tsconfig.json": '{ "compilerOptions": { "strict": true, "noUncheckedIndexedAccess": true } }\n' },
   );
   assert.deepEqual(r.hits, []);
+  // a line that already held a false flag, re-touched to add a key, is not a new relaxation
+  const r2 = check({ "tsconfig.json": '{ "compilerOptions": { "strict": false } }\n' }, { "tsconfig.json": '{ "compilerOptions": { "strict": false, "target": "es2022" } }\n' });
+  assert.deepEqual(r2.hits, []);
+  // the same extends, reformatted, is not a change
+  const r3 = check({ "packages/x/tsconfig.json": '{ "extends": "../../tsconfig.base.json" }\n' }, { "packages/x/tsconfig.json": '{\n  "extends": "../../tsconfig.base.json",\n  "include": ["src"]\n}\n' });
+  assert.deepEqual(r3.hits, []);
 });
 
 test("exit 0: a test file renamed to another test file is not a deletion; a new contract is free to write", () => {

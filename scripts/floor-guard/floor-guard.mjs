@@ -30,7 +30,8 @@ const RX = {
     /\.(skip|only|todo)\s*\(/, /\b(xit|xdescribe|xtest|fit|fdescribe)\s*\(/, /\b(skipIf|runIf)\s*\(/,
     /\.fixme\s*\(/, /(^|[{,])\s*(skip|todo|only)\s*:\s*[^,}\s]/,
     // a skip referenced without being called, e.g. a ternary `(cond ? it : it.skip)("a", …)` or `const t = it.skip` (GI-1c)
-    /\b(?:it|test|describe|suite)\.(?:skip|todo|only)\b(?!\s*\()/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
+    /\b(?:it|test|describe|suite)\.(?:(?:concurrent|serial|sequential)\.)?(?:skip|todo|only|fixme)\b(?!\s*\()/,
+    /\b(?:xit|xdescribe|xtest|fit|fdescribe)\b(?!\s*\()/, /^\s*if\s*\(.*(process\.env|\benv\.|platform|\bskip|\bCI\b).*\)\s*\{?\s*return\b/,
   ],
   assert: /\bexpect(\.\w+)?\s*\(|\bassert(\.\w+)*\s*\(/g,
   suppress: /eslint-disable|@ts-ignore|@ts-expect-error|@ts-nocheck|istanbul ignore|c8 ignore|\bnosec\b|gitleaks:allow/,
@@ -62,12 +63,13 @@ function git(cwd, args) {
 
 /** Parse `git diff --unified=0` output into files with status, removed and added lines (with line numbers). */
 export function parseDiff(text, { pairs = null } = {}) {
+  const headers = pairs ? new Map(pairs.map(([o, n]) => [`diff --git a/${o} b/${n}`, [o, n]])) : null;
   const files = [];
   let f = null, oldLn = 0, newLn = 0, inHeader = false;
   for (const line of text.split("\n")) {
     if (line.startsWith("diff --git ")) {
       // With the -z name-status pairs, match the header exactly, so a path containing " b/" splits right (GI-1c).
-      const pair = pairs?.find(([o, n]) => line === `diff --git a/${o} b/${n}`);
+      const pair = headers?.get(line);
       const m = pair ? [line, pair[0], pair[1]] : /^diff --git a\/(.+) b\/(.+)$/.exec(line);
       if (!m) throw new GuardError(`unreadable diff header: ${line.slice(0, 120)}`);
       f = { oldPath: m[1], path: m[2], status: "M", removed: [], added: [], hunks: [] };
@@ -451,10 +453,19 @@ export function analyse(files, show) {
       for (const [k, v] of now) if (/^(pre|post)/.test(k) && !was.has(k)) hit("test-script-changed", p, 0, `hook "${k}" added: "${v}"`);
     }
     if (TSCONFIG.test(p)) {
-      const flags = (ls, val) => ls.flatMap((l) => [...l.text.matchAll(TS_STRICT)].filter((m) => m[2] === val).map((m) => ({ k: m[1], l })));
-      for (const { k, l } of flags(f.added, "false")) hit("ts-strict-relaxed", p, l.ln, l.text);
+      // JSONC: a commented-out flag is no flag (review GI-1c-r1); strip comments before reading values
+      const unc = (t) => t.replace(/\/\*.*?\*\//g, "").replace(/(^|[^:"])\/\/.*$/, "$1");
+      const flags = (ls, val) => ls.flatMap((l) => [...unc(l.text).matchAll(TS_STRICT)].filter((m) => m[2] === val).map((m) => ({ k: m[1], l })));
+      // a false flag counts only beyond the false flags of the same key removed (a re-touched line is not new)
+      const oldFalse = {};
+      for (const { k } of flags(f.removed, "false")) oldFalse[k] = (oldFalse[k] ?? 0) + 1;
+      for (const { k, l } of flags(f.added, "false")) { if (oldFalse[k] > 0) oldFalse[k]--; else hit("ts-strict-relaxed", p, l.ln, l.text); }
       const nowTrue = new Set(flags(f.added, "true").map((x) => x.k));
       for (const { k, l } of flags(f.removed, "true")) if (!nowTrue.has(k)) hit("ts-strict-relaxed", p, l.ln, `removed: ${l.text}`);
+      // strictness is inherited through "extends": dropping or retargeting it can turn strict off
+      const ext = (ls) => ls.flatMap((l) => [...unc(l.text).matchAll(/"extends"\s*:\s*("(?:[^"\\]|\\.)*"|\[[^\]]*\])/g)].map((m) => ({ v: m[1].replace(/\s+/g, ""), l })));
+      const nowExt = new Set(ext(f.added).map((x) => x.v));
+      for (const { v, l } of ext(f.removed)) if (!nowExt.has(v)) hit("ts-strict-relaxed", p, l.ln, `extends changed or removed: ${l.text}`);
     }
     if (LINT_CONFIG.test(p)) for (const a of f.added) if (/[@\w/-]+["']?\s*:\s*\[?\s*(["'](off|warn)["']|[01]\s*[,\]}]|[01]\s*$)/.test(a.text) || /\bignores?\b["']?\s*:/.test(a.text)) hit("lint-rule-off", p, a.ln, a.text);
 
