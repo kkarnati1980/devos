@@ -180,11 +180,14 @@ export function notKeepable(h) {
   return false;
 }
 
-/** True when the verdict text has a line "FLOOR-GUARD CHANGE <path>" naming exactly this path. */
+/**
+ * True when the verdict text has a line "FLOOR-GUARD CHANGE <path>" naming exactly this path: the whole rest of
+ * the line (trailing whitespace aside) must equal the path, so one marker never covers a shorter path that is its
+ * prefix (Codex PR96-r1). Anything written after the path on the same line fails closed (no match).
+ */
 export function namesChange(text, path) {
-  for (const m of String(text).matchAll(/^\s*FLOOR-GUARD CHANGE (.+)$/gm)) {
-    const rest = m[1];
-    if (rest.startsWith(path) && (rest.length === path.length || /\s/.test(rest[path.length]))) return true;
+  for (const m of String(text).matchAll(/^[ \t]*FLOOR-GUARD CHANGE (.+)$/gm)) {
+    if (m[1].replace(/[ \t]+$/, "") === path) return true;
   }
   return false;
 }

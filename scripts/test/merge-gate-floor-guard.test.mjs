@@ -181,6 +181,12 @@ test("B7 marker parsing: KEEP and CHANGE markers inline in the one-line summary 
   const text = await passVerdictText(f.gh, REPO, 7, HEAD, "PR7-r2", "kkarnati1980");
   assert.ok(namesChange(text, "scripts/floor-guard/floor-guard.mjs"));
   assert.ok(!namesChange(text, "scripts/floor-guard/floor"), "a prefix is not a match");
+  // Codex PR96-r1: a path with a space never covers its shorter prefix path; only the whole path matches.
+  const spaced = "FLOOR-GUARD CHANGE scripts/floor-guard/a b.mjs";
+  assert.ok(namesChange(spaced, "scripts/floor-guard/a b.mjs"));
+  assert.ok(namesChange(spaced + "  ", "scripts/floor-guard/a b.mjs"), "trailing whitespace is ignored");
+  assert.ok(!namesChange(spaced, "scripts/floor-guard/a"), "a prefix up to a space is not a match");
+  assert.ok(!namesChange("FLOOR-GUARD CHANGE scripts/floor-guard/a trailing words", "scripts/floor-guard/a"), "text after the path fails closed");
   assert.match(text, /^FLOOR-GUARD KEEP fg-0123456789 a b\.ts:2 ok/m);
   const kept = applyDispositions({ sha: HEAD, exit: 1, hits: [{ id: "fg-0123456789", file: "a b.ts", line: 2 }] }, { sha: HEAD, source: "codex", text });
   assert.equal(kept.exit, 0, "a file name with a space still matches");
