@@ -310,6 +310,13 @@ test("M2.4-c2b AT7: project app secrets are sealed under their project, audited 
     return Buffer.concat([d.update(row.ciphertext.subarray(0, row.ciphertext.length - 16)), d.final()]).toString("utf8");
   };
   assert.equal(open(P1), v2, "sealed with the project-bound AAD");
+  assert.equal(await port.matches(P1, "preview/SESSION_SECRET", v2), true);
+  assert.equal(await port.matches(P1, "preview/SESSION_SECRET", v1), false, "an old value does not match");
+  assert.equal(await port.matches(P2, "preview/SESSION_SECRET", v2), false, "another project has no copy");
+  store.projectRows.set(`${P2}\npreview/SESSION_SECRET`, row);
+  assert.equal(await port.matches(P2, "preview/SESSION_SECRET", v2), false, "a row moved to another project does not open");
+  store.projectRows.delete(`${P2}\npreview/SESSION_SECRET`);
+  assert.equal(await new Vault(store, randomBytes(32), 1).matchesProject(P1, "preview/SESSION_SECRET", v2), false, "a wrong key is false, not a throw");
   assert.throws(() => open(P2), "a row moved to another project fails to open");
   assert.deepEqual(store.audits.map((a) => [a.action, a.projectId, a.details.name]),
     [["vault.app_secret.saved", P1, "preview/SESSION_SECRET"], ["vault.app_secret.rotated", P1, "preview/SESSION_SECRET"]]);

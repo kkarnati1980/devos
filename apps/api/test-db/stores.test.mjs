@@ -74,6 +74,8 @@ test("M2.4-c2b AT7: project app secrets upsert per (project, name) next to a sam
   assert.deepEqual(await vault.putProject(p.id, "preview/DB_PASSWORD", v1), { rotated: false });
   assert.deepEqual(await vault.putProject(p.id, "preview/DB_PASSWORD", v2), { rotated: true });
   assert.equal(await vault.hasProject(p.id, "preview/DB_PASSWORD"), true);
+  assert.equal(await vault.matchesProject(p.id, "preview/DB_PASSWORD", v2), true);
+  assert.equal(await vault.matchesProject(p.id, "preview/DB_PASSWORD", v1), false);
   const rows = await db.vaultSecret.findMany({ where: { projectId: p.id } });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].hint, null);

@@ -1,7 +1,7 @@
 // M1.4 encrypted vault (docs/modules/M1.4.md). Secrets are write-only over HTTP: the API stores a
 // value once (AES-256-GCM under the server's vault key) and only ever returns its name, its last
 // 4 characters and its dates. Plaintext leaves this file only through `reveal`, which no route calls.
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { writeAudit, type AuditEntry } from "./settings.js";
 
 /** The secrets KK enters in the wizard (continuous-build amendment, 6 Nov 2026). Global, not per project. */
@@ -77,6 +77,8 @@ export interface VaultStore {
   ): Promise<{ rotated: boolean }>;
   /** M2.4-c2b: true when the project holds a secret of that name. Reads no ciphertext. */
   hasProject(projectId: string, name: string): Promise<boolean>;
+  /** M2.4-c2b: the sealed project row, for `matchesProject` only. */
+  getProject(projectId: string, name: string): Promise<SealedSecret | null>;
 }
 
 const TAG_BYTES = 16;
@@ -159,10 +161,38 @@ export class Vault {
     return this.store.hasProject(projectId, name);
   }
 
+  /**
+   * M2.4-c2b (pre-review finding 1): true when the project's sealed copy equals `candidate`. The plaintext never leaves
+   * this method; the comparison is constant-time over SHA-256 digests. A missing, foreign-key or tampered row is false.
+   */
+  async matchesProject(projectId: string, name: string, candidate: string): Promise<boolean> {
+    if (!PROJECT_ID_RE.test(projectId)) throw new VaultKeyError("invalid:project");
+    if (!PROJECT_SECRET_NAME.test(name)) throw new VaultKeyError("invalid:name");
+    if (typeof candidate !== "string") return false;
+    const row = await this.store.getProject(projectId, name);
+    if (!row || row.keyVersion !== this.keyVersion || row.ciphertext.length <= TAG_BYTES) return false;
+    let plain: Buffer;
+    try {
+      const d = createDecipheriv("aes-256-gcm", this.key, row.nonce);
+      d.setAAD(projectAad(projectId, name, row.keyVersion));
+      d.setAuthTag(row.ciphertext.subarray(row.ciphertext.length - TAG_BYTES));
+      plain = Buffer.concat([d.update(row.ciphertext.subarray(0, row.ciphertext.length - TAG_BYTES)), d.final()]);
+    } catch {
+      return false;
+    }
+    const digest = (b: Buffer) => createHash("sha256").update(b).digest();
+    return timingSafeEqual(digest(plain), digest(Buffer.from(candidate, "utf8")));
+  }
+
   /** The provisioner's `ProjectSecrets` port (@devos/provision, M2.4-c2b). */
-  projectSecrets(): { has(projectId: string, name: string): Promise<boolean>; put(projectId: string, name: string, value: string): Promise<void> } {
+  projectSecrets(): {
+    has(projectId: string, name: string): Promise<boolean>;
+    put(projectId: string, name: string, value: string): Promise<void>;
+    matches(projectId: string, name: string, candidate: string): Promise<boolean>;
+  } {
     return {
       has: (projectId, name) => this.hasProject(projectId, name),
+      matches: (projectId, name, candidate) => this.matchesProject(projectId, name, candidate),
       put: async (projectId, name, value) => {
         await this.putProject(projectId, name, value);
       },
@@ -244,6 +274,9 @@ export class MemoryVaultStore implements VaultStore {
   async hasProject(projectId: string, name: string) {
     return this.projectRows.has(`${projectId}\n${name}`);
   }
+  async getProject(projectId: string, name: string) {
+    return this.projectRows.get(`${projectId}\n${name}`) ?? null;
+  }
 }
 
 /**
@@ -283,6 +316,12 @@ export class PrismaVaultStore implements VaultStore {
   }
   async hasProject(projectId: string, name: string) {
     return this.tx(async (tx: any) => (await tx.vaultSecret.count({ where: { projectId, name } })) > 0);
+  }
+  async getProject(projectId: string, name: string) {
+    return this.tx(async (tx: any) => {
+      const row = await tx.vaultSecret.findUnique({ where: { projectId_name: { projectId, name } } });
+      return row ? fromRow(row) : null;
+    });
   }
   /** Reads are bounded too (ADR-0011 §9, PR17-r1). */
   async list() {

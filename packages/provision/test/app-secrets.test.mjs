@@ -25,6 +25,7 @@ function fakeVault() {
     values, events,
     set failPut(v) { failPut = v; },
     has: async (projectId, name) => values.has(`${projectId}/${name}`),
+    matches: async (projectId, name, candidate) => values.get(`${projectId}/${name}`) === candidate,
     put: async (projectId, name, value) => {
       if (failPut) throw new Error("vault-unavailable");
       const k = `${projectId}/${name}`;
@@ -179,6 +180,41 @@ test("an env key already on the application without a vault row is rotated in pl
   assert.equal(app.envs[0].value, s.vault.values.get(`${P.id}/preview/SESSION_SECRET`));
 });
 
+test("AT3/AT4 on the PATCH path: a rejected, crashed or timed-out PATCH leaves a mismatch that the re-run rotates, never adopts", async () => {
+  for (const fault of [{ action: { status: 400 } }, { action: "timeout-before" }, { action: { status: 422 } }, { crash: true }]) {
+    const s = await setup();
+    const app = appOf(s.fake, "preview");
+    app.envs = [{ uuid: "ev-x", key: "SESSION_SECRET", value: "set-by-someone-else-0123456789", is_preview: false }];
+    if (fault.crash) {
+      // A lost lock right after the vault put stands in for a crash between the two writes.
+      let n = 0;
+      const orig = s.store.assertLockHeld.bind(s.store);
+      s.store.assertLockHeld = async (id) => { if (++n === 4) throw new Error("provision_lock_lost"); return orig(id); };
+    } else {
+      s.fake.faults.push({ match: (m, p) => m === "PATCH" && p.endsWith("/envs"), ...fault });
+    }
+    await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }));
+    const v1 = s.vault.values.get(`${P.id}/preview/SESSION_SECRET`);
+    assert.ok(v1, "the vault copy was written first");
+    assert.notEqual(app.envs[0].value, v1, "the PATCH did not land");
+    if (fault.crash) s.store.assertLockHeld = MemoryStore.prototype.assertLockHeld.bind(s.store);
+    const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    assert.notEqual(out[0].outcome, "adopted", `a mismatch is never adopted (${JSON.stringify(fault)})`);
+    assert.equal(app.envs.filter((e) => e.key === "SESSION_SECRET").length, 1);
+    assert.equal(app.envs[0].value, s.vault.values.get(`${P.id}/preview/SESSION_SECRET`), "Coolify and the vault agree after the re-run");
+  }
+});
+
+test("a lost journal with a mismatched value rotates instead of adopting", async () => {
+  const s = await setup();
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  appOf(s.fake, "production").envs.find((e) => e.key === "DB_PASSWORD").value = "changed-by-hand-0123456789abcdef";
+  for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.deepEqual(out.map((o) => o.outcome), ["adopted", "adopted", "adopted", "created"]);
+  assert.equal(appOf(s.fake, "production").envs.find((e) => e.key === "DB_PASSWORD").value, s.vault.values.get(`${P.id}/production/DB_PASSWORD`));
+});
+
 test("Coolify's pull-request preview entries do not count as present", async () => {
   const s = await setup();
   const app = appOf(s.fake, "preview");
@@ -238,6 +274,7 @@ test("names, generation and construction checks", () => {
   assert.throws(() => appSecretStep(cf, store, fakeVault(), { id: P.id, slug: "Bad Slug" }, "preview", "DB_PASSWORD"), /slug-invalid/);
   assert.throws(() => appSecretStep(cf, store, fakeVault(), P, "preview", "bad-key"), /app-secret-name-invalid/);
   assert.throws(() => appSecretStep(cf, store, undefined, P, "preview", "DB_PASSWORD"), /project-secrets-required/);
+  assert.throws(() => appSecretStep(cf, store, { has: async () => true, put: async () => {} }, P, "preview", "DB_PASSWORD"), /project-secrets-required/);
   const st = appSecretStep(cf, store, fakeVault(), P, "preview", "DB_PASSWORD");
   assert.deepEqual([st.key, st.provider, st.kind, st.name, st.action, st.inventory], ["vault/app_secret/preview/DB_PASSWORD", "vault", "app_secret", "acme/preview/DB_PASSWORD", "provision.vault.app_secret", false]);
 });
