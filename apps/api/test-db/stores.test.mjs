@@ -63,3 +63,27 @@ test("M1.4 AT14b: global secrets are saved and rotated in place, with the hint c
   assert.equal(list.find((m) => m.name === "linear_api_key").set, true);
   await assert.rejects(db.vaultSecret.update({ where: { id: rows[0].id }, data: { hint: "toolong" } })); // check: 4 chars
 });
+
+test("M2.4-c2b AT7: project app secrets upsert per (project, name) next to a same-named global row; audit names only", async () => {
+  const vault = new Vault(new PrismaVaultStore(db, 3000), randomBytes(32), 1);
+  const slug = `m24c2b-${randomBytes(6).toString("hex")}`;
+  const p = await db.project.create({ data: { slug, name: slug } });
+  const v1 = randomBytes(32).toString("base64url");
+  const v2 = randomBytes(32).toString("base64url");
+  assert.equal(await vault.hasProject(p.id, "preview/DB_PASSWORD"), false);
+  assert.deepEqual(await vault.putProject(p.id, "preview/DB_PASSWORD", v1), { rotated: false });
+  assert.deepEqual(await vault.putProject(p.id, "preview/DB_PASSWORD", v2), { rotated: true });
+  assert.equal(await vault.hasProject(p.id, "preview/DB_PASSWORD"), true);
+  const rows = await db.vaultSecret.findMany({ where: { projectId: p.id } });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].hint, null);
+  assert.ok(!Buffer.from(rows[0].ciphertext).includes(Buffer.from(v2)));
+  const audits = await db.auditEvent.findMany({ where: { projectId: p.id }, orderBy: { occurredAt: "asc" } });
+  assert.deepEqual(audits.map((a) => a.action), ["vault.app_secret.saved", "vault.app_secret.rotated"]);
+  assert.ok(!JSON.stringify(audits).includes(v1) && !JSON.stringify(audits).includes(v2));
+  // The global trigger only guards project_id NULL rows: the same name may exist globally and per project.
+  await db.vaultSecret.create({ data: { name: "preview/DB_PASSWORD", projectId: null, ciphertext: Buffer.alloc(32), nonce: Buffer.alloc(12), keyVersion: 1 } });
+  assert.deepEqual(await vault.putProject(p.id, "preview/DB_PASSWORD", v1), { rotated: true });
+  assert.equal(await db.vaultSecret.count({ where: { projectId: p.id } }), 1);
+  await db.vaultSecret.deleteMany({ where: { name: "preview/DB_PASSWORD" } });
+});

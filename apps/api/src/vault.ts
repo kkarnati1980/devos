@@ -66,10 +66,28 @@ export interface VaultStore {
   ): Promise<{ row: SealedSecret; rotated: boolean }>;
   list(): Promise<SealedSecret[]>;
   get(name: string): Promise<SealedSecret | null>;
+  /**
+   * M2.4-c2b: inserts or replaces the project-scoped secret (`project_id` = `projectId`) and writes its audit event in
+   * the same transaction. Never touches a global row.
+   */
+  upsertProject(
+    projectId: string,
+    row: Omit<SealedSecret, "createdAt" | "updatedAt">,
+    audit: (rotated: boolean) => AuditEntry,
+  ): Promise<{ rotated: boolean }>;
+  /** M2.4-c2b: true when the project holds a secret of that name. Reads no ciphertext. */
+  hasProject(projectId: string, name: string): Promise<boolean>;
 }
 
 const TAG_BYTES = 16;
 const aad = (name: string, keyVersion: number) => Buffer.from(`devos-vault/v1\nglobal\n${name}\n${keyVersion}`, "utf8");
+/** M2.4-c2b: a project row's AAD binds the ciphertext to its project, so a row moved to another project fails to open. */
+const projectAad = (projectId: string, name: string, keyVersion: number) =>
+  Buffer.from(`devos-vault/v1\nproject:${projectId}\n${name}\n${keyVersion}`, "utf8");
+
+const PROJECT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Project secret names: `<env>/<NAME>` (M2.4 row 5, e.g. `preview/SESSION_SECRET`). */
+export const PROJECT_SECRET_NAME = /^(preview|production)\/[A-Z][A-Z0-9_]{0,63}$/;
 
 export class VaultKeyError extends Error {}
 
@@ -111,6 +129,44 @@ export class Vault {
       details: { name, keyVersion: this.keyVersion },
     }));
     return { meta: toMeta(name, row), rotated };
+  }
+
+  /**
+   * M2.4-c2b: seals a generated app secret under its project (`vault_secret.project_id`). Returns nothing about the
+   * value; the audit event `vault.app_secret.saved|rotated` carries the project and the name only.
+   */
+  async putProject(projectId: string, name: string, value: string): Promise<{ rotated: boolean }> {
+    if (!PROJECT_ID_RE.test(projectId)) throw new VaultKeyError("invalid:project");
+    if (!PROJECT_SECRET_NAME.test(name)) throw new VaultKeyError("invalid:name");
+    const problem = checkSecretValue(value);
+    if (problem) throw new VaultKeyError(problem);
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", this.key, nonce);
+    cipher.setAAD(projectAad(projectId, name, this.keyVersion));
+    const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final(), cipher.getAuthTag()]);
+    // No hint for app secrets: nothing about the value is shown anywhere (decision 7).
+    return this.store.upsertProject(projectId, { name, ciphertext, nonce, keyVersion: this.keyVersion, hint: null }, (rotated) => ({
+      action: rotated ? "vault.app_secret.rotated" : "vault.app_secret.saved",
+      summary: `App secret ${name} ${rotated ? "rotated" : "saved"}`,
+      details: { name, keyVersion: this.keyVersion },
+      projectId,
+    }));
+  }
+
+  async hasProject(projectId: string, name: string): Promise<boolean> {
+    if (!PROJECT_ID_RE.test(projectId)) throw new VaultKeyError("invalid:project");
+    if (!PROJECT_SECRET_NAME.test(name)) throw new VaultKeyError("invalid:name");
+    return this.store.hasProject(projectId, name);
+  }
+
+  /** The provisioner's `ProjectSecrets` port (@devos/provision, M2.4-c2b). */
+  projectSecrets(): { has(projectId: string, name: string): Promise<boolean>; put(projectId: string, name: string, value: string): Promise<void> } {
+    return {
+      has: (projectId, name) => this.hasProject(projectId, name),
+      put: async (projectId, name, value) => {
+        await this.putProject(projectId, name, value);
+      },
+    };
   }
 
   /** Metadata for every wizard secret, set or not. */
@@ -174,6 +230,20 @@ export class MemoryVaultStore implements VaultStore {
   async get(name: string) {
     return this.rows.get(name) ?? null;
   }
+  /** M2.4-c2b: project rows, keyed `<projectId>\n<name>`; kept apart from the global rows. */
+  readonly projectRows = new Map<string, SealedSecret>();
+  async upsertProject(projectId: string, r: Omit<SealedSecret, "createdAt" | "updatedAt">, audit: (rotated: boolean) => AuditEntry) {
+    const k = `${projectId}\n${r.name}`;
+    const prev = this.projectRows.get(k);
+    if (this.failAudit) throw new Error("audit insert failed");
+    this.audits.push(audit(prev !== undefined));
+    const t = new Date(this.now());
+    this.projectRows.set(k, { ...r, createdAt: prev?.createdAt ?? t, updatedAt: t });
+    return { rotated: prev !== undefined };
+  }
+  async hasProject(projectId: string, name: string) {
+    return this.projectRows.has(`${projectId}\n${name}`);
+  }
 }
 
 /**
@@ -199,6 +269,20 @@ export class PrismaVaultStore implements VaultStore {
       await writeAudit(tx, audit(Boolean(prev)));
       return { row: fromRow(row), rotated: Boolean(prev) };
     });
+  }
+  /** M2.4-c2b: the compound unique (`project_id`, `name`) matches a non-null project, so a plain upsert is exact. */
+  async upsertProject(projectId: string, r: Omit<SealedSecret, "createdAt" | "updatedAt">, audit: (rotated: boolean) => AuditEntry) {
+    return this.tx(async (tx: any) => {
+      const where = { projectId_name: { projectId, name: r.name } };
+      const prev = await tx.vaultSecret.findUnique({ where, select: { id: true } });
+      const data = { ciphertext: r.ciphertext, nonce: r.nonce, keyVersion: r.keyVersion, hint: r.hint };
+      await tx.vaultSecret.upsert({ where, update: data, create: { projectId, name: r.name, ...data }, select: { id: true } });
+      await writeAudit(tx, audit(Boolean(prev)));
+      return { rotated: Boolean(prev) };
+    });
+  }
+  async hasProject(projectId: string, name: string) {
+    return this.tx(async (tx: any) => (await tx.vaultSecret.count({ where: { projectId, name } })) > 0);
   }
   /** Reads are bounded too (ADR-0011 §9, PR17-r1). */
   async list() {
