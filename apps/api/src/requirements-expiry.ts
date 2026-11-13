@@ -33,9 +33,10 @@ export interface ExpiryDeps {
   expire(ids: readonly string[], reason: string): Promise<string[]>;
   /**
    * Runs the pass so that no newer version can be saved meanwhile (`PrismaRequirementsStore.withProjectHeld`;
-   * Codex PR88-r1). Without it (in-memory tests) the pass runs as is.
+   * Codex PR88-r1). `assertHeld` is called before every expiry write and throws once the hold could lapse during
+   * that write (Codex PR88-r4). Without it (in-memory tests) the pass runs as is.
    */
-  serialize?<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
+  serialize?<T>(projectId: string, fn: (assertHeld: () => void) => Promise<T>): Promise<T>;
 }
 
 export interface ExpiryResult {
@@ -67,9 +68,12 @@ async function pendingCards(cards: PendingCardLister, projectId: string): Promis
   return out;
 }
 
-async function expireAll(deps: ExpiryDeps, ids: string[], reason: string): Promise<string[]> {
+async function expireAll(deps: ExpiryDeps, ids: string[], reason: string, assertHeld: () => void): Promise<string[]> {
   const done: string[] = [];
-  for (let i = 0; i < ids.length; i += EXPIRE_IDS_MAX) done.push(...(await deps.expire(ids.slice(i, i + EXPIRE_IDS_MAX), reason)));
+  for (let i = 0; i < ids.length; i += EXPIRE_IDS_MAX) {
+    assertHeld();
+    done.push(...(await deps.expire(ids.slice(i, i + EXPIRE_IDS_MAX), reason)));
+  }
   return done;
 }
 
@@ -90,11 +94,11 @@ export function expireSuperseded(deps: ExpiryDeps, projectId: string, r: SubmitR
   // The newest-version check and the expiry are one step: while the project row is held no newer submission can
   // save, so a card a newer version would reuse is never expired after the check (Codex PR88-r1). A newer version
   // saved after the pass raises its questions afresh, because the core reuses only pending twins.
-  const pass = () => expirePass(deps, projectId, r, startedAt);
-  return deps.serialize ? deps.serialize(projectId, pass) : pass();
+  const pass = (assertHeld: () => void) => expirePass(deps, projectId, r, startedAt, assertHeld);
+  return deps.serialize ? deps.serialize(projectId, pass) : pass(() => undefined);
 }
 
-async function expirePass(deps: ExpiryDeps, projectId: string, r: SubmitResult, startedAt: Date): Promise<ExpiryResult> {
+async function expirePass(deps: ExpiryDeps, projectId: string, r: SubmitResult, startedAt: Date, assertHeld: () => void): Promise<ExpiryResult> {
   const result: ExpiryResult = { requirements: [], questions: [], skipped: [] };
   const latest = await deps.latestDoc(projectId);
   if (!latest) return result;
@@ -109,8 +113,8 @@ async function expirePass(deps: ExpiryDeps, projectId: string, r: SubmitResult, 
     if (v < latest.version) superseded.push(c.id);
     else if (newest && v === latest.version) unlinked.push(c.id);
   }
-  if (superseded.length) result.requirements.push(...(await expireAll(deps, superseded, `Superseded: requirements v${latest.version} is the newest version`)));
-  if (unlinked.length) result.requirements.push(...(await expireAll(deps, unlinked, `Not linked: this card could not be linked to requirements v${latest.version}`)));
+  if (superseded.length) result.requirements.push(...(await expireAll(deps, superseded, `Superseded: requirements v${latest.version} is the newest version`, assertHeld)));
+  if (unlinked.length) result.requirements.push(...(await expireAll(deps, unlinked, `Not linked: this card could not be linked to requirements v${latest.version}`, assertHeld)));
 
   if (!newest) {
     result.skipped.push("newer-version");
@@ -124,7 +128,7 @@ async function expirePass(deps: ExpiryDeps, projectId: string, r: SubmitResult, 
   const qIds = pending
     .filter((c) => c.gate === "decision" && QUESTION_TARGET.test(c.target) && !keep.has(c.id) && c.createdAt.getTime() <= startedAt.getTime())
     .map((c) => c.id);
-  if (qIds.length) result.questions = await expireAll(deps, qIds, `Superseded: the question is not in requirements v${r.docVersion}`);
+  if (qIds.length) result.questions = await expireAll(deps, qIds, `Superseded: the question is not in requirements v${r.docVersion}`, assertHeld);
   return result;
 }
 

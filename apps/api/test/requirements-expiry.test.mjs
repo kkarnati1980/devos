@@ -187,7 +187,7 @@ test("AT-E7 (Codex PR88-r1) a newer version cannot save while an older pass chec
   const realSave = store.saveAnalysis.bind(store);
   const order = [];
   store.saveAnalysis = (input) => hold(async () => { order.push("save"); return realSave(input); });
-  store.withProjectHeld = (_id, fn) => hold(fn);
+  store.withProjectHeld = (_id, fn) => hold(() => fn(() => undefined));
   const svcHeld = requirementsServices(store, new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false }), approvalStore);
 
   await svcHeld.pipeline.submitSpec(P1, { kind: "paste", text: spec([DOMAIN]) }); // v1 asks Q
@@ -222,4 +222,35 @@ test("AT-E7 (Codex PR88-r1) a newer version cannot save while an older pass chec
   assert.notEqual(q3[0].id, q1.id);
   assert.equal(r3.docVersion, 3);
   assert.deepEqual(r2.expired.questions, [q1.id]);
+});
+
+test("AT-E9 (Codex PR88-r4) the pass never starts an expiry write the project hold may not outlast", async () => {
+  const { PrismaRequirementsStore, HoldLapsedError } = await import("../dist/requirements-store.js");
+  // The hold lasts the store's timeout plus one step; assertHeld refuses once a whole step no longer fits.
+  const txOpts = [];
+  const db = { $transaction: async (fn, o) => (txOpts.push(o), fn({ $queryRaw: async () => [] })) };
+  const store = new PrismaRequirementsStore(db, 60);
+  const seen = await store.withProjectHeld(P1, async (assertHeld) => {
+    assertHeld(); // at once: fits
+    await new Promise((r) => setTimeout(r, 90)); // 90 ms into a 60 + 40 ms hold: a 40 ms step no longer fits
+    try { assertHeld(); return "fits"; } catch (e) { return e; }
+  }, 40);
+  assert.deepEqual(txOpts[0], { timeout: 100, maxWait: 60 }, "the hold's own bound is the store timeout plus one step");
+  assert.ok(seen instanceof HoldLapsedError && seen.message === "project-hold-lapsed");
+
+  // In the pass: a hold that lapses after the first write stops before the second, and nothing more is expired.
+  const writes = [];
+  const pending = ["c1", "c2"].map((id, i) => ({ id, gate: "requirements", action: "requirements.approve", target: `project ${P1} docs/requirements.md v${i + 1}`, projectId: P1, createdAt: new Date(0) }));
+  let calls = 0;
+  const deps = {
+    latestDoc: async () => ({ id: "doc-3", version: 3, approvalId: null }),
+    cards: { list: async ({ cursor }) => (cursor ? [] : pending) },
+    expire: async (ids) => (writes.push(ids), ids),
+    serialize: async (_id, fn) => fn(() => { if (++calls > 1) throw new HoldLapsedError(); }),
+  };
+  const r = { docId: "doc-3", docVersion: 3, questionCards: { raised: [], failed: [] } };
+  const unlinked = { ...pending[0], id: "c3", target: `project ${P1} docs/requirements.md v3` };
+  deps.cards.list = async ({ cursor }) => (cursor ? [] : [...pending, unlinked]);
+  await assert.rejects(expireSuperseded(deps, P1, r, new Date()), /project-hold-lapsed/);
+  assert.deepEqual(writes, [["c1", "c2"]], "the superseded batch ran while held; the unlinked batch never started");
 });

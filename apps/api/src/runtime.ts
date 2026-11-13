@@ -159,7 +159,7 @@ export async function buildRuntime(
     ? runEngineModelRunner(new PrismaAnalystRunRows(db as unknown as AnalystRowsDb, t), await opts.loadAnalystEngine(db, engine))
     : null;
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
-  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), t);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
 }
@@ -176,6 +176,8 @@ export function requirementsServices(
   cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister & PendingCardLister,
   runner: ModelRunner | null = null,
   expiryLog?: ExpiryLog,
+  /** The longest one expiry write can take (the approvals store's transaction bound; Codex PR88-r4). */
+  expireStepMs = 0,
 ): RequirementsServices {
   // M2.2-d3c2: after each submission, the superseded version's pending cards and an unlinked requirements card
   // are expired through the M2.3 core (DEVOS-164).
@@ -192,18 +194,19 @@ export function requirementsServices(
       cards,
       expire: (ids, reason) => approvals.expireCardsById(ids, reason),
       // The Postgres store holds the project row for the pass (Codex PR88-r1); the in-memory store has no lock.
-      serialize: holder(store),
+      serialize: holder(store, expireStepMs),
     },
     expiryLog,
   );
   return { pipeline, store, cards: { get: (id) => cards.get(id) } };
 }
 
-type Held = { withProjectHeld?<T>(projectId: string, fn: () => Promise<T>): Promise<T> };
+type HeldFn<T> = (assertHeld: () => void) => Promise<T>;
+type Held = { withProjectHeld?<T>(projectId: string, fn: HeldFn<T>, stepMs?: number): Promise<T> };
 /** The store's project hold, when it has one (PrismaRequirementsStore does). */
-function holder(store: object): (<T>(projectId: string, fn: () => Promise<T>) => Promise<T>) | undefined {
+function holder(store: object, stepMs: number): (<T>(projectId: string, fn: HeldFn<T>) => Promise<T>) | undefined {
   const s = store as Held;
-  return typeof s.withProjectHeld === "function" ? (id, fn) => s.withProjectHeld!(id, fn) : undefined;
+  return typeof s.withProjectHeld === "function" ? (id, fn) => s.withProjectHeld!(id, fn, stepMs) : undefined;
 }
 
 /**
