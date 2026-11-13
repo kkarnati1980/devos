@@ -75,7 +75,7 @@ test("AT5: the gate never expects itself; push-only and other-branch workflows a
 test("the repo's own workflows parse: every PR job is expected, and the gate is not", () => {
   const names = expectedChecks(".github/workflows", "main");
   // Exact list: adding or renaming a PR check must update this test (and the ruleset notes) on purpose.
-  assert.deepEqual([...names].sort(), ["api-db", "build", "compose-smoke", "dashboard-e2e", "db", "licence-check", "linear-sync-db", "policy-db", "provision-db", "run-engine-db", "secret-scan", "security-selftest", "teardown-db", "vuln-scan"]);
+  assert.deepEqual([...names].sort(), ["api-db", "build", "compose-smoke", "dashboard-e2e", "db", "floor-guard", "licence-check", "linear-sync-db", "pass-rule", "policy-db", "provision-db", "run-engine-db", "secret-scan", "security-selftest", "teardown-db", "vuln-scan"]);
   assert.ok(!names.includes("ci-gate"));
 });
 
@@ -207,6 +207,6 @@ test("AT12 (Codex PR73-r4): check runs are tied to the head SHA's pull_request w
   await assert.rejects(listPrWorkflowRuns("https://api.example", "o/r", sha, "t", async () => ({ ok: false, status: 403 }), async () => {}), /workflow-runs read failed: HTTP 403/);
   // checkOwners maps each expected name to its file; the repo's real set is owned file by file.
   const owners = checkOwners(".github/workflows", "main");
-  assert.equal(owners.size, 14);
+  assert.equal(owners.size, 16);
   assert.ok([...owners.values()].every((f) => /\.ya?ml$/.test(f) && f !== "ci-gate.yml"));
 });

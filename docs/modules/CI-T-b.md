@@ -23,16 +23,16 @@ One check, `ci-gate`, that always reports on every PR into `main` and is green o
 | AT3 | `paths`, `paths-ignore`, `types`, job `if:`, matrix, reusable workflow, computed name, branch glob → `GateError` (exit 2) |
 | AT4 | The newest run of a re-run check decides |
 | AT5 | The gate's own workflow, push-only and other-branch workflows are not expected; job `name` or id is the check name; an empty set or a duplicate name is an error |
-| AT6 | The repo's real workflows parse to exactly the 14 current PR checks; the CLI exits 2 on missing inputs or an unsupported workflow |
+| AT6 | The repo's real workflows parse to exactly the 16 current PR checks (14 at first; `floor-guard` and `pass-rule` were added on main by DEVOS-141 and DEVOS-142); the CLI exits 2 on missing inputs or an unsupported workflow |
 | AT7 | A check main runs that the PR deletes or narrows → exit 2 at once; added checks are expected; a missing base directory, or an absent/empty `GATE_BASE_WORKFLOWS_DIR` input, is an error (exit 2, Codex PR73-r3) |
 | AT10 | Two PR workflow runs of the owning file on one SHA (e.g. close and reopen) fail the name; a re-run in the same suite counts |
 | AT8 | Every read uses `filter=all`; pagination over 100 runs; another app's same-named run ignored; 5xx retried to success; 3 network failures or one 4xx → `GateError` |
 | AT9 | Run through a symlinked path with a space and `%`, the CLI still exits 2 on missing inputs (fails on the old `file://` comparison) |
 | AT11 | A same-named run from a push-only workflow, or from another PR workflow file, neither satisfies nor blocks the expected check: alone it leaves the check pending; the owning PR run decides (Codex PR73-r4) |
-| AT12 | Workflow runs are read with `head_sha` and `event=pull_request`; push runs and other SHAs are dropped; each check run is tagged with its PR workflow file or null; a bad body or 4xx is exit 2; the repo's 14 checks each map to one workflow file |
+| AT12 | Workflow runs are read with `head_sha` and `event=pull_request`; push runs and other SHAs are dropped; each check run is tagged with its PR workflow file or null; a bad body or 4xx is exit 2; the repo's 16 checks each map to one workflow file |
 
 ## Pass rule
-`node --test scripts/test/ci-gate.test.mjs` exits 0, and on this PR's head the `ci-gate` check run is `success` only after the 14 other checks succeeded.
+`node --test scripts/test/ci-gate.test.mjs` exits 0, and on this PR's head the `ci-gate` check run is `success` only after the 16 other checks succeeded.
 
 ## Pre-review (runner B, 12 Nov 2026)
 9 findings (1 high, 3 medium, 5 low); 7 fixed, 2 recorded:
