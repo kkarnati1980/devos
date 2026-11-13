@@ -1,0 +1,49 @@
+# CI-T-b (DEVOS-152, docs/modules/CI-T-b.md, docs/decisions/0017-ci-gate.md): one always-running check that
+# passes only when every other PR check on the head SHA passed. The `main` ruleset requires this one check
+# (DEVOS-143), so a path-filtered or skipped job can never leave a PR silently mergeable (C2).
+name: ci-gate
+on:
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ci-gate-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  checks: read
+  actions: read # list the head SHA's pull_request workflow runs (Codex PR73-r4)
+jobs:
+  ci-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The workflow and the gate script both come from the PR (pull_request runs the PR's own workflow file), so
+      # changes to them are guarded by the floor guard (DEVOS-141) and Codex review, not by this job. The base
+      # commit's workflow list is read too, so a PR that deletes or narrows a check still has to pass it.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .gate-base
+          sparse-checkout: .github/workflows
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Install the gate's one dependency (yaml, pinned by the lockfile)
+        run: pnpm install --frozen-lockfile --filter . --ignore-scripts
+      - name: Wait for every PR check on the head SHA
+        timeout-minutes: 28
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GATE_SHA: ${{ github.event.pull_request.head.sha }}
+          GATE_BASE: ${{ github.event.pull_request.base.ref }}
+          GATE_WORKFLOWS_DIR: .github/workflows
+          GATE_BASE_WORKFLOWS_DIR: .gate-base/.github/workflows
+        run: node scripts/ci/ci-gate.mjs
