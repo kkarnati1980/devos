@@ -146,6 +146,17 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`<button onclick="go(${"1"})">x</button>`, /event-handler/);
   assert.throws(() => html`<p style="color: ${"red"}">x</p>`, /style/);
   assert.throws(() => html("<p>x</p>"), /tagged template/);
+  // Pre-review r2: a value may not name a tag, an end tag needs its terminator, <!-- in a script is refused, and
+  // <textarea>/<title> content is text, so markup-looking text there does not open a tag.
+  assert.throws(() => html`<${"script"}>${"alert(1)"}</script>`, /name a tag/);
+  assert.throws(() => html`</${"p"}>`, /quote every attribute/);
+  assert.throws(() => html`<script>var s = "</scripts>"; ${"x"}</script>`, /inside <script>/);
+  assert.equal(String(html`<script>var s = "</scripts>";</script>${"<"}`), '<script>var s = "</scripts>";</script>&lt;');
+  assert.throws(() => html`<script><!--<script></script>\n${"alert(1)"}\n</script>`, /<!-- inside <script>/);
+  assert.equal(String(html`<textarea><p title="</textarea><img src="/i.png" alt="${"x"}">">`), '<textarea><p title="</textarea><img src="/i.png" alt="x">">');
+  assert.throws(() => html`<textarea><p title="</textarea><img src=x onerror=${"alert(1)"}>">`, /quote every attribute/);
+  assert.equal(String(html`<title>${"<b>"}</title><p>${"&"}</p>`), "<title>&lt;b&gt;</title><p>&amp;</p>");
+  assert.equal(String(html`<p>a < b, ${"c"}</p>`), "<p>a < b, c</p>"); // a "<" followed by a space is text
   // After a closed raw-text element, values are allowed again.
   assert.equal(String(html`<script src="/a.js"></script><p>${"<"}</p>`), '<script src="/a.js"></script><p>&lt;</p>');
   // The result is branded; a look-alike object is not accepted.
@@ -191,6 +202,9 @@ test("SM-03-L2: the raw-HTML sink check finds every sink kind and passes this ap
     "jquery-html": ["public/n.js", P("$(el).", "html(userText)")],
     "mustache-ampersand": ["src/o.mustache", P("{{", "& body}}")],
     "ejs-unescaped": ["src/p.ejs", P("<p><%", "- body %></p>")],
+    "inner-html-key": ["src/s1.mjs", P("const props = { inner", "HTML: t };")],
+    "template-raw-filter": ["src/s2.twig", P("<p>{{ body|", "raw }}</p>")],
+    "template-autoescape-off": ["src/s3.jinja", P("{% auto", "escape off %}")],
     "lit-unsafe-html": ["src/q.mjs", P("html`${unsafe", "HTML(t)}`")],
   };
   // More forms of the same sinks (pre-review r1): each must be found too, at the line where it starts.
@@ -198,25 +212,34 @@ test("SM-03-L2: the raw-HTML sink check finds every sink kind and passes this ap
     ["inner-html", "src/r1.mjs", P("el.inner", "HTML ||= t;")],
     ["inner-html", "src/r2.mjs", P("el.inner", "HTML ??= t;")],
     ["inner-html", "src/r3.mjs", P("el.inner", "HTML\n    = t;")],
-    ["inner-html", "src/r4.mjs", P("Object.assign(el, { inner", "HTML: t });")],
+    ["inner-html-key", "src/r4.mjs", P("Object.assign(el, { inner", "HTML: t });")],
     ["inner-html", "src/r5.vue", P("<div :inner", "HTML=\"t\"></div>")],
     ["inner-html", "src/r6.jsx", P("<div inner", "HTML={t} />")],
     ["iframe-src-doc", "src/r7.mjs", P("el.setAttribute('src", "doc', t);")],
     ["jquery-html", "public/r8.js", P("jQuery('#x').", "append(userHtml);")],
     ["jquery-html", "public/r9.js", P("$('#x')\n  .", "replaceWith(userHtml);")],
+    ["jquery-html", "public/r10.js", P("$('#x').find('.y').", "html(userText);")],
+    ["jquery-html", "public/r11.js", P("$(this.el()).", "html(t);")],
+    ["document-write", "public/r12.js", P("frame.contentDocument.", "write(x);")],
+    ["template-raw-filter", "src/r13.twig", P("{{ body |", "raw }}")],
+    ["template-autoescape-off", "src/r14.njk", P("{% auto", "escape false %}{{ body }}")],
   ];
   assert.deepEqual(Object.keys(cases).sort(), SINKS.map(([n]) => n).sort(), "every sink kind has a fixture");
   for (const [, [rel, text]] of Object.entries(cases)) write(rel, `const a = 1;\n${text}\n`);
   for (const [, rel, text] of forms) write(rel, `const a = 1;\n${text.replaceAll("\\n", "\n").replaceAll('\\"', '"')}\n`);
   write("public/clean.js", "el.textContent = userText;\nconst same = el.innerText === x;\nif (a.innerHTML === b) {}\n$(el).html();\n");
   // Not sinks: "|| safe" in script, a server framework's c.html(page) helper, html`` itself, and ejs-like text in JS.
+  write("src/clean3.mjs", "const t = cond ? el.innerHTML : '';\n");
+  write("public/build/bundle.js", P("el.inner", "HTML = x")); // build output of src/, which is scanned itself
+  write("public/vendor/lib.js", P("el.inner", "HTML = x"));
+  write("public/lib.min.js", P("el.inner", "HTML = x"));
   write("src/clean2.mjs", "if (ok || safe) {}\nreturn c.html(page);\nreply.html(html`<p>${x}</p>`);\nconst s = '<%-';\n");
   write("src/notes.md", P("el.inner", "HTML = x")); // not a scanned file type
   write("node_modules/x/index.js", P("el.inner", "HTML = x")); // dependencies are not the app's code
   const hits = findRawHtmlSinks(dir);
   for (const [sink, [rel]] of Object.entries(cases)) assert.ok(hits.some((h) => h.sink === sink && h.file === rel && h.line === 2), `${sink} in ${rel}\n${JSON.stringify(hits)}`);
   for (const [sink, rel] of forms) assert.ok(hits.some((h) => h.sink === sink && h.file === rel && h.line === 2), `${sink} form in ${rel}\n${JSON.stringify(hits)}`);
-  assert.ok(!hits.some((h) => ["public/clean.js", "src/clean2.mjs", "src/notes.md"].includes(h.file) || h.file.startsWith("node_modules")), JSON.stringify(hits));
+  assert.ok(!hits.some((h) => ["public/clean.js", "src/clean2.mjs", "src/clean3.mjs", "src/notes.md", "public/build/bundle.js", "public/vendor/lib.js", "public/lib.min.js"].includes(h.file) || h.file.startsWith("node_modules")), JSON.stringify(hits));
   fs.rmSync(dir, { recursive: true, force: true });
   // This app (the generated project, including this add-on) has no raw-HTML sink in src/ or public/.
   assert.deepEqual(findRawHtmlSinks(APP_ROOT), []);

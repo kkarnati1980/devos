@@ -87,6 +87,7 @@ export function escapeHtml(value) {
 // html`` results) with a small state machine: text, inside a tag, inside a quoted attribute value, inside a raw-text
 // element (<script>, <style>, …) or inside a comment.
 const RAW_TEXT = new Set(["script", "style", "iframe", "noscript", "xmp", "noembed", "noframes", "plaintext"]);
+const RCDATA = new Set(["textarea", "title"]); // text only (escaped values are fine), no tags inside
 const URL_ATTRS = new Set(["href", "src", "action", "formaction", "xlink:href", "poster", "data", "background", "cite", "codebase", "manifest"]);
 // Tags whose attributes load or re-point code (a value there is refused whatever the attribute), and attributes that
 // are code or a document themselves (srcdoc is parsed as same-origin HTML after the browser decodes it).
@@ -102,19 +103,28 @@ function decodeEntities(s) {
 }
 
 class MarkupState {
-  mode = "text"; // text | tag | quote | raw | comment
+  mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment
   tag = ""; // current tag source since "<"
   tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false;
   feed(s) {
     for (let i = 0; i < s.length; i++) {
       const c = s[i];
-      if (this.mode === "text") {
+      if (this.mode === "lt") { // the "<" was the last character of the previous piece
+        this.mode = "text";
+        if (/[a-zA-Z\/!?]/.test(c)) { this.mode = "tag"; this.tag = "<" + c; this.tagName = ""; }
+      } else if (this.mode === "text") {
         if (c === "<" && s.startsWith("<!--", i)) { this.mode = "comment"; i += 3; }
-        else if (c === "<" && /[a-zA-Z\/!?]/.test(s[i + 1] ?? "")) { this.mode = "tag"; this.tag = "<"; this.tagName = ""; }
+        else if (c === "<" && i + 1 === s.length) this.mode = "lt";
+        else if (c === "<" && /[a-zA-Z\/!?]/.test(s[i + 1])) { this.mode = "tag"; this.tag = "<"; this.tagName = ""; }
       } else if (this.mode === "comment") {
         if (s.startsWith("-->", i)) { this.mode = "text"; i += 2; }
-      } else if (this.mode === "raw") {
-        if (c === "<" && s.slice(i, i + 2 + this.raw.length).toLowerCase() === `</${this.raw}`) { this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.raw = ""; }
+      } else if (this.mode === "raw" || this.mode === "rcdata") {
+        // An end tag counts only with a terminator after its name, as in the browser (</scripts> does not end it).
+        if (this.raw === "script" && s.startsWith("<!--", i)) throw new TypeError("html: <!-- inside <script> is not supported");
+        const end = `</${this.raw}`;
+        if (c === "<" && s.slice(i, i + end.length).toLowerCase() === end && /[\s/>]/.test(s[i + end.length] ?? "")) {
+          this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.raw = "";
+        }
       } else if (this.mode === "quote") {
         if (c === this.quote) {
           // A URL attribute that holds a value is judged as a whole when it closes, the way the browser reads it:
@@ -133,8 +143,9 @@ class MarkupState {
           this.mode = "quote"; this.quote = c; this.quoteAt = this.tag.length; this.attr = m ? m[1].toLowerCase() : ""; this.valued = false;
         } else if (c === ">") {
           const name = this.tagName;
-          this.mode = name && RAW_TEXT.has(name) ? "raw" : "text";
-          if (this.mode === "raw") this.raw = name;
+          const closing = this.tag.startsWith("</");
+          this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && RCDATA.has(name) ? "rcdata" : "text";
+          if (this.mode !== "text") this.raw = name;
           this.tag = ""; this.tagName = "";
         }
       }
@@ -169,7 +180,7 @@ export function html(strings, ...values) {
   state.feed(strings[0]);
   for (let i = 0; i < values.length; i++) {
     if (state.mode === "raw" || state.mode === "comment") throw new TypeError(`html: no value may be placed inside <${state.raw || "!--"}>`);
-    if (state.mode === "tag") throw new TypeError("html: quote every attribute that holds a value");
+    if (state.mode === "tag" || state.mode === "lt") throw new TypeError("html: quote every attribute that holds a value (and no value may name a tag)");
     if (state.mode === "quote" && (!state.attr || state.attr.startsWith("on") || CODE_ATTRS.has(state.attr) || CODE_TAGS.has(state.tagName))) {
       throw new TypeError("html: no value may be placed in an event-handler, style, srcdoc or code-loading attribute");
     }
@@ -193,14 +204,15 @@ export function sendHtml(res, page, status = 200) {
 // (so a sink split over lines is found) and reported at the line where it starts.
 const j = (...p) => p.join("");
 const TEMPLATES = /\.(?:html?|xhtml|svg|vue|svelte|hbs|handlebars|mustache|njk|jinja2?|j2|ejs|liquid|twig)$/i;
-const ASSIGN = "\\s*(?:=(?!=)|\\+=|\\|\\|=|\\?\\?=|&&=|:)"; // =, +=, ||=, ??=, &&=, and object/JSX/Vue-bind keys
+const ASSIGN = "\\s*(?:=(?!=)|\\+=|\\|\\|=|\\?\\?=|&&=)"; // =, +=, ||=, ??=, &&= (JSX and Vue-bind keys use =)
 export const SINKS = [
   ["react-dangerously-set", new RegExp(j("dangerously", "SetInner", "HTML"))],
   ["inner-html", new RegExp(j("\\binner", "HTML\\b['\"`]?\\]?", ASSIGN))],
+  ["inner-html-key", new RegExp(j("[{,]\\s*['\"`]?(?:inner|outer)", "HTML['\"`]?\\s*:"))],
   ["inner-html-bracket", new RegExp(j("\\[\\s*['\"`]inner", "HTML['\"`]\\s*\\]"))],
   ["outer-html", new RegExp(j("\\bouter", "HTML\\b['\"`]?\\]?", ASSIGN))],
   ["insert-adjacent-html", new RegExp(j("insertAdjacent", "HTML\\s*\\("))],
-  ["document-write", new RegExp(j("document\\s*\\.\\s*write", "(?:ln)?\\s*\\("))],
+  ["document-write", new RegExp(j("document\\s*\\.\\s*write", "(?:ln)?\\s*\\("), "i")],
   ["create-contextual-fragment", new RegExp(j("createContextual", "Fragment\\s*\\("))],
   ["set-html-unsafe", new RegExp(j("setHTML", "Unsafe|parseHTML", "Unsafe"))],
   ["vue-vhtml-directive", new RegExp(j("\\bv-", "html\\b"))],
@@ -208,11 +220,13 @@ export const SINKS = [
   ["template-safe-filter", new RegExp(j("\\|\\s*", "safe\\b")), TEMPLATES],
   ["handlebars-triple", new RegExp(j("\\{\\{", "\\{"))],
   ["mustache-ampersand", new RegExp(j("\\{\\{", "\\s*&")), TEMPLATES],
+  ["template-raw-filter", new RegExp(j("\\|\\s*", "raw\\b")), TEMPLATES],
+  ["template-autoescape-off", new RegExp(j("auto", "escape\\s+(?:false|off)\\b"), "i"), TEMPLATES],
   ["ejs-unescaped", new RegExp(j("<%", "-")), TEMPLATES],
   ["angular-inner-html", new RegExp(j("\\[inner", "HTML\\]"), "i")],
   ["iframe-src-doc", new RegExp(j("\\bsrc", "doc\\b['\"`]?\\s*[=,:]"), "i")],
   ["lit-unsafe-html", new RegExp(j("\\bunsafe", "(?:HTML|SVG)\\s*\\("))],
-  ["jquery-html", new RegExp(j("(?:\\$|\\bjQuery)\\s*\\([^()]*\\)\\s*\\.\\s*(?:html|append|prepend|before|after|replaceWith|wrap)", "\\s*\\(\\s*[^)\\s]"))],
+  ["jquery-html", new RegExp(j("(?:\\$|\\bjQuery)\\s*\\([^;]*?\\.\\s*(?:html|append|prepend|before|after|replaceWith|wrap)", "\\s*\\(\\s*[^)\\s]"))],
 ];
 const SCANNED = /\.(?:m?js|cjs|ts|mts|cts|tsx|jsx|vue|svelte|html?|xhtml|svg|hbs|handlebars|mustache|njk|jinja2?|j2|ejs|liquid|twig)$/i;
 
@@ -226,7 +240,8 @@ export function findRawHtmlSinks(root, dirs = ["src", "public"]) {
     let names;
     try { names = readdirSync(dir); } catch { return; }
     for (const name of names.sort()) {
-      if (name === "node_modules" || name === ".git") continue;
+      // Dependencies, build output and vendored copies are not the app's own code (their sources are scanned).
+      if (["node_modules", ".git", "dist", "build", "vendor"].includes(name) || /\.min\.[a-z]+$/i.test(name)) continue;
       const p = join(dir, name);
       const st = statSync(p);
       if (st.isDirectory()) { walk(p); continue; }
