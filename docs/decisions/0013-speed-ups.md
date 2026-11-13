@@ -12,6 +12,13 @@
 
      On approval the runner posts an evidence comment, moves the gate to Done and sends KK a short informational message; KK can reverse it ("reopen G<n>"). G3's policy `enforce` switch is technical and is covered.
      **Not delegated:** G5 (the pilot is on hold); the first production launch of a real app for users (a business decision); anything involving money, data deletion, legal, D11 or D13.
+
+     **Amendment — gate integrity, final form (KK, 12 Nov 2026; applied 13 Nov 2026 by DEVOS-144, note 0019).** In addition to the four conditions above, approval needs these stored results, none of them produced by the runner's own judgement:
+     - the floor guard is clean (exit 0) for every PR merged in the phase, or every hit has a valid disposition (a Codex Keep or a KK escalation on that SHA);
+     - every module has a pass rule, and its stored result passes on the merged SHA;
+     - every merged PR has green CI and a Codex PASS on the same head SHA, as recorded by the merge gate (`scripts/release/merge.mjs`).
+
+     The decision is made by `scripts/gates/evaluate-gate.mjs` over a manifest of those results, each with a link (exit 0 approve, 1 paused, 2 never an approval). If any result is missing or failed, only that gate pauses: the runner posts what is missing on the gate issue, continues every other lane (build-ahead stays allowed) and sends KK no card. The approval comment links a stored result for each condition. Reverting this amendment returns the rule to the interim form of 12 Nov 2026 (the four conditions, plus green CI and Codex PASS on the same SHA, plus every module's acceptance tests passing with stored evidence), never to the form before 12 Nov.
   3. **Fix review rounds in the same run.** After a push the runner polls the review watcher and CI, fixes findings and re-pushes until PASS, within its time box, instead of handing off between rounds.
   4. **Pre-PR self-review.** Before opening a PR, a separate review agent reviews only the diff against the module contract and the Review guidelines in `rules.md`. Accepted findings are fixed first; the PR body records `Pre-review: <n> findings, <m> fixed`. A module too large to review in one pass (about 800 changed lines of non-generated source, or more than one concern) is split into task sub-issues, one PR each.
   5. **Two parallel runners.** Runner A (at :18) takes Lane A, unlaned issues and the phase gates; its lock and log is DEVOS-75. Runner B (at :48) takes Lanes B and C; its lock and log is DEVOS-89. Neither touches the other's branches or PRs. They share one weekly usage cap.

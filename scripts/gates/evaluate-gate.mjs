@@ -1,0 +1,182 @@
+#!/usr/bin/env node
+// Gate evaluator v1.0.0 (DEVOS-144, gate integrity Part 4; contract docs/modules/GI-4.md).
+// Decides, from STORED results only, whether runner A may approve G2, G3 or G4 under KK's delegation
+// (ADR-0013 §2, final form of 12 Nov 2026). It never judges: every condition is a stored result with a link.
+//
+//   node scripts/gates/evaluate-gate.mjs <evidence.json> [--comment <out.md>]
+//
+// Exit codes: 0 approve · 1 paused (one or more results missing or failed; the missing items are printed) ·
+// 2 could not run (bad arguments, unreadable or malformed evidence, a gate that is never delegated).
+// Exit 2 is never an approval. Zero dependencies.
+import { readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+export const DELEGATED_GATES = new Set(["G2", "G3", "G4"]);
+const SHA = /^[0-9a-f]{7,40}$/;
+const LINK = /^https:\/\/\S+$/;
+
+export class CannotRun extends Error {}
+
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const shaOk = (s) => typeof s === "string" && SHA.test(s);
+// A short SHA matches a full one only as a prefix; both must be at least 7 hex chars.
+const sameSha = (a, b) => shaOk(a) && shaOk(b) && (a.startsWith(b) || b.startsWith(a));
+const linkOk = (l) => typeof l === "string" && LINK.test(l);
+
+/** Throws CannotRun when the evidence is not even shaped like evidence (distinct from a missing result). */
+function assertShape(ev) {
+  if (!isObj(ev)) throw new CannotRun("evidence is not a JSON object");
+  if (typeof ev.gate !== "string") throw new CannotRun("evidence.gate is missing");
+  if (!DELEGATED_GATES.has(ev.gate)) throw new CannotRun(`${ev.gate} is never delegated (G5, launches, money, data deletion, legal, D11 and D13 stay with KK)`);
+  for (const k of ["modules", "blockers", "criteria", "openKkItems", "mergedPrs"]) {
+    if (!Array.isArray(ev[k])) throw new CannotRun(`evidence.${k} must be an array`);
+  }
+  if (!isObj(ev.serverChecks)) throw new CannotRun("evidence.serverChecks must be an object");
+}
+
+/** A floor-guard hit is disposed only by a Codex Keep or a KK escalation, on the same SHA, with a link (spec §4.4). */
+function hitDisposed(hit, dispositions, sha) {
+  return dispositions.some((d) => isObj(d) && d.hit === hit && sameSha(d.sha, sha) && linkOk(d.link)
+    && ((d.kind === "keep" && d.source === "codex") || (d.kind === "escalate" && d.source === "kk")));
+}
+
+/**
+ * Evaluates one gate's evidence. Returns { decision: "approve" | "paused", missing: string[], conditions: [...] }.
+ * Each condition is { id, title, ok, results: [{ label, link }] }; a condition passes only when every result in it does.
+ */
+export function evaluateGate(ev) {
+  assertShape(ev);
+  const conditions = [];
+  const add = (id, title) => { const c = { id, title, ok: true, results: [], missing: [] }; conditions.push(c); return c; };
+  const fail = (c, msg) => { c.ok = false; c.missing.push(msg); };
+
+  // 1. Every module and blocker of the phase is Done.
+  const c1 = add(1, "Every module and blocker of the phase is Done");
+  if (!ev.modules.length) fail(c1, "no modules listed for the phase");
+  for (const m of [...ev.modules, ...ev.blockers]) {
+    const name = m?.id ?? m?.issue ?? "?";
+    if (!isObj(m) || m.status !== "Done") fail(c1, `${name} is not Done`);
+    else if (!linkOk(m.link)) fail(c1, `${name}: no link to its issue`);
+    else c1.results.push({ label: `${name} Done`, link: m.link });
+  }
+
+  // 2. Every server check on the deployed main SHA passes, with 0 skipped.
+  const c2 = add(2, "Every server check on the deployed main SHA passes, 0 skipped");
+  const sc = ev.serverChecks;
+  const checks = Array.isArray(sc.checks) ? sc.checks : [];
+  if (!shaOk(sc.sha)) fail(c2, "server checks: no deployed main SHA");
+  if (!checks.length) fail(c2, "server checks: no stored results");
+  for (const ch of checks) {
+    const name = ch?.name ?? "?";
+    if (!isObj(ch) || ch.state !== "success") fail(c2, `server check ${name}: ${ch?.state ?? "missing"}`);
+    else if (!sameSha(ch.sha, sc.sha)) fail(c2, `server check ${name}: not on the deployed SHA ${sc.sha}`);
+    else if (!linkOk(ch.link)) fail(c2, `server check ${name}: no link to the stored result`);
+    else c2.results.push({ label: `${name} success on ${sc.sha}`, link: ch.link });
+  }
+
+  // 3. The gate's own criteria (its issue description) are met — each with a stored result.
+  const c3 = add(3, "The gate's own criteria are met");
+  if (!ev.criteria.length) fail(c3, "no gate criteria listed");
+  for (const cr of ev.criteria) {
+    const name = cr?.text ?? "?";
+    if (!isObj(cr) || cr.met !== true) fail(c3, `criterion not met: ${name}`);
+    else if (!linkOk(cr.link)) fail(c3, `criterion "${name}": no link to a stored result`);
+    else c3.results.push({ label: name, link: cr.link });
+  }
+
+  // 4. No open KK card, deadlocked label or stop-and-ask item.
+  const c4 = add(4, "No open KK card, deadlocked label or stop-and-ask item");
+  for (const item of ev.openKkItems) fail(c4, `open KK item: ${item?.issue ?? item?.title ?? JSON.stringify(item)}`);
+  if (!linkOk(ev.openKkQuery)) fail(c4, "no link to the stored open-KK-items query");
+  else if (!ev.openKkItems.length) c4.results.push({ label: "open KK items: 0", link: ev.openKkQuery });
+
+  // 5–7 are per merged PR. A phase with no merged PR has nothing to prove and cannot pass them.
+  const c5 = add(5, "Floor guard clean (exit 0) or every hit validly disposed, for every PR merged in the phase");
+  const c6 = add(6, "Every module has a pass rule whose stored result passes on its merged SHA");
+  const c7 = add(7, "Every merged PR had green CI and a Codex PASS on the same head SHA (merge-gate record)");
+  if (!ev.mergedPrs.length) { fail(c5, "no merged PRs listed for the phase"); fail(c7, "no merged PRs listed for the phase"); }
+
+  for (const pr of ev.mergedPrs) {
+    const n = `PR #${pr?.number ?? "?"}`;
+    if (!isObj(pr) || !shaOk(pr.headSha)) { fail(c5, `${n}: no head SHA`); fail(c7, `${n}: no head SHA`); continue; }
+    const fg = pr.floorGuard;
+    if (!isObj(fg)) fail(c5, `${n}: no stored floor-guard result`);
+    else if (!sameSha(fg.sha, pr.headSha)) fail(c5, `${n}: floor-guard result is not for head ${pr.headSha}`);
+    else if (!linkOk(fg.link)) fail(c5, `${n}: floor-guard result has no link`);
+    else if (fg.exit === 0) c5.results.push({ label: `${n} floor guard exit 0 on ${pr.headSha}`, link: fg.link });
+    else if (fg.exit === 1) {
+      const hits = Array.isArray(fg.hits) ? fg.hits : [];
+      const disp = Array.isArray(fg.dispositions) ? fg.dispositions : [];
+      const open = hits.filter((h) => !hitDisposed(h, disp, pr.headSha));
+      if (!hits.length) fail(c5, `${n}: floor guard exit 1 with no hit ids stored`);
+      else if (open.length) fail(c5, `${n}: floor-guard hit(s) without a valid disposition: ${open.join(", ")}`);
+      else c5.results.push({ label: `${n} floor guard: ${hits.length} hit(s), all disposed on ${pr.headSha}`, link: fg.link });
+    } else fail(c5, `${n}: floor guard exit ${fg.exit ?? "?"} (could not run is never clean)`);
+
+    const ci = pr.ci, cx = pr.codex;
+    if (!isObj(ci) || ci.conclusion !== "success") fail(c7, `${n}: CI ${ci?.conclusion ?? "missing"}`);
+    else if (!sameSha(ci.sha, pr.headSha)) fail(c7, `${n}: CI result is not for head ${pr.headSha}`);
+    else if (!linkOk(ci.link)) fail(c7, `${n}: CI result has no link`);
+    if (!isObj(cx) || cx.state !== "success") fail(c7, `${n}: codex-review ${cx?.state ?? "missing"}`);
+    else if (!sameSha(cx.sha, pr.headSha)) fail(c7, `${n}: codex-review is not for head ${pr.headSha}`);
+    else if (!linkOk(cx.link)) fail(c7, `${n}: codex-review result has no link`);
+    if (isObj(ci) && ci.conclusion === "success" && sameSha(ci.sha, pr.headSha) && linkOk(ci.link)
+      && isObj(cx) && cx.state === "success" && sameSha(cx.sha, pr.headSha) && linkOk(cx.link)) {
+      c7.results.push({ label: `${n} CI success on ${pr.headSha}`, link: ci.link });
+      c7.results.push({ label: `${n} codex-review success on ${pr.headSha}`, link: cx.link });
+    }
+  }
+
+  for (const m of ev.modules) {
+    if (!isObj(m)) continue;
+    const name = m.id ?? "?";
+    const pr = m.passRule;
+    if (!isObj(pr)) fail(c6, `${name}: no stored pass-rule result`);
+    else if (!shaOk(m.mergedSha)) fail(c6, `${name}: no merged SHA`);
+    else if (pr.result !== "pass") fail(c6, `${name}: pass rule ${pr.result ?? "missing"}`);
+    else if (!sameSha(pr.sha, m.mergedSha)) fail(c6, `${name}: pass-rule result is not for merged SHA ${m.mergedSha}`);
+    else if (!linkOk(pr.link)) fail(c6, `${name}: pass-rule result has no link`);
+    else c6.results.push({ label: `${name} pass rule passes on ${m.mergedSha}`, link: pr.link });
+  }
+
+  const missing = conditions.flatMap((c) => c.missing.map((m) => `(${c.id}) ${m}`));
+  return { gate: ev.gate, decision: missing.length ? "paused" : "approve", missing, conditions };
+}
+
+/** The gate-issue comment: the approval lists every condition with its links (GC7); a pause names what is missing. */
+export function renderComment(result, iso) {
+  if (result.decision === "paused") {
+    return [`[runner] ${result.gate} PAUSED ${iso}: missing`, "", ...result.missing.map((m) => `- ${m}`), "",
+      "Other lanes continue. This is a technical gap, so no KK card."].join("\n");
+  }
+  const out = [`[runner] ${result.gate} APPROVED under KK's delegation (ADR-0013 §2, final form; gate evaluator exit 0) ${iso}`, ""];
+  for (const c of result.conditions) {
+    out.push(`${c.id}. ${c.title}`);
+    for (const r of c.results) out.push(`   - [${r.label}](${r.link})`);
+  }
+  return out.join("\n");
+}
+
+export function main(argv, { now = () => new Date().toISOString(), log = console.log, err = console.error } = {}) {
+  try {
+    const file = argv.find((a, i) => !a.startsWith("--") && argv[i - 1] !== "--comment");
+    if (!file) throw new CannotRun("usage: evaluate-gate.mjs <evidence.json> [--comment <out.md>]");
+    let ev;
+    try { ev = JSON.parse(readFileSync(file, "utf8")); } catch (e) { throw new CannotRun(`cannot read evidence: ${e.message}`); }
+    const result = evaluateGate(ev);
+    const ci = argv.indexOf("--comment");
+    if (ci !== -1) {
+      if (!argv[ci + 1]) throw new CannotRun("--comment needs a path");
+      writeFileSync(argv[ci + 1], renderComment(result, now()) + "\n");
+    }
+    log(`gate-evaluator: ${result.gate} ${result.decision}${result.missing.length ? ` (${result.missing.length} missing)` : ""}`);
+    for (const m of result.missing) log(`  missing ${m}`);
+    return result.decision === "approve" ? 0 : 1;
+  } catch (e) {
+    err(`gate-evaluator: could not run: ${e instanceof CannotRun ? e.message : `internal error: ${e?.message ?? e}`}`);
+    return 2;
+  }
+}
+
+const isMain = () => process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMain()) process.exit(main(process.argv.slice(2)));
