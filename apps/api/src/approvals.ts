@@ -617,13 +617,26 @@ export class PrismaApprovalStore implements ApprovalStore {
     private readonly timeoutMs = 10_000,
   ) {}
 
+  /**
+   * The longest one store operation can take from the call to its commit or rollback: a connection wait of up to
+   * `maxWait`, then a transaction of up to `timeout` (Codex PR88-r5). Callers that must finish a write inside a
+   * bounded window (the requirements project hold) size the window with this, not with `timeout` alone.
+   */
+  get stepBoundMs(): number {
+    return this.txOptions().maxWait + this.txOptions().timeout;
+  }
+
+  private txOptions() {
+    return { timeout: this.timeoutMs, maxWait: this.timeoutMs };
+  }
+
   private tx<T>(fn: (tx: any) => Promise<T>): Promise<T> {
     return this.db.$transaction(
       async (t: any) => {
         await t.$queryRaw`SELECT set_config('statement_timeout', ${String(this.timeoutMs)}, true) AS statement_timeout`;
         return fn(t);
       },
-      { timeout: this.timeoutMs, maxWait: this.timeoutMs },
+      this.txOptions(),
     );
   }
 

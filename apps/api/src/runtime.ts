@@ -159,7 +159,9 @@ export async function buildRuntime(
     ? runEngineModelRunner(new PrismaAnalystRunRows(db as unknown as AnalystRowsDb, t), await opts.loadAnalystEngine(db, engine))
     : null;
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
-  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), t);
+  // Codex PR88-r5: one expiry write can wait up to maxWait for a connection and then run up to timeout, so the hold
+  // reserves the store's whole step bound, not its transaction timeout alone.
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStore.stepBoundMs);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
 }
@@ -176,7 +178,7 @@ export function requirementsServices(
   cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister & PendingCardLister,
   runner: ModelRunner | null = null,
   expiryLog?: ExpiryLog,
-  /** The longest one expiry write can take (the approvals store's transaction bound; Codex PR88-r4). */
+  /** The longest one expiry write can take, connection wait included (the approvals store's `stepBoundMs`; Codex PR88-r4, PR88-r5). */
   expireStepMs = 0,
 ): RequirementsServices {
   // M2.2-d3c2: after each submission, the superseded version's pending cards and an unlinked requirements card
