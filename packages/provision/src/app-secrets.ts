@@ -36,7 +36,7 @@ export interface ProjectSecrets {
 
 interface EnvBody {
   key: string;
-  value: string;
+  value?: string | null;
   is_preview?: boolean;
 }
 
@@ -46,19 +46,21 @@ interface EnvBody {
  * with a string key and value is conclusive. Coolify's `is_preview` entries belong to pull-request preview
  * deployments, which DevOS does not use, so they do not count.
  */
-async function listAppEnvs(cf: CoolifyClient, appUuid: string): Promise<Map<string, string>> {
+async function listAppEnvs(cf: CoolifyClient, appUuid: string): Promise<Map<string, string | null>> {
   if (!UUID_RE.test(appUuid)) throw new Error("coolify-uuid-invalid");
   const r = await cf.http.get<unknown>(`/api/v1/applications/${appUuid}/envs`);
   if (r.status !== 200 || !Array.isArray(r.body)) {
     throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/applications/{uuid}/envs returned an unexpected response (${r.status})`, r.status);
   }
-  const envs = new Map<string, string>();
+  // A missing or null value (an empty variable, or a token that may not read values) keeps its key but can never
+  // match the vault copy, so that secret is rewritten rather than the whole list refused (pre-review r2 L1).
+  const envs = new Map<string, string | null>();
   for (const x of r.body as unknown[]) {
     const e = x as Partial<EnvBody> | null;
-    if (!e || typeof e !== "object" || typeof e.key !== "string" || typeof e.value !== "string" || (e.is_preview !== undefined && typeof e.is_preview !== "boolean")) {
+    if (!e || typeof e !== "object" || typeof e.key !== "string" || (e.value != null && typeof e.value !== "string") || (e.is_preview !== undefined && typeof e.is_preview !== "boolean")) {
       throw new ProviderError("coolify", "bad-response", "coolify env list has a malformed entry", r.status);
     }
-    if (e.is_preview !== true) envs.set(e.key, e.value);
+    if (e.is_preview !== true) envs.set(e.key, typeof e.value === "string" ? e.value : null);
   }
   return envs;
 }
@@ -104,7 +106,7 @@ export function appSecretStep(cf: CoolifyClient, store: ProvisionStore, secrets:
       const uuid = await appUuid();
       if (!(await secrets.has(p.id, vaultName))) return null;
       const listed = (await listAppEnvs(cf, uuid)).get(key);
-      if (listed === undefined) return null;
+      if (typeof listed !== "string") return null;
       return (await secrets.matches(p.id, vaultName, listed)) ? found : null;
     },
     create: async () => {

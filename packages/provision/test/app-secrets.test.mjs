@@ -215,6 +215,17 @@ test("a lost journal with a mismatched value rotates instead of adopting", async
   assert.equal(appOf(s.fake, "production").envs.find((e) => e.key === "DB_PASSWORD").value, s.vault.values.get(`${P.id}/production/DB_PASSWORD`));
 });
 
+test("pre-review r2 L1: another variable with a null value does not block; a key listed without a value is rewritten with PATCH", async () => {
+  const s = await setup();
+  const app = appOf(s.fake, "preview");
+  app.envs = [{ uuid: "ev-n", key: "OTHER", value: null, is_preview: false }, { uuid: "ev-h", key: "SESSION_SECRET", is_preview: false }];
+  await s.vault.put(P.id, "preview/SESSION_SECRET", "z".repeat(43));
+  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.equal(out[0].outcome, "created");
+  const w = envWrites(s.fake).filter((c) => c.path === `/api/v1/applications/${app.uuid}/envs`);
+  assert.deepEqual(w.map((c) => `${c.method} ${c.body.key}`), ["PATCH SESSION_SECRET", "POST DB_PASSWORD"]);
+});
+
 test("Coolify's pull-request preview entries do not count as present", async () => {
   const s = await setup();
   const app = appOf(s.fake, "preview");
