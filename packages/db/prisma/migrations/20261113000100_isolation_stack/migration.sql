@@ -32,9 +32,10 @@ CREATE UNIQUE INDEX "isolation_stack_network_key" ON "isolation_stack"("network"
 ALTER TABLE "isolation_stack" ADD CONSTRAINT "isolation_stack_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "project"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- Checks (not part of the Prisma schema, so not seen by the drift check): the same rules as packages/isolation
--- (network.ts): env preview|live, index 0–1023 (pool 10.208.0.0/14 in /24 blocks), a valid slug, and a subnet
--- inside the pool. The state document refuses anything else, so the table never holds a row it would refuse.
+-- (network.ts): env preview|live, index 0–1023 (pool 10.208.0.0/14 in /24 blocks), a valid slug, and the network
+-- name and subnet derived from them exactly, so no stray row can hold a value another stack's derivation needs.
 ALTER TABLE "isolation_stack" ADD CONSTRAINT "isolation_stack_env_valid" CHECK ("env" IN ('preview', 'live'));
 ALTER TABLE "isolation_stack" ADD CONSTRAINT "isolation_stack_idx_range" CHECK ("idx" BETWEEN 0 AND 1023);
 ALTER TABLE "isolation_stack" ADD CONSTRAINT "isolation_stack_slug_valid" CHECK ("slug" ~ '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$');
-ALTER TABLE "isolation_stack" ADD CONSTRAINT "isolation_stack_subnet_in_pool" CHECK ("subnet"::cidr <<= '10.208.0.0/14'::cidr);
+ALTER TABLE "isolation_stack" ADD CONSTRAINT "isolation_stack_network_derived" CHECK ("network" = 'devos-p-' || "slug" || '-' || "env");
+ALTER TABLE "isolation_stack" ADD CONSTRAINT "isolation_stack_subnet_derived" CHECK ("subnet" = '10.' || (208 + "idx" / 256) || '.' || ("idx" % 256) || '.0/24');

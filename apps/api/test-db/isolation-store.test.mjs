@@ -34,12 +34,18 @@ test("S4-a2a: one row per (project, env), idempotent; a taken index is refused a
     { projectId: a.id, slug: a.slug, env: "live", idx: base + 1 },
   ]);
 
-  // Database checks refuse what the state document would refuse, even when written around the store.
-  const raw = { projectId: b.id, slug: b.slug, network: `devos-p-${b.slug}-preview` };
-  await assert.rejects(db.isolationStack.create({ data: { ...raw, env: "production", idx: base + 2, subnet: subnet(base + 2) } }));
-  await assert.rejects(db.isolationStack.create({ data: { ...raw, env: "preview", idx: 1024, subnet: "10.212.0.0/24" } }));
-  await assert.rejects(db.isolationStack.create({ data: { ...raw, env: "preview", idx: base + 3, subnet: "192.168.0.0/24" } }));
-  await assert.rejects(db.isolationStack.create({ data: { ...raw, slug: "Bad_Slug", env: "preview", idx: base + 4, subnet: subnet(base + 4) } }));
+  // Database checks refuse what the state document would refuse, even when written around the store. Each row breaks
+  // exactly one check, and the rejection must name that check (pre-review).
+  const row = (o) => {
+    const slug = o.slug ?? b.slug, env = o.env ?? "preview", idx = o.idx;
+    return { projectId: b.id, slug, env, idx, network: o.network ?? `devos-p-${slug}-${env}`, subnet: o.subnet ?? subnet(idx) };
+  };
+  const refusedBy = (check) => (e) => String(e?.message ?? "").includes(check);
+  await assert.rejects(db.isolationStack.create({ data: row({ env: "production", idx: base + 2 }) }), refusedBy("isolation_stack_env_valid"));
+  await assert.rejects(db.isolationStack.create({ data: row({ idx: 1024 }) }), refusedBy("isolation_stack_idx_range"));
+  await assert.rejects(db.isolationStack.create({ data: row({ slug: "bad_slug", idx: base + 4 }) }), refusedBy("isolation_stack_slug_valid"));
+  await assert.rejects(db.isolationStack.create({ data: row({ idx: base + 3, subnet: "10.208.0.0/16" }) }), refusedBy("isolation_stack_subnet_derived"));
+  await assert.rejects(db.isolationStack.create({ data: row({ idx: base + 5, network: "devos-p-other-preview" }) }), refusedBy("isolation_stack_network_derived"));
   assert.equal(await db.isolationStack.count({ where: { projectId: b.id } }), 0);
 
   await db.isolationStack.deleteMany({ where: { projectId: { in: [a.id, b.id] } } });
