@@ -57,6 +57,19 @@ test("SM-04-L1: a hanging non-HTTP call fails within withDeadline's timeout and 
   await new Promise((r) => setTimeout(r, 150));
 });
 
+test("SM-04-L1: signal-aware work that settles on abort still loses to the OutboundTimeout", async () => {
+  // The deadline must settle before the abort fires, so work that resolves on abort cannot win the race.
+  await assert.rejects(
+    withDeadline("queue", 60, (s) => new Promise((resolve) => s.addEventListener("abort", () => resolve("cancelled")))),
+    (e) => e instanceof OutboundTimeout && e.dependency === "queue",
+  );
+  // Work that rejects with its own cancellation error on abort also loses to the OutboundTimeout.
+  await assert.rejects(
+    withDeadline("sdk", 60, (s) => new Promise((_, rej) => s.addEventListener("abort", () => rej(new Error("SDK aborted"))))),
+    OutboundTimeout,
+  );
+});
+
 test("SM-04-L1: no outbound call without an explicit timeout (set-up refusals)", () => {
   for (const ms of [undefined, null, 0, -1, 1.5, "1000", MAX_TIMEOUT_MS + 1, Infinity]) {
     assert.throws(() => outbound({ name: "dep", baseUrl: "https://dep.example", timeoutMs: ms }), /timeoutMs/, String(ms));

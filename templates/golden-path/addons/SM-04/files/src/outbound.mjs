@@ -28,7 +28,9 @@ export function withDeadline(name, timeoutMs, work) {
   const ac = new AbortController();
   let timer;
   const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => { const e = new OutboundTimeout(name, timeoutMs); ac.abort(e); reject(e); }, timeoutMs);
+    // Reject the deadline before aborting: abort listeners run synchronously, so signal-aware work that settles
+    // on abort must not win the race ahead of the OutboundTimeout the wrapper promises.
+    timer = setTimeout(() => { const e = new OutboundTimeout(name, timeoutMs); reject(e); ac.abort(e); }, timeoutMs);
   });
   let run;
   try { run = Promise.resolve(work(ac.signal)); } catch (e) { clearTimeout(timer); return Promise.reject(e); }
