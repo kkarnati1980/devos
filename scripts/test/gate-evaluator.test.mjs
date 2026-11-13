@@ -83,6 +83,9 @@ test("AT3: floor guard exit 2, open hits, a Keep on another SHA or by the Builde
     // PR84-r2: a security lint rule turned off, and lint ignores, are KK-only; an ordinary lint-rule-off is not
     [(fg) => { const h = hitOf("lint-rule-off", undefined, "eslint.config.mjs", 7, '"security/detect-eval-with-expression": "off",'); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { const h = hitOf("lint-rule-off", undefined, "eslint.config.mjs", 7, 'ignores: ["src/**"],'); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    // PR84-r3: the security check applies to suppressions too (by file or by rule name)
+    [(fg) => { const h = hitOf("suppression-added", undefined, "src/security/check.ts", 3, "// eslint-disable-next-line"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
+    [(fg) => { const h = hitOf("suppression-added", undefined, "src/a.ts", 3, "// eslint-disable-next-line no-eval"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     // PR84-r1: a CI hit names only the step ("Checks" running npm audit), so every ci-* hit is KK-only
     [(fg) => { const h = hitOf("ci-step-removed", undefined, ".github/workflows/ci.yml", 30, "job build: step name:Checks removed"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
     [(fg) => { const h = hitOf("ci-disabled", undefined, ".github/workflows/ci.yml", 12, "if: false"); Object.assign(fg.report, { exit: 1, hits: [h] }); fg.verdict = keep(H1, "codex", h); }, /needs KK's recorded answer/],
