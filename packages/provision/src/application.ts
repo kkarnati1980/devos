@@ -21,6 +21,39 @@ export const COMPOSE_PATH = "compose.yaml";
 export const COMPOSE_MAX_BYTES = 64 * 1024;
 /** The S4 hook runs while the project lock is held, so it is bounded like every other await (ADR-0011 §9). */
 export const HOOK_TIMEOUT_MS = 30_000;
+/** The service of the S3 core that serves HTTP, and the port it listens on (templates/golden-path/core/Dockerfile). */
+export const APP_SERVICE = "app";
+export const APP_CONTAINER_PORT = 3000;
+
+/** True for a dotted IPv4 address inside the tailnet range 100.64.0.0/10, written without leading zeros. */
+export function isTailnetIpv4(s: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (!m) return false;
+  const o = m.slice(1, 5).map((x) => (x.length > 1 && x.startsWith("0") ? NaN : Number(x)));
+  if (o.length !== 4 || o.some((x) => !Number.isInteger(x) || x > 255)) return false;
+  const [a, b] = o as [number, number, number, number];
+  return a === 100 && b >= 64 && b <= 127;
+}
+
+/**
+ * Publishes the stack's tailnet port (row 6) on the core's `app` service, after S4's hook (S4 drops every `ports`
+ * entry and leaves publishing to M2.4-c2). The binding is `<tailnet ip>:<port> -> 3000/tcp` only: never 0.0.0.0, so the
+ * stack is reachable on the tailnet and nowhere else (decision 1). Returns a new document; refuses rather than guesses.
+ */
+export function publishTailnetPort(compose: Record<string, unknown>, port: number, bindHost: string): Record<string, unknown> {
+  if (!isTailnetIpv4(bindHost)) throw new Error("tailnet-ip-invalid");
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("coolify-port-invalid");
+  const services = compose.services as Record<string, unknown> | undefined;
+  if (!services || typeof services !== "object" || Array.isArray(services)) throw new Error("compose-invalid: no services");
+  const app = services[APP_SERVICE] as Record<string, unknown> | undefined;
+  if (!app || typeof app !== "object" || Array.isArray(app)) throw new Error(`compose-invalid: no ${APP_SERVICE} service`);
+  // S4 drops `ports` everywhere; any left means the hook did not run as specified, so nothing is published blind.
+  for (const [n, svc] of Object.entries(services)) {
+    if (svc && typeof svc === "object" && "ports" in (svc as object)) throw new Error(`compose-ports-unexpected: service ${n}`);
+  }
+  const ports = [{ target: APP_CONTAINER_PORT, published: String(port), host_ip: bindHost, protocol: "tcp", mode: "host" }];
+  return { ...compose, services: { ...services, [APP_SERVICE]: { ...app, ports } } };
+}
 
 /** S4 names the production stack `live` (packages/isolation, StackEnv); M2.4 keeps Coolify's `production`. */
 export const hookEnvName = (env: StackEnv): "preview" | "live" => (env === "production" ? "live" : "preview");
@@ -78,6 +111,8 @@ export interface ApplicationOptions {
   owner: string;
   /** The Coolify server the stacks run on (`DEVOS_COOLIFY_SERVER_UUID`, set by the M2.4-d wiring). */
   serverUuid: string;
+  /** The DevOS server's tailnet IPv4 (`DEVOS_TAILNET_IP`, set by the M2.4-d wiring): the only address a stack binds. */
+  tailnetIp: string;
   range: PortRange;
   hooks: ProvisionHooks;
   /** Tests only: a shorter hook bound. */
@@ -91,6 +126,7 @@ export interface ApplicationOptions {
 export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: ProvisionStore, p: { id: string; slug: string }, env: StackEnv, opts: ApplicationOptions): StepSpec {
   if (!SLUG_RE.test(p.slug)) throw new Error("slug-invalid");
   if (!UUID_RE.test(opts.serverUuid)) throw new Error("coolify-server-uuid-invalid");
+  if (typeof opts.tailnetIp !== "string" || !isTailnetIpv4(opts.tailnetIp)) throw new Error("tailnet-ip-invalid");
   if (!opts.hooks || typeof opts.hooks.afterStack !== "function") throw new Error("provision-hooks-required: afterStack (S4) must be registered");
   const name = applicationName(p.slug, env);
   const marker = ownershipMarker(p.id);
@@ -137,6 +173,8 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
         new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new StepError(`coolify/application/${env}`, "provider_error", true, true, `afterStack hook did not finish within ${ms} ms`)), ms); }),
       ]).finally(() => clearTimeout(timer));
       if (!hardened || typeof hardened.compose !== "object" || hardened.compose === null || Array.isArray(hardened.compose)) throw new Error("after-stack-no-compose");
+      // Codex PR76-r4: the allocated port must reach the application, or the tailnet address leads nowhere.
+      const published = publishTailnetPort(hardened.compose, Number(port), opts.tailnetIp);
 
       // The reads and the hook above are awaits after the runner's last lock check (Codex PR50-r1): check again.
       await store.assertLockHeld(p.id);
@@ -146,7 +184,7 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
         environment_name: env,
         name,
         description: `DevOS ${p.slug} ${hookEnvName(env)} stack ${marker}`,
-        docker_compose_raw: Buffer.from(stringify(hardened.compose), "utf8").toString("base64"),
+        docker_compose_raw: Buffer.from(stringify(published), "utf8").toString("base64"),
         instant_deploy: false,
         // Decision 1: tailnet only; Coolify must not generate a proxy domain (Codex PR76-r1).
         autogenerate_domain: false,

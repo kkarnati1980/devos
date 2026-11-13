@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 import {
   allowAll, CoolifyClient, GitHubClient, MemoryStore, coolifyProjectStep, githubRepoStep, stackSteps, applicationSteps,
-  applicationStep, applicationName, parseCompose, parsePortRange, portStep, runProvision, StepError, COMPOSE_MAX_BYTES,
+  applicationStep, applicationName, parseCompose, publishTailnetPort, isTailnetIpv4, parsePortRange, portStep, runProvision, StepError, COMPOSE_MAX_BYTES,
 } from "../dist/index.js";
 import { fakeProviders } from "./fakes.mjs";
 
@@ -14,6 +14,7 @@ const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme", name: "Acme" };
 const RANGE = parsePortRange("20000-20999");
 const SERVER = "srv-0123456789";
+const TAILNET_IP = "100.101.102.103";
 const noSleep = async () => {};
 const CORE_COMPOSE = readFileSync(new URL("../../../templates/golden-path/core/compose.yaml", import.meta.url));
 const sha1 = (b) => createHash("sha1").update(Buffer.concat([Buffer.from(`blob ${b.length}\0`), b])).digest("hex");
@@ -41,7 +42,7 @@ async function pushCore(fake, store, files = { "compose.yaml": CORE_COMPOSE }) {
 async function setup({ fake = fakeProviders(), store = new MemoryStore(), hook = recordingHook(), files } = {}) {
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: noSleep });
   const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: noSleep });
-  const opts = { owner: "kkarnati1980", serverUuid: SERVER, range: RANGE, hooks: { afterStack: hook.afterStack } };
+  const opts = { owner: "kkarnati1980", serverUuid: SERVER, tailnetIp: TAILNET_IP, range: RANGE, hooks: { afterStack: hook.afterStack } };
   const base = [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P), ...stackSteps(cf, store, P, RANGE)];
   await runProvision(P.id, base, { store, authorize: allowAll });
   await pushCore(fake, store, files);
@@ -69,7 +70,10 @@ test("AT1 one application per environment, from the repo's Compose after the hoo
     assert.ok(b.description.includes(`devos:${P.id}`), "marker in the create call itself");
     const sent = parse(Buffer.from(b.docker_compose_raw, "base64").toString("utf8"));
     assert.equal(sent["x-hardened"], env[1], "Coolify gets the hook's Compose");
-    assert.deepEqual(sent.services, parse(CORE_COMPOSE.toString()).services, "built from the repo's compose.yaml");
+    const core = parse(CORE_COMPOSE.toString()).services;
+    const port = env[1] === "preview" ? 20000 : 20001;
+    assert.deepEqual(sent.services, { ...core, app: { ...core.app, ports: [{ target: 3000, published: String(port), host_ip: TAILNET_IP, protocol: "tcp", mode: "host" }] } },
+      "built from the repo's compose.yaml, with only the stack's tailnet port published (Codex PR76-r4)");
   }
   assert.deepEqual(s.hook.calls.map((c) => [c.env.name, c.env.port, c.env.portRangeStart, c.project.id]),
     [["preview", 20000, 20000, P.id], ["live", 20001, 20000, P.id]]);
@@ -182,7 +186,7 @@ test("Compose parsing: size cap, YAML errors, a non-mapping, merge keys stay lit
   assert.equal(applicationName("acme", "production"), "devos-acme-live");
   assert.equal(applicationName("acme", "preview"), "devos-acme-preview");
   const s = { cf: null, gh: null, store: new MemoryStore() };
-  const base = { owner: "kkarnati1980", serverUuid: SERVER, range: RANGE, hooks: recordingHook() };
+  const base = { owner: "kkarnati1980", serverUuid: SERVER, tailnetIp: TAILNET_IP, range: RANGE, hooks: recordingHook() };
   assert.throws(() => applicationStep(s.cf, s.gh, s.store, { id: P.id, slug: "Bad Slug" }, "preview", base), /slug-invalid/);
   assert.throws(() => applicationStep(s.cf, s.gh, s.store, P, "preview", { ...base, serverUuid: "../x" }), /server-uuid-invalid/);
 });
@@ -251,5 +255,26 @@ test("pre-review: a hook that hangs fails retryable within its bound; a hook ret
   const arr = { afterStack: async () => ({ compose: [] }) };
   await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), ...applicationSteps(s.cf, s.gh, s.store, P, { ...s.opts, hooks: arr })], { store: s.store, authorize: allowAll }),
     (e) => e.code === "provider_error" && e.retryable === false);
+  assert.equal(appCreates(s.fake).length, 0);
+});
+
+test("Codex PR76-r4: the allocated port is published on the tailnet address only, and refusals create nothing", async () => {
+  const s = await setup();
+  assert.throws(() => applicationStep(s.cf, s.gh, s.store, P, "preview", { ...s.opts, tailnetIp: undefined }), /tailnet-ip-invalid/);
+  for (const bad of ["0.0.0.0", "10.0.0.1", "100.128.0.1", "100.064.0.1", "100.64.0.1/32", "::1", "100.64.0.256"]) {
+    assert.throws(() => applicationStep(s.cf, s.gh, s.store, P, "preview", { ...s.opts, tailnetIp: bad }), /tailnet-ip-invalid/, bad);
+  }
+  assert.ok(isTailnetIpv4("100.64.0.1") && isTailnetIpv4("100.127.255.254"));
+  const doc = { services: { app: { image: "x" }, db: { image: "y" } } };
+  const out = publishTailnetPort(doc, 20004, TAILNET_IP);
+  assert.deepEqual(out.services.app.ports, [{ target: 3000, published: "20004", host_ip: TAILNET_IP, protocol: "tcp", mode: "host" }]);
+  assert.equal(out.services.db.ports, undefined, "only the app service is published");
+  assert.equal(doc.services.app.ports, undefined, "the input is not mutated");
+  assert.throws(() => publishTailnetPort({ services: { web: {} } }, 20004, TAILNET_IP), /no app service/);
+  assert.throws(() => publishTailnetPort({ services: { app: {}, db: { ports: ["5432:5432"] } } }, 20004, TAILNET_IP), /compose-ports-unexpected: service db/);
+
+  // A hook that leaves a ports entry (S4 not run as specified) fails the step, and no application is created.
+  const leaky = { afterStack: async (_p, env) => ({ compose: { ...env.compose, services: { ...env.compose.services, app: { ...env.compose.services.app, ports: ["0.0.0.0:80:3000"] } } } }) };
+  await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), ...applicationSteps(s.cf, s.gh, s.store, P, { ...s.opts, hooks: leaky })], { store: s.store, authorize: allowAll }));
   assert.equal(appCreates(s.fake).length, 0);
 });
