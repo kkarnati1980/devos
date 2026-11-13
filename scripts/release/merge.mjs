@@ -18,13 +18,26 @@ const API = "https://api.github.com";
 
 export class CannotRun extends Error {}
 
-// GitHub client with a timeout on every call (ADR-0011). GETs are retried (safe); the merge PUT never is.
-export function githubClient({ token, fetchImpl = fetch, timeoutMs = 30_000, retries = 2 } = {}) {
+// DEVOS-148 (ADR-0011 §9): bounded exponential backoff with equal jitter between GET attempts. Attempt i (from 1)
+// waits a random time in [delay/2, delay], delay = min(BACKOFF_BASE_MS * 2^(i-1), BACKOFF_CAP_MS).
+export const BACKOFF_BASE_MS = 500;
+export const BACKOFF_CAP_MS = 4_000;
+export function backoffMs(attempt, random = Math.random) {
+  const delay = Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_CAP_MS);
+  const r = Math.min(Math.max(Number(random()) || 0, 0), 1);
+  return Math.round(delay / 2 + r * (delay / 2));
+}
+const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// GitHub client with a timeout on every call (ADR-0011). GETs are retried (safe) after a backoff; the merge PUT
+// never is.
+export function githubClient({ token, fetchImpl = fetch, timeoutMs = 30_000, retries = 2, sleep = realSleep, random = Math.random } = {}) {
   if (!token) throw new CannotRun("no GitHub token (set GH_TOKEN, or log in with gh)");
   async function call(method, path, body) {
     const attempts = method === "GET" ? retries + 1 : 1;
     let last;
     for (let i = 0; i < attempts; i++) {
+      if (i > 0) await sleep(backoffMs(i, random));
       try {
         const res = await fetchImpl(`${API}${path}`, {
           method,
@@ -217,10 +230,10 @@ export function parseArgs(argv) {
   return out;
 }
 
-export async function main(argv, { env = process.env, fetchImpl = fetch, log = console.log } = {}) {
+export async function main(argv, { env = process.env, fetchImpl = fetch, log = console.log, sleep = realSleep } = {}) {
   try {
     const args = parseArgs(argv);
-    const gh = githubClient({ token: tokenFromEnv(env), fetchImpl });
+    const gh = githubClient({ token: tokenFromEnv(env), fetchImpl, sleep });
     return (await release(gh, { ...args, log })).code;
   } catch (err) {
     log(`CANNOT RUN: ${err instanceof CannotRun ? err.message : `unexpected error: ${String(err?.message ?? err).slice(0, 200)}`}`);
