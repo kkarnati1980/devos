@@ -60,7 +60,13 @@ function fakeGitHub(over = {}) {
   };
   const sleeps = [];
   const sleep = async (ms) => { sleeps.push(ms); };
-  return { state, calls, fetchImpl, sleep, sleeps, gh: githubClient({ token: TOKEN, fetchImpl, retries: 2, sleep }) };
+  // DEVOS-148: `netFailures` GETs fail with a network error before the fake answers (one client, one retry setting).
+  let netFailures = over.netFailures ?? 0;
+  const client = async (url, init) => {
+    if (init.method === "GET" && netFailures-- > 0) throw new TypeError("fetch failed");
+    return fetchImpl(url, init);
+  };
+  return { state, calls, fetchImpl, sleep, sleeps, gh: githubClient({ token: TOKEN, fetchImpl: client, retries: 2, sleep }) };
 }
 
 const run = (f, extra = {}) => release(f.gh, { repo: REPO, pr: 7, ...extra });
@@ -263,14 +269,7 @@ test("DEVOS-148 GET retries wait with bounded exponential backoff and jitter; th
 });
 
 test("DEVOS-148 a GET network error is retried after a backoff", async () => {
-  let failures = 1;
-  const f = fakeGitHub();
-  const sleeps = [];
-  const flaky = async (url, init) => {
-    if (init.method === "GET" && failures-- > 0) throw new TypeError("fetch failed");
-    return f.fetchImpl(url, init);
-  };
-  const gh = githubClient({ token: TOKEN, fetchImpl: flaky, retries: 2, sleep: async (ms) => sleeps.push(ms) });
-  assert.equal((await release(gh, { repo: REPO, pr: 7 })).code, 0);
-  assert.equal(sleeps.length, 1);
+  const f = fakeGitHub({ netFailures: 1 });
+  assert.equal((await release(f.gh, { repo: REPO, pr: 7 })).code, 0);
+  assert.equal(f.sleeps.length, 1);
 });
