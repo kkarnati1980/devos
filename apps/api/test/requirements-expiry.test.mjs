@@ -258,17 +258,19 @@ test("AT-E9 (Codex PR88-r4) the pass never starts an expiry write the project ho
 test("AT-E10 (Codex PR88-r5) one write's bound counts the connection wait as well as the transaction", async () => {
   const { PrismaApprovalStore } = await import("../dist/approvals.js");
   const { PrismaRequirementsStore } = await import("../dist/requirements-store.js");
-  // The store's step bound is exactly the maxWait plus the timeout it hands to each transaction.
+  const { approvalStepBoundMs } = await import("../dist/requirements-expiry.js");
+  // The bound is exactly the maxWait plus the timeout the real approvals store hands to each transaction.
   const seenOpts = [];
   const approvalDb = { $transaction: async (fn, o) => (seenOpts.push(o), fn({ $queryRaw: async () => [], approval: { findUnique: async () => null } })) };
   const store = new PrismaApprovalStore(approvalDb, 30);
   await store.get("00000000-0000-0000-0000-000000000001").catch(() => {});
   assert.ok(seenOpts.length >= 1, "a store operation ran one transaction");
-  assert.equal(store.stepBoundMs, seenOpts[0].maxWait + seenOpts[0].timeout);
-  assert.equal(store.stepBoundMs, 60);
+  const bound = approvalStepBoundMs(30);
+  assert.equal(bound, seenOpts[0].maxWait + seenOpts[0].timeout);
+  assert.equal(bound, 60);
 
   // A write that waits nearly maxWait for a connection and then runs nearly its timeout still ends inside a hold
-  // sized with stepBoundMs: assertHeld admits it only while the whole bound fits, and it finishes before the deadline.
+  // sized with that bound: assertHeld admits it only while the whole bound fits, and it finishes before the deadline.
   const holdOpts = [];
   const reqDb = { $transaction: async (fn, o) => (holdOpts.push(o), fn({ $queryRaw: async () => [] })) };
   const reqStore = new PrismaRequirementsStore(reqDb, 20);
@@ -278,7 +280,7 @@ test("AT-E10 (Codex PR88-r5) one write's bound counts the connection wait as wel
     await new Promise((r) => setTimeout(r, 28)); // connection wait, just under maxWait (30)
     await new Promise((r) => setTimeout(r, 28)); // the transaction, just under timeout (30)
     return performance.now();
-  }, store.stepBoundMs);
+  }, bound);
   assert.deepEqual(holdOpts[0], { timeout: 80, maxWait: 20 });
   assert.ok(ended - started < holdOpts[0].timeout, `the write ended ${Math.round(ended - started)} ms into an 80 ms hold`);
 });

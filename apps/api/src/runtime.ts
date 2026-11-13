@@ -11,7 +11,7 @@ import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js"
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
 import { parseSmtpConfig } from "./smtp.js";
-import { ExpiringRequirementsPipeline, type ExpiryLog, type PendingCardLister } from "./requirements-expiry.js";
+import { ExpiringRequirementsPipeline, approvalStepBoundMs, type ExpiryLog, type PendingCardLister } from "./requirements-expiry.js";
 import { PrismaRequirementsStore } from "./requirements-store.js";
 import type { RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
@@ -160,8 +160,8 @@ export async function buildRuntime(
     : null;
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
   // Codex PR88-r5: one expiry write can wait up to maxWait for a connection and then run up to timeout, so the hold
-  // reserves the store's whole step bound, not its transaction timeout alone.
-  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStore.stepBoundMs);
+  // reserves the approvals store's whole step bound (built with `t` above), not its transaction timeout alone.
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(t));
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
 }
@@ -178,7 +178,7 @@ export function requirementsServices(
   cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister & PendingCardLister,
   runner: ModelRunner | null = null,
   expiryLog?: ExpiryLog,
-  /** The longest one expiry write can take, connection wait included (the approvals store's `stepBoundMs`; Codex PR88-r4, PR88-r5). */
+  /** The longest one expiry write can take, connection wait included (`approvalStepBoundMs`; Codex PR88-r4, PR88-r5, PR88-r6). */
   expireStepMs = 0,
 ): RequirementsServices {
   // M2.2-d3c2: after each submission, the superseded version's pending cards and an unlinked requirements card

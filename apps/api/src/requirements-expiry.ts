@@ -7,6 +7,17 @@ import { EXPIRE_IDS_MAX } from "./approvals.js";
 
 /** Pending cards read per project for one expiry pass (bounded read, ADR-0011 §9). */
 export const PENDING_SCAN_MAX = 1000;
+
+/**
+ * The longest one approvals-store write can take, from the call to its commit or rollback, for a store built with
+ * `timeoutMs` (Codex PR88-r5): `PrismaApprovalStore` hands every transaction `{ maxWait: timeoutMs, timeout: timeoutMs }`,
+ * so a write may wait up to `maxWait` for a connection and then run up to `timeout`. The project hold reserves this
+ * whole bound. approvals.ts is Lane B's file and stays unchanged (Codex PR88-r6); AT-E10 reads the options the real
+ * store passes, so a change there that this bound no longer covers fails the test.
+ */
+export function approvalStepBoundMs(timeoutMs: number): number {
+  return timeoutMs + timeoutMs;
+}
 const PAGE = 100;
 /** The analyst's question-card targets (packages/analyst route.ts); other `decision` cards are never touched. */
 const QUESTION_TARGET = /^spec-(?:acceptance|question):/;
