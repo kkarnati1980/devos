@@ -114,6 +114,8 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
     "src/y.mjs": "/'/.test(s) && await " + F + "(u);",
     "src/z1.mjs": "const re = /^\\/*$/;\nawait " + F + "(u);",
     "src/z2.mjs": "const re = /`/;\nawait " + F + "(u);",
+    "src/x1.mjs": `await ${F}(url, { timeoutMs: 300, ["timeoutMs"]: undefined });`,
+    "src/x2.mjs": `await ${F}(url, { timeoutMs: 300, [k]: undefined });`,
   };
   for (const [rel, text] of Object.entries(bad)) write(rel, `const a = 1;\n${text}\n`);
   write("src/ok.mjs", [
@@ -129,6 +131,8 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
     `await ${F}(url, { "timeoutMs": 1000 });`,
     `await ${F}(url, { ...defaults, timeoutMs: 0x3e8 } as const);`,
     `const half = total / 2 / 3; await ${F}(url, { timeoutMs: 1000 });`,
+    `await ${F}(url, { ["x-other"]: 1, timeoutMs: 1000 });`,
+    `await ${F}(url, { timeoutMs: 1000, ["x-other"]: 1 });`,
   ].join("\n") + "\n");
   write("src/lib/imp.mjs", `import { ${F}, SafeFetchError } from "../${M}.mjs"; // the F2 fetch\nawait ${F}(u, { timeoutMs: 500 });\n`);
   write(`src/${M}.mjs`, `export async function ${F}(input, opts = {}) {}\n`);

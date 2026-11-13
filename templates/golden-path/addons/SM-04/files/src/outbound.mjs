@@ -135,11 +135,23 @@ function timeoutProblem(arg, rawArg = arg) {
   const rawObj = rawArg.slice(lead, lead + obj.length);
   const parsed = topLevelArgs(obj.slice(1, -1) + ")", 0);
   const props = (parsed?.spans ?? []).map(([a, b]) => ({ code: obj.slice(1 + a, 1 + b).trim(), raw: rawObj.slice(1 + a, 1 + b).trim() })).filter((x) => x.code);
-  const isTimeout = (x) => /^timeoutMs\s*(?::|$)/.test(x.code) || (/^(["'])timeoutMs\1\s*:/.test(x.raw) && /^(["'])\s*\1\s*:/.test(x.code));
+  // The property's key name, or null when it cannot be read statically: an identifier or shorthand (timeoutMs),
+  // a quoted key ("timeoutMs":), or a computed *string-literal* key (["timeoutMs"]:). A computed key with a
+  // dynamic expression ([k]:) reads as null, because it could be anything at run time.
+  const keyName = (x) => {
+    let m = /^([A-Za-z_$][\w$]*)\s*(?::|$)/.exec(x.code);
+    if (m) return m[1];
+    if (/^(["'])\s*\1\s*:/.test(x.code)) { m = /^(["'])(.*?)\1\s*:/.exec(x.raw); if (m) return m[2]; }
+    if (/^\[\s*(["'])\s*\1\s*\]\s*:/.test(x.code)) { m = /^\[\s*(["'])(.*?)\1\s*\]\s*:/.exec(x.raw); if (m) return m[2]; }
+    return null;
+  };
+  const isTimeout = (x) => keyName(x) === "timeoutMs";
   const last = props.findLastIndex(isTimeout);
   if (last < 0) return "the options do not name timeoutMs";
-  // A spread after the timeout can override it (…opts may carry timeoutMs: undefined), so it is refused.
-  if (props.slice(last + 1).some((x) => x.code.startsWith("..."))) return "a spread after timeoutMs can override it";
+  // Anything after the last timeoutMs that could override it at run time is refused: a spread (…opts may carry
+  // timeoutMs: undefined), or a computed key whose name cannot be read statically ([k]: undefined could be timeoutMs).
+  if (props.slice(last + 1).some((x) => x.code.startsWith("...") || (/^\[/.test(x.code) && keyName(x) === null)))
+    return "a spread or computed key after timeoutMs can override it";
   const prop = props[last].code;
   const value = prop.includes(":") ? prop.slice(prop.indexOf(":") + 1).trim() : "timeoutMs";
   if (/^(?:undefined|null|void\b.*)$/.test(value)) return "timeoutMs is not set";
