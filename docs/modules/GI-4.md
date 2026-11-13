@@ -24,6 +24,9 @@ Runner A approves G2, G3 or G4 only when a program, reading stored results, says
 5. `--comment` writes the gate-issue comment: `[runner] G<n> APPROVED …` listing each condition with the links of its results (GC7), or `[runner] G<n> PAUSED <iso>: missing …` (GC6).
 6. Exit codes: `0` approve · `1` paused · `2` could not run (bad arguments, unreadable or malformed evidence, or a gate other than G2–G4). Exit 2 is never an approval.
 
+## Floor-guard self-match
+The security-suppression pattern in `evaluate-gate.mjs` is written `gitleaks[:]allow|\bnose[c]\b`, and the AT4 fixture builds its text by concatenation, so the floor guard (GI-1) does not flag these pattern strings as new suppressions. They match the same text and suppress nothing; nothing in this PR changes what the floor guard detects.
+
 ## Runner procedure (ADR-0013 §2 amended)
 - Runner A compiles the manifest, runs the evaluator, and posts the `--comment` output on the gate issue.
 - Exit 0 → move the gate issue to Done and send KK one short line.

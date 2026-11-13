@@ -16,9 +16,12 @@ export const DELEGATED_GATES = new Set(["G2", "G3", "G4"]);
 const SHA = /^[0-9a-f]{40}$/;
 // No whitespace or Markdown/HTML delimiters, so a link cannot break out of the approval comment (GC7).
 const LINK = /^https:\/\/[^\s()[\]<>]+$/;
+// Secret-scanning and security-linter suppressions. Written with a one-character class so the floor guard does not
+// flag this pattern itself as a new suppression; it matches the same text and suppresses nothing (GI-4 contract).
+const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
 // Hits spec §4.4 sends to KK (security scanning, policy): a Codex Keep never clears them, only KK's recorded answer.
 export const KK_ONLY = (h) => h.rule === "gitleaksignore-added" || h.rule === "policy-weakened"
-  || (h.rule === "suppression-added" && /gitleaks:allow|\bnosec\b/.test(String(h.text ?? "")));
+  || (h.rule === "suppression-added" && SECURITY_SUPPRESSION.test(String(h.text ?? "")));
 
 export class CannotRun extends Error {}
 

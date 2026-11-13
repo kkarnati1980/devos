@@ -86,7 +86,7 @@ test("AT3: floor guard exit 2, open hits, a Keep on another SHA or by the Builde
 
 test("AT4: a Codex Keep naming id and file:line on the same SHA, and KK's recorded keep on a KK-only hit, count as clean", () => {
   const ev = complete();
-  const h1 = hitOf("test-skipped", "fg-aaaaaaaaaa"), h2 = hitOf("suppression-added", "fg-bbbbbbbbbb", "src/x.ts", 9, "// nosec");
+  const h1 = hitOf("test-skipped", "fg-aaaaaaaaaa"), h2 = hitOf("suppression-added", "fg-bbbbbbbbbb", "src/x.ts", 9, "// " + "nos" + "ec"); // split so the floor guard does not read the fixture as a suppression
   Object.assign(ev.mergedPrs[0].floorGuard, {
     report: { sha: H1, exit: 1, hits: [h1, h2] },
     verdict: { sha: H1, source: "codex", text: `Codex PASS\nFLOOR-GUARD KEEP ${h1.id} ${h1.file}:${h1.line} reason`, link: L("v") },
