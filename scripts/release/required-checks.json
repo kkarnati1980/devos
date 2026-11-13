@@ -5,8 +5,8 @@
   "requiredCheckRuns": ["floor-guard"],
   "floorGuard": {
     "check": "floor-guard",
-    "workflow": "floor-guard",
+    "workflowPath": ".github/workflows/floor-guard.yml",
     "aggregatorCheck": "ci-gate",
-    "aggregatorWorkflow": "ci-gate"
+    "aggregatorWorkflowPath": ".github/workflows/ci-gate.yml"
   }
 }

@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { githubClient, localGuardReport, namesChange, passVerdictText, release } from "../release/merge.mjs";
+import { githubClient, localGuardReport, namesChange, notKeepable, passVerdictText, release } from "../release/merge.mjs";
 import { applyDispositions, run as guardRun } from "../floor-guard/floor-guard.mjs";
 
 const REPO = "kkarnati1980/devos";
@@ -14,9 +14,11 @@ const HEAD = "a".repeat(40);
 const MAIN = "b".repeat(40);
 const OTHER = "f".repeat(40);
 const WATCHER = { login: "kkarnati1980" };
-const passComment = (extraSummary = "", { sha = HEAD, label = "PR7-r2", user = WATCHER, verdict = "PASS" } = {}) => ({
+const passComment = (extraSummary = "", { sha = HEAD, label = "PR7-r2", user = WATCHER, verdict = "PASS", table = "", created_at = "2026-11-13T10:01:00Z", updated_at = created_at } = {}) => ({
   user,
-  body: `### Codex review ${label} — **${verdict}**\n\n- **Commit:** \`${sha}\`\n- **Contract:** \`docs/modules/GI-1.md\`\n- **Summary:** Looks right.${extraSummary}\n\nMerge gate (D1): green CI **and** a PASS on this exact SHA.`,
+  created_at,
+  updated_at,
+  body: `### Codex review ${label} — **${verdict}**\n\n- **Commit:** \`${sha}\`\n- **Contract:** \`docs/modules/GI-1.md\`\n- **Summary:** Looks right.${extraSummary}\n\n${table}Merge gate (D1): green CI **and** a PASS on this exact SHA.`,
 });
 
 function fake(over = {}) {
@@ -30,9 +32,9 @@ function fake(over = {}) {
       { name: "ci-gate", status: "completed", conclusion: "success" },
     ],
     workflowRuns: [
-      { id: 1, workflow_id: 1, name: "ci", run_number: 1, status: "completed", conclusion: "success" },
-      { id: 2, workflow_id: 2, name: "floor-guard", run_number: 1, status: "completed", conclusion: "success" },
-      { id: 3, workflow_id: 3, name: "ci-gate", run_number: 1, status: "completed", conclusion: "success" },
+      { id: 1, workflow_id: 1, name: "ci", path: ".github/workflows/ci.yml", run_number: 1, status: "completed", conclusion: "success" },
+      { id: 2, workflow_id: 2, name: "floor-guard", path: ".github/workflows/floor-guard.yml", run_number: 1, status: "completed", conclusion: "success" },
+      { id: 3, workflow_id: 3, name: "ci-gate", path: ".github/workflows/ci-gate.yml", run_number: 1, status: "completed", conclusion: "success" },
     ],
     statuses: [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r2)", creator: WATCHER, updated_at: "2026-11-13T10:00:00Z" }],
     ...over,
@@ -74,9 +76,9 @@ const redGuard = (over = {}) => fake({
     { name: "ci-gate", status: "completed", conclusion: "failure" },
   ],
   workflowRuns: [
-    { id: 1, workflow_id: 1, name: "ci", run_number: 1, status: "completed", conclusion: "success" },
-    { id: 2, workflow_id: 2, name: "floor-guard", run_number: 1, status: "completed", conclusion: "failure" },
-    { id: 3, workflow_id: 3, name: "ci-gate", run_number: 1, status: "completed", conclusion: "failure" },
+    { id: 1, workflow_id: 1, name: "ci", path: ".github/workflows/ci.yml", run_number: 1, status: "completed", conclusion: "success" },
+    { id: 2, workflow_id: 2, name: "floor-guard", path: ".github/workflows/floor-guard.yml", run_number: 1, status: "completed", conclusion: "failure" },
+    { id: 3, workflow_id: 3, name: "ci-gate", path: ".github/workflows/ci-gate.yml", run_number: 1, status: "completed", conclusion: "failure" },
   ],
   ...over,
 });
@@ -209,4 +211,47 @@ test("B8 GC1 (local): a real .skip added to a test is a floor-guard hit the Rele
   // localGuardReport refuses bad SHAs before running anything.
   await assert.rejects(localGuardReport({ mainSha: "main", sha: head, cwd: dir }), /bad SHA/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("B9 (pre-review) markers count only on the Summary line of the earliest unedited PASS comment", async () => {
+  const row = `| low | x.ts:1 | quotes${keeps(HITS)} | none |\n\n`;
+  const cases = [
+    [passComment("", { table: row })],
+    [{ ...passComment(keeps(HITS)), updated_at: "2026-11-13T10:30:00Z" }],
+    [passComment(), passComment(keeps(HITS), { created_at: "2026-11-13T10:40:00Z" })],
+  ];
+  for (const comments of cases) {
+    const f = redGuard({ comments });
+    const r = await release(f.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: HITS }) });
+    assert.equal(r.code, 1, JSON.stringify(comments).slice(0, 80));
+    assert.equal(merges(f), 0);
+  }
+});
+
+test("B10 (pre-review) hits spec §4.4/§4.5 keep from Codex are never set aside by a Keep", async () => {
+  const kkHits = [
+    { id: "fg-1111111111", rule: "gitleaksignore-added", file: ".gitleaksignore", line: 1, text: "abc:rule:1" },
+    { id: "fg-2222222222", rule: "guard-change-not-isolated", file: "scripts/floor-guard/floor-guard.mjs", line: 1, text: "x" },
+    { id: "fg-3333333333", rule: "ci-step-removed", file: ".github/workflows/ci.yml", line: 4, text: "Lint" },
+    { id: "fg-4444444444", rule: "suppression-added", file: "apps/api/src/x.ts", line: 3, text: ["// ", "no", "sec"].join("") },
+    { id: "fg-5555555555", rule: "test-skipped", file: "apps/api/src/security/a.test.ts", line: 3, text: `${SKIP}("a"` },
+    { id: "fg-6666666666", rule: "policy-weakened", file: "packages/policy/src/a.ts", line: 3, text: "deny" },
+  ];
+  for (const h of kkHits) {
+    assert.equal(notKeepable(h), true, h.rule);
+    const f = redGuard({ comments: [passComment(keeps([h]))] });
+    const r = await release(f.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [h] }) });
+    assert.equal(r.code, 1, h.rule);
+    assert.ok(r.reasons.some((x) => x.includes(h.id) && x.includes("escalate to KK")), r.reasons.join("; "));
+    assert.equal(merges(f), 0);
+  }
+  for (const h of HITS) assert.equal(notKeepable(h), false, `${h.rule} is keepable`);
+});
+
+test("B11 (pre-review) a red workflow named floor-guard from another file is never set aside", async () => {
+  const f = redGuard({ comments: [passComment(keeps(HITS))] });
+  f.state.workflowRuns.push({ id: 9, workflow_id: 9, name: "floor-guard", path: ".github/workflows/sneaky.yml", run_number: 1, status: "completed", conclusion: "failure" });
+  const r = await release(f.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: HITS }) });
+  assert.equal(r.code, 1);
+  assert.ok(r.reasons.some((x) => x.includes("run 9")));
 });

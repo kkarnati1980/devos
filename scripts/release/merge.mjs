@@ -155,9 +155,29 @@ export async function passVerdictText(gh, repo, pr, sha, label, creator) {
     if (page === 20 && j.length === 100) throw new CannotRun(`PR #${pr} has more than 2,000 comments; refusing to judge a partial list`);
   }
   const head = `### Codex review ${label} — **PASS**`;
-  const match = comments.filter((c) => c?.user?.login === creator && String(c.body ?? "").split("\n")[0].trim() === head && String(c.body).includes(`**Commit:** \`${sha}\``));
-  if (match.length === 0) return null;
-  return String(match[match.length - 1].body).replace(/[ \t]*(FLOOR-GUARD (?:KEEP|CHANGE) )/g, "\n$1");
+  // The earliest matching comment that was never edited (pre-review finding 3): a later or edited comment from the
+  // shared account cannot replace the watcher's.
+  const match = comments.find((c) => c?.user?.login === creator && (!c.updated_at || c.updated_at === c.created_at) && String(c.body ?? "").split("\n")[0].trim() === head && String(c.body).includes(`**Commit:** \`${sha}\``));
+  if (!match) return null;
+  // Markers count only on the Summary line, never in the findings table, whose cells quote PR text (finding 1).
+  const summary = String(match.body).split("\n").find((l) => l.startsWith("- **Summary:** "));
+  if (!summary) return null;
+  return summary.slice("- **Summary:** ".length).replace(/[ \t]*(FLOOR-GUARD (?:KEEP|CHANGE) )/g, "\n$1");
+}
+
+// Hits a Codex Keep never clears (spec §4.4: security scanning, policy and money go to KK; §4.5: a guard change must
+// stand alone). Mirrors KK_ONLY in scripts/gates/evaluate-gate.mjs (DEVOS-144) plus guard-change-not-isolated.
+const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
+const SECURITY_WORDS = /secur|secret|gitleaks|\bnose[c]\b|audit|licen[cs]e|codeql|semgrep|trivy|snyk|xss|no-eval|detect-/i;
+export function notKeepable(h) {
+  const text = String(h?.text ?? "");
+  if (SECURITY_WORDS.test(`${h?.file ?? ""} ${text}`)) return true;
+  if (text.length >= 200) return true; // GI-1 cuts hit text at 200 characters: what follows cannot be ruled out
+  if (["gitleaksignore-added", "policy-weakened", "guard-change-not-isolated"].includes(h?.rule)) return true;
+  if (h?.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text);
+  if (/^ci-/.test(h?.rule ?? "")) return true; // a CI hit names the step, not what it ran
+  if (h?.rule === "lint-rule-off") return /\bignores?\b/.test(text);
+  return false;
 }
 
 /** True when the verdict text has a line "FLOOR-GUARD CHANGE <path>" naming exactly this path. */
@@ -213,8 +233,8 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
   }
   if (runs.length > 0 && !runs.some((r) => r.conclusion === "success")) reasons.push("no CI check run succeeded");
   for (const w of await latestWorkflowRuns(gh, repo, sha)) {
-    if (w.status !== "completed") red.push({ workflow: w.name, msg: `workflow "${w.name}" (run ${w.id}) is ${w.status}` });
-    else if (!OK_CONCLUSIONS.has(w.conclusion)) red.push({ workflow: w.name, failed: w.conclusion === "failure", msg: `workflow "${w.name}" (run ${w.id}) concluded ${w.conclusion}` });
+    if (w.status !== "completed") red.push({ workflow: w.name, path: w.path, msg: `workflow "${w.name}" (run ${w.id}) is ${w.status}` });
+    else if (!OK_CONCLUSIONS.has(w.conclusion)) red.push({ workflow: w.name, path: w.path, failed: w.conclusion === "failure", msg: `workflow "${w.name}" (run ${w.id}) concluded ${w.conclusion}` });
   }
   for (const name of config.requiredCheckRuns) {
     const r = runs.find((x) => x.name === name);
@@ -249,7 +269,7 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
   //     only when every hit it finds on this SHA has a valid Codex Keep (spec §4.4, GI-1 Dispositions).
   const fg = config.floorGuard;
   const fgFailed = fg ? red.filter((x) => x.check === fg.check && x.failed) : [];
-  const otherFgRed = fg ? red.filter((x) => (x.check === fg.check || x.workflow === fg.workflow) && !x.failed) : [];
+  const otherFgRed = fg ? red.filter((x) => (x.check === fg.check || x.path === fg.workflowPath) && !x.failed) : [];
   const guardFiles = await guardPathsTouched(gh, repo, pr, p.changed_files);
   let disposed = false;
   if (guardFiles.paths.length > 0 || (fgFailed.length > 0 && otherFgRed.length === 0)) {
@@ -270,13 +290,18 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
         else if (report.hits.length === 0) reasons.push(`floor guard failed in CI on ${sha.slice(0, 7)} but finds no hit on a re-run; re-run the check, a red check is never set aside without a hit`);
         else {
           const d = applyDispositions(report, { sha, source: "codex", text: verdictText });
-          if (d.exit === 0) disposed = true;
-          else for (const h of d.open) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} has no "FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} <reason>" in the PASS for ${sha.slice(0, 7)}`);
+          const kk = report.hits.filter(notKeepable);
+          for (const h of kk) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} cannot be kept by Codex: restore it or escalate to KK (spec §4.4/§4.5)`);
+          for (const h of d.open) if (!kk.includes(h)) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} has no "FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} <reason>" in the PASS for ${sha.slice(0, 7)}`);
+          if (d.exit === 0 && kk.length === 0) disposed = true;
         }
       }
     }
   }
-  const setAside = (x) => disposed && (x.check === fg.check || x.workflow === fg.workflow || (x.failed && (x.check === fg.aggregatorCheck || x.workflow === fg.aggregatorWorkflow)));
+  // Workflow runs are matched by their file, not their name, so a PR-added workflow named "floor-guard" is never
+  // set aside (pre-review finding 4).
+  const isWf = (x, file) => x.workflow !== undefined && x.path === file;
+  const setAside = (x) => disposed && (x.check === fg.check || isWf(x, fg.workflowPath) || (x.failed && (x.check === fg.aggregatorCheck || isWf(x, fg.aggregatorWorkflowPath))));
   for (const x of red) if (!setAside(x)) reasons.push(x.msg);
 
   // 3. origin/main is already in the head (ADR-0013).
