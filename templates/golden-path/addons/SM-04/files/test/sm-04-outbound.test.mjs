@@ -93,6 +93,14 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
     "src/q.mjs": `await ${F}(url, { timeoutMs: 0 });`,
     "src/r.mjs": `await ${F}(...args);`,
     "src/s.mjs": `await ${F}(url, { ...opts });`,
+    "src/t.mjs": `await ${F}(url, { timeoutMs: 5000, ...opts });`,
+    "src/u.mjs": `await ${F}(url, { timeoutMs: 5000, timeoutMs: undefined });`,
+    "src/v.mjs": `await ${F}(url, { timeoutMs: 0x7fffffff });`,
+    "src/w.mjs": `await ${F}(url, { timeoutMs: -1 });`,
+    "src/x.mjs": "if (/^https?:\\/\\//.test(u)) await " + F + "(u);",
+    "src/y.mjs": "/'/.test(s) && await " + F + "(u);",
+    "src/z1.mjs": "const re = /^\\/*$/;\nawait " + F + "(u);",
+    "src/z2.mjs": "const re = /`/;\nawait " + F + "(u);",
   };
   for (const [rel, text] of Object.entries(bad)) write(rel, `const a = 1;\n${text}\n`);
   write("src/ok.mjs", [
@@ -105,12 +113,16 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
     `await ${F}(url, { headers: { x: ")" }, timeoutMs: 1000 });`,
     `await ${F}(\`https://api.example/\${id}\`, { ...base, timeoutMs: 120_000 });`,
     `const note = \`call ${F}(\${u}) with care\`;`,
+    `await ${F}(url, { "timeoutMs": 1000 });`,
+    `await ${F}(url, { ...defaults, timeoutMs: 0x3e8 } as const);`,
+    `const half = total / 2 / 3; await ${F}(url, { timeoutMs: 1000 });`,
   ].join("\n") + "\n");
+  write("src/lib/imp.mjs", `import { ${F}, SafeFetchError } from "../${M}.mjs"; // the F2 fetch\nawait ${F}(u, { timeoutMs: 500 });\n`);
   write(`src/${M}.mjs`, `export async function ${F}(input, opts = {}) {}\n`);
   write("node_modules/x/i.js", `${F}(url);\n`);
   const hits = findUntimedCalls(dir);
   assert.deepEqual([...new Set(hits.map((h) => h.file))].sort(), Object.keys(bad).sort(), JSON.stringify(hits, null, 1));
-  for (const h of hits) assert.equal(h.line, 2, JSON.stringify(h));
+  for (const h of hits) assert.equal(h.line, h.file.startsWith("src/z") ? 3 : 2, JSON.stringify(h));
   assert.ok(hits.every((h) => typeof h.reason === "string" && h.reason), "each hit says why");
   fs.rmSync(dir, { recursive: true, force: true });
   assert.deepEqual(findUntimedCalls(APP_ROOT), []);
