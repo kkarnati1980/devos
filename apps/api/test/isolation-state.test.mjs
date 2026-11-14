@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { request } from "node:http";
 import { Socket } from "node:net";
 import {
-  ISOLATION_STATE_PATH, buildIsolationState, isolationStateConfig, isolationStateHandler, startIsolationStateServer, tokenMatches,
+  ISOLATION_STATE_PATH, buildIsolationState, defaultGateway, isolationStateConfig, isolationStateHandler, readDefaultGateway, startIsolationStateServer, tokenMatches,
 } from "../dist/isolation-state.js";
 
 // A test value built from parts, so it does not look like a real key to secret scanners.
@@ -67,18 +67,54 @@ test("AT4 (HTTP): another path or method is 404, even with the token", async () 
   });
 });
 
-test("AT4 (HTTP): a caller whose socket is not loopback gets 404 before the token is looked at", async () => {
-  const handler = isolationStateHandler({ token: TOKEN, source: source() });
-  for (const remoteAddress of ["100.64.1.2", "10.0.0.5", "::ffff:10.0.0.5", "0.0.0.0", undefined]) {
-    const socket = new Socket();
-    Object.defineProperty(socket, "remoteAddress", { value: remoteAddress });
-    const out = { status: 0, body: "" };
-    const res = { headersSent: false, writeHead(s) { out.status = s; this.headersSent = true; }, end(b) { out.body = b; }, destroy() {} };
-    await handler({ socket, method: "GET", url: ISOLATION_STATE_PATH, headers: { authorization: `Bearer ${TOKEN}` } }, res);
-    assert.equal(out.status, 404, String(remoteAddress));
-    assert.deepEqual(JSON.parse(out.body), { error: "not-found" });
-    socket.destroy();
+async function callAs(handler, remoteAddress, auth = `Bearer ${TOKEN}`) {
+  const socket = new Socket();
+  Object.defineProperty(socket, "remoteAddress", { value: remoteAddress });
+  const out = { status: 0, body: "" };
+  const res = { headersSent: false, writeHead(s) { out.status = s; this.headersSent = true; }, end(b) { out.body = b; }, destroy() {} };
+  await handler({ socket, method: "GET", url: ISOLATION_STATE_PATH, headers: { authorization: auth } }, res);
+  socket.destroy();
+  return { status: out.status, body: JSON.parse(out.body) };
+}
+
+test("AT4 (HTTP): a caller that is neither loopback nor the container's gateway gets 404 before the token is looked at", async () => {
+  const handler = isolationStateHandler({ token: TOKEN, source: source(), gateway: "172.18.0.1" });
+  for (const remoteAddress of ["100.64.1.2", "10.0.0.5", "::ffff:10.0.0.5", "172.18.0.2", "172.18.0.10", "0.0.0.0", undefined]) {
+    const r = await callAs(handler, remoteAddress);
+    assert.equal(r.status, 404, String(remoteAddress));
+    assert.deepEqual(r.body, { error: "not-found" });
   }
+  // A peer container on the Compose network has its own address, never the gateway's: still 404 without the gateway.
+  const loopbackOnly = isolationStateHandler({ token: TOKEN, source: source() });
+  assert.equal((await callAs(loopbackOnly, "172.18.0.1")).status, 404, "no gateway configured: loopback only");
+});
+
+test("AT4 (HTTP): the host's connection through the published port (from the gateway) is served, and still needs the token", async () => {
+  const handler = isolationStateHandler({ token: TOKEN, source: source(), gateway: "172.18.0.1" });
+  for (const peer of ["172.18.0.1", "::ffff:172.18.0.1", "127.0.0.1"]) {
+    assert.equal((await callAs(handler, peer)).status, 200, peer);
+    assert.equal((await callAs(handler, peer, "Bearer wrong")).status, 401, peer);
+  }
+  assert.throws(() => isolationStateHandler({ token: TOKEN, source: source(), gateway: "not-an-ip" }), /config-isolation-state-gateway-invalid/);
+});
+
+test("defaultGateway reads the default route of /proc/net/route (little-endian); anything else is null", () => {
+  const table = [
+    "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT",
+    "eth0\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0",
+    "eth0\t00000000\t010012AC\t0003\t0\t0\t0\t00000000\t0\t0\t0",
+  ].join("\n");
+  assert.equal(defaultGateway(table), "172.18.0.1");
+  assert.equal(defaultGateway(table.split("\n").slice(0, 2).join("\n")), null, "no default route");
+  assert.equal(defaultGateway("Iface\nlo\t00000000\tZZZZZZZZ\t0003"), null);
+  assert.equal(readDefaultGateway(() => { throw new Error("ENOENT"); }), null);
+  assert.equal(readDefaultGateway(() => table), "172.18.0.1");
+});
+
+test("the listener can bind 0.0.0.0 only by name; anything else is refused", async () => {
+  await assert.rejects(async () => startIsolationStateServer({ token: TOKEN, source: source(), port: 0, bind: "100.64.0.1" }), /config-isolation-state-bind-invalid/);
+  const server = await startIsolationStateServer({ token: TOKEN, source: source(), port: 0, bind: "0.0.0.0" });
+  try { assert.equal(server.address().address, "0.0.0.0"); } finally { await new Promise((r) => server.close(r)); }
 });
 
 test("the listener binds 127.0.0.1 only", async () => {
@@ -118,8 +154,13 @@ test("tokenMatches: exact Bearer token only", () => {
 test("config: no token keeps the listener off; a short or non-printable token, or a bad port, stops start-up with a code", () => {
   assert.equal(isolationStateConfig({}), null);
   assert.equal(isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: "" }), null);
-  assert.deepEqual(isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: TOKEN }), { token: TOKEN, port: 3002 });
-  assert.deepEqual(isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: TOKEN, API_INTERNAL_PORT: "4100" }), { token: TOKEN, port: 4100 });
+  assert.deepEqual(isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: TOKEN }), { token: TOKEN, port: 3002, bind: "127.0.0.1" });
+  assert.deepEqual(isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: TOKEN, API_INTERNAL_PORT: "4100", API_INTERNAL_BIND: "0.0.0.0" }), { token: TOKEN, port: 4100, bind: "0.0.0.0" });
+  assert.throws(() => isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: TOKEN, API_INTERNAL_BIND: "100.64.0.1" }), /config-isolation-state-bind-invalid/);
+  // The host script sends only [A-Za-z0-9._~+/=-]{16,512}; the API accepts the same characters, 32 to 512 of them.
+  assert.throws(() => isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: `${TOKEN}!` }), /config-isolation-state-token-invalid/);
+  assert.throws(() => isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: "a".repeat(513) }), /config-isolation-state-token-invalid/);
+  assert.ok(isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: "a".repeat(512) }));
   assert.throws(() => isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: "short" }), /config-isolation-state-token-invalid/);
   assert.throws(() => isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: `${TOKEN} with space` }), /config-isolation-state-token-invalid/);
   for (const p of ["0", "70000", "abc", "3.5"]) assert.throws(() => isolationStateConfig({ DEVOS_ISOLATION_STATE_TOKEN: TOKEN, API_INTERNAL_PORT: p }), /config-isolation-state-port-invalid/, p);

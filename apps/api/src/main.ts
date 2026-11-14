@@ -8,7 +8,8 @@ import { buildRuntime, type DbClient } from "./runtime.js";
 import type { DeadLetterQueue } from "./dead-letters.js";
 import { analystModelPass, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
 import { ANALYST_MAX_SECONDS } from "./analyst-runner.js";
-import { isolationStateConfig, startIsolationStateServer } from "./isolation-state.js";
+import { readFileSync } from "node:fs";
+import { isolationStateConfig, readDefaultGateway, startIsolationStateServer } from "./isolation-state.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
@@ -71,8 +72,12 @@ async function main(): Promise<void> {
   app.enableShutdownHooks();
   await app.listen(config.port, config.host);
   // S4-a2b: the host's state document, on 127.0.0.1 only. Off until the installer has set the token and a database exists.
+  // A listen failure (e.g. the port is taken) logs a fixed code and leaves the API serving: the host keeps its last
+  // good state without this endpoint (S4-a2b decision 4).
+  const warn = (code: string) => stdoutSink({ ts: new Date().toISOString(), level: "warn", msg: code });
   const isolationServer = isolationState && isolation
-    ? await startIsolationStateServer({ ...isolationState, source: isolation, onError: (code) => stdoutSink({ ts: new Date().toISOString(), level: "warn", msg: code }) })
+    ? await startIsolationStateServer({ ...isolationState, source: isolation, gateway: readDefaultGateway(() => readFileSync("/proc/net/route", "utf8")), onError: warn })
+        .catch(() => { warn("isolation-state-listen-failed"); return null; })
     : null;
   // M2.2-d3c1: decided requirements cards are applied without waiting for the sync POST; stopped with the process.
   requirementsSync?.start();
