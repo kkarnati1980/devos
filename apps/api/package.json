@@ -9,7 +9,7 @@
     "build": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/card-batch run build && tsc -p tsconfig.json",
     "typecheck": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/card-batch run build && tsc -p tsconfig.json --noEmit",
     "test": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/run-engine --filter @devos/card-batch run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
-    "test:db": "pnpm --filter @devos/policy --filter @devos/analyst run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
+    "test:db": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/card-batch run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
     "start": "node dist/main.js"
   },
   "dependencies": {
@@ -21,12 +21,14 @@
     "@nestjs/common": "11.2.8",
     "@nestjs/core": "11.2.8",
     "@nestjs/platform-express": "11.2.8",
+    "pg": "8.23.1",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2"
   },
   "devDependencies": {
     "@types/express": "5.0.6",
     "@types/node": "^22.7.0",
+    "@types/pg": "8.15.6",
     "typescript": "^5.6.3",
     "yaml": "2.8.1"
   }
