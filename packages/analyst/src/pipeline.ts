@@ -6,7 +6,7 @@ import { ingest as defaultIngest, IngestError, type IngestResult, type SpecFileF
 import { analyzeSpec, type Analysis, type Priority } from "./analyze.js";
 import { assistAnalysis, type ModelRunner } from "./assist.js";
 import { renderRequirementsMd } from "./render.js";
-import { buildPreflight, preflightLine, type PreflightItem } from "./preflight.js";
+import { buildPreflight, preflightDecisions, preflightLine, type PreflightDecisionRow, type PreflightItem } from "./preflight.js";
 import { CARD_REASON_MAX, planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
 
 export type SpecSourceFormat = SpecFileFormat | "paste";
@@ -74,6 +74,14 @@ export interface DocRow {
   version: number;
   status: DocStatus;
   approvalId: string | null;
+  /** ADR-0012 CR-a2: this version's pre-flight list (absent or null outside continuous-run mode). */
+  preflight?: PreflightItem[] | null;
+}
+
+/** ADR-0012 rule 3: the decision log rows written with an approval, in the same transaction. */
+export interface ApprovalDecisions {
+  approvalId: string;
+  rows: PreflightDecisionRow[];
 }
 
 /**
@@ -94,7 +102,13 @@ export interface RequirementsStore {
    * serialise: true only when the doc is a draft AND the project's newest doc (pre-review r2: a bare
    * compare-and-set outside the lock could leave two approved docs).
    */
-  approveDoc(docId: string): Promise<boolean>;
+  approveDoc(docId: string, decisions?: ApprovalDecisions): Promise<boolean>;
+  /**
+   * ADR-0012 rule 4: a rejected intake card. Sets `preflight_state` to `rejected` under the project lock, only while
+   * `docId` is the newest doc and a draft (a newer version has already re-opened the pre-flight). Optional: a store
+   * without it leaves the state as it is.
+   */
+  rejectPreflight?(docId: string): Promise<boolean>;
 }
 
 /** An M2.3 `CardInput` for the requirements gate; the port is `Approvals.raiseCard(card, [])`. */
@@ -363,10 +377,23 @@ export class RequirementsPipeline {
    * anything: approved → the doc is approved (KK approves once). A rejected or expired card, or a card for a
    * superseded version, leaves the docs as they are.
    */
-  async applyDecision(card: { id: string; gate: string; status: string }): Promise<"approved" | "ignored"> {
-    if (card.gate !== "requirements" || card.status !== "approved") return "ignored";
+  async applyDecision(
+    card: { id: string; gate: string; status: string },
+    /** KK's comments on the card, oldest first (ADR-0012 CR-a2: `PF-<n>: <answer>` lines). */
+    comments: readonly string[] = [],
+  ): Promise<"approved" | "rejected" | "ignored"> {
+    if (card.gate !== "requirements") return "ignored";
+    if (card.status === "rejected") {
+      // ADR-0012 rule 4: a rejected intake card closes the build until a new spec version re-opens it.
+      const doc = await this.ports.store.docForApproval(card.id);
+      if (!doc || doc.status !== "draft" || !doc.preflight || !this.ports.store.rejectPreflight) return "ignored";
+      return (await this.ports.store.rejectPreflight(doc.id)) ? "rejected" : "ignored";
+    }
+    if (card.status !== "approved") return "ignored";
     const doc = await this.ports.store.docForApproval(card.id);
     if (!doc || doc.status !== "draft") return "ignored";
-    return (await this.ports.store.approveDoc(doc.id)) ? "approved" : "ignored";
+    // ADR-0012 rule 3: every decision item gets KK's answer or its default, written with the approval.
+    const decisions = doc.preflight ? { approvalId: card.id, rows: preflightDecisions(doc.preflight, comments) } : undefined;
+    return (await this.ports.store.approveDoc(doc.id, decisions)) ? "approved" : "ignored";
   }
 }

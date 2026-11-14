@@ -280,3 +280,36 @@ test("AT2 (CR-a2): in continuous-run mode one requirements card carries the pre-
   await legacy.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
   assert.deepEqual(legacy.qCards.length, off.qCards.length);
 });
+
+test("AT4/AT6 (CR-a2, memory store): approval writes KK's answers and defaults with it; rejection closes; a new version re-opens", async () => {
+  const s = setup({ continuousRun: true, secretNames: async () => ["PAYMENTS_KEY"] });
+  const r = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  // Rejected: state `rejected`, nothing recorded, the doc stays a draft.
+  assert.equal(await s.pipeline.applyDecision({ id: r.approvalId, gate: "requirements", status: "rejected" }), "rejected");
+  assert.equal(s.store.preflightState.get(P1), "rejected");
+  assert.equal(s.store.decisions.length, 0);
+  // AT6: a new spec version re-opens the pre-flight with a new card.
+  const r2 = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.notEqual(r2.approvalId, r.approvalId);
+  assert.equal(s.store.preflightState.get(P1), "pending");
+  // The old card's late rejection no longer touches the state (it is not the newest doc).
+  assert.equal(await s.pipeline.applyDecision({ id: r.approvalId, gate: "requirements", status: "rejected" }), "ignored");
+  assert.equal(s.store.preflightState.get(P1), "pending");
+  // AT4: approving with `PF-1: yes` records PF-1 as kk and every other decision item as its default.
+  assert.equal(await s.pipeline.applyDecision({ id: r2.approvalId, gate: "requirements", status: "approved" }, ["PF-1: yes"]), "approved");
+  const decisions = r2.preflight.filter((i) => i.kind === "decision");
+  assert.equal(s.store.decisions.length, decisions.length);
+  assert.deepEqual(s.store.decisions.map((d) => d.source), decisions.map((_, i) => (i === 0 ? "kk" : "default")));
+  assert.equal(s.store.decisions[0].answer, "yes");
+  assert.ok(s.store.decisions.every((d) => d.approvalId === r2.approvalId && d.projectId === P1));
+  assert.equal(s.store.preflightState.get(P1), "approved");
+  // Idempotent: a second sync of the decided card records nothing more.
+  assert.equal(await s.pipeline.applyDecision({ id: r2.approvalId, gate: "requirements", status: "approved" }, ["PF-1: no"]), "ignored");
+  assert.equal(s.store.decisions.length, decisions.length);
+  // Mode off: approval records no decision rows, as before.
+  const off = setup({ continuousRun: false });
+  const r0 = await off.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(await off.pipeline.applyDecision({ id: r0.approvalId, gate: "requirements", status: "approved" }, ["PF-1: yes"]), "approved");
+  assert.equal(off.store.decisions.length, 0);
+  assert.equal(await off.pipeline.applyDecision({ id: r0.approvalId, gate: "requirements", status: "rejected" }), "ignored");
+});

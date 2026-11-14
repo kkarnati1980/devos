@@ -1,7 +1,7 @@
 // In-memory RequirementsStore (M2.2-d1): the reference behaviour of the port for tests; M2.2-d2's Prisma store
 // does the same in one transaction under a project row lock.
 import { randomUUID } from "node:crypto";
-import { PipelineError, type DocRow, type DocStatus, type ProjectRow, type RequirementsStore, type SaveAnalysisInput, type SaveAnalysisResult } from "./pipeline.js";
+import { PipelineError, type ApprovalDecisions, type DocRow, type DocStatus, type ProjectRow, type RequirementsStore, type SaveAnalysisInput, type SaveAnalysisResult } from "./pipeline.js";
 
 export interface MemorySpec {
   id: string;
@@ -88,7 +88,9 @@ export class MemoryRequirementsStore implements RequirementsStore {
 
   async docForApproval(approvalId: string): Promise<DocRow | null> {
     const d = this.docs.find((x) => x.approvalId === approvalId);
-    return d ? { id: d.id, projectId: d.projectId, version: d.version, status: d.status, approvalId: d.approvalId } : null;
+    return d
+      ? { id: d.id, projectId: d.projectId, version: d.version, status: d.status, approvalId: d.approvalId, ...(d.preflight ? { preflight: structuredClone(d.preflight) as DocRow["preflight"] } : {}) }
+      : null;
   }
 
   async linkApproval(docId: string, approvalId: string): Promise<boolean> {
@@ -98,12 +100,34 @@ export class MemoryRequirementsStore implements RequirementsStore {
     return true;
   }
 
-  async approveDoc(docId: string): Promise<boolean> {
+  /** ADR-0012 rule 3: the project decision log (`project_decision`), unique on approval and item. */
+  readonly decisions: { projectId: string; approvalId: string; itemId: string; text: string; answer: string; source: string }[] = [];
+
+  private newestDraft(docId: string) {
     const d = this.docs.find((x) => x.id === docId);
-    if (!d || d.status !== "draft") return false;
+    if (!d || d.status !== "draft") return null;
     const newest = this.docs.filter((x) => x.projectId === d.projectId).reduce((m, x) => Math.max(m, x.version), 0);
-    if (d.version !== newest) return false;
+    return d.version === newest ? d : null;
+  }
+
+  async approveDoc(docId: string, decisions?: ApprovalDecisions): Promise<boolean> {
+    const d = this.newestDraft(docId);
+    if (!d) return false;
     d.status = "approved";
+    if (decisions) {
+      for (const row of decisions.rows) {
+        if (this.decisions.some((x) => x.approvalId === decisions.approvalId && x.itemId === row.itemId)) continue;
+        this.decisions.push({ projectId: d.projectId, approvalId: decisions.approvalId, ...row });
+      }
+      this.preflightState.set(d.projectId, "approved");
+    }
+    return true;
+  }
+
+  async rejectPreflight(docId: string): Promise<boolean> {
+    const d = this.newestDraft(docId);
+    if (!d) return false;
+    this.preflightState.set(d.projectId, "rejected");
     return true;
   }
 
