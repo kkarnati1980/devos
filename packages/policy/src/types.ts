@@ -73,6 +73,12 @@ export interface RuleConstraints {
   maxTokens?: number;
   network?: boolean;
   requiredProvenance?: PolicyEvidence["provenance"][];
+  /**
+   * DEVOS-134: the M2.3 approval gate a `require_approval` from this rule raises (`requirements`, `decision`,
+   * `first_launch`, `destructive_or_spend`, `purge`). The engine never reads it; M2.3's `gateFromRules` validates it
+   * against its gate list and ignores anything else, so a typo can only fall back to a `decision` card.
+   */
+  gateName?: string;
 }
 
 /** policy_rule. Empty match lists match anything. */
