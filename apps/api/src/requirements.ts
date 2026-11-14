@@ -5,12 +5,15 @@ import { Controller, Get, HttpCode, Inject, Param, Post, Req } from "@nestjs/com
 import { PipelineError, type DocRow, type RequirementsPipeline, type RequirementsStore } from "@devos/analyst";
 import { httpError } from "./auth.js";
 import type { DevosRequest } from "./http.js";
+import { preflightView, type PreflightViewReader, type SecretPresence } from "./preflight.js";
 
 export const REQUIREMENTS = Symbol("devos:requirements");
 
 /** The slice of the M2.3 approval store this module reads (ApprovalStore satisfies it). */
 export interface CardReader {
   get(id: string): Promise<{ id: string; gate: string; status: string } | null>;
+  /** ADR-0012 CR-a2: the card's comments, oldest first (ApprovalStore.comments). */
+  comments?(id: string): Promise<{ body: string }[]>;
 }
 
 export interface RequirementRowView {
@@ -25,7 +28,12 @@ export interface RequirementsServices {
   pipeline: RequirementsPipeline | null;
   store: (RequirementsStore & { rows?(projectId: string): Promise<RequirementRowView[]> }) | null;
   cards: CardReader | null;
+  /** CR-a3 (DEVOS-199): the project vault's presence check for the pre-flight view; absent → secrets unverified. */
+  vault?: SecretPresence | null;
 }
+
+/** The dashboard's project slug (apps/dashboard/lib/source.ts `isSlug`). */
+const SLUG = /^[a-z0-9-]{2,40}$/;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Same as the M2.1 ingest `maxBytes` default; larger bodies are refused while streaming. */
@@ -87,8 +95,11 @@ export async function syncApproval(svc: RequirementsServices, projectId: string)
   const doc = await store.latestDoc(projectId);
   if (!doc || doc.status !== "draft" || !doc.approvalId || !svc.cards) return doc;
   const card = await svc.cards.get(doc.approvalId);
-  if (!card || card.status !== "approved") return doc;
-  await pipeline.applyDecision(card);
+  if (!card || (card.status !== "approved" && card.status !== "rejected")) return doc;
+  // ADR-0012 CR-a2: KK's comments carry the pre-flight answers (`PF-<n>: …`). A reader without comments gives none,
+  // so every item takes its default (the card is still applied).
+  const comments = card.status === "approved" && svc.cards.comments ? (await svc.cards.comments(card.id)).map((c) => c.body) : [];
+  await pipeline.applyDecision(card, comments);
   return store.latestDoc(projectId);
 }
 
@@ -142,6 +153,22 @@ export class RequirementsController {
     const doc = await store.latestDoc(id).catch(mapError);
     const rows = store.rows ? await store.rows(id).catch(mapError) : [];
     return { doc, requirements: rows };
+  }
+
+  /**
+   * CR-a3 (DEVOS-199): the project page's read-only pre-flight section — state, the list KK saw, missing secret
+   * names ("waiting for secrets") and the decision log. GET never writes (ADR-0011 §1); no secret value is read.
+   */
+  @Get("by-slug/:slug/preflight")
+  async preflight(@Param("slug") slug: string) {
+    if (!SLUG.test(slug)) throw httpError(400, "invalid:slug");
+    const store = need(this.svc.store, "requirements-not-configured") as unknown as Partial<PreflightViewReader>;
+    if (typeof store.projectBySlug !== "function" || typeof store.decisions !== "function" || typeof store.preflightSnapshot !== "function") {
+      throw httpError(503, "preflight-not-configured");
+    }
+    const view = await preflightView(slug, store as PreflightViewReader, this.svc.vault ?? null).catch(mapError);
+    if (!view) throw httpError(404, "project-not-found");
+    return { preflight: view };
   }
 
   /**

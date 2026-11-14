@@ -173,6 +173,8 @@ export async function buildRuntime(
   const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(approvalStore),
     // DEVOS-176: the `analyst.model_pass` setting, read before each pass (a change applies without a restart).
     async () => (await setup.settings!.get()).analystModelPass);
+  // CR-a3 (DEVOS-199): the pre-flight view asks the vault only whether a secret name is set.
+  requirements.vault = vault ? { hasProject: (projectId, name) => vault.hasProject(projectId, name) } : null;
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep };
@@ -187,7 +189,7 @@ export async function buildRuntime(
 export function requirementsServices(
   store: NonNullable<RequirementsServices["store"]>,
   approvals: Pick<Approvals, "raiseCard" | "expireCardsById">,
-  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister & PendingCardLister,
+  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null>; comments?(id: string): Promise<{ body: string }[]> } & DecidedCardLister & PendingCardLister,
   runner: ModelRunner | null = null,
   expiryLog?: ExpiryLog,
   /** The longest one expiry write can take, connection wait included (`approvalStepBoundMs`; Codex PR88-r4, PR88-r5, PR88-r6). */
@@ -216,7 +218,7 @@ export function requirementsServices(
     },
     expiryLog,
   );
-  return { pipeline, store, cards: { get: (id) => cards.get(id) } };
+  return { pipeline, store, cards: { get: (id) => cards.get(id), ...(cards.comments ? { comments: (id: string) => cards.comments!(id) } : {}) } };
 }
 
 type HeldFn<T> = (assertHeld: () => void) => Promise<T>;

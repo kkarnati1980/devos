@@ -33,7 +33,9 @@ const SPEC = `# Shop
 
 async function project(stage = "intake") {
   const slug = `m22d-${randomBytes(6).toString("hex")}`;
-  return db.project.create({ data: { slug, name: slug, stage } });
+  // ADR-0012 CR-a2: pinned to mode off (the backfill), so these M2.2 tests keep covering what they covered before;
+  // continuous-run mode on Postgres is covered by test-db/preflight.test.mjs.
+  return db.project.create({ data: { slug, name: slug, stage, continuousRun: false, preflightState: "approved" } });
 }
 
 function pipeline(store) {
