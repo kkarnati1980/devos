@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // DEVOS-197 (docs/modules/S2.md, "DEVOS-197 build notes"): the CI secret scan, run locally over the commits about
-// to be pushed (<base>..HEAD, base origin/main by default), before every push. Same gitleaks version, the same
+// to be pushed (<base>..HEAD, base origin/main by default), before every push of the checked-out branch. Same gitleaks version, the same
 // default rules and the same .gitleaksignore as the CI `secret-scan` job. Never prints a secret.
 //   pnpm secret-scan:local [--base <ref>]
 // Exit 0 = clean, 1 = finding(s), 2 = tool or setup failure (gitleaks missing, base not found).
@@ -48,6 +48,20 @@ export function main(argv, env = process.env) {
   if (count.status !== 0) { console.error("secret-scan:local: cannot list commits"); return 2; }
   const n = Number(count.stdout.trim());
   const bin = resolveGitleaks(env);
+  // The same rules as CI: the pinned version only, and never a config swapped in through GITLEAKS_CONFIG
+  // (pre-review: an older gitleaks on PATH has fewer default rules and would PASS what CI fails).
+  const { GITLEAKS_CONFIG: _ignored, ...childEnv } = env;
+  const pinned = pinnedGitleaks().version;
+  const ver = spawnSync(bin, ["version"], { encoding: "utf8", timeout: 30_000, env: childEnv });
+  if (ver.error?.code === "ENOENT") {
+    console.error("secret-scan:local: gitleaks not found. Install the pinned copy: node scripts/security/install-gitleaks.mjs");
+    return 2;
+  }
+  const got = String(ver.stdout ?? "").trim().replace(/^v/, "");
+  if (ver.status !== 0 || got !== pinned) {
+    console.error(`secret-scan:local: gitleaks ${got || "(unknown version)"} is not the CI-pinned ${pinned}. Install it: node scripts/security/install-gitleaks.mjs`);
+    return 2;
+  }
   const dir = mkdtempSync(join(tmpdir(), "s2-local-"));
   const reportPath = join(dir, "report.json");
   try {
@@ -55,7 +69,7 @@ export function main(argv, env = process.env) {
       bin,
       ["git", "--no-banner", "--redact", "--exit-code", "1", "--report-format", "json", "--report-path", reportPath,
         `--log-opts=${args.base}..HEAD`, args.repo],
-      { encoding: "utf8", timeout: 5 * 60 * 1000, maxBuffer: 64 * 1024 * 1024 },
+      { encoding: "utf8", timeout: 5 * 60 * 1000, maxBuffer: 64 * 1024 * 1024, env: childEnv },
     );
     if (run.error?.code === "ENOENT") {
       console.error("secret-scan:local: gitleaks not found. Install the pinned copy: node scripts/security/install-gitleaks.mjs");

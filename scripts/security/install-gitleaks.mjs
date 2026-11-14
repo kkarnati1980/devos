@@ -45,9 +45,14 @@ export async function install({ env = process.env, fetchImpl = fetch, timeoutMs 
     // Copy next to the destination, then rename: the temp dir may be on another filesystem, and a half-copied
     // binary must never sit at the cached path.
     const part = `${dest}.${process.pid}.part`;
-    copyFileSync(join(work, "gitleaks"), part);
-    chmodSync(part, 0o755);
-    renameSync(part, dest);
+    try {
+      copyFileSync(join(work, "gitleaks"), part);
+      chmodSync(part, 0o755);
+      renameSync(part, dest);
+    } catch (e) {
+      rmSync(part, { force: true });
+      throw e;
+    }
   } finally {
     rmSync(work, { recursive: true, force: true });
   }

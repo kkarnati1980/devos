@@ -33,7 +33,9 @@ function stub(dir) {
   writeFileSync(p, `#!${process.execPath}
 import { writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
+if (args[0] === "version") { console.log(process.env.STUB_VERSION ?? "${pinnedGitleaks().version}"); process.exit(0); }
 writeFileSync(process.env.STUB_ARGS, JSON.stringify(args));
+if (process.env.GITLEAKS_CONFIG) process.exit(9);
 const i = args.indexOf("--report-path");
 if (process.env.STUB_FINDINGS !== "none") writeFileSync(args[i + 1], process.env.STUB_FINDINGS ?? "[]");
 process.exit(Number(process.env.STUB_STATUS ?? 0));
@@ -60,10 +62,12 @@ test("DEVOS-197: scans only <base>..HEAD with the CI flags; exit 1 on a finding,
     assert.match(bad.out, /FAIL \(1 finding\(s\): generic-api-key\)/);
     assert.ok(!bad.out.includes("REDACTED-VALUE-X"), "the secret and match fields are never printed");
     const args = JSON.parse(readFileSync(argsFile, "utf8"));
-    assert.deepEqual(args.slice(0, 2), ["git", "--no-banner"]);
-    for (const f of ["--redact", "--exit-code", "--report-format"]) assert.ok(args.includes(f), f);
-    assert.ok(args.includes("--log-opts=base..HEAD"), "only the commits about to be pushed");
-    const ok = run(dir, ["--base", "base"], { GITLEAKS: bin, STUB_ARGS: argsFile, STUB_STATUS: "0", STUB_FINDINGS: "[]" });
+    // CI's flags (scripts/security/secret-scan.mjs), then the range, then the repo last.
+    const i = args.indexOf("--report-path");
+    assert.deepEqual(args.slice(0, i), ["git", "--no-banner", "--redact", "--exit-code", "1", "--report-format", "json"]);
+    assert.deepEqual(args.slice(i + 2), ["--log-opts=base..HEAD", "."], "only the commits about to be pushed, then the repo");
+    // A GITLEAKS_CONFIG in the caller's shell never reaches gitleaks (the stub exits 9 if it does).
+    const ok = run(dir, ["--base", "base"], { GITLEAKS: bin, STUB_ARGS: argsFile, STUB_STATUS: "0", STUB_FINDINGS: "[]", GITLEAKS_CONFIG: join(dir, "weaker.toml") });
     assert.equal(ok.status, 0, ok.out);
     assert.match(ok.out, /PASS \(1 commit\(s\) in base\.\.HEAD, no secrets\)/);
   } finally {
@@ -82,6 +86,9 @@ test("DEVOS-197: tool and setup failures exit 2, never 0", () => {
     assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: '[{"RuleID":"x","File":"f","StartLine":1}]' }).status, 2, "exit 0 with findings");
     assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: "not json" }).status, 2, "report not JSON");
     assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: "none" }).status, 2, "report missing with commits to scan");
+    const old = run(dir, ["--base", "base"], { ...env, STUB_VERSION: "8.18.0" });
+    assert.equal(old.status, 2, "a gitleaks that is not the CI-pinned version");
+    assert.match(old.out, /not the CI-pinned/);
     const missing = run(dir, ["--base", "base"], { GITLEAKS: join(dir, "no-such-gitleaks") });
     assert.equal(missing.status, 2);
     assert.match(missing.out, /install-gitleaks\.mjs/);
@@ -90,6 +97,18 @@ test("DEVOS-197: tool and setup failures exit 2, never 0", () => {
     assert.match(noBase.out, /not found/);
     assert.equal(run(dir, ["--base", "--all"], env).status, 2, "a base that git would read as an option");
     assert.equal(run(dir, ["--bogus"], env).status, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("DEVOS-197: no new commits passes without needing a report", () => {
+  const { dir } = repo();
+  try {
+    const bin = stub(dir);
+    const r = run(dir, ["--base", "base"], { GITLEAKS: bin, STUB_ARGS: join(dir, "args.json"), STUB_STATUS: "0", STUB_FINDINGS: "none" });
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.out, /PASS \(0 commit\(s\) in base\.\.HEAD/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -119,6 +138,7 @@ test("DEVOS-197: the local gitleaks pin is the CI pin, and a checksum mismatch i
     await assert.rejects(install({ env, fetchImpl }), /checksum mismatch/);
     assert.ok(!existsSync(cachedGitleaksPath(pin.version, env)), "nothing installed");
     await assert.rejects(install({ env, fetchImpl: async () => new Response("", { status: 404 }) }), /HTTP 404/);
+    assert.ok(!existsSync(cachedGitleaksPath(pin.version, env)), "nothing installed");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
