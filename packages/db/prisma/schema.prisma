@@ -894,6 +894,7 @@ model AppSettings {
   timezone             String    @default("Asia/Kolkata")
   auditRetentionMonths Int       @default(12) @map("audit_retention_months")
   deadlockAttempts     Int       @default(3) @map("deadlock_attempts")
+  analystModelPass     Boolean   @default(false) @map("analyst_model_pass")
   capsConfirmedAt      DateTime? @map("caps_confirmed_at") @db.Timestamptz(6)
   createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)

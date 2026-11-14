@@ -60,7 +60,7 @@ function sdk(text, { cost = 0.02, fail = false, calls = [] } = {}) {
   })();
 }
 
-function setup({ text = "", budgets = [], fail = false, mode = "observe" } = {}) {
+function setup({ text = "", budgets = [], fail = false, mode = "observe", modelPassOn } = {}) {
   const runStore = new MemoryRunStore();
   const pstore = new MemoryPolicyStore({ mode });
   const policy = new PolicyEngine({ store: pstore, hmacKey: randomBytes(32), budgets });
@@ -71,7 +71,7 @@ function setup({ text = "", budgets = [], fail = false, mode = "observe" } = {})
   reqStore.addProject({ id: P1, name: "Shop", stage: "intake" });
   const approvalStore = new MemoryApprovalStore();
   const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
-  const svc = requirementsServices(reqStore, approvals, approvalStore, runEngineModelRunner(rows, engine));
+  const svc = requirementsServices(reqStore, approvals, approvalStore, runEngineModelRunner(rows, engine), undefined, 0, modelPassOn);
   return { runStore, rows, reqStore, svc, pstore, calls };
 }
 
@@ -210,4 +210,33 @@ test("AT-MR7b (DEVOS-161) the runner's policy lock key is M1.7's", async () => {
   const { POLICY_LOCK_KEY } = await import("../dist/analyst-runner.js");
   const src = await readFile(new URL("../../../packages/policy/src/prisma-store.ts", import.meta.url), "utf8");
   assert.match(src, new RegExp(`const LOCK_KEY = "${POLICY_LOCK_KEY}";`));
+});
+
+test("AT-CA9b (DEVOS-176) the analyst.model_pass setting is read before each pass: off → no run, on → one run, no restart", async () => {
+  let setting = false;
+  let reads = 0;
+  const s = setup({ text: proposal(2), modelPassOn: async () => (reads++, setting) });
+  const off = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(s.rows.created.length, 0, "setting off → no analyst run, nothing charged");
+  assert.equal(s.calls.length, 0);
+  assert.equal(off.counts.proposed, 0);
+  assert.deepEqual(off.warnings, []);
+  setting = true;
+  const on = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC + "\n" });
+  assert.equal(s.rows.created.length, 1, "setting turned on, same pipeline → one run");
+  assert.equal(on.counts.proposed, 1);
+  setting = false;
+  await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC + "\n\n" });
+  assert.equal(s.rows.created.length, 1, "turned off again → no further run");
+  assert.equal(reads, 3, "read once per submission");
+});
+
+test("AT-CA9c (DEVOS-176) a setting read that fails, or a non-boolean value, counts as off (fail-safe, deterministic only)", async () => {
+  for (const modelPassOn of [async () => { throw new Error("db down"); }, async () => "true", async () => 1]) {
+    const s = setup({ text: proposal(2), modelPassOn });
+    const r = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+    assert.equal(s.rows.created.length, 0);
+    assert.equal(s.calls.length, 0);
+    assert.equal(r.counts.proposed, 0, "deterministic only: no model proposal");
+  }
 });

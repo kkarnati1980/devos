@@ -101,6 +101,11 @@ export interface PipelinePorts {
   raiseQuestionCard: RaiseCard;
   /** M1.5 run-engine binding (role Analyst); null/absent = deterministic only. */
   runner?: ModelRunner | null;
+  /**
+   * DEVOS-176: the `analyst.model_pass` setting, read before each pass so a change takes effect without a restart.
+   * Absent = on whenever a runner is bound. A read that fails counts as off (fail-safe: no model spend, deterministic only).
+   */
+  modelPassOn?: () => Promise<boolean>;
   ingest?: (bytes: Uint8Array, originalName: string) => Promise<IngestResult>;
   now?: () => Date;
 }
@@ -169,6 +174,16 @@ export class RequirementsPipeline {
     this.ingest = ports.ingest ?? ((b, n) => defaultIngest(b, n));
   }
 
+  /** DEVOS-176: the setting at call time; absent → on, a failed read → off (only `true` turns it on). */
+  private async modelPassOn(): Promise<boolean> {
+    if (!this.ports.modelPassOn) return true;
+    try {
+      return (await this.ports.modelPassOn()) === true;
+    } catch {
+      return false;
+    }
+  }
+
   async submitSpec(projectId: string, input: SpecInput): Promise<SubmitResult> {
     if (typeof projectId !== "string" || !UUID.test(projectId)) throw new PipelineError("invalid-input");
     const project = await this.ports.store.project(projectId);
@@ -206,7 +221,7 @@ export class RequirementsPipeline {
 
     const warnings: PipelineWarningCode[] = [];
     let analysis = analyzeSpec(ingested.blocks);
-    if (this.ports.runner) {
+    if (this.ports.runner && (await this.modelPassOn())) {
       try {
         const runner = this.ports.runner;
         const assisted = await assistAnalysis(ingested.blocks, analysis, (req) => runner({ ...req, projectId }));

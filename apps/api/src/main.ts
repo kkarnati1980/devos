@@ -6,7 +6,7 @@ import { stdoutSink } from "./http.js";
 import { TailscaleWhoisResolver } from "./identity.js";
 import { buildRuntime, type DbClient } from "./runtime.js";
 import type { DeadLetterQueue } from "./dead-letters.js";
-import { analystModelPass, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
+import { analystModelPassAllowed, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
 import { ANALYST_MAX_SECONDS } from "./analyst-runner.js";
 
 async function main(): Promise<void> {
@@ -39,8 +39,9 @@ async function main(): Promise<void> {
       });
       return q;
     },
-    // M2.2-d3b2: the analyst model pass is opt-in (`DEVOS_ANALYST_MODEL_PASS=on`); off, intake stays deterministic.
-    ...(analystModelPass(process.env)
+    // DEVOS-176: the run engine is loaded unless `DEVOS_ANALYST_MODEL_PASS=off` (hard off); whether a pass runs is the
+    // `analyst.model_pass` setting, read per call (default off, so intake stays deterministic until KK turns it on).
+    ...(analystModelPassAllowed(process.env)
       ? {
           loadAnalystEngine: async (db, policy, apiKey) => {
             const runEngineModuleName = "@devos/run-engine";
@@ -70,7 +71,7 @@ async function main(): Promise<void> {
   requirementsSync?.start();
   process.once("SIGTERM", () => requirementsSync?.stop());
   process.once("SIGINT", () => requirementsSync?.stop());
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPassAllowed: analystModelPassAllowed(process.env) && requirements.pipeline !== null });
 }
 
 main().catch((e: unknown) => {

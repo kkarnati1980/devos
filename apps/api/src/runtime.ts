@@ -89,7 +89,7 @@ export async function buildRuntime(
     loadQueue?: (redisUrl: string) => Promise<DeadLetterQueue>;
     /**
      * M2.2-d3b1: builds M1.5's RunEngine (with the Anthropic adapter) over this database and policy engine for the
-     * analyst model pass. Absent → model pass off. M2.2-d3b2 supplies it from main.ts when `DEVOS_ANALYST_MODEL_PASS=on`,
+     * analyst model pass. Absent → model pass off. main.ts supplies it unless `DEVOS_ANALYST_MODEL_PASS=off` (DEVOS-176),
      * importing the run engine at runtime like @devos/db, so the API typechecks on its own. `apiKey` reads the vault.
      */
     loadAnalystEngine?: (db: DbClient, policy: PolicyEngine, apiKey: () => Promise<string | null>) => Promise<RunExecutor>;
@@ -168,7 +168,9 @@ export async function buildRuntime(
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
   // Codex PR88-r5: one expiry write can wait up to maxWait for a connection and then run up to timeout, so the hold
   // reserves the approvals store's whole step bound (built with `t` above), not its transaction timeout alone.
-  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(t));
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(t),
+    // DEVOS-176: the `analyst.model_pass` setting, read before each pass (a change applies without a restart).
+    async () => (await setup.settings!.get()).analystModelPass);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
 }
@@ -187,6 +189,8 @@ export function requirementsServices(
   expiryLog?: ExpiryLog,
   /** The longest one expiry write can take, connection wait included (`approvalStepBoundMs`; Codex PR88-r4, PR88-r5, PR88-r6). */
   expireStepMs = 0,
+  /** DEVOS-176: the `analyst.model_pass` setting read per call; absent → the pass runs whenever a runner is bound. */
+  modelPassOn?: () => Promise<boolean>,
 ): RequirementsServices {
   // M2.2-d3c2: after each submission, the superseded version's pending cards and an unlinked requirements card
   // are expired through the M2.3 core (DEVOS-164).
@@ -197,6 +201,7 @@ export function requirementsServices(
       // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
       raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
       runner,
+      ...(modelPassOn ? { modelPassOn } : {}),
     },
     {
       latestDoc: (id) => store.latestDoc(id),
