@@ -220,9 +220,10 @@ function parenBody(text, i) {
 
 
 /** Every *.sql file under dir (sorted), or [] when the folder does not exist. */
+// The folder is resolved against cwd, so an absolute --dir is used as given (PR125-r7).
 export function migrationFiles(dir, cwd = process.cwd()) {
-  if (!existsSync(join(cwd, dir))) return [];
-  return readdirSync(join(cwd, dir), { recursive: true }).map(String).filter((f) => f.endsWith(".sql")).sort().map((f) => join(dir, f));
+  if (!existsSync(resolve(cwd, dir))) return [];
+  return readdirSync(resolve(cwd, dir), { recursive: true }).map(String).filter((f) => f.endsWith(".sql")).sort().map((f) => join(dir, f));
 }
 
 export function main(argv = process.argv.slice(2), { cwd = process.cwd(), log = console.log } = {}) {

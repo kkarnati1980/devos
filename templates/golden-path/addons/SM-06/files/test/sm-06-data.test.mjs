@@ -238,3 +238,15 @@ test("SM-06-L2: a column named like a value source (serial, generated) still nee
   assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN IF NOT EXISTS n serial4 NOT NULL;"), []);
   assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN id integer GENERATED ALWAYS AS IDENTITY NOT NULL;"), []);
 });
+
+// Codex PR125-r7 finding 1.
+test("SM-06-L2: an absolute --dir is read as given, not joined onto cwd (r7)", () => {
+  const root = mkdtempSync(join(tmpdir(), "sm06-abs-"));
+  mkdirSync(join(root, "db"));
+  writeFileSync(join(root, "db", "001.sql"), "DROP TABLE users;");
+  const lines = [];
+  const run = (argv) => main(argv, { cwd: join(root, "elsewhere"), log: (l) => lines.push(l) });
+  assert.equal(run(["--dir", join(root, "db")]), 1);
+  assert.ok(lines.some((l) => l.startsWith("REFUSED") && l.includes("drop-object")));
+  assert.ok(lines.some((l) => l.includes("1 file(s)")));
+});
