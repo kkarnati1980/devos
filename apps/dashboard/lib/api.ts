@@ -52,6 +52,25 @@ function markSession(): void {
   if (typeof window !== "undefined") window.dispatchEvent(new Event(SESSION_EVENT));
 }
 
+/** ADR-0012 CR-a3 (DEVOS-199): the project page's read-only pre-flight view. Secret items carry names only. */
+export interface PreflightItemView {
+  id: string;
+  kind: "decision" | "secret";
+  text: string;
+  default: string;
+  options?: string[];
+  blocks?: string[];
+}
+export interface PreflightView {
+  continuousRun: boolean;
+  state: "pending" | "approved" | "rejected" | null;
+  open: boolean;
+  items: PreflightItemView[];
+  missingSecrets: string[];
+  secretsUnverified: boolean;
+  decisions: { itemId: string; answer: string; source: string; createdAt: string }[];
+}
+
 /** M1.6 notifications. */
 export type ChannelKind = "dashboard" | "mybrain" | "email";
 export interface Delivery {
@@ -188,6 +207,10 @@ export class DevosApi {
   retryDeadLetter(jobId: string) {
     return this.call<{ retried: string }>("POST", `/runs/dead-letters/${encodeURIComponent(jobId)}/retry`);
   }
+  /** ADR-0012 CR-a3 (DEVOS-199). */
+  preflight(slug: string) {
+    return this.call<{ preflight: PreflightView }>("GET", `/projects/by-slug/${encodeURIComponent(slug)}/preflight`);
+  }
   /** M2.3-b2 (DEVOS-135): the approvals inbox over the M2.3-b1 routes. */
   approvals(query: { status?: ApprovalStatus; cursor?: string } = {}) {
     const q = new URLSearchParams();
@@ -288,6 +311,9 @@ export const SECRET_LABELS: Record<string, string> = {
 
 /** Human messages for API codes; the code itself is shown too, never any input. */
 export function explain(code: string): string {
+  if (code === "project-not-found") return "No pre-flight for this project yet (the API does not know it).";
+  if (code === "preflight-not-configured" || code === "requirements-not-configured") return "The pre-flight needs the database (DATABASE_URL).";
+  if (code === "requirements-store-error") return "The pre-flight could not be read. Try again in a minute.";
   if (code === "api-unreachable") return "The DevOS API did not answer. Check you are on the tailnet.";
   if (code === "not-kk") return "This device is not signed in to the tailnet as KK.";
   if (code === "notifications-not-configured") return "Notifications need the database (DATABASE_URL).";

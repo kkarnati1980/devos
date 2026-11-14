@@ -443,3 +443,28 @@ test("DEVOS-170 (db): gateForRulesFromDb reads real policy_rule rows (uuid ids, 
     if (created.length) await db.policyRule.deleteMany({ where: { id: { in: created } } });
   }
 });
+
+test("DEVOS-190 (db): list filters by gate, action and target, newest first, paged by cursor", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals, store } = setup();
+  const action = `question.${randomUUID()}`;
+  const mk = (over) => approvals.raiseCard(card(projectId, over), []);
+  const a1 = await mk({ action, target: "req:1" });
+  const other = await mk({ gate: "first_launch", action, target: "req:1" });
+  const a2 = await mk({ action, target: "req:2" });
+  const b1 = await mk({ target: "req:1" });
+  const a3 = await mk({ action, target: "req:3" });
+  const ids = (cards) => cards.map((c) => c.id);
+  const all = await store.list({ projectId, gate: "decision", action, limit: 10 });
+  assert.deepEqual(new Set(ids(all)), new Set([a1.id, a2.id, a3.id]));
+  assert.ok(!ids(all).includes(other.id) && !ids(all).includes(b1.id));
+  const p1 = await store.list({ projectId, gate: "decision", action, limit: 2 });
+  const p2 = await store.list({ projectId, gate: "decision", action, limit: 2, cursor: p1.at(-1).id });
+  assert.deepEqual([...ids(p1), ...ids(p2)], ids(all));
+  assert.deepEqual(ids(await store.list({ projectId, gate: "decision", action, target: "req:2", limit: 10 })), [a2.id]);
+  assert.deepEqual(ids(await store.list({ projectId, gate: "first_launch", limit: 10 })), [other.id]);
+  assert.deepEqual(await store.list({ projectId, gate: "decision", action, target: "req:9", limit: 10 }), []);
+  assert.deepEqual(await store.list({ projectId: randomUUID(), gate: "decision", action, limit: 10 }), []);
+  await approvals.reject(KK, a2.id, "no");
+  assert.deepEqual(ids(await store.list({ projectId, gate: "decision", action, status: "rejected", limit: 10 })), [a2.id]);
+});

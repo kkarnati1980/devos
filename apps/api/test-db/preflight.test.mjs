@@ -50,7 +50,7 @@ test("AT3/AT4/AT6 (CR-a2, db): new projects default to the mode; approval writes
   assert.match(card.reason, /Pre-flight: \d+ questions, 1 secrets/);
   assert.deepEqual(await store.latestPreflight(p.id), r.preflight);
   assert.equal(await store.preflightState(p.id), "pending");
-  assert.deepEqual(await store.preflightSnapshot(p.id), { state: "pending", items: r.preflight }, "one-statement snapshot");
+  assert.deepEqual(await store.preflightSnapshot(p.id), { state: "pending", items: r.preflight, approvalId: r.approvalId }, "one-statement snapshot");
   assert.equal(await store.preflightSnapshot("00000000-0000-4000-8000-000000000000"), null);
   const vault = (has) => ({ hasProject: async (_pid, n) => has && n === preflightSecretName("PAYMENTS_KEY") });
   assert.equal(await preflightOpen(p.id, store, vault(true)), false, "pending");
@@ -68,6 +68,10 @@ test("AT3/AT4/AT6 (CR-a2, db): new projects default to the mode; approval writes
   const rows = await db.projectDecision.findMany({ where: { projectId: p.id }, orderBy: { itemId: "asc" } });
   const decisions = r2.preflight.filter((i) => i.kind === "decision");
   assert.equal(rows.length, decisions.length);
+  // CR-a3 (Codex PR127-r1): the page's answers are scoped to the newest doc's card, from the same snapshot.
+  assert.equal((await store.preflightSnapshot(p.id)).approvalId, r2.approvalId);
+  assert.equal((await store.decisions(p.id, r2.approvalId)).length, decisions.length);
+  assert.deepEqual(await store.decisions(p.id, r.approvalId), [], "the rejected version's card has no rows");
   assert.deepEqual(rows.find((x) => x.itemId === "PF-1").source, "kk");
   assert.ok(rows.filter((x) => x.itemId !== "PF-1").every((x) => x.source === "default" && x.approvalId === r2.approvalId));
   assert.equal(await store.preflightState(p.id), "approved");
@@ -119,4 +123,17 @@ test("DEVOS-205 (db): approving a doc without a pre-flight on a pending project 
   const rejected = await mk("rejected");
   assert.equal(await store.approveDoc(rejected.doc.id), true);
   assert.equal(await store.preflightState(rejected.p.id), "rejected");
+});
+
+test("DEVOS-208 (db): a new spec version with the mode off re-opens a rejected pre-flight; approval then opens it", async () => {
+  const store = new PrismaRequirementsStore(db, 5000);
+  const p = await project({ continuousRun: false, preflightState: "rejected" });
+  const r = await pipeline(store, []).submitSpec(p.id, { kind: "paste", text: SPEC });
+  assert.equal(await store.preflightState(p.id), "pending", "rule 4: a new version re-opens it");
+  assert.equal(await pipeline(store, []).applyDecision({ id: r.approvalId, gate: "requirements", status: "approved" }), "approved");
+  assert.equal(await store.preflightState(p.id), "approved");
+  // An approved mode-off project is not moved by a new version.
+  const ok = await project({ continuousRun: false, preflightState: "approved" });
+  await pipeline(store, []).submitSpec(ok.id, { kind: "paste", text: SPEC });
+  assert.equal(await store.preflightState(ok.id), "approved");
 });
