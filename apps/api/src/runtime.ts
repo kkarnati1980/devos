@@ -16,6 +16,7 @@ import { PrismaRequirementsStore } from "./requirements-store.js";
 import type { RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
+import { PrismaIsolationStore } from "./isolation-store.js";
 import type { ModelRunner } from "@devos/analyst";
 import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
@@ -70,6 +71,8 @@ export interface Runtime {
   requirementsSync: RequirementsSyncJob | null;
   /** DEVOS-171: closes analyst runs left open past max_seconds + grace (start-up and every 5 min); main.ts starts it. */
   analystSweep: AnalystRunSweepJob | null;
+  /** S4-a2b: the stack rows GET /internal/isolation-state reads; null without a database. */
+  isolation: PrismaIsolationStore | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -111,7 +114,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, isolation: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -175,7 +178,9 @@ export async function buildRuntime(
     async () => (await setup.settings!.get()).analystModelPass);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep };
+  // S4-a2b: the read side of GET /internal/isolation-state (and, in the M2.4-d wiring, the afterStack hook store).
+  const isolation = new PrismaIsolationStore(db, t);
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation };
 }
 
 /**

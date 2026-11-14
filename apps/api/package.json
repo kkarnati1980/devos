@@ -6,15 +6,16 @@
   "description": "DevOS API (M1.2): NestJS, Tailscale identity, 12-hour session, CSRF, security headers, request-ID JSON logs, OpenAPI contract.",
   "main": "dist/main.js",
   "scripts": {
-    "build": "pnpm --filter @devos/policy --filter @devos/analyst run build && tsc -p tsconfig.json",
-    "typecheck": "pnpm --filter @devos/policy --filter @devos/analyst run build && tsc -p tsconfig.json --noEmit",
-    "test": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/run-engine run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
-    "test:db": "pnpm --filter @devos/policy --filter @devos/analyst run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
+    "build": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation run build && tsc -p tsconfig.json",
+    "typecheck": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation run build && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation --filter @devos/run-engine run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
+    "test:db": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
     "start": "node dist/main.js"
   },
   "dependencies": {
     "@devos/analyst": "workspace:*",
     "@devos/db": "workspace:*",
+    "@devos/isolation": "workspace:*",
     "@devos/policy": "workspace:*",
     "@devos/run-engine": "workspace:*",
     "@nestjs/common": "11.2.8",
