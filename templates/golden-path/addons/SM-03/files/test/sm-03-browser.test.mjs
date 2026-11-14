@@ -240,6 +240,13 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`${html`<svg><foreignObject><div></svg></div></foreignObject>`}<title><img onerror="${"x"}"></title></svg>`, /balanced|event-handler/);
   assert.throws(() => html`<svg></svg>${html`<title>${"t"}</title>`}`, /inside <svg> or <math>/);
   assert.equal(String(html`<svg></svg><textarea>${"<b>"}</textarea>`), "<svg></svg><textarea>&lt;b&gt;</textarea>");
+  // Codex PR98-r12: array members are placed in order, each against the state the earlier ones left.
+  const prefix = html`<svg><foreignObject><div></svg></div></foreignObject>`;
+  const body = html`<title><img src=x onerror="${"alert(1)"}"></title>`;
+  assert.throws(() => html`${[prefix, body]}</svg>`, /inside <svg> or <math>/);
+  assert.throws(() => html`${[[prefix], [[body]]]}</svg>`, /inside <svg> or <math>/);
+  assert.throws(() => html`<p>${["a", html`<svg>`]}</p>`, /balanced/);
+  assert.equal(String(html`<ul>${["<a>", html`<li>${"b"}</li>`, 3]}</ul>`), "<ul>&lt;a&gt;<li>b</li>3</ul>");
   // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
   // and an RCDATA-free fragment inside SVG.
   assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');

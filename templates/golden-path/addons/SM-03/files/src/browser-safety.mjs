@@ -313,7 +313,10 @@ export function html(strings, ...values) {
   const state = new MarkupState();
   let out = strings[0];
   state.feed(strings[0]);
-  for (let i = 0; i < values.length; i++) {
+  // Codex PR98-r12: an array's members are placed one at a time, each checked against the state the members
+  // before it left (a fragment that opens <svg> changes how the next one is read), never all against the start.
+  const place = (v) => {
+    if (Array.isArray(v)) { for (const x of v) place(x); return; }
     if (state.mode === "bogus") throw new TypeError("html: no value may be placed inside <!…>, <?…> or </…> declarations");
     if (state.mode === "raw" || state.mode === "comment") throw new TypeError(`html: no value may be placed inside <${state.raw || "!--"}>`);
     if (state.mode === "tag" || state.mode === "lt") throw new TypeError("html: quote every attribute that holds a value (and no value may name a tag)");
@@ -321,10 +324,15 @@ export function html(strings, ...values) {
       throw new TypeError("html: no value may be placed in an event-handler, style, srcdoc or code-loading attribute");
     }
     if (state.mode === "quote") state.valued = true;
-    assertPlaceable(values[i], state);
-    const piece = renderValue(values[i]) + strings[i + 1];
+    assertPlaceable(v, state);
+    const piece = renderValue(v);
     state.feed(piece);
     out += piece;
+  };
+  for (let i = 0; i < values.length; i++) {
+    place(values[i]);
+    state.feed(strings[i + 1]);
+    out += strings[i + 1];
   }
   // Each result must be balanced: it may not end inside a tag, attribute, comment, raw-text element or an open
   // SVG/MathML subtree. Otherwise an unbalanced fragment could smuggle an interpolated value into an attribute
