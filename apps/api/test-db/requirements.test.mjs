@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import { createDb } from "@devos/db";
 import { PipelineError, RequirementsPipeline } from "@devos/analyst";
 import { MAX_REQUIREMENTS, PrismaRequirementsStore } from "../dist/requirements-store.js";
+import { Approvals, PrismaApprovalStore } from "../dist/approvals.js";
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required for test:db");
@@ -180,4 +181,27 @@ test("AT-S4 draftsAwaitingDecision: only projects whose newest doc is a draft li
   const one = await store.draftsAwaitingDecision(1);
   assert.equal(one.length, 1);
   assert.equal(one[0], all[0], "the limit keeps the oldest");
+});
+
+test("AT-E8 (M2.2-d3c2, Codex PR88-r1) while the project is held, cards of that project can be expired (audit rows with its FK) and a new version waits", async () => {
+  const p = await project();
+  const store = new PrismaRequirementsStore(db, 5000);
+  const approvals = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
+  const pl = pipeline(store);
+  const r1 = await pl.submitSpec(p.id, { kind: "paste", text: SPEC });
+  const order = [];
+  let second;
+  const expired = await store.withProjectHeld(p.id, async () => {
+    second = pl.submitSpec(p.id, { kind: "paste", text: SPEC }).then((r) => (order.push("saved"), r));
+    await new Promise((res) => setTimeout(res, 300));
+    // Expiry writes audit rows that reference the project (a FOR KEY SHARE on its row): it must not wait on the hold.
+    const ids = await approvals.expireCardsById([r1.approvalId], "Superseded: test");
+    order.push("expired");
+    return ids;
+  });
+  const r2 = await second;
+  assert.deepEqual(expired, [r1.approvalId]);
+  assert.deepEqual(order, ["expired", "saved"], "the new version saved only after the hold ended");
+  assert.equal(r2.docVersion, 2);
+  assert.equal((await db.approval.findUnique({ where: { id: r1.approvalId } })).status, "expired");
 });

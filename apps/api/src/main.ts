@@ -6,13 +6,15 @@ import { stdoutSink } from "./http.js";
 import { TailscaleWhoisResolver } from "./identity.js";
 import { buildRuntime, type DbClient } from "./runtime.js";
 import type { DeadLetterQueue } from "./dead-letters.js";
+import { analystModelPass, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
+import { ANALYST_MAX_SECONDS } from "./analyst-runner.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadDb: async (url) => {
@@ -37,6 +39,16 @@ async function main(): Promise<void> {
       });
       return q;
     },
+    // M2.2-d3b2: the analyst model pass is opt-in (`DEVOS_ANALYST_MODEL_PASS=on`); off, intake stays deterministic.
+    ...(analystModelPass(process.env)
+      ? {
+          loadAnalystEngine: async (db, policy, apiKey) => {
+            const runEngineModuleName = "@devos/run-engine";
+            const m = (await import(runEngineModuleName)) as RunEngineModule;
+            return buildAnalystEngine(m, db, policy, { apiKey, timeoutMs: ANALYST_MAX_SECONDS * 1000 });
+          },
+        }
+      : {}),
   });
 
   const app = await createApp({
@@ -56,9 +68,11 @@ async function main(): Promise<void> {
   await app.listen(config.port, config.host);
   // M2.2-d3c1: decided requirements cards are applied without waiting for the sync POST; stopped with the process.
   requirementsSync?.start();
-  process.once("SIGTERM", () => requirementsSync?.stop());
-  process.once("SIGINT", () => requirementsSync?.stop());
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null });
+  // DEVOS-171: analyst runs the runner could not close (DB down) are closed and settled, at start-up and every 5 min.
+  analystSweep?.start();
+  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); });
+  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null });
 }
 
 main().catch((e: unknown) => {

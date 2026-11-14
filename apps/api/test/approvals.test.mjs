@@ -206,10 +206,11 @@ test("AT10 closeMilestone needs an approved, same-project, same-gate approval an
   const policy = new PolicyEngine({ store: new MemoryPolicyStore({ mode: "enforce", rules: [allowGate] }), hmacKey: KEY });
   const store = new MemoryGateStore();
   store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
-  store.approvals.set(A_OK, { id: A_OK, projectId: PROJECT, gate: "requirements", status: "approved" });
-  store.approvals.set(A_PENDING, { id: A_PENDING, projectId: PROJECT, gate: "requirements", status: "pending" });
-  store.approvals.set(A_OTHER_PROJECT, { id: A_OTHER_PROJECT, projectId: OTHER, gate: "requirements", status: "approved" });
-  store.approvals.set(A_OTHER_GATE, { id: A_OTHER_GATE, projectId: PROJECT, gate: "decision", status: "approved" });
+  const target = `milestone:${M}`;
+  store.approvals.set(A_OK, { id: A_OK, projectId: PROJECT, gate: "requirements", target, status: "approved" });
+  store.approvals.set(A_PENDING, { id: A_PENDING, projectId: PROJECT, gate: "requirements", target, status: "pending" });
+  store.approvals.set(A_OTHER_PROJECT, { id: A_OTHER_PROJECT, projectId: OTHER, gate: "requirements", target, status: "approved" });
+  store.approvals.set(A_OTHER_GATE, { id: A_OTHER_GATE, projectId: PROJECT, gate: "decision", target, status: "approved" });
   const gates = new GateEngine({ store, policy });
   const kkId = { id: "kk:kk@example.com", type: "kk" };
   for (const a of [A_PENDING, A_OTHER_PROJECT, A_OTHER_GATE, OTHER]) {
@@ -227,6 +228,41 @@ test("AT10 closeMilestone needs an approved, same-project, same-gate approval an
   assert.ok(store.milestones.get(M).closedAt);
   assert.equal(store.audit.at(-1).action, "milestone.closed");
   await assert.rejects(gates.closeMilestone(kkId, M, A_OK), (e) => e.code === "milestone-closed");
+});
+
+test("DEVOS-170: only a card raised for the milestone is evidence; a same-gate policy card or another milestone's card is not", async () => {
+  const M = "55555555-5555-4555-8555-55555555555a";
+  const M2 = "55555555-5555-4555-8555-55555555555b";
+  const A_POLICY = "66666666-6666-4666-8666-66666666666a";
+  const A_OTHER_MS = "66666666-6666-4666-8666-66666666666b";
+  const A_PREFIX = "66666666-6666-4666-8666-66666666666c";
+  const A_MS = "66666666-6666-4666-8666-66666666666d";
+  const allowGate = { ...approvalRule, id: "r-gate-170", name: "gate transitions", actions: ["gate.transition"], principals: [], effect: "allow" };
+  const policy = new PolicyEngine({ store: new MemoryPolicyStore({ mode: "enforce", rules: [allowGate] }), hmacKey: KEY });
+  const store = new MemoryGateStore();
+  store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "first_launch", closedAt: null });
+  store.milestones.set(M2, { id: M2, projectId: PROJECT, gateName: "first_launch", closedAt: null });
+  // KK approved a first_launch card for a launch action: right project, right gate, but not raised for the milestone.
+  store.approvals.set(A_POLICY, { id: A_POLICY, projectId: PROJECT, gate: "first_launch", target: "app:x", status: "approved" });
+  store.approvals.set(A_OTHER_MS, { id: A_OTHER_MS, projectId: PROJECT, gate: "first_launch", target: `milestone:${M2}`, status: "approved" });
+  store.approvals.set(A_PREFIX, { id: A_PREFIX, projectId: PROJECT, gate: "first_launch", target: `milestone:${M}x`, status: "approved" });
+  store.approvals.set(A_MS, { id: A_MS, projectId: PROJECT, gate: "first_launch", target: `milestone:${M}`, status: "approved" });
+  const gates = new GateEngine({ store, policy });
+  const kkId = { id: "kk:kk@example.com", type: "kk" };
+  for (const a of [A_POLICY, A_OTHER_MS, A_PREFIX]) {
+    await assert.rejects(gates.closeMilestone(kkId, M, a), (e) => e instanceof ApprovalError && e.code === "gate-evidence-missing" && e.status === 409, a);
+  }
+  assert.equal(store.milestones.get(M).closedAt, null);
+  // The store re-checks the target inside the close as well, not only the engine.
+  assert.equal(await store.close(M, A_POLICY, { gate: "first_launch", projectId: PROJECT }, new Date(), { action: "milestone.closed", summary: "s", details: {} }, "kk"), false);
+  assert.equal(store.milestones.get(M).closedAt, null);
+  const closed = await gates.closeMilestone(kkId, M, A_MS);
+  assert.equal(closed.approvalId, A_MS);
+  assert.ok(store.milestones.get(M).closedAt);
+  // A milestone card closes only its own milestone.
+  await assert.rejects(gates.closeMilestone(kkId, M2, A_MS), (e) => e.code === "gate-evidence-missing");
+  const closed2 = await gates.closeMilestone(kkId, M2, A_OTHER_MS);
+  assert.equal(closed2.milestoneId, M2);
 });
 
 test("pre-review: approve enforces option limits itself; a failed loser revoke is audited, not swallowed", async () => {
@@ -299,7 +335,7 @@ test("Codex PR41-r1: a gate.transition that requires approval closes only with K
   const { grantId } = await approvals.approve(session, c.id);
   const store = new MemoryGateStore();
   store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
-  store.approvals.set(c.id, { id: c.id, projectId: PROJECT, gate: "requirements", status: "approved" });
+  store.approvals.set(c.id, { id: c.id, projectId: PROJECT, gate: "requirements", target: c.target, status: "approved" });
   const gates = new GateEngine({ store, policy: engine });
   // The release agent acts on KK's grant (M1.7 refuses a grant used by its own issuer).
   const releaser = { id: "agent:release", type: "agent" };
@@ -320,7 +356,7 @@ test("Codex PR41-r4: a SHA-scoped gate grant closes the milestone only for the a
   const { grantId } = await approvals.approve(session, c.id, { sha: SHA_OK });
   const store = new MemoryGateStore();
   store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
-  store.approvals.set(c.id, { id: c.id, projectId: PROJECT, gate: "requirements", status: "approved" });
+  store.approvals.set(c.id, { id: c.id, projectId: PROJECT, gate: "requirements", target: c.target, status: "approved" });
   const gates = new GateEngine({ store, policy: engine });
   const releaser = { id: "agent:release", type: "agent" };
   // No SHA forwarded, or another commit: M1.7 refuses the SHA-scoped grant.
@@ -338,7 +374,7 @@ test("Codex PR41-r1: a gate name changed between validation and close does not c
   const A = "66666666-6666-4666-8666-666666666667";
   const store = new MemoryGateStore();
   store.milestones.set(M, { id: M, projectId: PROJECT, gateName: "requirements", closedAt: null });
-  store.approvals.set(A, { id: A, projectId: PROJECT, gate: "requirements", status: "approved" });
+  store.approvals.set(A, { id: A, projectId: PROJECT, gate: "requirements", target: `milestone:${M}`, status: "approved" });
   const policy = { decide: async () => { store.milestones.get(M).gateName = "first_launch"; return { enforcedOutcome: "allow", reason: "ok" }; } };
   const gates = new GateEngine({ store, policy });
   await assert.rejects(gates.closeMilestone({ id: "kk:kk@example.com", type: "kk" }, M, A), (e) => e.code === "gate-evidence-missing" && e.status === 409);
