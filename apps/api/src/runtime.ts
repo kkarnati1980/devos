@@ -1,5 +1,10 @@
 // Runtime wiring of the database-backed parts (readiness + policy engine), kept out of main.ts so it is testable.
 // Secrets are read by name only and never logged.
+import pg from "pg";
+import { randomUUID } from "node:crypto";
+import { CardBatchQueue } from "@devos/card-batch";
+import { CardBatchJob, batchCardsFrom } from "./card-batch.js";
+import { PrismaQueueStore, type CardBatchDb, type LockConnection } from "./card-batch-store.js";
 import { PolicyEngine, PrismaPolicyStore, type PrismaLike } from "@devos/policy";
 import type { KkSessionRegistry } from "./auth.js";
 import { stdoutSink, withTimeout } from "./http.js";
@@ -70,6 +75,8 @@ export interface Runtime {
   requirementsSync: RequirementsSyncJob | null;
   /** DEVOS-171: closes analyst runs left open past max_seconds + grace (start-up and every 5 min); main.ts starts it. */
   analystSweep: AnalystRunSweepJob | null;
+  /** CR-b2b (DEVOS-215): applies decided batch cards and flushes each project's daily batch; main.ts starts it. */
+  cardBatch?: CardBatchJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -177,7 +184,16 @@ export async function buildRuntime(
   requirements.vault = vault ? { hasProject: (projectId, name) => vault.hasProject(projectId, name) } : null;
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep };
+  // CR-b2b (DEVOS-215): the batched-question queue over Postgres. The raise lock is a session advisory lock on its
+  // own short-lived pg connection (bounded connect), so it spans M2.3's transactions.
+  const queueStore = new PrismaQueueStore(db as unknown as CardBatchDb, async () => {
+    const c = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: t });
+    await c.connect();
+    return c as unknown as LockConnection;
+  }, t);
+  const cardBatchQueue = new CardBatchQueue(queueStore, batchCardsFrom(approvalsCore, approvalStore), randomUUID);
+  const cardBatch = new CardBatchJob(cardBatchQueue, approvalsCore, (id) => queueStore.projectName(id), queueStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch };
 }
 
 /**

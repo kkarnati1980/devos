@@ -46,8 +46,12 @@ function istHour(now: Date): number {
   return new Date(now.getTime() + 330 * 60_000).getUTCHours();
 }
 
+/** How often the job runs (runner decision: 5 min, like the analyst sweep; the daily flush fires at the first tick from 08:00 IST). */
+export const CARD_BATCH_TICK_MS = 5 * 60_000;
+
 export class CardBatchJob {
   private running = false;
+  private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly queue: CardBatchQueue,
@@ -55,7 +59,21 @@ export class CardBatchJob {
     private readonly projectName: (projectId: string) => Promise<string | null>,
     private readonly lister: BatchLister,
     private readonly log: BatchLog,
+    readonly intervalMs: number = CARD_BATCH_TICK_MS,
   ) {}
+
+  start(): this {
+    if (!this.timer) {
+      this.timer = setInterval(() => void this.tick(), this.intervalMs);
+      this.timer.unref?.();
+    }
+    return this;
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
 
   /** One pass: apply decided batches (any time), then flush (from 08:00 IST). Ticks never overlap; errors are logged with fixed codes. */
   async tick(now = new Date()): Promise<{ applied: number; flushed: number } | null> {
