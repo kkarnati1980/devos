@@ -17,16 +17,23 @@ export const STOP_STEMS: readonly string[] = Object.freeze(
   }))].sort((a, b) => b.length - a.length || (a < b ? -1 : 1)),
 );
 
-const CURRENCY = /[₹$]/u;
+// Runner decision (pre-review finding 6): € and £ interrupt too, beyond the contract's ₹ and $ (fails toward interrupting).
+const CURRENCY = /[₹$€£]/u;
 const WORD = /[\p{L}\p{N}]+/gu;
+/** Common prefixes stripped before the stem check (pre-review finding 1: `unlicensed`, `relicense`, `undelete`). */
+const PREFIXES = ["under", "over", "non", "pre", "sub", "un", "re"];
 
-/** The stop-and-ask stem a text hits, `"currency"` for `₹` or `$`, or null. Case-insensitive; a word hits when it starts with a stem. */
+/**
+ * The stop-and-ask stem a text hits, `"currency"` for `₹`, `$`, `€` or `£`, or null. Case-insensitive; camelCase is
+ * split (`hardDelete`); a word hits when it, or the word without one common prefix, starts with a stem.
+ */
 export function stopHit(text: string): string | null {
   const s = String(text ?? "");
   if (CURRENCY.test(s)) return "currency";
-  for (const m of s.toLowerCase().matchAll(WORD)) {
-    const w = m[0];
-    for (const stem of STOP_STEMS) if (w.startsWith(stem)) return stem;
+  const split = s.replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2").toLowerCase();
+  for (const m of split.matchAll(WORD)) {
+    const forms = [m[0], ...PREFIXES.filter((p) => m[0].length > p.length && m[0].startsWith(p)).map((p) => m[0].slice(p.length))];
+    for (const w of forms) for (const stem of STOP_STEMS) if (w.startsWith(stem)) return stem;
   }
   return null;
 }
@@ -90,7 +97,8 @@ export interface BatchAnswerRow {
 
 /** Longest stored answer (characters); a longer answer is cut, never refused (the card is already decided). */
 export const BATCH_ANSWER_MAX = 1000;
-const ANSWER_LINE = /^\s*BQ-(\d{1,4})\s*:\s*(\S.*?)\s*$/;
+// Case-insensitive `BQ`; each line is made one line first, so U+2028 or a tab never drops an answer (finding 3).
+const ANSWER_LINE = /^\s*BQ-(\d{1,4})\s*:\s*(\S.*?)\s*$/i;
 
 /**
  * Rule 9: one row per question, in batch order: KK's answer from a `BQ-<n>: <answer>` line of his comments, or the
@@ -100,8 +108,8 @@ export function batchAnswers(questions: readonly BatchQuestion[], comments: read
   const answers = new Map<number, string>();
   for (const body of comments) {
     for (const line of String(body ?? "").split(/\r?\n/)) {
-      const m = ANSWER_LINE.exec(line);
-      if (m) answers.set(Number(m[1]), m[2]!.slice(0, BATCH_ANSWER_MAX));
+      const m = ANSWER_LINE.exec(oneLine(line));
+      if (m) answers.set(Number(m[1]), clip(m[2]!, BATCH_ANSWER_MAX));
     }
   }
   return questions.map((q, i) => {

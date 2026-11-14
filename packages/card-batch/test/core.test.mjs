@@ -24,6 +24,11 @@ test("AT9 (CR-b1): stop-and-ask gates and words are not batchable; a plain decis
     assert.equal(r.code, "not-batchable");
   }
   assert.deepEqual(batchable({ gate: "decision", text: "Which colour should the header be?", default: "blue" }), { ok: true });
+  assert.deepEqual(batchable({ gate: "decision", text: "Should the header be bold?" }), { ok: true });
+  // Pre-review findings 1 and 6: prefixed and camelCase forms, and € / £, interrupt too.
+  for (const text of ["Is the code unlicensed?", "Should we relicense it?", "Undelete support?", "Should hardDelete run?", "Is €5 fine?", "Is £5 fine?"]) {
+    assert.equal(batchable({ gate: "decision", text }).ok, false, text);
+  }
   // Runner decision: a stop-and-ask default is refused too (fails toward interrupting).
   assert.equal(batchable({ gate: "decision", text: "What should happen to old rows?", default: "delete them" }).ok, false);
   assert.equal(batchable({ gate: "decision", text: 42 }).ok, false);
@@ -85,6 +90,11 @@ test("AT11 (CR-b1, pure): `BQ-1: no` records BQ-1 as kk and the rest as default;
   const r = batchAnswers(qs, ["BQ-3: formal\nBQ-9: x", "note\nBQ-3: casual\nBQ-2:   "]);
   assert.deepEqual(r.map((x) => [x.answer, x.source]), [["blue", "default"], ["yes", "default"], ["casual", "kk"]]);
   assert.equal(batchAnswers(qs, [`BQ-1: ${"a".repeat(1500)}`])[0].answer.length, 1000);
+  // Pre-review findings 2 and 3: a surrogate-safe cut; U+2028 inside a line and a lower-case `bq` still answer.
+  const cut = batchAnswers(qs, [`BQ-1: ${"x".repeat(998)}😀tail`])[0].answer;
+  assert.ok(cut.length <= 1000 && !/[\ud800-\udbff]$/.test(cut.slice(0, -1)) && cut.endsWith("…"));
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(cut), "no lone high surrogate");
+  assert.deepEqual(batchAnswers(qs, ["BQ-1: yes\u2028more", "bq-2: no"]).map((x) => [x.answer, x.source]), [["yes more", "kk"], ["no", "kk"], ["friendly", "default"]]);
 });
 
 test("CR-b1: IST day and the fixed batch card identity", () => {
