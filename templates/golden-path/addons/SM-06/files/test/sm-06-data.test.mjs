@@ -225,3 +225,16 @@ test("SM-06-L2/L1: a $ inside a name is no keyword break, and an expression inde
   // A $ inside a column name is part of it.
   assert.deepEqual(checkSql("CREATE TABLE orders (user$id integer REFERENCES users(id));\nCREATE INDEX ON orders (user$id);").warnings, []);
 });
+
+// Codex PR125-r6 finding 1.
+test("SM-06-L2: a column named like a value source (serial, generated) still needs a DEFAULT (r6)", () => {
+  assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN serial text NOT NULL;"), ["add-not-null-without-default"]);
+  assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN generated text NOT NULL;"), ["add-not-null-without-default"]);
+  assert.deepEqual(rules("ALTER TABLE devices ADD serial8 text NOT NULL;"), ["add-not-null-without-default"]);
+  assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN IF NOT EXISTS serial text NOT NULL;"), ["add-not-null-without-default"]);
+  // The value-source forms still pass.
+  assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN serial text NOT NULL DEFAULT 'x';"), []);
+  assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN n bigserial NOT NULL;"), []);
+  assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN IF NOT EXISTS n serial4 NOT NULL;"), []);
+  assert.deepEqual(rules("ALTER TABLE devices ADD COLUMN id integer GENERATED ALWAYS AS IDENTITY NOT NULL;"), []);
+});

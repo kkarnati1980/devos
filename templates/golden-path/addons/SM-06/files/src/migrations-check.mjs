@@ -90,7 +90,13 @@ export function ruleHits(upperText) {
     // Keywords are read with quoted identifiers blanked, so a column named "default" is no DEFAULT (PR125-r3).
     for (const clause of splitTop(bare)) {
       if (!/\bADD\s+(COLUMN\s+)?(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|FOREIGN\b|CHECK\b|EXCLUDE\b)/.test(clause)) continue;
-      if (/\bNOT\s+NULL\b/.test(clause) && !/\bDEFAULT\b|\bGENERATED\b|\b(SMALL|BIG)?SERIAL\d?\b/.test(clause)) { hits.push("add-not-null-without-default"); break; }
+      if (!/\bNOT\s+NULL\b/.test(clause)) continue;
+      // The column name is cut off before the exemptions are read, so a column named `serial` or `generated` is no
+      // value source (PR125-r6); a serial type counts only in the type position. A clause that does not read as
+      // `ADD [COLUMN] [IF NOT EXISTS] name type …` fails closed.
+      const col = /\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:""|\w+)\s+(.*)$/.exec(clause);
+      const def = col ? col[1] : "";
+      if (!/^(SMALL|BIG)?SERIAL[248]?\b/.test(def) && !/\bDEFAULT\b|\bGENERATED\b/.test(def)) { hits.push("add-not-null-without-default"); break; }
     }
   }
   return hits;
