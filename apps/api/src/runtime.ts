@@ -6,18 +6,19 @@ import { stdoutSink, withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore, writeAudit } from "./settings.js";
 import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
-import { Approvals, PrismaApprovalStore, type GrantIssuer } from "./approvals.js";
+import { Approvals, ApprovalError, PrismaApprovalStore, gateFromRules, type GateName, type GrantIssuer } from "./approvals.js";
 import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js";
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
 import { parseSmtpConfig } from "./smtp.js";
-import { RequirementsPipeline } from "@devos/analyst";
+import { ExpiringRequirementsPipeline, approvalStepBoundMs, type ExpiryLog, type PendingCardLister } from "./requirements-expiry.js";
 import { PrismaRequirementsStore } from "./requirements-store.js";
 import type { RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 import type { ModelRunner } from "@devos/analyst";
-import { PrismaAnalystRunRows, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
+import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
+import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
 export interface DbClient extends PrismaLike {
@@ -67,6 +68,8 @@ export interface Runtime {
   requirements: RequirementsServices;
   /** M2.2-d3c1: the periodic `syncApproval` job, present only when spec intake is wired; main.ts starts it. */
   requirementsSync: RequirementsSyncJob | null;
+  /** DEVOS-171: closes analyst runs left open past max_seconds + grace (start-up and every 5 min); main.ts starts it. */
+  analystSweep: AnalystRunSweepJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -88,10 +91,10 @@ export async function buildRuntime(
     loadQueue?: (redisUrl: string) => Promise<DeadLetterQueue>;
     /**
      * M2.2-d3b1: builds M1.5's RunEngine (with the Anthropic adapter) over this database and policy engine for the
-     * analyst model pass. Absent → model pass off. M2.2-d3b2 supplies it from main.ts, importing the run engine at
-     * runtime like @devos/db, so the API typechecks on its own.
+     * analyst model pass. Absent → model pass off. main.ts supplies it when `DEVOS_ANALYST_MODEL_PASS=on` (then the setting decides per call, DEVOS-176),
+     * importing the run engine at runtime like @devos/db, so the API typechecks on its own. `apiKey` reads the vault.
      */
-    loadAnalystEngine?: (db: DbClient, policy: PolicyEngine) => Promise<RunExecutor>;
+    loadAnalystEngine?: (db: DbClient, policy: PolicyEngine, apiKey: () => Promise<string | null>) => Promise<RunExecutor>;
   },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
@@ -108,7 +111,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -148,6 +151,8 @@ export async function buildRuntime(
     grants: engine as unknown as GrantIssuer,
     notifier,
     verifyKkSession: opts.kkSessions.verify,
+    // DEVOS-134: a policy card's gate comes from the matched rules' `constraints.gateName`.
+    gateForRules: (ids) => gateForRulesFromDb(db, ids, t),
   });
   const approvals: ApprovalRouteServices = {
     approvals: approvalsCore,
@@ -156,12 +161,21 @@ export async function buildRuntime(
   };
   // M2.2-d3b1: the model pass is one M1.5 run per call (role analyst, Sonnet); the engine reserves, meters and records cost.
   const runner: ModelRunner | null = opts.loadAnalystEngine
-    ? runEngineModelRunner(new PrismaAnalystRunRows(db as unknown as AnalystRowsDb, t), await opts.loadAnalystEngine(db, engine))
+    ? runEngineModelRunner(
+        new PrismaAnalystRunRows(db as unknown as AnalystRowsDb, t),
+        // M2.2-d3b2: the Anthropic key is read from the vault by name at call time; no vault → null → assist-failed.
+        await opts.loadAnalystEngine(db, engine, async () => (vault ? vault.reveal(ANTHROPIC_KEY_NAME) : null)),
+      )
     : null;
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
-  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner);
+  // Codex PR88-r5: one expiry write can wait up to maxWait for a connection and then run up to timeout, so the hold
+  // reserves the approvals store's whole step bound (built with `t` above), not its transaction timeout alone.
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(t),
+    // DEVOS-176: the `analyst.model_pass` setting, read before each pass (a change applies without a restart).
+    async () => (await setup.settings!.get()).analystModelPass);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
+  const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep };
 }
 
 /**
@@ -172,18 +186,45 @@ export async function buildRuntime(
  */
 export function requirementsServices(
   store: NonNullable<RequirementsServices["store"]>,
-  approvals: Pick<Approvals, "raiseCard">,
-  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister,
+  approvals: Pick<Approvals, "raiseCard" | "expireCardsById">,
+  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister & PendingCardLister,
   runner: ModelRunner | null = null,
+  expiryLog?: ExpiryLog,
+  /** The longest one expiry write can take, connection wait included (`approvalStepBoundMs`; Codex PR88-r4, PR88-r5, PR88-r6). */
+  expireStepMs = 0,
+  /** DEVOS-176: the `analyst.model_pass` setting read per call. Absent with a runner → off (pre-review finding 1:
+   * a dropped argument must never turn model spend on). */
+  modelPassOn?: () => Promise<boolean>,
 ): RequirementsServices {
-  const pipeline = new RequirementsPipeline({
-    store,
-    raiseRequirementsCard: async (card) => ({ id: (await approvals.raiseCard(card)).id }),
-    // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
-    raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
-    runner,
-  });
+  // M2.2-d3c2: after each submission, the superseded version's pending cards and an unlinked requirements card
+  // are expired through the M2.3 core (DEVOS-164).
+  const pipeline = new ExpiringRequirementsPipeline(
+    {
+      store,
+      raiseRequirementsCard: async (card) => ({ id: (await approvals.raiseCard(card)).id }),
+      // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
+      raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
+      runner,
+      modelPassOn: modelPassOn ?? (async () => false),
+    },
+    {
+      latestDoc: (id) => store.latestDoc(id),
+      cards,
+      expire: (ids, reason) => approvals.expireCardsById(ids, reason),
+      // The Postgres store holds the project row for the pass (Codex PR88-r1); the in-memory store has no lock.
+      serialize: holder(store, expireStepMs),
+    },
+    expiryLog,
+  );
   return { pipeline, store, cards: { get: (id) => cards.get(id) } };
+}
+
+type HeldFn<T> = (assertHeld: () => void) => Promise<T>;
+type Held = { withProjectHeld?<T>(projectId: string, fn: HeldFn<T>, stepMs?: number): Promise<T> };
+/** The store's project hold, when it has one (PrismaRequirementsStore does). */
+function holder(store: object, stepMs: number): (<T>(projectId: string, fn: HeldFn<T>) => Promise<T>) | undefined {
+  const s = store as Held;
+  return typeof s.withProjectHeld === "function" ? (id, fn) => s.withProjectHeld!(id, fn, stepMs) : undefined;
 }
 
 /**
@@ -207,6 +248,25 @@ export function grantsForApproval(db: DbClient, approvalId: string, timeoutMs: n
     },
     { timeout: timeoutMs, maxWait: timeoutMs },
   );
+}
+
+/**
+ * DEVOS-134: reads the matched `policy_rule` rows (id and constraints only) and picks the card's gate with
+ * `gateFromRules`. Bounded like every other read (ADR-0011 §9). No ids → no read. More than 100 ids is refused rather
+ * than truncated (a dropped rule could weaken the gate); the engine matches far fewer.
+ */
+export async function gateForRulesFromDb(db: DbClient, ids: readonly string[], timeoutMs: number): Promise<GateName | null> {
+  const unique = [...new Set(ids.filter((x) => typeof x === "string" && x.length > 0))];
+  if (unique.length === 0) return null;
+  if (unique.length > 100) throw new ApprovalError("gate-rules-too-many", 500);
+  const rows = await db.$transaction(
+    async (tx: any) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
+      return tx.policyRule.findMany({ where: { id: { in: unique } }, select: { id: true, constraints: true } });
+    },
+    { timeout: timeoutMs, maxWait: timeoutMs },
+  );
+  return gateFromRules(unique, rows as { id: string; constraints: { gateName?: unknown } | null }[]);
 }
 
 /** `REDIS_URL`: absent → null (no dead-letter view); anything but redis:// or rediss:// stops start-up. */

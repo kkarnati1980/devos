@@ -1,5 +1,5 @@
 "use client";
-// M1.4 settings: the three caps, default lanes and deadlock attempts (all editable).
+// M1.4 settings: the three caps, default lanes, deadlock attempts and the analyst model pass (DEVOS-176), all editable.
 import { useEffect, useRef, useState } from "react";
 import { DevosApi, explain, type SettingsView } from "../../lib/api";
 
@@ -27,6 +27,7 @@ export function SettingsForm({ apiOrigin }: { apiOrigin: string }) {
       defaultProjectCapUsd: s.defaultProjectCapUsd,
       defaultLanes: s.defaultLanes,
       deadlockAttempts: s.deadlockAttempts,
+      analystModelPass: s.analystModelPass,
     });
     if (!r.ok) return setNotice(`${explain(r.code)} (${r.code})`);
     setS(r.data.settings);
@@ -53,6 +54,10 @@ export function SettingsForm({ apiOrigin }: { apiOrigin: string }) {
           <select name="deadlockAttempts" value={s.deadlockAttempts} onChange={(e) => setS({ ...s, deadlockAttempts: Number(e.target.value) })}>
             {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n}</option>)}
           </select>
+        </label>
+        <label>
+          <input type="checkbox" name="analystModelPass" data-testid="analyst-model-pass" checked={s.analystModelPass === true} onChange={(e) => setS({ ...s, analystModelPass: e.target.checked })} />
+          Use Claude to read new specs (spends from the Anthropic cap, and only if the server allows it; off means a rules-only reading)
         </label>
         <button type="submit" data-testid="save-settings">Save settings</button>
       </form>

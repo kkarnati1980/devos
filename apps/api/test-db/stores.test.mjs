@@ -24,6 +24,11 @@ test("M1.4 AT14a: settings singleton is created, edited and audited; project cap
   const again = await store.update({ defaultLanes: 3 }, t, audit);
   assert.equal(again.defaultLanes, 3);
   assert.equal(again.openaiCapUsd, "20.50");
+  // DEVOS-176 AT-CA9d: the migrated column, default off, round-trips on and off through the real store.
+  assert.equal(again.analystModelPass, false);
+  assert.equal((await store.update({ analystModelPass: true }, t, audit)).analystModelPass, true);
+  assert.equal((await store.get()).analystModelPass, true);
+  assert.equal((await store.update({ analystModelPass: false }, t, audit)).analystModelPass, false);
   assert.equal(await db.appSettings.count(), 1);
   const audits = await db.auditEvent.count({ where: { action: "settings.updated" } });
   await assert.rejects(store.update({ deadlockAttempts: 6 }, t, audit)); // database check 1–5
