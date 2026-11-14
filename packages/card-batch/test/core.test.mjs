@@ -29,6 +29,13 @@ test("AT9 (CR-b1): stop-and-ask gates and words are not batchable; a plain decis
   for (const text of ["Is the code unlicensed?", "Should we relicense it?", "Undelete support?", "Should hardDelete run?", "Is €5 fine?", "Is £5 fine?"]) {
     assert.equal(batchable({ gate: "decision", text }).ok, false, text);
   }
+  // Codex PR131-r3: an inner capital never hides a stop word (`copyLeft`, `buDget`): every word with any one inner
+  // letter upper-cased, and fully upper-cased, is still refused.
+  for (const text of ["Is copyLeft acceptable?", "What buDget is fine?"]) assert.equal(batchable({ gate: "decision", text }).ok, false, text);
+  for (const w of STOP_WORDS) {
+    const forms = [w.toUpperCase(), ...[...w].map((_, i) => (i === 0 ? null : w.slice(0, i) + w[i].toUpperCase() + w.slice(i + 1))).filter(Boolean)];
+    for (const f of forms) assert.notEqual(stopHit(`Is ${f} fine?`), null, f);
+  }
   // Runner decision: a stop-and-ask default is refused too (fails toward interrupting).
   assert.equal(batchable({ gate: "decision", text: "What should happen to old rows?", default: "delete them" }).ok, false);
   assert.equal(batchable({ gate: "decision", text: 42 }).ok, false);

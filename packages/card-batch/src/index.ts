@@ -25,14 +25,16 @@ const PREFIXES = ["under", "over", "non", "pre", "sub", "un", "re"];
 
 /**
  * The stop-and-ask stem a text hits, `"currency"` for `₹`, `$`, `€` or `£`, or null. Case-insensitive; camelCase is
- * split (`hardDelete`); a word hits when it, or the word without one common prefix, starts with a stem.
+ * split (`hardDelete`) as an extra form, never instead of the whole word; a word hits when it, or the word without one common prefix, starts with a stem.
  */
 export function stopHit(text: string): string | null {
   const s = String(text ?? "");
   if (CURRENCY.test(s)) return "currency";
-  const split = s.replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2").toLowerCase();
-  for (const m of split.matchAll(WORD)) {
-    const forms = [m[0], ...PREFIXES.filter((p) => m[0].length > p.length && m[0].startsWith(p)).map((p) => m[0].slice(p.length))];
+  // Codex PR131-r3: check the whole lower-cased words as well as the camelCase-split ones, so `copyLeft` or `buDget`
+  // still hit `copyleft` and `budget` (rule 6 is case-insensitive; the split only adds forms, never removes one).
+  const words = [...s.toLowerCase().matchAll(WORD), ...s.replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2").toLowerCase().matchAll(WORD)].map((m) => m[0]);
+  for (const word of words) {
+    const forms = [word, ...PREFIXES.filter((p) => word.length > p.length && word.startsWith(p)).map((p) => word.slice(p.length))];
     for (const w of forms) for (const stem of STOP_STEMS) if (w.startsWith(stem)) return stem;
   }
   return null;
