@@ -346,25 +346,25 @@ enum Mechanism {
 // ---------- project and plan ----------
 
 model Project {
-  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  slug         String       @unique
-  name         String
-  stage        ProjectStage @default(intake)
-  pausedAt     DateTime?    @map("paused_at") @db.Timestamptz(6)
-  capUsd       Decimal      @default(15) @map("cap_usd") @db.Decimal(12, 6)
-  lanes        Int          @default(2)
-  repoUrl      String?      @map("repo_url")
-  importedRepo Boolean      @default(false) @map("imported_repo")
-  previewUrl   String?      @map("preview_url")
-  liveUrl      String?      @map("live_url")
-  archivedAt   DateTime?    @map("archived_at") @db.Timestamptz(6)
-  purgeAfter   DateTime?    @map("purge_after") @db.Timestamptz(6)
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug           String       @unique
+  name           String
+  stage          ProjectStage @default(intake)
+  pausedAt       DateTime?    @map("paused_at") @db.Timestamptz(6)
+  capUsd         Decimal      @default(15) @map("cap_usd") @db.Decimal(12, 6)
+  lanes          Int          @default(2)
+  repoUrl        String?      @map("repo_url")
+  importedRepo   Boolean      @default(false) @map("imported_repo")
+  previewUrl     String?      @map("preview_url")
+  liveUrl        String?      @map("live_url")
+  archivedAt     DateTime?    @map("archived_at") @db.Timestamptz(6)
+  purgeAfter     DateTime?    @map("purge_after") @db.Timestamptz(6)
   /// ADR-0012 CR-a2: continuous-run mode; rows from before the migration are backfilled false.
-  continuousRun  Boolean    @default(true) @map("continuous_run")
+  continuousRun  Boolean      @default(true) @map("continuous_run")
   /// ADR-0012 CR-a2: `pending | approved | rejected` (CHECK in the migration); backfilled `approved`.
-  preflightState String     @default("pending") @map("preflight_state")
-  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+  preflightState String       @default("pending") @map("preflight_state")
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   specs              Spec[]
   decisions          ProjectDecision[]
@@ -433,15 +433,15 @@ model RequirementsDoc {
 
 /// ADR-0012 rule 3: one row per pre-flight answer or default (the project decision log). Append-only.
 model ProjectDecision {
-  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  projectId  String    @map("project_id") @db.Uuid
-  itemId     String    @map("item_id")
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId  String   @map("project_id") @db.Uuid
+  itemId     String   @map("item_id")
   text       String
   answer     String
   /// `kk | default | default-provisional` (CHECK in the migration).
   source     String
-  approvalId String?   @map("approval_id") @db.Uuid
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  approvalId String?  @map("approval_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   project  Project   @relation(fields: [projectId], references: [id], onDelete: Restrict)
   approval Approval? @relation(fields: [approvalId], references: [id], onDelete: Restrict)
@@ -818,15 +818,15 @@ model Approval {
   createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt        DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  project         Project?          @relation(fields: [projectId], references: [id], onDelete: Restrict)
-  comments        ApprovalComment[]
-  requirementDocs RequirementsDoc[]
+  project          Project?          @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  comments         ApprovalComment[]
+  requirementDocs  RequirementsDoc[]
   projectDecisions ProjectDecision[]
-  gatedMilestones Milestone[]
-  blockedTasks    TaskBlocker[]
-  deploys         Deploy[]
-  notifications   Notification[]
-  grants          ApprovalGrant[]
+  gatedMilestones  Milestone[]
+  blockedTasks     TaskBlocker[]
+  deploys          Deploy[]
+  notifications    Notification[]
+  grants           ApprovalGrant[]
 
   @@index([projectId, status])
   @@index([status, createdAt])
