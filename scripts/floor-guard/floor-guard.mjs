@@ -140,9 +140,13 @@ function normaliseYamlLine(raw) {
   return line.replace(/^(\s*(?:-\s+)?)(["'])([^"']*)\2(\s*:)/, "$1$3$4");
 }
 
-/** A step body on one line for hit text (GI-4c): lines trimmed and joined with " | "; an empty body is "(empty)". */
+/**
+ * A step body on one line for hit text (GI-4c): lines trimmed and joined with " ⏎ " (not " | ", which a YAML block
+ * scalar `run: |` already uses); an empty body is "(empty)". Indentation is dropped here, so an indent-only edit
+ * shows the same `was:` and `now:` text, though the hit still fires (bodies are compared with indentation kept).
+ */
 export function oneLine(body) {
-  const t = String(body ?? "").split("\n").map((l) => l.trim()).filter(Boolean).join(" | ");
+  const t = String(body ?? "").split("\n").map((l) => l.trim()).filter(Boolean).join(" ⏎ ");
   return t || "(empty)";
 }
 

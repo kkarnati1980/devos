@@ -66,7 +66,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 - `binary-code-change` stays as defence in depth: `run()` diffs with `--text`, so git never reports a binary file, but a caller of `analyse()` might.
 
 ## Follow-up GI-4c (DEVOS-167, note 0021) — what a removed or changed CI step ran
-- `ci-step-removed` text ends `; ran: <the step's body on one line>`, `ci-step-changed` ends `; was: <base body>; now: <head body>`, and `ci-job-removed` ends `; ran: <each step body, joined with " ;; ">`. A body is the step's lines other than its own `name:` (so `run:`, `uses:`, `with:`, `env:`, `if:` …), trimmed and joined with ` | `.
+- `ci-step-removed` text ends `; ran: <the step's body on one line>`, `ci-step-changed` ends `; was: <base body>; now: <head body>`, and `ci-job-removed` ends `; ran: <each step body, joined with " ;; ">`. A body is the step's lines other than its own `name:` (so `run:`, `uses:`, `with:`, `env:`, `if:` …), trimmed and joined with ` ⏎ ` (not ` | `, which a YAML block scalar `run: |` uses); indentation is dropped, so an indent-only edit reads the same in `was:` and `now:`, although the hit still fires.
 - The hit text is still cut at 200 characters, and hit ids follow the new text. Nothing else changes: the same hits fire, with the same rules, files and lines.
 - Why: the gate evaluator (`scripts/gates/evaluate-gate.mjs`, GI-4) can then tell from the stored result whether a removed or edited step ran security scanning. Narrowing its `KK_ONLY` on that basis is a separate, non-guard PR (DEVOS-186), because a guard change must come alone (§4.5).
 

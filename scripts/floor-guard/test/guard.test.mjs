@@ -384,6 +384,11 @@ test("GI-4c (DEVOS-167): a ci-* step or job hit carries what the step ran, so it
   r = check({ [WF]: wf(STEPS) + "  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Scan\n        run: gitleaks detect\n      - run: pnpm e2e\n" }, { [WF]: wf(STEPS) });
   h = r.hits.find((x) => x.rule === "ci-job-removed");
   assert.equal(h.text, "job e2e removed; ran: run: gitleaks detect ;; run: pnpm e2e");
+  // A multi-line block scalar: lines are joined with " ⏎ ", so the YAML "|" marker is not mistaken for a separator.
+  const multi = `      - name: Checks\n        run: |\n          npm audit\n          pnpm build\n`;
+  r = check({ [WF]: wf(STEPS + multi) }, { [WF]: wf(STEPS) });
+  h = r.hits.find((x) => x.rule === "ci-step-removed");
+  assert.equal(h.text, "job build: step name:Checks removed; ran: run: | ⏎ npm audit ⏎ pnpm build");
   // A body past the 200-character cut stays cut (the evaluator fails closed on a full-length text).
   const long = `      - name: Big\n        run: ${"x".repeat(300)}\n`;
   r = check({ [WF]: wf(STEPS + long) }, { [WF]: wf(STEPS) });
