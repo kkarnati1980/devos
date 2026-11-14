@@ -45,8 +45,12 @@ export function fileStore(path) {
     },
     save(all) {
       const dir = dirname(path);
-      const created = mkdirSync(dir, { recursive: true }); // the first directory it made, if any
-      if (created) syncDir(dirname(created)); // a new directory's entry must survive a power loss too
+      const created = mkdirSync(dir, { recursive: true }); // the first (outermost) directory it made, if any
+      if (created) {
+        // Every directory it made holds the entry of the next one, and the parent of the outermost holds its entry:
+        // fsync each of them, innermost first, so the whole chain survives a power loss (Codex PR104-r2).
+        for (let d = dir; ; d = dirname(d)) { syncDir(d); if (d === created) { syncDir(dirname(d)); break; } }
+      }
       const tmp = `${path}.${process.pid}.tmp`;
       // fsync before the rename, so after a power loss the file holds the old list or the new one.
       const fd = openSync(tmp, "w", 0o600);

@@ -93,7 +93,7 @@ test("SM-05-L1: an attempt that hangs is aborted at the timeout and counted as f
 test("SM-05-L1: queued and dead jobs survive a restart through the file store; a job cut off by stop runs again", async () => {
   const dir = mkdtempSync(join(tmpdir(), "sm05-"));
   try {
-    const path = join(dir, "data", "jobs.json");
+    const path = join(dir, "data", "queue", "deep", "jobs.json"); // several new directories (Codex PR104-r2)
     let release;
     const q1 = createQueue({ ...fast, maxAttempts: 1, store: fileStore(path), handlers: {
       "bad.job": async () => { throw new Error("poison"); },
