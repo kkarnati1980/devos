@@ -132,13 +132,15 @@ class MarkupState {
   get foreign() { return this.fstack.length; }
   inSelect = false;
   sawRcdata = false; // this parse entered RCDATA (<title>/<textarea> outside SVG/MathML) at least once
+  ts = "open"; closing = false; selfClose = false; curAttr = ""; // tag sub-state, as in the HTML tokenizer
+  openTag() { this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.ts = "open"; this.closing = false; this.selfClose = false; this.curAttr = ""; }
   feed(s) {
     for (let i = 0; i < s.length; i++) {
       const c = s[i];
       if (this.mode === "lt") { // the "<" was the last character of the previous piece
         this.mode = "text";
         if (c === "!" || c === "?") this.mode = "bogus";
-        else if (/[a-zA-Z\/]/.test(c)) { this.mode = "tag"; this.tag = "<" + c; this.tagName = ""; }
+        else if (/[a-zA-Z\/]/.test(c)) { this.openTag(); i--; }
       } else if (this.mode === "text") {
         // Comments end as the browser ends them (Codex PR98-r8): "<!-->" and "<!--->" close at once, and inside a
         // comment both "-->" and "--!>" close it.
@@ -150,7 +152,7 @@ class MarkupState {
         // the browser: they end at the first ">", whatever quotes they hold. Read as tags, a quote there could hide
         // a value that the browser places after the ">" (e.g. inside a <script>).
         else if (c === "<" && (s[i + 1] === "!" || s[i + 1] === "?" || (s[i + 1] === "/" && !/[a-zA-Z]/.test(s[i + 2] ?? "")))) this.mode = "bogus";
-        else if (c === "<" && /[a-zA-Z\/!?]/.test(s[i + 1])) { this.mode = "tag"; this.tag = "<"; this.tagName = ""; }
+        else if (c === "<" && /[a-zA-Z\/]/.test(s[i + 1])) this.openTag();
       } else if (this.mode === "bogus") {
         if (c === "<") assertNoTextEndTag(s, i);
         if (c === ">") this.mode = "text";
@@ -165,7 +167,7 @@ class MarkupState {
         // Only ASCII whitespace, "/" or ">" ends a raw/RCDATA close tag in the HTML tokenizer. JS \s also matches
         // U+00A0 and other Unicode spaces, which the browser does NOT accept, so </script > must stay raw.
         if (c === "<" && s.slice(i, i + end.length).toLowerCase() === end && /[\t\n\f\r />]/.test(s[i + end.length] ?? "")) {
-          this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.raw = "";
+          this.openTag(); this.raw = "";
         }
       } else if (this.mode === "quote") {
         if (c === "<") assertNoTextEndTag(s, i);
@@ -175,22 +177,56 @@ class MarkupState {
           if (this.valued && URL_ATTRS.has(this.attr) && !isSafeUrl(decodeEntities(this.tag.slice(this.quoteAt)))) {
             throw new TypeError("html: a URL attribute takes only http(s), mailto or relative URLs");
           }
-          this.mode = "tag"; this.quote = ""; this.valued = false;
+          this.mode = "tag"; this.ts = "afterQuoted"; this.quote = ""; this.valued = false;
         }
         this.tag += c;
-      } else { // tag
+      } else { // tag: the HTML tokenizer's tag states (Codex PR98-r9), so quotes count exactly where the browser's do
         if (c === "<") assertNoTextEndTag(s, i);
         this.tag += c;
-        if (!this.tagName && /[\s/>"']/.test(c)) this.tagName = (/^<([a-zA-Z][^\s/>"']*)/.exec(this.tag)?.[1] ?? "-").toLowerCase();
-        if (c === '"' || c === "'") {
-          const m = /([^\s"'=<>\/]+)\s*=\s*$/.exec(this.tag.slice(0, -1));
-          this.mode = "quote"; this.quote = c; this.quoteAt = this.tag.length; this.attr = m ? m[1].toLowerCase() : ""; this.valued = false;
-        } else if (c === ">") {
-          const name = this.tagName;
-          const closing = this.tag.startsWith("</");
-          const selfClose = /\/\s*>$/.test(this.tag);
-          // tagName is parsed from "<name"; a closing tag "</name" leaves it "-", so read the close name directly.
-          const closeName = closing ? (/^<\/\s*([a-zA-Z][^\s/>"']*)/.exec(this.tag)?.[1] ?? "").toLowerCase() : "";
+        const ws = c === "\t" || c === "\n" || c === "\f" || c === "\r" || c === " ";
+        const reconsume = (state) => { this.ts = state; this.tag = this.tag.slice(0, -1); i--; };
+        let emit = false;
+        switch (this.ts) {
+          case "open": // just after "<"
+            if (c === "/") this.closing = true; else this.tagName = c.toLowerCase();
+            this.ts = "name"; break;
+          case "name":
+            if (ws) this.ts = "beforeAttr"; else if (c === "/") this.ts = "selfClosing"; else if (c === ">") emit = true; else this.tagName += c.toLowerCase();
+            break;
+          case "beforeAttr":
+            if (ws) break;
+            if (c === "/" || c === ">") reconsume("afterAttrName");
+            else if (c === "=") { this.curAttr = "="; this.ts = "attrName"; }
+            else { this.curAttr = ""; reconsume("attrName"); }
+            break;
+          case "attrName": // quotes and "<" are part of a name here, as in the browser
+            if (ws || c === "/" || c === ">") reconsume("afterAttrName"); else if (c === "=") this.ts = "beforeValue"; else this.curAttr += c.toLowerCase();
+            break;
+          case "afterAttrName":
+            if (ws) break;
+            if (c === "/") this.ts = "selfClosing"; else if (c === "=") this.ts = "beforeValue"; else if (c === ">") emit = true; else { this.curAttr = ""; reconsume("attrName"); }
+            break;
+          case "beforeValue":
+            if (ws) break;
+            if (c === '"' || c === "'") { this.mode = "quote"; this.quote = c; this.quoteAt = this.tag.length; this.attr = this.curAttr; this.valued = false; }
+            else if (c === ">") emit = true;
+            else reconsume("unquoted");
+            break;
+          case "unquoted": // a quote here is a character of the value, not the start of one
+            if (ws) this.ts = "beforeAttr"; else if (c === ">") emit = true;
+            break;
+          case "afterQuoted":
+            if (ws) this.ts = "beforeAttr"; else if (c === "/") this.ts = "selfClosing"; else if (c === ">") emit = true; else reconsume("beforeAttr");
+            break;
+          case "selfClosing":
+            if (c === ">") { this.selfClose = true; emit = true; } else reconsume("beforeAttr");
+            break;
+        }
+        if (emit) {
+          const name = this.closing ? "" : this.tagName;
+          const closing = this.closing;
+          const selfClose = this.selfClose;
+          const closeName = closing ? this.tagName : "";
           // Track SVG/MathML foreign content. Inside it, <title>/<textarea> are NOT RCDATA: their children are
           // parsed as markup (SVG <title>/<desc>/<foreignObject> are HTML integration points), so a nested
           // <a href="${…}"> is a real attribute that must be URL-validated, not RCDATA text. Treating the whole

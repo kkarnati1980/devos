@@ -218,6 +218,14 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`<!--><script>/* --> */${"alert(1)"}</script>`, /inside <script>/);
   assert.throws(() => html`<!---><script>/* --> */${"alert(1)"}</script>`, /inside <script>/);
   assert.equal(String(html`<!-- a --!><p>${"x"}</p><!----><p>${"y"}</p>`), "<!-- a --!><p>x</p><!----><p>y</p>");
+  // Codex PR98-r9: tags are read with the HTML tokenizer's tag states, so a quote inside an unquoted value or an
+  // attribute name is a character, not the start of a quoted value.
+  assert.throws(() => html`<div x=y="><script>${"alert(1)//"}"></script>`, /inside <script>/);
+  assert.throws(() => html`<div x=a'b'><script>${"alert(1)"}</script>`, /inside <script>/);
+  assert.throws(() => html`<div x"y><script>${"alert(1)"}</script>`, /inside <script>/);
+  assert.throws(() => html`<a href = "${"javascript:alert(1)"}">x</a>`, /URL attribute/);
+  assert.throws(() => html`<a/href="${"javascript:alert(1)"}">x</a>`, /URL attribute/);
+  assert.equal(String(html`<a href="${"/x"}" title='${"t"}' data-n=1>ok</a><br/><p>${"y"}</p >`), `<a href="/x" title='t' data-n=1>ok</a><br/><p>y</p >`);
   // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
   // and an RCDATA-free fragment inside SVG.
   assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');
