@@ -196,3 +196,14 @@ test("SM-06-L1: an index clears a foreign-key warning only on the same schema an
     ["Orders.userId references User but no index leads with it"]);
   assert.deepEqual(checkSql('CREATE TABLE "Orders" ("userId" uuid REFERENCES "User"("id"));\nCREATE INDEX ON "Orders" ("userId");').warnings, []);
 });
+
+// Codex PR125-r3 findings 1–3.
+test("SM-06-L2/L1: a quoted column named default, a $ inside a name, and a partial index (r3)", () => {
+  assert.deepEqual(rules('ALTER TABLE users ADD COLUMN "default" text NOT NULL;'), ["add-not-null-without-default"]);
+  assert.deepEqual(rules('ALTER TABLE users ADD COLUMN "default" text NOT NULL DEFAULT \'x\';'), []);
+  assert.deepEqual(rules("SELECT * FROM events$archive$; DROP TABLE users;"), ["drop-object"]);
+  assert.deepEqual(rules("CREATE FUNCTION f() RETURNS int AS $$ DROP TABLE users; $$ LANGUAGE sql;"), []);
+  const partial = "CREATE TABLE orders (user_id uuid REFERENCES users(id), active boolean);\nCREATE INDEX ON orders (user_id) WHERE active;";
+  assert.deepEqual(checkSql(partial).warnings, ["orders.user_id references users but no index leads with it"]);
+  assert.deepEqual(checkSql(partial + "\nCREATE INDEX ON orders (user_id);").warnings, []);
+});

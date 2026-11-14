@@ -33,6 +33,7 @@ export const RULES = [
   ["drop-default", /^ALTER\s+TABLE\b.*\bDROP\s+DEFAULT\b/],
   ["truncate", /^TRUNCATE\b/],
 ];
+const QUOTED = /"(?:[^"]|"")*"/g;
 const CONTRACT = /^--\s*sm06:\s*contract\s+(\S.{9,})$/i;
 
 /** End index (exclusive) of the quoted run starting at i. An E'…' string honours backslash escapes. */
@@ -77,11 +78,13 @@ function splitTop(s) {
 export function ruleHits(upper) {
   const hits = RULES.filter(([, re]) => re.test(upper)).map(([rule]) => rule);
   // Quoted identifiers are blanked too here, so a table or column named "where" never reads as a WHERE clause.
-  const top = topLevel(upper.replace(/"(?:[^"]|"")*"/g, '""'));
+  const bare = upper.replace(QUOTED, '""');
+  const top = topLevel(bare);
   if (/^(WITH\b.*\s)?DELETE\s+FROM\b/.test(top) && !/\bWHERE\b/.test(top)) hits.push("delete-without-where");
   if (/^(WITH\b.*\s)?UPDATE\s+/.test(top) && /\bSET\b/.test(top) && !/\bWHERE\b/.test(top)) hits.push("update-without-where");
   if (/^ALTER\s+TABLE\b/.test(upper)) {
-    for (const clause of splitTop(upper)) {
+    // Keywords are read with quoted identifiers blanked, so a column named "default" is no DEFAULT (PR125-r3).
+    for (const clause of splitTop(bare)) {
       if (!/\bADD\s+(COLUMN\s+)?(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|FOREIGN\b|CHECK\b|EXCLUDE\b)/.test(clause)) continue;
       if (/\bNOT\s+NULL\b/.test(clause) && !/\bDEFAULT\b|\bGENERATED\b|\b(SMALL|BIG)?SERIAL\d?\b/.test(clause)) { hits.push("add-not-null-without-default"); break; }
     }
@@ -122,7 +125,8 @@ export function statements(sql) {
       continue;
     }
     if (rest.startsWith("/*")) { i = blockCommentEnd(sql, i); cur += " "; continue; }
-    const dollar = /^\$(\w*)\$/.exec(rest);
+    // A dollar quote never starts inside an identifier: `events$archive$` is a name (PR125-r3).
+    const dollar = /[\w$]/.test(sql[i - 1] ?? "") ? null : /^\$(\w*)\$/.exec(rest);
     if (dollar) { const end = sql.indexOf(dollar[0], i + dollar[0].length); cur += " $body$ "; i = end < 0 ? sql.length : end + dollar[0].length; continue; }
     if (c === "'" || c === '"') { const end = quoteEnd(sql, i); cur += sql.slice(i, end); i = end; continue; }
     if (c === ";") { flush(); i++; continue; }
@@ -180,7 +184,8 @@ function collectKeys(text, fks, indexed) {
     }
   }
   const ix = new RegExp(String.raw`^CREATE\s+(UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?(IF\s+NOT\s+EXISTS\s+)?(${ID}\s+)?ON\s+(ONLY\s+)?${T}\s*(USING\s+\w+\s*)?\(\s*("?\w+"?)`, "i").exec(text);
-  if (ix) indexed.add(`${table(ix[6])}\u0000${ident(ix[8])}`);
+  // A partial index (WHERE …) covers only some rows, so it never clears the warning (PR125-r3).
+  if (ix && !/\bWHERE\b/i.test(topLevel(text.replace(QUOTED, '""')))) indexed.add(`${table(ix[6])}\u0000${ident(ix[8])}`);
 }
 
 
