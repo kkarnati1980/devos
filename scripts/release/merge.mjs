@@ -86,12 +86,18 @@ async function allCheckRuns(gh, repo, sha) {
   throw new CannotRun("more than 2,000 check runs; refusing to judge a partial list");
 }
 
+// DEVOS-212: the list endpoint (/statuses), not the combined status (/status): only the list carries `creator`, which
+// codexPass needs to tell the review watcher's PASS from anyone else's. It returns every status, newest first,
+// superseded ones included; codexPass keeps the latest per context.
 export async function allStatuses(gh, repo, sha) {
   const statuses = [];
-  for (let page = 1; page <= 20; page++) {
-    const j = await gh.get(`/repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
-    statuses.push(...(j.statuses ?? []));
-    if (statuses.length >= (j.total_count ?? 0) || (j.statuses ?? []).length === 0) return statuses;
+  // Page 21 is read only to see that it is empty, so exactly 2,000 statuses are still judged.
+  for (let page = 1; page <= 21; page++) {
+    const j = await gh.get(`/repos/${repo}/commits/${sha}/statuses?per_page=100&page=${page}`);
+    if (!Array.isArray(j)) throw new CannotRun(`statuses for ${sha}: unexpected reply (not a list)`);
+    statuses.push(...j);
+    if (statuses.length > 2000) break;
+    if (j.length < 100) return statuses;
   }
   throw new CannotRun("more than 2,000 statuses; refusing to judge a partial list");
 }
