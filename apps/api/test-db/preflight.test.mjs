@@ -120,3 +120,16 @@ test("DEVOS-205 (db): approving a doc without a pre-flight on a pending project 
   assert.equal(await store.approveDoc(rejected.doc.id), true);
   assert.equal(await store.preflightState(rejected.p.id), "rejected");
 });
+
+test("DEVOS-208 (db): a new spec version with the mode off re-opens a rejected pre-flight; approval then opens it", async () => {
+  const store = new PrismaRequirementsStore(db, 5000);
+  const p = await project({ continuousRun: false, preflightState: "rejected" });
+  const r = await pipeline(store, []).submitSpec(p.id, { kind: "paste", text: SPEC });
+  assert.equal(await store.preflightState(p.id), "pending", "rule 4: a new version re-opens it");
+  assert.equal(await pipeline(store, []).applyDecision({ id: r.approvalId, gate: "requirements", status: "approved" }), "approved");
+  assert.equal(await store.preflightState(p.id), "approved");
+  // An approved mode-off project is not moved by a new version.
+  const ok = await project({ continuousRun: false, preflightState: "approved" });
+  await pipeline(store, []).submitSpec(ok.id, { kind: "paste", text: SPEC });
+  assert.equal(await store.preflightState(ok.id), "approved");
+});
