@@ -44,6 +44,9 @@ test("AT4 (CR-a2): `PF-1: yes` records PF-1 as kk and every other decision item 
   const decisions = items.filter((i) => i.kind === "decision");
   assert.equal(rows.length, decisions.length, "one row per decision item, none for the secret");
   assert.deepEqual(rows[0], { itemId: "PF-1", text: items[0].text, answer: "yes", source: "kk" });
+  // A blank line is no answer: the default stands, and it never overwrites an earlier real answer.
+  for (const blank of ["PF-1: ", "PF-1:   ", "PF-1:\t", "PF-1:"]) assert.equal(preflightDecisions(items, [blank])[0].source, "default");
+  assert.equal(preflightDecisions(items, ["PF-1: yes", "PF-1: "])[0].answer, "yes");
   for (const r of rows.slice(1)) {
     const it = items.find((i) => i.id === r.itemId);
     assert.equal(r.source, "default");

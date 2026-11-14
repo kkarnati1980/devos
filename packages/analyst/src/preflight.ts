@@ -112,7 +112,8 @@ export interface PreflightDecisionRow {
 
 /** Longest stored answer (characters); a longer answer is cut, never refused (the card is already decided). */
 export const ANSWER_MAX = 1000;
-const ANSWER_LINE = /^\s*PF-(\d{1,4})\s*:\s*(.+?)\s*$/;
+// The answer starts with a non-space character: a blank `PF-<n>:` line is no answer (the default stands), pre-review r2.
+const ANSWER_LINE = /^\s*PF-(\d{1,4})\s*:\s*(\S.*?)\s*$/;
 
 /**
  * One row per `decision` item, in item order: KK's answer from a `PF-<n>: <answer>` line of his comments, or the
