@@ -32,14 +32,84 @@ export const KK_ONLY = (h) => {
   if (text.length >= CUT) return true;
   if (h.rule === "gitleaksignore-added" || h.rule === "policy-weakened") return true;
   if (h.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text);
-  // A CI hit names the step or job, not what it ran, so whether it removed or disabled security scanning cannot be
-  // established from the stored result (Codex PR84-r1): every ci-* hit fails closed to KK-only. The usual answer is
-  // to restore the change; a Codex Keep alone never clears it.
-  if (/^ci-/.test(h.rule ?? "")) return true;
+  // CI hits (Codex PR84-r1, GI-4c). Since DEVOS-167 a removed or changed step or job carries its body, so a hit
+  // whose stored body is read in full and shows only known non-security work may be cleared by a Codex Keep
+  // (DEVOS-186). Every other ci-* hit — a body-less one (ci-disabled, ci-continue-on-error, ci-trigger-*,
+  // ci-workflow-deleted, or a report from the guard before GI-4c), or one whose body runs a script, a local action, a
+  // reusable workflow or anything not on the allow-list below — fails closed to KK-only.
+  if (/^ci-/.test(h.rule ?? "")) return !ciBodyIsPlain(h);
   // Lint ignores can drop files from security linting.
   if (h.rule === "lint-rule-off") return /\bignores?\b/.test(text);
   return false;
 };
+
+// DEVOS-186: the CI rules whose hit text carries the step body (floor guard GI-4c, note 0021).
+const CI_BODY_RULES = new Set(["ci-step-removed", "ci-step-changed", "ci-job-removed"]);
+// Package-manager scripts accepted as non-security by name. `test` and `lint` are left out on purpose: either can run
+// security checks (a security self-test, a security lint plugin), and the stored text cannot show which.
+const PM_SCRIPTS = new Set(["install", "ci", "build", "typecheck", "format", "pack", "e2e"]);
+// Setup and artifact actions that never scan; anything else (a scanner action, a local action, a reusable workflow) is unknown.
+const PLAIN_ACTIONS = new Set(["actions/checkout", "actions/setup-node", "pnpm/action-setup", "actions/cache", "actions/upload-artifact", "actions/download-artifact"]);
+// Step keys that only shape how a step runs; their values are still covered by SECURITY_WORDS, checked first.
+const PLAIN_KEYS = /^(with|env|if|timeout-minutes|working-directory|shell|continue-on-error|id|name|node-version|version|cache|path|key|retention-days|fetch-depth|run_install)\s*:/;
+
+// Package-manager options that take the next word as their value; any other option must be a bare flag or --x=value.
+const PM_VALUE_FLAGS = new Set(["--filter", "-F", "-C", "--dir", "--prefix", "--workspace", "-w"]);
+const WORD = /^[\w@./:=-]+$/;
+
+/**
+ * `pnpm|npm|yarn [options] [run] <script> [options]` with a script from PM_SCRIPTS and nothing else: no second
+ * positional word (which could be `exec`'s binary or an argument the script interprets), no unknown spaced option.
+ */
+function plainPmCommand(cmd) {
+  const t = cmd.split(/\s+/);
+  if (!["pnpm", "npm", "yarn"].includes(t[0]) || !t.slice(1).every((w) => WORD.test(w))) return false;
+  let script = null, sawRun = false;
+  for (let i = 1; i < t.length; i++) {
+    const w = t[i];
+    if (w.startsWith("-")) {
+      if (PM_VALUE_FLAGS.has(w)) { if (i + 1 >= t.length || t[i + 1].startsWith("-")) return false; i++; }
+      continue;
+    }
+    if (script !== null) return false;
+    if (w === "run" && !sawRun) { sawRun = true; continue; }
+    script = w;
+  }
+  return script !== null && PM_SCRIPTS.has(script);
+}
+
+/** One body line (GI-4c joins a step's lines with " ⏎ "), read on its own. */
+function plainLine(line) {
+  const l = line.trim();
+  if (!l || l === "(empty)") return true;
+  const run = /^run\s*:\s*(.*)$/.exec(l);
+  if (run) {
+    const cmd = run[1].trim();
+    // A block scalar's commands are on the following lines, joined into this text; read it as unknown.
+    if (/^[|>]/.test(cmd) || !cmd) return false;
+    // One command only: no chaining, pipes, substitutions or redirections that could start another program.
+    if (/[;&|`$<>()\\]/.test(cmd)) return false;
+    return plainPmCommand(cmd);
+  }
+  const uses = /^uses\s*:\s*([^@\s]+)@[\w.-]+$/.exec(l);
+  if (uses) return PLAIN_ACTIONS.has(uses[1]);
+  return PLAIN_KEYS.test(l);
+}
+
+/**
+ * DEVOS-186: true only when a ci-* hit's stored body is complete and every line of it is known non-security work.
+ * The body follows "; ran: " (a removal) or "; was: …; now: …" (an edit); steps of a removed job are joined by " ;; ".
+ * A missing body, a cut text (handled before this is called) or any unknown line returns false (KK-only).
+ */
+export function ciBodyIsPlain(h) {
+  if (!CI_BODY_RULES.has(h.rule)) return false;
+  const text = String(h.text ?? "");
+  const m = /; (ran|was): (.*)$/.exec(text);
+  if (!m) return false;
+  const parts = m[1] === "was" ? m[2].split("; now: ") : [m[2]];
+  if (m[1] === "was" && parts.length !== 2) return false;
+  return parts.every((p) => p.split(" ;; ").every((step) => step.split(" ⏎ ").every(plainLine)));
+}
 
 export class CannotRun extends Error {}
 
