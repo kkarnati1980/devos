@@ -229,7 +229,7 @@ test("AT-MR8 (DEVOS-171) the sweep closes each stale run once, logs a failure by
   logs.length = 0;
   const down = new AnalystRunSweepJob({ staleRunIds: async () => { throw new Error("down"); }, closeStale: async () => assert.fail("no close") }, (e) => logs.push(e));
   assert.equal(await down.tick(), 0);
-  assert.deepEqual(logs, [{ level: "warn", msg: "analyst-sweep-failed", runId: "*" }]);
+  assert.deepEqual(logs, [{ level: "warn", msg: "analyst-sweep-list-failed" }]);
 
   // Ticks never overlap.
   let release;

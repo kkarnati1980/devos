@@ -242,7 +242,7 @@ export class PrismaAnalystRunSweeper {
   }
 }
 
-export type SweepLog = (entry: { level: "warn"; msg: "analyst-sweep-failed"; runId: string }) => void;
+export type SweepLog = (entry: { level: "warn"; msg: "analyst-sweep-failed"; runId: string } | { level: "warn"; msg: "analyst-sweep-list-failed" }) => void;
 
 /** DEVOS-171: the start-up and periodic sweep over `PrismaAnalystRunSweeper` (ticks never overlap). */
 export class AnalystRunSweepJob {
@@ -264,7 +264,7 @@ export class AnalystRunSweepJob {
       try {
         ids = await this.sweeper.staleRunIds(ANALYST_SWEEP_BATCH);
       } catch {
-        this.log({ level: "warn", msg: "analyst-sweep-failed", runId: "*" });
+        this.log({ level: "warn", msg: "analyst-sweep-list-failed" });
         return 0;
       }
       let n = 0;

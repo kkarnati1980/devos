@@ -149,7 +149,8 @@ test("AT-MR8 (DEVOS-171) a run left open past max_seconds + grace is closed stal
   const done = await mk({ status: "succeeded" });
   const builder = await mk({ role: "builder" });
 
-  const ids = await sweeper.staleRunIds(50);
+  // A large limit, so stale runs other tests leave in the shared CI database cannot push these out of the batch.
+  const ids = await sweeper.staleRunIds(10_000);
   assert.ok(ids.includes(stale.run) && ids.includes(staleStarted.run), "both stale runs are listed");
   for (const x of [fresh, done, builder]) assert.ok(!ids.includes(x.run), "fresh, closed and non-analyst runs are not listed");
 
