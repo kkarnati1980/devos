@@ -27,6 +27,9 @@ importers:
       '@devos/analyst':
         specifier: workspace:*
         version: link:../../packages/analyst
+      '@devos/card-batch':
+        specifier: workspace:*
+        version: link:../../packages/card-batch
       '@devos/db':
         specifier: workspace:*
         version: link:../../packages/db
