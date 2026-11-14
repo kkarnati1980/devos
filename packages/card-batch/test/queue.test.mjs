@@ -221,6 +221,12 @@ test("pre-review findings 1, 2, 4: refusals park the batch, applies have one win
   assert.equal((await store.batch(r.batchId)).state, "refused");
   cards.raiseCard = raiseCard;
   const late = await q.queueQuestion(P, ask("Sticky footer?", "no", [T2]), DAY1_LATE);
+  // Pre-review r2 finding 1: until the caller confirms the hand-off, every flush returns the refused members again
+  // (a crash after the refusal loses nothing), and nothing new is claimed.
+  const again = await q.flushBatch(P, DAY2);
+  assert.deepEqual([again.outcome, again.batchId, again.members.map((m) => m.text)], ["refused", r.batchId, ["Which colour?"]]);
+  assert.equal(cards.cards.length, 0);
+  await q.handOff(r.batchId, DAY1_LATE);
   assert.deepEqual(await q.flushBatch(P, DAY1_LATE), { outcome: "none" }, "day 1 already has its batch");
   const next = await q.flushBatch(P, DAY2);
   assert.equal(next.outcome, "raised");
@@ -246,4 +252,21 @@ test("pre-review findings 1, 2, 4: refusals park the batch, applies have one win
   assert.deepEqual(a.followUps, b.followUps);
   const final = x.store.decisions.filter((d) => d.approvalId !== null);
   assert.deepEqual(final.map((d) => [d.source, d.answer]), [["kk", "no"]]);
+});
+
+test("pre-review r2 findings 2 and 4: an expired card stops its tasks like a rejection; a retried queue call is safe", async () => {
+  const { store, cards, q } = wire();
+  const id = randomUUID();
+  const one = await q.queueQuestion(P, { ...ask("Dark header?", "yes", [T1]), id }, DAY1);
+  const two = await q.queueQuestion(P, { ...ask("Dark header?", "yes", [T1]), id }, new Date(DAY1.getTime() + 5000));
+  assert.deepEqual(two, one);
+  assert.equal(store.questions.length, 1);
+  assert.equal(store.decisions.length, 1);
+  await assert.rejects(q.queueQuestion(P, { ...ask("Dark header?"), id: "x" }, DAY1), (e) => e.code === "invalid-input");
+  const r = await q.flushBatch(P, DAY1);
+  cards.cards[0].status = "expired";
+  const out = await q.applyBatch(r.batchId, DAY1_LATE);
+  assert.deepEqual([out.outcome, out.first, out.stopped], ["rejected", true, [T1]]);
+  assert.equal(store.decisions.length, 1);
+  assert.ok((await store.batch(r.batchId)).appliedAt);
 });
