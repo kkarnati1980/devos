@@ -24,7 +24,7 @@ The Release path (`node scripts/release/merge.mjs <pr>`) refuses a PR unless the
 - **Re-run, not a stored artifact.** The CI job writes its JSON report to the step summary only, which the API does not serve. The guard is deterministic over `main...head`, so the Release path recomputes it with main's copy. The local result never turns a red check green on its own: it can only identify the hits that Keeps must cover.
 - **Aggregator.** `ci-gate` fails whenever any check fails, so a disposed floor guard also reds `ci-gate`. Its `failure` is set aside only together with a disposed floor guard; the Release path still judges every other check run and workflow run itself. Residual: `ci-gate` also refuses a PR whose base expects a check the head no longer produces; removing a workflow or job is itself a floor-guard hit (`ci-step-removed`) that would need its own Keep. Follow-up: once the DEVOS-145 ruleset requires `ci-gate`, GitHub will refuse such a merge anyway, so `ci-gate` must learn to read dispositions (filed).
 - **CI exit 2 with hits.** If CI's guard could not run but the deterministic local re-run on the same SHA finds hits and every hit has a valid Keep, the check is set aside: the stored result is the re-run. A re-run that itself exits 2 or finds nothing always refuses (GC2).
-- **KK-only set duplicated.** It mirrors `KK_ONLY` from DEVOS-144's gate evaluator (not on main yet); once both are merged they are unified (follow-up filed).
+- **KK-only set shared (DEVOS-181, 14 Nov 2026).** `notKeepable` is now the gate evaluator's `KK_ONLY` from `scripts/gates/kk-only.mjs`; see GI-4.md "Shared KK-only classifier" for the three rules that changed and why. B10's cases are unchanged.
 - **Same account.** Runners and the watcher share `kkarnati1980`, so a comment's author alone does not prove the watcher wrote it (as for the GI-3 status). The comment must match the watcher-posted PASS status's label and SHA; the server-side verdict file (`verdicts/<sha>.json`) stays the record. Recorded, not solved here.
 
 - 13 Nov 2026, build runner A: Codex PR96-r1 (1 medium, accepted): `namesChange` accepted a marker whose path continued past a space, so `FLOOR-GUARD CHANGE scripts/floor-guard/a b.mjs` also covered `scripts/floor-guard/a`. It now requires the whole rest of the line to equal the path; B7 covers the case.
@@ -46,6 +46,7 @@ Codex cannot run scripts, so it does not see floor-guard hit ids unless they rea
 | B9 | Markers only in a findings-table row, only in an edited comment, or only in a later comment than the watcher's refuse |
 | B10 | A Keep for a KK-only or §4.5 hit (gitleaksignore, guard change mixed, `ci-*`, security suppression, security-named file, policy) refuses with "escalate to KK"; ordinary hits stay keepable |
 | B11 | A red workflow named `floor-guard` from another file is never set aside |
+| B12 | (DEVOS-181) A `ci-step-removed` hit with a plain stored body (the guard's own text) and a valid Keep merges; without a Keep it refuses; with a script body it refuses with "escalate to KK" |
 
 ## Pre-review (13 Nov 2026)
 Round 1: 7 findings, 6 fixed: markers from the Summary line only (B9), KK-only hits never kept (B10), earliest unedited comment (B9), workflows by file (B11), the CI-exit-2 decision recorded above, plain-marker wording in rules.md. Not changed: `localGuardReport`'s fetch path is not unit-tested against a remote (it needs `origin`); its argument check is (B8), and any failure in it is exit 2.
@@ -53,6 +54,8 @@ Round 2: 5 low findings, 1 fixed (main is read once, so the guard re-run and the
 
 ## Pass rule
 `node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 11 tests passing, `node --test scripts/test/merge-gate.test.mjs` exits 0 with 14 tests passing, and `pnpm check:rules` exits 0.
+
+From DEVOS-181: `node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 12 tests passing (B1–B12).
 
 ## Green
 - **GC1 end to end** (stored on DEVOS-140): a throwaway PR adding `.skip` to an existing test gets `floor-guard` exit 1, and `node scripts/release/merge.mjs <pr> --dry-run` exits 1 naming the `test-skipped` hit.

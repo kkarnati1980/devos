@@ -4,6 +4,7 @@
 - **Spec:** KK, `claude/devos-gate-integrity-spec-v1.0.0.md` §3 and §10 (claude.ai Project). **The rule is KK's; it is not redesigned here.**
 - **Depends on:** GI-1 floor guard (DEVOS-141), GI-2 pass rule (DEVOS-142), GI-3 Release merge path (DEVOS-143). All three are merged.
 - **Owned files:** `scripts/gates/evaluate-gate.mjs`, `scripts/test/gate-evaluator.test.mjs`, this contract, `docs/decisions/0019-gate-rule-final-form.md`, the §2 amendment in `docs/decisions/0013-speed-ups.md`, the gate lines in `rules.md` and the generated `CLAUDE.md` / `AGENTS.md`.
+- **Owned files, from DEVOS-181 (shared KK-only classifier):** `scripts/gates/kk-only.mjs` and `scripts/test/kk-only.test.mjs` (new, owned here). Shared with GI-1b (DEVOS-149, Lane A, the same runner), only for this task: the classifier lines of `scripts/release/merge.mjs` (the import and `notKeepable`), test B12 in `scripts/test/merge-gate-floor-guard.test.mjs`, and in `docs/modules/GI-1b.md` the "KK-only set shared" runner decision, the B12 row and the B12 pass-rule line. Why one PR: the task is to make both readers use one function, so the move and both imports must land together, or the two copies would differ on main in between (Codex PR109-r1).
 - **Decision record:** `docs/decisions/0019-gate-rule-final-form.md` (includes the D14 draft for KK).
 
 ## Goal
@@ -33,8 +34,14 @@ Since floor guard GI-4c (DEVOS-167, note 0021), `ci-step-removed` and `ci-step-c
 
 Everything else stays KK-only: every `ci-job-removed` (job-level `uses:` of a reusable workflow, `services:`, `container:` and `env:` never reach the hit text), an empty body, a body-less hit (`ci-disabled`, `ci-continue-on-error`, `ci-trigger-*`, `ci-workflow-deleted`, or a report from the guard before GI-4c), a block scalar (`run: |`), a script the stored text cannot resolve (`pnpm check`, `bash scripts/x.sh`), `pnpm test` and `pnpm lint` (either can run security checks), a local action (`uses: ./…`), a reusable workflow, any other action, any other env line. Why: the evaluator must decide from the stored text alone, so it accepts only what that text shows in full, and fails closed on the rest (the DEVOS-167 pre-review advisory).
 
+## Shared KK-only classifier (DEVOS-181; runner decision 14 Nov 2026)
+`KK_ONLY` and `ciBodyIsPlain` live in `scripts/gates/kk-only.mjs`. The gate evaluator re-exports them, and the Release merge path (GI-1b) uses the same function as `notKeepable`. One test table covers both (`scripts/test/kk-only.test.mjs`).
+- The union of the two former copies, strictest per rule: `guard-change-not-isolated` (only the merge path had it) is now KK-only for the evaluator too, and a `suppression-added` text naming `security/` (only the evaluator had it) is now KK-only for the merge path too.
+- `ci-*` hits follow the DEVOS-186 rule in both places. The merge path used to refuse every `ci-*` Keep; it now lets a Codex Keep clear a `ci-step-removed`/`ci-step-changed` hit whose stored body is plain, as the gate already does. Why: the two readers must agree, or a PR the gate later counts as clean could never merge (or the reverse). The DEVOS-186 rule was built for this decision and reads only the stored text, failing closed on anything it cannot show in full. Body-less `ci-*` hits (B10's `ci-step-removed` "Lint") stay KK-only in both.
+- Why one module: two copies had already drifted (the three differences above). Rollback: revert this PR; both copies come back unchanged.
+
 ## Floor-guard self-match
-The security-suppression pattern in `evaluate-gate.mjs` is written `gitleaks[:]allow|\bnose[c]\b`, and the AT4 fixture builds its text by concatenation, so the floor guard (GI-1) does not flag these pattern strings as new suppressions. They match the same text and suppress nothing; nothing in this PR changes what the floor guard detects.
+The security-suppression pattern in `kk-only.mjs` (formerly `evaluate-gate.mjs`) is written `gitleaks[:]allow|\bnose[c]\b`, and the AT4 fixture builds its text by concatenation, so the floor guard (GI-1) does not flag these pattern strings as new suppressions. They match the same text and suppress nothing; nothing in this PR changes what the floor guard detects.
 
 ## Runner procedure (ADR-0013 §2 amended)
 - Runner A compiles the manifest, runs the evaluator, and posts the `--comment` output on the gate issue.
@@ -63,6 +70,7 @@ The security-suppression pattern in `evaluate-gate.mjs` is written `gitleaks[:]a
 ## Pass rule
 - `node --test scripts/test/gate-evaluator.test.mjs` exits 0 with 9 tests passing (AT1–AT9); it runs under `pnpm test`.
 - From DEVOS-186: the same command exits 0 with 10 tests passing (AT1–AT10).
+- From DEVOS-181: `node --test scripts/test/kk-only.test.mjs` exits 0 with 3 tests passing (K1 one shared function, K2 the table, K3 malformed hits never throw), and the gate-evaluator and merge-gate-floor-guard commands still exit 0 with 10 and 12 tests passing (B12 added).
 - `pnpm check:rules` exits 0 (the generated `CLAUDE.md` and `AGENTS.md` match `rules.md`).
 
 ## Merge gate
@@ -75,3 +83,4 @@ Reverting this PR returns the gate rule to the interim form of 12 Nov 2026 (ADR-
 - See the PR body and the merge evidence comment on DEVOS-144; GC6 and GC7 evidence goes on DEVOS-140.
 - 13 Nov 2026, build runner A: Codex PR84-r6 (1 medium, accepted): an unknown option, extra positional or repeated `--comment` could still exit 0 and skip the comment. The whole argument list is now validated before evaluation; AT9 extended (`node --test scripts/test/gate-evaluator.test.mjs` → exit 0, 9/9).
 - 14 Nov 2026, build runner A: DEVOS-186 built (section "CI hits with a stored body", AT10). `node --test scripts/test/gate-evaluator.test.mjs` exit 0, 10/10. Pre-review round 1: CHANGES_REQUESTED, 5 findings (2 high: a step name could inject a body; a removed reusable-workflow job had an empty body; 3 medium: custom `shell:`, flow-mapped `env:`/`with:`, option values that start programs) + 1 low test gap; all fixed (marker count, `ci-job-removed` always KK-only, empty body KK-only, shell/env/with and option allow-lists, an end-to-end fixture). Round 2: 1 medium (pnpm `-w`/`--workspace` could hide `test`/`lint` as a flag value) and 1 low (`run_install:` args), both fixed. Codex PR106-r1 (1 high, accepted): a `run:` value carrying a literal ` ⏎ ` could hide a second command; `run:` must now be a body's last line and other values plain words.
+- 14 Nov 2026, build runner A: DEVOS-181 built (section "Shared KK-only classifier"). `node --test scripts/test/kk-only.test.mjs` exit 0, 3/3; gate-evaluator 10/10, merge-gate-floor-guard 12/12. Pre-review: PASS, 5 low findings, 3 fixed (B12 merge-path test, real guard text in the table, K3 asserts the value); 1 follow-up (make `kk-only.mjs` a guarded path); 1 nit left.
