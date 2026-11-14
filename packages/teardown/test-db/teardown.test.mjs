@@ -127,7 +127,9 @@ test("DEVOS-175 on Postgres: purge deletes the project's isolation_stack rows wi
   const s = await setup();
   const other = await setup();
   await s.provision();
-  // Three free indexes in 512–1023 (the index, subnet and network are unique across all stacks in the database).
+  // Three indexes no row holds yet (the index, subnet and network are unique across all stacks in the database).
+  // 512–1023 only keeps clear of low indexes other fixtures might use; the read-then-insert is safe because the
+  // teardown-db job runs its tests one at a time on its own database.
   const taken = new Set((await db.isolationStack.findMany({ select: { idx: true } })).map((r) => r.idx));
   const start = randomBytes(2).readUInt16BE(0) % 512;
   const free = [];
