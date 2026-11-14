@@ -8,13 +8,16 @@ import { buildRuntime, type DbClient } from "./runtime.js";
 import type { DeadLetterQueue } from "./dead-letters.js";
 import { analystModelPass, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
 import { ANALYST_MAX_SECONDS } from "./analyst-runner.js";
+import { isolationStateConfig, startIsolationStateServer } from "./isolation-state.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
+  // S4-a2b: a malformed isolation token or port stops start-up with a code (never the value).
+  const isolationState = isolationStateConfig(process.env);
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadDb: async (url) => {
@@ -67,13 +70,17 @@ async function main(): Promise<void> {
   });
   app.enableShutdownHooks();
   await app.listen(config.port, config.host);
+  // S4-a2b: the host's state document, on 127.0.0.1 only. Off until the installer has set the token and a database exists.
+  const isolationServer = isolationState && isolation
+    ? await startIsolationStateServer({ ...isolationState, source: isolation, onError: (code) => stdoutSink({ ts: new Date().toISOString(), level: "warn", msg: code }) })
+    : null;
   // M2.2-d3c1: decided requirements cards are applied without waiting for the sync POST; stopped with the process.
   requirementsSync?.start();
   // DEVOS-171: analyst runs the runner could not close (DB down) are closed and settled, at start-up and every 5 min.
   analystSweep?.start();
-  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); });
-  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); });
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null });
+  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); isolationServer?.close(); });
+  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); isolationServer?.close(); });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null });
 }
 
 main().catch((e: unknown) => {
