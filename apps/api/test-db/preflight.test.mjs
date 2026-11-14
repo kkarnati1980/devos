@@ -54,7 +54,7 @@ test("AT3/AT4/AT6 (CR-a2, db): new projects default to the mode; approval writes
   assert.equal(await preflightOpen(p.id, store, vault(true)), false, "pending");
 
   // Rejection closes; a new version re-opens.
-  await db.approval.update({ where: { id: r.approvalId }, data: { status: "rejected" } });
+  await db.approval.update({ where: { id: r.approvalId }, data: { status: "rejected", decidedAt: new Date(), decidedBy: "kk:test" } });
   assert.equal(await pipeline(store, []).applyDecision({ id: r.approvalId, gate: "requirements", status: "rejected" }), "rejected");
   assert.equal(await store.preflightState(p.id), "rejected");
   const r2 = await pipeline(store, []).submitSpec(p.id, { kind: "paste", text: SPEC });
