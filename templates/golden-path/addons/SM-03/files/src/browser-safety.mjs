@@ -71,9 +71,10 @@ export function assertAllProtected(routes) {
 // ---------- escaped output ----------
 
 const brand = new WeakSet();
+const enteredRcdata = new WeakSet(); // results whose own parse entered <title>/<textarea> text (RCDATA)
 class SafeHtml {
   #text;
-  constructor(text) { this.#text = text; brand.add(this); Object.freeze(this); }
+  constructor(text, rcdata = false) { this.#text = text; brand.add(this); if (rcdata) enteredRcdata.add(this); Object.freeze(this); }
   toString() { return this.#text; }
 }
 export const isSafeHtml = (v) => brand.has(v);
@@ -106,6 +107,7 @@ class MarkupState {
   mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment
   tag = ""; // current tag source since "<"
   tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false; foreign = 0; // SVG/MathML subtree depth
+  sawRcdata = false; // this parse entered RCDATA (<title>/<textarea> outside SVG/MathML) at least once
   feed(s) {
     for (let i = 0; i < s.length; i++) {
       const c = s[i];
@@ -158,6 +160,7 @@ class MarkupState {
           const rcdata = this.foreign === 0 && RCDATA.has(name);
           this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && rcdata ? "rcdata" : "text";
           if (this.mode !== "text") this.raw = name;
+          if (this.mode === "rcdata") this.sawRcdata = true;
           this.tag = ""; this.tagName = "";
         }
       }
@@ -171,6 +174,24 @@ export function isSafeUrl(value) {
   const s = String(value ?? "").replace(/[\u0000- \u007f]/g, "");
   const scheme = /^([^:/?#]*):/.exec(s);
   return !scheme || ["http", "https", "mailto"].includes(scheme[1].toLowerCase());
+}
+
+// A nested html`` result was checked as if it stood alone in element content. It is spliced verbatim, so it is
+// safe only where the parent parses its text exactly that way, or as plain attribute text. Refused (TypeError):
+// - inside <title>/<textarea> (RCDATA): the parent reads the fragment as text up to its first </title>, then as
+//   markup, so a value the fragment saw as text could land in an attribute the parent never checked;
+// - inside a quoted attribute value, when the fragment holds a quote character: it would close the attribute and
+//   open new ones (e.g. title="${html`" href="${userUrl}`}") that skipped the URL and handler checks;
+// - inside SVG/MathML content, when the fragment's own parse entered <title>/<textarea> text: there those
+//   elements hold markup, so the parent would read as tags and attributes what the fragment checked as text.
+function assertPlaceable(v, state) {
+  if (Array.isArray(v)) { for (const x of v) assertPlaceable(x, state); return; }
+  if (!isSafeHtml(v)) return;
+  if (state.mode === "rcdata") throw new TypeError(`html: a nested html\`\` result may not be placed inside <${state.raw}>; pass text`);
+  if (state.mode === "quote" && /["']/.test(String(v))) throw new TypeError("html: a nested html`` result inside an attribute value may not hold a quote character");
+  if (state.mode === "text" && state.foreign > 0 && enteredRcdata.has(v)) {
+    throw new TypeError("html: a nested html`` result holding <title> or <textarea> text may not be placed inside <svg> or <math>");
+  }
 }
 
 function renderValue(v) {
@@ -197,6 +218,7 @@ export function html(strings, ...values) {
       throw new TypeError("html: no value may be placed in an event-handler, style, srcdoc or code-loading attribute");
     }
     if (state.mode === "quote") state.valued = true;
+    assertPlaceable(values[i], state);
     const piece = renderValue(values[i]) + strings[i + 1];
     state.feed(piece);
     out += piece;
@@ -208,7 +230,7 @@ export function html(strings, ...values) {
   if (state.mode !== "text" || state.foreign !== 0) {
     throw new TypeError("html: the template must be balanced — it may not end inside a tag, attribute, comment, raw-text element or SVG/MathML subtree");
   }
-  return new SafeHtml(out);
+  return new SafeHtml(out, state.sawRcdata);
 }
 
 // Sends an html`` result; a plain string is refused, so unescaped text cannot reach the page through this path.

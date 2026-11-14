@@ -182,6 +182,21 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   const row = html`<a href="${"/x"}">x</a>`;
   assert.equal(String(html`<ul>${row}</ul>`), '<ul><a href="/x">x</a></ul>');
   assert.throws(() => html`<ul>${html`<a href="${"javascript:alert(1)"}">x</a>`}</ul>`, /URL attribute/);
+  // A nested result is spliced verbatim, so it is refused where the parent would parse its text differently.
+  const evilUrl = "javascript:alert(1)";
+  assert.throws(() => html`<a title="${html`" href="${evilUrl}`}">click</a>`, /may not hold a quote/); // Codex PR98-r5
+  assert.throws(() => html`<a title='${html`' href='${evilUrl}`}'>click</a>`, /may not hold a quote/);
+  assert.throws(() => html`<p title="${[html`<b>`, html`" onclick="${"alert(1)"}`]}">x</p>`, /may not hold a quote/);
+  assert.throws(() => html`<title>${html`<b title="</title><a href='">${evilUrl}'`}</title>`, /inside <title>/);
+  assert.throws(() => html`<textarea>${html`<b>x</b>`}</textarea>`, /inside <textarea>/);
+  assert.throws(() => html`<svg>${html`<title><b onclick="</title>${"alert(1)"}">x</b></title>`}</svg>`, /inside <svg> or <math>/);
+  assert.throws(() => html`<svg>${html`<div>${html`<textarea>t</textarea>`}</div>`}</svg>`, /inside <svg> or <math>/);
+  // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
+  // and an RCDATA-free fragment inside SVG.
+  assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');
+  assert.equal(String(html`<title>${"<b>"}</title>`), "<title>&lt;b&gt;</title>");
+  assert.equal(String(html`<svg>${html`<g><a href="${"/ok"}">ok</a></g>`}</svg>`), '<svg><g><a href="/ok">ok</a></g></svg>');
+  assert.equal(String(html`<div>${html`<title>${"t"}</title>`}</div>`), "<div><title>t</title></div>");
   // The result is branded; a look-alike object is not accepted.
   assert.ok(isSafeHtml(html`<p></p>`));
   assert.ok(!isSafeHtml({ toString: () => "<p></p>" }));
