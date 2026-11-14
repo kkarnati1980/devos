@@ -14,6 +14,7 @@ permissions:
   actions: read # list the head SHA's pull_request workflow runs (Codex PR73-r4)
   statuses: read # GI-1d: the head's codex-review status
   pull-requests: read # GI-1d: the PR's changed files and the watcher's PASS comment
+  # GI-1d: PR number and base SHA come from the event file; history is fetched only when a disposition is judged.
 jobs:
   ci-gate:
     runs-on: ubuntu-latest
@@ -25,7 +26,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0 # GI-1d: the floor guard re-run needs base...head locally
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
@@ -47,8 +47,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GATE_SHA: ${{ github.event.pull_request.head.sha }}
           GATE_BASE: ${{ github.event.pull_request.base.ref }}
-          GATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          GATE_PR: ${{ github.event.pull_request.number }}
           GATE_WORKFLOWS_DIR: .github/workflows
           GATE_BASE_WORKFLOWS_DIR: .gate-base/.github/workflows
         run: node scripts/ci/ci-gate.mjs

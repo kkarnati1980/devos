@@ -2,7 +2,10 @@
 // using the Release path's own code (judgeFloorGuard, codexPass), never a copy.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { floorGuardDisposition } from "../ci/ci-gate.mjs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fetchHistory, floorGuardDisposition, GateError, prFromEvent } from "../ci/ci-gate.mjs";
 import { githubClient } from "../release/merge.mjs";
 import { applyDispositions } from "../floor-guard/floor-guard.mjs";
 
@@ -122,10 +125,33 @@ test("D5: a guard-path change needs a CHANGE line and a decision note, as on the
 test("D6: the PR's head moved, or the PR number or base SHA is missing → never disposed", async () => {
   const moved = await judge(fgOnly, fake({ pr: { number: 7, changed_files: 1, head: { sha: BASE } } }), guard([HIT]));
   assert.equal(moved.disposed, false);
-  await assert.rejects(judge(fgOnly, fake(), guard([HIT]), { pr: "" }), /GATE_PR/);
-  await assert.rejects(judge(fgOnly, fake(), guard([HIT]), { baseSha: "main" }), /GATE_BASE_SHA/);
+  await assert.rejects(judge(fgOnly, fake(), guard([HIT]), { pr: null }), /pull request number/);
+  await assert.rejects(judge(fgOnly, fake(), guard([HIT]), { baseSha: "main" }), /base SHA/);
 });
 
 test("D7: if the Release module cannot load, the gate errors (exit 2 path), never passes", async () => {
-  await assert.rejects(judge(fgOnly, fake(), guard([HIT]), { release: async () => { throw new (await import("../ci/ci-gate.mjs")).GateError("cannot load"); } }), /cannot load/);
+  await assert.rejects(judge(fgOnly, fake(), guard([HIT]), { release: async () => { throw new GateError("cannot load"); } }), /cannot load/);
+});
+
+test("D8: PR number and base SHA come from the event file; an unreadable file gives nulls (then an error)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gi1d-"));
+  const f = join(dir, "event.json");
+  writeFileSync(f, JSON.stringify({ pull_request: { number: 7, base: { sha: BASE } } }));
+  assert.deepEqual(prFromEvent(f), { pr: 7, baseSha: BASE });
+  assert.deepEqual(prFromEvent(join(dir, "missing.json")), { pr: null, baseSha: null });
+});
+
+test("D9: the history fetch passes the token only through git's environment, unshallows a shallow clone, and a failure errors", () => {
+  const calls = [];
+  const run = (cmd, args, opts) => {
+    calls.push({ args, env: opts.env });
+    if (args[0] === "rev-parse") return { status: 0, stdout: "true\n" };
+    return { status: 0, stdout: "" };
+  };
+  fetchHistory({ baseSha: BASE, sha: HEAD, token: "tok", run });
+  const fetch = calls.find((c) => c.args[0] === "fetch");
+  assert.deepEqual(fetch.args, ["fetch", "--quiet", "--no-tags", "--unshallow", "origin", BASE, HEAD]);
+  assert.ok(!fetch.args.join(" ").includes("tok") && !fetch.args.join(" ").includes(Buffer.from("x-access-token:tok").toString("base64")));
+  assert.equal(fetch.env.GIT_CONFIG_VALUE_0, `AUTHORIZATION: basic ${Buffer.from("x-access-token:tok").toString("base64")}`);
+  assert.throws(() => fetchHistory({ baseSha: BASE, sha: HEAD, token: "tok", run: (c, a) => (a[0] === "fetch" ? { status: 128 } : { status: 0, stdout: "false" }) }), /cannot fetch/);
 });

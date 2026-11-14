@@ -4,6 +4,7 @@
 // one of them succeeded. It never passes by default: a failure, cancel, skip, timeout, missing check, or a
 // workflow it cannot reason about (path filters, job `if:`, matrices, reusable workflows) is a fail.
 // Exit codes: 0 pass · 1 a check failed or did not report in time · 2 error (never treated as a pass).
+import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -214,6 +215,33 @@ export async function waitForChecks({ expected, owners, read, deadlineMs, interv
   }
 }
 
+/**
+ * GI-1d: the PR number and base SHA from the workflow's event file (GITHUB_EVENT_PATH), so the workflow passes no
+ * new inputs. Anything unreadable is null, and `floorGuardDisposition` then errors (exit 2).
+ */
+export function prFromEvent(path) {
+  try {
+    const pr = JSON.parse(readFileSync(path, "utf8"))?.pull_request;
+    return { pr: pr?.number ?? null, baseSha: pr?.base?.sha ?? null };
+  } catch {
+    return { pr: null, baseSha: null };
+  }
+}
+
+/**
+ * GI-1d: the checkout is shallow and keeps no credentials, so the floor guard re-run first fetches the full history
+ * of base and head with the job token, passed through git's environment config (never on the command line or in
+ * .git/config). A failed fetch is an error, never a pass.
+ */
+export function fetchHistory({ baseSha, sha, token, cwd = process.cwd(), run = spawnSync }) {
+  const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader", GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${auth}` };
+  const shallow = run("git", ["rev-parse", "--is-shallow-repository"], { cwd, encoding: "utf8", timeout: 10_000 });
+  const args = ["fetch", "--quiet", "--no-tags", ...(String(shallow.stdout).trim() === "true" ? ["--unshallow"] : []), "origin", baseSha, sha];
+  const r = run("git", args, { cwd, encoding: "utf8", env, timeout: 120_000 });
+  if (r.status !== 0) throw new GateError("floor guard re-run: cannot fetch the base and head history");
+}
+
 /** The Release path's shared rules (GI-1b), loaded only when a disposition is judged; a load failure is an error
  * (exit 2), never a pass. */
 async function loadRelease() {
@@ -239,8 +267,8 @@ export async function floorGuardDisposition(v, { gh, repo, pr, sha, baseSha, con
   if (!fg || v.state !== "failure" || v.pending.length > 0 || v.failed.length !== 1 || v.failed[0] !== `${fg.check}=failure`) {
     return { disposed: false, reasons: [] };
   }
-  if (!Number.isInteger(Number(pr)) || Number(pr) <= 0) throw new GateError("GATE_PR (the pull request number) is required to judge floor-guard Keeps");
-  if (!/^[0-9a-f]{40}$/.test(String(baseSha))) throw new GateError("GATE_BASE_SHA is not a full commit SHA");
+  if (!Number.isInteger(Number(pr)) || Number(pr) <= 0) throw new GateError("the pull request number (event file) is required to judge floor-guard Keeps");
+  if (!/^[0-9a-f]{40}$/.test(String(baseSha))) throw new GateError("the base SHA (event file) is not a full commit SHA");
   const statuses = [];
   for (let page = 1; page <= 20; page++) {
     const j = await gh.get(`/repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
@@ -281,12 +309,18 @@ async function main() {
     console.log("ci-gate: every expected check passed");
     return 0;
   }
+  const { pr, baseSha } = prFromEvent(process.env.GITHUB_EVENT_PATH ?? "");
+  const rel = await loadRelease();
   const d = await floorGuardDisposition(v, {
-    gh: (await loadRelease()).githubClient({ token: GITHUB_TOKEN }),
+    gh: rel.githubClient({ token: GITHUB_TOKEN }),
     repo: GITHUB_REPOSITORY,
-    pr: process.env.GATE_PR,
+    pr,
     sha: GATE_SHA,
-    baseSha: process.env.GATE_BASE_SHA,
+    baseSha,
+    guardReport: async (a) => {
+      fetchHistory({ baseSha: a.mainSha, sha: a.sha, token: GITHUB_TOKEN });
+      return rel.localGuardReport({ ...a, fetch: false });
+    },
   });
   if (d.disposed) {
     console.log("ci-gate: every expected check passed except floor-guard, whose every hit has a valid Codex Keep for this SHA (GI-1b rules)");
