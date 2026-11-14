@@ -69,12 +69,18 @@ export function assertAllProtected(routes) {
 }
 
 // ---------- escaped output ----------
+// S3-b3 deadlock resolution (docs/modules/S3.md, 14 Nov 2026): the template may use only a fixed subset of HTML,
+// read by a strict tokenizer that fails closed. Thirteen Codex rounds (PR98-r1…r13) each found a place where a
+// model of the full HTML parser (foreign content, select, template, comments, bogus comments, CDATA, unquoted values)
+// read markup differently from a browser. With the subset below, the browser's tokenizer state is fixed by the
+// token stream alone: no allowed element changes how later text is tokenized except <title>/<textarea> (RCDATA,
+// ended here only by the exact end tag) and <script> (only as an empty <script …></script>). Anything outside the
+// subset makes html`` throw, so a mismatch can only refuse a page, never pass an unsafe one.
 
 const brand = new WeakSet();
-const enteredRcdata = new WeakSet(); // results whose own parse entered <title>/<textarea> text (RCDATA)
 class SafeHtml {
   #text;
-  constructor(text, rcdata = false) { this.#text = text; brand.add(this); if (rcdata) enteredRcdata.add(this); Object.freeze(this); }
+  constructor(text) { this.#text = text; brand.add(this); Object.freeze(this); }
   toString() { return this.#text; }
 }
 export const isSafeHtml = (v) => brand.has(v);
@@ -84,190 +90,30 @@ export function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"'`=]/g, (c) => ESC[c]);
 }
 
-// Where a value may go is decided by scanning the markup written so far (static text, escaped values and nested
-// html`` results) with a small state machine: text, inside a tag, inside a quoted attribute value, inside a raw-text
-// element (<script>, <style>, …) or inside a comment.
-const RAW_TEXT = new Set(["script", "style", "iframe", "noscript", "xmp", "noembed", "noframes", "plaintext"]);
-const RCDATA = new Set(["textarea", "title"]); // text only (escaped values are fine), no tags inside
-const URL_ATTRS = new Set(["href", "src", "action", "formaction", "xlink:href", "poster", "data", "background", "cite", "codebase", "manifest"]);
-// Tags whose attributes load or re-point code (a value there is refused whatever the attribute), and attributes that
-// are code or a document themselves (srcdoc is parsed as same-origin HTML after the browser decodes it).
-const CODE_TAGS = new Set(["script", "base", "object", "embed", "applet", "meta", "link", "animate", "set", "animatetransform", "animatemotion"]);
-const CODE_ATTRS = new Set(["style", ["src", "doc"].join(""), "values", "to", "from", "by", "attributename"]);
-const NAMED = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", colon: ":", tab: "\t", newline: "\n", sol: "/", lpar: "(", rpar: ")", nbsp: " " };
+export const ALLOWED_TAGS = new Set([
+  "html", "head", "body", "title", "meta", "link", "script", "main", "header", "footer", "nav", "section", "article",
+  "aside", "h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span", "a", "ul", "ol", "li", "dl", "dt", "dd", "table",
+  "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "form", "label", "input", "button", "textarea", "img", "br",
+  "hr", "strong", "em", "b", "i", "small", "code", "pre", "blockquote",
+]);
+export const ALLOWED_ATTRS = new Set([
+  "id", "class", "title", "lang", "dir", "role", "hidden", "tabindex", "href", "rel", "target", "src", "alt", "width",
+  "height", "loading", "action", "method", "for", "name", "value", "type", "placeholder", "checked", "disabled",
+  "required", "readonly", "min", "max", "step", "maxlength", "autocomplete", "colspan", "rowspan", "charset",
+  "content", "defer", "async",
+]); // plus aria-*
+const attrAllowed = (n) => ALLOWED_ATTRS.has(n) || /^aria-[a-z]+$/.test(n);
+const URL_ATTRS = new Set(["href", "src", "action"]);
+const CODE_TAGS = new Set(["script", "meta", "link"]); // no value in any of their attributes
+const RCDATA = new Set(["title", "textarea"]);
+const WS = new Set(["\t", "\n", "\f", "\r", " "]);
+const NAMED = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", colon: ":", tab: "\t", newline: "\n", sol: "/", lpar: "(", rpar: ")", nbsp: " " };
 function decodeEntities(s) {
   return s.replace(/&(?:#x([0-9a-f]+)|#(\d+)|([a-z]+));?/gi, (m, hex, dec, name) => {
     const cp = hex ? parseInt(hex, 16) : dec ? Number(dec) : NaN;
     if (Number.isFinite(cp)) return cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
     return NAMED[name?.toLowerCase()] ?? m;
   });
-}
-
-// End tags that switch the browser's tokenizer out of a text state (RCDATA, RAWTEXT, script data). Where this parser
-// and the browser can disagree about whether such an element is open (foreign content, its HTML integration points,
-// HTML elements that break out of it), the first of these end tags is where the two views meet again. So one of
-// them may appear only where this parser itself reads it as an end tag: never inside a tag, a quoted attribute
-// value or a comment (Codex PR98-r6). A "<" or a partial name at the end of a piece is refused there too, since the
-// next value could complete it.
-const TEXT_END_NAMES = ["title", "textarea", "style", "xmp", "iframe", "noembed", "noframes", "noscript", "script", "plaintext"];
-function assertNoTextEndTag(s, i) {
-  if (i + 1 === s.length) throw new TypeError("html: a \"<\" may not end a piece inside a tag, attribute value or comment");
-  if (s[i + 1] !== "/") return;
-  const rest = s.slice(i + 2, i + 2 + 12).toLowerCase();
-  for (const name of TEXT_END_NAMES) {
-    const complete = rest.startsWith(name) && (i + 2 + name.length === s.length || /[\t\n\f\r />]/.test(s[i + 2 + name.length]));
-    const partial = i + 2 + rest.length === s.length && rest.length < name.length && name.startsWith(rest);
-    if (complete || partial) throw new TypeError(`html: </${name}> may not appear inside a tag, attribute value or comment`);
-  }
-}
-// Start tags that open a text state, refused inside <select>: the select parsing mode ignores them in some browsers
-// (so their content is markup there) and honours them in others (Codex PR98-r6). <script> is raw text in both.
-const IGNORED_IN_SELECT = new Set([...RCDATA, ...RAW_TEXT].filter((n) => n !== "script"));
-
-const CDATA_REFUSED = "html: <![CDATA[ is not supported (inside <svg>/<math> it hides markup until ]]>)";
-
-class MarkupState {
-  mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment | bogus
-  tag = ""; // current tag source since "<"
-  tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false;
-  fstack = []; // open SVG/MathML roots, innermost last
-  get foreign() { return this.fstack.length; }
-  // Codex PR98-r11: once an <svg> or <math> start tag has been seen, the rest of the parse never enters RCDATA.
-  // Whether the browser is still in foreign content after an end tag depends on tree construction (an HTML element
-  // inside <foreignObject> makes the browser ignore a </svg>), which this parser does not model.
-  sawForeign = false;
-  inSelect = false;
-  sawRcdata = false; // this parse entered RCDATA (<title>/<textarea> before any SVG/MathML root) at least once
-  ts = "open"; closing = false; selfClose = false; curAttr = ""; // tag sub-state, as in the HTML tokenizer
-  openTag() { this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.ts = "open"; this.closing = false; this.selfClose = false; this.curAttr = ""; }
-  feed(s) {
-    for (let i = 0; i < s.length; i++) {
-      const c = s[i];
-      if (this.mode === "lt") { // the "<" was the last character of the previous piece
-        this.mode = "text";
-        if (c === "!" && s.startsWith("![CDATA[", i)) throw new TypeError(CDATA_REFUSED);
-        if (c === "!" || c === "?") this.mode = "bogus";
-        else if (/[a-zA-Z\/]/.test(c)) { this.openTag(); i--; }
-      } else if (this.mode === "text") {
-        // Comments end as the browser ends them (Codex PR98-r8): "<!-->" and "<!--->" close at once, and inside a
-        // comment both "-->" and "--!>" close it.
-        if (c === "<" && s.startsWith("<!-->", i)) i += 4;
-        else if (c === "<" && s.startsWith("<!--->", i)) i += 5;
-        else if (c === "<" && s.startsWith("<!--", i)) { this.mode = "comment"; i += 3; }
-        else if (c === "<" && i + 1 === s.length) this.mode = "lt";
-        // Codex PR98-r10: inside SVG/MathML, <![CDATA[ … ]]> is a CDATA section that ends only at "]]>", so the
-        // ">" and quotes inside it are text there, not the end of a bogus comment. Refused everywhere: outside foreign
-        // content the browser reads it as a bogus comment instead, and a template never needs it (text is escaped).
-        else if (c === "<" && s.startsWith("<![CDATA[", i)) throw new TypeError(CDATA_REFUSED);
-        // Codex PR98-r7: <!…> (other than a comment), <?…> and </ not followed by a letter are bogus comments in
-        // the browser: they end at the first ">", whatever quotes they hold. Read as tags, a quote there could hide
-        // a value that the browser places after the ">" (e.g. inside a <script>).
-        else if (c === "<" && (s[i + 1] === "!" || s[i + 1] === "?" || (s[i + 1] === "/" && !/[a-zA-Z]/.test(s[i + 2] ?? "")))) this.mode = "bogus";
-        else if (c === "<" && /[a-zA-Z\/]/.test(s[i + 1])) this.openTag();
-      } else if (this.mode === "bogus") {
-        if (c === "<") assertNoTextEndTag(s, i);
-        if (c === ">") this.mode = "text";
-      } else if (this.mode === "comment") {
-        if (c === "<") assertNoTextEndTag(s, i);
-        if (s.startsWith("-->", i)) { this.mode = "text"; i += 2; }
-        else if (s.startsWith("--!>", i)) { this.mode = "text"; i += 3; }
-      } else if (this.mode === "raw" || this.mode === "rcdata") {
-        // An end tag counts only with a terminator after its name, as in the browser (</scripts> does not end it).
-        if (this.raw === "script" && s.startsWith("<!--", i)) throw new TypeError("html: <!-- inside <script> is not supported");
-        const end = `</${this.raw}`;
-        // Only ASCII whitespace, "/" or ">" ends a raw/RCDATA close tag in the HTML tokenizer. JS \s also matches
-        // U+00A0 and other Unicode spaces, which the browser does NOT accept, so </script > must stay raw.
-        if (c === "<" && s.slice(i, i + end.length).toLowerCase() === end && /[\t\n\f\r />]/.test(s[i + end.length] ?? "")) {
-          this.openTag(); this.raw = "";
-        }
-      } else if (this.mode === "quote") {
-        if (c === "<") assertNoTextEndTag(s, i);
-        if (c === this.quote) {
-          // A URL attribute that holds a value is judged as a whole when it closes, the way the browser reads it:
-          // entities decoded, then leading spaces and control characters dropped (isSafeUrl).
-          if (this.valued && URL_ATTRS.has(this.attr) && !isSafeUrl(decodeEntities(this.tag.slice(this.quoteAt)))) {
-            throw new TypeError("html: a URL attribute takes only http(s), mailto or relative URLs");
-          }
-          this.mode = "tag"; this.ts = "afterQuoted"; this.quote = ""; this.valued = false;
-        }
-        this.tag += c;
-      } else { // tag: the HTML tokenizer's tag states (Codex PR98-r9), so quotes count exactly where the browser's do
-        if (c === "<") assertNoTextEndTag(s, i);
-        this.tag += c;
-        const ws = c === "\t" || c === "\n" || c === "\f" || c === "\r" || c === " ";
-        const reconsume = (state) => { this.ts = state; this.tag = this.tag.slice(0, -1); i--; };
-        let emit = false;
-        switch (this.ts) {
-          case "open": // just after "<"
-            if (c === "/") this.closing = true; else this.tagName = c.toLowerCase();
-            this.ts = "name"; break;
-          case "name":
-            if (ws) this.ts = "beforeAttr"; else if (c === "/") this.ts = "selfClosing"; else if (c === ">") emit = true; else this.tagName += c.toLowerCase();
-            break;
-          case "beforeAttr":
-            if (ws) break;
-            if (c === "/" || c === ">") reconsume("afterAttrName");
-            else if (c === "=") { this.curAttr = "="; this.ts = "attrName"; }
-            else { this.curAttr = ""; reconsume("attrName"); }
-            break;
-          case "attrName": // quotes and "<" are part of a name here, as in the browser
-            if (ws || c === "/" || c === ">") reconsume("afterAttrName"); else if (c === "=") this.ts = "beforeValue"; else this.curAttr += c.toLowerCase();
-            break;
-          case "afterAttrName":
-            if (ws) break;
-            if (c === "/") this.ts = "selfClosing"; else if (c === "=") this.ts = "beforeValue"; else if (c === ">") emit = true; else { this.curAttr = ""; reconsume("attrName"); }
-            break;
-          case "beforeValue":
-            if (ws) break;
-            if (c === '"' || c === "'") { this.mode = "quote"; this.quote = c; this.quoteAt = this.tag.length; this.attr = this.curAttr; this.valued = false; }
-            else if (c === ">") emit = true;
-            else reconsume("unquoted");
-            break;
-          case "unquoted": // a quote here is a character of the value, not the start of one
-            if (ws) this.ts = "beforeAttr"; else if (c === ">") emit = true;
-            break;
-          case "afterQuoted":
-            if (ws) this.ts = "beforeAttr"; else if (c === "/") this.ts = "selfClosing"; else if (c === ">") emit = true; else reconsume("beforeAttr");
-            break;
-          case "selfClosing":
-            if (c === ">") { this.selfClose = true; emit = true; } else reconsume("beforeAttr");
-            break;
-        }
-        if (emit) {
-          const name = this.closing ? "" : this.tagName;
-          const closing = this.closing;
-          const selfClose = this.selfClose;
-          const closeName = closing ? this.tagName : "";
-          // Track SVG/MathML foreign content. Inside it, <title>/<textarea> are NOT RCDATA: their children are
-          // parsed as markup (SVG <title>/<desc>/<foreignObject> are HTML integration points), so a nested
-          // <a href="${…}"> is a real attribute that must be URL-validated, not RCDATA text. Treating the whole
-          // foreign subtree as markup only ever adds validation, never removes it, which is the safe direction.
-          // An end tag pops back to its own open root, as the browser's foreign-content rule does (</math> inside an
-          // <svg> is ignored there, so it must not end the SVG subtree here either).
-          if (!closing && !selfClose && (name === "svg" || name === "math")) this.fstack.push(name);
-          if (!closing && (name === "svg" || name === "math")) this.sawForeign = true; // a self-closed root counts too
-          else if (closing && (closeName === "svg" || closeName === "math")) {
-            const at = this.fstack.lastIndexOf(closeName);
-            if (at >= 0) this.fstack.length = at;
-          }
-          if (this.foreign === 0) {
-            if (!closing && name === "select") this.inSelect = true;
-            else if (closing && closeName === "select") this.inSelect = false;
-            else if (!closing && this.inSelect && IGNORED_IN_SELECT.has(name)) {
-              throw new TypeError(`html: <${name}> inside <select> is not supported (browsers parse it differently there)`);
-            }
-          }
-          // RCDATA only before any SVG/MathML root (r11): after one, <title>/<textarea> are read as markup, so their
-          // attributes are checked. Reading RCDATA as markup only adds checks: a value there is escaped text anyway.
-          const rcdata = !this.sawForeign && RCDATA.has(name);
-          this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && rcdata ? "rcdata" : "text";
-          if (this.mode !== "text") this.raw = name;
-          if (this.mode === "rcdata") this.sawRcdata = true;
-          this.tag = ""; this.tagName = "";
-        }
-      }
-    }
-  }
 }
 
 // A URL value is refused when it names a scheme other than http, https or mailto (javascript:, data:, vbscript:, …).
@@ -278,70 +124,134 @@ export function isSafeUrl(value) {
   return !scheme || ["http", "https", "mailto"].includes(scheme[1].toLowerCase());
 }
 
-// A nested html`` result was checked as if it stood alone in element content. It is spliced verbatim, so it is
-// safe only where the parent parses its text exactly that way, or as plain attribute text. Refused (TypeError):
-// - inside <title>/<textarea> (RCDATA): the parent reads the fragment as text up to its first </title>, then as
-//   markup, so a value the fragment saw as text could land in an attribute the parent never checked;
-// - inside a quoted attribute value, when the fragment holds a quote character: it would close the attribute and
-//   open new ones (e.g. title="${html`" href="${userUrl}`}") that skipped the URL and handler checks;
-// - after any SVG/MathML root in the parent, when the fragment's own parse entered <title>/<textarea> text: there
-//   those elements may hold markup, so the parent would read as tags and attributes what the fragment checked as text.
-function assertPlaceable(v, state) {
-  if (Array.isArray(v)) { for (const x of v) assertPlaceable(x, state); return; }
-  if (!isSafeHtml(v)) return;
-  if (state.mode === "rcdata") throw new TypeError(`html: a nested html\`\` result may not be placed inside <${state.raw}>; pass text`);
-  if (state.mode === "quote" && /["']/.test(String(v))) throw new TypeError("html: a nested html`` result inside an attribute value may not hold a quote character");
-  if (state.mode === "text" && state.sawForeign && enteredRcdata.has(v)) {
-    throw new TypeError("html: a nested html`` result holding <title> or <textarea> text may not be placed inside <svg> or <math>");
+const fail = (msg) => { throw new TypeError(`html: ${msg}`); };
+const DOCTYPE = "<!doctype html>";
+
+// The strict tokenizer. Modes: text, lt ("<" seen), name, beforeAttr, attrName, eq ("=" seen), value (inside a
+// double-quoted value), afterValue, selfClose, endLt ("</" seen), endName, endWs, rcdata, endExact (matching the
+// one end tag allowed to leave <title>, <textarea> or <script>).
+class Tokenizer {
+  mode = "text"; at = 0; tag = ""; attr = ""; buf = ""; valued = false; closing = false; expect = ""; ei = 0; rc = "";
+  feed(s) {
+    for (let i = 0; i < s.length; i++, this.at++) {
+      const c = s[i];
+      const lc = c.toLowerCase();
+      switch (this.mode) {
+        case "text":
+          if (c === "<") {
+            if (this.at === 0 && s.slice(i, i + DOCTYPE.length).toLowerCase() === DOCTYPE) { i += DOCTYPE.length - 1; this.at += DOCTYPE.length - 1; }
+            else this.mode = "lt";
+          }
+          break;
+        case "lt":
+          if (c === "/") this.mode = "endLt";
+          else if (/[a-z]/i.test(c)) { this.mode = "name"; this.tag = lc; }
+          else fail('a "<" must start an allowed tag (write &lt; for a literal "<"); <!…>, <?…> and comments are not supported');
+          break;
+        case "name":
+          if (/[a-z0-9]/i.test(c)) { this.tag += lc; break; }
+          this.checkTag();
+          if (WS.has(c)) this.mode = "beforeAttr"; else if (c === ">") this.emit(); else if (c === "/") this.mode = "selfClose";
+          else fail(`unexpected ${JSON.stringify(c)} in a tag name`);
+          break;
+        case "beforeAttr":
+          if (WS.has(c)) break;
+          if (c === ">") this.emit(); else if (c === "/") this.mode = "selfClose";
+          else if (/[a-z]/i.test(c)) { this.mode = "attrName"; this.attr = lc; }
+          else fail(`unexpected ${JSON.stringify(c)} in <${this.tag}> (attributes are name or name="value")`);
+          break;
+        case "attrName":
+          if (/[a-z0-9-]/i.test(c)) { this.attr += lc; break; }
+          if (!attrAllowed(this.attr)) fail(`the attribute ${JSON.stringify(this.attr)} is not supported`);
+          if (c === "=") this.mode = "eq"; else if (WS.has(c)) this.mode = "beforeAttr"; else if (c === ">") this.emit(); else if (c === "/") this.mode = "selfClose";
+          else fail(`unexpected ${JSON.stringify(c)} after the attribute ${this.attr}`);
+          break;
+        case "eq":
+          if (c === '"') { this.mode = "value"; this.buf = ""; this.valued = false; }
+          else fail("quote every attribute value with double quotes, right after the =");
+          break;
+        case "value":
+          if (c === '"') { this.closeValue(); this.mode = "afterValue"; } else this.buf += c;
+          break;
+        case "afterValue":
+          if (WS.has(c)) this.mode = "beforeAttr"; else if (c === ">") this.emit(); else if (c === "/") this.mode = "selfClose";
+          else fail(`a space must follow a quoted value in <${this.tag}>`);
+          break;
+        case "selfClose":
+          if (c === ">") this.emit(); else fail('"/" in a tag must be followed by ">"');
+          break;
+        case "endLt":
+          if (/[a-z]/i.test(c)) { this.mode = "endName"; this.tag = lc; } else fail('"</" must start an allowed end tag');
+          break;
+        case "endName":
+          if (/[a-z0-9]/i.test(c)) { this.tag += lc; break; }
+          this.checkTag();
+          if (c === ">") this.mode = "text"; else if (WS.has(c)) this.mode = "endWs"; else fail("an end tag takes no attributes");
+          break;
+        case "endWs":
+          if (c === ">") this.mode = "text"; else if (!WS.has(c)) fail("an end tag takes no attributes");
+          break;
+        case "rcdata":
+          if (c === "<") { this.mode = "endExact"; this.ei = 1; }
+          break;
+        case "endExact":
+          if (lc !== this.expect[this.ei]) fail(`inside <${this.rc}> the only markup allowed is ${this.expect} (write &lt; for "<")`);
+          if (++this.ei === this.expect.length) this.mode = "text";
+          break;
+      }
+    }
+  }
+  checkTag() { if (!ALLOWED_TAGS.has(this.tag)) fail(`<${this.tag}> is not supported (allowed: ${[...ALLOWED_TAGS].join(", ")})`); }
+  closeValue() {
+    if (!this.valued || !URL_ATTRS.has(this.attr)) return;
+    // Judged whole when the quote closes, the way the browser reads it: entities decoded, then spaces and control
+    // characters dropped (isSafeUrl). A named reference this decoder does not know is refused rather than guessed.
+    const decoded = decodeEntities(this.buf);
+    if (/&[a-z]/i.test(decoded) || !isSafeUrl(decoded)) fail("a URL attribute takes only http(s), mailto or relative URLs");
+  }
+  emit() {
+    // <title>, <textarea> and <script> switch the browser's tokenizer whether or not the tag ends in "/>".
+    if (RCDATA.has(this.tag)) { this.mode = "rcdata"; this.rc = this.tag; this.expect = `</${this.tag}>`; }
+    else if (this.tag === "script") { this.mode = "endExact"; this.rc = "script"; this.expect = "</script>"; this.ei = 0; }
+    else this.mode = "text";
+  }
+  // Where the next value would land.
+  place(kind) { // kind: "text" (escaped) | "fragment" (nested html`` result)
+    if (this.mode === "text") return;
+    if (this.mode === "rcdata") { if (kind === "fragment") fail(`a nested html\`\` result may not be placed inside <${this.rc}>; pass text`); return; }
+    if (this.mode === "value") {
+      if (kind === "fragment") fail("a nested html`` result may be placed only in text, not in an attribute value");
+      if (CODE_TAGS.has(this.tag)) fail(`no value may be placed in an attribute of <${this.tag}>`);
+      this.valued = true;
+      return;
+    }
+    if (this.mode === "endExact" && this.rc === "script") fail("no value may be placed inside <script>");
+    fail("a value may go only in text or inside a double-quoted attribute value (never in a tag name, attribute name or end tag)");
   }
 }
 
-function renderValue(v) {
-  if (isSafeHtml(v)) return String(v);
-  if (Array.isArray(v)) return v.map(renderValue).join("");
-  return escapeHtml(v);
-}
-
-// html`<p>${name}</p>` escapes every value. Nested html`` results and arrays of them are kept as they are.
-// Refused at render (TypeError): a value inside <script>, <style> or another raw-text element or a comment; a value
-// inside a tag but outside a quoted attribute value (unquoted attributes, attribute names); a value in an on…
-// handler or style attribute, the iframe document attribute, an SVG animation value, or any attribute of <script>, <base>, <object>,
-// <embed>, <meta> or <link>; and a URL attribute that, once complete and decoded, names a scheme other than
-// http(s) or mailto (values split over several interpolations or nested html`` results are judged together).
+// html`<p>${name}</p>` escapes every value. Nested html`` results and arrays of them are kept as they are, in text
+// only. The static text must use the subset above; see ALLOWED_TAGS and ALLOWED_ATTRS. Refused (TypeError): any
+// other tag or attribute, <!…> (except a leading <!DOCTYPE html>), <?…>, comments, a "<" that does not start an
+// allowed tag, unquoted or single-quoted values, a value or nested result anywhere but text or an allowed
+// double-quoted value, any value in <script>, <meta> or <link>, a nested result inside <title>/<textarea> or an
+// attribute, and a URL attribute (href, src, action) holding a value that, decoded, names a scheme other than
+// http(s) or mailto. The result must end in text (not inside a tag, value, <title>, <textarea> or <script>).
 export function html(strings, ...values) {
   if (!Array.isArray(strings) || !Array.isArray(strings.raw)) throw new TypeError("html must be used as a tagged template");
-  const state = new MarkupState();
-  let out = strings[0];
-  state.feed(strings[0]);
-  // Codex PR98-r12: an array's members are placed one at a time, each checked against the state the members
-  // before it left (a fragment that opens <svg> changes how the next one is read), never all against the start.
+  const tok = new Tokenizer();
+  let out = "";
+  const put = (piece) => { tok.feed(piece); out += piece; };
   const place = (v) => {
     if (Array.isArray(v)) { for (const x of v) place(x); return; }
-    if (state.mode === "bogus") throw new TypeError("html: no value may be placed inside <!…>, <?…> or </…> declarations");
-    if (state.mode === "raw" || state.mode === "comment") throw new TypeError(`html: no value may be placed inside <${state.raw || "!--"}>`);
-    if (state.mode === "tag" || state.mode === "lt") throw new TypeError("html: quote every attribute that holds a value (and no value may name a tag)");
-    if (state.mode === "quote" && (!state.attr || state.attr.startsWith("on") || CODE_ATTRS.has(state.attr) || CODE_TAGS.has(state.tagName))) {
-      throw new TypeError("html: no value may be placed in an event-handler, style, srcdoc or code-loading attribute");
-    }
-    if (state.mode === "quote") state.valued = true;
-    assertPlaceable(v, state);
-    const piece = renderValue(v);
-    state.feed(piece);
-    out += piece;
+    if (isSafeHtml(v)) { tok.place("fragment"); put(String(v)); return; }
+    tok.place("text");
+    put(escapeHtml(v));
   };
-  for (let i = 0; i < values.length; i++) {
-    place(values[i]);
-    state.feed(strings[i + 1]);
-    out += strings[i + 1];
-  }
-  // Each result must be balanced: it may not end inside a tag, attribute, comment, raw-text element or an open
-  // SVG/MathML subtree. Otherwise an unbalanced fragment could smuggle an interpolated value into an attribute
-  // that a composing parent closes and reads as static — e.g. html`<a href="${userUrl}` spliced before `">` —
-  // skipping the close-time URL check (which fires only when the quote holds an interpolated value).
-  if (state.mode !== "text" || state.foreign !== 0) {
-    throw new TypeError("html: the template must be balanced — it may not end inside a tag, attribute, comment, raw-text element or SVG/MathML subtree");
-  }
-  return new SafeHtml(out, state.sawRcdata);
+  put(strings[0]);
+  for (let i = 0; i < values.length; i++) { place(values[i]); put(strings[i + 1]); }
+  if (tok.mode !== "text") fail("the template must be balanced: it may not end inside a tag, attribute value, <title>, <textarea> or <script>");
+  return new SafeHtml(out);
 }
 
 // Sends an html`` result; a plain string is refused, so unescaped text cannot reach the page through this path.
