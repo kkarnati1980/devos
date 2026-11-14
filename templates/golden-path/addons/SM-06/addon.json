@@ -1,0 +1,14 @@
+{
+  "id": "SM-06",
+  "name": "Data layer",
+  "files": [
+    "src/db.mjs",
+    "src/migrations-check.mjs",
+    "test/sm-06-data.test.mjs"
+  ],
+  "checks": {
+    "SM-06-L1": "test/sm-06-data.test.mjs",
+    "SM-06-L2": "test/sm-06-data.test.mjs"
+  },
+  "usage": "Set DB_POOL_MAX (1-50, no default) and pass poolConfig() to your driver. Wrap related writes in withTransaction(client, fn) on one connection (e.g. a pg PoolClient, never the pool). Write migrations as plain SQL in migrations/ and check new ones in CI with `git diff --name-only --diff-filter=AMR origin/main -- 'migrations/*.sql' | xargs -r node src/migrations-check.mjs` (-r: a PR with no new migration checks nothing): drops (tables, views, columns, types, sequences, functions), renames, type changes, new NOT NULL without a default, TRUNCATE and whole-table DELETE/UPDATE are refused (expand now, contract later); a planned contract step needs `-- sm06: contract <reason>` right above it. Index every foreign-key column (the check warns; --strict fails)."
+}
