@@ -1,7 +1,7 @@
 // ADR-0012 CR-a2 (DEVOS-198): preflightOpen (AT3) and the decision log rows from KK's comment (AT4).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { missingSecrets, preflightDecisions, preflightOpen, preflightSecretName } from "../dist/preflight.js";
+import { missingSecrets, preflightDecisions, preflightOpen, preflightSecretName, preflightView } from "../dist/preflight.js";
 
 const P = "11111111-1111-4111-8111-111111111111";
 // The shape @devos/analyst buildPreflight returns (its own AT1 pins the builder); fixed here so this file needs only
@@ -60,4 +60,39 @@ test("AT4 (CR-a2): `PF-1: yes` records PF-1 as kk and every other decision item 
   assert.equal(later[1].answer.length, 1000);
   assert.equal(later.length, rows.length);
   assert.deepEqual(preflightDecisions(items, []).map((r) => r.source), decisions.map(() => "default"));
+});
+
+test("AT-CA3a (CR-a3): the pre-flight view shows state, the list, missing secret names and the decision log; reads only", async () => {
+  const log = [{ itemId: "PF-1", answer: "yes", source: "kk", createdAt: "2026-11-14T10:00:00.000Z" }];
+  const viewReader = (state, list = items, over = {}) => ({
+    ...reader(state, list),
+    projectBySlug: async (slug) => (slug === "shop" ? { id: P, continuousRun: true } : null),
+    decisions: async () => log,
+    ...over,
+  });
+  assert.equal(await preflightView("nope", viewReader("pending"), vault([])), null, "unknown slug");
+  const waiting = await preflightView("shop", viewReader("approved"), vault([]));
+  assert.deepEqual(
+    { state: waiting.state, open: waiting.open, missing: waiting.missingSecrets, unverified: waiting.secretsUnverified, n: waiting.items.length },
+    { state: "approved", open: false, missing: ["SMS_API_KEY"], unverified: false, n: 4 },
+    "approved, waiting for secrets",
+  );
+  assert.deepEqual(waiting.decisions, log);
+  const open = await preflightView("shop", viewReader("approved"), vault([preflightSecretName("SMS_API_KEY")]));
+  assert.equal(open.open, true);
+  assert.deepEqual(open.missingSecrets, []);
+  // No vault, or a vault that fails: every name is listed as missing, unverified, and the build stays closed.
+  for (const v of [null, { hasProject: async () => { throw new Error("vault down"); } }]) {
+    const u = await preflightView("shop", viewReader("approved"), v);
+    assert.deepEqual([u.open, u.missingSecrets, u.secretsUnverified], [false, ["SMS_API_KEY"], true]);
+  }
+  // Outside the mode (backfilled): no list, open.
+  const off = await preflightView("shop", viewReader("approved", null, { projectBySlug: async () => ({ id: P, continuousRun: false }) }), null);
+  assert.deepEqual([off.continuousRun, off.items, off.open, off.secretsUnverified], [false, [], true, false]);
+  // The view never carries a secret value: secret items are names only, and the vault is asked only `hasProject`.
+  const asked = [];
+  await preflightView("shop", viewReader("approved"), { hasProject: async (pid, n) => { asked.push(n); return false; }, reveal: async () => { throw new Error("must not reveal"); } });
+  assert.ok(asked.every((n) => n === preflightSecretName("SMS_API_KEY")));
+  // A store fault propagates (the route maps it to a fixed 500 code).
+  await assert.rejects(preflightView("shop", viewReader("approved", items, { decisions: async () => { throw new Error("db"); } }), null));
 });

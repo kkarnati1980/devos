@@ -48,3 +48,61 @@ export async function missingSecrets(projectId: string, items: readonly Prefligh
 
 // The decision rows from KK's comment are built in @devos/analyst (`preflightDecisions`), next to the list builder.
 export { preflightDecisions, type PreflightDecisionRow } from "@devos/analyst";
+
+/** One row of the project decision log as the project page shows it. */
+export interface PreflightDecisionView {
+  itemId: string;
+  answer: string;
+  source: string;
+  createdAt: string;
+}
+
+/** The reads the project page's pre-flight section needs (CR-a3, DEVOS-199). */
+export interface PreflightViewReader extends PreflightReader {
+  /** The project row by slug, or null. */
+  projectBySlug(slug: string): Promise<{ id: string; continuousRun: boolean } | null>;
+  /** The project decision log, oldest first, bounded by the store. */
+  decisions(projectId: string): Promise<PreflightDecisionView[]>;
+}
+
+export interface PreflightView {
+  continuousRun: boolean;
+  state: PreflightState | null;
+  /** `preflightOpen`: the build may start. */
+  open: boolean;
+  /** The newest doc's list KK saw (secret items carry names only), or [] outside the mode. */
+  items: PreflightItem[];
+  /** Secret names not yet in the project vault; every secret name when the vault cannot be read (fail closed). */
+  missingSecrets: string[];
+  /** True when the vault could not be read: `missingSecrets` then lists every name, unverified. */
+  secretsUnverified: boolean;
+  decisions: PreflightDecisionView[];
+}
+
+/**
+ * CR-a3 (DEVOS-199): the read-only pre-flight view for the project page. Reads only: no card, no write, and the
+ * vault is asked only whether a name is set (never a value). Null when the slug names no project.
+ */
+export async function preflightView(slug: string, reader: PreflightViewReader, vault: SecretPresence | null): Promise<PreflightView | null> {
+  const project = await reader.projectBySlug(slug);
+  if (!project) return null;
+  const [state, items, decisions] = await Promise.all([
+    reader.preflightState(project.id),
+    reader.latestPreflight(project.id).then((l) => l ?? []),
+    reader.decisions(project.id),
+  ]);
+  const names = items.filter((i) => i.kind === "secret").map((i) => i.text);
+  let missing = names;
+  let unverified = names.length > 0;
+  if (vault && names.length > 0) {
+    try {
+      missing = await missingSecrets(project.id, items, vault);
+      unverified = false;
+    } catch {
+      missing = names;
+      unverified = true;
+    }
+  }
+  const open = vault ? await preflightOpen(project.id, reader, vault) : state === "approved" && names.length === 0;
+  return { continuousRun: project.continuousRun, state, open, items, missingSecrets: missing, secretsUnverified: unverified, decisions };
+}

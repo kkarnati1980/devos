@@ -273,6 +273,27 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
+  /** CR-a3 (DEVOS-199): the project row by slug, for the project page's pre-flight view. */
+  projectBySlug(slug: string): Promise<{ id: string; continuousRun: boolean } | null> {
+    return this.tx(async (tx) => {
+      const p = await tx.project.findUnique({ where: { slug }, select: { id: true, continuousRun: true } });
+      return p ? { id: p.id, continuousRun: p.continuousRun === true } : null;
+    });
+  }
+
+  /** CR-a3 (DEVOS-199): the project decision log, oldest first, at most 500 rows. */
+  decisions(projectId: string): Promise<{ itemId: string; answer: string; source: string; createdAt: string }[]> {
+    return this.tx(async (tx) => {
+      const rows = await tx.projectDecision.findMany({
+        where: { projectId },
+        orderBy: [{ createdAt: "asc" }, { itemId: "asc" }],
+        take: 500,
+        select: { itemId: true, answer: true, source: true, createdAt: true },
+      });
+      return rows.map((r: { itemId: string; answer: string; source: string; createdAt: Date }) => ({ itemId: r.itemId, answer: r.answer, source: r.source, createdAt: r.createdAt.toISOString() }));
+    });
+  }
+
   /** `PreflightReader` for `preflightOpen` (apps/api/src/preflight.ts): the state and the newest doc's list. */
   preflightState(projectId: string): Promise<"pending" | "approved" | "rejected" | null> {
     return this.tx(async (tx) => {
