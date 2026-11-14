@@ -60,7 +60,7 @@ function sdk(text, { cost = 0.02, fail = false, calls = [] } = {}) {
   })();
 }
 
-function setup({ text = "", budgets = [], fail = false, mode = "observe" } = {}) {
+function setup({ text = "", budgets = [], fail = false, mode = "observe", modelPassOn = async () => true } = {}) {
   const runStore = new MemoryRunStore();
   const pstore = new MemoryPolicyStore({ mode });
   const policy = new PolicyEngine({ store: pstore, hmacKey: randomBytes(32), budgets });
@@ -71,7 +71,7 @@ function setup({ text = "", budgets = [], fail = false, mode = "observe" } = {})
   reqStore.addProject({ id: P1, name: "Shop", stage: "intake" });
   const approvalStore = new MemoryApprovalStore();
   const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
-  const svc = requirementsServices(reqStore, approvals, approvalStore, runEngineModelRunner(rows, engine));
+  const svc = requirementsServices(reqStore, approvals, approvalStore, runEngineModelRunner(rows, engine), undefined, 0, modelPassOn);
   return { runStore, rows, reqStore, svc, pstore, calls };
 }
 
@@ -210,6 +210,68 @@ test("AT-MR7b (DEVOS-161) the runner's policy lock key is M1.7's", async () => {
   const { POLICY_LOCK_KEY } = await import("../dist/analyst-runner.js");
   const src = await readFile(new URL("../../../packages/policy/src/prisma-store.ts", import.meta.url), "utf8");
   assert.match(src, new RegExp(`const LOCK_KEY = "${POLICY_LOCK_KEY}";`));
+});
+
+test("AT-CA9b (DEVOS-176) the analyst.model_pass setting is read before each pass: off → no run, on → one run, no restart", async () => {
+  let setting = false;
+  let reads = 0;
+  const s = setup({ text: proposal(2), modelPassOn: async () => (reads++, setting) });
+  const off = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(s.rows.created.length, 0, "setting off → no analyst run, nothing charged");
+  assert.equal(s.calls.length, 0);
+  assert.equal(off.counts.proposed, 0);
+  assert.deepEqual(off.warnings, []);
+  setting = true;
+  const on = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC + "\n" });
+  assert.equal(s.rows.created.length, 1, "setting turned on, same pipeline → one run");
+  assert.equal(on.counts.proposed, 1);
+  setting = false;
+  await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC + "\n\n" });
+  assert.equal(s.rows.created.length, 1, "turned off again → no further run");
+  assert.equal(reads, 3, "read once per submission");
+});
+
+test("AT-CA9c (DEVOS-176) a setting read that fails, or a non-boolean value, counts as off (fail-safe, deterministic only)", async () => {
+  const warns = [];
+  for (const modelPassOn of [async () => { throw new Error("db down"); }, async () => "true", async () => 1]) {
+    const s = setup({ text: proposal(2), modelPassOn });
+    const r = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+    assert.equal(s.rows.created.length, 0);
+    assert.equal(s.calls.length, 0);
+    assert.equal(r.counts.proposed, 0, "deterministic only: no model proposal");
+    warns.push(r.warnings);
+  }
+  assert.deepEqual(warns, [["assist-failed"], [], []], "a failed read is reported; a non-boolean is plain off");
+});
+
+test("AT-CA9e (DEVOS-176) buildRuntime binds the pipeline to the settings row: missing or off → off, on → on, read error → skipped", async () => {
+  const { buildRuntime } = await import("../dist/runtime.js");
+  const { KkSessionRegistry } = await import("../dist/auth.js");
+  const env = { DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" };
+  let row = null;
+  let fail = false;
+  const tx = { appSettings: { findUnique: async ({ where }) => { assert.deepEqual(where, { singleton: true }); if (fail) throw new Error("db down"); return row; } } };
+  const db = { $transaction: async (fn) => fn(tx) };
+  const rt = await buildRuntime(env, {
+    outboundTimeoutMs: 500, kkSessions: new KkSessionRegistry(), loadDb: async () => db,
+    loadAnalystEngine: async () => ({ execute: async () => ({ status: "succeeded" }) }),
+  });
+  const read = rt.requirements.pipeline.ports.modelPassOn;
+  assert.equal(typeof read, "function", "the runtime always binds the setting when a runner exists");
+  const base = { anthropicCapUsd: 15, openaiCapUsd: 15, defaultProjectCapUsd: 15, defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null };
+  assert.equal(await read(), false, "no settings row → default off");
+  row = { ...base, analystModelPass: false };
+  assert.equal(await read(), false);
+  row = { ...base, analystModelPass: true };
+  assert.equal(await read(), true, "turned on → on, with no restart");
+  fail = true;
+  await assert.rejects(read(), /db down/, "the pipeline turns a failed read into off + assist-failed (AT-CA9c)");
+
+  // Pre-review finding 1: requirementsServices with a runner but no setting reader never runs the pass.
+  const s = setup({ text: proposal(2), modelPassOn: null });
+  const svc = requirementsServices(s.reqStore, new Approvals({ store: new MemoryApprovalStore(), grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false }), new MemoryApprovalStore(), s.svc.pipeline.ports.runner);
+  await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(s.rows.created.length, 0, "no reader → off");
 });
 
 test("AT-MR8 (DEVOS-171) the sweep closes each stale run once, logs a failure by id and moves on, never overlaps, and is wired by buildRuntime", async () => {

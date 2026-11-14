@@ -12,6 +12,8 @@ export interface SettingsView {
   defaultLanes: number;
   maxLanes: number;
   deadlockAttempts: number;
+  /** DEVOS-176: the analyst model pass (`analyst.model_pass`), default off. */
+  analystModelPass: boolean;
   capsConfirmedAt: string | null;
   updatedAt: string | null;
 }
@@ -158,7 +160,7 @@ export class DevosApi {
   settings() {
     return this.call<{ settings: SettingsView }>("GET", "/settings");
   }
-  saveSettings(patch: Partial<Pick<SettingsView, "anthropicCapUsd" | "openaiCapUsd" | "defaultProjectCapUsd" | "defaultLanes" | "deadlockAttempts">>) {
+  saveSettings(patch: Partial<Pick<SettingsView, "anthropicCapUsd" | "openaiCapUsd" | "defaultProjectCapUsd" | "defaultLanes" | "deadlockAttempts" | "analystModelPass">>) {
     return this.call<{ settings: SettingsView }>("PUT", "/settings", patch);
   }
   secrets() {
