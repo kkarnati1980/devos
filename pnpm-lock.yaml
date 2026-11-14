@@ -103,6 +103,19 @@ importers:
         specifier: ^5.6.3
         version: 5.9.3
 
+  packages/card-batch:
+    dependencies:
+      '@devos/analyst':
+        specifier: workspace:*
+        version: link:../analyst
+    devDependencies:
+      '@types/node':
+        specifier: ^22.7.0
+        version: 22.20.5
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
   packages/db:
     dependencies:
       '@prisma/adapter-pg':
