@@ -139,7 +139,9 @@ class Tokenizer {
       switch (this.mode) {
         case "text":
           if (c === "<") {
-            if (this.at === 0 && s.slice(i, i + DOCTYPE.length).toLowerCase() === DOCTYPE) { i += DOCTYPE.length - 1; this.at += DOCTYPE.length - 1; }
+            const doctype = s.slice(i, i + DOCTYPE.length).toLowerCase() === DOCTYPE;
+            if (doctype && this.at === 0) { i += DOCTYPE.length - 1; this.at += DOCTYPE.length - 1; }
+            else if (doctype) fail("<!DOCTYPE html> may appear only at the very start of the page (not in a nested result)");
             else this.mode = "lt";
           }
           break;
@@ -206,8 +208,14 @@ class Tokenizer {
     if (!this.valued || !URL_ATTRS.has(this.attr)) return;
     // Judged whole when the quote closes, the way the browser reads it: entities decoded, then spaces and control
     // characters dropped (isSafeUrl). A named reference this decoder does not know is refused rather than guessed.
+    for (const m of this.buf.matchAll(/&([a-z][a-z0-9]*)/gi)) {
+      if (!(m[1].toLowerCase() in NAMED)) fail(`a URL attribute holding a value may not use the reference &${m[1]} (write &amp; for "&")`);
+    }
     const decoded = decodeEntities(this.buf);
-    if (/&[a-z]/i.test(decoded) || !isSafeUrl(decoded)) fail("a URL attribute takes only http(s), mailto or relative URLs");
+    if (!isSafeUrl(decoded)) fail("a URL attribute takes only http(s), mailto or relative URLs");
+    // A form posts its fields (passwords included) to its action, so a value there may only make a same-origin path.
+    const bare = decoded.replace(/[\u0000- \u007f]/g, "");
+    if (this.attr === "action" && (/^[^:/?#]*:/.test(bare) || /^[\/\\]{2}/.test(bare))) fail("a URL attribute: a form action holding a value must be a same-origin path");
   }
   emit() {
     // <title>, <textarea> and <script> switch the browser's tokenizer whether or not the tag ends in "/>".

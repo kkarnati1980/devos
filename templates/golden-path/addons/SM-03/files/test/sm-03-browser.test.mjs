@@ -127,6 +127,16 @@ test("SM-03-L2: html`` escapes every value, in a fixed subset of HTML", () => {
     assert.equal(isSafeUrl(u), false, JSON.stringify(u));
   }
   assert.equal(String(html`<a href="/search?q=${"javascript:x"}">x</a>`), '<a href="/search?q=javascript:x">x</a>'); // not at the start
+  // "&" in a URL with a value: an escaped value and &amp; are fine; an unknown reference is refused (pre-review).
+  assert.equal(String(html`<a href="/s?a=1&amp;b=${"x"}">x</a>`), '<a href="/s?a=1&amp;b=x">x</a>');
+  assert.equal(String(html`<a href="/s?q=${"R&D"}&amp;p=${2}">x</a>`), '<a href="/s?q=R&amp;D&amp;p=2">x</a>');
+  assert.throws(() => html`<a href="/s?a=1&b=${"x"}">x</a>`, /reference &b/);
+  // A form action holding a value stays on this origin.
+  assert.equal(String(html`<form action="/notes/${"7"}" method="post"></form>`), '<form action="/notes/7" method="post"></form>');
+  for (const a of ["https://evil.example/collect", "//evil.example/x", "\\\\evil.example", " //evil.example"]) {
+    assert.throws(() => html`<form action="${a}"></form>`, /same-origin path/, a);
+  }
+  assert.throws(() => html`<div></div>${html`<!DOCTYPE html><p></p>`}`, /very start/);
   // The whole attribute is judged when it closes, as the browser reads it (pre-review r1).
   const u = "javascript:alert(1)";
   for (const render of [
