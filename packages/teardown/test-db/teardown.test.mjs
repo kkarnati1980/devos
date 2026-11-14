@@ -123,6 +123,44 @@ test("DEVOS-131 on Postgres: purge deletes the project's vault secrets (only thi
   assert.ok(!JSON.stringify(ev).includes("ciphertext"));
 });
 
+test("DEVOS-175 on Postgres: purge deletes the project's isolation_stack rows with the purge, freeing the index for a new project", async () => {
+  const s = await setup();
+  const other = await setup();
+  await s.provision();
+  // Three indexes no row holds yet (the index, subnet and network are unique across all stacks in the database).
+  // 512–1023 only keeps clear of low indexes other fixtures might use; the read-then-insert is safe because the
+  // teardown-db job runs its tests one at a time on its own database.
+  const taken = new Set((await db.isolationStack.findMany({ select: { idx: true } })).map((r) => r.idx));
+  const start = randomBytes(2).readUInt16BE(0) % 512;
+  const free = [];
+  for (let k = 0; k < 512 && free.length < 3; k++) { const i = 512 + ((start + k) % 512); if (!taken.has(i)) free.push(i); }
+  assert.equal(free.length, 3, "no free isolation index left in 512–1023 on the test database");
+  const [idx, idxLive, idxOther] = free;
+  // network and subnet as the migration's checks derive them (isolation_stack_network_derived / _subnet_derived).
+  const stack = (projectId, slug, env, i) => ({ projectId, slug, env, idx: i, network: `devos-p-${slug}-${env}`, subnet: `10.${208 + Math.floor(i / 256)}.${i % 256}.0/24` });
+  await db.isolationStack.create({ data: stack(s.p.id, s.p.slug, "preview", idx) });
+  await db.isolationStack.create({ data: stack(s.p.id, s.p.slug, "live", idxLive) });
+  await db.isolationStack.create({ data: stack(other.p.id, other.p.slug, "preview", idxOther) });
+  const otherBefore = await db.isolationStack.count({ where: { projectId: other.p.id } });
+  // While s holds the index, a new project cannot take it.
+  const late = await setup();
+  await assert.rejects(db.isolationStack.create({ data: stack(late.p.id, late.p.slug, "preview", idx) }), (e) => e.code === "P2002");
+  await archiveProject(s.p.id, { store: s.store, ops: s.ops, authorize: allowAll });
+  // Archive alone keeps the stacks (a restore needs them).
+  assert.equal(await db.isolationStack.count({ where: { projectId: s.p.id } }), 2);
+  const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: s.scanners, authorize: allowAll });
+  assert.equal(out.purged, true, JSON.stringify(out.report));
+  assert.equal(await db.isolationStack.count({ where: { projectId: s.p.id } }), 0);
+  assert.equal(await db.isolationStack.count({ where: { projectId: other.p.id } }), otherBefore);
+  const ev = await db.auditEvent.findFirst({ where: { projectId: s.p.id, action: "teardown.purged" } });
+  assert.deepEqual(ev.details, { isolationStacksDeleted: 2 });
+  // The freed index, subnet and network can now be recorded by the new project.
+  const freed = stack(late.p.id, late.p.slug, "preview", idx);
+  const row = await db.isolationStack.create({ data: freed });
+  assert.equal(row.idx, idx);
+  assert.equal(row.subnet, freed.subnet);
+});
+
 test("AT6 on Postgres: a vault secret left for the project is a leftover (listed by name, never by value); the stage stays archived", async () => {
   const s = await setup();
   // Simulates a secret that survives the delete (e.g. written by a racing writer): the scan must still see it.
