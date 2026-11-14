@@ -207,3 +207,21 @@ test("SM-06-L2/L1: a quoted column named default, a $ inside a name, and a parti
   assert.deepEqual(checkSql(partial).warnings, ["orders.user_id references users but no index leads with it"]);
   assert.deepEqual(checkSql(partial + "\nCREATE INDEX ON orders (user_id);").warnings, []);
 });
+
+// Codex PR125-r4 findings 1–2.
+test("SM-06-L2/L1: a $ inside a name is no keyword break, and an expression index never clears an FK warning (r4)", () => {
+  assert.deepEqual(rules("DELETE FROM where$archive;"), ["delete-without-where"]);
+  assert.deepEqual(rules("UPDATE where$archive SET a = 1;"), ["update-without-where"]);
+  assert.deepEqual(rules("UPDATE t SET where$x = 1;"), ["update-without-where"]);
+  assert.deepEqual(rules("DELETE FROM where$archive WHERE id = 1;"), []);
+  assert.deepEqual(rules("DROP TABLE$x;"), []);
+  const fk = "CREATE TABLE orders (user_id integer REFERENCES users(id));";
+  const warn = ["orders.user_id references users but no index leads with it"];
+  assert.deepEqual(checkSql(fk + "\nCREATE INDEX ON orders (user_id + 1);").warnings, warn);
+  assert.deepEqual(checkSql(fk + "\nCREATE INDEX ON orders ((user_id));").warnings, warn);
+  assert.deepEqual(checkSql(fk + "\nCREATE INDEX ON orders (lower(user_id::text));").warnings, warn);
+  assert.deepEqual(checkSql(fk + "\nCREATE INDEX ON orders USING btree (user_id DESC NULLS LAST, id);").warnings, []);
+  assert.deepEqual(checkSql(fk + '\nCREATE INDEX ON orders (user_id COLLATE "C" text_pattern_ops);').warnings, []);
+  // A $ inside a column name is part of it.
+  assert.deepEqual(checkSql("CREATE TABLE orders (user$id integer REFERENCES users(id));\nCREATE INDEX ON orders (user$id);").warnings, []);
+});

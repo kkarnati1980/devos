@@ -19,7 +19,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const ID = String.raw`(?:"[^"]*"|\w+)`;
+const ID = String.raw`(?:"[^"]*"|[\w$]+)`;
 const QID = String.raw`${ID}(?:\.${ID})?`;
 const OBJECTS = String.raw`(TABLE|VIEW|MATERIALIZED\s+VIEW|SCHEMA|TYPE|DOMAIN|SEQUENCE|FUNCTION|PROCEDURE)`;
 // Matched against the statement in upper case with the contents of string literals blanked ('…' → ''), so text
@@ -75,7 +75,11 @@ function splitTop(s) {
 }
 
 /** Refusal rule ids for one statement (upper case, literals blanked). */
-export function ruleHits(upper) {
+export function ruleHits(upperText) {
+  // Postgres allows `$` inside an unquoted name, but regex `\b` treats it as a word break, so `where$archive` would
+  // read as WHERE (PR125-r4). `$` is folded into a word character first, which makes every keyword boundary below
+  // identifier-aware. Dollar-quoted bodies are already replaced by statements(), so no `$` here starts a quote.
+  const upper = upperText.replace(/\$/g, "_");
   const hits = RULES.filter(([, re]) => re.test(upper)).map(([rule]) => rule);
   // Quoted identifiers are blanked too here, so a table or column named "where" never reads as a WHERE clause.
   const bare = upper.replace(QUOTED, '""');
@@ -164,28 +168,48 @@ function collectKeys(text, fks, indexed) {
     const tbl = table(ct[2]);
     for (const part of splitTop(ct[3])) {
       const p = part.trim();
-      const col = new RegExp(String.raw`^("?\w+"?)\s+[\w ()[\],]*?\bREFERENCES\s+${T}`, "i").exec(p);
+      const col = new RegExp(String.raw`^("[^"]*"|[\w$]+)\s+[\w ()[\],]*?\bREFERENCES\s+${T}`, "i").exec(p);
       if (col && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) fks.push({ table: tbl, column: ident(col[1]), ref: table(col[2]) });
-      const fk = new RegExp(String.raw`FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(p);
+      const fk = new RegExp(String.raw`FOREIGN\s+KEY\s*\(\s*("[^"]*"|[\w$]+)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(p);
       if (fk) fks.push({ table: tbl, column: ident(fk[1]), ref: table(fk[2]) });
-      const key = /^(CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|UNIQUE)\s*\(\s*("?\w+"?)/i.exec(p);
+      const key = /^(CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|UNIQUE)\s*\(\s*("[^"]*"|[\w$]+)/i.exec(p);
       if (key) indexed.add(`${tbl}\u0000${ident(key[3])}`);
-      const inline = /^("?\w+"?)\s.*\b(PRIMARY\s+KEY|UNIQUE)\b/i.exec(p);
+      const inline = /^("[^"]*"|[\w$]+)\s.*\b(PRIMARY\s+KEY|UNIQUE)\b/i.exec(p);
       if (inline && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) indexed.add(`${tbl}\u0000${ident(inline[1])}`);
     }
   }
-  const at = new RegExp(String.raw`^ALTER\s+TABLE\s+(ONLY\s+)?${T}\s+ADD\s+(CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(text);
+  const at = new RegExp(String.raw`^ALTER\s+TABLE\s+(ONLY\s+)?${T}\s+ADD\s+(CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY\s*\(\s*("[^"]*"|[\w$]+)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(text);
   if (at) fks.push({ table: table(at[2]), column: ident(at[4]), ref: table(at[5]) });
   const alt = new RegExp(String.raw`^ALTER\s+TABLE\s+(ONLY\s+)?(IF\s+EXISTS\s+)?${T}\s+(.*)$`, "i").exec(text);
   if (alt) {
     for (const clause of splitTop(alt[4])) {
-      const m = new RegExp(String.raw`^\s*ADD\s+(COLUMN\s+)?(IF\s+NOT\s+EXISTS\s+)?(?!CONSTRAINT\b|FOREIGN\b)("?\w+"?)\s.*\bREFERENCES\s+${T}`, "i").exec(clause);
+      const m = new RegExp(String.raw`^\s*ADD\s+(COLUMN\s+)?(IF\s+NOT\s+EXISTS\s+)?(?!CONSTRAINT\b|FOREIGN\b)("[^"]*"|[\w$]+)\s.*\bREFERENCES\s+${T}`, "i").exec(clause);
       if (m) fks.push({ table: table(alt[3]), column: ident(m[3]), ref: table(m[4]) });
     }
   }
-  const ix = new RegExp(String.raw`^CREATE\s+(UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?(IF\s+NOT\s+EXISTS\s+)?(${ID}\s+)?ON\s+(ONLY\s+)?${T}\s*(USING\s+\w+\s*)?\(\s*("?\w+"?)`, "i").exec(text);
+  const ix = new RegExp(String.raw`^CREATE\s+(UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?(IF\s+NOT\s+EXISTS\s+)?(${ID}\s+)?ON\s+(ONLY\s+)?${T}\s*(USING\s+\w+\s*)?\(`, "i").exec(text);
+  if (!ix) return;
   // A partial index (WHERE …) covers only some rows, so it never clears the warning (PR125-r3).
-  if (ix && !/\bWHERE\b/i.test(topLevel(text.replace(QUOTED, '""')))) indexed.add(`${table(ix[6])}\u0000${ident(ix[8])}`);
+  if (/\bWHERE\b/i.test(topLevel(text.replace(QUOTED, '""').replace(/\$/g, "_")))) return;
+  // Only a plain leading column counts: an identifier, optionally followed by bare words (ASC, DESC, NULLS LAST,
+  // COLLATE "C", an operator class). An expression such as `(user_id + 1)` or `((user_id))` never clears the
+  // warning (PR125-r4); fail closed rather than read expressions.
+  const lead = splitTop(parenBody(text, ix.index + ix[0].length - 1))[0].trim();
+  const plain = new RegExp(String.raw`^(${ID})(\s+(?:"[^"]*"|[\w$.]+))*$`).exec(lead);
+  if (plain) indexed.add(`${table(ix[6])}\u0000${ident(plain[1])}`);
+}
+
+/** The text inside the parentheses that open at index i (quoted names kept whole), or "" if they never close. */
+function parenBody(text, i) {
+  let depth = 0, j = i;
+  while (j < text.length) {
+    const c = text[j];
+    if (c === '"') { const end = text.indexOf('"', j + 1); j = end < 0 ? text.length : end + 1; continue; }
+    if (c === "(") depth++;
+    if (c === ")" && --depth === 0) return text.slice(i + 1, j);
+    j++;
+  }
+  return "";
 }
 
 
