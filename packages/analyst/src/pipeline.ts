@@ -103,7 +103,8 @@ export interface PipelinePorts {
   runner?: ModelRunner | null;
   /**
    * DEVOS-176: the `analyst.model_pass` setting, read before each pass so a change takes effect without a restart.
-   * Absent = on whenever a runner is bound. A read that fails counts as off (fail-safe: no model spend, deterministic only).
+   * Absent = on whenever a runner is bound (the API always binds it, default off). A read that fails counts as off
+   * (fail-safe: no model spend, deterministic only) and is reported as `assist-failed`.
    */
   modelPassOn?: () => Promise<boolean>;
   ingest?: (bytes: Uint8Array, originalName: string) => Promise<IngestResult>;
@@ -174,13 +175,13 @@ export class RequirementsPipeline {
     this.ingest = ports.ingest ?? ((b, n) => defaultIngest(b, n));
   }
 
-  /** DEVOS-176: the setting at call time; absent → on, a failed read → off (only `true` turns it on). */
-  private async modelPassOn(): Promise<boolean> {
+  /** DEVOS-176: the setting at call time; absent → on, a failed read → "unreadable" (off). Only `true` turns it on. */
+  private async modelPassOn(): Promise<boolean | "unreadable"> {
     if (!this.ports.modelPassOn) return true;
     try {
       return (await this.ports.modelPassOn()) === true;
     } catch {
-      return false;
+      return "unreadable";
     }
   }
 
@@ -221,7 +222,10 @@ export class RequirementsPipeline {
 
     const warnings: PipelineWarningCode[] = [];
     let analysis = analyzeSpec(ingested.blocks);
-    if (this.ports.runner && (await this.modelPassOn())) {
+    const passOn = this.ports.runner ? await this.modelPassOn() : false;
+    // Pre-review (DEVOS-176) finding 4: a setting that could not be read skips the pass visibly, never silently.
+    if (passOn === "unreadable") warnings.push("assist-failed");
+    if (this.ports.runner && passOn === true) {
       try {
         const runner = this.ports.runner;
         const assisted = await assistAnalysis(ingested.blocks, analysis, (req) => runner({ ...req, projectId }));

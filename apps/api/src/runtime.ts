@@ -189,7 +189,8 @@ export function requirementsServices(
   expiryLog?: ExpiryLog,
   /** The longest one expiry write can take, connection wait included (`approvalStepBoundMs`; Codex PR88-r4, PR88-r5, PR88-r6). */
   expireStepMs = 0,
-  /** DEVOS-176: the `analyst.model_pass` setting read per call; absent → the pass runs whenever a runner is bound. */
+  /** DEVOS-176: the `analyst.model_pass` setting read per call. Absent with a runner → off (pre-review finding 1:
+   * a dropped argument must never turn model spend on). */
   modelPassOn?: () => Promise<boolean>,
 ): RequirementsServices {
   // M2.2-d3c2: after each submission, the superseded version's pending cards and an unlinked requirements card
@@ -201,7 +202,7 @@ export function requirementsServices(
       // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
       raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
       runner,
-      ...(modelPassOn ? { modelPassOn } : {}),
+      modelPassOn: modelPassOn ?? (async () => false),
     },
     {
       latestDoc: (id) => store.latestDoc(id),

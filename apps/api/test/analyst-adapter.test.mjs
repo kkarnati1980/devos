@@ -182,12 +182,13 @@ test("AT-CA5 a request past its timeout is aborted and typed timeout; an engine 
   clearInterval(keepAlive);
 });
 
-test("AT-CA6 (DEVOS-176) only DEVOS_ANALYST_MODEL_PASS=off is a hard off; buildRuntime hands the engine a vault key reader", async () => {
+test("AT-CA6 (DEVOS-176) DEVOS_ANALYST_MODEL_PASS other than unset or on is a hard off; buildRuntime hands the engine a vault key reader", async () => {
   // The setting `analyst.model_pass` (default off) decides per call (AT-CA9); the env can only forbid loading the engine.
   assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: "off" }), false);
   assert.equal(analystModelPassAllowed({}), true);
   assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: "on" }), true);
-  assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: "OFF" }), true, "exact value only, like the old switch");
+  for (const v of ["OFF", "false", "0", "no", "off ", "On"]) assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: v }), false, `fail-safe: ${v}`);
+  assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: "" }), true, "empty = unset"); 
   const { buildRuntime } = await import("../dist/runtime.js");
   const { KkSessionRegistry } = await import("../dist/auth.js");
   const env = { DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" };

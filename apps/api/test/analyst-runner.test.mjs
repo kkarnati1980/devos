@@ -60,7 +60,7 @@ function sdk(text, { cost = 0.02, fail = false, calls = [] } = {}) {
   })();
 }
 
-function setup({ text = "", budgets = [], fail = false, mode = "observe", modelPassOn } = {}) {
+function setup({ text = "", budgets = [], fail = false, mode = "observe", modelPassOn = async () => true } = {}) {
   const runStore = new MemoryRunStore();
   const pstore = new MemoryPolicyStore({ mode });
   const policy = new PolicyEngine({ store: pstore, hmacKey: randomBytes(32), budgets });
@@ -232,11 +232,44 @@ test("AT-CA9b (DEVOS-176) the analyst.model_pass setting is read before each pas
 });
 
 test("AT-CA9c (DEVOS-176) a setting read that fails, or a non-boolean value, counts as off (fail-safe, deterministic only)", async () => {
+  const warns = [];
   for (const modelPassOn of [async () => { throw new Error("db down"); }, async () => "true", async () => 1]) {
     const s = setup({ text: proposal(2), modelPassOn });
     const r = await s.svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
     assert.equal(s.rows.created.length, 0);
     assert.equal(s.calls.length, 0);
     assert.equal(r.counts.proposed, 0, "deterministic only: no model proposal");
+    warns.push(r.warnings);
   }
+  assert.deepEqual(warns, [["assist-failed"], [], []], "a failed read is reported; a non-boolean is plain off");
+});
+
+test("AT-CA9e (DEVOS-176) buildRuntime binds the pipeline to the settings row: missing or off → off, on → on, read error → skipped", async () => {
+  const { buildRuntime } = await import("../dist/runtime.js");
+  const { KkSessionRegistry } = await import("../dist/auth.js");
+  const env = { DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" };
+  let row = null;
+  let fail = false;
+  const tx = { appSettings: { findUnique: async ({ where }) => { assert.deepEqual(where, { singleton: true }); if (fail) throw new Error("db down"); return row; } } };
+  const db = { $transaction: async (fn) => fn(tx) };
+  const rt = await buildRuntime(env, {
+    outboundTimeoutMs: 500, kkSessions: new KkSessionRegistry(), loadDb: async () => db,
+    loadAnalystEngine: async () => ({ execute: async () => ({ status: "succeeded" }) }),
+  });
+  const read = rt.requirements.pipeline.ports.modelPassOn;
+  assert.equal(typeof read, "function", "the runtime always binds the setting when a runner exists");
+  const base = { anthropicCapUsd: 15, openaiCapUsd: 15, defaultProjectCapUsd: 15, defaultLanes: 2, maxLanes: 3, deadlockAttempts: 3, capsConfirmedAt: null, updatedAt: null };
+  assert.equal(await read(), false, "no settings row → default off");
+  row = { ...base, analystModelPass: false };
+  assert.equal(await read(), false);
+  row = { ...base, analystModelPass: true };
+  assert.equal(await read(), true, "turned on → on, with no restart");
+  fail = true;
+  await assert.rejects(read(), /db down/, "the pipeline turns a failed read into off + assist-failed (AT-CA9c)");
+
+  // Pre-review finding 1: requirementsServices with a runner but no setting reader never runs the pass.
+  const s = setup({ text: proposal(2), modelPassOn: null });
+  const svc = requirementsServices(s.reqStore, new Approvals({ store: new MemoryApprovalStore(), grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false }), new MemoryApprovalStore(), s.svc.pipeline.ports.runner);
+  await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(s.rows.created.length, 0, "no reader → off");
 });

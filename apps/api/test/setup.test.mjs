@@ -131,7 +131,8 @@ test("DEVOS-176 AT-CA9a: analyst.model_pass is a settings field, default off, sa
     assert.equal((await kk.get("/settings")).json.settings.analystModelPass, false);
     const last = s.settings.audits.at(-1);
     assert.equal(last.action, "settings.updated");
-    assert.deepEqual(last.details, { fields: ["analystModelPass"] });
+    assert.deepEqual(last.details, { fields: ["analystModelPass"], analystModelPass: false }, "the new value is audited");
+    assert.deepEqual(s.settings.audits.at(-2).details, { fields: ["analystModelPass"], analystModelPass: true });
   } finally {
     await s.app.close();
   }
