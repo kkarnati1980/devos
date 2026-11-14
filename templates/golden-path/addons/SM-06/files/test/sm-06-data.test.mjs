@@ -177,3 +177,22 @@ test("SM-06-L1: withTransaction commits related writes together and rolls all of
   assert.equal(await withTransaction(nest, async () => "again"), "again");
   await assert.rejects(withTransaction({}, async () => {}), TypeError);
 });
+
+// Codex PR125-r2 findings 1–2.
+test("SM-06-L2: a quoted identifier named like WHERE is not read as a WHERE clause (r2 finding 1)", () => {
+  assert.deepEqual(rules('DELETE FROM "where";'), ["delete-without-where"]);
+  assert.deepEqual(rules('UPDATE users SET "where" = true;'), ["update-without-where"]);
+  assert.deepEqual(rules('UPDATE users SET "where" = true WHERE id = 1;'), []);
+  assert.deepEqual(rules('DELETE FROM "where" WHERE "where"."id" = 1;'), []);
+});
+
+test("SM-06-L1: an index clears a foreign-key warning only on the same schema and table, with Postgres name folding (r2 finding 2)", () => {
+  const other = "CREATE TABLE sales.orders (user_id uuid REFERENCES users(id));\nCREATE INDEX ON archive.orders (user_id);";
+  assert.deepEqual(checkSql(other).warnings, ["sales.orders.user_id references users but no index leads with it"]);
+  assert.deepEqual(checkSql(other + "\nCREATE INDEX ON sales.orders (user_id);").warnings, []);
+  // Unqualified means public; unquoted names fold to lower case, quoted ones keep their case.
+  assert.deepEqual(checkSql('CREATE TABLE Orders (user_id uuid REFERENCES users(id));\nCREATE INDEX ON public.orders (USER_ID);').warnings, []);
+  assert.deepEqual(checkSql('CREATE TABLE "Orders" ("userId" uuid REFERENCES "User"("id"));\nCREATE INDEX ON orders ("userId");').warnings,
+    ["Orders.userId references User but no index leads with it"]);
+  assert.deepEqual(checkSql('CREATE TABLE "Orders" ("userId" uuid REFERENCES "User"("id"));\nCREATE INDEX ON "Orders" ("userId");').warnings, []);
+});

@@ -76,7 +76,8 @@ function splitTop(s) {
 /** Refusal rule ids for one statement (upper case, literals blanked). */
 export function ruleHits(upper) {
   const hits = RULES.filter(([, re]) => re.test(upper)).map(([rule]) => rule);
-  const top = topLevel(upper);
+  // Quoted identifiers are blanked too here, so a table or column named "where" never reads as a WHERE clause.
+  const top = topLevel(upper.replace(/"(?:[^"]|"")*"/g, '""'));
   if (/^(WITH\b.*\s)?DELETE\s+FROM\b/.test(top) && !/\bWHERE\b/.test(top)) hits.push("delete-without-where");
   if (/^(WITH\b.*\s)?UPDATE\s+/.test(top) && /\bSET\b/.test(top) && !/\bWHERE\b/.test(top)) hits.push("update-without-where");
   if (/^ALTER\s+TABLE\b/.test(upper)) {
@@ -139,11 +140,16 @@ export function checkSql(sql) {
     for (const rule of ruleHits(upper)) (reason ? allowed : refused).push(reason ? { rule, statement: text, reason } : { rule, statement: text });
     collectKeys(blankLiterals(text), fks, indexed);
   }
-  const warnings = fks.filter((k) => !indexed.has(`${k.table}.${k.column}`)).map((k) => `${k.table}.${k.column} references ${k.ref} but no index leads with it`);
+  const warnings = fks.filter((k) => !indexed.has(`${k.table}\u0000${k.column}`)).map((k) => `${shown(k.table)}.${k.column} references ${shown(k.ref)} but no index leads with it`);
   return { refused, allowed, warnings };
 }
 
-const ident = (s) => s.replace(/"/g, "").toLowerCase().split(".").pop();
+// Postgres folds an unquoted name to lower case and keeps a quoted one as written; an unqualified table is taken to
+// be in `public` (the default search_path), so `orders` and `public.orders` match but `sales.orders` does not.
+const parts = (s) => (s.match(/"(?:[^"]|"")*"|[^."]+/g) ?? []).map((p) => (p.startsWith('"') ? p.slice(1, -1).replace(/""/g, '"') : p.toLowerCase()));
+const ident = (s) => parts(s).pop() ?? "";
+const table = (s) => { const p = parts(s); return p.length > 1 ? `${p.at(-2)}.${p.at(-1)}` : `public.${p[0] ?? ""}`; };
+const shown = (t) => (t.startsWith("public.") ? t.slice(7) : t);
 
 // A table name: optionally schema-qualified, each part bare or double-quoted ("public"."orders").
 const T = `(${QID})`;
@@ -151,30 +157,30 @@ const T = `(${QID})`;
 function collectKeys(text, fks, indexed) {
   const ct = new RegExp(String.raw`^CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?${T}\s*\((.*)\)`, "i").exec(text);
   if (ct) {
-    const table = ident(ct[2]);
+    const tbl = table(ct[2]);
     for (const part of splitTop(ct[3])) {
       const p = part.trim();
       const col = new RegExp(String.raw`^("?\w+"?)\s+[\w ()[\],]*?\bREFERENCES\s+${T}`, "i").exec(p);
-      if (col && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) fks.push({ table, column: ident(col[1]), ref: ident(col[2]) });
+      if (col && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) fks.push({ table: tbl, column: ident(col[1]), ref: table(col[2]) });
       const fk = new RegExp(String.raw`FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(p);
-      if (fk) fks.push({ table, column: ident(fk[1]), ref: ident(fk[2]) });
+      if (fk) fks.push({ table: tbl, column: ident(fk[1]), ref: table(fk[2]) });
       const key = /^(CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|UNIQUE)\s*\(\s*("?\w+"?)/i.exec(p);
-      if (key) indexed.add(`${table}.${ident(key[3])}`);
+      if (key) indexed.add(`${tbl}\u0000${ident(key[3])}`);
       const inline = /^("?\w+"?)\s.*\b(PRIMARY\s+KEY|UNIQUE)\b/i.exec(p);
-      if (inline && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) indexed.add(`${table}.${ident(inline[1])}`);
+      if (inline && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) indexed.add(`${tbl}\u0000${ident(inline[1])}`);
     }
   }
   const at = new RegExp(String.raw`^ALTER\s+TABLE\s+(ONLY\s+)?${T}\s+ADD\s+(CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(text);
-  if (at) fks.push({ table: ident(at[2]), column: ident(at[4]), ref: ident(at[5]) });
+  if (at) fks.push({ table: table(at[2]), column: ident(at[4]), ref: table(at[5]) });
   const alt = new RegExp(String.raw`^ALTER\s+TABLE\s+(ONLY\s+)?(IF\s+EXISTS\s+)?${T}\s+(.*)$`, "i").exec(text);
   if (alt) {
     for (const clause of splitTop(alt[4])) {
       const m = new RegExp(String.raw`^\s*ADD\s+(COLUMN\s+)?(IF\s+NOT\s+EXISTS\s+)?(?!CONSTRAINT\b|FOREIGN\b)("?\w+"?)\s.*\bREFERENCES\s+${T}`, "i").exec(clause);
-      if (m) fks.push({ table: ident(alt[3]), column: ident(m[3]), ref: ident(m[4]) });
+      if (m) fks.push({ table: table(alt[3]), column: ident(m[3]), ref: table(m[4]) });
     }
   }
   const ix = new RegExp(String.raw`^CREATE\s+(UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?(IF\s+NOT\s+EXISTS\s+)?(${ID}\s+)?ON\s+(ONLY\s+)?${T}\s*(USING\s+\w+\s*)?\(\s*("?\w+"?)`, "i").exec(text);
-  if (ix) indexed.add(`${ident(ix[6])}.${ident(ix[8])}`);
+  if (ix) indexed.add(`${table(ix[6])}\u0000${ident(ix[8])}`);
 }
 
 
