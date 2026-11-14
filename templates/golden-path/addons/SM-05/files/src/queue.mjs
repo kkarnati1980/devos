@@ -1,7 +1,7 @@
 // SM-05 add-on: background work (docs/modules/S3.md, "S3-b5 SM-05 build notes").
 // SM-05-L1: work over about 2 s runs from a queue; a poisoned job lands in the dead-letter list and can be retried.
 // No dependency: one process, one queue, jobs kept in a store. `fileStore(path)` keeps them across restarts.
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -35,16 +35,24 @@ export function fileStore(path) {
       let text;
       try { text = readFileSync(path, "utf8"); } catch (e) { if (e.code === "ENOENT") return []; throw e; }
       const data = JSON.parse(text);
-      if (!Array.isArray(data)) throw new TypeError(`fileStore: ${path} does not hold a job list`);
+      if (!Array.isArray(data) || !data.every(validJob)) throw new TypeError(`fileStore: ${path} does not hold a valid job list`);
       return data;
     },
     save(all) {
       mkdirSync(dirname(path), { recursive: true });
       const tmp = `${path}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify(all), { mode: 0o600 });
+      // fsync before the rename, so after a power loss the file holds the old list or the new one.
+      const fd = openSync(tmp, "w", 0o600);
+      try { writeSync(fd, JSON.stringify(all)); fsyncSync(fd); } finally { closeSync(fd); }
       renameSync(tmp, path);
     },
   };
+}
+
+const STATUSES = new Set(["queued", "running", "dead"]);
+function validJob(j) {
+  return j !== null && typeof j === "object" && typeof j.id === "string" && ID.test(j.id) && typeof j.type === "string" && TYPE.test(j.type)
+    && STATUSES.has(j.status) && Number.isInteger(j.attempts) && j.attempts >= 0 && Number.isFinite(j.runAfter);
 }
 
 function errorText(e) {
@@ -73,26 +81,36 @@ export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, 
     throw new TypeError("createQueue: backoffMs must be a non-empty list of integers 0–86400000");
   }
 
-  // Jobs left running by a stopped process are queued again; their attempt is not counted (it never finished).
-  let jobs = store.load().map((j) => (j.status === "running" ? { ...j, status: "queued", runAfter: 0 } : j));
+  // A job left running by a process that stopped or crashed keeps that attempt in its count: if the job itself
+  // killed the process, counting is what lets it reach the dead-letter list instead of crashing every boot.
+  // One with no attempts left is dead-lettered now; the others are queued again.
+  let jobs = store.load().map((j) => {
+    if (j.status !== "running") return j;
+    if (j.attempts >= maxAttempts) return { ...j, status: "dead", lastError: "interrupted: the process stopped during the last attempt", deadAt: new Date(now()).toISOString() };
+    return { ...j, status: "queued", runAfter: 0 };
+  });
   const running = new Map(); // id → AbortController
   const stopping = new Set(); // ids aborted by stop()
   let timer = null;
   let started = false;
   let idleWaiters = [];
 
-  const save = () => store.save(jobs);
+  // A failed write must not kill the process or wedge the queue: the in-memory state stays right, the error is
+  // reported, and the next change writes the whole list again.
+  const save = () => {
+    try { store.save(jobs); } catch (e) { onEvent({ event: "store.error", error: errorText(e) }); }
+  };
   const pub = (j) => ({ id: j.id, type: j.type, status: j.status, attempts: j.attempts, lastError: j.lastError ?? null, enqueuedAt: j.enqueuedAt, deadAt: j.deadAt ?? null });
 
   function wait(ms) {
     if (!started) return;
     clearTimeout(timer);
-    timer = setTimeout(pump, Math.max(0, ms));
-    timer.unref?.();
+    timer = setTimeout(pump, Math.max(0, ms)); // not unref'd: a worker with no server must stay up for a retry
   }
 
   function settleIdle() {
-    if (running.size === 0 && !jobs.some((j) => j.status === "queued" && j.runAfter <= now())) {
+    // Stopped: idle once nothing runs. Started: also nothing queued that is due.
+    if (running.size === 0 && (!started || !jobs.some((j) => j.status === "queued" && j.runAfter <= now()))) {
       const w = idleWaiters; idleWaiters = []; for (const r of w) r();
     }
   }
@@ -133,6 +151,7 @@ export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, 
       stopping.delete(job.id);
       save();
       pump();
+      settleIdle();
     }
   }
 
@@ -150,7 +169,11 @@ export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, 
   }
 
   return {
-    /** Adds a job; returns its id. The payload must be JSON (it is stored); never put a secret in it. */
+    /**
+     * Adds a job; returns its id. The payload must be JSON (it is stored); never put a secret in it. A handler's
+     * error message is kept as `lastError` and shown in the dead-letter list, so it must not hold payload or
+     * secret values either.
+     */
     enqueue(type, payload = null) {
       if (typeof type !== "string" || !Object.hasOwn(handlers, type)) throw new TypeError(`enqueue: no handler for ${JSON.stringify(type)}`);
       const copy = JSON.parse(JSON.stringify(payload ?? null));
@@ -189,11 +212,14 @@ export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, 
       return true;
     },
     start() { started = true; pump(); },
+    // Note: a handler that ignores its signal may still be running after its attempt ended (timeout or stop); the
+    // queue does not wait for it, so handlers should honour the signal or be safe to run twice.
     /** Stops taking new jobs; running attempts are aborted and will run again on the next start. */
     stop() {
       started = false;
       clearTimeout(timer);
       for (const [id, ac] of running) { stopping.add(id); ac.abort(new Error("queue stopped")); }
+      settleIdle();
     },
     /** Resolves when nothing is running and nothing queued is due (tests and graceful shutdown). */
     idle() { return new Promise((r) => { idleWaiters.push(r); settleIdle(); }); },

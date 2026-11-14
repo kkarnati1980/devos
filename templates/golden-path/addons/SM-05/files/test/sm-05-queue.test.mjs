@@ -114,6 +114,46 @@ test("SM-05-L1: queued and dead jobs survive a restart through the file store; a
   }
 });
 
+test("SM-05-L1: a job that was running when the process died keeps the attempt, so a crashing job reaches the dead-letter list", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sm05-"));
+  try {
+    const path = join(dir, "jobs.json");
+    const crashed = { id: "11111111-1111-4111-8111-111111111111", type: "pdf.render", payload: {}, status: "running", attempts: 3, runAfter: 0, enqueuedAt: "2026-11-14T00:00:00.000Z" };
+    const midway = { ...crashed, id: "22222222-2222-4222-8222-222222222222", attempts: 1 };
+    fileStore(path).save([crashed, midway]);
+    const attempts = [];
+    const q = createQueue({ ...fast, maxAttempts: 3, store: fileStore(path), handlers: { "pdf.render": async (p, { attempt }) => { attempts.push(attempt); } } });
+    const [dead] = q.deadLetters();
+    assert.equal(dead.id, crashed.id, "no attempts left: dead-lettered at start-up instead of crashing every boot");
+    assert.match(dead.lastError, /^interrupted/);
+    q.start();
+    await q.idle();
+    assert.deepEqual(attempts, [2], "the other one runs again with its count kept");
+    q.stop();
+    // A list that is not a valid job list is refused rather than half-trusted.
+    fileStore(path).save([{ id: "x", status: "weird" }]);
+    assert.throws(() => fileStore(path).load(), /valid job list/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SM-05-L1: a store that cannot write is reported, and the queue keeps working", async () => {
+  const events = [];
+  let ran = 0;
+  const broken = { load: () => [], save: () => { throw new Error("ENOSPC: no space left on device"); } };
+  const q = createQueue({ ...fast, store: broken, onEvent: (e) => events.push(e), handlers: { "a.b": async () => { ran += 1; } } });
+  q.start();
+  q.enqueue("a.b", {});
+  q.enqueue("a.b", {});
+  await q.idle();
+  assert.equal(ran, 2);
+  assert.ok(events.some((e) => e.event === "store.error" && /ENOSPC/.test(e.error)));
+  assert.deepEqual(q.stats(), { queued: 0, running: 0, dead: 0 });
+  q.stop();
+  await q.idle(); // resolves once stopped
+});
+
 test("SM-05-L1: the dead-letter routes list, retry and discard; bad ids are refused", async () => {
   const q = createQueue({ ...fast, maxAttempts: 1, store: memoryStore(), handlers: { "x.y": async () => { throw new Error("nope"); } } });
   q.start();
