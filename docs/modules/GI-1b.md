@@ -53,7 +53,9 @@ Round 1: 7 findings, 6 fixed: markers from the Summary line only (B9), KK-only h
 Round 2: 5 low findings, 1 fixed (main is read once, so the guard re-run and the compare judge the same main); the rest fail safe and are left as is.
 
 ## Pass rule
-`node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 11 tests passing (12 from DEVOS-181), `node --test scripts/test/merge-gate.test.mjs` exits 0 with 14 tests passing, and `pnpm check:rules` exits 0.
+`node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 11 tests passing, `node --test scripts/test/merge-gate.test.mjs` exits 0 with 14 tests passing, and `pnpm check:rules` exits 0.
+
+From DEVOS-181: `node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 12 tests passing (B1–B12).
 
 ## Green
 - **GC1 end to end** (stored on DEVOS-140): a throwaway PR adding `.skip` to an existing test gets `floor-guard` exit 1, and `node scripts/release/merge.mjs <pr> --dry-run` exits 1 naming the `test-skipped` hit.
