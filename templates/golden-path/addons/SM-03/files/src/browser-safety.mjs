@@ -140,7 +140,11 @@ class MarkupState {
         if (c === "!" || c === "?") this.mode = "bogus";
         else if (/[a-zA-Z\/]/.test(c)) { this.mode = "tag"; this.tag = "<" + c; this.tagName = ""; }
       } else if (this.mode === "text") {
-        if (c === "<" && s.startsWith("<!--", i)) { this.mode = "comment"; i += 3; }
+        // Comments end as the browser ends them (Codex PR98-r8): "<!-->" and "<!--->" close at once, and inside a
+        // comment both "-->" and "--!>" close it.
+        if (c === "<" && s.startsWith("<!-->", i)) i += 4;
+        else if (c === "<" && s.startsWith("<!--->", i)) i += 5;
+        else if (c === "<" && s.startsWith("<!--", i)) { this.mode = "comment"; i += 3; }
         else if (c === "<" && i + 1 === s.length) this.mode = "lt";
         // Codex PR98-r7: <!…> (other than a comment), <?…> and </ not followed by a letter are bogus comments in
         // the browser: they end at the first ">", whatever quotes they hold. Read as tags, a quote there could hide
@@ -153,6 +157,7 @@ class MarkupState {
       } else if (this.mode === "comment") {
         if (c === "<") assertNoTextEndTag(s, i);
         if (s.startsWith("-->", i)) { this.mode = "text"; i += 2; }
+        else if (s.startsWith("--!>", i)) { this.mode = "text"; i += 3; }
       } else if (this.mode === "raw" || this.mode === "rcdata") {
         // An end tag counts only with a terminator after its name, as in the browser (</scripts> does not end it).
         if (this.raw === "script" && s.startsWith("<!--", i)) throw new TypeError("html: <!-- inside <script> is not supported");

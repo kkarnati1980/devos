@@ -213,6 +213,11 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`<!foo ${"x"}>`, /declarations/);
   assert.throws(() => html`<!foo`, /balanced/);
   assert.equal(String(html`<!DOCTYPE html><p title="${"x"}">${"y"}</p>`), '<!DOCTYPE html><p title="x">y</p>');
+  // Codex PR98-r8: comments end where the browser ends them: "--!>", and at once for "<!-->" and "<!--->".
+  assert.throws(() => html`<!-- --!><script>/* --> */${"alert(1)"}</script>`, /inside <script>/);
+  assert.throws(() => html`<!--><script>/* --> */${"alert(1)"}</script>`, /inside <script>/);
+  assert.throws(() => html`<!---><script>/* --> */${"alert(1)"}</script>`, /inside <script>/);
+  assert.equal(String(html`<!-- a --!><p>${"x"}</p><!----><p>${"y"}</p>`), "<!-- a --!><p>x</p><!----><p>y</p>");
   // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
   // and an RCDATA-free fragment inside SVG.
   assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');
