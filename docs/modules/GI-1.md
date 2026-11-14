@@ -4,6 +4,7 @@
 - **Source:** KK's spec `claude/devos-gate-integrity-spec-v1.0.0.md` §4 (12 Nov 2026). The patterns of §4.2 are a minimum: the Architect may add patterns, never remove one.
 - **Applies:** D1 (Codex PASS on the same SHA), ADR-0013 (runner decides technical design; one task = one PR), ADR-0011 (no new network egress), C1 (no new third-party Action), C2 (under 2 minutes).
 - **Owned files (the guard paths):** `scripts/floor-guard/**`, `scripts/test/floor-guard.test.mjs`, `.github/workflows/floor-guard.yml`; plus this contract and `docs/decisions/0017-floor-guard.md`.
+- **Guard paths from DEVOS-189 (note 0022):** also `scripts/gates/kk-only.mjs` and `scripts/test/kk-only.test.mjs`, the KK-only classifier the gate evaluator and the Release merge path share (DEVOS-181). They stay owned by GI-4; they are guard paths so that a change to them must come alone and be named by a `FLOOR-GUARD CHANGE` marker. They are not exempt from the content rules.
 
 ## Interface
 - `node scripts/floor-guard/floor-guard.mjs --base <rev> --head <rev> [--report <file.json>]` diffs `merge-base(base, head)..head` with `git diff --unified=0 --find-renames`, and matches each file header against the `git diff -z --name-status` pairs so paths containing ` b/` split right (GI-1c). It reads the diff and the base/head copies of changed files only; never a PR description.
@@ -42,7 +43,7 @@
 | `policy-weakened` | a net loss of deny / require_approval / gate / default-deny / wouldBlock / budget-exceeded references in `packages/policy/src` (non-test), the file deleted, or any removed line under `packages/policy/rules/` |
 | `guard-change-not-isolated` | a change to a guard path together with any file other than guard paths, `docs/decisions/*.md` and this contract |
 
-Guard paths are exempt from the content rules (their tests hold the very patterns), which is safe only because a guard change must come alone and needs a Codex PASS naming it (§4.5).
+Guard paths are exempt from the content rules (their tests hold the very patterns), which is safe only because a guard change must come alone and needs a Codex PASS naming it (§4.5). From DEVOS-189 the exemption covers only the first three guard paths (`scripts/floor-guard/**`, `scripts/test/floor-guard.test.mjs`, `.github/workflows/floor-guard.yml`); the KK-only classifier and its table are guard paths but still get every content rule (note 0022).
 
 **Known gap (pre-review finding, recorded 12 Nov 2026):** GitHub runs a `pull_request` workflow from the PR's own copy of `floor-guard.yml`. A PR that edits that file could stop the base guard from running at all, so its isolation hit is never computed. Until the Release path closes it, the defence is Codex review: the review watcher sees every head, and §4.5 requires the PASS to name any guard change. **GI-1b** adds to the Release merge path (DEVOS-143) a refusal for any PR whose diff touches a guard path unless the Codex verdict for that SHA names the change.
 
@@ -68,7 +69,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 ## Follow-up GI-4c (DEVOS-167, note 0021) — what a removed or changed CI step ran
 - `ci-step-removed` text ends `; ran: <the step's body on one line>`, `ci-step-changed` ends `; was: <base body>; now: <head body>`, and `ci-job-removed` ends `; ran: <each step body, joined with " ;; ">`. A body is the step's lines other than its own `name:` (so `run:`, `uses:`, `with:`, `env:`, `if:` …), trimmed and joined with ` ⏎ ` (not ` | `, which a YAML block scalar `run: |` uses); indentation is dropped, so an indent-only edit reads the same in `was:` and `now:`, although the hit still fires.
 - The hit text is still cut at 200 characters, and hit ids follow the new text. Nothing else changes: the same hits fire, with the same rules, files and lines.
-- Why: the gate evaluator (`scripts/gates/evaluate-gate.mjs`, GI-4) can then tell from the stored result whether a removed or edited step ran security scanning. Narrowing its `KK_ONLY` on that basis is a separate, non-guard PR (DEVOS-186), because a guard change must come alone (§4.5).
+- Why: the gate evaluator (`scripts/gates/evaluate-gate.mjs`, GI-4) can then tell from the stored result whether a removed or edited step ran security scanning. Narrowing its `KK_ONLY` on that basis was a separate PR (DEVOS-186). Since DEVOS-189 `scripts/gates/kk-only.mjs` is itself a guard path, so any later change to `KK_ONLY` must come alone and be named by a `FLOOR-GUARD CHANGE` marker (note 0022).
 
 ## Not in scope
 - Making `floor-guard` a required check in the `main` ruleset (DEVOS-145, GI-3b) and adding it to `required-checks.json` (DEVOS-143).
@@ -76,6 +77,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 
 ## Pass rule
 - `node --test scripts/test/floor-guard.test.mjs` (part of `pnpm test`) exits 0. It holds one fixture diff per rule above expecting exit 1 and the rule's name, a clean diff expecting exit 0, forced errors (unknown ref, not a repository, missing arguments, unreadable diff) expecting exit 2, the isolation rule, dispositions, and the CLI.
+- From DEVOS-189: `node --test scripts/test/floor-guard.test.mjs` exits 0 with 169 tests passing, including "guard isolation (DEVOS-189)" (the KK-only classifier paths are guard paths) and "content rules (DEVOS-189)" (a suppression, a skipped test or a deleted test on those paths is still a hit; the guard itself stays exempt).
 - AT7: the `floor-guard` job on this PR's head SHA succeeds, and its log (`gh run view --log --job <id>`) shows `wall: <n>s` with n ≤ 120.
 
 ## Acceptance tests
