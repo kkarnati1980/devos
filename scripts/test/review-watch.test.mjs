@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false, manyComments: false });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false, manyComments: false, runs: null, reruns: [], failRerun: false, runState: null });
 
 before(async () => {
   reset();
@@ -32,9 +32,22 @@ before(async () => {
       if (p === "/repos/kkarnati1980/devos/commits/main") return M.failMain ? send(502, {}) : send(200, { sha: MAIN });
       if (p === "/repos/kkarnati1980/devos/actions/runs") {
         if (M.runsDelayMs) { const d = M.runsDelayMs; return void setTimeout(() => send(200, { workflow_runs: [{ workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "completed", conclusion: "success" }] }), d); }
+        if (M.runs) return send(200, { workflow_runs: M.runs });
         return send(200, { workflow_runs: [M.green
           ? { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "completed", conclusion: "success" }
           : { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
+      }
+      const rr = p.match(/^\/repos\/kkarnati1980\/devos\/actions\/runs\/(\d+)\/rerun-failed-jobs$/);
+      const rg = p.match(/^\/repos\/kkarnati1980\/devos\/actions\/runs\/(\d+)$/);
+      if (rg && req.method === "GET") {
+        const id = Number(rg[1]);
+        const st = (M.runState && M.runState[id]) || (M.reruns.includes(id) ? ["in_progress", null] : ["completed", "failure"]);
+        return send(200, { id, status: st[0], conclusion: st[1] });
+      }
+      if (rr && req.method === "POST") {
+        if (M.failRerun) return send(403, { message: "Resource not accessible by personal access token" });
+        M.reruns.push(Number(rr[1]));
+        return send(201, {});
       }
       const cm = p.match(/^\/repos\/kkarnati1980\/devos\/issues\/(\d+)\/comments$/);
       if (cm && req.method === "POST") {
@@ -476,4 +489,102 @@ test("AT21 (pre-review L2): a pending retry whose SHA is no longer a PR head is 
   assert.equal(closes().length, 2, "the second pending retry is closed as well");
   await tick([], { REVIEW_RUNNER: "/bin/false" });
   assert.equal(closes().length, 2, "and only once");
+});
+
+// DEVOS-195 (review-watch v1.6.0, AT22): a head held only by the floor guard (and ci-gate) is reviewed, so Codex can
+// write FLOOR-GUARD KEEP lines; after such a PASS the failed ci-gate run is re-run once. Any other red still waits.
+test("AT22: only floor-guard/ci-gate red is reviewed; any other red or unfinished run waits; workflows matched by path", async () => {
+  const run = (id, wf, path, conclusion, status = "completed", name = path) => ({ id, workflow_id: wf, path, name, created_at: "2026-11-14T00:00:00Z", status, conclusion });
+  const FG = ".github/workflows/floor-guard.yml", CG = ".github/workflows/ci-gate.yml", CI = ".github/workflows/ci.yml";
+  const cases = [
+    { runs: [run(1, 1, CI, "success"), run(2, 2, FG, "failure"), run(3, 3, CG, "failure")], review: true, why: "floor-guard + ci-gate red" },
+    { runs: [run(1, 1, CI, "success"), run(2, 2, FG, "failure"), run(3, 3, CG, "success")], review: true, why: "floor-guard red alone" },
+    { runs: [run(1, 1, CI, "failure"), run(2, 2, FG, "failure"), run(3, 3, CG, "failure")], review: false, why: "another workflow red" },
+    { runs: [run(1, 1, CI, "success"), run(2, 2, FG, "success"), run(3, 3, CG, "failure")], review: false, why: "ci-gate red without floor-guard" },
+    { runs: [run(1, 1, CI, null, "in_progress"), run(2, 2, FG, "failure"), run(3, 3, CG, "failure")], review: false, why: "a run not finished" },
+    { runs: [run(1, 1, CI, "success"), run(2, 2, FG, "cancelled"), run(3, 3, CG, "failure")], review: false, why: "floor-guard cancelled, not failure" },
+    { runs: [run(1, 1, CI, "success"), run(2, 2, ".github/workflows/other.yml", "failure", "completed", "floor-guard"), run(3, 3, CG, "failure", "completed", "ci-gate")], review: false, why: "named floor-guard but another file" },
+  ];
+  let n = 60;
+  for (const c of cases) {
+    reset();
+    const sha = (n++).toString(16).padStart(40, "a");
+    M.runs = c.runs;
+    M.prs = [{ number: n, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/S4.md" }];
+    const r = await tick(["--dry-run"]);
+    assert.equal(r.code, 0, r.out);
+    if (c.review) assert.match(r.out, /WOULD review/, c.why);
+    else { assert.doesNotMatch(r.out, /WOULD review/, c.why); assert.match(r.out, /CI not green yet/, c.why); }
+  }
+});
+
+test("AT22: a PASS with FLOOR-GUARD KEEP re-runs the failed ci-gate run once; a failed re-run is retried; no Keep, no re-run", async () => {
+  const FG = ".github/workflows/floor-guard.yml", CG = ".github/workflows/ci-gate.yml";
+  const runs = [{ id: 501, workflow_id: 2, path: FG, created_at: "2026-11-14T00:00:00Z", status: "completed", conclusion: "failure" },
+    { id: 777, workflow_id: 3, path: CG, created_at: "2026-11-14T00:00:00Z", status: "completed", conclusion: "failure" }];
+  fs.mkdirSync(path.join(dir, "verdicts"), { recursive: true });
+  const mk = (name, summary) => {
+    const f = path.join(dir, name);
+    fs.writeFileSync(f, `#!/usr/bin/env bash\nprintf '%s' '${JSON.stringify({ verdict: "PASS", summary, findings: [] })}' > "${dir}/verdicts/$2.json"\n`, { mode: 0o755 });
+    return f;
+  };
+  // With Keeps: the re-run POST fails once (token without Actions: write), then succeeds on the next tick, once.
+  reset();
+  const sha = "4c".repeat(20);
+  M.runs = runs; M.failRerun = true;
+  M.prs = [{ number: 117, draft: false, user: { login: "kkarnati1980" }, head: { sha, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/S4.md" }];
+  const keep = mk("runner-keep.sh", "ok. FLOOR-GUARD KEEP test-script-changed apps/api/package.json:7 build step only");
+  const r1 = await tick([], { REVIEW_RUNNER: keep });
+  assert.equal(r1.code, 0, r1.out);
+  assert.ok(M.statuses.some((x) => x.sha === sha && x.context === "codex-review" && x.state === "success"), r1.out);
+  assert.deepEqual(M.reruns, []);
+  assert.match(r1.out, /ci-gate re-run failed/);
+  M.failRerun = false;
+  await tick([], { REVIEW_RUNNER: keep });
+  assert.deepEqual(M.reruns, [777], "the failed ci-gate run, by id");
+  await tick([], { REVIEW_RUNNER: keep });
+  assert.deepEqual(M.reruns, [777], "only once");
+  // Pre-review L1: a ci-gate run already re-run by hand (now green) is not POSTed, and the watcher stops trying.
+  reset();
+  const sha4 = "5b".repeat(20);
+  M.runs = runs; M.failRerun = true;
+  M.prs = [{ number: 121, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha4, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/S4.md" }];
+  await tick([], { REVIEW_RUNNER: keep });
+  M.runState = { 777: ["completed", "success"] };
+  const rh = await tick([], { REVIEW_RUNNER: keep });
+  assert.match(rh.out, /not failed; no re-run needed/);
+  assert.ok(fs.existsSync(path.join(dir, "watch", `${sha4}.cigate-rerun`)));
+  const rh2 = await tick([], { REVIEW_RUNNER: keep });
+  assert.doesNotMatch(rh2.out, /ci-gate/);
+  assert.deepEqual(M.reruns, []);
+  // Codex PR121-r1 (low): with no ci-gate run to re-run (floor-guard red alone), --dry-run writes no marker.
+  reset();
+  const sha5 = "6a".repeat(20);
+  M.runs = [runs[0], { ...runs[1], conclusion: "success" }];
+  M.prs = [{ number: 122, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha5, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/S4.md" }];
+  const marker5 = path.join(dir, "watch", `${sha5}.cigate-rerun`);
+  await tick([], { REVIEW_RUNNER: keep });
+  assert.ok(fs.existsSync(marker5), "a real tick marks it done");
+  fs.rmSync(marker5);
+  const rd5 = await tick(["--dry-run"], { REVIEW_RUNNER: keep });
+  assert.match(rd5.out, /no ci-gate run to re-run/);
+  assert.ok(!fs.existsSync(marker5), "--dry-run writes no marker");
+  assert.deepEqual(M.reruns, []);
+  // A PASS without Keeps on such a head re-runs nothing (ci-gate would fail again).
+  reset();
+  const sha2 = "2e".repeat(20);
+  M.runs = runs;
+  M.prs = [{ number: 118, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha2, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/S4.md" }];
+  const plain = mk("runner-plain.sh", "ok");
+  await tick([], { REVIEW_RUNNER: plain });
+  await tick([], { REVIEW_RUNNER: plain });
+  assert.deepEqual(M.reruns, []);
+  // A green head (no floor-guard red) never gets a re-run, even with a Keep in its Summary.
+  reset();
+  const sha3 = "3d".repeat(20);
+  M.green = true;
+  M.prs = [{ number: 119, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha3, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/S4.md" }];
+  await tick([], { REVIEW_RUNNER: keep });
+  await tick([], { REVIEW_RUNNER: keep });
+  assert.deepEqual(M.reruns, []);
 });

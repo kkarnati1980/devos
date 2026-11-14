@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — review watcher: run the Codex review automatically on each new PR head (DEVOS-60)
-# Version: 1.5.0
+# Version: 1.6.0
+# v1.6.0 (DEVOS-195): a head whose only red runs are the floor-guard and ci-gate workflows (matched by file path,
+#   conclusion failure, floor-guard among them) is reviewed, so Codex can write FLOOR-GUARD KEEP lines. After a
+#   PASS with a KEEP line on such a head, the failed ci-gate run is re-run once (token needs Actions: write;
+#   a refused POST is logged and retried on later ticks). Any other red or unfinished run still waits. --dry-run writes no state (Codex PR121-r1).
 # v1.5.0 (DEVOS-172): a review that could not run (runner exit without a stored verdict, e.g. "Quota exceeded")
 # is retried with a bounded back-off instead of being final for that SHA. Attempt k failing (k < REVIEW_RETRY_MAX,
 # default 3) stores <sha>.fails=k and <sha>.retry_at = now + REVIEW_RETRY_BASE * 2^(k-1) seconds (default 600,
@@ -114,15 +118,59 @@ gh_all() {
   cat "$acc"; rm -f "$acc" "$chunk"
 }
 
-ci_green() {  # sha -> 0 green; 1 not green; 3 cannot read workflow runs (token lacks Actions: Read)
+FG_WF=".github/workflows/floor-guard.yml"   # DEVOS-195: matched by file path, never by workflow name
+CG_WF=".github/workflows/ci-gate.yml"
+ci_green() {  # sha -> 0 green; 1 not green; 3 cannot read workflow runs (token lacks Actions: Read);
+              # 4 reviewable: every red run is floor-guard or ci-gate with conclusion failure, floor-guard among them
   # All DevOS CI is GitHub Actions. Take the latest run of each workflow for this SHA (all pages); every one
   # must have completed with success/skipped/neutral, and there must be at least one.
   local runs
   runs="$(gh_all "/repos/$REPO/actions/runs?head_sha=$1" workflow_runs)" || return 3
-  jq -e '[group_by(.workflow_id)[] | max_by(.created_at)] as $latest
+  if jq -e '[group_by(.workflow_id)[] | max_by(.created_at)] as $latest
          | ($latest | length) > 0 and all($latest[]; .status == "completed"
            and (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral"))' \
-     <<<"$runs" >/dev/null
+     <<<"$runs" >/dev/null; then return 0; fi
+  # DEVOS-195: a head held only by the floor guard (and the ci-gate aggregator that reflects it) is reviewed, so
+  # Codex can write FLOOR-GUARD KEEP lines. Any other red, or any unfinished run, still waits.
+  if jq -e --arg fg "$FG_WF" --arg cg "$CG_WF" '[group_by(.workflow_id)[] | max_by(.created_at)] as $latest
+         | [$latest[] | select((.status == "completed"
+             and (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral")) | not)] as $red
+         | all($red[]; .status == "completed" and .conclusion == "failure" and (.path == $fg or .path == $cg))
+           and any($red[]; .path == $fg)' <<<"$runs" >/dev/null; then
+    # The failed ci-gate run to re-run after a PASS with Keeps (none when ci-gate is not red).
+    jq -r --arg cg "$CG_WF" '[group_by(.workflow_id)[] | max_by(.created_at)][]
+         | select(.path == $cg and .conclusion == "failure") | .id' <<<"$runs" | head -n1 > "$TMP/cigate.$1"
+    return 4
+  fi
+  return 1
+}
+
+# DEVOS-195: after a PASS whose Summary has FLOOR-GUARD KEEP lines on a head reviewed with the floor guard red,
+# re-run that head's failed ci-gate jobs once (needs Actions: write). ci-gate passes only if the Keeps are valid
+# (GI-1d). A failed POST is retried on later ticks; <sha>.cigate-rerun marks it done.
+rerun_cigate() {  # sha
+  local sha="$1" id
+  [[ -s "$STATE/$sha.fgred" && ! -e "$STATE/$sha.cigate-rerun" && -s "$VDIR/$sha.json" ]] || return 0
+  [[ "$(jq -r .verdict "$VDIR/$sha.json")" == "PASS" ]] || return 0
+  # A here-string, not a pipe: grep -q exiting early must not fail a pipefail pipeline (pre-review L2).
+  grep -q 'FLOOR-GUARD KEEP ' <<<"$(jq -r .summary "$VDIR/$sha.json")" || return 0
+  id="$(cat "$STATE/$sha.fgred")"
+  [[ "$id" =~ ^[0-9]{1,20}$ ]] || { log "${sha:0:7}: no ci-gate run to re-run"; [[ $DRY -eq 1 ]] || touch "$STATE/$sha.cigate-rerun"; return 0; }
+  # Pre-review L1: a run that is no longer failed (re-run by hand, or in progress) is never POSTed again.
+  local conc
+  conc="$(gh_api GET "/repos/$REPO/actions/runs/$id" | jq -r '"\(.status) \(.conclusion)"')" || { log "${sha:0:7}: cannot read ci-gate run $id; retry next tick"; return 0; }
+  if [[ "$conc" != "completed failure" ]]; then
+    log "${sha:0:7}: ci-gate run $id is '$conc', not failed; no re-run needed"
+    [[ $DRY -eq 1 ]] || touch "$STATE/$sha.cigate-rerun"
+    return 0
+  fi
+  if [[ $DRY -eq 1 ]]; then log "${sha:0:7}: WOULD re-run ci-gate run $id"; return 0; fi
+  printf '{}' > "$TMP/rerun.json"
+  if gh_api POST "/repos/$REPO/actions/runs/$id/rerun-failed-jobs" "$TMP/rerun.json" >/dev/null; then
+    touch "$STATE/$sha.cigate-rerun"; log "${sha:0:7}: re-ran ci-gate run $id after a PASS with FLOOR-GUARD KEEP"
+  else
+    log "${sha:0:7}: ci-gate re-run failed (the token needs 'Actions: Read and write'); retry next tick"
+  fi
 }
 
 set_status() {  # sha state description
@@ -226,13 +274,13 @@ for i in $(seq 0 $((count - 1))); do
   fi
   heads[$sha]=1
   if [[ "$draft" == "true" ]]; then log "PR #$pr ${sha:0:7}: draft, skipped"; continue; fi
-  if published "$sha"; then log "PR #$pr ${sha:0:7}: already reviewed and published"; continue; fi
+  if published "$sha"; then log "PR #$pr ${sha:0:7}: already reviewed and published"; rerun_cigate "$sha"; continue; fi
 
   # Reviewed (or could not run) earlier, but publication is incomplete: publish again, never re-review.
   if [[ -s "$STATE/$sha.msg" ]]; then
     tried[$sha]=1
     if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication"; continue; fi
-    if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed"; fi
+    if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed"; rerun_cigate "$sha"; fi
     continue
   fi
   # A stored verdict without a message (e.g. from a manual run): build the message and publish it.
@@ -256,7 +304,14 @@ for i in $(seq 0 $((count - 1))); do
   fi
   set +e; ci_green "$sha"; ci=$?; set -e
   if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; unreadable=$((unreadable + 1)); continue; fi
-  if [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; waiting=$((waiting + 1)); continue; fi
+  # Pre-review L1: a head that is green (or red for another reason) carries no stale floor-guard marker.
+  if [[ $ci -ne 4 && $ci -ne 3 && $DRY -eq 0 ]]; then rm -f "$STATE/$sha.fgred"; fi
+  if [[ $ci -eq 4 ]]; then
+    log "PR #$pr ${sha:0:7}: only floor-guard/ci-gate red; reviewable for FLOOR-GUARD KEEP lines"
+    if [[ $DRY -eq 0 ]]; then
+      if [[ -s "$TMP/cigate.$sha" ]]; then cp "$TMP/cigate.$sha" "$STATE/$sha.fgred"; else echo none > "$STATE/$sha.fgred"; fi
+    fi
+  elif [[ $ci -ne 0 ]]; then log "PR #$pr ${sha:0:7}: CI not green yet"; waiting=$((waiting + 1)); continue; fi
 
   # DEVOS-172: a head whose review could not run waits for its back-off. A value further ahead than the cap
   # (clock stepped back, or a bad file) never blocks it for longer than the cap.
@@ -333,7 +388,7 @@ review_one() {  # pr sha contract
     echo "error Codex review could not run ($label)" > "$STATE/$sha.state"
     log "PR #$pr ${sha:0:7}: runner failed (exit $rc)"
   fi
-  publish "$pr" "$sha" || true
+  if publish "$pr" "$sha"; then rerun_cigate "$sha"; fi
 }
 
 # DEVOS-116: one review per tick (runner limit 900 s < service limit 1200 s), oldest first-green time first,
