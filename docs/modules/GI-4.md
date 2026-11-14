@@ -4,6 +4,7 @@
 - **Spec:** KK, `claude/devos-gate-integrity-spec-v1.0.0.md` §3 and §10 (claude.ai Project). **The rule is KK's; it is not redesigned here.**
 - **Depends on:** GI-1 floor guard (DEVOS-141), GI-2 pass rule (DEVOS-142), GI-3 Release merge path (DEVOS-143). All three are merged.
 - **Owned files:** `scripts/gates/evaluate-gate.mjs`, `scripts/test/gate-evaluator.test.mjs`, this contract, `docs/decisions/0019-gate-rule-final-form.md`, the §2 amendment in `docs/decisions/0013-speed-ups.md`, the gate lines in `rules.md` and the generated `CLAUDE.md` / `AGENTS.md`.
+- **Owned files, from DEVOS-181 (shared KK-only classifier):** `scripts/gates/kk-only.mjs` and `scripts/test/kk-only.test.mjs` (new, owned here). Shared with GI-1b (DEVOS-149, Lane A, the same runner), only for this task: the classifier lines of `scripts/release/merge.mjs` (the import and `notKeepable`), test B12 in `scripts/test/merge-gate-floor-guard.test.mjs`, and in `docs/modules/GI-1b.md` the "KK-only set shared" runner decision, the B12 row and the B12 pass-rule line. Why one PR: the task is to make both readers use one function, so the move and both imports must land together, or the two copies would differ on main in between (Codex PR109-r1).
 - **Decision record:** `docs/decisions/0019-gate-rule-final-form.md` (includes the D14 draft for KK).
 
 ## Goal
