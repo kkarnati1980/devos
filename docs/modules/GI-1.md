@@ -5,6 +5,7 @@
 - **Applies:** D1 (Codex PASS on the same SHA), ADR-0013 (runner decides technical design; one task = one PR), ADR-0011 (no new network egress), C1 (no new third-party Action), C2 (under 2 minutes).
 - **Owned files (the guard paths):** `scripts/floor-guard/**`, `scripts/test/floor-guard.test.mjs`, `.github/workflows/floor-guard.yml`; plus this contract and `docs/decisions/0017-floor-guard.md`.
 - **Guard paths from DEVOS-189 (note 0022):** also `scripts/gates/kk-only.mjs` and `scripts/test/kk-only.test.mjs`, the KK-only classifier the gate evaluator and the Release merge path share (DEVOS-181). They stay owned by GI-4; they are guard paths so that a change to them must come alone and be named by a `FLOOR-GUARD CHANGE` marker. They are not exempt from the content rules.
+- **DEVOS-192 (rules.md):** the Review guidelines' "Floor guard markers" line in `rules.md` (and the generated `CLAUDE.md` / `AGENTS.md`) lists all five guard paths, so Codex writes a `FLOOR-GUARD CHANGE` marker for a classifier change. AT-192: `pnpm check:rules` exits 0 and `node --test scripts/test/gen-rules.test.mjs` exits 0.
 
 ## Interface
 - `node scripts/floor-guard/floor-guard.mjs --base <rev> --head <rev> [--report <file.json>]` diffs `merge-base(base, head)..head` with `git diff --unified=0 --find-renames`, and matches each file header against the `git diff -z --name-status` pairs so paths containing ` b/` split right (GI-1c). It reads the diff and the base/head copies of changed files only; never a PR description.
