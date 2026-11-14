@@ -10,7 +10,7 @@ import { CoreRepo } from "./core-repo.js";
 import { deployComposeStep } from "./deploy-compose.js";
 import type { GitHubClient } from "./github.js";
 import { ProviderError } from "./http.js";
-import { ownershipMarker, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
+import { ownershipMarker, StepError, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
 import { STACK_ENVS, type PortRange, type StackEnv } from "./stack.js";
 
 const UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
@@ -185,6 +185,14 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
       const path = `deploy/compose.${env}.devos.yaml`;
       const entry = (await repo.treeOf(deployCommit)).get(path);
       if (!entry) throw new Error(`compose-missing: the deploy commit has no ${path}`);
+      // Codex PR115-r1: Coolify clones `main`, not the journalled commit. A run interrupted after `github/deploy_compose`
+      // could resume after someone edited or deleted the file on main, so the file on main now must be the very blob
+      // DevOS committed; anything else is compose_drift (non-retryable), and no application is created.
+      const head = await repo.mainHead();
+      const onMain = typeof head === "string" && head !== "empty" ? (await repo.treeOf(head)).get(path) : undefined;
+      if (!onMain || onMain.sha !== entry.sha || onMain.mode !== "100644") {
+        throw new StepError(`coolify/application/${env}`, "compose_drift", false, true, `${path} on main is missing or differs from the hardened file DevOS committed; no application is created`);
+      }
       const bytes = await repo.blobContent(entry.sha);
       // Defence in depth: the file must still publish exactly this stack's tailnet port on `app`, and nothing else.
       assertPublished(parseCompose(bytes), Number(port), opts.tailnetIp);

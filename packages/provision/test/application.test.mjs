@@ -385,10 +385,43 @@ test("c2c2: a deploy file that no longer publishes exactly the stack's tailnet p
   g.trees.set(t, tree);
   const c = createHash("sha1").update(`commit ${t}`).digest("hex");
   g.commits.set(c, { tree: t, parents: [g.main] });
+  // The bad file is on main too, so the PR115-r1 drift check passes and the publish check is what refuses it.
+  g.main = c;
   await s.store.markDone(P.id, { key: "github/deploy_compose", provider: "github", kind: "deploy_compose" }, c);
   await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), applicationStep(s.cf, s.gh, s.store, P, "preview", s.opts)], { store: s.store, authorize: allowAll }),
     (e) => e.code === "provider_error");
   assert.equal(appCreates(s.fake).length, 0);
+});
+
+test("c2c2 (Codex PR115-r1): a run interrupted after the deploy commit, then main edited or the file deleted, is compose_drift; no application", async () => {
+  for (const change of ["edit", "delete"]) {
+    const s = await setup();
+    // The interrupted run: everything up to and including github/deploy_compose is done.
+    await runProvision(P.id, [...s.steps().slice(0, 6), deployComposeStep(s.gh, s.store, P, s.opts)], { store: s.store, authorize: allowAll });
+    const g = repoOf(s.fake);
+    const journalled = s.store.steps.get(`${P.id}/github/deploy_compose`).externalId;
+    assert.equal(journalled, g.main);
+    // Someone commits on main afterwards.
+    let tree = g.trees.get(g.commits.get(g.main).tree).map((e) => ({ ...e }));
+    if (change === "edit") {
+      const edited = Buffer.from("services:\n  app:\n    privileged: true\n");
+      g.blobs.set(sha1(edited), edited);
+      tree.find((e) => e.path === "deploy/compose.preview.devos.yaml").sha = sha1(edited);
+    } else {
+      tree = tree.filter((e) => e.path !== "deploy/compose.preview.devos.yaml");
+    }
+    const t = createHash("sha1").update(JSON.stringify(tree) + change).digest("hex");
+    g.trees.set(t, tree);
+    const c = createHash("sha1").update(`commit ${t} ${change}`).digest("hex");
+    g.commits.set(c, { tree: t, parents: [g.main] });
+    g.main = c;
+    // The retry skips the done deploy step (still journalled at the old commit) and reaches the application.
+    await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }),
+      (e) => e instanceof StepError && e.code === "compose_drift" && e.retryable === false, change);
+    assert.equal(s.store.steps.get(`${P.id}/github/deploy_compose`).externalId, journalled, change);
+    assert.equal(appCreates(s.fake).length, 0, change);
+    assert.equal(g.main, c, `${change}: main is not moved`);
+  }
 });
 
 test("c2c2 AT3/AT4: a fast-forward that times out after it happened is adopted; one commit", async () => {
