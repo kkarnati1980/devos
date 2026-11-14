@@ -288,3 +288,27 @@ test("M2.3 AT12 (DEVOS-135): a deep-linked purge card shows the phrase to type a
   assert.deepEqual(problems, []);
   await context.close();
 });
+
+test("AT-CA3b (CR-a3, DEVOS-199): the project page shows the pre-flight read-only — waiting for secrets, answers and defaults, escaped", async () => {
+  const { page, context, problems } = await open("/projects/xss-probe");
+  await page.getByTestId("preflight-state").waitFor();
+  assert.match(await page.getByTestId("preflight-state").innerText(), /Intake card approved\. The build has not started\./);
+  assert.match(await page.getByTestId("preflight-waiting").innerText(), /waiting for secrets: SMS_API_KEY/);
+  const items = await page.getByTestId("preflight-item").allInnerTexts();
+  assert.equal(items.length, 3);
+  assert.match(items[0], /PF-1 Who pays for SMS\? <img src=x onerror=window\.__xss3=1>/, "spec text is shown as text");
+  assert.match(items[0], /Your answer: the client <b>pays<\/b>/);
+  assert.match(items[1], /Default used: USD 15/);
+  assert.match(items[2], /PF-3 secret SMS_API_KEY \(missing\)/);
+  assert.equal(await page.evaluate(() => window.__xss3), undefined, "no payload ran");
+  assert.equal(await page.locator('[data-testid="preflight-panel"] img, [data-testid="preflight-panel"] b').count(), 0);
+  assert.equal(await page.locator("button", { hasText: /approve|reject/i }).count(), 0, "read-only: no decision controls");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems, []);
+  await context.close();
+  // Another project with no pre-flight on the stub: a fixed message, never raw error text.
+  const other = await open("/projects/social-content-extraction");
+  await other.page.getByTestId("preflight-error").waitFor();
+  assert.match(await other.page.getByTestId("preflight-error").innerText(), /\(project-not-found\)$/);
+  await other.context.close();
+});

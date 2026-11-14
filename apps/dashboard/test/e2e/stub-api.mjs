@@ -47,6 +47,28 @@ export async function startStubApi(allowedOrigin) {
       state.csrfRefused = (state.csrfRefused ?? 0) + 1;
       return json(403, { statusCode: 403, code: "csrf-token-invalid" });
     }
+    // ADR-0012 CR-a3 (DEVOS-199): one approved project waiting for a secret, with seeded markup in its texts.
+    if (req.method === "GET" && url === "/projects/by-slug/xss-probe/preflight") {
+      return json(200, {
+        preflight: {
+          continuousRun: true,
+          state: "approved",
+          open: false,
+          items: [
+            { id: "PF-1", kind: "decision", text: "Who pays for SMS? <img src=x onerror=window.__xss3=1>", default: "Architect decides" },
+            { id: "PF-2", kind: "decision", text: "Monthly spend cap for this project", default: "USD 15 (the project's budget envelope)" },
+            { id: "PF-3", kind: "secret", text: "SMS_API_KEY", default: "enter in setup wizard" },
+          ],
+          missingSecrets: ["SMS_API_KEY"],
+          secretsUnverified: false,
+          decisions: [
+            { itemId: "PF-1", answer: "the client <b>pays</b>", source: "kk", createdAt: "2026-11-14T10:00:00.000Z" },
+            { itemId: "PF-2", answer: "USD 15 (the project's budget envelope)", source: "default", createdAt: "2026-11-14T10:00:00.000Z" },
+          ],
+        },
+      });
+    }
+    if (req.method === "GET" && url.startsWith("/projects/by-slug/")) return json(404, { statusCode: 404, code: "project-not-found" });
     if (req.method === "GET" && url === "/setup") {
       return json(200, { capsConfirmed: state.settings.capsConfirmedAt !== null, vaultConfigured: true, secrets: NAMES.map((n) => ({ name: n, set: state.secrets.has(n) })), complete: false });
     }
