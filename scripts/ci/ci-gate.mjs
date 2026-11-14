@@ -214,6 +214,48 @@ export async function waitForChecks({ expected, owners, read, deadlineMs, interv
   }
 }
 
+/** The Release path's shared rules (GI-1b), loaded only when a disposition is judged; a load failure is an error
+ * (exit 2), never a pass. */
+async function loadRelease() {
+  try {
+    return await import("../release/merge.mjs");
+  } catch {
+    throw new GateError("cannot load scripts/release/merge.mjs to judge floor-guard Keeps");
+  }
+}
+
+/**
+ * GI-1d (DEVOS-179): when the only failed check is the floor guard, ci-gate passes only if the Release path's own
+ * rules (GI-1b, `judgeFloorGuard`) dispose of it: the watcher's Codex PASS for this SHA and PR holds a valid
+ * Keep for every hit of the floor guard re-run (base copy, on base...head), no hit is KK-only, and every guard
+ * path the PR changes is named by a CHANGE line with a decision note. It never waits for the PASS: the watcher
+ * reviews only green heads, so ci-gate is re-run after the PASS lands. Anything else stays a failure.
+ * @returns {Promise<{ disposed: boolean, reasons: string[] }>}
+ */
+export async function floorGuardDisposition(v, { gh, repo, pr, sha, baseSha, config, guardReport, release = loadRelease }) {
+  const rel = await release();
+  config ??= rel.DEFAULT_CONFIG;
+  const fg = config.floorGuard;
+  if (!fg || v.state !== "failure" || v.pending.length > 0 || v.failed.length !== 1 || v.failed[0] !== `${fg.check}=failure`) {
+    return { disposed: false, reasons: [] };
+  }
+  if (!Number.isInteger(Number(pr)) || Number(pr) <= 0) throw new GateError("GATE_PR (the pull request number) is required to judge floor-guard Keeps");
+  if (!/^[0-9a-f]{40}$/.test(String(baseSha))) throw new GateError("GATE_BASE_SHA is not a full commit SHA");
+  const statuses = [];
+  for (let page = 1; page <= 20; page++) {
+    const j = await gh.get(`/repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
+    statuses.push(...(j?.statuses ?? []));
+    if (statuses.length >= (j?.total_count ?? 0) || (j?.statuses ?? []).length === 0) break;
+    if (page === 20) throw new GateError("more than 2,000 statuses; refusing to judge a partial list");
+  }
+  const { passLabel, reasons } = rel.codexPass(statuses, pr, config);
+  if (!passLabel) return { disposed: false, reasons };
+  const p = await gh.get(`/repos/${repo}/pulls/${pr}`);
+  if (p?.head?.sha !== sha) return { disposed: false, reasons: [`PR #${pr}'s head is ${String(p?.head?.sha).slice(0, 7)}, not ${sha.slice(0, 7)}`] };
+  const judged = await rel.judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles: p.changed_files, floorGuardFailed: true, otherFloorGuardRed: false, mainSha: baseSha, guardReport: guardReport ?? ((a) => rel.localGuardReport({ ...a, fetch: false })), config });
+  return { disposed: judged.disposed && judged.reasons.length === 0, reasons: judged.reasons };
+}
+
 async function main() {
   const { GITHUB_API_URL = "https://api.github.com", GITHUB_REPOSITORY, GATE_SHA, GATE_BASE, GITHUB_TOKEN } = process.env;
   if (!GITHUB_REPOSITORY || !GATE_SHA || !GATE_BASE || !GITHUB_TOKEN) throw new GateError("GITHUB_REPOSITORY, GATE_SHA, GATE_BASE and GITHUB_TOKEN are required");
@@ -239,6 +281,18 @@ async function main() {
     console.log("ci-gate: every expected check passed");
     return 0;
   }
+  const d = await floorGuardDisposition(v, {
+    gh: (await loadRelease()).githubClient({ token: GITHUB_TOKEN }),
+    repo: GITHUB_REPOSITORY,
+    pr: process.env.GATE_PR,
+    sha: GATE_SHA,
+    baseSha: process.env.GATE_BASE_SHA,
+  });
+  if (d.disposed) {
+    console.log("ci-gate: every expected check passed except floor-guard, whose every hit has a valid Codex Keep for this SHA (GI-1b rules)");
+    return 0;
+  }
+  for (const r of d.reasons) console.error(`ci-gate: floor-guard not disposed: ${r}`);
   console.error(`ci-gate: FAIL ${v.failed.join(", ")}`);
   return 1;
 }
