@@ -15,8 +15,10 @@ export const PENDING_SCAN_MAX = 1000;
  * whole bound. approvals.ts is Lane B's file and stays unchanged (Codex PR88-r6); AT-E10 reads the options the real
  * store passes, so a change there that this bound no longer covers fails the test.
  */
-export function approvalStepBoundMs(timeoutMs: number): number {
-  return timeoutMs + timeoutMs;
+export function approvalStepBoundMs(timeoutMsOrStore: number | { readonly stepBoundMs: number }): number {
+  // DEVOS-185: given the store, its own `stepBoundMs` (built from the options its transactions really get) is used.
+  if (typeof timeoutMsOrStore === "object") return timeoutMsOrStore.stepBoundMs;
+  return timeoutMsOrStore + timeoutMsOrStore;
 }
 const PAGE = 100;
 /** The analyst's question-card targets (packages/analyst route.ts); other `decision` cards are never touched. */
