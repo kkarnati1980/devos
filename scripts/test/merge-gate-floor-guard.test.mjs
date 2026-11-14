@@ -261,3 +261,25 @@ test("B11 (pre-review) a red workflow named floor-guard from another file is nev
   assert.equal(r.code, 1);
   assert.ok(r.reasons.some((x) => x.includes("run 9")));
 });
+
+test("B12 (DEVOS-181) a ci-step hit with a plain stored body is cleared by a Keep, as in the gate; without a Keep, or with an unknown body, it refuses", async () => {
+  // The guard's own text for a removed step (GI-4c): "job <id>: step <name> removed; ran: <body>".
+  const plain = { id: "fg-7777777777", rule: "ci-step-removed", file: ".github/workflows/ci.yml", line: 12, text: "job ci: step Build removed; ran: run: pnpm build" };
+  const kept = redGuard({ comments: [passComment(keeps([plain]))] });
+  const r1 = await release(kept.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [plain] }) });
+  assert.equal(r1.code, 0, r1.reasons.join("; "));
+  assert.equal(r1.disposed, true);
+  assert.equal(merges(kept), 1);
+
+  const none = redGuard({ comments: [passComment()] });
+  const r2 = await release(none.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [plain] }) });
+  assert.equal(r2.code, 1);
+  assert.equal(merges(none), 0);
+
+  const script = { ...plain, id: "fg-8888888888", text: "job ci: step Checks removed; ran: run: bash scripts/check.sh" };
+  const unknown = redGuard({ comments: [passComment(keeps([script]))] });
+  const r3 = await release(unknown.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [script] }) });
+  assert.equal(r3.code, 1);
+  assert.ok(r3.reasons.some((x) => x.includes(script.id) && x.includes("escalate to KK")), r3.reasons.join("; "));
+  assert.equal(merges(unknown), 0);
+});
