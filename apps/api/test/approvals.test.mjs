@@ -3,7 +3,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { KkSessionRegistry } from "../dist/auth.js";
-import { Approvals, ApprovalError, MemoryApprovalStore, parseApproveOptions, parseCard, purgeConfirmationHash } from "../dist/approvals.js";
+import { Approvals, ApprovalError, MemoryApprovalStore, gateFromRules, parseApproveOptions, parseCard, purgeConfirmationHash } from "../dist/approvals.js";
+import { gateForRulesFromDb } from "../dist/runtime.js";
 import { GateEngine, MemoryGateStore } from "../dist/gates.js";
 
 const KEY = Buffer.alloc(32, 7);
@@ -419,4 +420,43 @@ test("DEVOS-164 expireCardsById boundaries: 500 distinct ids and a 500-character
   const ids = [...filler, c.id.toUpperCase(), c.id, filler[0], "nope"];
   assert.deepEqual(await approvals.expireCardsById(ids, "r".repeat(500)), [c.id]);
   assert.equal((await store.get(c.id)).status, "expired");
+});
+
+test("DEVOS-134: the gate comes from the matched rules' constraints.gateName; unknown names are ignored; the stricter gate wins", async () => {
+  const rules = [
+    { id: "r-launch", constraints: { gate: true, gateName: "first_launch" } },
+    { id: "r-spend", constraints: { gateName: "destructive_or_spend" } },
+    { id: "r-typo", constraints: { gateName: "first-launch" } },
+    { id: "r-none", constraints: {} },
+    { id: "r-null", constraints: null },
+    { id: "r-num", constraints: { gateName: 3 } },
+  ];
+  assert.equal(gateFromRules(["r-launch"], rules), "first_launch");
+  assert.equal(gateFromRules(["r-launch", "r-spend"], rules), "destructive_or_spend", "a second rule never weakens the gate");
+  assert.equal(gateFromRules(["r-spend", "r-launch"], rules), "destructive_or_spend", "order does not matter");
+  assert.equal(gateFromRules(["r-typo", "r-none", "r-null", "r-num"], rules), null, "names outside GATES are ignored");
+  assert.equal(gateFromRules(["r-spend"], [{ id: "r-launch", constraints: { gateName: "purge" } }]), null, "only matched rules count");
+  assert.equal(gateFromRules([], rules), null);
+
+  // The runtime read: bounded transaction, only the matched ids, no read when nothing matched, >100 ids refused.
+  const seen = [];
+  const db = {
+    $transaction: async (fn, o) => { seen.push({ o }); return fn({ $queryRaw: async (...a) => { seen.push({ raw: a[0].join("?") }); return []; }, policyRule: { findMany: async (q) => { seen.push({ q }); return rules.filter((r) => q.where.id.in.includes(r.id)); } } }); },
+  };
+  assert.equal(await gateForRulesFromDb(db, ["r-launch", "r-launch", "r-spend"], 5000), "destructive_or_spend");
+  assert.deepEqual(seen[0].o, { timeout: 5000, maxWait: 5000 });
+  assert.match(seen[1].raw, /statement_timeout/);
+  assert.deepEqual(seen[2].q, { where: { id: { in: ["r-launch", "r-spend"] } }, select: { id: true, constraints: true } });
+  seen.length = 0;
+  assert.equal(await gateForRulesFromDb(db, [], 5000), null);
+  assert.equal(seen.length, 0, "no matched rule, no read");
+  await assert.rejects(gateForRulesFromDb(db, Array.from({ length: 101 }, (_, i) => `r${i}`), 5000), /gate-rules-too-many/);
+
+  // Wired through Approvals: a launch rule raises a first_launch card; a purge action stays gate 5 whatever the rule says.
+  const { store } = setup();
+  const a = new Approvals({ store, grants: { issueGrant: async () => ({}), revokeGrant: async () => true }, notifier: null, verifyKkSession: () => false, gateForRules: (ids) => gateForRulesFromDb(db, ids, 5000) });
+  const d = { enforcedOutcome: "require_approval", reason: "r", matchedRuleIds: ["r-launch"] };
+  assert.equal((await a.cardForDecision(d, { action: "app.launch", resource: "app:x", projectId: PROJECT })).gate, "first_launch");
+  assert.equal((await a.cardForDecision({ ...d, matchedRuleIds: ["r-typo"] }, { action: "app.other", resource: "app:y", projectId: PROJECT })).gate, "decision");
+  assert.equal((await a.cardForDecision(d, { action: "project.purge", resource: "project:demo", projectId: PROJECT })).gate, "purge");
 });

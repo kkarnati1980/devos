@@ -6,7 +6,7 @@ import { stdoutSink, withTimeout } from "./http.js";
 import type { GrantService, ReadinessProbe, SetupServices } from "./routes.js";
 import { PrismaSettingsStore, writeAudit } from "./settings.js";
 import type { DeadLetterQueue, DeadLetterServices } from "./dead-letters.js";
-import { Approvals, PrismaApprovalStore, type GrantIssuer } from "./approvals.js";
+import { Approvals, ApprovalError, PrismaApprovalStore, gateFromRules, type GateName, type GrantIssuer } from "./approvals.js";
 import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js";
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
@@ -149,6 +149,8 @@ export async function buildRuntime(
     grants: engine as unknown as GrantIssuer,
     notifier,
     verifyKkSession: opts.kkSessions.verify,
+    // DEVOS-134: a policy card's gate comes from the matched rules' `constraints.gateName`.
+    gateForRules: (ids) => gateForRulesFromDb(db, ids, t),
   });
   const approvals: ApprovalRouteServices = {
     approvals: approvalsCore,
@@ -212,6 +214,25 @@ export function grantsForApproval(db: DbClient, approvalId: string, timeoutMs: n
     },
     { timeout: timeoutMs, maxWait: timeoutMs },
   );
+}
+
+/**
+ * DEVOS-134: reads the matched `policy_rule` rows (id and constraints only) and picks the card's gate with
+ * `gateFromRules`. Bounded like every other read (ADR-0011 §9). No ids → no read. More than 100 ids is refused rather
+ * than truncated (a dropped rule could weaken the gate); the engine matches far fewer.
+ */
+export async function gateForRulesFromDb(db: DbClient, ids: readonly string[], timeoutMs: number): Promise<GateName | null> {
+  const unique = [...new Set(ids.filter((x) => typeof x === "string" && x.length > 0))];
+  if (unique.length === 0) return null;
+  if (unique.length > 100) throw new ApprovalError("gate-rules-too-many", 500);
+  const rows = await db.$transaction(
+    async (tx: any) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
+      return tx.policyRule.findMany({ where: { id: { in: unique } }, select: { id: true, constraints: true } });
+    },
+    { timeout: timeoutMs, maxWait: timeoutMs },
+  );
+  return gateFromRules(unique, rows as { id: string; constraints: { gateName?: unknown } | null }[]);
 }
 
 /** `REDIS_URL`: absent → null (no dead-letter view); anything but redis:// or rediss:// stops start-up. */

@@ -116,6 +116,35 @@ export function isBlockedAddress(ip: string): boolean {
   return false;
 }
 
+/**
+ * Errors `pinnedFetch` raised before any request existed (the DNS lookup failed or was aborted, or the signal fired
+ * before dispatch). Nothing reached the provider, so `messagesQuery` charges nothing for them (Codex PR92-r3, 2).
+ * A WeakSet, so the caller's own abort reason is marked without being changed (AT-CA7 keeps `e === reason`).
+ */
+const preSendErrors = new WeakSet<object>();
+function preSend<T>(e: T): T {
+  if (e !== null && (typeof e === "object" || typeof e === "function")) preSendErrors.add(e as object);
+  return e;
+}
+/** True for an error `pinnedFetch` raised before dispatch (no request was sent). */
+export const isPreSendError = (e: unknown): boolean => e !== null && typeof e === "object" && preSendErrors.has(e);
+
+/** Statuses whose Response must have a null body (the constructor throws otherwise; Codex PR92-r3, 1). */
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
+
+/**
+ * The fetch Response for one upstream reply. A status outside 200–599 becomes 502; a null-body status (204, 205, …)
+ * gets a null body and its stream is drained, because `new Response(stream, { status: 204 })` throws.
+ */
+export function toResponse(res: Readable, status: number): Response {
+  const mapped = status < 200 || status > 599 ? 502 : status;
+  if (NULL_BODY_STATUSES.has(mapped)) {
+    res.resume();
+    return new Response(null, { status: mapped });
+  }
+  return new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, { status: mapped });
+}
+
 export type Lookup = (host: string) => Promise<Array<{ address: string; family: number }>>;
 const systemLookup: Lookup = (host) => dns.lookup(host, { all: true, verbatim: true });
 
@@ -146,12 +175,12 @@ export function pinnedFetch(lookup: Lookup = systemLookup): typeof fetch {
     try {
       addrs = net.isIP(host) ? [{ address: host, family: net.isIP(host) }] : await abortable(lookup(host), signal);
     } catch (e) {
-      if (signal?.aborted) throw signal.reason;
-      throw Object.assign(new TypeError("fetch failed"), { cause: e });
+      if (signal?.aborted) throw preSend(signal.reason);
+      throw preSend(Object.assign(new TypeError("fetch failed"), { cause: e }));
     }
     if (!addrs.length || addrs.some((a) => isBlockedAddress(a.address))) throw new AnalystApiError("analyst-blocked-address");
     const addr = addrs[0]!;
-    if (signal?.aborted) throw signal.reason;
+    if (signal?.aborted) throw preSend(signal.reason);
     return new Promise<Response>((resolve, reject) => {
       let settled = false;
       const req = https.request(
@@ -176,7 +205,14 @@ export function pinnedFetch(lookup: Lookup = systemLookup): typeof fetch {
             return;
           }
           settled = true;
-          resolve(new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, { status: status < 200 || status > 599 ? 502 : status }));
+          // Never throw inside this callback: it runs outside the Promise executor, so a throw here would crash the
+          // process (Codex PR92-r3, 1). A null-body status gets a null body; anything else that fails rejects.
+          try {
+            resolve(toResponse(res, status));
+          } catch (e) {
+            res.destroy();
+            reject(Object.assign(new TypeError("fetch failed"), { cause: e }));
+          }
         },
       );
       const onAbort = (): void => {
@@ -261,6 +297,13 @@ export function messagesQuery(o: MessagesQueryOptions): (args: QueryArgs) => Asy
       if (e instanceof AnalystApiError && e.status !== undefined) throw e;
       // Refused before any byte was sent (F2): nothing to charge.
       if (e instanceof AnalystApiError && e.message === "analyst-blocked-address") throw e;
+      // Failed before dispatch (DNS failure, or a timeout/cancel during the lookup): no provider request exists, so
+      // nothing is charged (§5, AT-CA5; Codex PR92-r3, 2). Typed like the pre-send check above.
+      if (isPreSendError(e)) {
+        if (isTimeout(e)) throw Object.assign(new AnalystApiError("timeout"), { name: "TimeoutError" });
+        if (isAbort(e) || signal.aborted) throw new AnalystApiError("cancelled");
+        throw e;
+      }
       // Pre-review finding 1: the request was sent, so the provider may bill a generation we never read (timeout,
       // cancel, a lost connection, an oversize or unreadable body). Report the upper bound of its tokens (every
       // request byte as an input token, the full answer cap as output) with no cost, so M1.5 settles fail-closed:

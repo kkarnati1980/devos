@@ -47,7 +47,8 @@ export interface AnalystRunRows {
   /**
    * Closes the intake task once the call has ended, and marks the run `failed` (`analyst-run-<why>`: `abandoned`, or
    * `paused` for a paused project) if the engine left it queued or running: this run is in-process and is never
-   * re-queued (pre-review finding 2).
+   * re-queued (pre-review finding 2). A run closed that way has its still-open budget reservation settled
+   * fail-closed: charged the whole reserved amount (DEVOS-161).
    */
   finishTask(runId: string, ok: boolean, why?: string): Promise<void>;
 }
@@ -107,9 +108,11 @@ export function runEngineModelRunner(rows: AnalystRunRows, engine: RunExecutor, 
 
 type Tx = {
   $queryRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown>;
+  $executeRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<number>;
   task: { create(args: unknown): Promise<{ id: string }>; update(args: unknown): Promise<unknown> };
   run: { create(args: unknown): Promise<{ id: string }>; findUnique(args: unknown): Promise<{ taskId: string } | null>; updateMany(args: unknown): Promise<unknown> };
   capabilityEnvelope: { create(args: unknown): Promise<unknown> };
+  costEntry: { create(args: unknown): Promise<unknown> };
   runEvent: { findMany(args: unknown): Promise<{ payload: unknown }[]> };
 };
 export interface AnalystRowsDb {
@@ -163,12 +166,51 @@ export class PrismaAnalystRunRows implements AnalystRunRows {
       const run = await tx.run.findUnique({ where: { id: runId }, select: { taskId: true } });
       if (!run) return;
       await tx.task.update({ where: { id: run.taskId }, data: { status: ok ? "done" : "failed" } });
-      if (!ok) {
-        await tx.run.updateMany({
-          where: { id: runId, status: { in: ["queued", "running"] } },
-          data: { status: "failed", error: `analyst-run-${why === "paused" ? "paused" : "abandoned"}`, endedAt: new Date() },
-        });
-      }
+      if (ok) return;
+      // DEVOS-161: M1.7 moves reservation rows only under its global lock, so a decision never sees a row move
+      // between its usage reads (PR13-r3). Taken before the run row, as every policy transaction takes it first.
+      await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${POLICY_LOCK_KEY}))) AS l`;
+      const closed = (await tx.run.updateMany({
+        where: { id: runId, status: { in: ["queued", "running"] } },
+        data: { status: "failed", error: `analyst-run-${why === "paused" ? "paused" : "abandoned"}`, endedAt: new Date() },
+      })) as { count?: number };
+      // The engine left this run open, so it threw before settling, and a reservation it made may still be
+      // `reserved`. The spend is unknown, so it is settled fail-closed as M1.5 settles an orphaned attempt: the cost
+      // ledger is charged the whole reservation first (less any cost the engine recorded but did not settle), then
+      // the reservation is reconciled at its full amount. Only this run's still-open rows change.
+      if ((closed.count ?? 0) > 0) await settleOpenReservations(tx, runId);
     });
   }
+}
+
+/** Postgres advisory-lock key of M1.7's PrismaPolicyStore (packages/policy/src/prisma-store.ts). */
+export const POLICY_LOCK_KEY = "devos:policy-engine";
+
+type Sums = { open_usd: unknown; provider: string | null; cost_usd: unknown; settled_usd: unknown; project_id: string; model: string; role: string }[];
+
+/** DEVOS-161: fail-closed settlement of a run's still-open reservations, inside the caller's transaction. */
+async function settleOpenReservations(tx: Tx, runId: string): Promise<void> {
+  const rows = (await tx.$queryRaw`
+    SELECT
+      (SELECT COALESCE(SUM(reserved_usd), 0) FROM budget_reservation WHERE run_id = ${runId}::uuid AND status = 'reserved'::budget_status) AS open_usd,
+      (SELECT MIN(provider::text) FROM budget_reservation WHERE run_id = ${runId}::uuid AND status = 'reserved'::budget_status) AS provider,
+      (SELECT COALESCE(SUM(usd), 0) FROM cost_entry WHERE run_id = ${runId}::uuid) AS cost_usd,
+      (SELECT COALESCE(SUM(actual_usd), 0) FROM budget_reservation WHERE run_id = ${runId}::uuid AND status = 'reconciled'::budget_status) AS settled_usd,
+      r.project_id::text AS project_id, r.model, r.role::text AS role
+    FROM run r WHERE r.id = ${runId}::uuid`) as Sums;
+  const s = rows[0];
+  // One ledger entry under the reservations' provider: analyst runs reserve for `anthropic` only.
+  if (!s || !s.provider) return; // nothing open
+  // Work in micro-dollars (the columns are numeric(12,6)), so no float drift.
+  const micro = (v: unknown) => Math.round(Number(String(v)) * 1e6);
+  // Cost the engine recorded for this run that no reconciled reservation accounts for yet (it recorded, then failed
+  // to settle): already in the ledger, so it is not charged twice.
+  const unmatched = Math.max(0, micro(s.cost_usd) - micro(s.settled_usd));
+  const charge = Math.max(0, micro(s.open_usd) - unmatched);
+  if (charge > 0) {
+    await tx.costEntry.create({
+      data: { projectId: s.project_id, runId, provider: s.provider, model: s.model, role: s.role, usd: (charge / 1e6).toFixed(6) },
+    });
+  }
+  await tx.$executeRaw`UPDATE budget_reservation SET status = 'reconciled'::budget_status, actual_usd = reserved_usd, actual_tokens = reserved_tokens, updated_at = now() WHERE run_id = ${runId}::uuid AND status = 'reserved'::budget_status`;
 }

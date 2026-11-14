@@ -9,7 +9,7 @@ import * as runEngineModule from "@devos/run-engine";
 import { MemoryRunStore } from "@devos/run-engine";
 import {
   ANTHROPIC_MESSAGES_URL, ANTHROPIC_KEY_NAME, ANALYST_ANSWER_MAX_TOKENS, MAX_RESPONSE_BYTES,
-  analystModelPass, buildAnalystEngine, costUsd, messagesQuery, isBlockedAddress, pinnedFetch,
+  analystModelPass, buildAnalystEngine, costUsd, messagesQuery, isBlockedAddress, pinnedFetch, toResponse, isPreSendError,
 } from "../dist/analyst-adapter.js";
 import { runEngineModelRunner, ANALYST_MODEL } from "../dist/analyst-runner.js";
 
@@ -252,4 +252,46 @@ test("AT-CA7 (Codex PR92-r2, F2) the production call refuses internal addresses 
   ac.abort(reason);
   await assert.rejects(p, (e) => e === reason);
   await assert.rejects(slow(ANTHROPIC_MESSAGES_URL, { signal: AbortSignal.abort(reason) }), (e) => e === reason);
+});
+
+test("AT-CA8 (Codex PR92-r3) a null-body reply never crashes the process; a call that fails before dispatch is not charged", async () => {
+  const { Readable } = await import("node:stream");
+  // 1. A 204/205 reply gets a null body instead of making `new Response` throw inside the https callback.
+  for (const status of [204, 205]) {
+    const r = toResponse(Readable.from([]), status);
+    assert.equal(r.status, status);
+    assert.equal(r.body, null);
+  }
+  assert.equal(toResponse(Readable.from(["x"]), 200).status, 200);
+  assert.equal(toResponse(Readable.from(["x"]), 99).status, 502, "a status outside 200-599 becomes 502");
+  // ...and messagesQuery turns an empty 204 into a typed failure (the run fails, deterministic analysis stays).
+  const q204 = messagesQuery({ apiKey: async () => KEY, timeoutMs: 5_000, fetch: async () => new Response(null, { status: 204 }) });
+  await assert.rejects(async () => { for await (const _ of q204({ prompt: "p", options: { abortController: new AbortController(), model: ANALYST_MODEL } })) void _; }, /analyst-bad-response/);
+
+  // 2. A DNS failure: no request exists, so no upper-bound usage is yielded (nothing charged).
+  const dnsFail = messagesQuery({ apiKey: async () => KEY, timeoutMs: 5_000, lookup: async () => { throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }); } });
+  const seenDns = [];
+  await assert.rejects(async () => { for await (const m of dnsFail({ prompt: "p", options: { abortController: new AbortController(), model: ANALYST_MODEL } })) seenDns.push(m); }, /fetch failed/);
+  assert.deepEqual(seenDns, [], "a DNS failure is not charged");
+
+  // 3. A cancel and a timeout during the lookup: typed cancelled / TimeoutError, nothing charged.
+  const keepAlive = setInterval(() => {}, 1000);
+  const ac = new AbortController();
+  const slowCancel = messagesQuery({ apiKey: async () => KEY, timeoutMs: 60_000, lookup: () => new Promise(() => {}) });
+  const seenCancel = [];
+  const pc = (async () => { for await (const m of slowCancel({ prompt: "p", options: { abortController: ac, model: ANALYST_MODEL } })) seenCancel.push(m); })();
+  setTimeout(() => ac.abort(), 20);
+  await assert.rejects(pc, /cancelled/);
+  assert.deepEqual(seenCancel, [], "a cancel during the lookup is not charged");
+  const slowTimeout = messagesQuery({ apiKey: async () => KEY, timeoutMs: 30, lookup: () => new Promise(() => {}) });
+  const seenTimeout = [];
+  await assert.rejects(async () => { for await (const m of slowTimeout({ prompt: "p", options: { abortController: new AbortController(), model: ANALYST_MODEL } })) seenTimeout.push(m); }, (e) => e.name === "TimeoutError");
+  assert.deepEqual(seenTimeout, [], "a timeout during the lookup is not charged");
+  clearInterval(keepAlive);
+
+  // 4. The caller's own abort reason is marked, not replaced (AT-CA7 still sees e === reason), and an ordinary
+  // error is never pre-send.
+  const reason = Object.assign(new Error("cancelled"), { name: "AbortError" });
+  await assert.rejects(pinnedFetch(() => new Promise(() => {}))(ANTHROPIC_MESSAGES_URL, { signal: AbortSignal.abort(reason) }), (e) => e === reason && isPreSendError(e));
+  assert.equal(isPreSendError(new Error("x")), false);
 });
