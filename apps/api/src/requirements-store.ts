@@ -4,6 +4,7 @@
 // approval for the same project serialise and a project never ends with two approved requirements docs.
 import {
   PipelineError,
+  type ApprovalDecisions,
   type DocRow,
   type DocStatus,
   type ProjectRow,
@@ -75,8 +76,13 @@ export class PrismaRequirementsStore implements RequirementsStore {
 
   project(projectId: string): Promise<ProjectRow | null> {
     return this.tx(async (tx) => {
-      const p = await tx.project.findUnique({ where: { id: projectId }, select: { id: true, name: true, stage: true } });
-      return p ? { id: p.id, name: p.name, stage: String(p.stage) } : null;
+      const p = await tx.project.findUnique({
+        where: { id: projectId },
+        select: { id: true, name: true, stage: true, continuousRun: true, capUsd: true },
+      });
+      // ADR-0012 CR-a2: the mode and the budget cap for the pre-flight. `cap_usd` is a Decimal; Number() is exact
+      // enough for a display value (12,6 fits a double's integer range).
+      return p ? { id: p.id, name: p.name, stage: String(p.stage), continuousRun: p.continuousRun === true, capUsd: Number(p.capUsd) } : null;
     });
   }
 
@@ -108,9 +114,11 @@ export class PrismaRequirementsStore implements RequirementsStore {
       });
       await tx.requirementsDoc.updateMany({ where: { projectId: pid, status: "draft" }, data: { status: "superseded" } });
       const doc = await tx.requirementsDoc.create({
-        data: { projectId: pid, version: docVersion, repoPath: input.repoPath, status: "draft" },
+        data: { projectId: pid, version: docVersion, repoPath: input.repoPath, status: "draft", ...(input.preflight ? { preflight: input.preflight } : {}) },
         select: { id: true },
       });
+      // ADR-0012 rule 4: a new version in continuous-run mode re-opens the pre-flight, under the same project lock.
+      if (input.preflight) await tx.project.update({ where: { id: pid }, data: { preflightState: "pending" }, select: { id: true } });
 
       // Milestones by ordinal; earlier ones absent now are kept (no deletion) and reported.
       const oldMs: { id: string; ordinal: number }[] = await tx.milestone.findMany({ where: { projectId: pid }, select: { id: true, ordinal: true } });
@@ -171,17 +179,22 @@ export class PrismaRequirementsStore implements RequirementsStore {
    * `limit` (the sync job's batch). Only approved cards are read, so drafts whose card is pending, rejected or expired
    * never fill the batch and starve newer projects (pre-review finding 2). Read-only; the job applies each decision
    * through `syncApproval`.
+   * ADR-0012 CR-a2 (pre-review finding 2): a draft whose intake card (with a pre-flight) was **rejected** is listed
+   * too while the project's `preflight_state` is not yet `rejected`, so the job closes the pre-flight unattended;
+   * once it is `rejected` the draft drops out again and never fills the batch.
    */
   draftsAwaitingDecision(limit: number): Promise<string[]> {
     const n = Math.max(1, Math.min(1000, Math.trunc(limit)));
     return this.tx(async (tx) => {
       const rows: { project_id: string }[] = await tx.$queryRaw`
         SELECT d.project_id::text AS project_id FROM (
-          SELECT DISTINCT ON (project_id) project_id, status, approval_id, created_at
+          SELECT DISTINCT ON (project_id) project_id, status, approval_id, created_at, preflight
           FROM requirements_doc ORDER BY project_id, version DESC
         ) d
-        JOIN approval a ON a.id = d.approval_id AND a.status = 'approved' AND a.gate = 'requirements'
+        JOIN approval a ON a.id = d.approval_id AND a.gate = 'requirements'
+        JOIN project p ON p.id = d.project_id
         WHERE d.status = 'draft'
+          AND (a.status = 'approved' OR (a.status = 'rejected' AND d.preflight IS NOT NULL AND p.preflight_state <> 'rejected'))
         ORDER BY d.created_at, d.project_id
         LIMIT ${n}`;
       return rows.map((r) => r.project_id);
@@ -190,8 +203,9 @@ export class PrismaRequirementsStore implements RequirementsStore {
 
   docForApproval(approvalId: string): Promise<DocRow | null> {
     return this.tx(async (tx) => {
-      const r = await tx.requirementsDoc.findFirst({ where: { approvalId }, orderBy: { version: "desc" }, select: DOC_SELECT });
-      return r ? toDoc(r) : null;
+      const r = await tx.requirementsDoc.findFirst({ where: { approvalId }, orderBy: { version: "desc" }, select: { ...DOC_SELECT, preflight: true } });
+      // ADR-0012 CR-a2: the stored pre-flight list rides along, so the approval records against what KK saw.
+      return r ? { ...toDoc(r), ...(Array.isArray(r.preflight) ? { preflight: r.preflight } : {}) } : null;
     });
   }
 
@@ -215,7 +229,7 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
-  approveDoc(docId: string): Promise<boolean> {
+  approveDoc(docId: string, decisions?: ApprovalDecisions): Promise<boolean> {
     return this.tx(async (tx) => {
       const d = await tx.requirementsDoc.findUnique({ where: { id: docId }, select: { projectId: true } });
       if (!d) return false;
@@ -233,7 +247,65 @@ export class PrismaRequirementsStore implements RequirementsStore {
           projectId: d.projectId,
         },
       });
+      if (decisions) {
+        // ADR-0012 rule 3, in the approval's transaction: one row per decision item. The unique (approval, item)
+        // index makes a retried sync a no-op.
+        await tx.projectDecision.createMany({
+          data: decisions.rows.map((row) => ({ projectId: d.projectId, approvalId: decisions.approvalId, itemId: row.itemId, text: row.text, answer: row.answer, source: row.source })),
+          skipDuplicates: true,
+        });
+        await tx.project.update({ where: { id: d.projectId }, data: { preflightState: "approved" }, select: { id: true } });
+      }
       return true;
+    });
+  }
+
+  /** ADR-0012 rule 4: a rejected intake card closes the build, only for the newest draft (under the project lock). */
+  rejectPreflight(docId: string): Promise<boolean> {
+    return this.tx(async (tx) => {
+      const d = await tx.requirementsDoc.findUnique({ where: { id: docId }, select: { projectId: true } });
+      if (!d) return false;
+      await this.lockProject(tx, d.projectId);
+      const newest = await tx.requirementsDoc.findFirst({ where: { projectId: d.projectId }, orderBy: { version: "desc" }, select: DOC_SELECT });
+      if (!newest || newest.id !== docId || newest.status !== "draft") return false;
+      await tx.project.update({ where: { id: d.projectId }, data: { preflightState: "rejected" }, select: { id: true } });
+      return true;
+    });
+  }
+
+  /**
+   * `PreflightReader` for `preflightOpen` (apps/api/src/preflight.ts): the state and the newest doc's list in one
+   * SQL statement, so both come from the same snapshot even under READ COMMITTED (Codex PR122-r2).
+   */
+  preflightSnapshot(projectId: string): Promise<{ state: "pending" | "approved" | "rejected" | null; items: import("@devos/analyst").PreflightItem[] | null } | null> {
+    return this.tx(async (tx) => {
+      const rows: { state: string; preflight: unknown }[] = await tx.$queryRaw`
+        SELECT p.preflight_state AS state,
+               (SELECT d.preflight FROM requirements_doc d WHERE d.project_id = p.id ORDER BY d.version DESC LIMIT 1) AS preflight
+        FROM project p WHERE p.id = ${projectId}::uuid`;
+      const r = rows[0];
+      if (!r) return null;
+      const s = r.state;
+      return {
+        state: s === "pending" || s === "approved" || s === "rejected" ? s : null,
+        items: Array.isArray(r.preflight) ? (r.preflight as import("@devos/analyst").PreflightItem[]) : null,
+      };
+    });
+  }
+
+  /** The project's pre-flight state (decision log and project page reads; `preflightOpen` uses `preflightSnapshot`). */
+  preflightState(projectId: string): Promise<"pending" | "approved" | "rejected" | null> {
+    return this.tx(async (tx) => {
+      const p = await tx.project.findUnique({ where: { id: projectId }, select: { preflightState: true } });
+      const s = p?.preflightState;
+      return s === "pending" || s === "approved" || s === "rejected" ? s : null;
+    });
+  }
+
+  latestPreflight(projectId: string): Promise<import("@devos/analyst").PreflightItem[] | null> {
+    return this.tx(async (tx) => {
+      const d = await tx.requirementsDoc.findFirst({ where: { projectId }, orderBy: { version: "desc" }, select: { preflight: true } });
+      return Array.isArray(d?.preflight) ? d.preflight : null;
     });
   }
 }

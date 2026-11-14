@@ -6,7 +6,8 @@ import { ingest as defaultIngest, IngestError, type IngestResult, type SpecFileF
 import { analyzeSpec, type Analysis, type Priority } from "./analyze.js";
 import { assistAnalysis, type ModelRunner } from "./assist.js";
 import { renderRequirementsMd } from "./render.js";
-import { planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
+import { BUDGET_TEXT, PUBLIC_URL_TEXT, buildPreflight, preflightDecisions, preflightLine, type PreflightDecisionRow, type PreflightItem } from "./preflight.js";
+import { CARD_REASON_MAX, planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
 
 export type SpecSourceFormat = SpecFileFormat | "paste";
 export type DocStatus = "draft" | "approved" | "superseded";
@@ -25,6 +26,10 @@ export interface ProjectRow {
   id: string;
   name: string;
   stage: string;
+  /** ADR-0012 CR-a2: `project.continuous_run`. Absent = off (today's behaviour). */
+  continuousRun?: boolean;
+  /** The project's M1.7 budget envelope cap (`project.cap_usd`), for the pre-flight budget item. */
+  capUsd?: number;
 }
 
 export interface RequirementRowInput {
@@ -45,6 +50,12 @@ export interface SaveAnalysisInput {
   requirements: RequirementRowInput[];
   milestones: { ordinal: number; name: string; gateName: string }[];
   repoPath: string;
+  /**
+   * ADR-0012 CR-a2: in continuous-run mode, this version's pre-flight list. The store writes it to the new doc and
+   * sets `project.preflight_state` to `pending` in the same transaction (rule 4: a new version re-opens the
+   * pre-flight). Absent or null outside the mode: nothing changes.
+   */
+  preflight?: PreflightItem[] | null;
 }
 
 export interface SaveAnalysisResult {
@@ -63,6 +74,14 @@ export interface DocRow {
   version: number;
   status: DocStatus;
   approvalId: string | null;
+  /** ADR-0012 CR-a2: this version's pre-flight list (absent or null outside continuous-run mode). */
+  preflight?: PreflightItem[] | null;
+}
+
+/** ADR-0012 rule 3: the decision log rows written with an approval, in the same transaction. */
+export interface ApprovalDecisions {
+  approvalId: string;
+  rows: PreflightDecisionRow[];
 }
 
 /**
@@ -83,7 +102,13 @@ export interface RequirementsStore {
    * serialise: true only when the doc is a draft AND the project's newest doc (pre-review r2: a bare
    * compare-and-set outside the lock could leave two approved docs).
    */
-  approveDoc(docId: string): Promise<boolean>;
+  approveDoc(docId: string, decisions?: ApprovalDecisions): Promise<boolean>;
+  /**
+   * ADR-0012 rule 4: a rejected intake card. Sets `preflight_state` to `rejected` under the project lock, only while
+   * `docId` is the newest doc and a draft (a newer version has already re-opened the pre-flight). Optional: a store
+   * without it leaves the state as it is.
+   */
+  rejectPreflight?(docId: string): Promise<boolean>;
 }
 
 /** An M2.3 `CardInput` for the requirements gate; the port is `Approvals.raiseCard(card, [])`. */
@@ -107,6 +132,8 @@ export interface PipelinePorts {
    * (fail-safe: no model spend, deterministic only) and is reported as `assist-failed`.
    */
   modelPassOn?: () => Promise<boolean>;
+  /** ADR-0012 CR-a2: the secret names the app needs (from the S5 selection); absent = none yet. */
+  secretNames?: (projectId: string) => Promise<string[]>;
   ingest?: (bytes: Uint8Array, originalName: string) => Promise<IngestResult>;
   now?: () => Date;
 }
@@ -125,6 +152,8 @@ export interface SubmitResult {
   architectLog: string;
   counts: { requirements: number; milestones: number; openQuestions: number; proposed: number };
   questionCards: RouteResult;
+  /** ADR-0012 CR-a2: the pre-flight list on the intake card, or null outside continuous-run mode. */
+  preflight: PreflightItem[] | null;
   droppedKeys: string[];
   droppedMilestones: number[];
   analysisWarnings: Analysis["warnings"];
@@ -148,8 +177,29 @@ function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-/** The requirements card. No spec text: only counts and the version, so it never trips the secret check. */
-export function requirementsCard(projectId: string, docVersion: number, a: Analysis): RequirementsCard {
+/** Stands in for an open question's text when the approvals core refused the card (it may look like a secret). */
+export const PREFLIGHT_WITHHELD_TEXT = "question text withheld (the inbox could not accept it; it may look like a secret), see the project page";
+
+/**
+ * The pre-flight with every spec-derived question text replaced by {@link PREFLIGHT_WITHHELD_TEXT}. The fixed
+ * budget and public-URL texts, the defaults and the secret NAMES (`[A-Z][A-Z0-9_]*`, never a value) stay.
+ */
+export function withholdPreflightText(items: readonly PreflightItem[]): PreflightItem[] {
+  return items.map((i) => (i.kind === "decision" && i.text !== BUDGET_TEXT && i.text !== PUBLIC_URL_TEXT ? { ...i, text: PREFLIGHT_WITHHELD_TEXT } : { ...i }));
+}
+
+/**
+ * The requirements card. Off continuous-run mode it has no spec text: only counts and the version. In continuous-run
+ * mode (ADR-0012 CR-a) it also carries the pre-flight line, whose question texts come from the spec and can trip
+ * M2.3's secret check; `ensureCardFor` then retries once with `withhold` (question texts replaced).
+ */
+export function requirementsCard(
+  projectId: string,
+  docVersion: number,
+  a: Analysis,
+  preflight?: readonly PreflightItem[] | null,
+  opts: { withhold?: boolean } = {},
+): RequirementsCard {
   const by = { must: 0, should: 0, could: 0 };
   for (const r of a.requirements) by[r.priority] += 1;
   const proposed = a.requirements.filter((r) => r.proposed).length;
@@ -158,6 +208,12 @@ export function requirementsCard(projectId: string, docVersion: number, a: Analy
     proposed > 0 ? `${proposed} requirements were proposed by the model from spec text; check them before approving.` : null,
     `Approving accepts ${REPO_PATH} version ${docVersion} as the plan the build follows. Rejecting keeps it as a draft for a revised spec.`,
   ].filter((l): l is string => l !== null);
+  if (preflight) {
+    // ADR-0012 CR-a: the one intake card carries the pre-flight; action and target stay as they are.
+    const room = CARD_REASON_MAX - lines.join("\n").length - 1;
+    const line = preflightLine(opts.withhold ? withholdPreflightText(preflight) : preflight, room);
+    if (line) lines.push(line);
+  }
   return {
     gate: "requirements",
     action: "requirements.approve",
@@ -239,6 +295,13 @@ export class RequirementsPipeline {
       }
     }
 
+    // ADR-0012 CR-a2: in continuous-run mode the requirements card is the one intake card. Its pre-flight list
+    // replaces the separate non-technical question cards; technical questions still go to the Architect log.
+    const continuous = project.continuousRun === true;
+    const preflight = continuous
+      ? buildPreflight(analysis, this.ports.secretNames ? await this.ports.secretNames(projectId) : [], { maxCostUsd: project.capUsd ?? 0 })
+      : null;
+
     const ordinals = new Map(analysis.milestones.map((m) => [m.name, m.ordinal]));
     const saved = await this.ports.store.saveAnalysis({
       projectId,
@@ -258,6 +321,7 @@ export class RequirementsPipeline {
       })),
       milestones: analysis.milestones.map((m) => ({ ordinal: m.ordinal, name: m.name, gateName: `G${m.ordinal}` })),
       repoPath: REPO_PATH,
+      ...(preflight ? { preflight } : {}),
     });
 
     const at = this.now();
@@ -271,9 +335,10 @@ export class RequirementsPipeline {
     const plan = planQuestions(analysis, meta);
     const architectLog = renderArchitectLog(plan, { ...meta, generatedAt: isoDate(at) });
 
-    const approvalId = await this.ensureCardFor(saved.docId, projectId, saved.docVersion, analysis, warnings);
+    const approvalId = await this.ensureCardFor(saved.docId, projectId, saved.docVersion, analysis, warnings, preflight);
     // Question cards never wait on the requirements card, and one failure never stops the others (DV-FR-012).
-    const questionCards = await raiseQuestionCards(plan, this.ports.raiseQuestionCard);
+    // In continuous-run mode every card-routed question is a pre-flight item, so none is raised on its own.
+    const questionCards = await raiseQuestionCards(continuous ? { ...plan, cards: [] } : plan, this.ports.raiseQuestionCard);
 
     return {
       specId: saved.specId,
@@ -290,6 +355,7 @@ export class RequirementsPipeline {
         proposed: analysis.requirements.filter((r) => r.proposed).length,
       },
       questionCards,
+      preflight,
       droppedKeys: saved.droppedKeys,
       droppedMilestones: saved.droppedMilestones,
       analysisWarnings: analysis.warnings,
@@ -303,14 +369,28 @@ export class RequirementsPipeline {
     docVersion: number,
     analysis: Analysis,
     warnings: PipelineWarningCode[],
+    preflight: readonly PreflightItem[] | null,
   ): Promise<string | null> {
     let id: string;
     try {
-      ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis)));
-    } catch {
-      // The doc stays a draft with no card and the result says so; submitting the spec again raises a fresh one.
-      warnings.push("card-failed");
-      return null;
+      ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis, preflight)));
+    } catch (e) {
+      const code = (e as { code?: unknown } | null)?.code;
+      // Pre-review CR-a2 #1: pre-flight question text the approvals core refuses (secret-shaped, or a shape it
+      // rejects) is retried once without it, as M2.2-c does for question cards. Without a pre-flight the card has
+      // no spec text, so a retry would be refused the same way.
+      const retry = preflight !== null && (code === "card-contains-secret" || code === "invalid-input");
+      if (!retry) {
+        // The doc stays a draft with no card and the result says so; submitting the spec again raises a fresh one.
+        warnings.push("card-failed");
+        return null;
+      }
+      try {
+        ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis, preflight, { withhold: true })));
+      } catch {
+        warnings.push("card-failed");
+        return null;
+      }
     }
     let linked = false;
     try {
@@ -331,10 +411,23 @@ export class RequirementsPipeline {
    * anything: approved → the doc is approved (KK approves once). A rejected or expired card, or a card for a
    * superseded version, leaves the docs as they are.
    */
-  async applyDecision(card: { id: string; gate: string; status: string }): Promise<"approved" | "ignored"> {
-    if (card.gate !== "requirements" || card.status !== "approved") return "ignored";
+  async applyDecision(
+    card: { id: string; gate: string; status: string },
+    /** KK's comments on the card, oldest first (ADR-0012 CR-a2: `PF-<n>: <answer>` lines). */
+    comments: readonly string[] = [],
+  ): Promise<"approved" | "rejected" | "ignored"> {
+    if (card.gate !== "requirements") return "ignored";
+    if (card.status === "rejected") {
+      // ADR-0012 rule 4: a rejected intake card closes the build until a new spec version re-opens it.
+      const doc = await this.ports.store.docForApproval(card.id);
+      if (!doc || doc.status !== "draft" || !doc.preflight || !this.ports.store.rejectPreflight) return "ignored";
+      return (await this.ports.store.rejectPreflight(doc.id)) ? "rejected" : "ignored";
+    }
+    if (card.status !== "approved") return "ignored";
     const doc = await this.ports.store.docForApproval(card.id);
     if (!doc || doc.status !== "draft") return "ignored";
-    return (await this.ports.store.approveDoc(doc.id)) ? "approved" : "ignored";
+    // ADR-0012 rule 3: every decision item gets KK's answer or its default, written with the approval.
+    const decisions = doc.preflight ? { approvalId: card.id, rows: preflightDecisions(doc.preflight, comments) } : undefined;
+    return (await this.ports.store.approveDoc(doc.id, decisions)) ? "approved" : "ignored";
   }
 }
