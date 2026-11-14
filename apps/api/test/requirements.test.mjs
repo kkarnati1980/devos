@@ -211,8 +211,7 @@ test("AT-CA3a route (CR-a3, DEVOS-199): GET /projects/by-slug/:slug/preflight â€
       if (failDecisions) throw new Error("db down: secret detail");
       return [];
     },
-    preflightState: async () => "pending",
-    latestPreflight: async () => [{ id: "PF-1", kind: "secret", text: "SMS_API_KEY", default: "enter in setup wizard" }],
+    preflightSnapshot: async () => ({ state: "pending", items: [{ id: "PF-1", kind: "secret", text: "SMS_API_KEY", default: "enter in setup wizard" }] }),
   });
   const make = async (s) => {
     const app = await createApp({

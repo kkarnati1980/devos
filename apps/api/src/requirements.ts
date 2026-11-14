@@ -163,7 +163,7 @@ export class RequirementsController {
   async preflight(@Param("slug") slug: string) {
     if (!SLUG.test(slug)) throw httpError(400, "invalid:slug");
     const store = need(this.svc.store, "requirements-not-configured") as unknown as Partial<PreflightViewReader>;
-    if (typeof store.projectBySlug !== "function" || typeof store.decisions !== "function" || typeof store.preflightState !== "function" || typeof store.latestPreflight !== "function") {
+    if (typeof store.projectBySlug !== "function" || typeof store.decisions !== "function" || typeof store.preflightSnapshot !== "function") {
       throw httpError(503, "preflight-not-configured");
     }
     const view = await preflightView(slug, store as PreflightViewReader, this.svc.vault ?? null).catch(mapError);

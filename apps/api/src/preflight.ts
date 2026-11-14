@@ -89,11 +89,10 @@ export interface PreflightView {
 export async function preflightView(slug: string, reader: PreflightViewReader, vault: SecretPresence | null): Promise<PreflightView | null> {
   const project = await reader.projectBySlug(slug);
   if (!project) return null;
-  const [state, items, decisions] = await Promise.all([
-    reader.preflightState(project.id),
-    reader.latestPreflight(project.id).then((l) => l ?? []),
-    reader.decisions(project.id),
-  ]);
+  // One snapshot for the state and the list (same read as preflightOpen, Codex PR122-r2).
+  const [snap, decisions] = await Promise.all([reader.preflightSnapshot(project.id), reader.decisions(project.id)]);
+  const state = snap?.state ?? null;
+  const items = snap?.items ?? [];
   const names = items.filter((i) => i.kind === "secret").map((i) => i.text);
   let missing = names;
   let unverified = names.length > 0;
