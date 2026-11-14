@@ -69,7 +69,9 @@ function errorText(e) {
  * A job with no handler for its type is refused at enqueue. Jobs move queued → running → done | queued (retry) | dead.
  * Done jobs are dropped from the store; dead jobs stay until retried or removed.
  */
-export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, backoffMs = [1000, 5000, 30000], timeoutMs = 60_000, concurrency = 1, now = Date.now, onEvent = () => {} } = {}) {
+export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, backoffMs = [1000, 5000, 30000], timeoutMs = 60_000, concurrency = 1, now = Date.now, onEvent: onEventRaw = () => {} } = {}) {
+  // An app's event callback that throws must not change a job's outcome or crash the worker.
+  const onEvent = (e) => { try { onEventRaw(e); } catch { /* the event is lost; the job state is not */ } };
   if (!handlers || typeof handlers !== "object") throw new TypeError("createQueue: handlers is required");
   for (const [type, fn] of Object.entries(handlers)) {
     if (!TYPE.test(type) || typeof fn !== "function") throw new TypeError(`createQueue: bad handler ${JSON.stringify(type)}`);
@@ -126,6 +128,8 @@ export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, 
       // The attempt ends at the timeout or on stop() even if the handler ignores its signal.
       const aborted = new Promise((_, rej) => ac.signal.addEventListener("abort", () => rej(ac.signal.reason), { once: true }));
       t = setTimeout(() => ac.abort(new JobTimeout(timeoutMs)), timeoutMs);
+      // Own handlers only: a stored type such as "constructor" must not resolve to an inherited function.
+      if (!Object.hasOwn(handlers, job.type)) { job.attempts = maxAttempts; throw new Error(`no handler for ${JSON.stringify(job.type)}`); }
       await Promise.race([Promise.resolve().then(() => handlers[job.type](job.payload, { signal: ac.signal, attempt: job.attempts })), aborted]);
       jobs = jobs.filter((j) => j.id !== job.id);
       onEvent({ event: "job.done", id: job.id, type: job.type, attempts: job.attempts });
@@ -164,7 +168,7 @@ export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, 
       void runOne(next);
     }
     const later = jobs.filter((j) => j.status === "queued").map((j) => j.runAfter);
-    if (later.length && running.size < concurrency) wait(Math.min(...later) - t);
+    if (later.length && running.size < concurrency) wait(later.reduce((a, b) => Math.min(a, b)) - t);
     settleIdle();
   }
 
@@ -241,7 +245,7 @@ export function deadLetterRoutes(queue, prefix = "/admin/dead-letters") {
     // Past 1 KB the rest is read and dropped (not kept), so the client still gets its 400; past 64 KB, or after
     // 10 s, the connection is closed (ADR-0011 timeouts).
     const t = setTimeout(() => { req.destroy(); resolve(null); }, 10_000);
-    req.on("close", () => clearTimeout(t));
+    req.on("close", () => { clearTimeout(t); resolve(null); }); // a no-op once "end" has resolved
     req.on("data", (c) => { size += c.length; if (size <= 1024) parts.push(c); else if (size > 65_536) { clearTimeout(t); req.destroy(); resolve(null); } });
     req.on("end", () => { clearTimeout(t); if (size > 1024) return resolve(null); try { const v = JSON.parse(Buffer.concat(parts).toString("utf8")); resolve(typeof v?.id === "string" && ID.test(v.id) ? v.id : null); } catch { resolve(null); } });
     req.on("error", () => resolve(null));

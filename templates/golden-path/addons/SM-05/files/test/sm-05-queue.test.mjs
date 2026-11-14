@@ -11,7 +11,7 @@ import { createQueue, deadLetterRoutes, fileStore, memoryStore, JobTimeout } fro
 
 const fast = { backoffMs: [0], timeoutMs: 1000 };
 
-test("SM-05-L1: work runs from the queue, not in the request; retries follow the policy", async () => {
+test("SM-05-L1: work runs from the queue once started; retries follow the policy", async () => {
   const seen = [];
   let flaky = 0;
   const events = [];
@@ -32,6 +32,21 @@ test("SM-05-L1: work runs from the queue, not in the request; retries follow the
   assert.deepEqual(q.stats(), { queued: 0, running: 0, dead: 0 });
   assert.deepEqual(events.filter((e) => e === "job.retry").length, 2);
   assert.throws(() => q.enqueue("no.such.type", {}), /no handler/);
+  q.stop();
+});
+
+test("SM-05-L1: a stored job with no own handler is dead-lettered at once; a throwing event callback changes nothing", async () => {
+  const stored = [{ id: "33333333-3333-4333-8333-333333333333", type: "constructor", payload: {}, status: "queued", attempts: 0, runAfter: 0, enqueuedAt: "2026-11-14T00:00:00.000Z" }];
+  const store = memoryStore(); store.save(stored);
+  let ran = 0;
+  const q = createQueue({ ...fast, maxAttempts: 3, store, onEvent: () => { throw new Error("callback bug"); }, handlers: { "a.b": async () => { ran += 1; } } });
+  q.start();
+  q.enqueue("a.b", {});
+  await q.idle();
+  assert.equal(ran, 1, "the throwing callback did not turn a success into a failure");
+  const [d] = q.deadLetters();
+  assert.equal(d.type, "constructor");
+  assert.match(d.lastError, /no handler for "constructor"/);
   q.stop();
 });
 
