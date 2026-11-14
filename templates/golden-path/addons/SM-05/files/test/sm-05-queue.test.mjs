@@ -169,6 +169,18 @@ test("SM-05-L1: a store that cannot write is reported, and the queue keeps worki
   await q.idle(); // resolves once stopped
 });
 
+test("SM-05-L1: a large backlog of stored jobs with no handler is dead-lettered without exhausting the stack", async () => {
+  const store = memoryStore();
+  const n = 4000; // enough that a direct pump() per job would nest several thousand frames deep
+  const hex = (i) => i.toString(16).padStart(12, "0");
+  store.save(Array.from({ length: n }, (_, i) => ({ id: `44444444-4444-4444-8444-${hex(i)}`, type: "gone.type", payload: {}, status: "queued", attempts: 0, runAfter: 0, enqueuedAt: "2026-11-14T00:00:00.000Z" })));
+  const q = createQueue({ ...fast, store, handlers: { "a.b": async () => {} } });
+  q.start();
+  await q.idle();
+  assert.equal(q.stats().dead, n);
+  q.stop();
+});
+
 test("SM-05-L1: the dead-letter routes list, retry and discard; bad ids are refused", async () => {
   const q = createQueue({ ...fast, maxAttempts: 1, store: memoryStore(), handlers: { "x.y": async () => { throw new Error("nope"); } } });
   q.start();

@@ -28,6 +28,11 @@ export function memoryStore() {
  * JSON-file store: every change is written to a temporary file and renamed over the old one, so a crash leaves the
  * old or the new list, never half a file. A job that was running when the process stopped is queued again on load.
  */
+function syncDir(dir) {
+  const fd = openSync(dir, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
 export function fileStore(path) {
   if (typeof path !== "string" || !path) throw new TypeError("fileStore: path is required");
   return {
@@ -39,12 +44,15 @@ export function fileStore(path) {
       return data;
     },
     save(all) {
-      mkdirSync(dirname(path), { recursive: true });
+      const dir = dirname(path);
+      const created = mkdirSync(dir, { recursive: true }); // the first directory it made, if any
+      if (created) syncDir(dirname(created)); // a new directory's entry must survive a power loss too
       const tmp = `${path}.${process.pid}.tmp`;
       // fsync before the rename, so after a power loss the file holds the old list or the new one.
       const fd = openSync(tmp, "w", 0o600);
       try { writeSync(fd, JSON.stringify(all)); fsyncSync(fd); } finally { closeSync(fd); }
       renameSync(tmp, path);
+      syncDir(dir); // the rename is durable only once the directory is fsynced (Codex PR104-r1)
     },
   };
 }
@@ -154,7 +162,9 @@ export function createQueue({ handlers, store = memoryStore(), maxAttempts = 3, 
       running.delete(job.id);
       stopping.delete(job.id);
       save();
-      pump();
+      // Not a direct call: an attempt can end before its first await (e.g. no handler), and a direct pump() would
+      // then recurse once per such job and could exhaust the stack on a large backlog (Codex PR104-r1).
+      queueMicrotask(pump);
       settleIdle();
     }
   }
