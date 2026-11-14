@@ -33,9 +33,9 @@ const SPEC = `# Shop
 - Should the cache use Redis or Postgres?
 `;
 
-function setup({ stage = "intake", raiseReq, raiseQ, runner } = {}) {
+function setup({ stage = "intake", raiseReq, raiseQ, runner, continuousRun, secretNames } = {}) {
   const store = new MemoryRequirementsStore();
-  store.addProject({ id: P1, name: "Shop", stage });
+  store.addProject({ id: P1, name: "Shop", stage, ...(continuousRun === undefined ? {} : { continuousRun, capUsd: 15 }) });
   const reqCards = [];
   const qCards = [];
   let n = 0;
@@ -43,6 +43,7 @@ function setup({ stage = "intake", raiseReq, raiseQ, runner } = {}) {
     store,
     now: NOW,
     runner,
+    ...(secretNames ? { secretNames } : {}),
     raiseRequirementsCard: raiseReq ?? (async (card) => {
       reqCards.push(card);
       return { id: `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}` };
@@ -249,4 +250,118 @@ test("PL7 requirementsCard is accepted by the M2.3 card rules for long counts an
   const c = requirementsCard(P1, 12345, a);
   assert.ok(cardOk(c));
   assert.ok(!c.reason.includes("script") && !c.reason.includes("sk-live"));
+});
+
+test("AT2 (CR-a2): in continuous-run mode one requirements card carries the pre-flight and no decision card is raised; off, as before", async () => {
+  const on = setup({ continuousRun: true, secretNames: async () => ["PAYMENTS_KEY"] });
+  const r = await on.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(on.reqCards.length, 1);
+  assert.equal(on.reqCards[0].gate, "requirements");
+  assert.equal(on.qCards.length, 0, "no separate decision card");
+  assert.ok(r.preflight.length >= 3);
+  assert.match(on.reqCards[0].reason, /\nPre-flight: \d+ questions, 1 secrets — PF-1: .*payment provider/);
+  assert.match(on.reqCards[0].reason, /secret PAYMENTS_KEY \(enter in setup wizard\)/);
+  assert.ok(on.reqCards[0].reason.length <= 2000);
+  assert.match(r.architectLog, /Redis/, "technical questions still go to the Architect log");
+  const doc = on.store.docs.at(-1);
+  assert.deepEqual(doc.preflight, r.preflight, "the list KK saw is stored with the doc");
+  assert.equal(on.store.preflightState.get(P1), "pending");
+  // The card's action and target are unchanged by the mode.
+  const off = setup({ continuousRun: false });
+  const r0 = await off.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(off.reqCards[0].action, on.reqCards[0].action);
+  assert.equal(off.reqCards[0].target, on.reqCards[0].target);
+  assert.ok(!/Pre-flight/.test(off.reqCards[0].reason));
+  assert.ok(off.qCards.length > 0, "mode off raises the decision cards as before");
+  assert.equal(r0.preflight, null);
+  assert.equal(off.store.preflightState.has(P1), false);
+  // A project row without the field (before CR-a2's store) behaves as off.
+  const legacy = setup();
+  await legacy.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.deepEqual(legacy.qCards.length, off.qCards.length);
+});
+
+test("AT5 (CR-a2, card half): a secret-shaped pre-flight question is retried without its text; a long pre-flight ends with +k more", async () => {
+  // Same shape as M2.3's looksSecret password/token/api-key rule (apps/api/src/notify.ts).
+  const SECRETISH = /\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S{6,}/i;
+  const VALUE = "zq81Lm0pXr";
+  const spec = SPEC.replace("- Which payment provider should we pay for?", `- Which payment provider should we pay for? Our old token: ${VALUE}`);
+  const tries = [];
+  const raiseReq = async (card) => {
+    tries.push(card);
+    if (SECRETISH.test(card.reason)) throw Object.assign(new Error("refused"), { code: "card-contains-secret" });
+    return { id: "00000000-0000-4000-8000-000000000099" };
+  };
+  const on = setup({ continuousRun: true, raiseReq, secretNames: async () => ["PAYMENTS_KEY"] });
+  const r = await on.pipeline.submitSpec(P1, { kind: "paste", text: spec });
+  assert.equal(tries.length, 2, "one refusal, one retry");
+  assert.ok(SECRETISH.test(tries[0].reason), "the first try carried the question text");
+  const card = tries[1];
+  assert.ok(!card.reason.includes(VALUE), "no secret value in the raised card");
+  assert.match(card.reason, /Pre-flight: \d+ questions, 1 secrets — PF-1: question text withheld/);
+  assert.match(card.reason, /secret PAYMENTS_KEY \(enter in setup wizard\)/);
+  assert.match(card.reason, /Monthly spend cap for this project/, "fixed texts stay");
+  assert.equal(card.action, "requirements.approve");
+  assert.ok(!r.warnings.includes("card-failed"));
+  assert.equal(on.qCards.length, 0);
+  assert.ok(on.store.docs.at(-1).approvalId, "the doc is linked to the one intake card");
+  // Any other refusal is not retried.
+  const other = setup({ continuousRun: true, raiseReq: async () => { throw Object.assign(new Error("x"), { code: "db-down" }); } });
+  const r2 = await other.pipeline.submitSpec(P1, { kind: "paste", text: spec });
+  assert.deepEqual(r2.warnings, ["card-failed"]);
+  // Mode off: the card has no spec text, so a refusal is not retried (as before CR-a2).
+  let offTries = 0;
+  const off = setup({ continuousRun: false, raiseReq: async () => { offTries++; throw Object.assign(new Error("x"), { code: "card-contains-secret" }); } });
+  await off.pipeline.submitSpec(P1, { kind: "paste", text: spec });
+  assert.equal(offTries, 1);
+  // A pre-flight longer than the 2,000-character reason ends with "+<k> more on the project page".
+  const many = Array.from({ length: 40 }, (_, i) => `- Which vendor should we pay for option ${i} of the monthly ${"plan ".repeat(12)}?`).join("\n");
+  const big = setup({ continuousRun: true });
+  await big.pipeline.submitSpec(P1, { kind: "paste", text: SPEC.replace("- Which payment provider should we pay for?", many) });
+  const reason = big.reqCards[0].reason;
+  assert.ok(reason.length <= 2000);
+  assert.match(reason, /; \+\d+ more on the project page$/);
+});
+
+test("AT4/AT6 (CR-a2, memory store): approval writes KK's answers and defaults with it; rejection closes; a new version re-opens", async () => {
+  const s = setup({ continuousRun: true, secretNames: async () => ["PAYMENTS_KEY"] });
+  const r = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  // Rejected: state `rejected`, nothing recorded, the doc stays a draft.
+  assert.equal(await s.pipeline.applyDecision({ id: r.approvalId, gate: "requirements", status: "rejected" }), "rejected");
+  assert.equal(s.store.preflightState.get(P1), "rejected");
+  assert.equal(s.store.decisions.length, 0);
+  // AT6: a new spec version re-opens the pre-flight with a new card.
+  const r2 = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.notEqual(r2.approvalId, r.approvalId);
+  assert.equal(s.store.preflightState.get(P1), "pending");
+  // The old card's late rejection no longer touches the state (it is not the newest doc).
+  assert.equal(await s.pipeline.applyDecision({ id: r.approvalId, gate: "requirements", status: "rejected" }), "ignored");
+  assert.equal(s.store.preflightState.get(P1), "pending");
+  // AT4: approving with `PF-1: yes` records PF-1 as kk and every other decision item as its default.
+  assert.equal(await s.pipeline.applyDecision({ id: r2.approvalId, gate: "requirements", status: "approved" }, ["PF-1: yes"]), "approved");
+  const decisions = r2.preflight.filter((i) => i.kind === "decision");
+  assert.equal(s.store.decisions.length, decisions.length);
+  assert.deepEqual(s.store.decisions.map((d) => d.source), decisions.map((_, i) => (i === 0 ? "kk" : "default")));
+  assert.equal(s.store.decisions[0].answer, "yes");
+  assert.ok(s.store.decisions.every((d) => d.approvalId === r2.approvalId && d.projectId === P1));
+  assert.equal(s.store.preflightState.get(P1), "approved");
+  // Idempotent: a second sync of the decided card records nothing more.
+  assert.equal(await s.pipeline.applyDecision({ id: r2.approvalId, gate: "requirements", status: "approved" }, ["PF-1: no"]), "ignored");
+  assert.equal(s.store.decisions.length, decisions.length);
+  // Mode off: approval records no decision rows, as before.
+  const off = setup({ continuousRun: false });
+  const r0 = await off.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(await off.pipeline.applyDecision({ id: r0.approvalId, gate: "requirements", status: "approved" }, ["PF-1: yes"]), "approved");
+  assert.equal(off.store.decisions.length, 0);
+  assert.equal(await off.pipeline.applyDecision({ id: r0.approvalId, gate: "requirements", status: "rejected" }), "ignored");
+});
+
+test("DEVOS-205 (memory store): approving a doc without a pre-flight on a pending project opens the state; rejected and approved stay", async () => {
+  for (const [before, after] of [["pending", "approved"], ["rejected", "rejected"], ["approved", "approved"]]) {
+    const s = setup({ continuousRun: false });
+    const r = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+    s.store.preflightState.set(P1, before);
+    assert.equal(await s.pipeline.applyDecision({ id: r.approvalId, gate: "requirements", status: "approved" }), "approved");
+    assert.equal(s.store.preflightState.get(P1), after);
+  }
 });

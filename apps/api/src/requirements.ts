@@ -11,6 +11,8 @@ export const REQUIREMENTS = Symbol("devos:requirements");
 /** The slice of the M2.3 approval store this module reads (ApprovalStore satisfies it). */
 export interface CardReader {
   get(id: string): Promise<{ id: string; gate: string; status: string } | null>;
+  /** ADR-0012 CR-a2: the card's comments, oldest first (ApprovalStore.comments). */
+  comments?(id: string): Promise<{ body: string }[]>;
 }
 
 export interface RequirementRowView {
@@ -87,8 +89,11 @@ export async function syncApproval(svc: RequirementsServices, projectId: string)
   const doc = await store.latestDoc(projectId);
   if (!doc || doc.status !== "draft" || !doc.approvalId || !svc.cards) return doc;
   const card = await svc.cards.get(doc.approvalId);
-  if (!card || card.status !== "approved") return doc;
-  await pipeline.applyDecision(card);
+  if (!card || (card.status !== "approved" && card.status !== "rejected")) return doc;
+  // ADR-0012 CR-a2: KK's comments carry the pre-flight answers (`PF-<n>: …`). A reader without comments gives none,
+  // so every item takes its default (the card is still applied).
+  const comments = card.status === "approved" && svc.cards.comments ? (await svc.cards.comments(card.id)).map((c) => c.body) : [];
+  await pipeline.applyDecision(card, comments);
   return store.latestDoc(projectId);
 }
 

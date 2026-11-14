@@ -19,6 +19,8 @@ const TABLES = [
   "provision_step",
   // S4-a2a (docs/modules/S4.md)
   "isolation_stack",
+  // ADR-0012 CR-a2 (docs/modules/ADR-0012.md)
+  "project_decision",
 ];
 
 // Unique keys the contract names (table -> column lists).
@@ -44,6 +46,7 @@ const UNIQUES = {
   run_event: [["run_id", "seq"]],
   provision_step: [["project_id", "key"]],
   isolation_stack: [["project_id", "env"], ["idx"], ["subnet"], ["network"]],
+  project_decision: [["approval_id", "item_id"]],
   mechanism_flag: [["role", "mechanism"]],
 };
 
@@ -58,6 +61,7 @@ const CHECKS = [
   "provision_step_done_has_external_id", "provision_step_attempts_nonnegative", "provision_step_last_error_short",
   "isolation_stack_env_valid", "isolation_stack_idx_range", "isolation_stack_slug_valid", "isolation_stack_network_derived",
   "isolation_stack_subnet_derived",
+  "project_preflight_state_valid", "project_decision_source_valid",
 ];
 const TRIGGERS = [
   "requirements_doc_one_approved", "vault_secret_global_unique", "deploy_requires_pass",

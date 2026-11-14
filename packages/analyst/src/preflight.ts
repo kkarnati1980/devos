@@ -102,3 +102,37 @@ export function preflightLine(items: readonly PreflightItem[], max: number): str
   // Not even the head fits: the caller gave too little room; never exceed it.
   return clip(build(0), limit);
 }
+
+export interface PreflightDecisionRow {
+  itemId: string;
+  text: string;
+  answer: string;
+  source: "kk" | "default";
+}
+
+/** Longest stored answer (characters); a longer answer is cut, never refused (the card is already decided). */
+export const ANSWER_MAX = 1000;
+// The answer starts with a non-space character: a blank `PF-<n>:` line is no answer (the default stands), pre-review r2.
+const ANSWER_LINE = /^\s*PF-(\d{1,4})\s*:\s*(\S.*?)\s*$/;
+
+/**
+ * One row per `decision` item, in item order: KK's answer from a `PF-<n>: <answer>` line of his comments, or the
+ * item's default. The last line for an id wins (a later comment corrects an earlier one). Lines for unknown ids,
+ * for `secret` items (never answered in the card) and any other text are ignored; they stay in the comments.
+ */
+export function preflightDecisions(items: readonly PreflightItem[], comments: readonly string[]): PreflightDecisionRow[] {
+  const answers = new Map<string, string>();
+  for (const body of comments) {
+    for (const line of String(body ?? "").split(/\r?\n/)) {
+      const m = ANSWER_LINE.exec(line);
+      if (m) answers.set(`PF-${Number(m[1])}`, m[2]!.slice(0, ANSWER_MAX));
+    }
+  }
+  const rows: PreflightDecisionRow[] = [];
+  for (const it of items) {
+    if (it.kind !== "decision") continue;
+    const a = answers.get(it.id);
+    rows.push(a === undefined ? { itemId: it.id, text: it.text, answer: it.default, source: "default" } : { itemId: it.id, text: it.text, answer: a, source: "kk" });
+  }
+  return rows;
+}
