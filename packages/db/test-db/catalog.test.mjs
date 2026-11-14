@@ -17,6 +17,8 @@ const TABLES = [
   "run_telemetry", "artifact", "log_receipt", "mechanism_flag", "guard_metric",
   // M2.4 (docs/modules/M2.4.md)
   "provision_step",
+  // S4-a2a (docs/modules/S4.md)
+  "isolation_stack",
 ];
 
 // Unique keys the contract names (table -> column lists).
@@ -41,6 +43,7 @@ const UNIQUES = {
   policy_decision: [["chain", "seq"], ["hash"]],
   run_event: [["run_id", "seq"]],
   provision_step: [["project_id", "key"]],
+  isolation_stack: [["project_id", "env"], ["idx"], ["subnet"], ["network"]],
   mechanism_flag: [["role", "mechanism"]],
 };
 
@@ -53,6 +56,8 @@ const CHECKS = [
   "run_event_seq_positive", "run_error_not_an_attempt", "artifact_values", "guard_metric_values",
   "capability_envelope_paths_canonical", "milestone_closed_has_gate_approval",
   "provision_step_done_has_external_id", "provision_step_attempts_nonnegative", "provision_step_last_error_short",
+  "isolation_stack_env_valid", "isolation_stack_idx_range", "isolation_stack_slug_valid", "isolation_stack_network_derived",
+  "isolation_stack_subnet_derived",
 ];
 const TRIGGERS = [
   "requirements_doc_one_approved", "vault_secret_global_unique", "deploy_requires_pass",

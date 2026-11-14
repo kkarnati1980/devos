@@ -11,7 +11,7 @@ import type { ApprovalRouteServices, GrantSummary } from "./approvals-routes.js"
 import type { NotifyServices } from "./notify-routes.js";
 import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.js";
 import { parseSmtpConfig } from "./smtp.js";
-import { RequirementsPipeline } from "@devos/analyst";
+import { ExpiringRequirementsPipeline, approvalStepBoundMs, type ExpiryLog, type PendingCardLister } from "./requirements-expiry.js";
 import { PrismaRequirementsStore } from "./requirements-store.js";
 import type { RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
@@ -166,7 +166,9 @@ export async function buildRuntime(
       )
     : null;
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
-  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner);
+  // Codex PR88-r5: one expiry write can wait up to maxWait for a connection and then run up to timeout, so the hold
+  // reserves the approvals store's whole step bound (built with `t` above), not its transaction timeout alone.
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(t));
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync };
 }
@@ -179,18 +181,41 @@ export async function buildRuntime(
  */
 export function requirementsServices(
   store: NonNullable<RequirementsServices["store"]>,
-  approvals: Pick<Approvals, "raiseCard">,
-  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister,
+  approvals: Pick<Approvals, "raiseCard" | "expireCardsById">,
+  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister & PendingCardLister,
   runner: ModelRunner | null = null,
+  expiryLog?: ExpiryLog,
+  /** The longest one expiry write can take, connection wait included (`approvalStepBoundMs`; Codex PR88-r4, PR88-r5, PR88-r6). */
+  expireStepMs = 0,
 ): RequirementsServices {
-  const pipeline = new RequirementsPipeline({
-    store,
-    raiseRequirementsCard: async (card) => ({ id: (await approvals.raiseCard(card)).id }),
-    // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
-    raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
-    runner,
-  });
+  // M2.2-d3c2: after each submission, the superseded version's pending cards and an unlinked requirements card
+  // are expired through the M2.3 core (DEVOS-164).
+  const pipeline = new ExpiringRequirementsPipeline(
+    {
+      store,
+      raiseRequirementsCard: async (card) => ({ id: (await approvals.raiseCard(card)).id }),
+      // M2.2-d3c1: a question KK already approved or rejected in an earlier version is not asked again.
+      raiseQuestionCard: skipDecidedQuestions(async (draft, reason) => ({ id: (await approvals.raiseCard({ ...draft.card, reason })).id }), cards),
+      runner,
+    },
+    {
+      latestDoc: (id) => store.latestDoc(id),
+      cards,
+      expire: (ids, reason) => approvals.expireCardsById(ids, reason),
+      // The Postgres store holds the project row for the pass (Codex PR88-r1); the in-memory store has no lock.
+      serialize: holder(store, expireStepMs),
+    },
+    expiryLog,
+  );
   return { pipeline, store, cards: { get: (id) => cards.get(id) } };
+}
+
+type HeldFn<T> = (assertHeld: () => void) => Promise<T>;
+type Held = { withProjectHeld?<T>(projectId: string, fn: HeldFn<T>, stepMs?: number): Promise<T> };
+/** The store's project hold, when it has one (PrismaRequirementsStore does). */
+function holder(store: object, stepMs: number): (<T>(projectId: string, fn: HeldFn<T>) => Promise<T>) | undefined {
+  const s = store as Held;
+  return typeof s.withProjectHeld === "function" ? (id, fn) => s.withProjectHeld!(id, fn, stepMs) : undefined;
 }
 
 /**
