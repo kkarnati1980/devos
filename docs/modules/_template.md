@@ -18,6 +18,9 @@
 <what is deferred, with follow-up issue ids>
 
 ## Acceptance tests
+<!-- Fixture rule (docs/decisions/0024-local-secret-scan.md): a test value that looks like a secret is obviously fake and
+     low-entropy (e.g. `test-key-not-real`) or built at run time. Never add to `.gitleaksignore` to silence a hit.
+     Run `pnpm secret-scan:local` before every push. -->
 | # | Pass when |
 |---|---|
 | AT1 | <observable condition> |
