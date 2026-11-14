@@ -1,4 +1,5 @@
-// M2.4-c2a acceptance tests on fake GitHub + Coolify (docs/modules/M2.4.md: AT1–AT4 for applications; the S4 hook).
+// M2.4-c2a/c2c2 acceptance tests on fake GitHub + Coolify (docs/modules/M2.4.md: AT1–AT4 for applications; the S4 hook;
+// the committed deploy Compose and the git-based create).
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -6,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 import {
   allowAll, CoolifyClient, GitHubClient, MemoryStore, coolifyProjectStep, githubRepoStep, stackSteps, applicationSteps,
-  applicationStep, applicationName, parseCompose, publishTailnetPort, isTailnetIpv4, parsePortRange, portStep, runProvision, StepError, COMPOSE_MAX_BYTES,
+  applicationStep, applicationName, deployComposeStep, DEPLOY_COMPOSE_HEADER, parseCompose, publishTailnetPort, isTailnetIpv4, parsePortRange, portStep, runProvision, StepError, COMPOSE_MAX_BYTES,
 } from "../dist/index.js";
 import { fakeProviders } from "./fakes.mjs";
 
@@ -16,6 +17,7 @@ const RANGE = parsePortRange("20000-20999");
 const SERVER = "srv-0123456789";
 const TAILNET_IP = "100.101.102.103";
 const noSleep = async () => {};
+const FIXTURE_PK = "pkaaaaaaaaaa";
 const CORE_COMPOSE = readFileSync(new URL("../../../templates/golden-path/core/compose.yaml", import.meta.url));
 const sha1 = (b) => createHash("sha1").update(Buffer.concat([Buffer.from(`blob ${b.length}\0`), b])).digest("hex");
 
@@ -39,6 +41,13 @@ async function pushCore(fake, store, files = { "compose.yaml": CORE_COMPOSE }) {
   return c;
 }
 
+/** Journals the c2c1 deploy key rows (a Coolify private key the fake knows, and the GitHub key) as done. */
+async function deployKeys(fake, store) {
+  fake.keys.set(FIXTURE_PK, { id: 1, uuid: FIXTURE_PK, name: "devos-acme-deploy", description: `devos:${P.id}`, private_key: "-----BEGIN OPENSSH x", is_git_related: true });
+  await store.markDone(P.id, { key: "coolify/deploy_key", provider: "coolify", kind: "private_key" }, FIXTURE_PK);
+  await store.markDone(P.id, { key: "github/deploy_key", provider: "github", kind: "deploy_key" }, "kkarnati1980/devos-acme#7");
+}
+
 async function setup({ fake = fakeProviders(), store = new MemoryStore(), hook = recordingHook(), files } = {}) {
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: noSleep });
   const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: noSleep });
@@ -46,11 +55,19 @@ async function setup({ fake = fakeProviders(), store = new MemoryStore(), hook =
   const base = [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P), ...stackSteps(cf, store, P, RANGE)];
   await runProvision(P.id, base, { store, authorize: allowAll });
   await pushCore(fake, store, files);
+  await deployKeys(fake, store);
   const steps = () => [...base, ...applicationSteps(cf, gh, store, P, opts)];
   return { fake, store, hook, gh, cf, opts, steps };
 }
 
-const appCreates = (fake) => fake.creates().filter((c) => c.path === "/api/v1/applications/dockercompose");
+const appCreates = (fake) => fake.creates().filter((c) => c.path === "/api/v1/applications/private-deploy-key");
+const repoOf = (fake) => fake.gitOf(`kkarnati1980/devos-${P.slug}`);
+/** The bytes of a path in the tree of `main` on the fake repo, or undefined. */
+const fileOnMain = (fake, path) => {
+  const g = repoOf(fake);
+  const e = g.trees.get(g.commits.get(g.main).tree).find((x) => x.path === path);
+  return e && g.blobs.get(e.sha);
+};
 
 test("AT1 one application per environment, from the repo's Compose after the hook, recorded; nothing deployed", async () => {
   const s = await setup();
@@ -68,7 +85,17 @@ test("AT1 one application per environment, from the repo's Compose after the hoo
     assert.equal(b.instant_deploy, false, "M2.4 deploys nothing");
     assert.equal(b.autogenerate_domain, false, "decision 1: no Coolify domain, tailnet only");
     assert.ok(b.description.includes(`devos:${P.id}`), "marker in the create call itself");
-    const sent = parse(Buffer.from(b.docker_compose_raw, "base64").toString("utf8"));
+    // M2.4-c2c2: the repo is the source, cloned with the c2c1 key; the committed file is the Compose that runs.
+    assert.equal(b.private_key_uuid, FIXTURE_PK);
+    assert.equal(b.git_repository, "git@github.com:kkarnati1980/devos-acme.git");
+    assert.equal(b.git_branch, "main");
+    assert.equal(b.build_pack, "dockercompose");
+    assert.equal(b.ports_exposes, "3000");
+    assert.equal(b.docker_compose_location, `/deploy/compose.${env[0]}.devos.yaml`);
+    const raw = Buffer.from(b.docker_compose_raw, "base64");
+    assert.ok(raw.equals(fileOnMain(s.fake, `deploy/compose.${env[0]}.devos.yaml`)), "Coolify's copy equals the committed file byte for byte");
+    assert.ok(raw.toString().startsWith(DEPLOY_COMPOSE_HEADER), "the file says it is generated");
+    const sent = parse(raw.toString("utf8"));
     assert.equal(sent["x-hardened"], env[1], "Coolify gets the hook's Compose");
     const core = parse(CORE_COMPOSE.toString()).services;
     const port = env[1] === "preview" ? 20000 : 20001;
@@ -98,7 +125,7 @@ test("AT2 a re-run creates nothing; a lost journal adopts both applications by n
 
 test("AT3/AT4 a create that times out after it happened is adopted with one POST", async () => {
   const s = await setup();
-  s.fake.faults.push({ match: (m, p) => m === "POST" && p === "/api/v1/applications/dockercompose", action: "timeout-after" });
+  s.fake.faults.push({ match: (m, p) => m === "POST" && p === "/api/v1/applications/private-deploy-key", action: "timeout-after" });
   const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
   assert.equal(out.at(-2).outcome, "adopted");
   assert.equal(appCreates(s.fake).length, 2, "one POST per environment");
@@ -118,11 +145,13 @@ test("AT3 crash after the create returns, before the DB write: the re-run adopts
 
 test("AT5-style: a same-named application without our marker is a name_conflict; nothing is created", async () => {
   const s = await setup();
+  const commits = repoOf(s.fake).commits.size;
   s.fake.apps.set("apforeign0001", { uuid: "apforeign0001", name: "devos-acme-preview", description: "someone else's" });
   await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }),
     (e) => e instanceof StepError && e.code === "name_conflict" && e.retryable === false);
   assert.equal(appCreates(s.fake).length, 0);
-  assert.equal(s.hook.calls.length, 0);
+  // Intended (contract, c2c2 build notes): the repo file is DevOS-owned and harmless without an application.
+  assert.equal(repoOf(s.fake).commits.size, commits + 1, "the deploy Compose commit is still made, once");
 });
 
 test("the S4 hook is required, and its refusal creates nothing", async () => {
@@ -136,12 +165,19 @@ test("the S4 hook is required, and its refusal creates nothing", async () => {
   assert.equal(appCreates(s.fake).length, 0);
 });
 
-test("AT12-style: a policy deny on provision.coolify.application creates nothing and calls no hook", async () => {
+test("AT12-style: a policy deny on provision.coolify.application creates nothing; on the deploy Compose, no hook and no commit", async () => {
   const s = await setup();
   const authorize = async (a) => (a === "provision.coolify.application" ? "deny" : "allow");
   await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize }), (e) => e.code === "policy_denied");
   assert.equal(appCreates(s.fake).length, 0);
-  assert.equal(s.hook.calls.length, 0);
+
+  const t = await setup();
+  const commits = repoOf(t.fake).commits.size;
+  const deny = async (a) => (a === "provision.github.deploy_compose" ? "deny" : "allow");
+  await assert.rejects(runProvision(P.id, t.steps(), { store: t.store, authorize: deny }), (e) => e.code === "policy_denied");
+  assert.equal(t.hook.calls.length, 0);
+  assert.equal(repoOf(t.fake).commits.size, commits);
+  assert.equal(appCreates(t.fake).length, 0);
 });
 
 test("missing inputs fail before any write: no core commit, no compose.yaml, a lost lock", async () => {
@@ -158,8 +194,10 @@ test("missing inputs fail before any write: no core commit, no compose.yaml, a l
   const hook = u.hook.afterStack;
   u.opts.hooks.afterStack = async (...a) => { const r = await hook(...a); u.store.lockLost = true; return r; };
   const steps = [...u.steps().slice(0, 6), ...applicationSteps(u.cf, u.gh, u.store, P, u.opts)];
+  const commits = repoOf(u.fake).commits.size;
   await assert.rejects(runProvision(P.id, steps, { store: u.store, authorize: allowAll }), (e) => e instanceof StepError && e.code === "provider_error");
-  assert.equal(appCreates(u.fake).length, 0, "the lock is checked after the hook, right before the POST");
+  assert.equal(repoOf(u.fake).commits.size, commits, "the lock is checked after the hook, before any Git write");
+  assert.equal(appCreates(u.fake).length, 0);
 });
 
 test("an inconclusive application list creates nothing", async () => {
@@ -229,7 +267,7 @@ test("pre-review: a 2xx POST with no uuid is looked up and adopted, never POSTed
   const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, sleep: noSleep,
     fetchImpl: async (url, init = {}) => {
       const res = await real(url, init);
-      if (once && init.method === "POST" && new URL(url).pathname === "/api/v1/applications/dockercompose") { once = false; return new Response("{}", { status: 201, headers: { "content-type": "application/json" } }); }
+      if (once && init.method === "POST" && new URL(url).pathname === "/api/v1/applications/private-deploy-key") { once = false; return new Response("{}", { status: 201, headers: { "content-type": "application/json" } }); }
       return res;
     } });
   const out = await runProvision(P.id, [...s.steps().slice(0, 6), ...applicationSteps(cf, s.gh, s.store, P, s.opts)], { store: s.store, authorize: allowAll });
@@ -277,4 +315,103 @@ test("Codex PR76-r4: the allocated port is published on the tailnet address only
   const leaky = { afterStack: async (_p, env) => ({ compose: { ...env.compose, services: { ...env.compose.services, app: { ...env.compose.services.app, ports: ["0.0.0.0:80:3000"] } } } }) };
   await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), ...applicationSteps(s.cf, s.gh, s.store, P, { ...s.opts, hooks: leaky })], { store: s.store, authorize: allowAll }));
   assert.equal(appCreates(s.fake).length, 0);
+});
+
+test("c2c2: one commit adds both deploy files on top of the core; a re-run with the files present commits nothing", async () => {
+  const s = await setup();
+  const core = repoOf(s.fake).main;
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const g = repoOf(s.fake);
+  assert.deepEqual(g.commits.get(g.main).parents, [core], "one fast-forward commit on the core");
+  const paths = g.trees.get(g.commits.get(g.main).tree).map((e) => e.path).sort();
+  assert.deepEqual(paths, ["compose.yaml", "deploy/compose.preview.devos.yaml", "deploy/compose.production.devos.yaml"]);
+  assert.equal(s.store.steps.get(`${P.id}/github/deploy_compose`).externalId, g.main);
+  assert.equal(s.store.resources.filter((r) => r.kind === "deploy_compose").length, 0, "journalled, not an inventory row");
+
+  // A lost journal: the byte-equal files are recognised; no commit, no ref move, no new application.
+  const head = g.main;
+  const commits = g.commits.size;
+  s.store.steps.delete(`${P.id}/github/deploy_compose`);
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.equal(g.main, head);
+  assert.equal(g.commits.size, commits);
+  assert.equal(s.store.steps.get(`${P.id}/github/deploy_compose`).externalId, head);
+  assert.equal(appCreates(s.fake).length, 2);
+});
+
+test("c2c2: a changed deploy file on main is compose_drift; it is not overwritten and nothing is created", async () => {
+  const s = await setup();
+  const g = repoOf(s.fake);
+  const tree = [...g.trees.get(g.commits.get(g.main).tree)];
+  const edited = Buffer.from("services:\n  app:\n    privileged: true\n");
+  g.blobs.set(sha1(edited), edited);
+  tree.push({ path: "deploy/compose.production.devos.yaml", mode: "100644", type: "blob", sha: sha1(edited) });
+  const t = createHash("sha1").update(JSON.stringify(tree)).digest("hex");
+  g.trees.set(t, tree);
+  const c = createHash("sha1").update(`commit ${t} edited`).digest("hex");
+  g.commits.set(c, { tree: t, parents: [g.main] });
+  g.main = c;
+  await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }),
+    (e) => e instanceof StepError && e.code === "compose_drift" && e.retryable === false);
+  assert.equal(g.main, c, "main is not moved");
+  assert.ok(fileOnMain(s.fake, "deploy/compose.production.devos.yaml").equals(edited));
+  assert.equal(appCreates(s.fake).length, 0);
+});
+
+test("c2c2: a missing deploy key row, or a missing deploy Compose row, fails the application before any write", async () => {
+  for (const missing of ["coolify/deploy_key", "github/deploy_key"]) {
+    const s = await setup();
+    s.store.steps.delete(`${P.id}/${missing}`);
+    await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }), (e) => e.code === "provider_error", missing);
+    assert.equal(appCreates(s.fake).length, 0, missing);
+    assert.ok(fileOnMain(s.fake, "deploy/compose.preview.devos.yaml"), "the DevOS-owned deploy commit is still made (recorded)");
+  }
+  const s = await setup();
+  await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), applicationStep(s.cf, s.gh, s.store, P, "preview", s.opts)], { store: s.store, authorize: allowAll }),
+    (e) => e.code === "provider_error");
+  assert.equal(appCreates(s.fake).length, 0);
+});
+
+test("c2c2: a deploy file that no longer publishes exactly the stack's tailnet port is refused before the create", async () => {
+  const s = await setup();
+  await runProvision(P.id, [...s.steps().slice(0, 6), deployComposeStep(s.gh, s.store, P, s.opts)], { store: s.store, authorize: allowAll });
+  // Journal a commit whose preview file publishes 0.0.0.0 (as if the row pointed at an edited commit).
+  const g = repoOf(s.fake);
+  const tree = g.trees.get(g.commits.get(g.main).tree).map((e) => ({ ...e }));
+  const bad = Buffer.from("services:\n  app:\n    ports: ['0.0.0.0:80:3000']\n");
+  g.blobs.set(sha1(bad), bad);
+  tree.find((e) => e.path === "deploy/compose.preview.devos.yaml").sha = sha1(bad);
+  const t = createHash("sha1").update(JSON.stringify(tree) + "bad").digest("hex");
+  g.trees.set(t, tree);
+  const c = createHash("sha1").update(`commit ${t}`).digest("hex");
+  g.commits.set(c, { tree: t, parents: [g.main] });
+  await s.store.markDone(P.id, { key: "github/deploy_compose", provider: "github", kind: "deploy_compose" }, c);
+  await assert.rejects(runProvision(P.id, [...s.steps().slice(0, 6), applicationStep(s.cf, s.gh, s.store, P, "preview", s.opts)], { store: s.store, authorize: allowAll }),
+    (e) => e.code === "provider_error");
+  assert.equal(appCreates(s.fake).length, 0);
+});
+
+test("c2c2 AT3/AT4: a fast-forward that times out after it happened is adopted; one commit", async () => {
+  const s = await setup();
+  const commits = repoOf(s.fake).commits.size;
+  s.fake.faults.push({ match: (m, p) => m === "PATCH" && p.endsWith("/git/refs/heads/main"), action: "timeout-after", once: true });
+  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const row = out.find((o) => o.key === "github/deploy_compose");
+  assert.equal(row.outcome, "adopted");
+  assert.equal(repoOf(s.fake).commits.size, commits + 1);
+  assert.equal(row.externalId, repoOf(s.fake).main);
+  assert.equal(appCreates(s.fake).length, 2);
+});
+
+test("c2c2: a non-blob entry (submodule) on main is refused before any Git write", async () => {
+  const s = await setup();
+  const g = repoOf(s.fake);
+  const tree = [...g.trees.get(g.commits.get(g.main).tree), { path: "vendor/x", mode: "160000", type: "commit", sha: "e".repeat(40) }];
+  g.trees.set("f".repeat(40), tree);
+  g.commits.set("9".repeat(40), { tree: "f".repeat(40), parents: [g.main] });
+  g.main = "9".repeat(40);
+  const writes = s.fake.creates().length;
+  await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }), (e) => e.code === "provider_error");
+  assert.equal(s.fake.creates().length, writes);
+  assert.equal(g.main, "9".repeat(40));
 });

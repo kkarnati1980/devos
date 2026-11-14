@@ -52,6 +52,10 @@ async function setup({ fake = fakeProviders(), store = new MemoryStore(), vault 
   g.commits.set(c, { tree: t, parents: [] });
   g.main = c;
   await store.markDone(P.id, { key: "github/core", provider: "github", kind: "core" }, c);
+  // M2.4-c2c2: the git-based create needs the c2c1 deploy key rows (as in application.test.mjs).
+  fake.keys.set("pkaaaaaaaaaa", { id: 1, uuid: "pkaaaaaaaaaa", name: "k", description: `devos:${P.id}`, private_key: "-----BEGIN OPENSSH x", is_git_related: true });
+  await store.markDone(P.id, { key: "coolify/deploy_key", provider: "coolify", kind: "private_key" }, "pkaaaaaaaaaa");
+  await store.markDone(P.id, { key: "github/deploy_key", provider: "github", kind: "deploy_key" }, "kkarnati1980/devos-acme#7");
   const apps = applicationSteps(cf, gh, store, P, { owner: "kkarnati1980", serverUuid: "srv-0123456789", tailnetIp: "100.101.102.103", range: RANGE, hooks });
   await runProvision(P.id, apps, { store, authorize: allowAll });
   const steps = () => appSecretSteps(cf, store, vault, P);
