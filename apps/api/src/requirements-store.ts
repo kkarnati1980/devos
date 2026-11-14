@@ -75,8 +75,13 @@ export class PrismaRequirementsStore implements RequirementsStore {
 
   project(projectId: string): Promise<ProjectRow | null> {
     return this.tx(async (tx) => {
-      const p = await tx.project.findUnique({ where: { id: projectId }, select: { id: true, name: true, stage: true } });
-      return p ? { id: p.id, name: p.name, stage: String(p.stage) } : null;
+      const p = await tx.project.findUnique({
+        where: { id: projectId },
+        select: { id: true, name: true, stage: true, continuousRun: true, capUsd: true },
+      });
+      // ADR-0012 CR-a2: the mode and the budget cap for the pre-flight. `cap_usd` is a Decimal; Number() is exact
+      // enough for a display value (12,6 fits a double's integer range).
+      return p ? { id: p.id, name: p.name, stage: String(p.stage), continuousRun: p.continuousRun === true, capUsd: Number(p.capUsd) } : null;
     });
   }
 
@@ -108,9 +113,11 @@ export class PrismaRequirementsStore implements RequirementsStore {
       });
       await tx.requirementsDoc.updateMany({ where: { projectId: pid, status: "draft" }, data: { status: "superseded" } });
       const doc = await tx.requirementsDoc.create({
-        data: { projectId: pid, version: docVersion, repoPath: input.repoPath, status: "draft" },
+        data: { projectId: pid, version: docVersion, repoPath: input.repoPath, status: "draft", ...(input.preflight ? { preflight: input.preflight } : {}) },
         select: { id: true },
       });
+      // ADR-0012 rule 4: a new version in continuous-run mode re-opens the pre-flight, under the same project lock.
+      if (input.preflight) await tx.project.update({ where: { id: pid }, data: { preflightState: "pending" }, select: { id: true } });
 
       // Milestones by ordinal; earlier ones absent now are kept (no deletion) and reported.
       const oldMs: { id: string; ordinal: number }[] = await tx.milestone.findMany({ where: { projectId: pid }, select: { id: true, ordinal: true } });
