@@ -24,7 +24,8 @@ export function parseArgs(argv) {
   }
   // A ref starting with "-" would be read by git log as an option.
   if (typeof base !== "string" || !REF.test(base) || base.startsWith("-")) throw new Error("--base must be a git ref");
-  if (typeof repo !== "string" || !repo) throw new Error("--repo must be a path");
+  // gitleaks would read a leading "-" as one of its own flags (pre-review r2).
+  if (typeof repo !== "string" || !repo || repo.startsWith("-")) throw new Error("--repo must be a path");
   return { base, repo };
 }
 

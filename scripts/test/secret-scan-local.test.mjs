@@ -120,6 +120,8 @@ test("DEVOS-197: argument parsing defaults to origin/main and refuses option-lik
   assert.throws(() => parseArgs(["--base", "-p"]), /git ref/);
   assert.throws(() => parseArgs(["--base", "a b"]), /git ref/);
   assert.throws(() => parseArgs(["--base"]), /git ref/);
+  assert.deepEqual(parseArgs(["--repo", "/tmp/x"]), { base: "origin/main", repo: "/tmp/x" });
+  assert.throws(() => parseArgs(["--repo", "--config=weak.toml"]), /must be a path/);
 });
 
 test("DEVOS-197: the local gitleaks pin is the CI pin, and a checksum mismatch installs nothing", async () => {
