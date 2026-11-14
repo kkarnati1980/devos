@@ -378,3 +378,36 @@ test("DEVOS-205 (memory store): approving a doc without a pre-flight on a pendin
     assert.equal(s.store.preflightState.get(P1), after);
   }
 });
+
+test("DEVOS-204 (memory store): a later KK comment re-answers one item; the earlier row stays; nothing pauses; re-runs add nothing", async () => {
+  const s = setup({ continuousRun: true });
+  const r = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  const decidedAt = new Date("2026-11-14T10:00:00Z");
+  const card = { id: r.approvalId, gate: "requirements", status: "approved", decidedAt };
+  assert.equal(await s.pipeline.applyDecision(card, ["PF-1: yes"]), "approved");
+  const before = s.store.decisions.map((d) => ({ ...d }));
+  const comments = [
+    { id: "c0", body: "PF-1: yes", createdAt: decidedAt },
+    { id: "c1", body: "PF-1: no", createdAt: new Date("2026-11-14T11:00:00Z") },
+  ];
+  const seen = new Date("2026-11-14T11:00:00Z");
+  assert.equal(await s.pipeline.applyReanswers(card, comments, seen), 1);
+  assert.equal(s.store.decisions.length, before.length + 1);
+  assert.deepEqual(s.store.decisions.slice(0, before.length), before, "the approval rows stay as they were");
+  const added = s.store.decisions.at(-1);
+  assert.deepEqual({ itemId: added.itemId, answer: added.answer, source: added.source, commentId: added.commentId, approvalId: added.approvalId }, { itemId: "PF-1", answer: "no", source: "kk", commentId: "c1", approvalId: null });
+  assert.equal(s.store.preflightState.get(P1), "approved", "running work is not paused");
+  assert.equal(s.store.answersSyncedAt.get(s.store.docs.at(-1).id).getTime(), seen.getTime());
+  // A re-run is a no-op, and the cursor never moves back.
+  assert.equal(await s.pipeline.applyReanswers(card, comments, new Date("2026-11-14T10:30:00Z")), 1);
+  assert.equal(s.store.decisions.length, before.length + 1);
+  assert.equal(s.store.answersSyncedAt.get(s.store.docs.at(-1).id).getTime(), seen.getTime());
+  // Not applied: a draft doc, a rejected or undecided card, another gate.
+  assert.equal(await s.pipeline.applyReanswers({ ...card, status: "rejected" }, comments, seen), null);
+  assert.equal(await s.pipeline.applyReanswers({ ...card, decidedAt: null }, comments, seen), null);
+  assert.equal(await s.pipeline.applyReanswers({ ...card, gate: "decision" }, comments, seen), null);
+  const d = setup({ continuousRun: true });
+  const rd = await d.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(await d.pipeline.applyReanswers({ ...card, id: rd.approvalId }, comments, seen), null);
+  assert.equal(d.store.decisions.length, 0);
+});

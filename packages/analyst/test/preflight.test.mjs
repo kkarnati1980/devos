@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseSpec } from "@devos/intake";
-import { analyzeSpec, buildPreflight, preflightEntries, preflightLine, PreflightError, SECRET_DEFAULT } from "../dist/index.js";
+import { analyzeSpec, buildPreflight, preflightEntries, preflightLine, preflightReanswers, PreflightError, SECRET_DEFAULT } from "../dist/index.js";
 
 // Same one-line rule as M2.3 parseCard (apps/api/src/approvals.ts ONE_LINE), pinned here as in route.test.mjs.
 const ONE_LINE = new RegExp("^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]+$");
@@ -106,4 +106,30 @@ test("AT5b (pure half): control and bidi characters become spaces, and a cut nev
     const c = e2.charCodeAt(i);
     if (c >= 0xd800 && c <= 0xdbff) assert.ok(i + 1 < e2.length && e2.charCodeAt(i + 1) >= 0xdc00 && e2.charCodeAt(i + 1) <= 0xdfff, "lone high surrogate");
   }
+});
+
+test("DEVOS-204: a later `PF-1: no` after an approval with `PF-1: yes` gives one kk row for PF-1 only", () => {
+  const items = [
+    { id: "PF-1", kind: "decision", text: "Public URL?", default: "no — tailnet only" },
+    { id: "PF-2", kind: "decision", text: "Budget", default: "USD 15" },
+    { id: "PF-3", kind: "secret", text: "PAYMENTS_KEY", default: "enter in setup wizard" },
+  ];
+  const approved = [
+    { itemId: "PF-1", answer: "yes" },
+    { itemId: "PF-2", answer: "USD 15" },
+  ];
+  const rows = preflightReanswers(items, approved, [{ id: "c1", body: "Changed my mind.\nPF-1: no\nPF-2: USD 15\nPF-3: abc\nPF-9: x" }]);
+  assert.deepEqual(rows, [{ commentId: "c1", itemId: "PF-1", text: "Public URL?", answer: "no", source: "kk" }]);
+  // Deterministic: the same input gives the same rows; an unchanged answer, a secret or an unknown id gives none.
+  assert.deepEqual(preflightReanswers(items, approved, [{ id: "c1", body: "Changed my mind.\nPF-1: no\nPF-2: USD 15\nPF-3: abc\nPF-9: x" }]), rows);
+  assert.deepEqual(preflightReanswers(items, approved, [{ id: "c2", body: "PF-1: yes\nPF-1:   \nnote" }]), []);
+  // Each comment is read in order against the current answer: no, then back to yes, gives two rows.
+  const twice = preflightReanswers(items, approved, [
+    { id: "c1", body: "PF-1: no" },
+    { id: "c2", body: "PF-1: no" },
+    { id: "c3", body: "PF-2: USD 30\nPF-1: yes" },
+  ]);
+  assert.deepEqual(twice.map((r) => [r.commentId, r.itemId, r.answer]), [["c1", "PF-1", "no"], ["c3", "PF-1", "yes"], ["c3", "PF-2", "USD 30"]]);
+  // Within one comment the last line for an id wins; an item missing from the approval rows starts at its default.
+  assert.deepEqual(preflightReanswers(items, [], [{ id: "c4", body: "PF-2: USD 20\nPF-2: USD 15" }]), []);
 });

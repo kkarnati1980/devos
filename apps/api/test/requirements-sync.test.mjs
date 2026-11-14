@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { MemoryRequirementsStore } from "@devos/analyst";
 import { Approvals, MemoryApprovalStore } from "../dist/approvals.js";
 import { requirementsServices } from "../dist/runtime.js";
+import { syncApproval } from "../dist/requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, SYNC_DEFAULT_MS, SYNC_MIN_MS, SYNC_MAX_MS } from "../dist/requirements-sync.js";
 
 const P1 = "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d";
@@ -234,4 +235,99 @@ test("AT-Q3 (DEVOS-166) concurrent submissions each make their own scan", async 
   // Three submissions, one scan each (two statuses per scan), even two at once for the same project.
   assert.equal(reads.filter((p) => p === P1).length, 4);
   assert.equal(reads.filter((p) => p === P2).length, 2);
+});
+
+test("DEVOS-204: approval counts only comments up to the decision; a later `PF-1: no` is a re-answer on the next tick", async () => {
+  const store = new MemoryRequirementsStore();
+  store.addProject({ id: P1, name: "Shop", stage: "intake", continuousRun: true, capUsd: 15 });
+  const approvalStore = new MemoryApprovalStore();
+  const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
+  const svc = requirementsServices(store, approvals, approvalStore);
+  const r = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.ok(r.preflight?.length, "continuous-run spec has a pre-flight");
+  const decidedAt = new Date(Date.now() - 600_000);
+  const card = approvalStore.cards.get(r.approvalId);
+  card.status = "approved";
+  card.decidedAt = decidedAt;
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: yes", new Date(decidedAt.getTime() - 1000));
+  // Posted after the decision but before the approval sync ran: it must not count as the approval's answer.
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: no", new Date(decidedAt.getTime() + 60_000));
+  let reanswerCalls = 0;
+  const lister = {
+    async draftsAwaitingDecision() {
+      const d = await store.latestDoc(P1);
+      return d.status === "draft" ? [P1] : [];
+    },
+    async reanswersAwaiting() {
+      reanswerCalls++;
+      const d = await store.latestDoc(P1);
+      return d.status === "approved" ? [P1] : [];
+    },
+  };
+  const job = new RequirementsSyncJob(svc, lister, () => {}, 60_000);
+  assert.equal(await job.tick(), 1);
+  const items = r.preflight.filter((i) => i.kind === "decision");
+  const pf1 = () => store.decisions.filter((d) => d.itemId === "PF-1");
+  // The first tick approves with `yes` (only comments up to the decision count, though `no` already exists).
+  assert.equal(store.decisions.filter((d) => d.approvalId === r.approvalId).length, items.length);
+  assert.deepEqual(pf1().map((d) => [d.answer, d.source]), [["yes", "kk"]]);
+  // The next tick reads the later comment as a re-answer: one new kk row; the state stays approved.
+  assert.equal(await job.tick(), 1);
+  assert.deepEqual(pf1().map((d) => [d.answer, d.source, d.approvalId === r.approvalId]), [["yes", "kk", true], ["no", "kk", false]]);
+  assert.equal(store.decisions.length, items.length + 1);
+  assert.equal(store.preflightState.get(P1), "approved");
+  // Another tick adds nothing; a new comment changing PF-2 adds one row for PF-2 only.
+  assert.equal(await job.tick(), 1);
+  assert.equal(store.decisions.length, items.length + 1);
+  await approvalStore.comment(r.approvalId, "kk", "PF-2: USD 40", new Date(Date.now() - 40_000));
+  assert.equal(await job.tick(), 1);
+  assert.equal(store.decisions.length, items.length + 2);
+  assert.deepEqual(store.decisions.at(-1).itemId, "PF-2");
+  assert.equal(store.decisions.at(-1).answer, "USD 40");
+  assert.ok(reanswerCalls >= 3);
+  // A comment younger than REANSWER_SETTLE_MS is not read yet: nothing is written and the cursor stays.
+  const docId = (await store.latestDoc(P1)).id;
+  const cursor = store.answersSyncedAt.get(docId).getTime();
+  await approvalStore.comment(r.approvalId, "kk", "PF-2: USD 50", new Date());
+  assert.equal(await job.tick(), 1);
+  assert.equal(store.decisions.length, items.length + 2);
+  assert.equal(store.answersSyncedAt.get(docId).getTime(), cursor);
+});
+
+test("DEVOS-204 (Codex PR130-r1): a comment that commits late with an earlier time never leaves a stale change row", async () => {
+  const store = new MemoryRequirementsStore();
+  store.addProject({ id: P1, name: "Shop", stage: "intake", continuousRun: true, capUsd: 15 });
+  const approvalStore = new MemoryApprovalStore();
+  const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
+  const svc = requirementsServices(store, approvals, approvalStore);
+  const r = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  const t0 = Date.parse("2026-11-14T10:00:00Z");
+  const card = approvalStore.cards.get(r.approvalId);
+  card.status = "approved";
+  card.decidedAt = new Date(t0);
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: yes", new Date(t0));
+  await syncApproval(svc, P1, new Date(t0 + 60_000));
+  const base = store.decisions.length;
+  // B (PF-1: no, at t0+100 s) is visible; A (PF-1: no, at t0+95 s) has not committed yet. A sync 10 s after B reads
+  // neither (both are inside the settle window), so no row can come from B alone.
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: no", new Date(t0 + 100_000));
+  await syncApproval(svc, P1, new Date(t0 + 110_000));
+  assert.equal(store.decisions.length, base);
+  // A commits (within the 10 s bound); once both are settled, A is the change and B is unchanged: exactly one row.
+  approvalStore.commentsList.splice(approvalStore.commentsList.length - 1, 0, { id: "a-late", approvalId: r.approvalId, author: "kk", body: "PF-1: no", createdAt: new Date(t0 + 95_000) });
+  await syncApproval(svc, P1, new Date(t0 + 140_000));
+  const pf1 = store.decisions.filter((d) => d.itemId === "PF-1" && d.approvalId === null);
+  assert.deepEqual(pf1.map((d) => [d.commentId, d.answer]), [["a-late", "no"]]);
+  assert.equal(store.decisions.length, base + 1);
+});
+
+test("DEVOS-204: a failing re-answer list is logged and the approvals of the tick still run", async () => {
+  const { svc, approvalStore, lister } = wire();
+  const r = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  approvalStore.cards.get(r.approvalId).status = "approved";
+  const logs = [];
+  const job = new RequirementsSyncJob(svc, { ...lister, reanswersAwaiting: async () => { throw new Error("db down"); } }, (e) => logs.push(e), 60_000);
+  assert.equal(await job.tick(), 1);
+  assert.equal((await svc.store.latestDoc(P1)).status, "approved");
+  assert.deepEqual(logs, [{ level: "warn", msg: "requirements-sync-failed", projectId: "*" }]);
 });

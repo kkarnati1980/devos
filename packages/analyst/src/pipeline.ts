@@ -6,7 +6,7 @@ import { ingest as defaultIngest, IngestError, type IngestResult, type SpecFileF
 import { analyzeSpec, type Analysis, type Priority } from "./analyze.js";
 import { assistAnalysis, type ModelRunner } from "./assist.js";
 import { renderRequirementsMd } from "./render.js";
-import { BUDGET_TEXT, PUBLIC_URL_TEXT, buildPreflight, preflightDecisions, preflightLine, type PreflightDecisionRow, type PreflightItem } from "./preflight.js";
+import { BUDGET_TEXT, PUBLIC_URL_TEXT, buildPreflight, preflightDecisions, preflightLine, preflightReanswers, type PreflightDecisionRow, type PreflightItem, type PreflightReanswerRow } from "./preflight.js";
 import { CARD_REASON_MAX, planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
 
 export type SpecSourceFormat = SpecFileFormat | "paste";
@@ -109,6 +109,15 @@ export interface RequirementsStore {
    * without it leaves the state as it is.
    */
   rejectPreflight?(docId: string): Promise<boolean>;
+  /** DEVOS-204: the rows written with this approval (`approval_id`), any order. Optional with `recordReanswers`. */
+  approvalDecisions?(approvalId: string): Promise<{ itemId: string; answer: string }[]>;
+  /**
+   * DEVOS-204: writes re-answer rows (`comment_id` set, `approval_id` null) for the approved `docId`, skipping any
+   * (comment, item) already written, and moves the doc's re-answer cursor forward to `seenUpTo` (never back).
+   * Never changes `preflight_state` or any task (rule 3: running work does not stop). False when the doc is not
+   * approved (nothing is written).
+   */
+  recordReanswers?(docId: string, rows: readonly PreflightReanswerRow[], seenUpTo: Date | null): Promise<boolean>;
 }
 
 /** An M2.3 `CardInput` for the requirements gate; the port is `Approvals.raiseCard(card, [])`. */
@@ -429,5 +438,27 @@ export class RequirementsPipeline {
     // ADR-0012 rule 3: every decision item gets KK's answer or its default, written with the approval.
     const decisions = doc.preflight ? { approvalId: card.id, rows: preflightDecisions(doc.preflight, comments) } : undefined;
     return (await this.ports.store.approveDoc(doc.id, decisions)) ? "approved" : "ignored";
+  }
+
+  /**
+   * DEVOS-204 (ADR-0012 rule 3, last sentence): KK's comments on an approved intake card made after it was decided
+   * re-answer pre-flight items. `comments` are all of the card's comments, oldest first; only those created after
+   * `decidedAt` count (the approval counted the rest), so the result does not depend on when the sync ran. Returns
+   * the number of rows computed (the store skips any already written), or null when nothing applies.
+   */
+  async applyReanswers(
+    card: { id: string; gate: string; status: string; decidedAt: Date | null },
+    comments: readonly { id: string; body: string; createdAt: Date }[],
+    seenUpTo: Date | null,
+  ): Promise<number | null> {
+    const store = this.ports.store;
+    if (card.gate !== "requirements" || card.status !== "approved" || !card.decidedAt) return null;
+    if (!store.approvalDecisions || !store.recordReanswers) return null;
+    const doc = await store.docForApproval(card.id);
+    if (!doc || doc.status !== "approved" || !doc.preflight) return null;
+    const decidedAt = card.decidedAt.getTime();
+    const later = comments.filter((c) => c.createdAt.getTime() > decidedAt);
+    const rows = preflightReanswers(doc.preflight, await store.approvalDecisions(card.id), later);
+    return (await store.recordReanswers(doc.id, rows, seenUpTo)) ? rows.length : null;
   }
 }

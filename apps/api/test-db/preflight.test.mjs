@@ -137,3 +137,52 @@ test("DEVOS-208 (db): a new spec version with the mode off re-opens a rejected p
   await pipeline(store, []).submitSpec(ok.id, { kind: "paste", text: SPEC });
   assert.equal(await store.preflightState(ok.id), "approved");
 });
+
+test("DEVOS-204 (db): a later KK comment adds one kk row keyed by the comment; listed until read; earlier rows stay; state unchanged", async () => {
+  const p = await project();
+  const store = new PrismaRequirementsStore(db, 5000);
+  const pl = pipeline(store, []);
+  const r = await pl.submitSpec(p.id, { kind: "paste", text: SPEC });
+  const decidedAt = new Date(Date.now() - 600_000);
+  await db.approval.update({ where: { id: r.approvalId }, data: { status: "approved", decidedAt, decidedBy: "kk:test" } });
+  const card = { id: r.approvalId, gate: "requirements", status: "approved", decidedAt };
+  await db.approvalComment.create({ data: { approvalId: r.approvalId, author: "kk:test", body: "PF-1: yes", createdAt: decidedAt } });
+  assert.equal(await pl.applyDecision(card, ["PF-1: yes"]), "approved");
+  const before = await db.projectDecision.findMany({ where: { projectId: p.id }, orderBy: { itemId: "asc" } });
+  assert.ok(before.length >= 2 && before.every((d) => d.approvalId === r.approvalId && d.commentId === null));
+  assert.equal((await store.reanswersAwaiting(1000)).includes(p.id), false, "no comment after the decision: not listed");
+
+  const c1 = await db.approvalComment.create({ data: { approvalId: r.approvalId, author: "kk:test", body: "Thinking again.\nPF-1: no", createdAt: new Date(decidedAt.getTime() + 60_000) } });
+  assert.equal((await store.reanswersAwaiting(1000)).includes(p.id), true, "a later comment lists the project");
+  const comments = await db.approvalComment.findMany({ where: { approvalId: r.approvalId }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
+  assert.equal(await pl.applyReanswers(card, comments, c1.createdAt), 1);
+  // A re-run (same comments) is a no-op through the unique (comment, item) index.
+  assert.equal(await pl.applyReanswers(card, comments, new Date(decidedAt.getTime() + 30_000)), 1);
+  const after = await db.projectDecision.findMany({ where: { projectId: p.id }, orderBy: [{ createdAt: "asc" }, { itemId: "asc" }] });
+  assert.equal(after.length, before.length + 1);
+  const added = after.find((d) => d.commentId === c1.id);
+  assert.deepEqual([added.itemId, added.answer, added.source, added.approvalId], ["PF-1", "no", "kk", null]);
+  for (const b of before) assert.deepEqual(after.find((d) => d.id === b.id), b, "the approval rows are unchanged");
+  assert.equal((await db.project.findUnique({ where: { id: p.id } })).preflightState, "approved", "running work is not paused");
+  // The cursor moved to the comment and never moves back, so the project drops out of the list.
+  const doc = await db.requirementsDoc.findFirst({ where: { approvalId: r.approvalId } });
+  assert.equal(doc.answersSyncedAt.getTime(), c1.createdAt.getTime());
+  assert.equal((await store.reanswersAwaiting(1000)).includes(p.id), false);
+  // The project page's decision log for that card shows both PF-1 rows, oldest first.
+  const log = (await store.decisions(p.id, r.approvalId)).filter((d) => d.itemId === "PF-1");
+  assert.deepEqual(log.map((d) => [d.answer, d.source]), [["yes", "kk"], ["no", "kk"]]);
+  // Pre-review finding 1: two re-answers of one item in one pass share created_at; the log still ends with the newest.
+  const c2 = await db.approvalComment.create({ data: { approvalId: r.approvalId, author: "kk:test", body: "PF-1: maybe", createdAt: new Date(decidedAt.getTime() + 120_000) } });
+  const c3 = await db.approvalComment.create({ data: { approvalId: r.approvalId, author: "kk:test", body: "PF-1: yes", createdAt: new Date(decidedAt.getTime() + 180_000) } });
+  const all = await db.approvalComment.findMany({ where: { approvalId: r.approvalId }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
+  assert.equal(await pl.applyReanswers(card, all, c3.createdAt), 3);
+  const log2 = (await store.decisions(p.id, r.approvalId)).filter((d) => d.itemId === "PF-1");
+  assert.deepEqual(log2.map((d) => d.answer), ["yes", "no", "maybe", "yes"]);
+  assert.ok([c2.id, c3.id].every(Boolean));
+  // A draft doc is never written by recordReanswers.
+  const p2 = await project();
+  const r2 = await pl.submitSpec(p2.id, { kind: "paste", text: SPEC });
+  const d2 = await db.requirementsDoc.findFirst({ where: { approvalId: r2.approvalId } });
+  assert.equal(await store.recordReanswers(d2.id, [{ commentId: c1.id, itemId: "PF-1", text: "t", answer: "x", source: "kk" }], new Date()), false);
+  assert.equal(await db.projectDecision.count({ where: { projectId: p2.id } }), 0);
+});
