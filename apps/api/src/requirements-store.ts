@@ -45,6 +45,34 @@ export class PrismaRequirementsStore implements RequirementsStore {
     return rows.length ? rows[0]!.stage : null;
   }
 
+  /**
+   * M2.2-d3c2 (Codex PR88-r1): runs `fn` while holding the project row, so no submission can save a new version
+   * (`saveAnalysis` takes `FOR UPDATE` on the same row) until it returns. `FOR NO KEY UPDATE` still conflicts with
+   * that, but not with the `FOR KEY SHARE` a foreign-key insert takes, so `fn` may write rows that reference the
+   * project (the approvals core's audit rows) from its own transactions without waiting on this one.
+   *
+   * Codex PR88-r4: `fn`'s writes run in their own transactions, so a hold that times out would release the row while
+   * `fn` carries on. The hold therefore lasts the store's timeout plus `stepMs` (the longest one write of `fn` can
+   * take: its own transaction bound), and `fn` gets `assertHeld()`, which throws `project-hold-lapsed` unless a whole
+   * step still fits before the hold's deadline. Calling it before each write means every write `fn` starts also ends
+   * (commits or rolls back on its own bound) while the row is still held.
+   */
+  withProjectHeld<T>(projectId: string, fn: (assertHeld: () => void) => Promise<T>, stepMs = 0): Promise<T> {
+    const holdMs = this.timeoutMs + stepMs;
+    const started = performance.now();
+    const assertHeld = () => {
+      if (performance.now() + stepMs >= started + holdMs) throw new HoldLapsedError();
+    };
+    return this.db.$transaction(
+      async (tx: Tx) => {
+        await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(holdMs)}, true) AS statement_timeout`;
+        await tx.$queryRaw`SELECT 1 AS held FROM project WHERE id = ${projectId}::uuid FOR NO KEY UPDATE`;
+        return fn(assertHeld);
+      },
+      { timeout: holdMs, maxWait: this.timeoutMs },
+    );
+  }
+
   project(projectId: string): Promise<ProjectRow | null> {
     return this.tx(async (tx) => {
       const p = await tx.project.findUnique({ where: { id: projectId }, select: { id: true, name: true, stage: true } });
@@ -207,5 +235,13 @@ export class PrismaRequirementsStore implements RequirementsStore {
       });
       return true;
     });
+  }
+}
+
+/** The project hold's deadline is too near for another write (Codex PR88-r4): the pass stops, nothing more is expired. */
+export class HoldLapsedError extends Error {
+  constructor() {
+    super("project-hold-lapsed");
+    this.name = "HoldLapsedError";
   }
 }
