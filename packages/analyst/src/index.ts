@@ -49,6 +49,8 @@ export {
   RequirementsPipeline,
   ingestStatus,
   requirementsCard,
+  withholdPreflightText,
+  PREFLIGHT_WITHHELD_TEXT,
   type ApprovalDecisions,
   type DocRow,
   type DocStatus,

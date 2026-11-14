@@ -6,7 +6,7 @@ import { ingest as defaultIngest, IngestError, type IngestResult, type SpecFileF
 import { analyzeSpec, type Analysis, type Priority } from "./analyze.js";
 import { assistAnalysis, type ModelRunner } from "./assist.js";
 import { renderRequirementsMd } from "./render.js";
-import { buildPreflight, preflightDecisions, preflightLine, type PreflightDecisionRow, type PreflightItem } from "./preflight.js";
+import { BUDGET_TEXT, PUBLIC_URL_TEXT, buildPreflight, preflightDecisions, preflightLine, type PreflightDecisionRow, type PreflightItem } from "./preflight.js";
 import { CARD_REASON_MAX, planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
 
 export type SpecSourceFormat = SpecFileFormat | "paste";
@@ -177,8 +177,29 @@ function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-/** The requirements card. No spec text: only counts and the version, so it never trips the secret check. */
-export function requirementsCard(projectId: string, docVersion: number, a: Analysis, preflight?: readonly PreflightItem[] | null): RequirementsCard {
+/** Stands in for an open question's text when the approvals core refused the card (it may look like a secret). */
+export const PREFLIGHT_WITHHELD_TEXT = "question text withheld (the inbox could not accept it; it may look like a secret), see the project page";
+
+/**
+ * The pre-flight with every spec-derived question text replaced by {@link PREFLIGHT_WITHHELD_TEXT}. The fixed
+ * budget and public-URL texts, the defaults and the secret NAMES (`[A-Z][A-Z0-9_]*`, never a value) stay.
+ */
+export function withholdPreflightText(items: readonly PreflightItem[]): PreflightItem[] {
+  return items.map((i) => (i.kind === "decision" && i.text !== BUDGET_TEXT && i.text !== PUBLIC_URL_TEXT ? { ...i, text: PREFLIGHT_WITHHELD_TEXT } : { ...i }));
+}
+
+/**
+ * The requirements card. Off continuous-run mode it has no spec text: only counts and the version. In continuous-run
+ * mode (ADR-0012 CR-a) it also carries the pre-flight line, whose question texts come from the spec and can trip
+ * M2.3's secret check; `ensureCardFor` then retries once with `withhold` (question texts replaced).
+ */
+export function requirementsCard(
+  projectId: string,
+  docVersion: number,
+  a: Analysis,
+  preflight?: readonly PreflightItem[] | null,
+  opts: { withhold?: boolean } = {},
+): RequirementsCard {
   const by = { must: 0, should: 0, could: 0 };
   for (const r of a.requirements) by[r.priority] += 1;
   const proposed = a.requirements.filter((r) => r.proposed).length;
@@ -190,7 +211,7 @@ export function requirementsCard(projectId: string, docVersion: number, a: Analy
   if (preflight) {
     // ADR-0012 CR-a: the one intake card carries the pre-flight; action and target stay as they are.
     const room = CARD_REASON_MAX - lines.join("\n").length - 1;
-    const line = preflightLine(preflight, room);
+    const line = preflightLine(opts.withhold ? withholdPreflightText(preflight) : preflight, room);
     if (line) lines.push(line);
   }
   return {
@@ -353,10 +374,23 @@ export class RequirementsPipeline {
     let id: string;
     try {
       ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis, preflight)));
-    } catch {
-      // The doc stays a draft with no card and the result says so; submitting the spec again raises a fresh one.
-      warnings.push("card-failed");
-      return null;
+    } catch (e) {
+      const code = (e as { code?: unknown } | null)?.code;
+      // Pre-review CR-a2 #1: pre-flight question text the approvals core refuses (secret-shaped, or a shape it
+      // rejects) is retried once without it, as M2.2-c does for question cards. Without a pre-flight the card has
+      // no spec text, so a retry would be refused the same way.
+      const retry = preflight !== null && (code === "card-contains-secret" || code === "invalid-input");
+      if (!retry) {
+        // The doc stays a draft with no card and the result says so; submitting the spec again raises a fresh one.
+        warnings.push("card-failed");
+        return null;
+      }
+      try {
+        ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis, preflight, { withhold: true })));
+      } catch {
+        warnings.push("card-failed");
+        return null;
+      }
     }
     let linked = false;
     try {

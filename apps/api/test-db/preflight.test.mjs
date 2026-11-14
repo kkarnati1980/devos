@@ -89,3 +89,17 @@ test("AT3 (CR-a2, db): a project with the mode off and state approved (the backf
   assert.equal(await store.latestPreflight(p.id), null);
   assert.equal(await preflightOpen(p.id, store, { hasProject: async () => false }), true);
 });
+
+test("CR-a2 pre-review 2 (db): the sync lister picks up a rejected intake card until preflight_state is rejected", async () => {
+  const store = new PrismaRequirementsStore(db, 5000);
+  const rejected = await project();
+  const modeOff = await project({ continuousRun: false, preflightState: "approved" });
+  const r = await pipeline(store, []).submitSpec(rejected.id, { kind: "paste", text: SPEC });
+  const r0 = await pipeline(store, []).submitSpec(modeOff.id, { kind: "paste", text: SPEC });
+  await db.approval.updateMany({ where: { id: { in: [r.approvalId, r0.approvalId] } }, data: { status: "rejected", decidedAt: new Date(), decidedBy: "kk:test" } });
+  const ours = (ids) => ids.filter((id) => id === rejected.id || id === modeOff.id);
+  assert.deepEqual(ours(await store.draftsAwaitingDecision(1000)), [rejected.id], "rejected with a pre-flight is listed; mode off is not");
+  assert.equal(await pipeline(store, []).applyDecision({ id: r.approvalId, gate: "requirements", status: "rejected" }), "rejected");
+  assert.equal(await store.preflightState(rejected.id), "rejected");
+  assert.deepEqual(ours(await store.draftsAwaitingDecision(1000)), [], "once rejected it drops out of the batch");
+});

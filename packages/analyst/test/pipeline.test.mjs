@@ -281,6 +281,48 @@ test("AT2 (CR-a2): in continuous-run mode one requirements card carries the pre-
   assert.deepEqual(legacy.qCards.length, off.qCards.length);
 });
 
+test("AT5 (CR-a2, card half): a secret-shaped pre-flight question is retried without its text; a long pre-flight ends with +k more", async () => {
+  // Same shape as M2.3's looksSecret password/token/api-key rule (apps/api/src/notify.ts).
+  const SECRETISH = /\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S{6,}/i;
+  const VALUE = "zq81Lm0pXr";
+  const spec = SPEC.replace("- Which payment provider should we pay for?", `- Which payment provider should we pay for? Our old token: ${VALUE}`);
+  const tries = [];
+  const raiseReq = async (card) => {
+    tries.push(card);
+    if (SECRETISH.test(card.reason)) throw Object.assign(new Error("refused"), { code: "card-contains-secret" });
+    return { id: "00000000-0000-4000-8000-000000000099" };
+  };
+  const on = setup({ continuousRun: true, raiseReq, secretNames: async () => ["PAYMENTS_KEY"] });
+  const r = await on.pipeline.submitSpec(P1, { kind: "paste", text: spec });
+  assert.equal(tries.length, 2, "one refusal, one retry");
+  assert.ok(SECRETISH.test(tries[0].reason), "the first try carried the question text");
+  const card = tries[1];
+  assert.ok(!card.reason.includes(VALUE), "no secret value in the raised card");
+  assert.match(card.reason, /Pre-flight: \d+ questions, 1 secrets — PF-1: question text withheld/);
+  assert.match(card.reason, /secret PAYMENTS_KEY \(enter in setup wizard\)/);
+  assert.match(card.reason, /Monthly spend cap for this project/, "fixed texts stay");
+  assert.equal(card.action, "requirements.approve");
+  assert.ok(!r.warnings.includes("card-failed"));
+  assert.equal(on.qCards.length, 0);
+  assert.ok(on.store.docs.at(-1).approvalId, "the doc is linked to the one intake card");
+  // Any other refusal is not retried.
+  const other = setup({ continuousRun: true, raiseReq: async () => { throw Object.assign(new Error("x"), { code: "db-down" }); } });
+  const r2 = await other.pipeline.submitSpec(P1, { kind: "paste", text: spec });
+  assert.deepEqual(r2.warnings, ["card-failed"]);
+  // Mode off: the card has no spec text, so a refusal is not retried (as before CR-a2).
+  let offTries = 0;
+  const off = setup({ continuousRun: false, raiseReq: async () => { offTries++; throw Object.assign(new Error("x"), { code: "card-contains-secret" }); } });
+  await off.pipeline.submitSpec(P1, { kind: "paste", text: spec });
+  assert.equal(offTries, 1);
+  // A pre-flight longer than the 2,000-character reason ends with "+<k> more on the project page".
+  const many = Array.from({ length: 40 }, (_, i) => `- Which vendor should we pay for option ${i} of the monthly ${"plan ".repeat(12)}?`).join("\n");
+  const big = setup({ continuousRun: true });
+  await big.pipeline.submitSpec(P1, { kind: "paste", text: SPEC.replace("- Which payment provider should we pay for?", many) });
+  const reason = big.reqCards[0].reason;
+  assert.ok(reason.length <= 2000);
+  assert.match(reason, /; \+\d+ more on the project page$/);
+});
+
 test("AT4/AT6 (CR-a2, memory store): approval writes KK's answers and defaults with it; rejection closes; a new version re-opens", async () => {
   const s = setup({ continuousRun: true, secretNames: async () => ["PAYMENTS_KEY"] });
   const r = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });

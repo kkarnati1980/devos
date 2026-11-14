@@ -179,17 +179,22 @@ export class PrismaRequirementsStore implements RequirementsStore {
    * `limit` (the sync job's batch). Only approved cards are read, so drafts whose card is pending, rejected or expired
    * never fill the batch and starve newer projects (pre-review finding 2). Read-only; the job applies each decision
    * through `syncApproval`.
+   * ADR-0012 CR-a2 (pre-review finding 2): a draft whose intake card (with a pre-flight) was **rejected** is listed
+   * too while the project's `preflight_state` is not yet `rejected`, so the job closes the pre-flight unattended;
+   * once it is `rejected` the draft drops out again and never fills the batch.
    */
   draftsAwaitingDecision(limit: number): Promise<string[]> {
     const n = Math.max(1, Math.min(1000, Math.trunc(limit)));
     return this.tx(async (tx) => {
       const rows: { project_id: string }[] = await tx.$queryRaw`
         SELECT d.project_id::text AS project_id FROM (
-          SELECT DISTINCT ON (project_id) project_id, status, approval_id, created_at
+          SELECT DISTINCT ON (project_id) project_id, status, approval_id, created_at, preflight
           FROM requirements_doc ORDER BY project_id, version DESC
         ) d
-        JOIN approval a ON a.id = d.approval_id AND a.status = 'approved' AND a.gate = 'requirements'
+        JOIN approval a ON a.id = d.approval_id AND a.gate = 'requirements'
+        JOIN project p ON p.id = d.project_id
         WHERE d.status = 'draft'
+          AND (a.status = 'approved' OR (a.status = 'rejected' AND d.preflight IS NOT NULL AND p.preflight_state <> 'rejected'))
         ORDER BY d.created_at, d.project_id
         LIMIT ${n}`;
       return rows.map((r) => r.project_id);
