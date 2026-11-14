@@ -376,6 +376,7 @@ model Project {
   approvals          Approval[]
   resources          Resource[]
   provisionSteps     ProvisionStep[]
+  isolationStacks    IsolationStack[]
   vaultSecrets       VaultSecret[]
   memoryItems        MemoryItem[]
   auditEvents        AuditEvent[]
@@ -855,6 +856,28 @@ model ProvisionStep {
 
   @@unique([projectId, key])
   @@map("provision_step")
+}
+
+/// S4-a2a (docs/modules/S4.md): one row per project stack, recorded by the afterStack hook. The stack index and the
+/// subnet are unique across all stacks, so a colliding offset fails at the hook, never in the state document.
+model IsolationStack {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId String   @map("project_id") @db.Uuid
+  slug      String
+  env       String
+  idx       Int
+  network   String
+  subnet    String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
+
+  @@unique([projectId, env])
+  @@unique([idx])
+  @@unique([subnet])
+  @@unique([network])
+  @@map("isolation_stack")
 }
 
 model AppSettings {
