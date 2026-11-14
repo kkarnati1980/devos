@@ -125,6 +125,30 @@ export class PrismaQueueStore implements QueueStore {
     });
   }
 
+  /** BatchLister: projects with a waiting question, a `raising` batch or a refused batch not handed off. */
+  async projectsToFlush(limit: number): Promise<string[]> {
+    return this.tx(async (tx) => {
+      const rows = (await tx.$queryRaw`
+        SELECT DISTINCT "project_id" AS id FROM (
+          SELECT "project_id" FROM "queued_question" WHERE "batch_id" IS NULL
+          UNION ALL
+          SELECT "project_id" FROM "card_batch" WHERE "state" = 'raising' OR ("state" = 'refused' AND "handed_off_at" IS NULL)
+        ) AS w ORDER BY id LIMIT ${limit}`) as { id: string }[];
+      return rows.map((r) => r.id);
+    });
+  }
+
+  /** BatchLister: `raised` batches not applied whose card is no longer pending. */
+  async batchesToApply(limit: number): Promise<string[]> {
+    return this.tx(async (tx) => {
+      const rows = (await tx.$queryRaw`
+        SELECT b."id" AS id FROM "card_batch" b JOIN "approval" a ON a."id" = b."card_id"
+        WHERE b."state" = 'raised' AND b."applied_at" IS NULL AND a."status" <> 'pending'
+        ORDER BY b."created_at", b."id" LIMIT ${limit}`) as { id: string }[];
+      return rows.map((r) => r.id);
+    });
+  }
+
   async withBatchLock<T>(batchId: string, fn: () => Promise<T>): Promise<{ locked: true; value: T } | { locked: false }> {
     const ms = this.timeoutMs;
     const conn = await bounded(this.connectLock(), ms, "card_batch_lock_connect");
