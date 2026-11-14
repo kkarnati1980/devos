@@ -116,6 +116,13 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
     "src/z2.mjs": "const re = /`/;\nawait " + F + "(u);",
     "src/x1.mjs": `await ${F}(url, { timeoutMs: 300, ["timeoutMs"]: undefined });`,
     "src/x2.mjs": `await ${F}(url, { timeoutMs: 300, [k]: undefined });`,
+    // Codex PR99-r4: an accessor or method replaces timeoutMs at run time; a regex after `if (…)` hides nothing.
+    "src/x3.mjs": `await ${F}(url, { timeoutMs: 300, get timeoutMs() { return undefined; } });`,
+    "src/x4.mjs": `await ${F}(url, { timeoutMs: 300, timeoutMs() {} });`,
+    "src/x5.mjs": `await ${F}(url, { timeoutMs: 300, set x(v) {} });`,
+    "src/z3.mjs": "if (enabled) /`/.test(text);\nawait " + F + "(url);",
+    "src/z4.mjs": "function f() { return /`/.test(s); }\nawait " + F + "(u);",
+    "src/z5.mjs": "while (go()) /'/.test(s);\nawait " + F + "(u);",
   };
   for (const [rel, text] of Object.entries(bad)) write(rel, `const a = 1;\n${text}\n`);
   write("src/ok.mjs", [
@@ -133,6 +140,8 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
     `const half = total / 2 / 3; await ${F}(url, { timeoutMs: 1000 });`,
     `await ${F}(url, { ["x-other"]: 1, timeoutMs: 1000 });`,
     `await ${F}(url, { timeoutMs: 1000, ["x-other"]: 1 });`,
+    `const avg = (a + b) / 2 / n; await ${F}(url, { timeoutMs: 1000 });`,
+    "function g() { return /'/.test(s); } await " + F + "(url, { timeoutMs: 1000 });",
   ].join("\n") + "\n");
   write("src/lib/imp.mjs", `import { ${F}, SafeFetchError } from "../${M}.mjs"; // the F2 fetch\nawait ${F}(u, { timeoutMs: 500 });\n`);
   write(`src/${M}.mjs`, `export async function ${F}(input, opts = {}) {}\n`);

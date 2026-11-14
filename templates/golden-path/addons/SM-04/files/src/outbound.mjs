@@ -106,7 +106,19 @@ function regexCanStart(out, i) {
   while (k >= 0 && /\s/.test(out[k])) k--;
   if (k < 0) return true;
   if ("(,=:[!&|?{};+-*%<>~^".includes(out[k])) return true;
-  const word = /[A-Za-z_$][\w$]*$/.exec(out.slice(Math.max(0, k - 12), k + 1))?.[0];
+  // Codex PR99-r4: after the ")" that closes `if (…)`, `while (…)`, `for (…)` or `with (…)`, a statement starts,
+  // so "/" begins a regex there. Any other ")" ends an expression (a division follows).
+  if (out[k] === ")") {
+    let depth = 0, j = k;
+    for (; j >= 0; j--) {
+      if (out[j] === ")") depth++;
+      else if (out[j] === "(" && --depth === 0) break;
+    }
+    if (j < 0) return false;
+    const kw = /([A-Za-z_$][\w$]*)\s*$/.exec(out.slice(Math.max(0, j - 16), j).join(""))?.[1];
+    return ["if", "while", "for", "with"].includes(kw);
+  }
+  const word = /[A-Za-z_$][\w$]*$/.exec(out.slice(Math.max(0, k - 12), k + 1).join(""))?.[0];
   return ["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"].includes(word);
 }
 
@@ -145,6 +157,11 @@ function timeoutProblem(arg, rawArg = arg) {
     if (/^\[\s*(["'])\s*\1\s*\]\s*:/.test(x.code)) { m = /^\[\s*(["'])(.*?)\1\s*\]\s*:/.exec(x.raw); if (m) return m[2]; }
     return null;
   };
+  // Codex PR99-r4: a getter, setter or method (`get timeoutMs() {…}`) replaces an earlier timeoutMs at run time and
+  // is not a plain value, so any accessor or method in the options object is refused (fail closed).
+  const isAccessorOrMethod = (x) => /^(?:get|set|async|static)\s+[^\s:,=(]/.test(x.code) || x.code.startsWith("*") ||
+    /^(?:[A-Za-z_$][\w$]*|\[[^\]]*\]|(["'])\s*\1)\s*\(/.test(x.code);
+  if (props.some(isAccessorOrMethod)) return "options must hold only plain properties (no getter, setter or method)";
   const isTimeout = (x) => keyName(x) === "timeoutMs";
   const last = props.findLastIndex(isTimeout);
   if (last < 0) return "the options do not name timeoutMs";
