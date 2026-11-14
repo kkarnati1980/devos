@@ -322,6 +322,11 @@ test("content rules (DEVOS-189): the KK-only classifier paths are guard paths bu
   // The guard itself stays exempt: a suppression inside scripts/floor-guard/ is not a content hit.
   const own = check({ "scripts/floor-guard/x.mjs": "export const a = 1;\n" }, { "scripts/floor-guard/x.mjs": "export const a = 1; // eslint-disable-line\n" });
   assert.ok(!rules(own).includes("suppression-added"));
+  // So do its test file and its workflow, named explicitly (not by list position).
+  for (const ex of ["scripts/test/floor-guard.test.mjs", ".github/workflows/floor-guard.yml"]) {
+    const r = check({ [ex]: "a: 1\n" }, { [ex]: "a: 1 # eslint-disable-line\n" });
+    assert.ok(!rules(r).includes("suppression-added"), ex);
+  }
 });
 
 test("dispositions: Keep only from a Codex verdict on the same SHA naming id and file:line; a new SHA voids it", () => {

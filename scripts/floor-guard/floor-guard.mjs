@@ -24,7 +24,7 @@ export const GUARD_PATHS = [
 // Exempt from the content rules: only the guard itself, whose tests hold the very patterns it matches. The KK-only
 // classifier and its table are guard paths but NOT exempt, so a suppression, a skipped test or a deleted test there
 // is still a hit (DEVOS-189 pre-review, note 0022).
-const CONTENT_EXEMPT = GUARD_PATHS.slice(0, 3);
+const CONTENT_EXEMPT = [/^scripts\/floor-guard\//, /^scripts\/test\/floor-guard\.test\.mjs$/, /^\.github\/workflows\/floor-guard\.yml$/];
 const GUARD_COMPANIONS = [/^docs\/decisions\/[^/]+\.md$/, /^docs\/modules\/GI-1\.md$/];
 
 const CODE = /\.(m?[jt]sx?|c[jt]s|sh|bash|ya?ml|json|py)$/;
