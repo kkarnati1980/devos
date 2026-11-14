@@ -2,12 +2,12 @@
 // queue and can be retried.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "../src/server.mjs";
 import { loadConfig } from "../src/config.mjs";
-import { createQueue, deadLetterRoutes, fileStore, memoryStore, JobTimeout } from "../src/queue.mjs";
+import { createQueue, deadLetterRoutes, fileStore, memoryStore, JobTimeout, writeFully } from "../src/queue.mjs";
 
 const fast = { backoffMs: [0], timeoutMs: 1000 };
 
@@ -220,4 +220,39 @@ test("SM-05-L1: set-up is checked", () => {
   assert.throws(() => createQueue({ handlers: { "a.b": async () => {} }, timeoutMs: 0 }), /timeoutMs/);
   assert.throws(() => createQueue({ handlers: { "a.b": async () => {} }, backoffMs: [] }), /backoffMs/);
   assert.throws(() => fileStore(""), /path is required/);
+});
+
+test("SM-05-L1: fileStore writes the whole file even when a write is short, and a failed write keeps the old file (Codex PR104-r4)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sm05-"));
+  try {
+    const path = join(dir, "jobs.json");
+    const job = { id: "33333333-3333-4333-8333-333333333333", type: "pdf.render", payload: { note: "ünïcode ✓" }, status: "queued", attempts: 0, runAfter: 0, enqueuedAt: "2026-11-14T00:00:00.000Z" };
+    // Short writes: at most 7 bytes per call. The file must still hold the complete list.
+    const calls = [];
+    const shortWrite = (fd, buf, off, len) => { calls.push(len); return writeSync(fd, buf, off, Math.min(len, 7)); };
+    fileStore(path, { write: shortWrite }).save([job]);
+    assert.ok(calls.length > 1, "the write was split into several short writes");
+    assert.deepEqual(fileStore(path).load(), [job]);
+    // A write that stops making progress (storage full): save throws, the old file is unchanged, no temp file is left.
+    const before = readFileSync(path, "utf8");
+    let n = 0;
+    const fullDisk = (fd, buf, off, len) => (n++ === 0 ? writeSync(fd, buf, off, Math.min(len, 5)) : 0);
+    assert.throws(() => fileStore(path, { write: fullDisk }).save([job, { ...job, id: "44444444-4444-4444-8444-444444444444" }]), /short write/);
+    assert.equal(readFileSync(path, "utf8"), before);
+    assert.deepEqual(readdirSync(dir), ["jobs.json"]);
+    // A write that throws (EIO, ENOSPC) is reported the same way.
+    const throwing = () => { const e = new Error("no space left on device"); e.code = "ENOSPC"; throw e; };
+    assert.throws(() => fileStore(path, { write: throwing }).save([]), /no space/);
+    assert.equal(readFileSync(path, "utf8"), before);
+    assert.deepEqual(readdirSync(dir), ["jobs.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SM-05-L1: writeFully refuses a write that returns no progress instead of looping", () => {
+  assert.throws(() => writeFully(0, Buffer.from("abc"), () => 0), /short write \(0 of 3 bytes\)/);
+  const parts = [];
+  writeFully(0, Buffer.from("abcdef"), (fd, buf, off, len) => { parts.push(buf.subarray(off, off + 2).toString()); return Math.min(2, len); });
+  assert.deepEqual(parts, ["ab", "cd", "ef"]);
 });

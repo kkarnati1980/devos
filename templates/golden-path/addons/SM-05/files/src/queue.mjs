@@ -1,7 +1,7 @@
 // SM-05 add-on: background work (docs/modules/S3.md, "S3-b5 SM-05 build notes").
 // SM-05-L1: work over about 2 s runs from a queue; a poisoned job lands in the dead-letter list and can be retried.
 // No dependency: one process, one queue, jobs kept in a store. `fileStore(path)` keeps them across restarts.
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -33,7 +33,21 @@ function syncDir(dir) {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-export function fileStore(path) {
+/**
+ * Write the whole buffer: writeSync may write fewer bytes than asked (e.g. when storage fills), so loop until every
+ * byte is written. A write that makes no progress throws instead of looping forever (Codex PR104-r4).
+ */
+export function writeFully(fd, buf, write = writeSync) {
+  let off = 0;
+  while (off < buf.length) {
+    const n = write(fd, buf, off, buf.length - off);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`fileStore: short write (${off} of ${buf.length} bytes)`);
+    off += n;
+  }
+}
+
+// `write` is a test seam (default writeSync); apps pass only the path.
+export function fileStore(path, { write = writeSync } = {}) {
   if (typeof path !== "string" || !path) throw new TypeError("fileStore: path is required");
   return {
     load() {
@@ -53,8 +67,16 @@ export function fileStore(path) {
       }
       const tmp = `${path}.${process.pid}.tmp`;
       // fsync before the rename, so after a power loss the file holds the old list or the new one.
+      // The full UTF-8 buffer is written (writeFully) before the rename; on any failure the temporary file is removed
+      // and the error is thrown, so the previous file is kept unchanged (Codex PR104-r4).
+      const buf = Buffer.from(JSON.stringify(all), "utf8");
       const fd = openSync(tmp, "w", 0o600);
-      try { writeSync(fd, JSON.stringify(all)); fsyncSync(fd); } finally { closeSync(fd); }
+      try {
+        try { writeFully(fd, buf, write); fsyncSync(fd); } finally { closeSync(fd); }
+      } catch (e) {
+        try { unlinkSync(tmp); } catch { /* already gone */ }
+        throw e;
+      }
       renameSync(tmp, path);
       syncDir(dir); // the rename is durable only once the directory is fsynced (Codex PR104-r1)
     },
