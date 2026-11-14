@@ -255,6 +255,11 @@ export class PrismaRequirementsStore implements RequirementsStore {
           skipDuplicates: true,
         });
         await tx.project.update({ where: { id: d.projectId }, data: { preflightState: "approved" }, select: { id: true } });
+      } else {
+        // DEVOS-205: a doc without a pre-flight (written before CR-a2, or by old code in the deploy window) on a
+        // project left `pending`: approving it is the whole intake decision, so the state opens too. A `rejected`
+        // or already `approved` state is left as it is.
+        await tx.project.updateMany({ where: { id: d.projectId, preflightState: "pending" }, data: { preflightState: "approved" } });
       }
       return true;
     });

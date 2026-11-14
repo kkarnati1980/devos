@@ -120,6 +120,9 @@ export class MemoryRequirementsStore implements RequirementsStore {
         this.decisions.push({ projectId: d.projectId, approvalId: decisions.approvalId, ...row });
       }
       this.preflightState.set(d.projectId, "approved");
+    } else if (this.preflightState.get(d.projectId) === "pending") {
+      // DEVOS-205: a doc without a pre-flight on a `pending` project: its approval opens the state (as Prisma).
+      this.preflightState.set(d.projectId, "approved");
     }
     return true;
   }
