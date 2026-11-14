@@ -144,3 +144,5 @@ Run the existing Codex review automatically on every new PR head, so a review no
 - `node --test --test-concurrency=1 scripts/test/review-watch.test.mjs` exits 0 on the merged SHA (AT14–AT21, HB1–HB3).
 - `bash -n scripts/review/review-watch.sh` and `bash -n scripts/review/install-review-watch.sh` exit 0.
 - After the server agent installs the merged script, the next runner failure that ends in under 120 s shows `codex-review` = pending with "attempt 1 of 3" on that head, and the `codex-review-watch` heartbeat on main is at most 2 hours old.
+
+**Codex PR94-r2 (1 medium; fixed, 14 Nov 2026):** the `<sha>.retry-closed` marker was never cleared, so a SHA whose pending retry was closed once, then became a PR head again and failed again, kept its new "retry in …" status for ever after the PR closed a second time. A new pending retry now removes the marker, so each pending retry gets its own close. AT21 (pre-review L2) now covers reopen → failed retry → close again: the marker is cleared, the second pending retry is closed, and only once.

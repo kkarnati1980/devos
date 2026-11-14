@@ -307,6 +307,8 @@ review_one() {  # pr sha contract
       wait=$(( REVIEW_RETRY_BASE << (fails - 1) )); (( wait <= REVIEW_RETRY_CAP )) || wait=$REVIEW_RETRY_CAP
       echo "$fails" > "$STATE/$sha.fails"
       echo "$(( $(date +%s) + wait ))" > "$STATE/$sha.retry_at"
+      # Codex PR94-r2: a new pending retry needs its own close if the SHA is superseded again later.
+      rm -f "$STATE/$sha.retry-closed"
       set_status "$sha" pending "Codex review $label could not run (attempt $fails of $REVIEW_RETRY_MAX); retry in $((wait / 60)) min" || true
       log "PR #$pr ${sha:0:7}: runner failed (exit $rc) after ${elapsed}s, attempt $fails of $REVIEW_RETRY_MAX; retry in ${wait}s"
       return 0

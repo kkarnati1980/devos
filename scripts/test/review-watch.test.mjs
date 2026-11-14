@@ -463,4 +463,17 @@ test("AT21 (pre-review L2): a pending retry whose SHA is no longer a PR head is 
   await tick([], { REVIEW_RUNNER: "/bin/false" });
   assert.equal(closes().length, 1, "closed once");
   assert.equal(M.comments.length, 0);
+  // Codex PR94-r2: the PR reopens on the same SHA, the due retry fails again (a new pending status), and the PR
+  // closes again: that new pending retry is closed too, once.
+  M.prs = [{ number: 45, draft: false, user: { login: "kkarnati1980" }, head: { sha: old, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/M45.md" }];
+  fs.writeFileSync(path.join(ws, `${old}.retry_at`), "0\n");
+  const pend = () => M.statuses.filter((x) => x.sha === old && x.state === "pending" && /attempt 2 of/.test(x.description));
+  await tick([], { REVIEW_RUNNER: "/bin/false" });
+  assert.equal(pend().length, 1, "attempt 2 failed and posted a pending retry");
+  assert.ok(!fs.existsSync(path.join(ws, `${old}.retry-closed`)), "the old close marker is cleared by the new pending retry");
+  M.prs = [];
+  await tick([], { REVIEW_RUNNER: "/bin/false" });
+  assert.equal(closes().length, 2, "the second pending retry is closed as well");
+  await tick([], { REVIEW_RUNNER: "/bin/false" });
+  assert.equal(closes().length, 2, "and only once");
 });
