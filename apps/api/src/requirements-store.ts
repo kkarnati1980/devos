@@ -119,6 +119,9 @@ export class PrismaRequirementsStore implements RequirementsStore {
       });
       // ADR-0012 rule 4: a new version in continuous-run mode re-opens the pre-flight, under the same project lock.
       if (input.preflight) await tx.project.update({ where: { id: pid }, data: { preflightState: "pending" }, select: { id: true } });
+      // DEVOS-208: so does a new version with the mode off (a pre-flight rejected while the mode was on would
+      // otherwise stay rejected for good); only a rejected state moves, approved stays approved.
+      else await tx.project.updateMany({ where: { id: pid, preflightState: "rejected" }, data: { preflightState: "pending" } });
 
       // Milestones by ordinal; earlier ones absent now are kept (no deletion) and reported.
       const oldMs: { id: string; ordinal: number }[] = await tx.milestone.findMany({ where: { projectId: pid }, select: { id: true, ordinal: true } });
