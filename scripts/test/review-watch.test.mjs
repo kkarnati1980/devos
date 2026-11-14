@@ -557,6 +557,19 @@ test("AT22: a PASS with FLOOR-GUARD KEEP re-runs the failed ci-gate run once; a 
   const rh2 = await tick([], { REVIEW_RUNNER: keep });
   assert.doesNotMatch(rh2.out, /ci-gate/);
   assert.deepEqual(M.reruns, []);
+  // Codex PR121-r1 (low): with no ci-gate run to re-run (floor-guard red alone), --dry-run writes no marker.
+  reset();
+  const sha5 = "6a".repeat(20);
+  M.runs = [runs[0], { ...runs[1], conclusion: "success" }];
+  M.prs = [{ number: 122, draft: false, user: { login: "kkarnati1980" }, head: { sha: sha5, repo: { full_name: "kkarnati1980/devos" } }, body: "Review-Contract: docs/modules/S4.md" }];
+  const marker5 = path.join(dir, "watch", `${sha5}.cigate-rerun`);
+  await tick([], { REVIEW_RUNNER: keep });
+  assert.ok(fs.existsSync(marker5), "a real tick marks it done");
+  fs.rmSync(marker5);
+  const rd5 = await tick(["--dry-run"], { REVIEW_RUNNER: keep });
+  assert.match(rd5.out, /no ci-gate run to re-run/);
+  assert.ok(!fs.existsSync(marker5), "--dry-run writes no marker");
+  assert.deepEqual(M.reruns, []);
   // A PASS without Keeps on such a head re-runs nothing (ci-gate would fail again).
   reset();
   const sha2 = "2e".repeat(20);

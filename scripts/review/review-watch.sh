@@ -4,7 +4,7 @@
 # v1.6.0 (DEVOS-195): a head whose only red runs are the floor-guard and ci-gate workflows (matched by file path,
 #   conclusion failure, floor-guard among them) is reviewed, so Codex can write FLOOR-GUARD KEEP lines. After a
 #   PASS with a KEEP line on such a head, the failed ci-gate run is re-run once (token needs Actions: write;
-#   a refused POST is logged and retried on later ticks). Any other red or unfinished run still waits.
+#   a refused POST is logged and retried on later ticks). Any other red or unfinished run still waits. --dry-run writes no state (Codex PR121-r1).
 # v1.5.0 (DEVOS-172): a review that could not run (runner exit without a stored verdict, e.g. "Quota exceeded")
 # is retried with a bounded back-off instead of being final for that SHA. Attempt k failing (k < REVIEW_RETRY_MAX,
 # default 3) stores <sha>.fails=k and <sha>.retry_at = now + REVIEW_RETRY_BASE * 2^(k-1) seconds (default 600,
@@ -155,7 +155,7 @@ rerun_cigate() {  # sha
   # A here-string, not a pipe: grep -q exiting early must not fail a pipefail pipeline (pre-review L2).
   grep -q 'FLOOR-GUARD KEEP ' <<<"$(jq -r .summary "$VDIR/$sha.json")" || return 0
   id="$(cat "$STATE/$sha.fgred")"
-  [[ "$id" =~ ^[0-9]{1,20}$ ]] || { log "${sha:0:7}: no ci-gate run to re-run"; touch "$STATE/$sha.cigate-rerun"; return 0; }
+  [[ "$id" =~ ^[0-9]{1,20}$ ]] || { log "${sha:0:7}: no ci-gate run to re-run"; [[ $DRY -eq 1 ]] || touch "$STATE/$sha.cigate-rerun"; return 0; }
   # Pre-review L1: a run that is no longer failed (re-run by hand, or in progress) is never POSTed again.
   local conc
   conc="$(gh_api GET "/repos/$REPO/actions/runs/$id" | jq -r '"\(.status) \(.conclusion)"')" || { log "${sha:0:7}: cannot read ci-gate run $id; retry next tick"; return 0; }
