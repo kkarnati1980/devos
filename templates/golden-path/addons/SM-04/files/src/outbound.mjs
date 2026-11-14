@@ -162,6 +162,9 @@ function timeoutProblem(arg, rawArg = arg) {
   const isAccessorOrMethod = (x) => /^(?:get|set|async|static)\s+[^\s:,=(]/.test(x.code) || x.code.startsWith("*") ||
     /^(?:[A-Za-z_$][\w$]*|\[[^\]]*\]|(["'])\s*\1)\s*\(/.test(x.code);
   if (props.some(isAccessorOrMethod)) return "options must hold only plain properties (no getter, setter or method)";
+  // Codex PR99-r5: a quoted or computed string key with an escape ("timeout\u004ds") can name timeoutMs at run time
+  // while reading as another name here, so any escaped key is refused (fail closed) rather than decoded.
+  if (props.some((x) => /^\[?\s*(["'])(?:\\.|(?!\1)[^\n])*?\\/.test(x.raw))) return "escaped property names are refused";
   const isTimeout = (x) => keyName(x) === "timeoutMs";
   const last = props.findLastIndex(isTimeout);
   if (last < 0) return "the options do not name timeoutMs";

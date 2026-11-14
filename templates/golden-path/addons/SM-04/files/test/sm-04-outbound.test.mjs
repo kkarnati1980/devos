@@ -119,6 +119,9 @@ test("SM-04-L1: the untimed-call check finds every call without timeoutMs and pa
     // Codex PR99-r4: an accessor or method replaces timeoutMs at run time; a regex after `if (…)` hides nothing.
     "src/x3.mjs": `await ${F}(url, { timeoutMs: 300, get timeoutMs() { return undefined; } });`,
     "src/x4.mjs": `await ${F}(url, { timeoutMs: 300, timeoutMs() {} });`,
+    // Codex PR99-r5: an escaped key that JavaScript reads as timeoutMs.
+    "src/x6.mjs": `await ${F}(url, { timeoutMs: 300, "timeout\\u004ds": undefined });`,
+    "src/x7.mjs": `await ${F}(url, { timeoutMs: 300, ["timeout\\u004ds"]: undefined });`,
     "src/x5.mjs": `await ${F}(url, { timeoutMs: 300, set x(v) {} });`,
     "src/z3.mjs": "if (enabled) /`/.test(text);\nawait " + F + "(url);",
     "src/z4.mjs": "function f() { return /`/.test(s); }\nawait " + F + "(u);",
