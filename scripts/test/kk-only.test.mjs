@@ -51,6 +51,14 @@ const TABLE = [
   ["ci-step-changed", ".github/workflows/ci.yml", "job ci: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ ref: main", true],
   ["ci-step-changed", ".github/workflows/security.yml", "job vuln-scan: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", true],
   ["ci-job-removed", ".github/workflows/ci.yml", "x".repeat(250), true],
+  // Pre-review finding 2: a base SHA or a sparse checkout on the main checkout changes what later steps scan or lint.
+  ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ ref: ${{ github.event.pull_request.base.sha }}", true],
+  ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ sparse-checkout: README.md", true],
+  ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ sparse-checkout: README.md ⏎ path: .", true],
+  ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ ref: ${{ github.event.pull_request.base.sha }} ⏎ path: ./", true],
+  ["ci-step-changed", ".github/workflows/ci.yml", "job build: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ ref: ${{ github.event.pull_request.head.sha }}", false],
+  // Pre-review finding 1: a step text of exactly 200 characters may be an older guard's cut, so it fails closed.
+  ["ci-step-removed", ".github/workflows/ci.yml", ("job ci: step X removed; ran: run: pnpm build" + " ".repeat(200)).slice(0, 200), true],
   // Ordinary weakenings stay Codex-keepable.
   ["test-skipped", "apps/api/test/a.test.mjs", `${SKIP}("flaky on CI"`, false],
   ["assertion-removed", "apps/api/test/a.test.mjs", "assert.equal(a, 1)", false],

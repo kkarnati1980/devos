@@ -11,11 +11,14 @@ DEVOS-203 pins the setup actions to full SHAs. Every such step became a KK-only 
 ## Decision
 1. `ci-step-removed` and `ci-step-changed` keep up to **1000** characters (`STEP_BODY_CUT`); every other rule keeps 200. A text at its cut still fails closed. `kk-only.mjs` holds the same numbers; test K4 checks they match the guard's exports.
 2. `ciBodyIsPlain` accepts `node-version-file`, `package-manager-cache` and `sparse-checkout` with plain-word values; `persist-credentials` only as `false`; `ref` only as `${{ github.event.pull_request.head.sha }}` or `…base.sha` (any other `ref`, including a branch name, stays KK-only).
-3. Unchanged: security words in the file or text are still checked first (a `security.yml` hit stays KK-only); `ci-job-removed` stays KK-only; the marker and body-shape checks of DEVOS-186 are as they were.
+   - A base-SHA `ref` or a `sparse-checkout` changes what the job's later steps (a scan, lint, tests) see. So they are plain only in a side checkout: the same body has a `path:` below the workspace root (not `.`, `./`, `..` or absolute), as in ci-gate.yml's `.gate-base`/`.gate-src`. On the main checkout they stay KK-only (pre-review finding 2).
+   - Removing `persist-credentials: false` reads as plain. That is hardening, not scanning (outside spec §4.4), so it is left to Codex's judgement (pre-review finding 3).
+4. Unchanged: security words in the file or text are still checked first (a `security.yml` hit stays KK-only); `ci-job-removed` stays KK-only; the marker and body-shape checks of DEVOS-186 are as they were.
+3. A step text of exactly 200 characters is read as cut. CI runs the base copy of the guard, so until this has merged, stored reports cut step bodies at 200; without this rule a cut prefix would read as a whole plain body (pre-review finding 1). A real 200-character step body just goes to KK.
 
 Why not raise the cut for every rule: other rules carry a single diff line, which rarely nears 200, and a longer stored text only matters where the classifier reads a body.
 
 ## Consequences
 - On the DEVOS-203 branch (11 non-guard, non-security workflows) the guard gives 35 hits, none KK-only, so Codex Keeps can clear them.
-- An older base copy of the guard (before this merges) still cuts at 200; that only makes more hits KK-only, never fewer.
+- An older base copy of the guard (before this merges) still cuts step texts at 200; rule 4 keeps those KK-only. So the DEVOS-203 PR waits until this has merged, and its CI then runs the new guard as the base copy.
 - `docs/modules/GI-4.md` still says "200-character checks"; it is not a guard companion, so it is updated in the DEVOS-203 PR.

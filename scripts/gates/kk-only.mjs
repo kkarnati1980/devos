@@ -20,6 +20,9 @@ export const KK_ONLY = (h) => {
   if (SECURITY_WORDS.test(`${h?.file ?? ""} ${text}`)) return true;
   // A full-length (cut) text may hide a security token past the cut, for every rule, so it fails closed (PR84-r4).
   if (text.length >= (CI_BODY_RULES.has(h?.rule) ? STEP_BODY_CUT : CUT)) return true;
+  // A step text of exactly 200 characters may come from a guard before DEVOS-209 (CI runs the base copy), which cut
+  // step bodies at 200, so it is read as cut too (pre-review finding 1).
+  if (CI_BODY_RULES.has(h?.rule) && text.length === CUT) return true;
   // A guard change mixed with other changes must stand alone (spec §4.5); only KK can accept it (merge path GI-1b).
   if (h?.rule === "gitleaksignore-added" || h?.rule === "policy-weakened" || h?.rule === "guard-change-not-isolated") return true;
   if (h?.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text);
@@ -48,8 +51,13 @@ const PLAIN_ACTIONS = new Set(["actions/checkout", "actions/setup-node", "pnpm/a
 // their nested lines pass only when they are keys on this list). `shell:` only names a standard shell, because a
 // custom shell template runs any program (pre-review findings 3 and 4).
 // DEVOS-209: plus the setup-action keys `node-version-file`, `package-manager-cache`, `sparse-checkout`; and
-// `persist-credentials` only as `false` and checkout's `ref` only as the PR's head or base SHA (PLAIN_FIXED).
+// `persist-credentials` only as `false` and checkout's `ref` only as the PR's head or base SHA (PLAIN_FIXED). A base
+// SHA or a sparse checkout changes what the job's later steps (a scan, lint) see, so those two are plain only in a
+// side checkout: a body that also has a `path:` below the workspace root (sidePath; pre-review finding 2).
 const PLAIN_KEYS = /^(if|timeout-minutes|working-directory|id|name|node-version|node-version-file|version|cache|package-manager-cache|path|key|retention-days|fetch-depth|sparse-checkout)\s*:/;
+const NARROWING = /^ref\s*:\s*\$\{\{\s*github\.event\.pull_request\.base\.sha\s*\}\}$|^sparse-checkout\s*:/;
+// A relative path below the workspace root: plain-word segments, none of them `.` or `..`.
+const sidePath = (t) => { const m = /^path\s*:\s*([\w./-]+)$/.exec(t); return !!m && m[1].split("/").filter(Boolean).every((seg) => seg !== "." && seg !== "..") && m[1].split("/").some(Boolean) && !m[1].startsWith("/"); };
 const PLAIN_FIXED = /^persist-credentials\s*:\s*false$|^ref\s*:\s*\$\{\{\s*github\.event\.pull_request\.(head|base)\.sha\s*\}\}$/;
 const BARE_KEYS = /^(with|env)\s*:$|^run_install\s*:\s*(true|false)$/;
 const PLAIN_SHELL = /^shell\s*:\s*(bash|sh|pwsh|powershell|cmd|python)$/;
@@ -140,6 +148,8 @@ function plainBody(body) {
   const lines = body.split(" ⏎ ");
   const runs = lines.filter((l) => /^run\s*:/.test(l.trim()));
   if (runs.length > 1 || (runs.length === 1 && !/^run\s*:/.test(lines.at(-1).trim()))) return false;
+  const trimmed = lines.map((l) => l.trim());
+  if (trimmed.some((t) => NARROWING.test(t)) && !trimmed.some(sidePath)) return false;
   return lines.every((l, i) => {
     const t = l.trim();
     if (/^(run|uses)\s*:/.test(t)) return plainLine(t);
