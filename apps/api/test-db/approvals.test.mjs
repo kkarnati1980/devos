@@ -425,14 +425,21 @@ test("DEVOS-170 (db): gateForRulesFromDb reads real policy_rule rows (uuid ids, 
   const rule = (constraints) => db.policyRule.create({
     data: { name: `m23-170-${randomUUID()}`, version: 1, priority: 0, actions: ["app.launch"], resources: [], principals: [], roles: [], environments: [], effect: "require_approval", constraints, createdBy: "kk:kk@kiot.io" },
   });
-  const launch = await rule({ gateName: "first_launch" });
-  const reqs = await rule({ gateName: "requirements" });
-  const plain = await rule({});
-  const junk = await rule({ gateName: "not-a-gate" });
-  assert.equal(await gateForRulesFromDb(db, [reqs.id, launch.id, plain.id], 5000), "first_launch");
-  assert.equal(await gateForRulesFromDb(db, [reqs.id], 5000), "requirements");
-  assert.equal(await gateForRulesFromDb(db, [plain.id, junk.id], 5000), null);
-  // A matched id with no row (e.g. a deleted rule) is ignored; no ids means no read.
-  assert.equal(await gateForRulesFromDb(db, [randomUUID(), launch.id], 5000), "first_launch");
-  assert.equal(await gateForRulesFromDb(db, [], 5000), null);
+  const created = [];
+  try {
+    const launch = await rule({ gateName: "first_launch" });
+    const reqs = await rule({ gateName: "requirements" });
+    const plain = await rule({});
+    const junk = await rule({ gateName: "not-a-gate" });
+    created.push(launch.id, reqs.id, plain.id, junk.id);
+    assert.equal(await gateForRulesFromDb(db, [reqs.id, launch.id, plain.id], 5000), "first_launch");
+    assert.equal(await gateForRulesFromDb(db, [reqs.id], 5000), "requirements");
+    assert.equal(await gateForRulesFromDb(db, [plain.id, junk.id], 5000), null);
+    // A matched id with no row (e.g. a deleted rule) is ignored; an empty list gives null.
+    assert.equal(await gateForRulesFromDb(db, [randomUUID(), launch.id], 5000), "first_launch");
+    assert.equal(await gateForRulesFromDb(db, [], 5000), null);
+  } finally {
+    // These require_approval rules must not leak into later suites on the shared database.
+    if (created.length) await db.policyRule.deleteMany({ where: { id: { in: created } } });
+  }
 });
