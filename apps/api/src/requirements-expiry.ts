@@ -12,12 +12,13 @@ export const PENDING_SCAN_MAX = 1000;
  * The longest one approvals-store write can take, from the call to its commit or rollback, for a store built with
  * `timeoutMs` (Codex PR88-r5): `PrismaApprovalStore` hands every transaction `{ maxWait: timeoutMs, timeout: timeoutMs }`,
  * so a write may wait up to `maxWait` for a connection and then run up to `timeout`. The project hold reserves this
- * whole bound. approvals.ts is Lane B's file and stays unchanged (Codex PR88-r6); AT-E10 reads the options the real
- * store passes, so a change there that this bound no longer covers fails the test.
+ * whole bound. Given the store, this reads `PrismaApprovalStore.stepBoundMs` (DEVOS-185), which is built from the
+ * options its transactions really get. The number form is kept for AT-E10, and the DEVOS-185 test checks that it agrees
+ * with the store.
  */
 export function approvalStepBoundMs(timeoutMsOrStore: number | { readonly stepBoundMs: number }): number {
   // DEVOS-185: given the store, its own `stepBoundMs` (built from the options its transactions really get) is used.
-  if (typeof timeoutMsOrStore === "object") return timeoutMsOrStore.stepBoundMs;
+  if (typeof timeoutMsOrStore === "object" && timeoutMsOrStore !== null) return timeoutMsOrStore.stepBoundMs;
   return timeoutMsOrStore + timeoutMsOrStore;
 }
 const PAGE = 100;
