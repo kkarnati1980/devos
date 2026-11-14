@@ -30,6 +30,8 @@ export interface RequirementsServices {
   cards: CardReader | null;
   /** CR-a3 (DEVOS-199): the project vault's presence check for the pre-flight view; absent → secrets unverified. */
   vault?: SecretPresence | null;
+  /** DEVOS-204 (Codex PR130-r2): how old a comment must be before re-answers read it (`reanswerSettleMs`). */
+  reanswerSettleMs?: number;
 }
 
 /** The dashboard's project slug (apps/dashboard/lib/source.ts `isSlug`). */
@@ -115,10 +117,23 @@ export async function syncApproval(svc: RequirementsServices, projectId: string,
 
 /**
  * DEVOS-204: how old a comment must be before re-answers read it. A comment's time is taken before its transaction
- * commits (M2.3 `comment`, bounded by the store's 10 s timeout and wait), so one made just before `now` may not be
- * visible yet; only comments older than `now - REANSWER_SETTLE_MS` are read, all of them committed (Codex PR130-r1).
+ * commits (M2.3 `comment`, bounded by the approvals store's wait plus timeout), so one made just before `now` may not
+ * be visible yet; only comments older than the settle window are read, all of them committed (Codex PR130-r1). The
+ * window is the floor below, or `reanswerSettleMs(stepBound)` when the services were built with the store's bound.
  */
 export const REANSWER_SETTLE_MS = 30_000;
+/** Slack added on top of the approvals store's step bound (clock steps between the API and Postgres, scheduling). */
+export const REANSWER_SETTLE_MARGIN_MS = 5_000;
+
+/**
+ * DEVOS-204 (Codex PR130-r2): the settle window for a comment store whose one write can take up to `commentStepMs`
+ * (connection wait plus transaction, `PrismaApprovalStore.stepBoundMs`): that bound plus a margin, never below
+ * REANSWER_SETTLE_MS. With `DEVOS_OUTBOUND_TIMEOUT_MS` at its 30 s maximum the bound is 60 s, so the window is 65 s.
+ */
+export function reanswerSettleMs(commentStepMs: number): number {
+  const step = Number.isFinite(commentStepMs) && commentStepMs > 0 ? commentStepMs : 0;
+  return Math.max(REANSWER_SETTLE_MS, step + REANSWER_SETTLE_MARGIN_MS);
+}
 
 /** DEVOS-204: re-answers from KK's comments made after the approved intake card was decided (ADR-0012 rule 3). */
 async function syncReanswers(svc: RequirementsServices, pipeline: RequirementsPipeline, approvalId: string, now: Date): Promise<void> {
@@ -127,10 +142,10 @@ async function syncReanswers(svc: RequirementsServices, pipeline: RequirementsPi
   const card = await cards.get(approvalId);
   if (!card || card.gate !== "requirements" || card.status !== "approved" || !card.decidedAt) return;
   const all = await cards.comments(card.id);
-  // Codex PR130-r1: only the settled prefix (comments at least REANSWER_SETTLE_MS old) is read. Every comment in it
+  // Codex PR130-r1: only the settled prefix (comments at least the settle window old, PR130-r2) is read. Every comment in it
   // has committed, so a comment that commits late can never land before rows already written from a later one;
   // younger comments wait for a later tick (the lister keeps the project listed until the cursor passes them).
-  const cutoff = now.getTime() - REANSWER_SETTLE_MS;
+  const cutoff = now.getTime() - (svc.reanswerSettleMs ?? REANSWER_SETTLE_MS);
   const comments: { id: string; body: string; createdAt: Date }[] = [];
   for (const c of all) if (c.id && c.createdAt && c.createdAt.getTime() <= cutoff) comments.push({ id: c.id, body: c.body, createdAt: c.createdAt });
   const newest = comments.reduce<number | null>((m, c) => (m === null || c.createdAt.getTime() > m ? c.createdAt.getTime() : m), null);

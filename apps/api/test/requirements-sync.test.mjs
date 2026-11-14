@@ -4,7 +4,9 @@ import assert from "node:assert/strict";
 import { MemoryRequirementsStore } from "@devos/analyst";
 import { Approvals, MemoryApprovalStore } from "../dist/approvals.js";
 import { requirementsServices } from "../dist/runtime.js";
-import { syncApproval } from "../dist/requirements.js";
+import { REANSWER_SETTLE_MS, reanswerSettleMs, syncApproval } from "../dist/requirements.js";
+import { PrismaApprovalStore } from "../dist/approvals.js";
+import { approvalStepBoundMs } from "../dist/requirements-expiry.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, SYNC_DEFAULT_MS, SYNC_MIN_MS, SYNC_MAX_MS } from "../dist/requirements-sync.js";
 
 const P1 = "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d";
@@ -319,6 +321,42 @@ test("DEVOS-204 (Codex PR130-r1): a comment that commits late with an earlier ti
   const pf1 = store.decisions.filter((d) => d.itemId === "PF-1" && d.approvalId === null);
   assert.deepEqual(pf1.map((d) => [d.commentId, d.answer]), [["a-late", "no"]]);
   assert.equal(store.decisions.length, base + 1);
+});
+
+test("DEVOS-204 (Codex PR130-r2): the settle window covers the approvals store's real write bound", async () => {
+  assert.equal(REANSWER_SETTLE_MS, 30_000);
+  // The floor holds for short bounds; a long bound gets the bound plus the 5 s margin. A bad bound fails safe to the floor.
+  assert.equal(reanswerSettleMs(0), 30_000);
+  assert.equal(reanswerSettleMs(6_000), 30_000);
+  assert.equal(reanswerSettleMs(Number.NaN), 30_000);
+  assert.equal(reanswerSettleMs(-1), 30_000);
+  // DEVOS_OUTBOUND_TIMEOUT_MS at its 30 s maximum: maxWait 30 s + timeout 30 s = 60 s, so 65 s.
+  const bound = approvalStepBoundMs(new PrismaApprovalStore({ $transaction: async () => { throw new Error("unused"); } }, 30_000));
+  assert.equal(bound, 60_000);
+  assert.equal(reanswerSettleMs(bound), 65_000);
+  // requirementsServices (as runtime.ts builds it) carries the window from the bound it is given, and the sync uses it:
+  // a comment 40 s old is past the 30 s floor but inside the 65 s window, so it is not read until it is 65 s old.
+  const store = new MemoryRequirementsStore();
+  store.addProject({ id: P1, name: "Shop", stage: "intake", continuousRun: true, capUsd: 15 });
+  const approvalStore = new MemoryApprovalStore();
+  const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
+  const svc = requirementsServices(store, approvals, approvalStore, null, undefined, bound);
+  assert.equal(svc.reanswerSettleMs, 65_000);
+  assert.equal(requirementsServices(store, approvals, approvalStore).reanswerSettleMs, 30_000);
+  const r = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  const t0 = Date.parse("2026-11-14T10:00:00Z");
+  const card = approvalStore.cards.get(r.approvalId);
+  card.status = "approved";
+  card.decidedAt = new Date(t0);
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: yes", new Date(t0));
+  await syncApproval(svc, P1, new Date(t0 + 120_000));
+  const base = store.decisions.length;
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: no", new Date(t0 + 200_000));
+  await syncApproval(svc, P1, new Date(t0 + 240_000));
+  assert.equal(store.decisions.length, base, "40 s old: inside the 65 s window");
+  await syncApproval(svc, P1, new Date(t0 + 265_000));
+  assert.equal(store.decisions.length, base + 1, "65 s old: settled");
+  assert.equal(store.decisions.at(-1).answer, "no");
 });
 
 test("DEVOS-204: a failing re-answer list is logged and the approvals of the tick still run", async () => {
