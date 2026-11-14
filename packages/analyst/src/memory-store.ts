@@ -64,6 +64,7 @@ export class MemoryRequirementsStore implements RequirementsStore {
     };
     this.docs.push(doc);
     if (input.preflight) this.preflightState.set(pid, "pending");
+    else if (this.preflightState.get(pid) === "rejected") this.preflightState.set(pid, "pending"); // DEVOS-208
 
     const ms = this.milestones.get(pid) ?? new Map();
     this.milestones.set(pid, ms);
