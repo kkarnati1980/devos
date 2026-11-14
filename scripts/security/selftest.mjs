@@ -67,6 +67,34 @@ try {
   const s2 = runGate("./secret-scan.mjs", clean);
   check("AT5d", "clean twin: secret-scan exits 0", s2.status === 0, s2.out);
 
+  // AT5e–AT5h (DEVOS-197) — `pnpm secret-scan:local` with the real gitleaks: only <base>..HEAD is scanned.
+  const local = join(root, "local");
+  mkdirSync(local, { recursive: true });
+  const lgit = (...a) => execFileSync("git", a, { cwd: local, stdio: "pipe" });
+  const lcommit = (name, body) => {
+    writeFileSync(join(local, name), body);
+    lgit("add", ".");
+    lgit("-c", "user.name=s2-selftest", "-c", "user.email=s2-selftest@example.invalid", "commit", "-q", "-m", name);
+  };
+  const runLocal = (base) => {
+    const r = spawnSync(process.execPath, [here("./secret-scan-local.mjs"), "--base", base, "--repo", local], { encoding: "utf8", timeout: 6 * 60 * 1000 });
+    return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+  };
+  lgit("init", "-q", "-b", "main");
+  lcommit("readme.txt", "fixture repo\n");
+  lgit("branch", "base");
+  const fakeLocal = `ghp_${rand(ALNUM, 36)}`;
+  lcommit("config.js", `export const token = "${fakeLocal}";\n`);
+  const l1 = runLocal("base");
+  check("AT5e", "key-like value in an unpushed commit: secret-scan:local exits 1", l1.status === 1 && /github-pat/.test(l1.out), l1.out);
+  check("AT5f", "secret-scan:local prints no secret value", !l1.out.includes(fakeLocal), "(secret value found in output)");
+  lgit("branch", "-f", "base", "HEAD");
+  lcommit("clean.txt", "obviously fake: test-key-not-real\n");
+  const l2 = runLocal("base");
+  check("AT5g", "clean unpushed commit: secret-scan:local exits 0 (commits already on the base are not rescanned)", l2.status === 0, l2.out);
+  const l3 = runLocal("no-such-base");
+  check("AT5h", "unknown base: secret-scan:local exits 2, never 0", l3.status === 2, l3.out);
+
   // AT6 — pinned vulnerable test package (lodash 4.17.20, CVE-2021-23337, CVSS 7.2).
   const vulnDir = join(root, "vuln");
   const okDir = join(root, "ok");
