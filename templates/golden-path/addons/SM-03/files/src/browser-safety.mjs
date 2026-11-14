@@ -125,7 +125,7 @@ function assertNoTextEndTag(s, i) {
 const IGNORED_IN_SELECT = new Set([...RCDATA, ...RAW_TEXT].filter((n) => n !== "script"));
 
 class MarkupState {
-  mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment
+  mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment | bogus
   tag = ""; // current tag source since "<"
   tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false;
   fstack = []; // open SVG/MathML roots, innermost last
@@ -137,11 +137,19 @@ class MarkupState {
       const c = s[i];
       if (this.mode === "lt") { // the "<" was the last character of the previous piece
         this.mode = "text";
-        if (/[a-zA-Z\/!?]/.test(c)) { this.mode = "tag"; this.tag = "<" + c; this.tagName = ""; }
+        if (c === "!" || c === "?") this.mode = "bogus";
+        else if (/[a-zA-Z\/]/.test(c)) { this.mode = "tag"; this.tag = "<" + c; this.tagName = ""; }
       } else if (this.mode === "text") {
         if (c === "<" && s.startsWith("<!--", i)) { this.mode = "comment"; i += 3; }
         else if (c === "<" && i + 1 === s.length) this.mode = "lt";
+        // Codex PR98-r7: <!…> (other than a comment), <?…> and </ not followed by a letter are bogus comments in
+        // the browser: they end at the first ">", whatever quotes they hold. Read as tags, a quote there could hide
+        // a value that the browser places after the ">" (e.g. inside a <script>).
+        else if (c === "<" && (s[i + 1] === "!" || s[i + 1] === "?" || (s[i + 1] === "/" && !/[a-zA-Z]/.test(s[i + 2] ?? "")))) this.mode = "bogus";
         else if (c === "<" && /[a-zA-Z\/!?]/.test(s[i + 1])) { this.mode = "tag"; this.tag = "<"; this.tagName = ""; }
+      } else if (this.mode === "bogus") {
+        if (c === "<") assertNoTextEndTag(s, i);
+        if (c === ">") this.mode = "text";
       } else if (this.mode === "comment") {
         if (c === "<") assertNoTextEndTag(s, i);
         if (s.startsWith("-->", i)) { this.mode = "text"; i += 2; }
@@ -251,6 +259,7 @@ export function html(strings, ...values) {
   let out = strings[0];
   state.feed(strings[0]);
   for (let i = 0; i < values.length; i++) {
+    if (state.mode === "bogus") throw new TypeError("html: no value may be placed inside <!…>, <?…> or </…> declarations");
     if (state.mode === "raw" || state.mode === "comment") throw new TypeError(`html: no value may be placed inside <${state.raw || "!--"}>`);
     if (state.mode === "tag" || state.mode === "lt") throw new TypeError("html: quote every attribute that holds a value (and no value may name a tag)");
     if (state.mode === "quote" && (!state.attr || state.attr.startsWith("on") || CODE_ATTRS.has(state.attr) || CODE_TAGS.has(state.tagName))) {

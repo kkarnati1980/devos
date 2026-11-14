@@ -149,7 +149,7 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   // Pre-review r2: a value may not name a tag, an end tag needs its terminator, <!-- in a script is refused, and
   // <textarea>/<title> content is text, so markup-looking text there does not open a tag.
   assert.throws(() => html`<${"script"}>${"alert(1)"}</script>`, /name a tag/);
-  assert.throws(() => html`</${"p"}>`, /quote every attribute/);
+  assert.throws(() => html`</${"p"}>`, /declarations/); // "</" + a value: refused (since r7, as a bogus-comment start)
   assert.throws(() => html`<script>var s = "</scripts>"; ${"x"}</script>`, /inside <script>/);
   assert.equal(String(html`<script>var s = "</scripts>";</script>${"<"}`), '<script>var s = "</scripts>";</script>&lt;');
   // A close tag ended by non-ASCII whitespace (U+00A0) does not end raw text in the browser, so a value after it
@@ -206,6 +206,13 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`<svg></math><title><a href="${evilUrl}">x</a></title></svg>`, /URL attribute/);
   assert.equal(String(html`<select><option value="${"a"}">${"A"}</option></select><textarea>${"t"}</textarea>`), '<select><option value="a">A</option></select><textarea>t</textarea>');
   assert.equal(String(html`<p title="${"a"}">2 &lt; 3</p><!-- note -->`), '<p title="a">2 &lt; 3</p><!-- note -->');
+  // Codex PR98-r7: <!…>, <?…> and </ + non-letter are bogus comments that end at the first ">", quotes or not.
+  assert.throws(() => html`<!foo title="><script>${"alert(1)//"}"></script>`, /inside <script>/);
+  assert.throws(() => html`<?x title="><script>${"alert(1)//"}"></script>`, /inside <script>/);
+  assert.throws(() => html`</1 title="><script>${"alert(1)//"}"></script>`, /inside <script>/);
+  assert.throws(() => html`<!foo ${"x"}>`, /declarations/);
+  assert.throws(() => html`<!foo`, /balanced/);
+  assert.equal(String(html`<!DOCTYPE html><p title="${"x"}">${"y"}</p>`), '<!DOCTYPE html><p title="x">y</p>');
   // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
   // and an RCDATA-free fragment inside SVG.
   assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');
