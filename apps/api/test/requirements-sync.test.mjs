@@ -235,3 +235,67 @@ test("AT-Q3 (DEVOS-166) concurrent submissions each make their own scan", async 
   assert.equal(reads.filter((p) => p === P1).length, 4);
   assert.equal(reads.filter((p) => p === P2).length, 2);
 });
+
+test("DEVOS-204: approval counts only comments up to the decision; a later `PF-1: no` is a re-answer on the next tick", async () => {
+  const store = new MemoryRequirementsStore();
+  store.addProject({ id: P1, name: "Shop", stage: "intake", continuousRun: true, capUsd: 15 });
+  const approvalStore = new MemoryApprovalStore();
+  const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
+  const svc = requirementsServices(store, approvals, approvalStore);
+  const r = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.ok(r.preflight?.length, "continuous-run spec has a pre-flight");
+  const decidedAt = new Date(Date.now() - 600_000);
+  const card = approvalStore.cards.get(r.approvalId);
+  card.status = "approved";
+  card.decidedAt = decidedAt;
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: yes", new Date(decidedAt.getTime() - 1000));
+  // Posted after the decision but before the approval sync ran: it must not count as the approval's answer.
+  await approvalStore.comment(r.approvalId, "kk", "PF-1: no", new Date(decidedAt.getTime() + 60_000));
+  let reanswerCalls = 0;
+  const lister = {
+    async draftsAwaitingDecision() {
+      const d = await store.latestDoc(P1);
+      return d.status === "draft" ? [P1] : [];
+    },
+    async reanswersAwaiting() {
+      reanswerCalls++;
+      const d = await store.latestDoc(P1);
+      return d.status === "approved" ? [P1] : [];
+    },
+  };
+  const job = new RequirementsSyncJob(svc, lister, () => {}, 60_000);
+  assert.equal(await job.tick(), 1);
+  const items = r.preflight.filter((i) => i.kind === "decision");
+  const pf1 = () => store.decisions.filter((d) => d.itemId === "PF-1");
+  // The first tick approves with `yes` (only comments up to the decision count, though `no` already exists).
+  assert.equal(store.decisions.filter((d) => d.approvalId === r.approvalId).length, items.length);
+  assert.deepEqual(pf1().map((d) => [d.answer, d.source]), [["yes", "kk"]]);
+  // The next tick reads the later comment as a re-answer: one new kk row; the state stays approved.
+  assert.equal(await job.tick(), 1);
+  assert.deepEqual(pf1().map((d) => [d.answer, d.source, d.approvalId === r.approvalId]), [["yes", "kk", true], ["no", "kk", false]]);
+  assert.equal(store.decisions.length, items.length + 1);
+  assert.equal(store.preflightState.get(P1), "approved");
+  // Another tick adds nothing; a new comment changing PF-2 adds one row for PF-2 only.
+  assert.equal(await job.tick(), 1);
+  assert.equal(store.decisions.length, items.length + 1);
+  await approvalStore.comment(r.approvalId, "kk", "PF-2: USD 40", new Date());
+  assert.equal(await job.tick(), 1);
+  assert.equal(store.decisions.length, items.length + 2);
+  assert.deepEqual(store.decisions.at(-1).itemId, "PF-2");
+  assert.equal(store.decisions.at(-1).answer, "USD 40");
+  assert.ok(reanswerCalls >= 3);
+  // The cursor stays REANSWER_SETTLE_MS behind now, so the newest comment is read again on later ticks (no-op).
+  const docId = (await store.latestDoc(P1)).id;
+  assert.ok(store.answersSyncedAt.get(docId).getTime() <= Date.now() - 29_000);
+});
+
+test("DEVOS-204: a failing re-answer list is logged and the approvals of the tick still run", async () => {
+  const { svc, approvalStore, lister } = wire();
+  const r = await svc.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  approvalStore.cards.get(r.approvalId).status = "approved";
+  const logs = [];
+  const job = new RequirementsSyncJob(svc, { ...lister, reanswersAwaiting: async () => { throw new Error("db down"); } }, (e) => logs.push(e), 60_000);
+  assert.equal(await job.tick(), 1);
+  assert.equal((await svc.store.latestDoc(P1)).status, "approved");
+  assert.deepEqual(logs, [{ level: "warn", msg: "requirements-sync-failed", projectId: "*" }]);
+});

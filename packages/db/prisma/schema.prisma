@@ -411,17 +411,19 @@ model Spec {
 }
 
 model RequirementsDoc {
-  id         String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  projectId  String                @map("project_id") @db.Uuid
-  version    Int
-  repoPath   String                @map("repo_path")
-  commitSha  String?               @map("commit_sha")
-  status     RequirementsDocStatus @default(draft)
-  approvalId String?               @map("approval_id") @db.Uuid
+  id              String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId       String                @map("project_id") @db.Uuid
+  version         Int
+  repoPath        String                @map("repo_path")
+  commitSha       String?               @map("commit_sha")
+  status          RequirementsDocStatus @default(draft)
+  approvalId      String?               @map("approval_id") @db.Uuid
   /// ADR-0012 CR-a2: this version's PreflightItem[] (null outside continuous-run mode).
-  preflight  Json?
-  createdAt  DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+  preflight       Json?
+  /// DEVOS-204: newest KK comment time on the approved intake card already read for re-answers.
+  answersSyncedAt DateTime?             @map("answers_synced_at") @db.Timestamptz(6)
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   project  Project   @relation(fields: [projectId], references: [id], onDelete: Restrict)
   approval Approval? @relation(fields: [approvalId], references: [id], onDelete: Restrict)
@@ -441,12 +443,16 @@ model ProjectDecision {
   /// `kk | default | default-provisional` (CHECK in the migration).
   source     String
   approvalId String?  @map("approval_id") @db.Uuid
+  /// DEVOS-204: set on a re-answer row (a KK comment after the decision); `approval_id` is then null.
+  commentId  String?  @map("comment_id") @db.Uuid
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  project  Project   @relation(fields: [projectId], references: [id], onDelete: Restrict)
-  approval Approval? @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  project  Project          @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  approval Approval?        @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  comment  ApprovalComment? @relation(fields: [commentId], references: [id], onDelete: Restrict)
 
   @@unique([approvalId, itemId])
+  @@unique([commentId, itemId])
   @@index([projectId, itemId, createdAt])
   @@map("project_decision")
 }
@@ -840,7 +846,8 @@ model ApprovalComment {
   body       String
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  approval Approval @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  approval  Approval          @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  decisions ProjectDecision[]
 
   @@index([approvalId])
   @@map("approval_comment")

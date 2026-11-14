@@ -46,7 +46,7 @@ const UNIQUES = {
   run_event: [["run_id", "seq"]],
   provision_step: [["project_id", "key"]],
   isolation_stack: [["project_id", "env"], ["idx"], ["subnet"], ["network"]],
-  project_decision: [["approval_id", "item_id"]],
+  project_decision: [["approval_id", "item_id"], ["comment_id", "item_id"]],
   mechanism_flag: [["role", "mechanism"]],
 };
 
