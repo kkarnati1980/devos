@@ -71,6 +71,11 @@ function fakeDb(seed = {}) {
     project: {
       findUnique: async ({ where }) => db.rows.project.find((p) => p.slug === where.slug) ?? null,
       create: async ({ data }) => { const p = { id: "11111111-1111-4111-8111-111111111111", pausedAt: null, ...data }; db.rows.project.push(p); return p; },
+      updateMany: async ({ where, data }) => {
+        const hit = db.rows.project.filter((p) => p.id === where.id && p.preflightState === where.preflightState);
+        for (const p of hit) Object.assign(p, data);
+        return { count: hit.length };
+      },
     },
     task: {
       findFirst: async ({ where }) => db.rows.task.find((t) => t.projectId === where.projectId) ?? null,
@@ -152,6 +157,16 @@ test("AT4 probe-start: creates the g1-probe project, task and run, queues it; ne
   assert.equal(b.code, 3);
   assert.equal(b.out.reason, "worker-busy");
   assert.equal(q2.length, 0);
+});
+
+test("AT4 probe-start (DEVOS-205): an existing probe row still pending is opened; an approved one is left alone", async () => {
+  const stale = fakeDb({ project: [{ id: "pp", slug: "g1-probe", pausedAt: null, continuousRun: true, preflightState: "pending" }] });
+  assert.equal((await probeStart(stale, jobs(async () => {}))).code, 0);
+  assert.equal(stale.rows.project[0].preflightState, "approved");
+  assert.equal(stale.rows.project[0].continuousRun, false);
+  const done = fakeDb({ project: [{ id: "pp", slug: "g1-probe", pausedAt: null, continuousRun: false, preflightState: "approved" }] });
+  done.project.updateMany = async () => { throw new Error("must not write an approved probe row"); };
+  assert.equal((await probeStart(done, jobs(async () => {}))).code, 0);
 });
 
 const RUN = "22222222-2222-4222-8222-222222222222";

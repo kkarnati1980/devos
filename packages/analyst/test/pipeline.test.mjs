@@ -356,8 +356,8 @@ test("AT4/AT6 (CR-a2, memory store): approval writes KK's answers and defaults w
   assert.equal(await off.pipeline.applyDecision({ id: r0.approvalId, gate: "requirements", status: "rejected" }), "ignored");
 });
 
-test("DEVOS-205 (memory store): approving a doc without a pre-flight on a pending project opens the state; rejected stays", async () => {
-  for (const [before, after] of [["pending", "approved"], ["rejected", "rejected"]]) {
+test("DEVOS-205 (memory store): approving a doc without a pre-flight on a pending project opens the state; rejected and approved stay", async () => {
+  for (const [before, after] of [["pending", "approved"], ["rejected", "rejected"], ["approved", "approved"]]) {
     const s = setup({ continuousRun: false });
     const r = await s.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
     s.store.preflightState.set(P1, before);

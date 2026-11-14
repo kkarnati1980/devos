@@ -89,9 +89,17 @@ export const PROBE_PROJECT_DATA = Object.freeze({
 
 /** Find or create the probe project and its task (only rows of the `g1-probe` project are written). */
 async function probeProject(db: Db): Promise<{ projectId: string; taskId: string; pausedAt: Date | null }> {
-  const project =
-    (await db.project.findUnique({ where: { slug: PROBE_SLUG } })) ??
-    (await db.project.create({ data: { ...PROBE_PROJECT_DATA } }));
+  let project = await db.project.findUnique({ where: { slug: PROBE_SLUG } });
+  if (!project) {
+    project = await db.project.create({ data: { ...PROBE_PROJECT_DATA } });
+  } else if (project.preflightState === "pending") {
+    // A probe row created before this change got the column defaults (continuous-run on, pre-flight pending) and
+    // would stay closed once CR-c reads preflightOpen. Open it the same way; only a still-pending row is touched.
+    await db.project.updateMany({
+      where: { id: project.id, preflightState: "pending" },
+      data: { continuousRun: false, preflightState: "approved" },
+    });
+  }
   const task =
     (await db.task.findFirst({ where: { projectId: project.id, title: "g1-probe run-resume" } })) ??
     (await db.task.create({ data: { projectId: project.id, kind: "test", title: "g1-probe run-resume" } }));
