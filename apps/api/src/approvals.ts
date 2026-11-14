@@ -215,6 +215,29 @@ export interface ApprovalsDeps {
   now?: () => number;
 }
 
+/** The rule fields `gateFromRules` reads (structural; `@devos/policy` PolicyRule). */
+export interface GateRuleLike {
+  id: string;
+  constraints?: { gateName?: unknown } | null;
+}
+
+/**
+ * DEVOS-134: the gate of a policy card, read from the matched rules' `constraints.gateName`. Names outside GATES are
+ * ignored. When matched rules name different gates, the stricter one wins (later in GATES, `purge` strictest), so a
+ * second rule can never weaken the card a first one asks for. No named gate → null (the caller uses `decision`).
+ */
+export function gateFromRules(matchedRuleIds: readonly string[], rules: readonly GateRuleLike[]): GateName | null {
+  const ids = new Set(matchedRuleIds);
+  let best = -1;
+  for (const r of rules) {
+    if (!r || !ids.has(r.id)) continue;
+    const g = r.constraints?.gateName;
+    const i = typeof g === "string" ? (GATES as readonly string[]).indexOf(g) : -1;
+    if (i > best) best = i;
+  }
+  return best < 0 ? null : GATES[best]!;
+}
+
 /** Actions that destroy data always go through gate 5 (typed confirmation), whatever the rule says. */
 export function isPurgeAction(action: string): boolean {
   return /(^|[.:/_-])purge($|[.:/_-])/i.test(action);
