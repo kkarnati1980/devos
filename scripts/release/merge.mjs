@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { GUARD_PATHS } from "../floor-guard/floor-guard.mjs";
+import { KK_ONLY } from "../gates/kk-only.mjs";
 
 export const DEFAULT_CONFIG = JSON.parse(readFileSync(new URL("./required-checks.json", import.meta.url), "utf8"));
 const OK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
@@ -85,7 +86,7 @@ async function allCheckRuns(gh, repo, sha) {
   throw new CannotRun("more than 2,000 check runs; refusing to judge a partial list");
 }
 
-async function allStatuses(gh, repo, sha) {
+export async function allStatuses(gh, repo, sha) {
   const statuses = [];
   for (let page = 1; page <= 20; page++) {
     const j = await gh.get(`/repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
@@ -166,19 +167,8 @@ export async function passVerdictText(gh, repo, pr, sha, label, creator) {
 }
 
 // Hits a Codex Keep never clears (spec §4.4: security scanning, policy and money go to KK; §4.5: a guard change must
-// stand alone). Mirrors KK_ONLY in scripts/gates/evaluate-gate.mjs (DEVOS-144) plus guard-change-not-isolated.
-const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
-const SECURITY_WORDS = /secur|secret|gitleaks|\bnose[c]\b|audit|licen[cs]e|codeql|semgrep|trivy|snyk|xss|no-eval|detect-/i;
-export function notKeepable(h) {
-  const text = String(h?.text ?? "");
-  if (SECURITY_WORDS.test(`${h?.file ?? ""} ${text}`)) return true;
-  if (text.length >= 200) return true; // GI-1 cuts hit text at 200 characters: what follows cannot be ruled out
-  if (["gitleaksignore-added", "policy-weakened", "guard-change-not-isolated"].includes(h?.rule)) return true;
-  if (h?.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text);
-  if (/^ci-/.test(h?.rule ?? "")) return true; // a CI hit names the step, not what it ran
-  if (h?.rule === "lint-rule-off") return /\bignores?\b/.test(text);
-  return false;
-}
+// stand alone). The one shared classifier (DEVOS-181), also used by the gate evaluator.
+export const notKeepable = KK_ONLY;
 
 /**
  * True when the verdict text has a line "FLOOR-GUARD CHANGE <path>" naming exactly this path: the whole rest of
@@ -196,10 +186,13 @@ export function namesChange(text, path) {
  * GI-1b: re-run the floor guard on <main>...<sha> with main's copy of the guard (as CI runs the base copy), in
  * the current repository after fetching both SHAs. Any failure to fetch, load or run is "could not run".
  */
-export async function localGuardReport({ mainSha, sha, cwd = process.cwd() }) {
+export async function localGuardReport({ mainSha, sha, cwd = process.cwd(), fetch = true }) {
   for (const x of [mainSha, sha]) if (!/^[0-9a-f]{40}$/.test(String(x))) throw new CannotRun("floor guard: bad SHA");
-  const fetched = spawnSync("git", ["fetch", "--quiet", "--no-tags", "origin", mainSha, sha], { cwd, encoding: "utf8", timeout: 60_000 });
-  if (fetched.status !== 0) throw new CannotRun("floor guard: cannot fetch the main and head SHAs");
+  // GI-1d: ci-gate fetches base and head itself (fetchHistory, token through git's environment), so it skips this fetch.
+  if (fetch) {
+    const fetched = spawnSync("git", ["fetch", "--quiet", "--no-tags", "origin", mainSha, sha], { cwd, encoding: "utf8", timeout: 60_000 });
+    if (fetched.status !== 0) throw new CannotRun("floor guard: cannot fetch the main and head SHAs");
+  }
   const src = spawnSync("git", ["show", `${mainSha}:scripts/floor-guard/floor-guard.mjs`], { cwd, encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
   if (src.status !== 0) throw new CannotRun("floor guard: main has no scripts/floor-guard/floor-guard.mjs");
   const dir = mkdtempSync(join(tmpdir(), "devos-fg-"));
@@ -211,6 +204,76 @@ export async function localGuardReport({ mainSha, sha, cwd = process.cwd() }) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/**
+ * GI-1d: the head's `codex-review` PASS label (`PR<n>-r<k>`) for this PR, or null with the reasons it is missing;
+ * also a reason for every other non-success status. Shared by the Release path and ci-gate.
+ */
+export function codexPass(statuses, pr, config = DEFAULT_CONFIG) {
+  const reasons = [];
+  const latest = new Map();
+  for (const s of statuses) {
+    const prev = latest.get(s.context);
+    if (!prev || String(s.updated_at ?? s.created_at) > String(prev.updated_at ?? prev.created_at)) latest.set(s.context, s);
+  }
+  const codex = latest.get(config.codexContext);
+  const desc = String(codex?.description ?? "");
+  let passLabel = null;
+  if (!codex) reasons.push(`no ${config.codexContext} status on the head SHA (not reviewed yet)`);
+  else if (codex.creator?.login !== config.codexCreator) reasons.push(`${config.codexContext} was posted by ${codex.creator?.login ?? "an unknown account"}, not the review watcher (${config.codexCreator})`);
+  else if (codex.state !== "success" || !desc.startsWith("Codex PASS")) reasons.push(`${config.codexContext} is ${codex.state} ("${desc.slice(0, 80)}"), not a PASS`);
+  else {
+    const label = desc.match(/\bPR(\d+)-r\d+\b/);
+    if (!label || Number(label[1]) !== Number(pr)) reasons.push(`the PASS on this SHA is labelled for ${label ? `PR #${label[1]}` : "no PR"}, not PR #${pr}`);
+    else passLabel = label[0];
+  }
+  for (const s of latest.values()) {
+    if (s.context === config.codexContext) continue;
+    if (s.state !== "success") reasons.push(`status "${s.context}" is ${s.state}`);
+  }
+  return { passLabel, reasons };
+}
+
+/**
+ * GI-1b step 2b, shared with ci-gate (GI-1d): guard-path changes must be named by the PASS, and a failed floor
+ * guard is disposed of only when every hit of the re-run on this SHA has a valid Codex Keep and none is KK-only.
+ * `mainSha` is the base to re-run against, or a function that reads it (called at most once).
+ * @returns {Promise<{ reasons: string[], disposed: boolean, mainSha: string | null }>}
+ */
+export async function judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles, floorGuardFailed, otherFloorGuardRed, mainSha: base, guardReport = localGuardReport, config = DEFAULT_CONFIG }) {
+  const reasons = [];
+  let mainSha = typeof base === "string" ? base : null;
+  const readMain = async () => (mainSha ??= await base());
+  const guardFiles = await guardPathsTouched(gh, repo, pr, changedFiles);
+  let disposed = false;
+  if (guardFiles.paths.length > 0 || (floorGuardFailed && !otherFloorGuardRed)) {
+    const verdictText = passLabel ? await passVerdictText(gh, repo, pr, sha, passLabel, config.codexCreator) : null;
+    if (guardFiles.paths.length > 0) {
+      if (!verdictText) reasons.push(`the PR changes guard path(s) ${guardFiles.paths.join(", ")}, and there is no Codex PASS comment for ${sha.slice(0, 7)} to name the change`);
+      else {
+        for (const path of guardFiles.paths) if (!namesChange(verdictText, path)) reasons.push(`guard path ${path} changed, but the PASS for ${sha.slice(0, 7)} has no "FLOOR-GUARD CHANGE ${path}" line`);
+        if (!guardFiles.decisionNote) reasons.push("guard paths changed without a docs/decisions/ note in the same PR (spec §4.5)");
+      }
+    }
+    if (floorGuardFailed && !otherFloorGuardRed) {
+      if (!verdictText) reasons.push(`floor guard failed on ${sha.slice(0, 7)} and there is no Codex PASS comment for this SHA to hold Keeps`);
+      else {
+        const { report, applyDispositions } = await guardReport({ mainSha: await readMain(), sha });
+        if (report.sha !== sha) reasons.push(`floor-guard report is for ${String(report.sha).slice(0, 7)}, not the head ${sha.slice(0, 7)}`);
+        else if (report.exit === 2) reasons.push(`floor guard could not run on ${sha.slice(0, 7)} (exit 2 is never clean): ${report.error ?? "unknown error"}`);
+        else if (report.hits.length === 0) reasons.push(`floor guard failed in CI on ${sha.slice(0, 7)} but finds no hit on a re-run; re-run the check, a red check is never set aside without a hit`);
+        else {
+          const d = applyDispositions(report, { sha, source: "codex", text: verdictText });
+          const kk = report.hits.filter(notKeepable);
+          for (const h of kk) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} cannot be kept by Codex: restore it or escalate to KK (spec §4.4/§4.5)`);
+          for (const h of d.open) if (!kk.includes(h)) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} has no "FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} <reason>" in the PASS for ${sha.slice(0, 7)}`);
+          if (d.exit === 0 && kk.length === 0) disposed = true;
+        }
+      }
+    }
+  }
+  return { reasons, disposed, mainSha };
 }
 
 // Reads every stored result for the PR's current head and returns { ok, sha, reasons[] }. Never merges.
@@ -247,62 +310,18 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
 
   // 2. Codex PASS on this SHA (the review watcher's `codex-review` status, for this PR), and no other red status.
   const statuses = await allStatuses(gh, repo, sha);
-  const latest = new Map();
-  for (const s of statuses) {
-    const prev = latest.get(s.context);
-    if (!prev || String(s.updated_at ?? s.created_at) > String(prev.updated_at ?? prev.created_at)) latest.set(s.context, s);
-  }
-  const codex = latest.get(config.codexContext);
-  const desc = String(codex?.description ?? "");
-  let passLabel = null;
-  if (!codex) reasons.push(`no ${config.codexContext} status on the head SHA (not reviewed yet)`);
-  else if (codex.creator?.login !== config.codexCreator) reasons.push(`${config.codexContext} was posted by ${codex.creator?.login ?? "an unknown account"}, not the review watcher (${config.codexCreator})`);
-  else if (codex.state !== "success" || !desc.startsWith("Codex PASS")) reasons.push(`${config.codexContext} is ${codex.state} ("${desc.slice(0, 80)}"), not a PASS`);
-  else {
-    const label = desc.match(/\bPR(\d+)-r\d+\b/);
-    if (!label || Number(label[1]) !== Number(pr)) reasons.push(`the PASS on this SHA is labelled for ${label ? `PR #${label[1]}` : "no PR"}, not PR #${pr}`);
-    else passLabel = label[0];
-  }
-  for (const s of latest.values()) {
-    if (s.context === config.codexContext) continue;
-    if (s.state !== "success") reasons.push(`status "${s.context}" is ${s.state}`);
-  }
+  const { passLabel, reasons: codexReasons } = codexPass(statuses, pr, config);
+  reasons.push(...codexReasons);
 
   // 2b. Floor guard (GI-1b): guard-path changes must be named by the PASS; a failing floor guard is set aside
   //     only when every hit it finds on this SHA has a valid Codex Keep (spec §4.4, GI-1 Dispositions).
   const fg = config.floorGuard;
-  let mainSha = null; // read once: the guard re-run and the compare in step 3 judge the same main
   const fgFailed = fg ? red.filter((x) => x.check === fg.check && x.failed) : [];
   const otherFgRed = fg ? red.filter((x) => (x.check === fg.check || x.path === fg.workflowPath) && !x.failed) : [];
-  const guardFiles = await guardPathsTouched(gh, repo, pr, p.changed_files);
-  let disposed = false;
-  if (guardFiles.paths.length > 0 || (fgFailed.length > 0 && otherFgRed.length === 0)) {
-    const verdictText = passLabel ? await passVerdictText(gh, repo, pr, sha, passLabel, config.codexCreator) : null;
-    if (guardFiles.paths.length > 0) {
-      if (!verdictText) reasons.push(`the PR changes guard path(s) ${guardFiles.paths.join(", ")}, and there is no Codex PASS comment for ${sha.slice(0, 7)} to name the change`);
-      else {
-        for (const path of guardFiles.paths) if (!namesChange(verdictText, path)) reasons.push(`guard path ${path} changed, but the PASS for ${sha.slice(0, 7)} has no "FLOOR-GUARD CHANGE ${path}" line`);
-        if (!guardFiles.decisionNote) reasons.push("guard paths changed without a docs/decisions/ note in the same PR (spec §4.5)");
-      }
-    }
-    if (fgFailed.length > 0 && otherFgRed.length === 0) {
-      if (!verdictText) reasons.push(`floor guard failed on ${sha.slice(0, 7)} and there is no Codex PASS comment for this SHA to hold Keeps`);
-      else {
-        mainSha ??= await mainHead(gh, repo, config);
-        const { report, applyDispositions } = await guardReport({ mainSha, sha });
-        if (report.sha !== sha) reasons.push(`floor-guard report is for ${String(report.sha).slice(0, 7)}, not the head ${sha.slice(0, 7)}`);
-        else if (report.exit === 2) reasons.push(`floor guard could not run on ${sha.slice(0, 7)} (exit 2 is never clean): ${report.error ?? "unknown error"}`);
-        else if (report.hits.length === 0) reasons.push(`floor guard failed in CI on ${sha.slice(0, 7)} but finds no hit on a re-run; re-run the check, a red check is never set aside without a hit`);
-        else {
-          const d = applyDispositions(report, { sha, source: "codex", text: verdictText });
-          const kk = report.hits.filter(notKeepable);
-          for (const h of kk) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} cannot be kept by Codex: restore it or escalate to KK (spec §4.4/§4.5)`);
-          for (const h of d.open) if (!kk.includes(h)) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} has no "FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} <reason>" in the PASS for ${sha.slice(0, 7)}`);
-          if (d.exit === 0 && kk.length === 0) disposed = true;
-        }
-      }
-    }
-  }
+  const judged = await judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles: p.changed_files, floorGuardFailed: fgFailed.length > 0, otherFloorGuardRed: otherFgRed.length > 0, mainSha: () => mainHead(gh, repo, config), guardReport, config });
+  reasons.push(...judged.reasons);
+  const disposed = judged.disposed;
+  let mainSha = judged.mainSha; // read once: the guard re-run and the compare in step 3 judge the same main
   // Workflow runs are matched by their file, not their name, so a PR-added workflow named "floor-guard" is never
   // set aside (pre-review finding 4).
   const isWf = (x, file) => x.workflow !== undefined && x.path === file;

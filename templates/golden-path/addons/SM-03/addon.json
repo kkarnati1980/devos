@@ -1,0 +1,13 @@
+{
+  "id": "SM-03",
+  "name": "Browser safety",
+  "files": [
+    "src/browser-safety.mjs",
+    "test/sm-03-browser.test.mjs"
+  ],
+  "checks": {
+    "SM-03-L1": "test/sm-03-browser.test.mjs",
+    "SM-03-L2": "test/sm-03-browser.test.mjs"
+  },
+  "usage": "Build one guard with createOriginGuard({ allowedOrigins: originsFromEnv() }) (APP_ORIGINS lists the app's own origins, e.g. https://app.example) and pass every app route through guard.protectAll(routes): a POST, PUT, PATCH or DELETE from another origin gets 403. Never change state on GET. With SM-02, nest originGuard.protect(guard.protect(...)). Render pages only with the html`` tag and send them with sendHtml(res, page); quote every attribute, put no value in <script>, <style>, on… handlers or style attributes, and never build HTML by string concatenation. Keep test/sm-03-browser.test.mjs: its last test fails the build on any raw-HTML sink (innerHTML, dangerouslySetInnerHTML, v-html, |safe, {@html}, {{{ }}}, document.write, …) in src/ or public/. In an app test call assertAllProtected(routes)."
+}

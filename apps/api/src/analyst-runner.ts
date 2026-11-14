@@ -65,6 +65,12 @@ export class AnalystRunError extends Error {
   }
 }
 
+/**
+ * DEVOS-171 (Codex PR102-r2): ids of analyst runs this API process is executing right now. The stale-run sweep
+ * never closes one of these, whatever the timestamps say, so clock skew cannot close a live run.
+ */
+export const liveAnalystRuns = new Set<string>();
+
 export function runEngineModelRunner(rows: AnalystRunRows, engine: RunExecutor, now: () => number = Date.now): ModelRunner {
   return async ({ prompt, tag, projectId }) => {
     if (!projectId) throw new AnalystRunError("analyst-run-no-project");
@@ -77,6 +83,7 @@ export function runEngineModelRunner(rows: AnalystRunRows, engine: RunExecutor, 
       maxCostUsd: ANALYST_MAX_COST_USD,
       envelope: analystEnvelope(now()),
     });
+    liveAnalystRuns.add(runId);
     let ok = false;
     let ended: string = "abandoned";
     let cwd: string | null = null;
@@ -101,6 +108,7 @@ export function runEngineModelRunner(rows: AnalystRunRows, engine: RunExecutor, 
     } finally {
       // Best effort: a task left open does not change the analysis, and its run row already holds the outcome.
       await rows.finishTask(runId, ok, ended).catch(() => undefined);
+      liveAnalystRuns.delete(runId);
       if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
     }
   };
@@ -180,6 +188,125 @@ export class PrismaAnalystRunRows implements AnalystRunRows {
       // the reservation is reconciled at its full amount. Only this run's still-open rows change.
       if ((closed.count ?? 0) > 0) await settleOpenReservations(tx, runId);
     });
+  }
+}
+
+/** DEVOS-171: an open analyst run is stale once `max_seconds` plus this grace has passed since it started. */
+export const ANALYST_STALE_GRACE_MS = 5 * 60_000;
+/** Stale runs closed per sweep; the rest are reached on later sweeps (bounded work, ADR-0011 §9). */
+export const ANALYST_SWEEP_BATCH = 50;
+/** How often the sweep runs after its start-up pass. */
+export const ANALYST_SWEEP_MS = 5 * 60_000;
+
+/**
+ * DEVOS-171: closes analyst runs that the runner could not close (the database was down when it tried), so their
+ * budget reservations do not stay held. The bound is measured on the API clock (`now`), the clock M1.5 writes
+ * `started_at` with (Codex PR102-r2); runs live in this process are skipped by the job (`liveAnalystRuns`).
+ */
+export class PrismaAnalystRunSweeper {
+  constructor(private readonly db: AnalystRowsDb, private readonly timeoutMs: number, private readonly graceMs = ANALYST_STALE_GRACE_MS) {}
+
+  private tx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+    return this.db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(Math.floor(this.timeoutMs))}, true) AS statement_timeout`;
+      return fn(tx);
+    }, { timeout: this.timeoutMs, maxWait: this.timeoutMs });
+  }
+
+  /** Ids of open (queued/running) analyst runs past `max_seconds` + grace, oldest first. */
+  staleRunIds(limit: number = ANALYST_SWEEP_BATCH, now: number = Date.now()): Promise<string[]> {
+    const graceSecs = this.graceMs / 1000;
+    return this.tx(async (tx) => {
+      const rows = (await tx.$queryRaw`
+        SELECT id::text AS id FROM run
+        WHERE role = 'analyst'::role AND status IN ('queued'::run_status, 'running'::run_status)
+          AND COALESCE(started_at, created_at) + make_interval(secs => max_seconds + ${graceSecs}::float8) < ${new Date(now)}::timestamptz
+        ORDER BY COALESCE(started_at, created_at), id
+        LIMIT ${Math.max(1, Math.floor(limit))}::int`) as { id: string }[];
+      return rows.map((r) => r.id);
+    });
+  }
+
+  /**
+   * Closes one stale run as `failed` (`analyst-run-stale`), fails its task and settles its open reservations
+   * fail-closed (DEVOS-161's settlement), all in one transaction under M1.7's lock. The run is re-checked inside
+   * that transaction, so a run that closed or is no longer stale in the meantime is left alone. Returns whether it
+   * closed the run.
+   */
+  closeStale(runId: string, now: number = Date.now()): Promise<boolean> {
+    const graceSecs = this.graceMs / 1000;
+    return this.tx(async (tx) => {
+      // M1.7's global lock first, as every policy transaction takes it (DEVOS-161, PR13-r3).
+      await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${POLICY_LOCK_KEY}))) AS l`;
+      const closed = (await tx.$queryRaw`
+        UPDATE run SET status = 'failed'::run_status, error = 'analyst-run-stale', ended_at = now(), updated_at = now()
+        WHERE id = ${runId}::uuid AND role = 'analyst'::role AND status IN ('queued'::run_status, 'running'::run_status)
+          AND COALESCE(started_at, created_at) + make_interval(secs => max_seconds + ${graceSecs}::float8) < ${new Date(now)}::timestamptz
+        RETURNING task_id::text AS task_id`) as { task_id: string }[];
+      if (!closed.length) return false;
+      await tx.task.update({ where: { id: closed[0]!.task_id }, data: { status: "failed" } });
+      await settleOpenReservations(tx, runId);
+      return true;
+    });
+  }
+}
+
+export type SweepLog = (entry: { level: "warn"; msg: "analyst-sweep-failed"; runId: string } | { level: "warn"; msg: "analyst-sweep-list-failed" }) => void;
+
+/** DEVOS-171: the start-up and periodic sweep over `PrismaAnalystRunSweeper` (ticks never overlap). */
+export class AnalystRunSweepJob {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private running = false;
+
+  constructor(
+    private readonly sweeper: Pick<PrismaAnalystRunSweeper, "staleRunIds" | "closeStale">,
+    private readonly log: SweepLog,
+    readonly intervalMs: number = ANALYST_SWEEP_MS,
+    private readonly live: ReadonlySet<string> = liveAnalystRuns,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /** One pass; null when a pass is already running. One run's failure is logged by id (fixed code) and skipped. */
+  async tick(): Promise<number | null> {
+    if (this.running) return null;
+    this.running = true;
+    try {
+      let ids: string[];
+      try {
+        ids = await this.sweeper.staleRunIds(ANALYST_SWEEP_BATCH, this.now());
+      } catch {
+        this.log({ level: "warn", msg: "analyst-sweep-list-failed" });
+        return 0;
+      }
+      let n = 0;
+      for (const id of ids) {
+        // A run this process is still executing is never closed (Codex PR102-r2).
+        if (this.live.has(id)) continue;
+        try {
+          if (await this.sweeper.closeStale(id, this.now())) n++;
+        } catch {
+          this.log({ level: "warn", msg: "analyst-sweep-failed", runId: id });
+        }
+      }
+      return n;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /** Runs one pass now (the start-up sweep), then every `intervalMs`. */
+  start(): this {
+    if (!this.timer) {
+      void this.tick();
+      this.timer = setInterval(() => void this.tick(), this.intervalMs);
+      this.timer.unref?.();
+    }
+    return this;
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
   }
 }
 

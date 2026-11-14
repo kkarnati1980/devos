@@ -4,6 +4,7 @@
 // Tasks those cards block stay blocked, as for age expiry. Expiry is best-effort: it never fails a submission.
 import { REPO_PATH, RequirementsPipeline, type PipelinePorts, type SpecInput, type SubmitResult } from "@devos/analyst";
 import { EXPIRE_IDS_MAX } from "./approvals.js";
+import { withDecidedScan } from "./requirements-sync.js";
 
 /** Pending cards read per project for one expiry pass (bounded read, ADR-0011 §9). */
 export const PENDING_SCAN_MAX = 1000;
@@ -166,7 +167,8 @@ export class ExpiringRequirementsPipeline extends RequirementsPipeline {
 
   override async submitSpec(projectId: string, input: SpecInput): Promise<ExpiringSubmitResult> {
     const startedAt = this.clock();
-    const r = await super.submitSpec(projectId, input);
+    // DEVOS-166: the submission's question cards share one decided-card scan.
+    const r = await withDecidedScan(() => super.submitSpec(projectId, input));
     let expired: ExpiryResult | null = null;
     try {
       expired = await expireSuperseded(this.expiry, projectId, r, startedAt);

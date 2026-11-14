@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-60 · P1 · Lane C (ops tooling; bootstrap until M3.4 Codex reviewer replaces it)
 - **Depends on:** M0.3 (review runner `scripts/review/review-commit.sh` v1.0.2, Codex CLI, read-only deploy key, verdict schema on the server)
-- **Owned files:** `scripts/review/review-watch.sh` (v1.2.0), `scripts/review/install-review-watch.sh` (v1.1.0), `scripts/test/review-watch.test.mjs` (AT14–AT17), this contract.
+- **Owned files:** `scripts/review/review-watch.sh` (v1.5.0), `scripts/review/install-review-watch.sh` (v1.1.1), `scripts/test/review-watch.test.mjs` (AT14–AT21), this contract.
 - **Approved by KK:** 4 Nov 2026 (build plan v1.0.0, section 7).
 
 ## Goal
@@ -114,3 +114,35 @@ Run the existing Codex review automatically on every new PR head, so a review no
   - **AT20 covers more cases:** a failed comment read, a forged comment by another login, and an own comment that belongs to a different SHA.
 - **Codex PR52-r2 (1 medium, accepted):** runner-failure reports ("could not run") had no commit line, so a retry could not recognise one that GitHub had stored. They now carry `- **Commit:** \`<sha>\`` like verdicts do, and the same duplicate check covers them. Test: a failure report whose POST timed out is not posted again (review-watch 11/11).
 - **Codex PR52-r5 (1 medium, accepted):** `gh_all` stops after 30 pages. A comment list that reaches 3,000 entries may be truncated, so it now counts as indeterminate (return 2): the POST waits instead of risking a duplicate. Test: every page full → no POST, nothing marked posted (review-watch 12/12).
+
+**v1.5.0 (13 Nov 2026, DEVOS-172, runner B): a review that could not run is retried.**
+- **Problem.** From 13:11 IST on 13 Nov, the OpenAI credit ran out. Every review ended "could not run (exit 1)" after about 10 s: PR83-r2, PR85-r5, PR88-r2 and PR89-r1. The watcher treated that `error` as final for the SHA. So once Codex worked again, each of those PRs needed a new head, and each new head cost one more paid review. (The quota itself is KK's to top up. Runner A emailed him at 13:29 IST, and reviews ran again by 13:38 IST.)
+- **Change.**
+  - When the runner exits without a stored verdict, attempt *k* (with *k* below `REVIEW_RETRY_MAX`, default 3) is no longer final.
+  - The watcher stores `watch/<sha>.fails` = *k* and `watch/<sha>.retry_at` = now + `REVIEW_RETRY_BASE`·2^(k−1) seconds (default 600 s, then 1200 s, capped at `REVIEW_RETRY_CAP`, default 3600 s).
+  - It sets `codex-review` = pending, with "could not run (attempt k of N); retry in m min".
+  - It posts no comment. It writes no `.pr` or `.label`, so the retry keeps the same round label (`PR<n>-r<k>`).
+  - Until `retry_at` passes, the head is logged and skipped. After that, it is a normal candidate again, still one review per tick and oldest first-green first.
+  - Only the last attempt posts the "could not run" report, which now carries `- **Attempts:** N of N`, and the final `error` status, as before.
+  - The installer's `RETRY_FAILED=1` also clears `.fails` and `.retry_at` (installer v1.1.1).
+- **Decisions (runner B, technical).**
+  - **3 attempts over about 30 minutes.** That covers a short outage. A longer one (such as the credit running out) still ends in the visible `error` and the STUCK alert, instead of retrying forever.
+  - **Only fast failures are retried** (pre-review finding 1, review cost rule). Retrying is free only when the runner fails before Codex answers: a quota or auth error, or a fetch failure. Those end within seconds. But `review-commit.sh` also exits 1 *after* a full, paid Codex run: on the 900 s timeout, a dirty checkout, or a verdict that fails the schema or the SHA check. So an attempt is retried only when the runner ran for less than `REVIEW_RETRY_FAST` seconds (default 120; a real review takes several minutes). A slower failure is final at once, as before v1.5.0, and is logged "Codex may have run". Why elapsed time rather than parsing the runner log: the time does not depend on the wording of Codex or OpenAI error messages, and the runner (approved M0.3 machinery) stays unchanged.
+  - **A superseded pending retry is closed.** When a SHA with a pending retry is no longer the head of any open PR (a new push, or the PR closed), the watcher sets its status to `error` "not retried: no longer a PR head", once (marker `.retry-closed`). So no stale "retry in …" status is left (pre-review L2). A draft or red-CI head is still a PR head, so it keeps its pending retry.
+  - **The report never overstates.** A max lowered between attempts is clamped, so the report never reads "2 of 1" (pre-review L3).
+  - **A `retry_at` further ahead than the cap counts as due.** That covers a clock stepped back or a bad file, so a head is never blocked for longer than the cap.
+  - **The status stays `pending` between attempts,** so runners see the head is still in progress and do not push a new head to refresh it (review cost rule, 12 Nov).
+- **Tests:** `scripts/test/review-watch.test.mjs`, 16/16.
+  - AT21: attempt 1 posts pending with a 600 s back-off, no comment, and no round used up. A tick before `retry_at` does not run the runner. Attempt 2 doubles the back-off and keeps the label. Attempt 3 posts the report ("Attempts: 3 of 3") and `error`. No run happens after that.
+  - AT21: a retry that succeeds publishes the PASS as `PR<n>-r1`. `REVIEW_RETRY_BASE` sets the back-off. A `retry_at` beyond the cap counts as due.
+  - The existing AT20 (PR52-r2) test now pins `REVIEW_RETRY_MAX=1`, so it still checks that a final failure report is not posted twice. Its assertions are unchanged.
+- **Deployment:** the server agent installs the merged script (allow-list). KK does nothing.
+  - AT21 (pre-review): a failure slower than `REVIEW_RETRY_FAST` is final at once ("Attempts: 1 of 3", `error`, no `retry_at`). A runner exiting 0 with no verdict file counts as a fast failure and is retried, never published as a PASS (D1). A superseded pending retry is closed with `error` exactly once. `--dry-run` writes no state and posts no status, whether a retry is waiting or would be closed.
+- **Pre-review (1 medium, 4 low; all fixed):** (M1) the slow-failure rule above; (L2) the superseded retry is closed; (L3) the attempt count is clamped; (L4) the `REVIEW_RETRY_BASE` test now has a lower bound, plus the new tests above; (L5) the versions under owned files are updated. A runner that reports it is busy still uses up no attempt: that check returns before the retry logic, unchanged.
+
+## Pass rule
+- `node --test --test-concurrency=1 scripts/test/review-watch.test.mjs` exits 0 on the merged SHA (AT14–AT21, HB1–HB3).
+- `bash -n scripts/review/review-watch.sh` and `bash -n scripts/review/install-review-watch.sh` exit 0.
+- After the server agent installs the merged script, the next runner failure that ends in under 120 s shows `codex-review` = pending with "attempt 1 of 3" on that head, and the `codex-review-watch` heartbeat on main is at most 2 hours old.
+
+**Codex PR94-r2 (1 medium; fixed, 14 Nov 2026):** the `<sha>.retry-closed` marker was never cleared, so a SHA whose pending retry was closed once, then became a PR head again and failed again, kept its new "retry in …" status for ever after the PR closed a second time. A new pending retry now removes the marker, so each pending retry gets its own close. AT21 (pre-review L2) now covers reopen → failed retry → close again: the marker is cleared, the second pending retry is closed, and only once.

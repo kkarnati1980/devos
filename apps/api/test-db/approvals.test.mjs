@@ -8,7 +8,7 @@ import { createDb } from "@devos/db";
 import { PolicyEngine, PrismaPolicyStore } from "@devos/policy";
 import { Approvals, PrismaApprovalStore } from "../dist/approvals.js";
 import { GateEngine, PrismaGateStore } from "../dist/gates.js";
-import { grantsForApproval } from "../dist/runtime.js";
+import { gateForRulesFromDb, grantsForApproval } from "../dist/runtime.js";
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required for test:db");
@@ -204,18 +204,24 @@ test("AT10 (db): closeMilestone needs an approved, same-project, same-gate appro
   const other = await fixture(0);
   const ms = await db.milestone.create({ data: { projectId, ordinal: 1, name: "P1", gateName: "requirements" } });
   const { approvals } = setup();
-  const pending = await approvals.raiseCard(card(projectId, { gate: "requirements" }), []);
-  const otherProject = await approvals.raiseCard(card(other.projectId, { gate: "requirements" }), []);
-  const otherGate = await approvals.raiseCard(card(projectId, { gate: "decision" }), []);
+  const target = `milestone:${ms.id}`;
+  const pending = await approvals.raiseCard(card(projectId, { gate: "requirements", target }), []);
+  const otherProject = await approvals.raiseCard(card(other.projectId, { gate: "requirements", target }), []);
+  const otherGate = await approvals.raiseCard(card(projectId, { gate: "decision", target }), []);
+  // DEVOS-170: right project and gate, but raised for another target (e.g. a policy card), is not evidence.
+  const otherTarget = await approvals.raiseCard(card(projectId, { gate: "requirements" }), []);
   await approvals.approve(KK, otherProject.id);
   await approvals.approve(KK, otherGate.id);
+  await approvals.approve(KK, otherTarget.id);
   await db.policyRule.create({
     data: { name: `m23-at10-${randomUUID()}`, version: 1, priority: 0, actions: ["gate.transition"], resources: [], principals: [], roles: [], environments: [], effect: "allow", constraints: {}, createdBy: "kk:kk@kiot.io" },
   });
   const gates = new GateEngine({ store: new PrismaGateStore(db, 5000), policy: new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: KEY }) });
-  for (const a of [pending.id, otherProject.id, otherGate.id]) {
+  for (const a of [pending.id, otherProject.id, otherGate.id, otherTarget.id]) {
     await assert.rejects(gates.closeMilestone(KK.identity, ms.id, a), (e) => e.code === "gate-evidence-missing");
   }
+  // The Postgres close re-checks the target inside its transaction too.
+  assert.equal(await new PrismaGateStore(db, 5000).close(ms.id, otherTarget.id, { gate: "requirements", projectId }, new Date(), { action: "milestone.closed", summary: "s", details: {} }, "kk"), false);
   assert.equal((await db.milestone.findUnique({ where: { id: ms.id } })).closedAt, null);
   await approvals.approve(KK, pending.id);
   const closed = await gates.closeMilestone(KK.identity, ms.id, pending.id);
@@ -226,11 +232,15 @@ test("AT10 (db): closeMilestone needs an approved, same-project, same-gate appro
   await assert.rejects(gates.closeMilestone(KK.identity, ms.id, pending.id), (e) => e.code === "milestone-closed");
 });
 
-test("PR41-r3 (db): concurrent closes on one approval never deadlock (same milestone and two milestones)", async () => {
+test("PR41-r3 (db): concurrent closes never deadlock (same milestone and two milestones)", async () => {
   const { projectId } = await fixture(0);
   const { approvals } = setup();
-  const ap = await approvals.raiseCard(card(projectId, { gate: "requirements" }), []);
-  await approvals.approve(KK, ap.id);
+  // DEVOS-170: a card is evidence only for the milestone it was raised for, so each milestone gets its own card.
+  const approvedCardFor = async (milestoneId) => {
+    const c = await approvals.raiseCard(card(projectId, { gate: "requirements", target: `milestone:${milestoneId}` }), []);
+    await approvals.approve(KK, c.id);
+    return c;
+  };
   await db.policyRule.create({
     data: { name: `m23-r3-${randomUUID()}`, version: 1, priority: 0, actions: ["gate.transition"], resources: [], principals: [], roles: [], environments: [], effect: "allow", constraints: {}, createdBy: "kk:kk@kiot.io" },
   });
@@ -239,14 +249,21 @@ test("PR41-r3 (db): concurrent closes on one approval never deadlock (same miles
   for (let round = 0; round < 5; round++) {
     const m1 = await db.milestone.create({ data: { projectId, ordinal: 10 + round * 2, name: `R${round}a`, gateName: "requirements" } });
     const m2 = await db.milestone.create({ data: { projectId, ordinal: 11 + round * 2, name: `R${round}b`, gateName: "requirements" } });
+    const ap = await approvedCardFor(m1.id);
     // same milestone, four at once: exactly one closes, the rest see milestone-closed
     const same = await Promise.all([1, 2, 3, 4].map(() => outcome(gates.closeMilestone(KK.identity, m1.id, ap.id))));
     assert.equal(same.filter((o) => o === "closed").length, 1, same.join(","));
     assert.ok(same.every((o) => o === "closed" || o === "milestone-closed"), same.join(","));
-    // two milestones sharing the approval, at once: both close
+    // two milestones at once, each with its own card: both close
     const m3 = await db.milestone.create({ data: { projectId, ordinal: 100 + round, name: `R${round}c`, gateName: "requirements" } });
-    const two = await Promise.all([m2.id, m3.id].map((id) => outcome(gates.closeMilestone(KK.identity, id, ap.id))));
+    const [c2, c3] = [await approvedCardFor(m2.id), await approvedCardFor(m3.id)];
+    const two = await Promise.all([[m2.id, c2.id], [m3.id, c3.id]].map(([id, a]) => outcome(gates.closeMilestone(KK.identity, id, a))));
     assert.deepEqual(two, ["closed", "closed"], two.join(","));
+    // one card offered for two other milestones at once: neither closes, and nothing deadlocks
+    const m4 = await db.milestone.create({ data: { projectId, ordinal: 200 + round * 2, name: `R${round}d`, gateName: "requirements" } });
+    const m5 = await db.milestone.create({ data: { projectId, ordinal: 201 + round * 2, name: `R${round}e`, gateName: "requirements" } });
+    const shared = await Promise.all([m4.id, m5.id].map((id) => outcome(gates.closeMilestone(KK.identity, id, ap.id))));
+    assert.deepEqual(shared, ["gate-evidence-missing", "gate-evidence-missing"], shared.join(","));
   }
 });
 
@@ -401,5 +418,28 @@ test("DEVOS-164 (db): smoke: expireCardsById racing approve: the card is either 
       assert.deepEqual([expiredAudits, approvedAudits], [0, 1]);
       assert.equal(await status(t1), "ready");
     }
+  }
+});
+
+test("DEVOS-170 (db): gateForRulesFromDb reads real policy_rule rows (uuid ids, Json constraints) and picks the highest gate", async () => {
+  const rule = (constraints) => db.policyRule.create({
+    data: { name: `m23-170-${randomUUID()}`, version: 1, priority: 0, actions: ["app.launch"], resources: [], principals: [], roles: [], environments: [], effect: "require_approval", constraints, createdBy: "kk:kk@kiot.io" },
+  });
+  const created = [];
+  try {
+    const launch = await rule({ gateName: "first_launch" });
+    const reqs = await rule({ gateName: "requirements" });
+    const plain = await rule({});
+    const junk = await rule({ gateName: "not-a-gate" });
+    created.push(launch.id, reqs.id, plain.id, junk.id);
+    assert.equal(await gateForRulesFromDb(db, [reqs.id, launch.id, plain.id], 5000), "first_launch");
+    assert.equal(await gateForRulesFromDb(db, [reqs.id], 5000), "requirements");
+    assert.equal(await gateForRulesFromDb(db, [plain.id, junk.id], 5000), null);
+    // A matched id with no row (e.g. a deleted rule) is ignored; an empty list gives null.
+    assert.equal(await gateForRulesFromDb(db, [randomUUID(), launch.id], 5000), "first_launch");
+    assert.equal(await gateForRulesFromDb(db, [], 5000), null);
+  } finally {
+    // These require_approval rules must not leak into later suites on the shared database.
+    if (created.length) await db.policyRule.deleteMany({ where: { id: { in: created } } });
   }
 });

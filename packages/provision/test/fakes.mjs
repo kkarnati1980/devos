@@ -4,6 +4,8 @@ export function fakeProviders() {
   const repos = new Map(); // full_name -> body
   const projects = new Map(); // uuid -> body
   const apps = new Map(); // uuid -> application body (M2.4-c2a)
+  const keys = new Map(); // uuid -> Coolify private key (M2.4-c2c1); the list returns private_key too, like Coolify
+  const deployKeys = new Map(); // full_name -> [{ id, title, key, read_only }] (M2.4-c2c1)
   const calls = [];
   let n = 0;
   // inject: list of { match(method, path) -> bool, action: "timeout-after" | "timeout-before" | {status} , once }
@@ -46,6 +48,27 @@ export function fakeProviders() {
       const full = `${m[1]}/${m[2]}`;
       if (!repos.has(full.toLowerCase())) return json(404, { message: "Not Found" });
       return gitApi(gitOf(full), method, m[3], init);
+    }
+    if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)\/keys(?:\/(\d+))?$/))) {
+      const full = `${m[1]}/${m[2]}`.toLowerCase();
+      if (!repos.has(full)) return json(404, { message: "Not Found" });
+      const list = deployKeys.get(full) ?? [];
+      deployKeys.set(full, list);
+      if (m[3]) {
+        const i = list.findIndex((k) => k.id === Number(m[3]));
+        if (i < 0) return json(404, { message: "Not Found" });
+        if (method === "GET") return json(200, list[i]);
+        if (method === "DELETE") { list.splice(i, 1); return json(204); }
+      }
+      if (method === "GET") return json(200, list.map((k) => ({ ...k })));
+      if (method === "POST") {
+        const b = JSON.parse(init.body);
+        const key = String(b.key).split(" ").slice(0, 2).join(" ");
+        if ([...deployKeys.values()].some((l) => l.some((k) => k.key === key))) return json(422, { message: "key is already in use" });
+        const k = { id: ++n, title: b.title, key, read_only: b.read_only === true, verified: true };
+        list.push(k);
+        return json(201, k);
+      }
     }
     if (method === "POST" && path === "/user/repos") {
       const b = JSON.parse(init.body);
@@ -148,9 +171,29 @@ export function fakeProviders() {
         return json(201, { uuid: prev.uuid });
       }
     }
+    if (path === "/api/v1/security/keys") {
+      if (method === "GET") return json(200, [...keys.values()].map((k) => ({ ...k })));
+      if (method === "POST") {
+        const b = JSON.parse(init.body);
+        if (typeof b.private_key !== "string" || !b.private_key.startsWith("-----BEGIN OPENSSH ")) return json(422, { message: "Validation failed." });
+        const uuid = `pk${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+        keys.set(uuid, { id: ++n, uuid, name: b.name, description: b.description ?? null, private_key: b.private_key, is_git_related: false });
+        return json(201, { uuid });
+      }
+    }
+    if ((m = path.match(/^\/api\/v1\/security\/keys\/([^/]+)$/)) && method === "DELETE") {
+      if (!keys.delete(m[1])) return json(404, { message: "Private Key not found." });
+      return json(200, { message: "Private Key deleted." });
+    }
     if (method === "GET" && path === "/api/v1/applications") return json(200, [...apps.values()].map(({ uuid, name, description }) => ({ uuid, name, description })));
-    if (method === "POST" && path === "/api/v1/applications/dockercompose") {
+    if (method === "POST" && (path === "/api/v1/applications/dockercompose" || path === "/api/v1/applications/private-deploy-key")) {
       const b = JSON.parse(init.body);
+      if (path.endsWith("/private-deploy-key")) {
+        // M2.4-c2c2: like Coolify, a git application needs a stored key, a repo, a branch and a build pack.
+        if (!keys.has(b.private_key_uuid) || typeof b.git_repository !== "string" || typeof b.git_branch !== "string" || typeof b.build_pack !== "string" || !/^\d+(,\d+)*$/.test(b.ports_exposes ?? "")) {
+          return json(422, { message: "Validation failed." });
+        }
+      }
       const p = projects.get(b.project_uuid);
       if (!p || !(p.environments ?? []).includes(b.environment_name)) return json(404, { message: "Project or environment not found." });
       if (typeof b.docker_compose_raw !== "string" || !b.server_uuid) return json(422, { message: "Validation failed." });
@@ -188,5 +231,5 @@ export function fakeProviders() {
   }
 
   const creates = () => calls.filter((c) => c.method !== "GET");
-  return { fetchImpl, calls, creates, repos, projects, apps, faults, state, git, gitOf };
+  return { fetchImpl, calls, creates, repos, projects, apps, keys, deployKeys, faults, state, git, gitOf };
 }
