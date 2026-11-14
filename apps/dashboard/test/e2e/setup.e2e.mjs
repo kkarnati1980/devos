@@ -111,6 +111,26 @@ test("M1.4 AT12 (amendment): the wizard saves three caps and every secret; no va
   await context.close();
 });
 
+test("DEVOS-176 AT-CA9: the settings screen turns the analyst model pass on and off (default off)", async () => {
+  const { page, context, problems } = await open("/settings");
+  await page.getByTestId("settings-form").waitFor();
+  const box = page.getByTestId("analyst-model-pass");
+  assert.equal(await box.isChecked(), false);
+  await box.check();
+  await page.getByTestId("save-settings").click();
+  await page.getByTestId("notice").filter({ hasText: "Settings saved." }).waitFor();
+  assert.equal(JSON.parse(api.state.received.filter((r) => r.url === "/settings").at(-1).body).analystModelPass, true);
+  assert.equal(await box.isChecked(), true);
+  const before = api.state.received.filter((r) => r.url === "/settings").length;
+  await box.uncheck();
+  await page.getByTestId("save-settings").click();
+  for (let i = 0; i < 100 && api.state.received.filter((r) => r.url === "/settings").length === before; i++) await page.waitForTimeout(50);
+  assert.equal(JSON.parse(api.state.received.filter((r) => r.url === "/settings").at(-1).body).analystModelPass, false);
+  assert.equal(await box.isChecked(), false);
+  assert.deepEqual(problems, []);
+  await context.close();
+});
+
 test("M1.4 AT13: settings edits the caps, default lanes and deadlock attempts", async () => {
   const { page, context, problems } = await open("/settings");
   await page.getByTestId("settings-form").waitFor();
@@ -123,6 +143,7 @@ test("M1.4 AT13: settings edits the caps, default lanes and deadlock attempts", 
   assert.equal(sent.anthropicCapUsd, "30");
   assert.equal(sent.defaultLanes, 3);
   assert.equal(sent.deadlockAttempts, 3);
+  assert.equal(sent.analystModelPass, false);
   assert.equal(await page.locator('input[name="anthropicCapUsd"]').inputValue(), "30.00");
   assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
   const m = await page.evaluate(() => ({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }));
