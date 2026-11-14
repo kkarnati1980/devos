@@ -72,6 +72,9 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 - The hit text is still cut at 200 characters, and hit ids follow the new text. Nothing else changes: the same hits fire, with the same rules, files and lines.
 - Why: the gate evaluator (`scripts/gates/evaluate-gate.mjs`, GI-4) can then tell from the stored result whether a removed or edited step ran security scanning. Narrowing its `KK_ONLY` on that basis was a separate PR (DEVOS-186). Since DEVOS-189 `scripts/gates/kk-only.mjs` is itself a guard path, so any later change to `KK_ONLY` must come alone and be named by a `FLOOR-GUARD CHANGE` marker (note 0022).
 
+## Decision: CI-gate and Release scripts are not guard paths (DEVOS-196, note 0023)
+`scripts/ci/**` and `scripts/release/**` stay ordinary paths with every content rule. The Release script runs `main`'s copy, so a head's change to them cannot merge by itself; and guard paths must come alone, which would split each change from its tests and contract. The remaining gap (`ci-gate` runs the head's copy) is closed by running the base copy in `ci-gate.yml`, filed for Lane C before DEVOS-145.
+
 ## Not in scope
 - Making `floor-guard` a required check in the `main` ruleset (DEVOS-145, GI-3b) and adding it to `required-checks.json` (DEVOS-143).
 - The pass-rule field and validator (DEVOS-142).
@@ -102,3 +105,4 @@ Run over the last 15 merged PRs on main: 11 clean; 4 with hits — two `eslint-d
 
 ## Build record
 - Pre-review and evidence: see the PR body and the merge evidence comment on DEVOS-141.
+- 14 Nov 2026, runner A: DEVOS-196 decided (note 0023): no new guard paths; the base-copy fix for `ci-gate.yml` is filed for Lane C. Docs only.
