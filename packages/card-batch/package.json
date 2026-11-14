@@ -1,0 +1,27 @@
+{
+  "name": "@devos/card-batch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DevOS batched mid-build questions: one decision card per project per IST day (ADR-0012 CR-b).",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "pnpm --filter @devos/analyst run build && tsc -p tsconfig.json",
+    "typecheck": "pnpm --filter @devos/analyst run build && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @devos/analyst run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@devos/analyst": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "typescript": "^5.6.3"
+  }
+}
