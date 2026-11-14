@@ -36,12 +36,12 @@ const TABLE = [
   // CI: body-less or unknown bodies are KK-only; a plain stored body is not (DEVOS-186).
   ["ci-step-removed", ".github/workflows/ci.yml", "Lint", true],
   ["ci-disabled", ".github/workflows/ci.yml", "build", true],
-  ["ci-job-removed", ".github/workflows/ci.yml", "build; ran: run: pnpm build", true],
-  ["ci-step-removed", ".github/workflows/ci.yml", "Build; ran: run: pnpm test", true],
-  ["ci-step-removed", ".github/workflows/ci.yml", "Build; ran: run: ./scripts/x.sh", true],
-  ["ci-step-removed", ".github/workflows/ci.yml", "Build; ran: run: pnpm build", false],
-  ["ci-step-changed", ".github/workflows/ci.yml", "Install; was: run: pnpm install; now: run: pnpm install --frozen-lockfile", false],
-  ["ci-step-removed", ".github/workflows/ci.yml", "Checkout; ran: uses: actions/checkout@v4", false],
+  ["ci-job-removed", ".github/workflows/ci.yml", "job build removed; ran: run: pnpm build", true],
+  ["ci-step-removed", ".github/workflows/ci.yml", "job ci: step Build removed; ran: run: pnpm test", true],
+  ["ci-step-removed", ".github/workflows/ci.yml", "job ci: step Build removed; ran: run: ./scripts/x.sh", true],
+  ["ci-step-removed", ".github/workflows/ci.yml", "job ci: step Build removed; ran: run: pnpm build", false],
+  ["ci-step-changed", ".github/workflows/ci.yml", "job ci: step Install changed; was: run: pnpm install; now: run: pnpm install --frozen-lockfile", false],
+  ["ci-step-removed", ".github/workflows/ci.yml", "job ci: step Checkout removed; ran: uses: actions/checkout@v4", false],
   // Ordinary weakenings stay Codex-keepable.
   ["test-skipped", "apps/api/test/a.test.mjs", `${SKIP}("flaky on CI"`, false],
   ["assertion-removed", "apps/api/test/a.test.mjs", "assert.equal(a, 1)", false],
@@ -63,5 +63,6 @@ test("K2 the KK-only table", () => {
 test("K3 a malformed hit fails closed or reads as an ordinary hit, never throws", () => {
   assert.equal(KK_ONLY({ rule: "guard-change-not-isolated" }), true);
   assert.equal(KK_ONLY({ rule: "ci-step-removed" }), true);
-  for (const h of [null, undefined, {}]) assert.doesNotThrow(() => KK_ONLY(h));
+  // A hit with no rule, file or text names nothing a Keep could cover; it reads as an ordinary hit.
+  for (const h of [null, undefined, {}]) assert.equal(KK_ONLY(h), false);
 });

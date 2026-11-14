@@ -46,13 +46,14 @@ Codex cannot run scripts, so it does not see floor-guard hit ids unless they rea
 | B9 | Markers only in a findings-table row, only in an edited comment, or only in a later comment than the watcher's refuse |
 | B10 | A Keep for a KK-only or §4.5 hit (gitleaksignore, guard change mixed, `ci-*`, security suppression, security-named file, policy) refuses with "escalate to KK"; ordinary hits stay keepable |
 | B11 | A red workflow named `floor-guard` from another file is never set aside |
+| B12 | (DEVOS-181) A `ci-step-removed` hit with a plain stored body (the guard's own text) and a valid Keep merges; without a Keep it refuses; with a script body it refuses with "escalate to KK" |
 
 ## Pre-review (13 Nov 2026)
 Round 1: 7 findings, 6 fixed: markers from the Summary line only (B9), KK-only hits never kept (B10), earliest unedited comment (B9), workflows by file (B11), the CI-exit-2 decision recorded above, plain-marker wording in rules.md. Not changed: `localGuardReport`'s fetch path is not unit-tested against a remote (it needs `origin`); its argument check is (B8), and any failure in it is exit 2.
 Round 2: 5 low findings, 1 fixed (main is read once, so the guard re-run and the compare judge the same main); the rest fail safe and are left as is.
 
 ## Pass rule
-`node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 11 tests passing, `node --test scripts/test/merge-gate.test.mjs` exits 0 with 14 tests passing, and `pnpm check:rules` exits 0.
+`node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 11 tests passing (12 from DEVOS-181), `node --test scripts/test/merge-gate.test.mjs` exits 0 with 14 tests passing, and `pnpm check:rules` exits 0.
 
 ## Green
 - **GC1 end to end** (stored on DEVOS-140): a throwaway PR adding `.skip` to an existing test gets `floor-guard` exit 1, and `node scripts/release/merge.mjs <pr> --dry-run` exits 1 naming the `test-skipped` hit.

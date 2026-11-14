@@ -69,7 +69,7 @@ The security-suppression pattern in `kk-only.mjs` (formerly `evaluate-gate.mjs`)
 ## Pass rule
 - `node --test scripts/test/gate-evaluator.test.mjs` exits 0 with 9 tests passing (AT1–AT9); it runs under `pnpm test`.
 - From DEVOS-186: the same command exits 0 with 10 tests passing (AT1–AT10).
-- From DEVOS-181: `node --test scripts/test/kk-only.test.mjs` exits 0 with 3 tests passing (K1 one shared function, K2 the table, K3 malformed hits never throw), and the gate-evaluator and merge-gate-floor-guard commands still exit 0 with 10 and 11 tests passing.
+- From DEVOS-181: `node --test scripts/test/kk-only.test.mjs` exits 0 with 3 tests passing (K1 one shared function, K2 the table, K3 malformed hits never throw), and the gate-evaluator and merge-gate-floor-guard commands still exit 0 with 10 and 12 tests passing (B12 added).
 - `pnpm check:rules` exits 0 (the generated `CLAUDE.md` and `AGENTS.md` match `rules.md`).
 
 ## Merge gate
@@ -82,4 +82,4 @@ Reverting this PR returns the gate rule to the interim form of 12 Nov 2026 (ADR-
 - See the PR body and the merge evidence comment on DEVOS-144; GC6 and GC7 evidence goes on DEVOS-140.
 - 13 Nov 2026, build runner A: Codex PR84-r6 (1 medium, accepted): an unknown option, extra positional or repeated `--comment` could still exit 0 and skip the comment. The whole argument list is now validated before evaluation; AT9 extended (`node --test scripts/test/gate-evaluator.test.mjs` → exit 0, 9/9).
 - 14 Nov 2026, build runner A: DEVOS-186 built (section "CI hits with a stored body", AT10). `node --test scripts/test/gate-evaluator.test.mjs` exit 0, 10/10. Pre-review round 1: CHANGES_REQUESTED, 5 findings (2 high: a step name could inject a body; a removed reusable-workflow job had an empty body; 3 medium: custom `shell:`, flow-mapped `env:`/`with:`, option values that start programs) + 1 low test gap; all fixed (marker count, `ci-job-removed` always KK-only, empty body KK-only, shell/env/with and option allow-lists, an end-to-end fixture). Round 2: 1 medium (pnpm `-w`/`--workspace` could hide `test`/`lint` as a flag value) and 1 low (`run_install:` args), both fixed. Codex PR106-r1 (1 high, accepted): a `run:` value carrying a literal ` ⏎ ` could hide a second command; `run:` must now be a body's last line and other values plain words.
-- 14 Nov 2026, build runner A: DEVOS-181 built (section "Shared KK-only classifier"). `node --test scripts/test/kk-only.test.mjs` exit 0, 3/3; gate-evaluator 10/10, merge-gate-floor-guard 11/11.
+- 14 Nov 2026, build runner A: DEVOS-181 built (section "Shared KK-only classifier"). `node --test scripts/test/kk-only.test.mjs` exit 0, 3/3; gate-evaluator 10/10, merge-gate-floor-guard 12/12. Pre-review: PASS, 5 low findings, 3 fixed (B12 merge-path test, real guard text in the table, K3 asserts the value); 1 follow-up (make `kk-only.mjs` a guarded path); 1 nit left.
