@@ -39,7 +39,8 @@ async function main(): Promise<void> {
       });
       return q;
     },
-    // M2.2-d3b2: the analyst model pass is opt-in (`DEVOS_ANALYST_MODEL_PASS=on`); off, intake stays deterministic.
+    // M2.2-d3b2: the run engine is loaded only with `DEVOS_ANALYST_MODEL_PASS=on` (any other value is a hard off);
+    // DEVOS-176: whether a pass then runs is the `analyst.model_pass` setting, read per call (default off).
     ...(analystModelPass(process.env)
       ? {
           loadAnalystEngine: async (db, policy, apiKey) => {

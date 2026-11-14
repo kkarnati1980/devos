@@ -45,7 +45,11 @@ export class AnalystApiError extends Error {
   }
 }
 
-/** The opt-in switch `analyst.model_pass` (env `DEVOS_ANALYST_MODEL_PASS`): only `on` enables it. */
+/**
+ * The deployment-level allow for the model pass (env `DEVOS_ANALYST_MODEL_PASS`): only `on` loads the run engine; any
+ * other value is a hard off. DEVOS-176: with it on, the setting `analyst.model_pass` (M1.4 settings screen, default
+ * off) switches each pass on or off at call time, without a restart.
+ */
 export function analystModelPass(env: NodeJS.ProcessEnv): boolean {
   return env.DEVOS_ANALYST_MODEL_PASS === "on";
 }
