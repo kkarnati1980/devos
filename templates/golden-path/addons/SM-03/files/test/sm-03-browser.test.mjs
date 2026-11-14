@@ -232,6 +232,14 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`<p><![CDATA[x]]></p>`, /CDATA/);
   assert.throws(() => html`<svg>${html`<![CDATA[x]]>`}</svg>`, /CDATA/);
   assert.equal(String(html`<svg><title>${"<![CDATA["}</title></svg>`), "<svg><title>&lt;![CDATA[</title></svg>");
+  // Codex PR98-r11: a </svg> the browser ignores (an HTML element is open inside <foreignObject>) must not make
+  // <title> RCDATA again: after any SVG/MathML root, <title>/<textarea> are read as markup and checked.
+  assert.throws(() => html`<svg><foreignObject><div></svg></div></foreignObject><title><img src=x onerror="${"alert(1)"}"></title></svg>`, /event-handler/);
+  assert.throws(() => html`<svg></svg><textarea><a href="${"javascript:alert(1)"}">x</a></textarea>`, /URL attribute/);
+  assert.throws(() => html`<math/><title><img onerror="${"x"}"></title>`, /event-handler/);
+  assert.throws(() => html`${html`<svg><foreignObject><div></svg></div></foreignObject>`}<title><img onerror="${"x"}"></title></svg>`, /balanced|event-handler/);
+  assert.throws(() => html`<svg></svg>${html`<title>${"t"}</title>`}`, /inside <svg> or <math>/);
+  assert.equal(String(html`<svg></svg><textarea>${"<b>"}</textarea>`), "<svg></svg><textarea>&lt;b&gt;</textarea>");
   // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
   // and an RCDATA-free fragment inside SVG.
   assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');

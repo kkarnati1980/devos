@@ -132,8 +132,12 @@ class MarkupState {
   tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false;
   fstack = []; // open SVG/MathML roots, innermost last
   get foreign() { return this.fstack.length; }
+  // Codex PR98-r11: once an <svg> or <math> start tag has been seen, the rest of the parse never enters RCDATA.
+  // Whether the browser is still in foreign content after an end tag depends on tree construction (an HTML element
+  // inside <foreignObject> makes the browser ignore a </svg>), which this parser does not model.
+  sawForeign = false;
   inSelect = false;
-  sawRcdata = false; // this parse entered RCDATA (<title>/<textarea> outside SVG/MathML) at least once
+  sawRcdata = false; // this parse entered RCDATA (<title>/<textarea> before any SVG/MathML root) at least once
   ts = "open"; closing = false; selfClose = false; curAttr = ""; // tag sub-state, as in the HTML tokenizer
   openTag() { this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.ts = "open"; this.closing = false; this.selfClose = false; this.curAttr = ""; }
   feed(s) {
@@ -241,6 +245,7 @@ class MarkupState {
           // An end tag pops back to its own open root, as the browser's foreign-content rule does (</math> inside an
           // <svg> is ignored there, so it must not end the SVG subtree here either).
           if (!closing && !selfClose && (name === "svg" || name === "math")) this.fstack.push(name);
+          if (!closing && (name === "svg" || name === "math")) this.sawForeign = true; // a self-closed root counts too
           else if (closing && (closeName === "svg" || closeName === "math")) {
             const at = this.fstack.lastIndexOf(closeName);
             if (at >= 0) this.fstack.length = at;
@@ -252,7 +257,9 @@ class MarkupState {
               throw new TypeError(`html: <${name}> inside <select> is not supported (browsers parse it differently there)`);
             }
           }
-          const rcdata = this.foreign === 0 && RCDATA.has(name);
+          // RCDATA only before any SVG/MathML root (r11): after one, <title>/<textarea> are read as markup, so their
+          // attributes are checked. Reading RCDATA as markup only adds checks: a value there is escaped text anyway.
+          const rcdata = !this.sawForeign && RCDATA.has(name);
           this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && rcdata ? "rcdata" : "text";
           if (this.mode !== "text") this.raw = name;
           if (this.mode === "rcdata") this.sawRcdata = true;
@@ -277,14 +284,14 @@ export function isSafeUrl(value) {
 //   markup, so a value the fragment saw as text could land in an attribute the parent never checked;
 // - inside a quoted attribute value, when the fragment holds a quote character: it would close the attribute and
 //   open new ones (e.g. title="${html`" href="${userUrl}`}") that skipped the URL and handler checks;
-// - inside SVG/MathML content, when the fragment's own parse entered <title>/<textarea> text: there those
-//   elements hold markup, so the parent would read as tags and attributes what the fragment checked as text.
+// - after any SVG/MathML root in the parent, when the fragment's own parse entered <title>/<textarea> text: there
+//   those elements may hold markup, so the parent would read as tags and attributes what the fragment checked as text.
 function assertPlaceable(v, state) {
   if (Array.isArray(v)) { for (const x of v) assertPlaceable(x, state); return; }
   if (!isSafeHtml(v)) return;
   if (state.mode === "rcdata") throw new TypeError(`html: a nested html\`\` result may not be placed inside <${state.raw}>; pass text`);
   if (state.mode === "quote" && /["']/.test(String(v))) throw new TypeError("html: a nested html`` result inside an attribute value may not hold a quote character");
-  if (state.mode === "text" && state.foreign > 0 && enteredRcdata.has(v)) {
+  if (state.mode === "text" && state.sawForeign && enteredRcdata.has(v)) {
     throw new TypeError("html: a nested html`` result holding <title> or <textarea> text may not be placed inside <svg> or <math>");
   }
 }
