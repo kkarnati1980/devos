@@ -12,6 +12,9 @@ permissions:
   contents: read
   checks: read
   actions: read # list the head SHA's pull_request workflow runs (Codex PR73-r4)
+  statuses: read # GI-1d: the head's codex-review status
+  pull-requests: read # GI-1d: the PR's changed files and the watcher's PASS comment
+  # GI-1d: PR number and base SHA come from the event file; history is fetched only when a disposition is judged.
 jobs:
   ci-gate:
     runs-on: ubuntu-latest

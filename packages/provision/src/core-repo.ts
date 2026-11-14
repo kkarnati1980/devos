@@ -10,6 +10,8 @@ import { StepError, type Found, type StepSpec } from "./runner.js";
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
+/** The DevOS-generated deploy Compose files (M2.4-c2c2, `deploy/compose.<env>.devos.yaml`). */
+export const DEPLOY_COMPOSE_RE = /^deploy\/compose\.(preview|production)\.devos\.yaml$/;
 
 interface TreeEntry { path: string; mode: string; type: string; sha: string }
 
@@ -88,6 +90,15 @@ export class CoreRepo {
     return sha(r.body?.sha, "POST git/trees", r.status);
   }
 
+  /** A full tree from existing entries plus new blobs (M2.4-c2c2: the deploy Compose files on top of `main`). */
+  async createTreeEntries(entries: { path: string; mode: string; sha: string }[]): Promise<string> {
+    for (const e of entries) assertRepoPath(e.path);
+    const r = await this.http.write<{ sha?: unknown }>("POST", `${this.base}/git/trees`, {
+      tree: entries.map((e) => ({ path: e.path, mode: e.mode, type: "blob", sha: sha(e.sha, "tree entry") })),
+    });
+    return sha(r.body?.sha, "POST git/trees", r.status);
+  }
+
   async createCommit(message: string, tree: string, parents: string[]): Promise<string> {
     const r = await this.http.write<{ sha?: unknown }>("POST", `${this.base}/git/commits`, { message, tree, parents });
     return sha(r.body?.sha, "POST git/commits", r.status);
@@ -143,7 +154,9 @@ export async function mainState(repo: CoreRepo, files: RepoFile[]): Promise<Main
     manifestOk = got.sha === manifest.sha || (manifestKey(await repo.blobContent(got.sha)) ?? "x") === manifestKey(manifest.content);
   }
   const rest = files.filter((f) => f !== manifest);
-  if (manifestOk && tree.size === files.length && rest.every((f) => tree.get(f.path)?.sha === f.sha && tree.get(f.path)?.mode === f.mode)) {
+  // M2.4-c2c2: the generated deploy Compose files sit on top of the core, so a lost journal still sees the core.
+  const size = [...tree.keys()].filter((k) => !DEPLOY_COMPOSE_RE.test(k) || files.some((f) => f.path === k)).length;
+  if (manifestOk && size === files.length && rest.every((f) => tree.get(f.path)?.sha === f.sha && tree.get(f.path)?.mode === f.mode)) {
     return { kind: "core", head };
   }
   if (manifestOk && tree.size === 1) return { kind: "bootstrap", head };

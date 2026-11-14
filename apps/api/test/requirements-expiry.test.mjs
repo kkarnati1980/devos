@@ -284,3 +284,18 @@ test("AT-E10 (Codex PR88-r5) one write's bound counts the connection wait as wel
   assert.deepEqual(holdOpts[0], { timeout: 80, maxWait: 20 });
   assert.ok(ended - started < holdOpts[0].timeout, `the write ended ${Math.round(ended - started)} ms into an 80 ms hold`);
 });
+
+test("DEVOS-185: PrismaApprovalStore exposes its write bound, built from the options its transactions really get", async () => {
+  const { PrismaApprovalStore } = await import("../dist/approvals.js");
+  const { approvalStepBoundMs } = await import("../dist/requirements-expiry.js");
+  for (const ms of [30, 10_000]) {
+    const seen = [];
+    const db = { $transaction: async (fn, o) => (seen.push(o), fn({ $queryRaw: async () => [], approval: { findUnique: async () => null } })) };
+    const store = new PrismaApprovalStore(db, ms);
+    await store.get("00000000-0000-0000-0000-000000000001").catch(() => {});
+    assert.ok(seen.length >= 1);
+    assert.equal(store.stepBoundMs, seen[0].maxWait + seen[0].timeout);
+    assert.equal(approvalStepBoundMs(store), store.stepBoundMs, "read from the store");
+    assert.equal(approvalStepBoundMs(ms), store.stepBoundMs, "the number form agrees");
+  }
+});
