@@ -66,6 +66,7 @@ export {
 export { MemoryRequirementsStore, type MemoryRequirement, type MemorySpec } from "./memory-store.js";
 export {
   buildPreflight,
+  preflightEntries,
   preflightLine,
   PreflightError,
   ACCEPTANCE_DEFAULT,

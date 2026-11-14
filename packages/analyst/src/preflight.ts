@@ -33,6 +33,7 @@ const CONTROL = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a
 const oneLine = (s: string): string => s.replace(CONTROL, " ").replace(/\s+/g, " ").trim();
 function clip(s: string, max: number): string {
   if (s.length <= max) return s;
+  if (max < 1) return "";
   let end = max - 1;
   const c = s.charCodeAt(end - 1);
   if (c >= 0xd800 && c <= 0xdbff) end -= 1;
@@ -67,18 +68,26 @@ export function buildPreflight(analysis: Analysis, secretNames: readonly string[
   return items.map((it, i) => ({ id: `PF-${i + 1}`, ...it }));
 }
 
+/** Each item as it appears in the summary line: one line of at most 200 characters (M2.3's per-line limit). */
+export function preflightEntries(items: readonly PreflightItem[]): string[] {
+  return items.map((i) =>
+    clip(oneLine(i.kind === "secret" ? `${i.id}: secret ${i.text} (${i.default})` : `${i.id}: ${i.text} (default: ${i.default})`), CARD_LINE_MAX),
+  );
+}
+
 /**
  * The one line the intake card's reason gains: `Pre-flight: <n> questions, <m> secrets — PF-1: … (default: …); …`.
- * At most `max` characters (the room left in M2.3's 2,000-character reason); entries that do not fit are replaced
- * by `+<k> more on the project page`. Each entry is one line of at most 200 characters.
+ * `max` is required: the caller passes the room left in M2.3's 2,000-character reason (at most `CARD_REASON_MAX`).
+ * The result is never longer than `max`; entries that do not fit are replaced by `+<k> more on the project page`,
+ * and with no room at all (`max` < 1, or not a number) the result is "" so the caller's reason stays within the limit.
  */
-export function preflightLine(items: readonly PreflightItem[], max: number = CARD_REASON_MAX): string {
+export function preflightLine(items: readonly PreflightItem[], max: number): string {
+  if (!Number.isFinite(max) || max < 1) return "";
+  const limit = Math.min(Math.floor(max), CARD_REASON_MAX);
   const questions = items.filter((i) => i.kind === "decision").length;
   const secrets = items.length - questions;
   const head = `Pre-flight: ${questions} questions, ${secrets} secrets`;
-  const entries = items.map((i) =>
-    clip(oneLine(i.kind === "secret" ? `${i.id}: secret ${i.text} (${i.default})` : `${i.id}: ${i.text} (default: ${i.default})`), CARD_LINE_MAX),
-  );
+  const entries = preflightEntries(items);
   const build = (n: number) => {
     const shown = entries.slice(0, n);
     const rest = entries.length - n;
@@ -88,8 +97,8 @@ export function preflightLine(items: readonly PreflightItem[], max: number = CAR
   };
   for (let n = entries.length; n >= 0; n--) {
     const s = build(n);
-    if (s.length <= max) return s;
+    if (s.length <= limit) return s;
   }
   // Not even the head fits: the caller gave too little room; never exceed it.
-  return clip(build(0), max);
+  return clip(build(0), limit);
 }

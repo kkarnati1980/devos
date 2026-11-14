@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseSpec } from "@devos/intake";
-import { analyzeSpec, buildPreflight, preflightLine, PreflightError, SECRET_DEFAULT } from "../dist/index.js";
+import { analyzeSpec, buildPreflight, preflightEntries, preflightLine, PreflightError, SECRET_DEFAULT } from "../dist/index.js";
 
 // Same one-line rule as M2.3 parseCard (apps/api/src/approvals.ts ONE_LINE), pinned here as in route.test.mjs.
 const ONE_LINE = new RegExp("^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]+$");
@@ -67,7 +67,7 @@ test("AT1c: a secret name that is not NAME-shaped, or a bad envelope, is refused
 
 test("AT5 (pure half): the summary line names counts, defaults and secrets by name, fits the limit, and ends with +k more when cut", () => {
   const items = buildPreflight(analysis(SPEC), ["SMS_API_KEY", "MAPS_KEY"], { maxCostUsd: 25 });
-  const line = preflightLine(items);
+  const line = preflightLine(items, 2000);
   assert.match(line, /^Pre-flight: 5 questions, 2 secrets — PF-1: /);
   assert.match(line, /PF-6: secret SMS_API_KEY \(enter in setup wizard\)/);
   assert.ok(ONE_LINE.test(line));
@@ -80,7 +80,30 @@ test("AT5 (pure half): the summary line names counts, defaults and secrets by na
   const m = cut.match(/\+(\d+) more on the project page$/);
   assert.ok(m && Number(m[1]) >= 1);
   assert.ok(ONE_LINE.test(cut));
-  for (const e of cut.replace(/^Pre-flight: [^—]+— /, "").split("; ")) assert.ok(e.length <= 200, `entry of ${e.length}`);
-  // Too little room: never longer than asked.
+  // Entries checked directly (not by splitting the line): each is ≤ 200, and the line lists a prefix of them in order.
+  const entries = preflightEntries(big);
+  for (const e of entries) assert.ok(e.length <= 200, `entry of ${e.length}`);
+  const shown = entries.length - Number(m[1]);
+  assert.ok(cut.startsWith(`Pre-flight: ${big.length} questions, 0 secrets — ${entries.slice(0, shown).join("; ")}; +`));
+  // Too little room: never longer than asked; no room at all gives "".
   assert.ok(preflightLine(big, 10).length <= 10);
+  for (const max of [0, -5, Number.NaN]) assert.equal(preflightLine(big, max), "", `max ${max}`);
+  assert.ok(preflightLine(big, 5000).length <= 2000, "never past M2.3's reason limit");
+});
+
+test("AT5b (pure half): control and bidi characters become spaces, and a cut never splits a surrogate pair", () => {
+  const items = [
+    { id: "PF-1", kind: "decision", text: "Ship\tthe \u202edark\u2066 mode\nnow?", default: "Architect decides" },
+    { id: "PF-2", kind: "decision", text: `${"a".repeat(192)}\u{1F600}${"b".repeat(40)}`, default: "x" },
+  ];
+  const line = preflightLine(items, 2000);
+  assert.ok(ONE_LINE.test(line));
+  assert.match(line, /PF-1: Ship the dark mode now\? \(default: Architect decides\)/);
+  const e2 = preflightEntries(items)[1];
+  assert.ok(e2.length <= 200);
+  assert.ok(e2.endsWith("a…"), "the cut drops the whole pair before the ellipsis");
+  for (let i = 0; i < e2.length; i++) {
+    const c = e2.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) assert.ok(i + 1 < e2.length && e2.charCodeAt(i + 1) >= 0xdc00 && e2.charCodeAt(i + 1) <= 0xdfff, "lone high surrogate");
+  }
 });
