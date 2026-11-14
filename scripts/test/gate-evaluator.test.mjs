@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { evaluateGate, renderComment, CannotRun } from "../gates/evaluate-gate.mjs";
+import { workflowShape, oneLine } from "../floor-guard/floor-guard.mjs";
 
 const SUP = "// eslint-" + "disable-next-line";
 const fgClean = (sha, link) => ({ report: { sha, exit: 0, hits: [] }, link });
@@ -254,7 +255,9 @@ test("AT10 (DEVOS-186, GI-4c): a CI hit whose stored body shows only known non-s
     "job build: step uses:actions/checkout removed; ran: uses: actions/checkout@v4",
     "job build: step name:Build changed; was: run: pnpm build ⏎ timeout-minutes: 10; now: run: pnpm build ⏎ timeout-minutes: 20",
   ]) assert.equal(run(text.includes("changed;") ? "ci-step-changed" : "ci-step-removed", text), "", text);
-  assert.equal(run("ci-job-removed", "job e2e removed; ran: uses: actions/checkout@v4 ;; run: pnpm e2e"), "");
+  // End to end: the hit text the floor guard itself writes for a removed build step is cleared.
+  const shape = workflowShape("on: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - name: Build\n        run: pnpm build\n        shell: bash\n");
+  assert.equal(run("ci-step-removed", `job build: step name:Build removed; ran: ${oneLine(shape.bodies.build["name:Build"])}`), "");
   // KK-only: a security command, a script the text cannot resolve, a local action, a block scalar, chaining,
   // `test`/`lint`, an extra word, the old body-less text, and every body-less ci-* rule.
   for (const [rule, text] of [
@@ -273,6 +276,20 @@ test("AT10 (DEVOS-186, GI-4c): a CI hit whose stored body shows only known non-s
     ["ci-step-changed", "job build: step name:B changed; was: run: pnpm build; now: run: pnpm build && pnpm pack"],
     ["ci-step-changed", "job build: step name:B changed; was: run: pnpm build"],
     ["ci-job-removed", "job e2e removed; ran: run: pnpm e2e ;; run: pnpm test"],
+    // Pre-review round 1: a removed job is always KK-only (job-level uses:/services:/env: never reach the text).
+    ["ci-job-removed", "job e2e removed; ran: uses: actions/checkout@v4 ;; run: pnpm e2e"],
+    ["ci-job-removed", "job checks removed; ran: "],
+    // a step name carrying a marker cannot inject a body
+    ["ci-step-removed", "job build: step name:x; ran: run: pnpm build ⏎ name: y removed; ran: run: bash scripts/verify-deps.sh"],
+    ["ci-step-changed", "job build: step name:x; ran: run: pnpm build changed; was: run: bash v.sh; now: run: pnpm build"],
+    ["ci-step-changed", "job build: step name:B changed; was: run: pnpm build; now: run: pnpm build; now: run: pnpm build"],
+    // an empty body, a custom shell, a flow mapping on env:/with:, and unknown package-manager options
+    ["ci-step-removed", "job build: step name:B removed; ran: "],
+    ["ci-step-removed", "job build: step name:B removed; ran: (empty)"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ shell: node scripts/check-deps.js {0}"],
+    ["ci-step-removed", 'job build: step name:B removed; ran: run: pnpm build ⏎ env: { NODE_OPTIONS: "--require ./scripts/v.cjs" }'],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: npm --script-shell=./scripts/v.sh run build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm --config.node-options=--require=./x.cjs build"],
     ["ci-disabled", "if: false"],
     ["ci-continue-on-error", "continue-on-error: true"],
     ["ci-trigger-removed", "trigger push removed"],
