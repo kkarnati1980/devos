@@ -260,22 +260,22 @@ async function loadRelease() {
  * reviews only green heads, so ci-gate is re-run after the PASS lands. Anything else stays a failure.
  * @returns {Promise<{ disposed: boolean, reasons: string[] }>}
  */
+/** GI-1d: true only when the one failed check is a `failure` of the floor guard and nothing is pending. */
+export function floorGuardOnly(v, check = "floor-guard") {
+  return v.state === "failure" && v.pending.length === 0 && v.failed.length === 1 && v.failed[0] === `${check}=failure`;
+}
+
 export async function floorGuardDisposition(v, { gh, repo, pr, sha, baseSha, config, guardReport, release = loadRelease }) {
+  // Shape first, so any other failure never loads the Release module and fails exactly as before (pre-review L1).
+  if (!floorGuardOnly(v, config?.floorGuard?.check)) return { disposed: false, reasons: [] };
   const rel = await release();
   config ??= rel.DEFAULT_CONFIG;
   const fg = config.floorGuard;
-  if (!fg || v.state !== "failure" || v.pending.length > 0 || v.failed.length !== 1 || v.failed[0] !== `${fg.check}=failure`) {
-    return { disposed: false, reasons: [] };
-  }
+  if (!fg || !floorGuardOnly(v, fg.check)) return { disposed: false, reasons: [] };
   if (!Number.isInteger(Number(pr)) || Number(pr) <= 0) throw new GateError("the pull request number (event file) is required to judge floor-guard Keeps");
   if (!/^[0-9a-f]{40}$/.test(String(baseSha))) throw new GateError("the base SHA (event file) is not a full commit SHA");
-  const statuses = [];
-  for (let page = 1; page <= 20; page++) {
-    const j = await gh.get(`/repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
-    statuses.push(...(j?.statuses ?? []));
-    if (statuses.length >= (j?.total_count ?? 0) || (j?.statuses ?? []).length === 0) break;
-    if (page === 20) throw new GateError("more than 2,000 statuses; refusing to judge a partial list");
-  }
+  // Statuses other than codex-review stay a Release-path check (ci-gate never judged statuses); only the PASS is used.
+  const statuses = await rel.allStatuses(gh, repo, sha);
   const { passLabel, reasons } = rel.codexPass(statuses, pr, config);
   if (!passLabel) return { disposed: false, reasons };
   const p = await gh.get(`/repos/${repo}/pulls/${pr}`);
@@ -308,6 +308,10 @@ async function main() {
   if (v.state === "success") {
     console.log("ci-gate: every expected check passed");
     return 0;
+  }
+  if (!floorGuardOnly(v)) {
+    console.error(`ci-gate: FAIL ${v.failed.join(", ")}`);
+    return 1;
   }
   const { pr, baseSha } = prFromEvent(process.env.GITHUB_EVENT_PATH ?? "");
   const rel = await loadRelease();
@@ -345,7 +349,8 @@ if (isEntry()) {
   main().then(
     (code) => process.exit(code),
     (e) => {
-      console.error(`ci-gate: ERROR ${e instanceof GateError ? e.message : "unexpected failure"}`);
+      // The Release module throws CannotRun (pre-review L2): its message names the API or git step that failed.
+      console.error(`ci-gate: ERROR ${e instanceof GateError || e?.constructor?.name === "CannotRun" ? e.message : "unexpected failure"}`);
       process.exit(2);
     },
   );

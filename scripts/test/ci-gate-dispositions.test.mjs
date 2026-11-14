@@ -74,7 +74,9 @@ test("D2: any other failure, a pending check, a cancelled or timed-out floor gua
     { state: "failure", failed: ["floor-guard=not-finished-in-time"], pending: [] },
     { state: "failure", failed: ["floor-guard=reported-by-more-than-one-workflow-run"], pending: [] },
   ]) {
-    assert.deepEqual(await judge(v, fake(), g), { disposed: false, reasons: [] });
+    let loaded = false;
+    assert.deepEqual(await judge(v, fake(), g, { release: async () => { loaded = true; throw new GateError("must not load"); } }), { disposed: false, reasons: [] });
+    assert.equal(loaded, false, "the Release module is not loaded for another failure");
   }
   assert.equal(g.calls.length, 0, "the guard is not re-run");
 });

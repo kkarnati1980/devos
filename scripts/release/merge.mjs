@@ -86,7 +86,7 @@ async function allCheckRuns(gh, repo, sha) {
   throw new CannotRun("more than 2,000 check runs; refusing to judge a partial list");
 }
 
-async function allStatuses(gh, repo, sha) {
+export async function allStatuses(gh, repo, sha) {
   const statuses = [];
   for (let page = 1; page <= 20; page++) {
     const j = await gh.get(`/repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
@@ -188,7 +188,7 @@ export function namesChange(text, path) {
  */
 export async function localGuardReport({ mainSha, sha, cwd = process.cwd(), fetch = true }) {
   for (const x of [mainSha, sha]) if (!/^[0-9a-f]{40}$/.test(String(x))) throw new CannotRun("floor guard: bad SHA");
-  // GI-1d: ci-gate checks out the full history itself (fetch-depth 0, no stored credentials), so it skips the fetch.
+  // GI-1d: ci-gate fetches base and head itself (fetchHistory, token through git's environment), so it skips this fetch.
   if (fetch) {
     const fetched = spawnSync("git", ["fetch", "--quiet", "--no-tags", "origin", mainSha, sha], { cwd, encoding: "utf8", timeout: 60_000 });
     if (fetched.status !== 0) throw new CannotRun("floor guard: cannot fetch the main and head SHAs");
