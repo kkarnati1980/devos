@@ -345,17 +345,25 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
-  /** CR-a3 (DEVOS-199): the decision log rows of one intake card (approval), oldest first, at most 500 rows. */
+  /**
+   * CR-a3 (DEVOS-199): the decision log rows of one intake card (approval), oldest first, at most 500 rows.
+   * DEVOS-204: the approval's rows come first (item order), then the re-answers from that card's later comments in
+   * comment order (`created_at`, `id`), so the newest answer per item is always last. Rows written in one
+   * transaction share `created_at`, so that column alone cannot order them (pre-review finding 1).
+   */
   decisions(projectId: string, approvalId: string): Promise<{ itemId: string; answer: string; source: string; createdAt: string }[]> {
     return this.tx(async (tx) => {
-      const rows = await tx.projectDecision.findMany({
-        // DEVOS-204: the approval's rows and the re-answers from that card's later comments.
-        where: { projectId, OR: [{ approvalId }, { comment: { approvalId } }] },
-        orderBy: [{ createdAt: "asc" }, { itemId: "asc" }],
+      type Row = { itemId: string; answer: string; source: string; createdAt: Date; comment?: { createdAt: Date; id: string } | null };
+      const select = { itemId: true, answer: true, source: true, createdAt: true } as const;
+      const approved: Row[] = await tx.projectDecision.findMany({ where: { projectId, approvalId }, orderBy: [{ createdAt: "asc" }, { itemId: "asc" }], take: 500, select });
+      const later: Row[] = await tx.projectDecision.findMany({
+        where: { projectId, comment: { approvalId } },
+        orderBy: [{ comment: { createdAt: "asc" } }, { commentId: "asc" }, { itemId: "asc" }],
         take: 500,
-        select: { itemId: true, answer: true, source: true, createdAt: true },
+        select: { ...select, comment: { select: { createdAt: true, id: true } } },
       });
-      return rows.map((r: { itemId: string; answer: string; source: string; createdAt: Date }) => ({ itemId: r.itemId, answer: r.answer, source: r.source, createdAt: r.createdAt.toISOString() }));
+      const rows = [...approved, ...later].slice(0, 500);
+      return rows.map((r) => ({ itemId: r.itemId, answer: r.answer, source: r.source, createdAt: r.createdAt.toISOString() }));
     });
   }
 

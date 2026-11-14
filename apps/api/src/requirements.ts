@@ -130,7 +130,10 @@ async function syncReanswers(svc: RequirementsServices, pipeline: RequirementsPi
   const comments: { id: string; body: string; createdAt: Date }[] = [];
   for (const c of all) if (c.id && c.createdAt) comments.push({ id: c.id, body: c.body, createdAt: c.createdAt });
   const newest = comments.reduce<number | null>((m, c) => (m === null || c.createdAt.getTime() > m ? c.createdAt.getTime() : m), null);
-  const seenUpTo = newest === null ? null : new Date(Math.min(newest, now.getTime() - REANSWER_SETTLE_MS));
+  // No comment after the decision: nothing to read and nothing to write (pre-review finding 2: a sync of an
+  // approved doc stays read-only then).
+  if (newest === null || newest <= card.decidedAt.getTime()) return;
+  const seenUpTo = new Date(Math.min(newest, now.getTime() - REANSWER_SETTLE_MS));
   await pipeline.applyReanswers({ id: card.id, gate: card.gate, status: card.status, decidedAt: card.decidedAt }, comments, seenUpTo);
 }
 

@@ -171,6 +171,14 @@ test("DEVOS-204 (db): a later KK comment adds one kk row keyed by the comment; l
   // The project page's decision log for that card shows both PF-1 rows, oldest first.
   const log = (await store.decisions(p.id, r.approvalId)).filter((d) => d.itemId === "PF-1");
   assert.deepEqual(log.map((d) => [d.answer, d.source]), [["yes", "kk"], ["no", "kk"]]);
+  // Pre-review finding 1: two re-answers of one item in one pass share created_at; the log still ends with the newest.
+  const c2 = await db.approvalComment.create({ data: { approvalId: r.approvalId, author: "kk:test", body: "PF-1: maybe", createdAt: new Date(decidedAt.getTime() + 120_000) } });
+  const c3 = await db.approvalComment.create({ data: { approvalId: r.approvalId, author: "kk:test", body: "PF-1: yes", createdAt: new Date(decidedAt.getTime() + 180_000) } });
+  const all = await db.approvalComment.findMany({ where: { approvalId: r.approvalId }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
+  assert.equal(await pl.applyReanswers(card, all, c3.createdAt), 3);
+  const log2 = (await store.decisions(p.id, r.approvalId)).filter((d) => d.itemId === "PF-1");
+  assert.deepEqual(log2.map((d) => d.answer), ["yes", "no", "maybe", "yes"]);
+  assert.ok([c2.id, c3.id].every(Boolean));
   // A draft doc is never written by recordReanswers.
   const p2 = await project();
   const r2 = await pl.submitSpec(p2.id, { kind: "paste", text: SPEC });
