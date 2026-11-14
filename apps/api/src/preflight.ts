@@ -5,12 +5,14 @@ import type { PreflightItem } from "@devos/analyst";
 
 export type PreflightState = "pending" | "approved" | "rejected";
 
-/** The reads `preflightOpen` needs. Any read that throws makes the result false (fail closed). */
+/** The read `preflightOpen` needs. A read that throws makes the result false (fail closed). */
 export interface PreflightReader {
-  /** `project.preflight_state`, or null when the project does not exist. */
-  preflightState(projectId: string): Promise<PreflightState | null>;
-  /** The newest requirements doc's pre-flight list, or null (no doc, or a doc from outside the mode). */
-  latestPreflight(projectId: string): Promise<PreflightItem[] | null>;
+  /**
+   * `project.preflight_state` and the newest requirements doc's pre-flight list (null: no doc, or a doc from outside
+   * the mode), read from ONE database snapshot; null when the project does not exist. One read, not two, so a spec
+   * version committed between them can never pair an `approved` state with the new, unapproved list (Codex PR122-r2).
+   */
+  preflightSnapshot(projectId: string): Promise<{ state: PreflightState | null; items: PreflightItem[] | null } | null>;
 }
 
 /** The vault read (Vault.hasProject satisfies it). Reads no ciphertext. */
@@ -27,8 +29,9 @@ export const preflightSecretName = (name: string): string => `preview/${name}`;
  */
 export async function preflightOpen(projectId: string, reader: PreflightReader, vault: SecretPresence): Promise<boolean> {
   try {
-    if ((await reader.preflightState(projectId)) !== "approved") return false;
-    const items = (await reader.latestPreflight(projectId)) ?? [];
+    const snap = await reader.preflightSnapshot(projectId);
+    if (!snap || snap.state !== "approved") return false;
+    const items = snap.items ?? [];
     for (const it of items) {
       if (it.kind !== "secret") continue;
       if ((await vault.hasProject(projectId, preflightSecretName(it.text))) !== true) return false;

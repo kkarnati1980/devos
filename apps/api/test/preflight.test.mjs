@@ -14,7 +14,7 @@ const items = [
 ];
 
 function reader(state, list = items) {
-  return { preflightState: async () => state, latestPreflight: async () => list };
+  return { preflightSnapshot: async () => (state === null ? null : { state, items: list }) };
 }
 function vault(names) {
   const set = new Set(names);
@@ -32,11 +32,19 @@ test("AT3 (CR-a2): open only when approved and every secret is in the project va
   assert.equal(await preflightOpen(P, reader("approved", null), vault([])), true, "backfilled: approved, no pre-flight list");
   assert.equal(await preflightOpen(P, reader(null), all), false, "no such project");
   // Fail closed on any read error.
-  const broken = { preflightState: async () => { throw new Error("db down"); }, latestPreflight: async () => items };
+  const broken = { preflightSnapshot: async () => { throw new Error("db down"); } };
   assert.equal(await preflightOpen(P, broken, all), false);
   assert.equal(await preflightOpen(P, reader("approved"), { hasProject: async () => { throw new Error("vault down"); } }), false);
   // The vault name is the preview env's (M2.4 `<env>/<NAME>`); a global or other-env name does not count.
   assert.equal(await preflightOpen(P, reader("approved"), vault(["SMS_API_KEY", "live/SMS_API_KEY"])), false);
+  // Codex PR122-r2: only the one-snapshot read decides. Separate state and list reads that would disagree (an
+  // approved state next to a newer, unapproved version's list) are never consulted.
+  const racy = {
+    preflightState: async () => "approved",
+    latestPreflight: async () => [],
+    preflightSnapshot: async () => ({ state: "pending", items: [] }),
+  };
+  assert.equal(await preflightOpen(P, racy, all), false, "a new version reset the state in the same snapshot");
 });
 
 test("AT4 (CR-a2): `PF-1: yes` records PF-1 as kk and every other decision item as its default; secrets are never answered", () => {
