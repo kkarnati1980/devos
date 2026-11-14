@@ -226,6 +226,12 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`<a href = "${"javascript:alert(1)"}">x</a>`, /URL attribute/);
   assert.throws(() => html`<a/href="${"javascript:alert(1)"}">x</a>`, /URL attribute/);
   assert.equal(String(html`<a href="${"/x"}" title='${"t"}' data-n=1>ok</a><br/><p>${"y"}</p >`), `<a href="/x" title='t' data-n=1>ok</a><br/><p>y</p >`);
+  // Codex PR98-r10: CDATA inside SVG ends only at "]]>"; it is refused everywhere, also when built from a fragment.
+  assert.throws(() => html`<svg><![CDATA[><a title="]]><foreignObject><script>${"alert(1)//"}"></script></foreignObject></svg>`, /CDATA/);
+  assert.throws(() => html`<math><![CDATA[x]]></math>`, /CDATA/);
+  assert.throws(() => html`<p><![CDATA[x]]></p>`, /CDATA/);
+  assert.throws(() => html`<svg>${html`<![CDATA[x]]>`}</svg>`, /CDATA/);
+  assert.equal(String(html`<svg><title>${"<![CDATA["}</title></svg>`), "<svg><title>&lt;![CDATA[</title></svg>");
   // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
   // and an RCDATA-free fragment inside SVG.
   assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');

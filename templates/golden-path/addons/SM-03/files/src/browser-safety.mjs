@@ -124,6 +124,8 @@ function assertNoTextEndTag(s, i) {
 // (so their content is markup there) and honours them in others (Codex PR98-r6). <script> is raw text in both.
 const IGNORED_IN_SELECT = new Set([...RCDATA, ...RAW_TEXT].filter((n) => n !== "script"));
 
+const CDATA_REFUSED = "html: <![CDATA[ is not supported (inside <svg>/<math> it hides markup until ]]>)";
+
 class MarkupState {
   mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment | bogus
   tag = ""; // current tag source since "<"
@@ -139,6 +141,7 @@ class MarkupState {
       const c = s[i];
       if (this.mode === "lt") { // the "<" was the last character of the previous piece
         this.mode = "text";
+        if (c === "!" && s.startsWith("![CDATA[", i)) throw new TypeError(CDATA_REFUSED);
         if (c === "!" || c === "?") this.mode = "bogus";
         else if (/[a-zA-Z\/]/.test(c)) { this.openTag(); i--; }
       } else if (this.mode === "text") {
@@ -148,6 +151,10 @@ class MarkupState {
         else if (c === "<" && s.startsWith("<!--->", i)) i += 5;
         else if (c === "<" && s.startsWith("<!--", i)) { this.mode = "comment"; i += 3; }
         else if (c === "<" && i + 1 === s.length) this.mode = "lt";
+        // Codex PR98-r10: inside SVG/MathML, <![CDATA[ … ]]> is a CDATA section that ends only at "]]>", so the
+        // ">" and quotes inside it are text there, not the end of a bogus comment. Refused everywhere: outside foreign
+        // content the browser reads it as a bogus comment instead, and a template never needs it (text is escaped).
+        else if (c === "<" && s.startsWith("<![CDATA[", i)) throw new TypeError(CDATA_REFUSED);
         // Codex PR98-r7: <!…> (other than a comment), <?…> and </ not followed by a letter are bogus comments in
         // the browser: they end at the first ">", whatever quotes they hold. Read as tags, a quote there could hide
         // a value that the browser places after the ">" (e.g. inside a <script>).
