@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { GUARD_PATHS } from "../floor-guard/floor-guard.mjs";
+import { KK_ONLY } from "../gates/kk-only.mjs";
 
 export const DEFAULT_CONFIG = JSON.parse(readFileSync(new URL("./required-checks.json", import.meta.url), "utf8"));
 const OK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
@@ -166,19 +167,8 @@ export async function passVerdictText(gh, repo, pr, sha, label, creator) {
 }
 
 // Hits a Codex Keep never clears (spec §4.4: security scanning, policy and money go to KK; §4.5: a guard change must
-// stand alone). Mirrors KK_ONLY in scripts/gates/evaluate-gate.mjs (DEVOS-144) plus guard-change-not-isolated.
-const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
-const SECURITY_WORDS = /secur|secret|gitleaks|\bnose[c]\b|audit|licen[cs]e|codeql|semgrep|trivy|snyk|xss|no-eval|detect-/i;
-export function notKeepable(h) {
-  const text = String(h?.text ?? "");
-  if (SECURITY_WORDS.test(`${h?.file ?? ""} ${text}`)) return true;
-  if (text.length >= 200) return true; // GI-1 cuts hit text at 200 characters: what follows cannot be ruled out
-  if (["gitleaksignore-added", "policy-weakened", "guard-change-not-isolated"].includes(h?.rule)) return true;
-  if (h?.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text);
-  if (/^ci-/.test(h?.rule ?? "")) return true; // a CI hit names the step, not what it ran
-  if (h?.rule === "lint-rule-off") return /\bignores?\b/.test(text);
-  return false;
-}
+// stand alone). The one shared classifier (DEVOS-181), also used by the gate evaluator.
+export const notKeepable = KK_ONLY;
 
 /**
  * True when the verdict text has a line "FLOOR-GUARD CHANGE <path>" naming exactly this path: the whole rest of
