@@ -6,7 +6,7 @@ import { stdoutSink } from "./http.js";
 import { TailscaleWhoisResolver } from "./identity.js";
 import { buildRuntime, type DbClient } from "./runtime.js";
 import type { DeadLetterQueue } from "./dead-letters.js";
-import { analystModelPassAllowed, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
+import { analystModelPass, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
 import { ANALYST_MAX_SECONDS } from "./analyst-runner.js";
 
 async function main(): Promise<void> {
@@ -39,10 +39,9 @@ async function main(): Promise<void> {
       });
       return q;
     },
-    // DEVOS-176: the run engine is loaded only when `DEVOS_ANALYST_MODEL_PASS` is unset, empty or `on` (any other value
-    // is a hard off; `analystModelPassAllowed`); whether a pass runs is the
-    // `analyst.model_pass` setting, read per call (default off, so intake stays deterministic until KK turns it on).
-    ...(analystModelPassAllowed(process.env)
+    // M2.2-d3b2: the run engine is loaded only with `DEVOS_ANALYST_MODEL_PASS=on` (any other value is a hard off);
+    // DEVOS-176: whether a pass then runs is the `analyst.model_pass` setting, read per call (default off).
+    ...(analystModelPass(process.env)
       ? {
           loadAnalystEngine: async (db, policy, apiKey) => {
             const runEngineModuleName = "@devos/run-engine";
@@ -72,7 +71,7 @@ async function main(): Promise<void> {
   requirementsSync?.start();
   process.once("SIGTERM", () => requirementsSync?.stop());
   process.once("SIGINT", () => requirementsSync?.stop());
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPassAllowed: analystModelPassAllowed(process.env) && requirements.pipeline !== null });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null });
 }
 
 main().catch((e: unknown) => {

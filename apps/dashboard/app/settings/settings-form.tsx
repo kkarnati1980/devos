@@ -57,7 +57,7 @@ export function SettingsForm({ apiOrigin }: { apiOrigin: string }) {
         </label>
         <label>
           <input type="checkbox" name="analystModelPass" data-testid="analyst-model-pass" checked={s.analystModelPass === true} onChange={(e) => setS({ ...s, analystModelPass: e.target.checked })} />
-          Use Claude to read new specs (spends from the Anthropic cap; off means a rules-only reading)
+          Use Claude to read new specs (spends from the Anthropic cap, and only if the server allows it; off means a rules-only reading)
         </label>
         <button type="submit" data-testid="save-settings">Save settings</button>
       </form>

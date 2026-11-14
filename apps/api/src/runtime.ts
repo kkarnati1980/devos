@@ -89,7 +89,7 @@ export async function buildRuntime(
     loadQueue?: (redisUrl: string) => Promise<DeadLetterQueue>;
     /**
      * M2.2-d3b1: builds M1.5's RunEngine (with the Anthropic adapter) over this database and policy engine for the
-     * analyst model pass. Absent → model pass off. main.ts supplies it unless `DEVOS_ANALYST_MODEL_PASS=off` (DEVOS-176),
+     * analyst model pass. Absent → model pass off. main.ts supplies it when `DEVOS_ANALYST_MODEL_PASS=on` (then the setting decides per call, DEVOS-176),
      * importing the run engine at runtime like @devos/db, so the API typechecks on its own. `apiKey` reads the vault.
      */
     loadAnalystEngine?: (db: DbClient, policy: PolicyEngine, apiKey: () => Promise<string | null>) => Promise<RunExecutor>;

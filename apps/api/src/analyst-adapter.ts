@@ -46,14 +46,12 @@ export class AnalystApiError extends Error {
 }
 
 /**
- * DEVOS-176: the model pass is switched on and off by the setting `analyst.model_pass` (M1.4 settings screen, default
- * off), read before each pass. The env `DEVOS_ANALYST_MODEL_PASS` is now only a hard off, and fails safe (pre-review
- * finding 2): unset or exactly `on` leaves the decision to the setting; any other value (`off`, `OFF`, `false`, `0`,
- * a typo) keeps the run engine unloaded, so the setting has no effect.
+ * The deployment-level allow for the model pass (env `DEVOS_ANALYST_MODEL_PASS`): only `on` loads the run engine; any
+ * other value is a hard off. DEVOS-176: with it on, the setting `analyst.model_pass` (M1.4 settings screen, default
+ * off) switches each pass on or off at call time, without a restart.
  */
-export function analystModelPassAllowed(env: NodeJS.ProcessEnv): boolean {
-  const v = env.DEVOS_ANALYST_MODEL_PASS;
-  return v === undefined || v === "" || v === "on";
+export function analystModelPass(env: NodeJS.ProcessEnv): boolean {
+  return env.DEVOS_ANALYST_MODEL_PASS === "on";
 }
 
 /** Largest response body read (one 8 000-token answer is far under 1 MiB of JSON). */

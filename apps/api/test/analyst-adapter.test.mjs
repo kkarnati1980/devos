@@ -9,7 +9,7 @@ import * as runEngineModule from "@devos/run-engine";
 import { MemoryRunStore } from "@devos/run-engine";
 import {
   ANTHROPIC_MESSAGES_URL, ANTHROPIC_KEY_NAME, ANALYST_ANSWER_MAX_TOKENS, MAX_RESPONSE_BYTES,
-  analystModelPassAllowed, buildAnalystEngine, costUsd, messagesQuery, isBlockedAddress, pinnedFetch, toResponse, isPreSendError,
+  analystModelPass, buildAnalystEngine, costUsd, messagesQuery, isBlockedAddress, pinnedFetch, toResponse, isPreSendError,
 } from "../dist/analyst-adapter.js";
 import { runEngineModelRunner, ANALYST_MODEL } from "../dist/analyst-runner.js";
 
@@ -182,13 +182,11 @@ test("AT-CA5 a request past its timeout is aborted and typed timeout; an engine 
   clearInterval(keepAlive);
 });
 
-test("AT-CA6 (DEVOS-176) DEVOS_ANALYST_MODEL_PASS other than unset or on is a hard off; buildRuntime hands the engine a vault key reader", async () => {
-  // The setting `analyst.model_pass` (default off) decides per call (AT-CA9); the env can only forbid loading the engine.
-  assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: "off" }), false);
-  assert.equal(analystModelPassAllowed({}), true);
-  assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: "on" }), true);
-  for (const v of ["OFF", "false", "0", "no", "off ", "On"]) assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: v }), false, `fail-safe: ${v}`);
-  assert.equal(analystModelPassAllowed({ DEVOS_ANALYST_MODEL_PASS: "" }), true, "empty = unset"); 
+test("AT-CA6 opt-in: only DEVOS_ANALYST_MODEL_PASS=on enables the pass; buildRuntime hands the engine a vault key reader", async () => {
+  assert.equal(analystModelPass({}), false);
+  assert.equal(analystModelPass({ DEVOS_ANALYST_MODEL_PASS: "true" }), false);
+  assert.equal(analystModelPass({ DEVOS_ANALYST_MODEL_PASS: "ON" }), false);
+  assert.equal(analystModelPass({ DEVOS_ANALYST_MODEL_PASS: "on" }), true);
   const { buildRuntime } = await import("../dist/runtime.js");
   const { KkSessionRegistry } = await import("../dist/auth.js");
   const env = { DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" };
