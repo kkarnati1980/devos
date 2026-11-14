@@ -217,7 +217,9 @@ async function saveSettings(svc: SetupServices, body: unknown, requireCaps: bool
   const current = await guarded(() => settings.get(), "settings-store-error");
   const patch = parseAppSettings(body, current.maxLanes, requireCaps);
   if (typeof patch === "string") throw httpError(400, patch);
-  const audit = { action: "settings.updated", summary: "Settings saved", details: { fields: Object.keys(patch) } };
+  // DEVOS-176 (pre-review finding 3): the model pass spends money, so its new value is kept in the audit row.
+  const details = { fields: Object.keys(patch), ...(patch.analystModelPass !== undefined ? { analystModelPass: patch.analystModelPass } : {}) };
+  const audit = { action: "settings.updated", summary: "Settings saved", details };
   return guarded(() => settings.update(patch, new Date(), audit), "settings-store-error");
 }
 

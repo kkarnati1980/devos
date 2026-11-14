@@ -1,5 +1,5 @@
 // M1.4 settings (docs/modules/M1.4.md): the three USD caps (O5), default lanes, deadlock attempts,
-// and per-project cap + lanes. Validated at the boundary (BS-A01); unknown fields are refused.
+// per-project cap + lanes, and the analyst model pass switch (DEVOS-176). Validated at the boundary (BS-A01); unknown fields are refused.
 
 export const CAP_MIN = 0.01;
 export const CAP_MAX = 10000;
@@ -14,6 +14,8 @@ export interface AppSettingsView {
   defaultLanes: number;
   maxLanes: number;
   deadlockAttempts: number;
+  /** DEVOS-176: `analyst.model_pass`, default off. Read by the requirements pipeline before each pass. */
+  analystModelPass: boolean;
   capsConfirmedAt: string | null;
   updatedAt: string | null;
 }
@@ -24,6 +26,7 @@ export interface AppSettingsPatch {
   defaultProjectCapUsd?: string;
   defaultLanes?: number;
   deadlockAttempts?: number;
+  analystModelPass?: boolean;
 }
 
 export interface ProjectSettingsPatch {
@@ -74,7 +77,7 @@ export function parseUsd(v: unknown): string | null {
 const int = (v: unknown, min: number, max: number): number | null =>
   Number.isInteger(v) && (v as number) >= min && (v as number) <= max ? (v as number) : null;
 
-const APP_KEYS = new Set(["anthropicCapUsd", "openaiCapUsd", "defaultProjectCapUsd", "defaultLanes", "deadlockAttempts"]);
+const APP_KEYS = new Set(["anthropicCapUsd", "openaiCapUsd", "defaultProjectCapUsd", "defaultLanes", "deadlockAttempts", "analystModelPass"]);
 const PROJECT_KEYS = new Set(["capUsd", "lanes"]);
 
 function objectBody(body: unknown): Record<string, unknown> | string {
@@ -111,6 +114,11 @@ export function parseAppSettings(body: unknown, maxLanes: number, requireCaps: b
     if (n === null) return "invalid:deadlockAttempts";
     out.deadlockAttempts = n;
   }
+  if (b.analystModelPass !== undefined) {
+    // Only a JSON boolean: "true", 1 or "on" are refused, so a typo never turns model spend on.
+    if (typeof b.analystModelPass !== "boolean") return "invalid:analystModelPass";
+    out.analystModelPass = b.analystModelPass;
+  }
   return out;
 }
 
@@ -140,6 +148,7 @@ const DEFAULTS: AppSettingsView = {
   defaultLanes: 2,
   maxLanes: 3,
   deadlockAttempts: 3,
+  analystModelPass: false,
   capsConfirmedAt: null,
   updatedAt: null,
 };
@@ -184,6 +193,7 @@ function view(row: any): AppSettingsView {
     defaultLanes: row.defaultLanes,
     maxLanes: row.maxLanes,
     deadlockAttempts: row.deadlockAttempts,
+    analystModelPass: row.analystModelPass === true,
     capsConfirmedAt: row.capsConfirmedAt ? new Date(row.capsConfirmedAt).toISOString() : null,
     updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : null,
   };
