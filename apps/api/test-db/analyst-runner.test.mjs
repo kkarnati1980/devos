@@ -4,7 +4,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { createDb } from "@devos/db";
-import { PrismaAnalystRunRows, runEngineModelRunner, ANALYST_MODEL } from "../dist/analyst-runner.js";
+import { PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, ANALYST_MODEL } from "../dist/analyst-runner.js";
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required for test:db");
@@ -126,4 +126,53 @@ test("AT-MR7 (DEVOS-161) an abandoned run's open reservation is settled fail-clo
   }), /analyst-run-failed/);
   assert.equal((await db.budgetReservation.findUnique({ where: { id: closedOpen } })).status, "reserved");
   assert.equal((await db.budgetReservation.findUnique({ where: { id: otherOpen } })).status, "reserved", "another run's reservation");
+});
+
+test("AT-MR8 (DEVOS-171) a run left open past max_seconds + grace is closed stale, its task failed and its reservation settled fail-closed; fresh, closed and non-analyst runs are left alone", async () => {
+  const p = await project();
+  const sweeper = new PrismaAnalystRunSweeper(db, 5_000);
+  const mk = async ({ role = "analyst", status = "running", ageSec = 3600, startedAgo = null } = {}) => {
+    const task = await db.task.create({ data: { projectId: p.id, kind: "analysis", assignee: "agent", title: "Analyst assist", status: "running" } });
+    const created = new Date(Date.now() - ageSec * 1000);
+    const run = await db.run.create({
+      data: {
+        taskId: task.id, projectId: p.id, role, model: ANALYST_MODEL, status, maxTurns: 2, maxSeconds: 90, maxCostUsd: "0.500000",
+        createdAt: created, startedAt: startedAgo === null ? null : new Date(Date.now() - startedAgo * 1000),
+      },
+    });
+    const res = await db.budgetReservation.create({ data: { projectId: p.id, runId: run.id, provider: "anthropic", reservedUsd: "0.500000", reservedTokens: 200_000 } });
+    return { run: run.id, task: task.id, res: res.id };
+  };
+  const stale = await mk();                                   // created an hour ago, never started
+  const staleStarted = await mk({ startedAgo: 600 });         // started 10 min ago: past 90 s + 5 min
+  const fresh = await mk({ ageSec: 3600, startedAgo: 60 });    // started a minute ago: still within its bound
+  const done = await mk({ status: "succeeded" });
+  const builder = await mk({ role: "builder" });
+
+  // A large limit, so stale runs other tests leave in the shared CI database cannot push these out of the batch.
+  const ids = await sweeper.staleRunIds(10_000);
+  assert.ok(ids.includes(stale.run) && ids.includes(staleStarted.run), "both stale runs are listed");
+  for (const x of [fresh, done, builder]) assert.ok(!ids.includes(x.run), "fresh, closed and non-analyst runs are not listed");
+
+  assert.equal(await sweeper.closeStale(stale.run), true);
+  assert.equal(await sweeper.closeStale(stale.run), false, "a second close finds nothing open");
+  assert.equal(await sweeper.closeStale(staleStarted.run), true);
+  assert.equal(await sweeper.closeStale(fresh.run), false, "the bound is re-checked inside the transaction");
+  // The bound is measured on the caller's (API) clock: with "now" an hour ahead, the fresh run counts as stale.
+  assert.ok((await sweeper.staleRunIds(10_000, Date.now() + 3_600_000)).includes(fresh.run));
+  assert.ok(!(await sweeper.staleRunIds(10_000, Date.now())).includes(fresh.run));
+
+  for (const x of [stale, staleStarted]) {
+    const run = await db.run.findUnique({ where: { id: x.run }, include: { task: true } });
+    assert.deepEqual([run.status, run.error, run.task.status], ["failed", "analyst-run-stale", "failed"]);
+    assert.ok(run.endedAt);
+    const res = await db.budgetReservation.findUnique({ where: { id: x.res } });
+    assert.deepEqual([res.status, Number(res.actualUsd)], ["reconciled", 0.5], "settled at the full reservation");
+    const cost = (await db.costEntry.findMany({ where: { runId: x.run } })).reduce((a, c) => a + Number(c.usd), 0);
+    assert.equal(Math.round(cost * 1e6), 500_000, "one cost entry for the charge");
+  }
+  for (const x of [fresh, done, builder]) {
+    assert.equal((await db.budgetReservation.findUnique({ where: { id: x.res } })).status, "reserved", "untouched");
+    assert.equal((await db.task.findUnique({ where: { id: x.task } })).status, "running", "untouched");
+  }
 });

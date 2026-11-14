@@ -10,7 +10,7 @@ import { ClaudeAgentSdkAdapter, MemoryRunStore, RunEngine } from "@devos/run-eng
 import { MemoryRequirementsStore } from "@devos/analyst";
 import { Approvals, MemoryApprovalStore } from "../dist/approvals.js";
 import { requirementsServices } from "../dist/runtime.js";
-import { runEngineModelRunner, ANALYST_MODEL, ANALYST_MAX_OUTPUT_BYTES } from "../dist/analyst-runner.js";
+import { runEngineModelRunner, ANALYST_MODEL, ANALYST_MAX_OUTPUT_BYTES, AnalystRunSweepJob, ANALYST_SWEEP_BATCH, ANALYST_SWEEP_MS, liveAnalystRuns } from "../dist/analyst-runner.js";
 
 const P1 = "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d";
 // The overview paragraph is not yet a requirement, so the model pass is called (the M2.2-d1 PL6 fixture).
@@ -210,4 +210,75 @@ test("AT-MR7b (DEVOS-161) the runner's policy lock key is M1.7's", async () => {
   const { POLICY_LOCK_KEY } = await import("../dist/analyst-runner.js");
   const src = await readFile(new URL("../../../packages/policy/src/prisma-store.ts", import.meta.url), "utf8");
   assert.match(src, new RegExp(`const LOCK_KEY = "${POLICY_LOCK_KEY}";`));
+});
+
+test("AT-MR8 (DEVOS-171) the sweep closes each stale run once, logs a failure by id and moves on, never overlaps, and is wired by buildRuntime", async () => {
+  const closed = [], logs = [];
+  let listed = 0;
+  const sweeper = {
+    staleRunIds: async (limit) => (listed++, assert.equal(limit, ANALYST_SWEEP_BATCH), ["r1", "r2", "r3"]),
+    closeStale: async (id) => { if (id === "r2") throw new Error("db down: secret text"); closed.push(id); return id === "r1"; },
+  };
+  const job = new AnalystRunSweepJob(sweeper, (e) => logs.push(e));
+  assert.equal(job.intervalMs, ANALYST_SWEEP_MS);
+  assert.equal(await job.tick(), 1, "r1 closed; r3 was no longer stale (closeStale false); r2 failed");
+  assert.deepEqual(closed, ["r1", "r3"]);
+  assert.deepEqual(logs, [{ level: "warn", msg: "analyst-sweep-failed", runId: "r2" }], "a fixed code and the run id, never the error text");
+
+  // A failed listing is logged once and the pass ends.
+  logs.length = 0;
+  const down = new AnalystRunSweepJob({ staleRunIds: async () => { throw new Error("down"); }, closeStale: async () => assert.fail("no close") }, (e) => logs.push(e));
+  assert.equal(await down.tick(), 0);
+  assert.deepEqual(logs, [{ level: "warn", msg: "analyst-sweep-list-failed" }]);
+
+  // Ticks never overlap.
+  let release;
+  const slow = new AnalystRunSweepJob({ staleRunIds: () => new Promise((r) => { release = () => r([]); }), closeStale: async () => true }, () => {});
+  const first = slow.tick();
+  assert.equal(await slow.tick(), null, "a tick during a running tick does nothing");
+  release();
+  assert.equal(await first, 0);
+
+  // start() runs the start-up pass at once; stop() clears the timer.
+  listed = 0;
+  job.start();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(listed, 1, "start-up sweep");
+  job.stop();
+
+  // buildRuntime returns the sweep with the database wired, and none without one.
+  const { buildRuntime } = await import("../dist/runtime.js");
+  const { KkSessionRegistry } = await import("../dist/auth.js");
+  const opts = { outboundTimeoutMs: 500, kkSessions: new KkSessionRegistry(), loadDb: async () => ({ $transaction: async (fn) => fn({ $queryRaw: async () => [] }) }) };
+  const off = await buildRuntime({}, opts);
+  assert.equal(off.analystSweep, null);
+  const on = await buildRuntime({ DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" }, opts);
+  assert.ok(on.analystSweep instanceof AnalystRunSweepJob);
+  assert.equal(await on.analystSweep.tick(), 0, "an empty stale list closes nothing");
+});
+
+test("AT-MR8b (DEVOS-171, Codex PR102-r2) a run this process is executing is never swept; the bound is measured on the API clock", async () => {
+  // While the engine runs, the run id is live; afterwards it is not.
+  let seenLive = null;
+  const rows = {
+    createRun: async () => "run-live-1",
+    textEvents: async () => ["{}"],
+    finishTask: async () => undefined,
+  };
+  const engine = { execute: async (i) => ((seenLive = liveAnalystRuns.has(i.runId)), { status: "succeeded" }) };
+  await runEngineModelRunner(rows, engine)({ prompt: "p", tag: "analyst_assist", projectId: P1 });
+  assert.equal(seenLive, true, "live while executing");
+  assert.equal(liveAnalystRuns.has("run-live-1"), false, "removed when the call ends");
+  await assert.rejects(runEngineModelRunner(rows, { execute: async () => { throw new Error("down"); } })({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /down/);
+  assert.equal(liveAnalystRuns.has("run-live-1"), false, "removed when the engine throws");
+
+  // The sweep skips a live id even when the store lists it as stale, and passes its own clock to both calls.
+  const calls = [];
+  const sweeper = {
+    staleRunIds: async (limit, now) => (calls.push(["list", now]), ["r-live", "r-dead"]),
+    closeStale: async (id, now) => (calls.push(["close", id, now]), true),
+  };
+  const job = new AnalystRunSweepJob(sweeper, () => {}, ANALYST_SWEEP_MS, new Set(["r-live"]), () => 1_700_000_000_000);
+  assert.equal(await job.tick(), 1);
+  assert.deepEqual(calls, [["list", 1_700_000_000_000], ["close", "r-dead", 1_700_000_000_000]]);
 });
