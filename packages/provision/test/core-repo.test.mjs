@@ -228,3 +228,26 @@ test("pre-review r2: a 409 'empty' on a Git Data write after the bootstrap is re
   assert.equal(out[1].outcome, "created");
   assert.equal(s.fake.calls.filter((c) => c.method === "PUT").length, 1);
 });
+
+test("c2c2: a lost journal still adopts the core when DevOS's deploy Compose files sit on top; any other extra file is a conflict", async () => {
+  for (const [path, adopt] of [["deploy/compose.preview.devos.yaml", true], ["deploy/compose.staging.devos.yaml", false], ["deploy/other.yaml", false]]) {
+    const s = setup();
+    await s.run();
+    const g = s.fake.gitOf(FULL);
+    const content = Buffer.from("services: {}\n");
+    g.blobs.set(blobSha(content), content);
+    const tree = [...g.trees.get(g.commits.get(g.main).tree), { path, mode: "100644", type: "blob", sha: blobSha(content) }];
+    g.trees.set("c".repeat(40), tree);
+    g.commits.set("d".repeat(40), { tree: "c".repeat(40), parents: [g.main] });
+    g.main = "d".repeat(40);
+    const fresh = new MemoryStore();
+    fresh.resources.push(...s.store.resources);
+    const s2 = setup(s.fake, fresh);
+    if (adopt) {
+      const out = await s2.run();
+      assert.deepEqual(out.map((o) => o.outcome), ["adopted", "adopted"], path);
+    } else {
+      await assert.rejects(s2.run(), (e) => e instanceof StepError && e.code === "name_conflict", path);
+    }
+  }
+});

@@ -186,8 +186,14 @@ export function fakeProviders() {
       return json(200, { message: "Private Key deleted." });
     }
     if (method === "GET" && path === "/api/v1/applications") return json(200, [...apps.values()].map(({ uuid, name, description }) => ({ uuid, name, description })));
-    if (method === "POST" && path === "/api/v1/applications/dockercompose") {
+    if (method === "POST" && (path === "/api/v1/applications/dockercompose" || path === "/api/v1/applications/private-deploy-key")) {
       const b = JSON.parse(init.body);
+      if (path.endsWith("/private-deploy-key")) {
+        // M2.4-c2c2: like Coolify, a git application needs a stored key, a repo, a branch and a build pack.
+        if (!keys.has(b.private_key_uuid) || typeof b.git_repository !== "string" || typeof b.git_branch !== "string" || typeof b.build_pack !== "string" || !/^\d+(,\d+)*$/.test(b.ports_exposes ?? "")) {
+          return json(422, { message: "Validation failed." });
+        }
+      }
       const p = projects.get(b.project_uuid);
       if (!p || !(p.environments ?? []).includes(b.environment_name)) return json(404, { message: "Project or environment not found." });
       if (typeof b.docker_compose_raw !== "string" || !b.server_uuid) return json(422, { message: "Validation failed." });
