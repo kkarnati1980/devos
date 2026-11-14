@@ -9,6 +9,9 @@ import { notKeepable } from "../release/merge.mjs";
 const SKIP = ["test", "skip"].join(".");
 const NOSEC = ["// ", "no", "sec"].join("");
 const LONG = "x".repeat(200);
+// Built by concatenation so the floor guard does not read these fixtures as new suppressions (GI-4 "Floor-guard self-match").
+const ESL = ["// eslint", "disable-next-line"].join("-");
+const TSE = ["// @ts", "expect-error"].join("-");
 
 // [rule, file, text, expected KK-only]
 const TABLE = [
@@ -25,8 +28,8 @@ const TABLE = [
   ["test-skipped", "apps/api/test/a.test.mjs", LONG, true],
   // Suppressions.
   ["suppression-added", "apps/api/src/x.ts", NOSEC, true],
-  ["suppression-added", "apps/api/src/x.ts", "// eslint-disable-next-line security/detect-object-injection", true],
-  ["suppression-added", "apps/api/src/x.ts", "// @ts-expect-error narrow later", false],
+  ["suppression-added", "apps/api/src/x.ts", `${ESL} security/detect-object-injection`, true],
+  ["suppression-added", "apps/api/src/x.ts", `${TSE} narrow later`, false],
   // Lint.
   ["lint-rule-off", "eslint.config.mjs", "ignores: [\"dist/**\"]", true],
   ["lint-rule-off", "eslint.config.mjs", '"no-console": "off"', false],
