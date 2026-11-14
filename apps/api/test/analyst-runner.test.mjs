@@ -10,7 +10,7 @@ import { ClaudeAgentSdkAdapter, MemoryRunStore, RunEngine } from "@devos/run-eng
 import { MemoryRequirementsStore } from "@devos/analyst";
 import { Approvals, MemoryApprovalStore } from "../dist/approvals.js";
 import { requirementsServices } from "../dist/runtime.js";
-import { runEngineModelRunner, ANALYST_MODEL, ANALYST_MAX_OUTPUT_BYTES, AnalystRunSweepJob, ANALYST_SWEEP_BATCH, ANALYST_SWEEP_MS } from "../dist/analyst-runner.js";
+import { runEngineModelRunner, ANALYST_MODEL, ANALYST_MAX_OUTPUT_BYTES, AnalystRunSweepJob, ANALYST_SWEEP_BATCH, ANALYST_SWEEP_MS, liveAnalystRuns } from "../dist/analyst-runner.js";
 
 const P1 = "4b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d";
 // The overview paragraph is not yet a requirement, so the model pass is called (the M2.2-d1 PL6 fixture).
@@ -255,4 +255,30 @@ test("AT-MR8 (DEVOS-171) the sweep closes each stale run once, logs a failure by
   const on = await buildRuntime({ DATABASE_URL: "postgresql://x/y", DEVOS_POLICY_HMAC_KEY: "test-only-policy-hmac-key-0123456789abcdef" }, opts);
   assert.ok(on.analystSweep instanceof AnalystRunSweepJob);
   assert.equal(await on.analystSweep.tick(), 0, "an empty stale list closes nothing");
+});
+
+test("AT-MR8b (DEVOS-171, Codex PR102-r2) a run this process is executing is never swept; the bound is measured on the API clock", async () => {
+  // While the engine runs, the run id is live; afterwards it is not.
+  let seenLive = null;
+  const rows = {
+    createRun: async () => "run-live-1",
+    textEvents: async () => ["{}"],
+    finishTask: async () => undefined,
+  };
+  const engine = { execute: async (i) => ((seenLive = liveAnalystRuns.has(i.runId)), { status: "succeeded" }) };
+  await runEngineModelRunner(rows, engine)({ prompt: "p", tag: "analyst_assist", projectId: P1 });
+  assert.equal(seenLive, true, "live while executing");
+  assert.equal(liveAnalystRuns.has("run-live-1"), false, "removed when the call ends");
+  await assert.rejects(runEngineModelRunner(rows, { execute: async () => { throw new Error("down"); } })({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /down/);
+  assert.equal(liveAnalystRuns.has("run-live-1"), false, "removed when the engine throws");
+
+  // The sweep skips a live id even when the store lists it as stale, and passes its own clock to both calls.
+  const calls = [];
+  const sweeper = {
+    staleRunIds: async (limit, now) => (calls.push(["list", now]), ["r-live", "r-dead"]),
+    closeStale: async (id, now) => (calls.push(["close", id, now]), true),
+  };
+  const job = new AnalystRunSweepJob(sweeper, () => {}, ANALYST_SWEEP_MS, new Set(["r-live"]), () => 1_700_000_000_000);
+  assert.equal(await job.tick(), 1);
+  assert.deepEqual(calls, [["list", 1_700_000_000_000], ["close", "r-dead", 1_700_000_000_000]]);
 });

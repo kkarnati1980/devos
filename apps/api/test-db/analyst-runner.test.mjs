@@ -158,6 +158,9 @@ test("AT-MR8 (DEVOS-171) a run left open past max_seconds + grace is closed stal
   assert.equal(await sweeper.closeStale(stale.run), false, "a second close finds nothing open");
   assert.equal(await sweeper.closeStale(staleStarted.run), true);
   assert.equal(await sweeper.closeStale(fresh.run), false, "the bound is re-checked inside the transaction");
+  // The bound is measured on the caller's (API) clock: with "now" an hour ahead, the fresh run counts as stale.
+  assert.ok((await sweeper.staleRunIds(10_000, Date.now() + 3_600_000)).includes(fresh.run));
+  assert.ok(!(await sweeper.staleRunIds(10_000, Date.now())).includes(fresh.run));
 
   for (const x of [stale, staleStarted]) {
     const run = await db.run.findUnique({ where: { id: x.run }, include: { task: true } });
