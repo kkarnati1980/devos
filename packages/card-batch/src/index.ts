@@ -134,5 +134,5 @@ export function batchCard(projectName: string, batchId: string): { gate: "decisi
   return { gate: "decision", action: clip(oneLine(`Answer the build questions for ${projectName}`), CARD_LINE_MAX), target: `batch:${batchId}` };
 }
 
-export { CardBatchQueue, MemoryQueueStore, QueueError, QUESTION_BLOCKS_MAX, QUESTION_DEFAULT_MAX, QUESTION_SOURCE_MAX, QUESTION_TEXT_MAX } from "./queue.js";
+export { CardBatchQueue, DETERMINISTIC_REFUSALS, MemoryQueueStore, QueueError, QUESTION_BLOCKS_MAX, QUESTION_DEFAULT_MAX, QUESTION_SOURCE_MAX, QUESTION_TEXT_MAX } from "./queue.js";
 export type { BatchCards, CardBatch, DecisionRow, QueueInput, QueueStore, QueuedQuestion } from "./queue.js";

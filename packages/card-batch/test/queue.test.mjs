@@ -33,10 +33,10 @@ function fakeCards() {
     },
     async get(id) {
       const c = cards.find((x) => x.id === id);
-      return c ? { id: c.id, status: c.status } : null;
+      return c ? { id: c.id, status: c.status, decidedAt: c.decidedAt ?? null } : null;
     },
     async comments(id) {
-      return cards.find((x) => x.id === id).comments.map((body) => ({ body }));
+      return cards.find((x) => x.id === id).comments.map((c) => (typeof c === "string" ? { body: c } : c));
     },
   };
   return f;
@@ -164,7 +164,10 @@ test("AT11 (core): approval records BQ answers as kk and the rest as default; re
   const final = store.decisions.slice(before);
   assert.deepEqual(final.map((d) => [d.itemId, d.source, d.answer, d.approvalId]), [[`Q-${q1.id}`, "kk", "no", cards.cards[0].id], [final[1].itemId, "default", "no", cards.cards[0].id]]);
   assert.deepEqual(applied.followUps, [{ questionId: q1.id, answer: "no", blocks: [T1] }]);
-  assert.equal((await q.applyBatch(r.batchId, DAY2)).outcome, "already");
+  assert.equal(applied.first, true);
+  // Pre-review finding 2: a second apply is not first and returns the same follow-ups (the caller files per question id).
+  const again = await q.applyBatch(r.batchId, DAY2);
+  assert.deepEqual([again.outcome, again.first, again.followUps], ["approved", false, applied.followUps]);
   assert.equal(store.decisions.length, before + 2);
 
   const w = wire();
@@ -203,4 +206,44 @@ test("queueQuestion refuses non-batchable and malformed input, and unknown proje
   assert.equal(store.decisions.length, 0);
   const ok = await q.queueQuestion(P, ask("  Which colour?  ", "blue", [T1, T1]), DAY1);
   assert.deepEqual([ok.text, ok.blocks, ok.source, ok.batchId], ["Which colour?", [T1], "runner", null]);
+});
+
+test("pre-review findings 1, 2, 4: refusals park the batch, applies have one winner, late comments do not count", async () => {
+  // 1a: a refusal no retry can change parks the batch as refused with its members; the next day batches again.
+  const { store, cards, q } = wire();
+  await q.queueQuestion(P, ask("Which colour?", "blue", [T1]), DAY1);
+  const raiseCard = cards.raiseCard;
+  cards.raiseCard = async () => {
+    throw Object.assign(new Error("task-not-found"), { code: "task-not-found" });
+  };
+  const r = await q.flushBatch(P, DAY1);
+  assert.deepEqual([r.outcome, r.code, r.members.map((m) => m.text)], ["refused", "task-not-found", ["Which colour?"]]);
+  assert.equal((await store.batch(r.batchId)).state, "refused");
+  cards.raiseCard = raiseCard;
+  const late = await q.queueQuestion(P, ask("Sticky footer?", "no", [T2]), DAY1_LATE);
+  assert.deepEqual(await q.flushBatch(P, DAY1_LATE), { outcome: "none" }, "day 1 already has its batch");
+  const next = await q.flushBatch(P, DAY2);
+  assert.equal(next.outcome, "raised");
+  assert.equal(cards.cards.length, 1);
+  assert.deepEqual((await store.members(next.batchId)).map((m) => m.id), [late.id], "the refused member never joins another batch");
+  // 1b: the check port refuses at queue time; a `*` in the project name never reaches the action.
+  const w = wire();
+  w.cards.check = async ({ reason, blocks }) => (blocks.includes(T3) || reason.includes("sk-") ? "task-not-found" : null);
+  await assert.rejects(w.q.queueQuestion(P, ask("Which colour?", "blue", [T3]), DAY1), (e) => e.code === "not-batchable" && e.hit === "card");
+  assert.equal(w.store.questions.length, 0);
+  w.store.addProject(P, "Shop*");
+  await w.q.queueQuestion(P, ask("Which colour?", "blue", [T1]), DAY1);
+  await w.q.flushBatch(P, DAY1);
+  assert.equal(w.cards.cards[0].action, "Answer the build questions for Shop");
+  // 2: two concurrent applies: exactly one is first; 4: a BQ line after the decision does not count.
+  const x = wire();
+  await x.q.queueQuestion(P, ask("Dark header?", "yes", [T1]), DAY1);
+  const xb = await x.q.flushBatch(P, DAY1);
+  Object.assign(x.cards.cards[0], { status: "approved", decidedAt: new Date(DAY1.getTime() + 60_000) });
+  x.cards.cards[0].comments.push({ body: "BQ-1: no", createdAt: new Date(DAY1.getTime() + 30_000) }, { body: "BQ-1: maybe", createdAt: new Date(DAY1.getTime() + 90_000) });
+  const [a, b] = await Promise.all([x.q.applyBatch(xb.batchId, DAY1_LATE), x.q.applyBatch(xb.batchId, DAY1_LATE)]);
+  assert.deepEqual([a.first, b.first].sort(), [false, true]);
+  assert.deepEqual(a.followUps, b.followUps);
+  const final = x.store.decisions.filter((d) => d.approvalId !== null);
+  assert.deepEqual(final.map((d) => [d.source, d.answer]), [["kk", "no"]]);
 });

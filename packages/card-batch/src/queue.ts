@@ -27,7 +27,8 @@ export interface CardBatch {
   id: string;
   projectId: string;
   istDay: string;
-  state: "raising" | "raised";
+  /** `refused`: M2.3 refused the card for a reason a retry cannot change (pre-review finding 1); never retried. */
+  state: "raising" | "raised" | "refused";
   cardId: string | null;
   /** Runner decision (CR-b2a): when `applyBatch` handled the decided card, so the sync job applies each batch once. */
   appliedAt: Date | null;
@@ -57,8 +58,13 @@ export interface QueueStore {
   /** The batch's members in queue order (`queuedAt`, then id). */
   members(batchId: string): Promise<QueuedQuestion[]>;
   markRaised(batchId: string, cardId: string): Promise<void>;
-  /** Final decision rows (idempotent on approval and item) and `appliedAt`, together. */
-  apply(batchId: string, rows: readonly DecisionRow[], now: Date): Promise<void>;
+  /** `raising` → `refused` (only from `raising`). Its members keep their `batchId`, so they never join another batch. */
+  markRefused(batchId: string): Promise<void>;
+  /**
+   * Final decision rows (idempotent on approval and item) and `appliedAt`, together. True only for the call that
+   * set `appliedAt` (a conditional update in Postgres), so two concurrent applies cannot both win.
+   */
+  apply(batchId: string, rows: readonly DecisionRow[], now: Date): Promise<boolean>;
   /**
    * Rule 8 step 2: runs `fn` holding the batch's lock (`pg_try_advisory_lock` on one dedicated connection in
    * Postgres), or returns `{ locked: false }` at once when another flush holds it. The lock is released after `fn`.
@@ -72,9 +78,18 @@ export interface BatchCards {
   raiseCard(input: { gate: "decision"; action: string; target: string; reason: string; projectId: string }, blocks: readonly string[]): Promise<{ id: string }>;
   /** Newest card with this target, any status (M2.3 store listing with the DEVOS-190 target filter). */
   findByTarget(projectId: string, target: string): Promise<{ id: string } | null>;
-  get(id: string): Promise<{ id: string; status: string } | null>;
-  comments(id: string): Promise<{ body: string }[]>;
+  get(id: string): Promise<{ id: string; status: string; decidedAt?: Date | null } | null>;
+  /** The card's comments, oldest first (`batchAnswers` takes the last `BQ-<n>:` line; pre-review finding 3). */
+  comments(id: string): Promise<{ body: string; createdAt?: Date }[]>;
+  /**
+   * Pre-review finding 1: the checks M2.3's `raiseCard` would refuse for good (a secret-shaped reason, a blocked
+   * task that does not exist or belongs to another project), run at queue time; returns the refusal code or null.
+   */
+  check?(input: { projectId: string; reason: string; blocks: readonly string[] }): Promise<string | null>;
 }
+
+/** M2.3 `ApprovalError` codes a retry of the same card cannot change (apps/api/src/approvals.ts). */
+export const DETERMINISTIC_REFUSALS: readonly string[] = Object.freeze(["card-contains-secret", "invalid-input", "task-not-found", "task-other-project"]);
 
 export class QueueError extends Error {
   constructor(public readonly code: "not-batchable" | "invalid-input" | "project-not-found", public readonly hit?: string) {
@@ -121,6 +136,9 @@ export class CardBatchQueue {
     if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new QueueError("invalid-input");
     if ((await this.store.projectName(projectId)) === null) throw new QueueError("project-not-found");
     const q: QueuedQuestion = { id: this.newId(), projectId, text, source, default: dflt, blocks: [...new Set(blocks as string[])], queuedAt: now, batchId: null };
+    // Pre-review finding 1: a question M2.3 would refuse in any card is refused here, so the caller raises it at once
+    // (and sees the refusal) instead of it stalling a batch.
+    if (this.cards.check && (await this.cards.check({ projectId, reason: batchReason([q]), blocks: q.blocks }))) throw new QueueError("not-batchable", "card");
     await this.store.queue(q, { projectId, itemId: `Q-${q.id}`, text, answer: dflt, source: "default-provisional", approvalId: null });
     return q;
   }
@@ -129,17 +147,22 @@ export class CardBatchQueue {
    * Rule 8: claims at most one batch per project per IST day, then raises its card under the batch lock. Returns
    * what happened: `none` (nothing to claim), `busy` (another flush holds the lock), `raised` or `recorded` (a card
    * an earlier attempt created was found by target), or `already` (the row was already raised). A `raiseCard`
-   * failure is rethrown with the batch left `raising` (rule 10); the next flush retries exactly that card.
+   * failure is rethrown with the batch left `raising` (rule 10); the next flush retries exactly that card. A refusal
+   * no retry can change (DETERMINISTIC_REFUSALS) returns `refused` with the members instead, for the caller to raise.
    */
-  async flushBatch(projectId: string, now: Date): Promise<{ outcome: "none" | "busy" | "already" | "raised" | "recorded"; batchId?: string; cardId?: string }> {
+  async flushBatch(
+    projectId: string,
+    now: Date,
+  ): Promise<{ outcome: "none" | "busy" | "already" | "raised" | "recorded" | "refused"; batchId?: string; cardId?: string; code?: string; members?: QueuedQuestion[] }> {
     const claimed = await this.store.claim(projectId, istDay(now), this.newId());
     if (!claimed) return { outcome: "none" };
     const batchId = claimed.id;
     const held = await this.store.withBatchLock(batchId, async () => {
       const row = await this.store.batch(batchId);
       if (!row) return { outcome: "none" as const };
-      if (row.state === "raised") return { outcome: "already" as const, batchId, cardId: row.cardId ?? undefined };
-      const name = (await this.store.projectName(projectId)) ?? "this project";
+      if (row.state !== "raising") return { outcome: "already" as const, batchId, cardId: row.cardId ?? undefined };
+      // M2.3 refuses `*` in an action (pre-review finding 1); the name is only a label here.
+      const name = ((await this.store.projectName(projectId)) ?? "").replace(/\*/g, "").trim() || "this project";
       const card = batchCard(name, batchId);
       const found = await this.cards.findByTarget(projectId, card.target);
       if (found) {
@@ -148,7 +171,19 @@ export class CardBatchQueue {
       }
       const members = await this.store.members(batchId);
       const blocks = [...new Set(members.flatMap((m) => m.blocks))];
-      const raised = await this.cards.raiseCard({ ...card, reason: batchReason(members), projectId }, blocks);
+      let raised: { id: string };
+      try {
+        raised = await this.cards.raiseCard({ ...card, reason: batchReason(members), projectId }, blocks);
+      } catch (e) {
+        // Pre-review finding 1: a refusal a retry cannot change parks the batch as `refused` (so the project's next
+        // day can batch again) and hands its members back; the caller raises each as its own card at once.
+        const code = (e as { code?: unknown })?.code;
+        if (typeof code === "string" && DETERMINISTIC_REFUSALS.includes(code)) {
+          await this.store.markRefused(batchId);
+          return { outcome: "refused" as const, batchId, code, members };
+        }
+        throw e;
+      }
       await this.store.markRaised(batchId, raised.id);
       return { outcome: "raised" as const, batchId, cardId: raised.id };
     });
@@ -158,26 +193,34 @@ export class CardBatchQueue {
   /**
    * Rule 9, for a `raised` batch whose card is decided: on approval, one final `project_decision` row per member
    * (`kk` from a `BQ-<n>:` line of KK's comments, else `default`); on rejection, no rows (M2.3 keeps the card's
-   * blockers, so the tasks stay blocked). Either way the batch is marked applied, once. `followUps` lists the
-   * questions whose answer differs from their default, with their tasks (rule 7: the caller files a follow-up task).
+   * blockers, so the tasks stay blocked). Either way the batch is marked applied; `first` is true only for the call
+   * that did (pre-review finding 2). `followUps` lists the questions whose answer differs from their default, with
+   * their tasks, and is the same on every call: the caller files one follow-up task per question id, idempotently,
+   * so neither a concurrent apply nor a crash after `apply` can duplicate or lose one (rule 7).
    */
-  async applyBatch(batchId: string, now: Date): Promise<{ outcome: "not-ready" | "already" | "approved" | "rejected"; followUps: { questionId: string; answer: string; blocks: string[] }[]; stopped: string[] }> {
-    const none = { followUps: [], stopped: [] };
+  async applyBatch(
+    batchId: string,
+    now: Date,
+  ): Promise<{ outcome: "not-ready" | "approved" | "rejected"; first: boolean; followUps: { questionId: string; answer: string; blocks: string[] }[]; stopped: string[] }> {
+    const none = { first: false, followUps: [], stopped: [] };
     const row = await this.store.batch(batchId);
     if (!row || row.state !== "raised" || !row.cardId) return { outcome: "not-ready", ...none };
-    if (row.appliedAt) return { outcome: "already", ...none };
     const card = await this.cards.get(row.cardId);
     if (!card || (card.status !== "approved" && card.status !== "rejected")) return { outcome: "not-ready", ...none };
     const members = await this.store.members(batchId);
     if (card.status === "rejected") {
-      await this.store.apply(batchId, [], now);
-      return { outcome: "rejected", followUps: [], stopped: [...new Set(members.flatMap((m) => m.blocks))] };
+      const first = await this.store.apply(batchId, [], now);
+      return { outcome: "rejected", first, followUps: [], stopped: [...new Set(members.flatMap((m) => m.blocks))] };
     }
-    const answers = batchAnswers(members, (await this.cards.comments(card.id)).map((c) => c.body));
+    // Pre-review finding 4: only comments made up to the decision count (as CR-a's intake card), so the answers, and
+    // the follow-ups below, are the same on every call.
+    const decidedAt = card.decidedAt ? card.decidedAt.getTime() : null;
+    const comments = (await this.cards.comments(card.id)).filter((c) => decidedAt === null || !c.createdAt || c.createdAt.getTime() <= decidedAt).map((c) => c.body);
+    const answers = batchAnswers(members, comments);
     const rows: DecisionRow[] = members.map((m, i) => ({ projectId: row.projectId, itemId: `Q-${m.id}`, text: m.text, answer: answers[i]!.answer, source: answers[i]!.source, approvalId: card.id }));
-    await this.store.apply(batchId, rows, now);
+    const first = await this.store.apply(batchId, rows, now);
     const followUps = members.flatMap((m, i) => (answers[i]!.source === "kk" && answers[i]!.answer !== m.default ? [{ questionId: m.id, answer: answers[i]!.answer, blocks: [...m.blocks] }] : []));
-    return { outcome: "approved", followUps, stopped: [] };
+    return { outcome: "approved", first, followUps, stopped: [] };
   }
 }
 
@@ -224,11 +267,16 @@ export class MemoryQueueStore implements QueueStore {
     const b = this.batches.get(batchId);
     if (b && b.state === "raising") Object.assign(b, { state: "raised", cardId });
   }
+  async markRefused(batchId: string) {
+    const b = this.batches.get(batchId);
+    if (b && b.state === "raising") b.state = "refused";
+  }
   async apply(batchId: string, rows: readonly DecisionRow[], now: Date) {
     const b = this.batches.get(batchId);
-    if (!b || b.appliedAt) return;
+    if (!b || b.appliedAt) return false;
     for (const r of rows) if (!this.decisions.some((d) => d.approvalId === r.approvalId && d.itemId === r.itemId)) this.decisions.push({ ...r });
     b.appliedAt = now;
+    return true;
   }
   async withBatchLock<T>(batchId: string, fn: () => Promise<T>): Promise<{ locked: true; value: T } | { locked: false }> {
     if (this.locks.has(batchId)) return { locked: false };
