@@ -14,6 +14,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json .nvmrc .
 COPY apps/api/package.json apps/api/
 COPY apps/dashboard/package.json apps/dashboard/
 COPY packages/analyst/package.json packages/analyst/
+COPY packages/card-batch/package.json packages/card-batch/
 COPY packages/db/package.json packages/db/
 COPY packages/intake/package.json packages/intake/
 COPY packages/policy/package.json packages/policy/
