@@ -88,6 +88,17 @@ export function ruleHits(upper) {
   return hits;
 }
 
+// End index (exclusive) of the block comment starting at i. Postgres block comments nest: /* a /* b */ c */.
+function blockCommentEnd(sql, i) {
+  let depth = 0, j = i;
+  while (j < sql.length) {
+    if (sql.startsWith("/*", j)) { depth++; j += 2; continue; }
+    if (sql.startsWith("*/", j)) { depth--; j += 2; if (depth === 0) return j; continue; }
+    j++;
+  }
+  return sql.length;
+}
+
 /** Splits SQL into statements, each with the contract reason from a comment line just above it (or null). */
 export function statements(sql) {
   const out = [];
@@ -104,10 +115,12 @@ export function statements(sql) {
       const line = sql.slice(i, end < 0 ? sql.length : end).trim();
       const m = CONTRACT.exec(line);
       if (m && !cur.trim()) reason = m[1].trim();
+      // The newline ends the comment but stays a separator: `DROP-- x\nTABLE t` is DROP TABLE, not DROPTABLE.
+      cur += " ";
       i = end < 0 ? sql.length : end + 1;
       continue;
     }
-    if (rest.startsWith("/*")) { const end = sql.indexOf("*/", i + 2); i = end < 0 ? sql.length : end + 2; cur += " "; continue; }
+    if (rest.startsWith("/*")) { i = blockCommentEnd(sql, i); cur += " "; continue; }
     const dollar = /^\$(\w*)\$/.exec(rest);
     if (dollar) { const end = sql.indexOf(dollar[0], i + dollar[0].length); cur += " $body$ "; i = end < 0 ? sql.length : end + dollar[0].length; continue; }
     if (c === "'" || c === '"') { const end = quoteEnd(sql, i); cur += sql.slice(i, end); i = end; continue; }
@@ -132,15 +145,18 @@ export function checkSql(sql) {
 
 const ident = (s) => s.replace(/"/g, "").toLowerCase().split(".").pop();
 
+// A table name: optionally schema-qualified, each part bare or double-quoted ("public"."orders").
+const T = `(${QID})`;
+
 function collectKeys(text, fks, indexed) {
-  const ct = /^CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("?[\w.]+"?)\s*\((.*)\)/i.exec(text);
+  const ct = new RegExp(String.raw`^CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?${T}\s*\((.*)\)`, "i").exec(text);
   if (ct) {
     const table = ident(ct[2]);
     for (const part of splitTop(ct[3])) {
       const p = part.trim();
-      const col = /^("?\w+"?)\s+[\w ()[\],]*?\bREFERENCES\s+("?[\w.]+"?)/i.exec(p);
+      const col = new RegExp(String.raw`^("?\w+"?)\s+[\w ()[\],]*?\bREFERENCES\s+${T}`, "i").exec(p);
       if (col && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) fks.push({ table, column: ident(col[1]), ref: ident(col[2]) });
-      const fk = /FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+("?[\w.]+"?)/i.exec(p);
+      const fk = new RegExp(String.raw`FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(p);
       if (fk) fks.push({ table, column: ident(fk[1]), ref: ident(fk[2]) });
       const key = /^(CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|UNIQUE)\s*\(\s*("?\w+"?)/i.exec(p);
       if (key) indexed.add(`${table}.${ident(key[3])}`);
@@ -148,16 +164,16 @@ function collectKeys(text, fks, indexed) {
       if (inline && !/^(CONSTRAINT|FOREIGN|PRIMARY|UNIQUE|CHECK)\b/i.test(p)) indexed.add(`${table}.${ident(inline[1])}`);
     }
   }
-  const at = /^ALTER\s+TABLE\s+(ONLY\s+)?("?[\w.]+"?)\s+ADD\s+(CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+("?[\w.]+"?)/i.exec(text);
+  const at = new RegExp(String.raw`^ALTER\s+TABLE\s+(ONLY\s+)?${T}\s+ADD\s+(CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY\s*\(\s*("?\w+"?)[^)]*\)\s*REFERENCES\s+${T}`, "i").exec(text);
   if (at) fks.push({ table: ident(at[2]), column: ident(at[4]), ref: ident(at[5]) });
-  const alt = /^ALTER\s+TABLE\s+(ONLY\s+)?(IF\s+EXISTS\s+)?("?[\w.]+"?)\s+(.*)$/i.exec(text);
+  const alt = new RegExp(String.raw`^ALTER\s+TABLE\s+(ONLY\s+)?(IF\s+EXISTS\s+)?${T}\s+(.*)$`, "i").exec(text);
   if (alt) {
     for (const clause of splitTop(alt[4])) {
-      const m = /^\s*ADD\s+(COLUMN\s+)?(IF\s+NOT\s+EXISTS\s+)?(?!CONSTRAINT\b|FOREIGN\b)("?\w+"?)\s.*\bREFERENCES\s+("?[\w.]+"?)/i.exec(clause);
+      const m = new RegExp(String.raw`^\s*ADD\s+(COLUMN\s+)?(IF\s+NOT\s+EXISTS\s+)?(?!CONSTRAINT\b|FOREIGN\b)("?\w+"?)\s.*\bREFERENCES\s+${T}`, "i").exec(clause);
       if (m) fks.push({ table: ident(alt[3]), column: ident(m[3]), ref: ident(m[4]) });
     }
   }
-  const ix = /^CREATE\s+(UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?(IF\s+NOT\s+EXISTS\s+)?("?\w+"?\s+)?ON\s+(ONLY\s+)?("?[\w.]+"?)\s*(USING\s+\w+\s*)?\(\s*("?\w+"?)/i.exec(text);
+  const ix = new RegExp(String.raw`^CREATE\s+(UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?(IF\s+NOT\s+EXISTS\s+)?(${ID}\s+)?ON\s+(ONLY\s+)?${T}\s*(USING\s+\w+\s*)?\(\s*("?\w+"?)`, "i").exec(text);
   if (ix) indexed.add(`${ident(ix[6])}.${ident(ix[8])}`);
 }
 

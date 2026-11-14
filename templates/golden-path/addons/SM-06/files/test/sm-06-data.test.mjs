@@ -94,6 +94,36 @@ test("SM-06-L1: a foreign key without an index that leads with it is a warning; 
   assert.deepEqual(checkSql(fixed).warnings, []);
 });
 
+// Codex PR125-r1 findings 1–3.
+test("SM-06-L2: a line comment ends at its newline but still separates words (r1 finding 1)", () => {
+  assert.deepEqual(rules("DROP-- x\nTABLE users;"), ["drop-object"]);
+  assert.deepEqual(rules("ALTER TABLE users DROP-- why\nCOLUMN email;"), ["drop-column"]);
+  assert.equal(statements("DROP-- x\nTABLE users;")[0].text, "DROP TABLE users");
+});
+
+test("SM-06-L2: block comments nest as in Postgres, so a statement after an inner */ is not hidden (r1 finding 2)", () => {
+  assert.deepEqual(rules("/* a /* b */ DROP TABLE users; */ SELECT 1;"), []);
+  assert.deepEqual(rules("/* a /* b */ c */ DROP TABLE users;"), ["drop-object"]);
+  assert.deepEqual(statements("/* a /* b */ c */ SELECT 1;").map((s) => s.text), ["SELECT 1"]);
+});
+
+test("SM-06-L1: separately quoted schema and table names are matched by the foreign-key index scan (r1 finding 3)", () => {
+  const sql = `
+    CREATE TABLE "public"."orders" ("id" uuid PRIMARY KEY, "user_id" uuid REFERENCES "public"."users"("id"));
+    ALTER TABLE "public"."orders" ADD CONSTRAINT "o_shop_fk" FOREIGN KEY ("shop_id") REFERENCES "public"."shops"("id");
+    ALTER TABLE ONLY "public"."orders" ADD COLUMN "coupon_id" uuid REFERENCES "public"."coupons"("id");`;
+  assert.deepEqual(checkSql(sql).warnings.sort(), [
+    "orders.coupon_id references coupons but no index leads with it",
+    "orders.shop_id references shops but no index leads with it",
+    "orders.user_id references users but no index leads with it",
+  ]);
+  const fixed = sql + `
+    CREATE INDEX "o_user_idx" ON "public"."orders"("user_id");
+    CREATE INDEX "o_shop_idx" ON "public"."orders" USING btree ("shop_id");
+    CREATE INDEX ON public."orders" ("coupon_id");`;
+  assert.deepEqual(checkSql(fixed).warnings, []);
+});
+
 test("SM-06-L2: the CLI exits 1 on a refused migration, 0 on a clean one, 1 on a warning only with --strict, 2 on bad usage", () => {
   const dir = mkdtempSync(join(tmpdir(), "sm06-"));
   mkdirSync(join(dir, "migrations/2026"), { recursive: true });
