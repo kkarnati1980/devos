@@ -77,7 +77,9 @@ export type StepErrorCode =
   | "create_unconfirmed"
   | "provider_error"
   | "resource_owned_elsewhere"
-  | "port_range_exhausted";
+  | "port_range_exhausted"
+  /** M2.4-c2c2: a DevOS-owned deploy file on `main` differs from what DevOS generates; never overwritten. */
+  | "compose_drift";
 
 export class StepError extends Error {
   constructor(

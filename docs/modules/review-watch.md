@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-60 · P1 · Lane C (ops tooling; bootstrap until M3.4 Codex reviewer replaces it)
 - **Depends on:** M0.3 (review runner `scripts/review/review-commit.sh` v1.0.2, Codex CLI, read-only deploy key, verdict schema on the server)
-- **Owned files:** `scripts/review/review-watch.sh` (v1.5.0), `scripts/review/install-review-watch.sh` (v1.1.1), `scripts/test/review-watch.test.mjs` (AT14–AT21), this contract.
+- **Owned files:** `scripts/review/review-watch.sh` (v1.6.0), `scripts/review/install-review-watch.sh` (v1.1.1), `scripts/test/review-watch.test.mjs` (AT14–AT22), this contract.
 - **Approved by KK:** 4 Nov 2026 (build plan v1.0.0, section 7).
 
 ## Goal
@@ -12,7 +12,7 @@ Run the existing Codex review automatically on every new PR head, so a review no
 1. List all open PRs on `kkarnati1980/devos`, across every page. Skip drafts.
 2. Skip a head SHA whose result is already published. A SHA that was reviewed (or could not run) but whose comment or status did not post is **published again, never re-reviewed**. A stored verdict with no publication (e.g. a manual run) is published. A new commit gets a new review; an old verdict never carries over.
 3. Read the contract from the PR body line `Review-Contract: docs/modules/<id>.md`. The path must start with `docs/`, end with `.md`, and contain no `..`. If the line is missing, post one comment for that SHA and do not review.
-4. Review only when the latest GitHub Actions run (all pages read) of **every** workflow on that SHA has completed with success, skipped or neutral (all DevOS CI is Actions). Codex never sees failing code (PRD build loop, step 4).
+4. Review only when the latest GitHub Actions run (all pages read) of **every** workflow on that SHA has completed with success, skipped or neutral (all DevOS CI is Actions). **Exception (v1.6.0, DEVOS-195):** a head whose only red runs are `.github/workflows/floor-guard.yml` and `.github/workflows/ci-gate.yml` (matched by file path, conclusion `failure`, floor-guard among them; every other run completed green) is reviewed too, so Codex can write `FLOOR-GUARD KEEP` lines; after a PASS whose Summary has one, the head's failed ci-gate run is re-run once. Codex never sees failing code (PRD build loop, step 4).
 5. Run at most **one review per tick** (the runner's 900 s limit then fits inside the service's 1200 s limit; other PRs wait for the next tick). Run the unchanged runner: `review-commit.sh main <sha> <contract> PR<n>-r<k>`, where k counts this PR's reviewed SHAs.
 6. On a verdict: post a PR comment (verdict, SHA, contract, summary, findings table) and set the commit status `codex-review` to `success` (PASS) or `failure` (CHANGES_REQUESTED). The comment and the status are tracked separately per SHA; each is posted exactly once, and a failed post is retried on later ticks until both succeed.
 7. **Runner busy** (a manual review holds the lock): set status `pending`, post no comment, retry next tick.
@@ -22,7 +22,7 @@ Run the existing Codex review automatically on every new PR head, so a review no
 11. **Heartbeat (v1.2.0, DEVOS-105):** at the end of a tick, if the last heartbeat is at least `HEARTBEAT_SECONDS` old (default 3600), set the commit status `codex-review-watch` = `success` on the head of `main`, with the description `alive at <UTC>, <n> open PRs, <k> waiting for green CI`. A failed read or post is logged and retried on the next tick; it never fails the tick. A tick that stops earlier (for example, the PR list cannot be read) posts no heartbeat, which is the point: the heartbeat goes stale. `--dry-run` posts nothing and writes no state. **Reading it:** a newest `codex-review-watch` on main older than 2 hours means the watcher is down; a runner raises it at once (DEVOS-101 lost about 6 hours because nothing showed). A description with `CI unreadable (token)` means the token lost Actions: Read. GitHub keeps at most 1,000 statuses per SHA and context, so on a main that has not moved for about 41 days the heartbeat stops updating; a merge clears it. Every GitHub call has a timeout (connect 10 s, total `GH_TIMEOUT`, default 30 s, ADR-0011).
 
 ## Secrets
-- **Token:** a fine-grained GitHub token for `kkarnati1980/devos` only, with Pull requests RW, Commit statuses RW, Actions R, Contents R and Metadata R.
+- **Token:** a fine-grained GitHub token for `kkarnati1980/devos` only, with Pull requests RW, Commit statuses RW, Actions R, Contents R and Metadata R. **Actions RW** (v1.6.0) lets it re-run ci-gate after a PASS with Keeps; without it the re-run is logged as refused, retried each tick, and a runner re-runs ci-gate by hand.
 - **Storage:** entered at a hidden prompt into `/root/.devos/github-review.env` (mode 600). It is read with `sed`, never sourced, and reaches `curl` through a mode-600 header file in a mode-700 temp dir that is deleted on exit.
 - **Never exposed:** the token is never printed, committed or passed on a command line. Everything posted is redacted first, including verdict summaries and findings (`sk-` keys and GitHub token prefixes).
 
@@ -32,6 +32,7 @@ Run the existing Codex review automatically on every new PR head, so a review no
 | AT1 | Draft PRs and SHAs with a stored verdict are skipped |
 | AT2 | A PR without a valid `Review-Contract:` line gets exactly one comment per SHA and no review |
 | AT3 | A SHA whose CI is not all green is not reviewed |
+| AT22 | (v1.6.0, DEVOS-195; the one exception to AT3, which otherwise holds unchanged) A head whose only red runs are floor-guard.yml and ci-gate.yml by path (conclusion failure, floor-guard among them) is reviewed; any other red, unfinished or cancelled run, or ci-gate red alone, waits; after a PASS with a `FLOOR-GUARD KEEP` line the failed ci-gate run is re-run exactly once (a refused re-run is retried), and never without a Keep or on a green head |
 | AT4 | A green SHA is reviewed once. The runner gets the exact SHA, contract and label `PR<n>-r<k>`. The verdict comment and the `codex-review` status (success for PASS, failure for CHANGES_REQUESTED) are posted once |
 | AT5 | A busy runner leaves the SHA for the next tick (status pending, no comment); a failing runner yields one error comment with redacted log lines and no retry loop |
 | AT6 | The token never appears in output, comments or files other than the 600 env file. The installer refuses anything that does not look like a GitHub token, and verifies every read the watcher needs (PRs, commits, workflow runs, statuses), naming the missing permission if one fails. An unreadable workflow-runs API is logged as a token problem, never as "CI not green" |
@@ -140,8 +141,19 @@ Run the existing Codex review automatically on every new PR head, so a review no
   - AT21 (pre-review): a failure slower than `REVIEW_RETRY_FAST` is final at once ("Attempts: 1 of 3", `error`, no `retry_at`). A runner exiting 0 with no verdict file counts as a fast failure and is retried, never published as a PASS (D1). A superseded pending retry is closed with `error` exactly once. `--dry-run` writes no state and posts no status, whether a retry is waiting or would be closed.
 - **Pre-review (1 medium, 4 low; all fixed):** (M1) the slow-failure rule above; (L2) the superseded retry is closed; (L3) the attempt count is clamped; (L4) the `REVIEW_RETRY_BASE` test now has a lower bound, plus the new tests above; (L5) the versions under owned files are updated. A runner that reports it is busy still uses up no attempt: that check returns before the retry logic, unchanged.
 
+## DEVOS-195 build notes (14 Nov 2026, runner B, ADR-0013) — v1.6.0
+- **Why:** `ci_green` required every workflow green, so a head whose floor guard failed was never reviewed and Codex could never write a `FLOOR-GUARD KEEP` (#117 waited from 19:06 IST, 14 Nov).
+- **Rule:** `ci_green` returns 4 ("reviewable") when every latest run is completed, every red one is `failure` of `floor-guard.yml` or `ci-gate.yml` by **path** (never by name), and floor-guard is among them. Unfinished runs, `cancelled`/`timed_out`, any other red workflow, or ci-gate red with floor-guard green still wait. The ci-gate run id is stored as `watch/<sha>.fgred`.
+- **Runner decision (technical): floor-guard must be among the reds.** ci-gate red alone means some other check failed (it aggregates them), so that head is not ready.
+- **Re-run:** after a PASS whose Summary contains `FLOOR-GUARD KEEP `, on a head with `.fgred`, the watcher posts `POST /actions/runs/<id>/rerun-failed-jobs` once (`.cigate-rerun`). A refused POST is logged and retried on later ticks (the already-published path). A PASS without a Keep, or a green head, re-runs nothing. With GI-1d merged, the re-run passes only if the Keeps are valid.
+- **Pre-review (3 low, all fixed):** (L1) before re-running, the watcher reads the run; one that is no longer `completed failure` (re-run by hand, or running) is marked done, never POSTed again, and a head that is green or red for another reason drops its stale `.fgred`; (L2) the Keep check uses a here-string, not a pipe under `pipefail`; (L3) a publication completed on a later tick also triggers the re-run.
+- **Merge gate unchanged:** merging still needs green CI (including the re-run ci-gate) and a PASS on the exact SHA (D1). The red floor-guard check itself stays red; the merge path reads the Keeps (GI-1b/GI-1d).
+- **Tests:** AT22 (two tests): seven run shapes (floor-guard + ci-gate red, floor-guard alone, another workflow red, ci-gate alone, unfinished, cancelled, a workflow *named* floor-guard in another file); the re-run is made once by id after a refused attempt; no re-run without a Keep or on a green head. `review-watch.test.mjs` 18/18.
+- **Deployment:** the server agent installs the merged script. Until the review token has Actions: write, runners re-run ci-gate themselves after such a PASS.
+
 ## Pass rule
 - `node --test --test-concurrency=1 scripts/test/review-watch.test.mjs` exits 0 on the merged SHA (AT14–AT21, HB1–HB3).
+- The same command's two AT22 tests pass on the merged SHA (DEVOS-195), 18/18 tests in the file.
 - `bash -n scripts/review/review-watch.sh` and `bash -n scripts/review/install-review-watch.sh` exit 0.
 - After the server agent installs the merged script, the next runner failure that ends in under 120 s shows `codex-review` = pending with "attempt 1 of 3" on that head, and the `codex-review-watch` heartbeat on main is at most 2 hours old.
 

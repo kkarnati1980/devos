@@ -14,7 +14,8 @@
     "gen:rules": "node scripts/gen-rules.mjs",
     "check:rules": "node scripts/gen-rules.mjs --check",
     "gen:standard": "node scripts/standards/gen-standard.mjs",
-    "check:standard": "node scripts/standards/gen-standard.mjs --check"
+    "check:standard": "node scripts/standards/gen-standard.mjs --check",
+    "secret-scan:local": "node scripts/security/secret-scan-local.mjs"
   },
   "devDependencies": {
     "ajv": "8.17.1",

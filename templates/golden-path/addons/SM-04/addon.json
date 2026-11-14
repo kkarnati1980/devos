@@ -1,0 +1,12 @@
+{
+  "id": "SM-04",
+  "name": "Outbound resilience",
+  "files": [
+    "src/outbound.mjs",
+    "test/sm-04-outbound.test.mjs"
+  ],
+  "checks": {
+    "SM-04-L1": "test/sm-04-outbound.test.mjs"
+  },
+  "usage": "Make one client per external dependency with outbound({ name, baseUrl, timeoutMs }) and call it with client.call(path, opts); a call may lower the timeout but never drop or raise it. Wrap every outbound call that is not HTTP (database, queue, SDK) in withDeadline(name, timeoutMs, (signal) => work) and pass the signal on. A timeout is an OutboundTimeout with code \"timeout\". Keep test/sm-04-outbound.test.mjs: its last test fails the build on any direct safeFetch call in src/ that does not set timeoutMs. In the app's own tests, stub each dependency with a server that never answers and assert the call fails within its timeout."
+}
