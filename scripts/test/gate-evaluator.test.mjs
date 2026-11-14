@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { evaluateGate, renderComment, CannotRun } from "../gates/evaluate-gate.mjs";
+import { workflowShape, oneLine } from "../floor-guard/floor-guard.mjs";
 
 const SUP = "// eslint-" + "disable-next-line";
 const fgClean = (sha, link) => ({ report: { sha, exit: 0, hits: [] }, link });
@@ -235,4 +236,73 @@ test("AT9: G5 or an unknown gate, malformed evidence, unreadable files and bad a
   }
   assert.equal(spawnSync(process.execPath, [CLI, ok, "--comment", out], { encoding: "utf8" }).status, 0);
   assert.match(fs.readFileSync(out, "utf8"), /APPROVED/);
+});
+
+test("AT10 (DEVOS-186, GI-4c): a CI hit whose stored body shows only known non-security work is cleared by a Codex Keep; any other CI hit stays KK-only", () => {
+  const WFP = ".github/workflows/ci.yml";
+  const run = (rule, text) => {
+    const ev = complete();
+    const h = hitOf(rule, "fg-dddddddddd", WFP, 0, text);
+    Object.assign(ev.mergedPrs[0].floorGuard, { report: { sha: H1, exit: 1, hits: [h] },
+      verdict: { sha: H1, source: "codex", text: `FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} ok`, link: L("v10") } });
+    return evaluateGate(ev).missing.join("\n");
+  };
+  // Cleared by the Codex Keep: the stored body is read in full and is plain build/setup work.
+  for (const text of [
+    "job build: step name:Build removed; ran: run: pnpm build",
+    "job build: step name:Build removed; ran: run: pnpm --filter @devos/api build",
+    "job build: step name:Install removed; ran: run: pnpm install --frozen-lockfile",
+    "job build: step uses:actions/checkout removed; ran: uses: actions/checkout@v4",
+    "job build: step name:Build changed; was: timeout-minutes: 10 ⏎ run: pnpm build; now: timeout-minutes: 20 ⏎ run: pnpm build",
+  ]) assert.equal(run(text.includes("changed;") ? "ci-step-changed" : "ci-step-removed", text), "", text);
+  // End to end: the hit text the floor guard itself writes for a removed build step is cleared.
+  const shape = workflowShape("on: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - name: Build\n        shell: bash\n        run: pnpm build\n");
+  assert.equal(run("ci-step-removed", `job build: step name:Build removed; ran: ${oneLine(shape.bodies.build["name:Build"])}`), "");
+  // KK-only: a security command, a script the text cannot resolve, a local action, a block scalar, chaining,
+  // `test`/`lint`, an extra word, the old body-less text, and every body-less ci-* rule.
+  for (const [rule, text] of [
+    ["ci-step-removed", "job build: step name:Checks removed; ran: run: npm audit --audit-level high"],
+    ["ci-step-removed", "job build: step name:Checks removed"],
+    ["ci-step-removed", "job build: step name:Check removed; ran: run: pnpm check"],
+    ["ci-step-removed", "job build: step name:Test removed; ran: run: pnpm test"],
+    ["ci-step-removed", "job build: step name:Lint removed; ran: run: pnpm lint"],
+    ["ci-step-removed", "job build: step name:S removed; ran: run: bash scripts/x.sh"],
+    ["ci-step-removed", "job build: step name:S removed; ran: run: pnpm --silent exec build"],
+    ["ci-step-removed", "job build: step name:S removed; ran: run: pnpm build extra"],
+    ["ci-step-removed", "job build: step uses:./.github/actions/x removed; ran: uses: ./.github/actions/x@v1"],
+    ["ci-step-removed", "job build: step name:S removed; ran: uses: some/scanner@v2"],
+    ["ci-step-removed", "job build: step name:S removed; ran: run: | ⏎ pnpm build"],
+    ["ci-step-removed", "job build: step name:S removed; ran: run: pnpm build ⏎ FOO: bar"],
+    ["ci-step-changed", "job build: step name:B changed; was: run: pnpm build; now: run: pnpm build && pnpm pack"],
+    ["ci-step-changed", "job build: step name:B changed; was: run: pnpm build"],
+    ["ci-job-removed", "job e2e removed; ran: run: pnpm e2e ;; run: pnpm test"],
+    // Pre-review round 1: a removed job is always KK-only (job-level uses:/services:/env: never reach the text).
+    ["ci-job-removed", "job e2e removed; ran: uses: actions/checkout@v4 ;; run: pnpm e2e"],
+    ["ci-job-removed", "job checks removed; ran: "],
+    // a step name carrying a marker cannot inject a body
+    ["ci-step-removed", "job build: step name:x; ran: run: pnpm build ⏎ name: y removed; ran: run: bash scripts/verify-deps.sh"],
+    ["ci-step-changed", "job build: step name:x; ran: run: pnpm build changed; was: run: bash v.sh; now: run: pnpm build"],
+    ["ci-step-changed", "job build: step name:B changed; was: run: pnpm build; now: run: pnpm build; now: run: pnpm build"],
+    // an empty body, a custom shell, a flow mapping on env:/with:, and unknown package-manager options
+    ["ci-step-removed", "job build: step name:B removed; ran: "],
+    ["ci-step-removed", "job build: step name:B removed; ran: (empty)"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ shell: node scripts/check-deps.js {0}"],
+    ["ci-step-removed", 'job build: step name:B removed; ran: run: pnpm build ⏎ env: { NODE_OPTIONS: "--require ./scripts/v.cjs" }'],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: npm --script-shell=./scripts/v.sh run build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm --config.node-options=--require=./x.cjs build"],
+    // Pre-review round 2: pnpm's -w/--workspace take no value, so they cannot hide a test/lint script; run_install args
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm -w test build"],
+    // Codex PR106-r1: a run value carrying a literal " ⏎ " cannot hide a command; run must be the last line
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ name:; bash scripts/verify-deps.sh"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ if: x"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ run: pnpm build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: if: ${{ always() }} ⏎ run: pnpm build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm --workspace lint build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: uses: pnpm/action-setup@v4 ⏎ with: ⏎ run_install: {args: [--config.node-options=--require=./x.cjs]}"],
+    ["ci-disabled", "if: false"],
+    ["ci-continue-on-error", "continue-on-error: true"],
+    ["ci-trigger-removed", "trigger push removed"],
+    ["ci-workflow-deleted", ".github/workflows/ci.yml deleted"],
+    ["ci-step-removed", "job build: step name:Build removed; ran: run: pnpm build " + "x".repeat(200)],
+  ]) assert.match(run(rule, text), /needs KK's recorded answer/, `${rule}: ${text}`);
 });
