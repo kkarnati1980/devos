@@ -178,3 +178,47 @@ test("AT-Q1 the decided-card scan is bounded and paged", async () => {
   assert.ok(pages.every((f) => f.projectId === P1 && f.limit <= 100));
   assert.equal(pages[1].cursor, pages[0].limit && `${pages[0].status}-1-99`, "the next page starts after the last card");
 });
+
+test("AT-Q3 (DEVOS-166) one decided-card scan per submission, not one per question; the next submission scans afresh", async () => {
+  const { store, approvalStore } = wire();
+  const approvals = new Approvals({ store: approvalStore, grants: { issueGrant: async () => ({ id: "g" }) }, notifier: null, verifyKkSession: () => false });
+  const decidedReads = [];
+  const list = approvalStore.list.bind(approvalStore);
+  const spied = Object.create(approvalStore);
+  spied.list = async (f) => {
+    if (f.status === "approved" || f.status === "rejected") decidedReads.push(f.status);
+    return list(f);
+  };
+  const svc = requirementsServices(store, approvals, spied);
+  const two = `${SPEC}- Which payment provider do we use?\n`;
+  const v1 = await svc.pipeline.submitSpec(P1, { kind: "paste", text: two });
+  assert.ok(v1.questionCards.raised.length >= 2, `needs two or more questions, got ${v1.questionCards.raised.length}`);
+  // One scan: one read per status (each page is short), however many questions were raised.
+  assert.deepEqual(decidedReads, ["approved", "rejected"]);
+  // A card KK decides between submissions is seen by the next one, which scans again.
+  const [first] = v1.questionCards.raised;
+  approvalStore.cards.get(first.cardId).status = "approved";
+  decidedReads.length = 0;
+  const v2 = await svc.pipeline.submitSpec(P1, { kind: "paste", text: `${two}\n- FR-9: Reviews\n  - Reviews show\n` });
+  assert.deepEqual(decidedReads, ["approved", "rejected"]);
+  assert.ok(v2.questionCards.raised.some((x) => x.cardId === first.cardId), "the decided card is reused, not asked again");
+});
+
+test("AT-Q3 (DEVOS-166) outside a submission each question still scans; a failed shared scan raises every question", async () => {
+  let reads = 0;
+  const lister = { list: async () => { reads++; return []; } };
+  const port = skipDecidedQuestions(async () => ({ id: "new" }), lister);
+  const q = (t) => ({ card: { gate: "decision", action: "a", target: t, projectId: P1, reason: "r" } });
+  await port(q("t1"), "r");
+  await port(q("t2"), "r");
+  assert.equal(reads, 4, "two scans of two statuses without a submission scope");
+
+  const { withDecidedScan } = await import("../dist/requirements-sync.js");
+  let fails = 0, raised = 0;
+  const failing = skipDecidedQuestions(async () => ({ id: `new-${++raised}` }), { list: async () => { fails++; throw new Error("db timeout"); } });
+  await withDecidedScan(async () => {
+    assert.deepEqual(await failing(q("t1"), "r"), { id: "new-1" });
+    assert.deepEqual(await failing(q("t2"), "r"), { id: "new-2" });
+  });
+  assert.equal(fails, 1, "the failed scan is shared, not retried per question");
+});
