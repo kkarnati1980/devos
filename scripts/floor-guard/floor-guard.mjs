@@ -10,8 +10,8 @@ import { fileURLToPath } from "node:url";
 
 export const CEILINGS = Object.freeze({ ciTimeoutMinutes: 30, testTimeoutMs: 120000 });
 
-// Paths owned by the guard: exempt from content patterns, but a change to any of them must come
-// alone (with only a decision note or the GI-1 contract beside it).
+// Paths owned by the guard: a change to any of them must come alone (with only a decision note or the GI-1 contract
+// beside it), and the Release path needs a `FLOOR-GUARD CHANGE <path>` marker for each (GI-1b).
 // DEVOS-189: the shared KK-only classifier (DEVOS-181) and its table are guard paths too, so loosening which hits only
 // KK can clear needs the same isolation and the same Codex marker as a guard change (note 0022).
 export const GUARD_PATHS = [
@@ -21,6 +21,10 @@ export const GUARD_PATHS = [
   /^scripts\/gates\/kk-only\.mjs$/,
   /^scripts\/test\/kk-only\.test\.mjs$/,
 ];
+// Exempt from the content rules: only the guard itself, whose tests hold the very patterns it matches. The KK-only
+// classifier and its table are guard paths but NOT exempt, so a suppression, a skipped test or a deleted test there
+// is still a hit (DEVOS-189 pre-review, note 0022).
+const CONTENT_EXEMPT = GUARD_PATHS.slice(0, 3);
 const GUARD_COMPANIONS = [/^docs\/decisions\/[^/]+\.md$/, /^docs\/modules\/GI-1\.md$/];
 
 const CODE = /\.(m?[jt]sx?|c[jt]s|sh|bash|ya?ml|json|py)$/;
@@ -80,6 +84,7 @@ const RX = {
 };
 
 const isGuard = (p) => GUARD_PATHS.some((r) => r.test(p));
+const isExempt = (p) => CONTENT_EXEMPT.some((r) => r.test(p));
 const isTest = (p) => TEST_FILE.test(p);
 
 export class GuardError extends Error {}
@@ -367,7 +372,7 @@ export function analyse(files, show) {
         return { ...l, text: b.text };
       });
     }
-    if (isGuard(p) || isGuard(f.oldPath)) continue;
+    if (isExempt(p) || isExempt(f.oldPath)) continue;
     const test = isTest(p), oldTest = isTest(f.oldPath);
     const code = CODE.test(p) || p.endsWith(".gitleaksignore");
 

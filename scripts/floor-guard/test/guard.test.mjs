@@ -307,6 +307,23 @@ test("guard isolation (DEVOS-189): the shared KK-only classifier and its table a
   assert.ok(!rules(near).includes("guard-change-not-isolated"));
 });
 
+test("content rules (DEVOS-189): the KK-only classifier paths are guard paths but not exempt from content rules", () => {
+  // A new suppression in the classifier is still a hit.
+  const sup = check({ "scripts/gates/kk-only.mjs": "export const a = 1;\n" }, { "scripts/gates/kk-only.mjs": "export const a = 1; // eslint-disable-line\n" });
+  assert.ok(rules(sup).includes("suppression-added"));
+  // A skipped test in its table is still a hit.
+  const KT = "scripts/test/kk-only.test.mjs";
+  const tsrc = 'import { test } from "node:test";\nimport assert from "node:assert/strict";\ntest("a", () => {\n  assert.ok(true);\n});\n';
+  const skip = check({ [KT]: tsrc }, { [KT]: tsrc.replace('test("a"', 'test.skip("a"') });
+  assert.ok(rules(skip).includes("test-skipped"));
+  // Deleting the table is still a hit.
+  const del = check({ [KT]: tsrc }, { [KT]: null });
+  assert.ok(rules(del).includes("test-file-deleted"));
+  // The guard itself stays exempt: a suppression inside scripts/floor-guard/ is not a content hit.
+  const own = check({ "scripts/floor-guard/x.mjs": "export const a = 1;\n" }, { "scripts/floor-guard/x.mjs": "export const a = 1; // eslint-disable-line\n" });
+  assert.ok(!rules(own).includes("suppression-added"));
+});
+
 test("dispositions: Keep only from a Codex verdict on the same SHA naming id and file:line; a new SHA voids it", () => {
   const r = check({ [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
   const [h] = r.hits;
