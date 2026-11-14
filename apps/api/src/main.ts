@@ -39,7 +39,8 @@ async function main(): Promise<void> {
       });
       return q;
     },
-    // DEVOS-176: the run engine is loaded unless `DEVOS_ANALYST_MODEL_PASS=off` (hard off); whether a pass runs is the
+    // DEVOS-176: the run engine is loaded only when `DEVOS_ANALYST_MODEL_PASS` is unset, empty or `on` (any other value
+    // is a hard off; `analystModelPassAllowed`); whether a pass runs is the
     // `analyst.model_pass` setting, read per call (default off, so intake stays deterministic until KK turns it on).
     ...(analystModelPassAllowed(process.env)
       ? {
