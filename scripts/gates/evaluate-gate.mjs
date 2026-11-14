@@ -56,19 +56,21 @@ const PLAIN_ACTIONS = new Set(["actions/checkout", "actions/setup-node", "pnpm/a
 // `with:` and `env:` count only as a bare key (a flow mapping on the same line could set NODE_OPTIONS and the like;
 // their nested lines pass only when they are keys on this list). `shell:` only names a standard shell, because a
 // custom shell template runs any program (pre-review findings 3 and 4).
-const PLAIN_KEYS = /^(if|timeout-minutes|working-directory|id|name|node-version|version|cache|path|key|retention-days|fetch-depth|run_install)\s*:/;
-const BARE_KEYS = /^(with|env)\s*:$/;
+const PLAIN_KEYS = /^(if|timeout-minutes|working-directory|id|name|node-version|version|cache|path|key|retention-days|fetch-depth)\s*:/;
+const BARE_KEYS = /^(with|env)\s*:$|^run_install\s*:\s*(true|false)$/;
 const PLAIN_SHELL = /^shell\s*:\s*(bash|sh|pwsh|powershell|cmd|python)$/;
 // The markers the floor guard writes around a body. Any further occurrence (a step name or a command carrying one)
 // makes the text ambiguous, so it is read as unknown (pre-review finding 1).
 const MARKERS = /; ran: |; was: |; now: /g;
 
 // Package-manager options that take the next word as their value; any other option must be a bare flag or --x=value.
-const PM_VALUE_FLAGS = new Set(["--filter", "-F", "-C", "--dir", "--workspace", "-w"]);
+// Only options that take a value in pnpm, npm and yarn alike. `-w`/`--workspace` are left out: npm reads a value
+// after them, pnpm does not (`-w` is --workspace-root), so `pnpm -w test build` would hide `test` (pre-review round 2).
+const PM_VALUE_FLAGS = new Set(["--filter", "-F", "-C", "--dir"]);
 // Bare options known not to start another program. Any other option (`--script-shell=…`, `--node-options=…`,
 // `--userconfig=…`, `--config.*=…`) is unknown (pre-review finding 5).
 const PM_PLAIN_FLAGS = new Set(["--frozen-lockfile", "--prefer-offline", "--if-present", "-r", "--recursive", "--silent", "-s", "--no-audit", "--no-fund", "--ignore-scripts"]);
-const PM_VALUE_EQ = /^(--filter|--dir|--workspace)=[\w@./*-]+$/;
+const PM_VALUE_EQ = /^(--filter|--dir)=[\w@./*-]+$/;
 const WORD = /^[\w@./:=-]+$/;
 
 /**

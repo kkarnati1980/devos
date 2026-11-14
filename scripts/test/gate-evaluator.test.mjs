@@ -290,6 +290,10 @@ test("AT10 (DEVOS-186, GI-4c): a CI hit whose stored body shows only known non-s
     ["ci-step-removed", 'job build: step name:B removed; ran: run: pnpm build ⏎ env: { NODE_OPTIONS: "--require ./scripts/v.cjs" }'],
     ["ci-step-removed", "job build: step name:B removed; ran: run: npm --script-shell=./scripts/v.sh run build"],
     ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm --config.node-options=--require=./x.cjs build"],
+    // Pre-review round 2: pnpm's -w/--workspace take no value, so they cannot hide a test/lint script; run_install args
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm -w test build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm --workspace lint build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: uses: pnpm/action-setup@v4 ⏎ with: ⏎ run_install: {args: [--config.node-options=--require=./x.cjs]}"],
     ["ci-disabled", "if: false"],
     ["ci-continue-on-error", "continue-on-error: true"],
     ["ci-trigger-removed", "trigger push removed"],
