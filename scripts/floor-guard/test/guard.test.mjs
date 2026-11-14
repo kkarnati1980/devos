@@ -423,9 +423,18 @@ test("GI-4c (DEVOS-167): a ci-* step or job hit carries what the step ran, so it
   r = check({ [WF]: wf(STEPS + multi) }, { [WF]: wf(STEPS) });
   h = r.hits.find((x) => x.rule === "ci-step-removed");
   assert.equal(h.text, "job build: step name:Checks removed; ran: run: | ⏎ npm audit ⏎ pnpm build");
-  // A body past the 200-character cut stays cut (the evaluator fails closed on a full-length text).
-  const long = `      - name: Big\n        run: ${"x".repeat(300)}\n`;
+  // DEVOS-209: a step body keeps up to 1000 characters, so a SHA-pinned setup step is stored whole...
+  const pinned = `      - uses: actions/setup-node@${"a".repeat(40)}\n        with:\n          node-version-file: .nvmrc\n          package-manager-cache: false\n`;
+  r = check({ [WF]: wf(STEPS + pinned.replace("a".repeat(40), "v4").replace("          package-manager-cache: false\n", "")) }, { [WF]: wf(STEPS + pinned) });
+  h = r.hits.find((x) => x.rule === "ci-step-changed");
+  assert.ok(h.text.length > 200 && h.text.endsWith("package-manager-cache: false"), h.text);
+  // ...and a body past that cut stays cut (the evaluator fails closed on a full-length text).
+  const long = `      - name: Big\n        run: ${"x".repeat(1100)}\n`;
   r = check({ [WF]: wf(STEPS + long) }, { [WF]: wf(STEPS) });
   h = r.hits.find((x) => x.rule === "ci-step-removed");
+  assert.equal(h.text.length, 1000);
+  // A removed job (always KK-only) and every other rule keep the 200-character cut.
+  r = check({ [WF]: wf(STEPS) + `  big:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ${"y".repeat(300)}\n` }, { [WF]: wf(STEPS) });
+  h = r.hits.find((x) => x.rule === "ci-job-removed");
   assert.equal(h.text.length, 200);
 });
