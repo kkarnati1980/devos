@@ -183,6 +183,120 @@ export class PrismaAnalystRunRows implements AnalystRunRows {
   }
 }
 
+/** DEVOS-171: an open analyst run is stale once `max_seconds` plus this grace has passed since it started. */
+export const ANALYST_STALE_GRACE_MS = 5 * 60_000;
+/** Stale runs closed per sweep; the rest are reached on later sweeps (bounded work, ADR-0011 §9). */
+export const ANALYST_SWEEP_BATCH = 50;
+/** How often the sweep runs after its start-up pass. */
+export const ANALYST_SWEEP_MS = 5 * 60_000;
+
+/**
+ * DEVOS-171: closes analyst runs that the runner could not close (the database was down when it tried), so their
+ * budget reservations do not stay held. Times are the database's own clock, so API and DB clocks never disagree.
+ */
+export class PrismaAnalystRunSweeper {
+  constructor(private readonly db: AnalystRowsDb, private readonly timeoutMs: number, private readonly graceMs = ANALYST_STALE_GRACE_MS) {}
+
+  private tx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+    return this.db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(Math.floor(this.timeoutMs))}, true) AS statement_timeout`;
+      return fn(tx);
+    }, { timeout: this.timeoutMs, maxWait: this.timeoutMs });
+  }
+
+  /** Ids of open (queued/running) analyst runs past `max_seconds` + grace, oldest first. */
+  staleRunIds(limit: number = ANALYST_SWEEP_BATCH): Promise<string[]> {
+    const graceSecs = this.graceMs / 1000;
+    return this.tx(async (tx) => {
+      const rows = (await tx.$queryRaw`
+        SELECT id::text AS id FROM run
+        WHERE role = 'analyst'::role AND status IN ('queued'::run_status, 'running'::run_status)
+          AND COALESCE(started_at, created_at) + make_interval(secs => max_seconds + ${graceSecs}::float8) < now()
+        ORDER BY COALESCE(started_at, created_at), id
+        LIMIT ${Math.max(1, Math.floor(limit))}::int`) as { id: string }[];
+      return rows.map((r) => r.id);
+    });
+  }
+
+  /**
+   * Closes one stale run as `failed` (`analyst-run-stale`), fails its task and settles its open reservations
+   * fail-closed (DEVOS-161's settlement), all in one transaction under M1.7's lock. The run is re-checked inside
+   * that transaction, so a run that closed or is no longer stale in the meantime is left alone. Returns whether it
+   * closed the run.
+   */
+  closeStale(runId: string): Promise<boolean> {
+    const graceSecs = this.graceMs / 1000;
+    return this.tx(async (tx) => {
+      // M1.7's global lock first, as every policy transaction takes it (DEVOS-161, PR13-r3).
+      await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${POLICY_LOCK_KEY}))) AS l`;
+      const closed = (await tx.$queryRaw`
+        UPDATE run SET status = 'failed'::run_status, error = 'analyst-run-stale', ended_at = now(), updated_at = now()
+        WHERE id = ${runId}::uuid AND role = 'analyst'::role AND status IN ('queued'::run_status, 'running'::run_status)
+          AND COALESCE(started_at, created_at) + make_interval(secs => max_seconds + ${graceSecs}::float8) < now()
+        RETURNING task_id::text AS task_id`) as { task_id: string }[];
+      if (!closed.length) return false;
+      await tx.task.update({ where: { id: closed[0]!.task_id }, data: { status: "failed" } });
+      await settleOpenReservations(tx, runId);
+      return true;
+    });
+  }
+}
+
+export type SweepLog = (entry: { level: "warn"; msg: "analyst-sweep-failed"; runId: string }) => void;
+
+/** DEVOS-171: the start-up and periodic sweep over `PrismaAnalystRunSweeper` (ticks never overlap). */
+export class AnalystRunSweepJob {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private running = false;
+
+  constructor(
+    private readonly sweeper: Pick<PrismaAnalystRunSweeper, "staleRunIds" | "closeStale">,
+    private readonly log: SweepLog,
+    readonly intervalMs: number = ANALYST_SWEEP_MS,
+  ) {}
+
+  /** One pass; null when a pass is already running. One run's failure is logged by id (fixed code) and skipped. */
+  async tick(): Promise<number | null> {
+    if (this.running) return null;
+    this.running = true;
+    try {
+      let ids: string[];
+      try {
+        ids = await this.sweeper.staleRunIds(ANALYST_SWEEP_BATCH);
+      } catch {
+        this.log({ level: "warn", msg: "analyst-sweep-failed", runId: "*" });
+        return 0;
+      }
+      let n = 0;
+      for (const id of ids) {
+        try {
+          if (await this.sweeper.closeStale(id)) n++;
+        } catch {
+          this.log({ level: "warn", msg: "analyst-sweep-failed", runId: id });
+        }
+      }
+      return n;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /** Runs one pass now (the start-up sweep), then every `intervalMs`. */
+  start(): this {
+    if (!this.timer) {
+      void this.tick();
+      this.timer = setInterval(() => void this.tick(), this.intervalMs);
+      this.timer.unref?.();
+    }
+    return this;
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+}
+
 /** Postgres advisory-lock key of M1.7's PrismaPolicyStore (packages/policy/src/prisma-store.ts). */
 export const POLICY_LOCK_KEY = "devos:policy-engine";
 
