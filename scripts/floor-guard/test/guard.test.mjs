@@ -364,3 +364,29 @@ test("exit 0: a false && term ORed with a live condition is not ci-disabled (PR7
     assert.deepEqual(r.hits, [], cond);
   }
 });
+
+test("GI-4c (DEVOS-167): a ci-* step or job hit carries what the step ran, so its security relevance is stored", () => {
+  const audit = `      - uses: actions/checkout@v4\n      - name: Checks\n        run: npm audit --audit-level high\n      - name: Build\n        run: pnpm build\n`;
+  // A removed step named "Checks" that ran npm audit: the stored text names the command, not only the step.
+  let r = check({ [WF]: wf(audit) }, { [WF]: wf(audit.replace("      - name: Checks\n        run: npm audit --audit-level high\n", "")) });
+  let h = r.hits.find((x) => x.rule === "ci-step-removed");
+  assert.ok(h, String(rules(r)));
+  assert.equal(h.text, "job build: step name:Checks removed; ran: run: npm audit --audit-level high");
+  // A removed build step: the text shows it ran only pnpm build.
+  r = check({ [WF]: wf(audit) }, { [WF]: wf(audit.replace("      - name: Build\n        run: pnpm build\n", "")) });
+  h = r.hits.find((x) => x.rule === "ci-step-removed");
+  assert.equal(h.text, "job build: step name:Build removed; ran: run: pnpm build");
+  // An edited step: both the old and the new body, so dropping a scanner from a multi-command step is visible.
+  r = check({ [WF]: wf(STEPS) }, { [WF]: wf(STEPS.replace("run: pnpm test", "run: echo ok")) });
+  h = r.hits.find((x) => x.rule === "ci-step-changed");
+  assert.equal(h.text, "job build: step name:Test changed; was: run: pnpm test; now: run: echo ok");
+  // A removed job: every step body it ran, in order.
+  r = check({ [WF]: wf(STEPS) + "  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Scan\n        run: gitleaks detect\n      - run: pnpm e2e\n" }, { [WF]: wf(STEPS) });
+  h = r.hits.find((x) => x.rule === "ci-job-removed");
+  assert.equal(h.text, "job e2e removed; ran: run: gitleaks detect ;; run: pnpm e2e");
+  // A body past the 200-character cut stays cut (the evaluator fails closed on a full-length text).
+  const long = `      - name: Big\n        run: ${"x".repeat(300)}\n`;
+  r = check({ [WF]: wf(STEPS + long) }, { [WF]: wf(STEPS) });
+  h = r.hits.find((x) => x.rule === "ci-step-removed");
+  assert.equal(h.text.length, 200);
+});

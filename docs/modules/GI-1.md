@@ -65,6 +65,11 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 - Paths containing ` b/` are split with the `git diff -z --name-status` pairs, so hits name the real file.
 - `binary-code-change` stays as defence in depth: `run()` diffs with `--text`, so git never reports a binary file, but a caller of `analyse()` might.
 
+## Follow-up GI-4c (DEVOS-167, note 0021) — what a removed or changed CI step ran
+- `ci-step-removed` text ends `; ran: <the step's body on one line>`, `ci-step-changed` ends `; was: <base body>; now: <head body>`, and `ci-job-removed` ends `; ran: <each step body, joined with " ;; ">`. A body is the step's lines other than its own `name:` (so `run:`, `uses:`, `with:`, `env:`, `if:` …), trimmed and joined with ` | `.
+- The hit text is still cut at 200 characters, and hit ids follow the new text. Nothing else changes: the same hits fire, with the same rules, files and lines.
+- Why: the gate evaluator (`scripts/gates/evaluate-gate.mjs`, GI-4) can then tell from the stored result whether a removed or edited step ran security scanning. Narrowing its `KK_ONLY` on that basis is a separate, non-guard PR (DEVOS-186), because a guard change must come alone (§4.5).
+
 ## Not in scope
 - Making `floor-guard` a required check in the `main` ruleset (DEVOS-145, GI-3b) and adding it to `required-checks.json` (DEVOS-143).
 - The pass-rule field and validator (DEVOS-142).
@@ -83,6 +88,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 | AT5 | A Keep is honoured only from Codex, on the same SHA, naming id and file:line |
 | AT6 | A guard change mixed with any other change is a hit; alone with a decision note it is not |
 | AT7 | The CI job runs the base copy of the guard and finishes in ≤ 120 s |
+| AT8 | (GI-4c) A removed `npm audit` step named "Checks", a removed `pnpm build` step, an edited step and a removed job each carry their body in the hit text (`ran:` / `was:`/`now:`), and a body past the cut stays cut at 200 characters |
 
 ## Green (stored on DEVOS-140 after merge)
 - **GC1:** a throwaway PR adding `.skip` to an existing test gets `floor-guard` exit 1. "Cannot merge" is enforced by the Release path (DEVOS-143) and the ruleset (DEVOS-145) once `floor-guard` is a required check.
