@@ -2,7 +2,7 @@
 // all on the PR's current head SHA, and merges pinned to that SHA (docs/modules/GI-3.md, AT1–AT9).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_CONFIG, githubClient, main, release } from "../release/merge.mjs";
+import { BACKOFF_CAP_MS, DEFAULT_CONFIG, backoffMs, githubClient, main, release } from "../release/merge.mjs";
 
 const REPO = "kkarnati1980/devos";
 const HEAD = "a".repeat(40);
@@ -58,7 +58,15 @@ function fakeGitHub(over = {}) {
     }
     return reply(404, { message: "not found" });
   };
-  return { state, calls, fetchImpl, gh: githubClient({ token: TOKEN, fetchImpl, retries: 2 }) };
+  const sleeps = [];
+  const sleep = async (ms) => { sleeps.push(ms); };
+  // DEVOS-148: `netFailures` GETs fail with a network error before the fake answers (one client, one retry setting).
+  let netFailures = over.netFailures ?? 0;
+  const client = async (url, init) => {
+    if (init.method === "GET" && netFailures-- > 0) throw new TypeError("fetch failed");
+    return fetchImpl(url, init);
+  };
+  return { state, calls, fetchImpl, sleep, sleeps, gh: githubClient({ token: TOKEN, fetchImpl: client, retries: 2, sleep }) };
 }
 
 const run = (f, extra = {}) => release(f.gh, { repo: REPO, pr: 7, ...extra });
@@ -206,13 +214,13 @@ test("AT9 cannot run → exit 2, never a merge; the token never appears in outpu
   assert.equal(await main(["7", "--repo", "bad repo"], { env: { GH_TOKEN: TOKEN }, log }), 2);
   assert.equal(await main(["7", "--repo", "../.."], { env: { GH_TOKEN: TOKEN }, log }), 2);
   const down = async () => { throw new TypeError("fetch failed"); };
-  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: down, log }), 2);
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: down, log, sleep: async () => {} }), 2);
   const f = fakeGitHub({ fail5xx: 2 });
-  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: f.fetchImpl, log }), 0, "two 502s on GET are retried");
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: f.fetchImpl, log, sleep: f.sleep }), 0, "two 502s on GET are retried");
   assert.ok(f.calls.every((c) => c.hasSignal), "every call carries a timeout signal");
   assert.ok(f.calls.every((c) => c.auth === `Bearer ${TOKEN}`));
   const g = fakeGitHub({ fail5xx: 9 });
-  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: g.fetchImpl, log }), 2);
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: g.fetchImpl, log, sleep: g.sleep }), 2);
   assert.equal(merges(g).length, 0);
   assert.ok(!out.join("\n").includes(TOKEN), "token never printed");
   assert.ok(out.some((l) => l.startsWith("MERGED PR #7")));
@@ -231,4 +239,37 @@ test("AT5c Codex PR67-r1: a 5xx or an unreadable 200 on the merge PUT is read ba
   // A definite refusal (405 not mergeable, 409 head moved) stays exit 1 without a read-back merge claim.
   const refused = fakeGitHub({ putStatus: 405, putBody: JSON.stringify({ message: "Pull Request is not mergeable" }) });
   assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: refused.fetchImpl, log }), 1);
+});
+
+test("DEVOS-148 GET retries wait with bounded exponential backoff and jitter; the merge PUT never waits or retries", async () => {
+  // Two 502s, then success: two waits, the first in [250, 500] ms, the second in [500, 1000] ms.
+  const f = fakeGitHub({ fail5xx: 2 });
+  assert.equal((await run(f)).code, 0);
+  assert.equal(f.sleeps.length, 2);
+  assert.ok(f.sleeps[0] >= 250 && f.sleeps[0] <= 500, `first wait ${f.sleeps[0]}`);
+  assert.ok(f.sleeps[1] >= 500 && f.sleeps[1] <= 1000, `second wait ${f.sleeps[1]}`);
+  assert.equal(merges(f).length, 1);
+  // A run with no failures never waits.
+  const ok = fakeGitHub();
+  assert.equal((await run(ok)).code, 0);
+  assert.deepEqual(ok.sleeps, []);
+  // The PUT is not retried and does not wait, even when it fails in flight.
+  const p = fakeGitHub({ putThrows: "merged" });
+  assert.equal((await run(p)).code, 0, "read back as merged");
+  assert.equal(merges(p).length, 1);
+  assert.deepEqual(p.sleeps, []);
+  // The schedule: exact bounds at jitter 0 and 1, capped, and a bad random source cannot escape the bounds.
+  assert.deepEqual([1, 2, 3].map((a) => backoffMs(a, () => 0)), [250, 500, 1000]);
+  assert.deepEqual([1, 2, 3].map((a) => backoffMs(a, () => 1)), [500, 1000, 2000]);
+  assert.equal(backoffMs(30, () => 1), BACKOFF_CAP_MS);
+  for (const r of [() => -5, () => 7, () => Number.NaN]) {
+    const ms = backoffMs(1, r);
+    assert.ok(ms >= 250 && ms <= 500, `bounded for ${r}`);
+  }
+});
+
+test("DEVOS-148 a GET network error is retried after a backoff", async () => {
+  const f = fakeGitHub({ netFailures: 1 });
+  assert.equal((await release(f.gh, { repo: REPO, pr: 7 })).code, 0);
+  assert.equal(f.sleeps.length, 1);
 });

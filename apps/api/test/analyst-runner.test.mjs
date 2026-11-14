@@ -204,3 +204,10 @@ test("AT-MR5 buildRuntime keeps the model pass off without loadAnalystEngine; wi
   await assert.rejects(paused.requirements.pipeline.ports.runner({ prompt: "p", tag: "analyst_assist", projectId: P1 }), /analyst-run-paused/);
   assert.deepEqual(writes.at(-1), ["run.updateMany", { id: "r1", status: { in: ["queued", "running"] } }, "failed", "analyst-run-paused"]);
 });
+
+test("AT-MR7b (DEVOS-161) the runner's policy lock key is M1.7's", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { POLICY_LOCK_KEY } = await import("../dist/analyst-runner.js");
+  const src = await readFile(new URL("../../../packages/policy/src/prisma-store.ts", import.meta.url), "utf8");
+  assert.match(src, new RegExp(`const LOCK_KEY = "${POLICY_LOCK_KEY}";`));
+});

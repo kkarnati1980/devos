@@ -67,3 +67,63 @@ test("AT-MR6 an unknown project is refused by the FK and leaves no task", async 
   await assert.rejects(rows.createRun({ projectId: ghost, title: "Analyst assist", model: ANALYST_MODEL, maxTurns: 2, maxSeconds: 90, maxCostUsd: 0.5 }));
   assert.equal(await db.task.count({ where: { projectId: ghost } }), 0);
 });
+
+test("AT-MR7 (DEVOS-161) an abandoned run's open reservation is settled fail-closed with its cost entry; other rows and engine-closed runs are left alone", async () => {
+  const p = await project();
+  const rows = new PrismaAnalystRunRows(db, 5_000);
+  const reserve = (runId, data = {}) =>
+    db.budgetReservation.create({ data: { projectId: p.id, runId, provider: "anthropic", reservedUsd: "0.500000", reservedTokens: 200_000, ...data } });
+  const ledger = async (runId) => {
+    const cost = (await db.costEntry.findMany({ where: { runId } })).reduce((a, c) => a + Number(c.usd), 0);
+    const settled = (await db.budgetReservation.findMany({ where: { runId, status: "reconciled" } })).reduce((a, r) => a + Number(r.actualUsd), 0);
+    return { cost: Math.round(cost * 1e6), settled: Math.round(settled * 1e6) };
+  };
+  const run = (engine) => runEngineModelRunner(rows, engine)({ prompt: "p", tag: "analyst_assist", projectId: p.id });
+
+  // Another run's open reservation, to prove the run scoping.
+  let otherRun;
+  await run({ execute: async (i) => { otherRun = i.runId; return { status: "succeeded" }; } });
+  const otherOpen = (await reserve(otherRun)).id;
+
+  // 1. The engine reserves, then throws before recording or settling: the whole reservation is charged and reconciled.
+  let r1, open1, settled1;
+  await assert.rejects(run({
+    execute: async (i) => {
+      r1 = i.runId;
+      open1 = (await reserve(i.runId)).id;
+      settled1 = (await reserve(i.runId, { status: "reconciled", reservedUsd: "0.200000", actualUsd: "0.010000", actualTokens: 900 })).id;
+      await db.costEntry.create({ data: { projectId: p.id, runId: i.runId, provider: "anthropic", model: ANALYST_MODEL, role: "analyst", usd: "0.010000" } });
+      throw new Error("store down");
+    },
+  }), /store down/);
+  const o1 = await db.budgetReservation.findUnique({ where: { id: open1 } });
+  assert.deepEqual([o1.status, Number(o1.actualUsd), o1.actualTokens], ["reconciled", 0.5, 200_000], "charged the whole reservation");
+  const s1 = await db.budgetReservation.findUnique({ where: { id: settled1 } });
+  assert.deepEqual([s1.status, Number(s1.actualUsd), s1.actualTokens], ["reconciled", 0.01, 900], "an already settled reservation is unchanged");
+  assert.deepEqual(await ledger(r1), { cost: 510_000, settled: 510_000 }, "the ledger matches the reconciled actuals (M1.5 invariant)");
+  assert.equal((await db.run.findUnique({ where: { id: r1 } })).error, "analyst-run-abandoned");
+
+  // 2. The engine recorded the crash cost but failed to settle: only the remainder is charged, never twice.
+  let r2;
+  await assert.rejects(run({
+    execute: async (i) => {
+      r2 = i.runId;
+      await reserve(i.runId);
+      await db.costEntry.create({ data: { projectId: p.id, runId: i.runId, provider: "anthropic", model: ANALYST_MODEL, role: "analyst", usd: "0.500000" } });
+      throw new Error("settle failed");
+    },
+  }), /settle failed/);
+  assert.deepEqual(await ledger(r2), { cost: 500_000, settled: 500_000 }, "no second charge for cost already recorded");
+
+  // 3. The engine closed the run itself (it settles its own reservation): the runner does not touch it.
+  let closedOpen;
+  await assert.rejects(run({
+    execute: async (i) => {
+      closedOpen = (await reserve(i.runId)).id;
+      await db.run.update({ where: { id: i.runId }, data: { status: "failed", error: "engine-error", endedAt: new Date() } });
+      return { status: "failed" };
+    },
+  }), /analyst-run-failed/);
+  assert.equal((await db.budgetReservation.findUnique({ where: { id: closedOpen } })).status, "reserved");
+  assert.equal((await db.budgetReservation.findUnique({ where: { id: otherOpen } })).status, "reserved", "another run's reservation");
+});
