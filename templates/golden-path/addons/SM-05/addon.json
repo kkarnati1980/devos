@@ -1,0 +1,12 @@
+{
+  "id": "SM-05",
+  "name": "Background work",
+  "files": [
+    "src/queue.mjs",
+    "test/sm-05-queue.test.mjs"
+  ],
+  "checks": {
+    "SM-05-L1": "test/sm-05-queue.test.mjs"
+  },
+  "usage": "createQueue({ handlers: { \"report.build\": async (payload, { signal }) => … }, store: fileStore(\"data/jobs.json\") }), call start(), and enqueue(type, payload) from a route instead of doing slow work in it. Failed attempts are retried (maxAttempts, backoffMs, timeoutMs); a job that fails every attempt is dead-lettered. Mount deadLetterRoutes(queue) behind the app's auth guard (SM-02) and origin guard (SM-03) to list, retry and discard dead letters. Never put a secret in a payload or in a handler's error message (both are stored, and errors are shown in the dead-letter list); handlers should honour their abort signal."
+}
