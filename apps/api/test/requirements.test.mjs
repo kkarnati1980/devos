@@ -199,3 +199,61 @@ test("AT-R5 not configured → 503", async () => {
     await app.close();
   }
 });
+
+test("AT-CA3a route (CR-a3, DEVOS-199): GET /projects/by-slug/:slug/preflight — session, 400 bad slug, 404 unknown, fixed 500, 503 without the reads", async () => {
+  const store = new MemoryRequirementsStore();
+  store.addProject({ id: P1, name: "Shop", stage: "intake", continuousRun: true, capUsd: 15 });
+  let failDecisions = false;
+  // The memory store has no slug or decision-log reads; the Prisma store does (test-db covers its SQL).
+  const viewStore = Object.assign(Object.create(store), {
+    projectBySlug: async (slug) => (slug === "shop" ? { id: P1, continuousRun: true } : null),
+    decisions: async () => {
+      if (failDecisions) throw new Error("db down: secret detail");
+      return [];
+    },
+    preflightState: async () => "pending",
+    latestPreflight: async () => [{ id: "PF-1", kind: "secret", text: "SMS_API_KEY", default: "enter in setup wizard" }],
+  });
+  const make = async (s) => {
+    const app = await createApp({
+      config: loadConfig(ENV),
+      identity: { async whois() { return { login: KK, node: "kk-laptop" }; } },
+      grants: null,
+      log: () => {},
+      kkSessions: new KkSessionRegistry(),
+      requirements: { pipeline: null, store: s, cards: null },
+    });
+    await app.listen(0, "127.0.0.1");
+    return { app, port: app.getHttpServer().address().port };
+  };
+  const { app, port } = await make(viewStore);
+  try {
+    assert.equal((await call(port, "GET", "/projects/by-slug/shop/preflight")).status, 401, "session required");
+    const h = await signIn(port);
+    const ok = await call(port, "GET", "/projects/by-slug/shop/preflight", { headers: { cookie: h.cookie } });
+    assert.equal(ok.status, 200, ok.text);
+    assert.deepEqual(
+      { state: ok.json.preflight.state, open: ok.json.preflight.open, missing: ok.json.preflight.missingSecrets, unverified: ok.json.preflight.secretsUnverified },
+      { state: "pending", open: false, missing: ["SMS_API_KEY"], unverified: true },
+      "no vault wired: every secret name listed, unverified",
+    );
+    const bad = await call(port, "GET", "/projects/by-slug/Bad_Slug/preflight", { headers: { cookie: h.cookie } });
+    assert.deepEqual([bad.status, bad.json.code], [400, "invalid:slug"]);
+    const none = await call(port, "GET", "/projects/by-slug/nope/preflight", { headers: { cookie: h.cookie } });
+    assert.deepEqual([none.status, none.json.code], [404, "project-not-found"]);
+    failDecisions = true;
+    const fault = await call(port, "GET", "/projects/by-slug/shop/preflight", { headers: { cookie: h.cookie } });
+    assert.deepEqual([fault.status, fault.json.code], [500, "requirements-store-error"]);
+    assert.ok(!fault.text.includes("secret detail"), "never the error message");
+  } finally {
+    await app.close();
+  }
+  const plain = await make(store);
+  try {
+    const h = await signIn(plain.port);
+    const r = await call(plain.port, "GET", "/projects/by-slug/shop/preflight", { headers: { cookie: h.cookie } });
+    assert.deepEqual([r.status, r.json.code], [503, "preflight-not-configured"]);
+  } finally {
+    await plain.app.close();
+  }
+});

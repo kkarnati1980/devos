@@ -311,6 +311,9 @@ export const SECRET_LABELS: Record<string, string> = {
 
 /** Human messages for API codes; the code itself is shown too, never any input. */
 export function explain(code: string): string {
+  if (code === "project-not-found") return "No pre-flight for this project yet (the API does not know it).";
+  if (code === "preflight-not-configured" || code === "requirements-not-configured") return "The pre-flight needs the database (DATABASE_URL).";
+  if (code === "requirements-store-error") return "The pre-flight could not be read. Try again in a minute.";
   if (code === "api-unreachable") return "The DevOS API did not answer. Check you are on the tailnet.";
   if (code === "not-kk") return "This device is not signed in to the tailnet as KK.";
   if (code === "notifications-not-configured") return "Notifications need the database (DATABASE_URL).";

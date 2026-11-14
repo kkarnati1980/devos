@@ -309,6 +309,17 @@ test("AT-CA3b (CR-a3, DEVOS-199): the project page shows the pre-flight read-onl
   // Another project with no pre-flight on the stub: a fixed message, never raw error text.
   const other = await open("/projects/social-content-extraction");
   await other.page.getByTestId("preflight-error").waitFor();
-  assert.match(await other.page.getByTestId("preflight-error").innerText(), /\(project-not-found\)$/);
+  assert.match(await other.page.getByTestId("preflight-error").innerText(), /^No pre-flight for this project yet .*\(project-not-found\)$/);
   await other.context.close();
+  // Signed out (not KK's device): the sign-in line, and no pre-flight read.
+  api.state.denySignIn = true;
+  try {
+    const out = await open("/projects/xss-probe");
+    await out.page.getByTestId("preflight-error").waitFor();
+    assert.match(await out.page.getByTestId("preflight-error").innerText(), /not signed in to the tailnet as KK\. \(not-kk\)$/);
+    assert.equal(await out.page.getByTestId("preflight-item").count(), 0);
+    await out.context.close();
+  } finally {
+    api.state.denySignIn = false;
+  }
 });

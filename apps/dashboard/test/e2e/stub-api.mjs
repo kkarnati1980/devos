@@ -33,6 +33,8 @@ export async function startStubApi(allowedOrigin) {
     if (req.method !== "GET" && req.method !== "POST") state.csrfSeen.push(req.headers["x-devos-csrf"] ?? null);
     // Like M1.2: every sign-in rotates the cookie and its CSRF token; GET /auth/session returns
     // the token for the cookie presented; a write needs the token of the current cookie.
+    // CR-a3: a device that is not KK's (the API refuses the session).
+    if (req.method === "POST" && url === "/auth/session" && state.denySignIn) return json(403, { statusCode: 403, code: "not-kk" });
     if (req.method === "POST" && url === "/auth/session") {
       const n = ++state.signIns;
       res.setHeader("Set-Cookie", `devos_session=stub-${n}; HttpOnly; SameSite=Strict; Path=/`);

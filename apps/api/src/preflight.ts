@@ -103,6 +103,8 @@ export async function preflightView(slug: string, reader: PreflightViewReader, v
       unverified = true;
     }
   }
-  const open = vault ? await preflightOpen(project.id, reader, vault) : state === "approved" && names.length === 0;
+  // Pre-review CR-a3 #3: `open` from the values already read, so it always agrees with the state and the secret
+  // lines shown (preflightOpen's rule: approved, and every secret verified present). CR-c gates on preflightOpen.
+  const open = state === "approved" && !unverified && missing.length === 0;
   return { continuousRun: project.continuousRun, state, open, items, missingSecrets: missing, secretsUnverified: unverified, decisions };
 }
