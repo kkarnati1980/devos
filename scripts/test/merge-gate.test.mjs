@@ -14,9 +14,12 @@ const WATCHER = { login: "kkarnati1980" };
 // A fake GitHub. `state` is mutated per test; every request is recorded.
 function fakeGitHub(over = {}) {
   const state = {
-    pr: { number: 7, state: "open", draft: false, merged: false, base: { ref: "main" }, head: { sha: HEAD, repo: { full_name: REPO } } },
+    pr: { number: 7, state: "open", draft: false, merged: false, changed_files: 1, base: { ref: "main" }, head: { sha: HEAD, repo: { full_name: REPO } } },
+    files: [{ filename: "apps/api/src/x.ts", status: "modified" }],
+    comments: [],
     checkRuns: [
       { name: "build", status: "completed", conclusion: "success" },
+      { name: "floor-guard", status: "completed", conclusion: "success" },
       { name: "e2e", status: "completed", conclusion: "skipped" },
     ],
     statuses: [{ context: "codex-review", state: "success", description: "Codex PASS (PR7-r2)", creator: WATCHER, updated_at: "2026-11-12T10:00:00Z" }],
@@ -46,6 +49,14 @@ function fakeGitHub(over = {}) {
     if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)) return reply(200, { total_count: state.statuses.length, statuses: state.statuses });
     if (path.startsWith(`/repos/${REPO}/commits/${OLD}/status`)) return reply(200, { total_count: 1, statuses: state.oldShaStatuses });
     if (path.startsWith(`/repos/${REPO}/actions/runs?head_sha=${HEAD}`)) return reply(200, { total_count: state.workflowRuns.length, workflow_runs: state.workflowRuns });
+    if (path.startsWith(`/repos/${REPO}/pulls/7/files`)) {
+      const page = Number(new URL(url).searchParams.get("page"));
+      return reply(200, state.files.slice((page - 1) * 100, page * 100));
+    }
+    if (path.startsWith(`/repos/${REPO}/issues/7/comments`)) {
+      const page = Number(new URL(url).searchParams.get("page"));
+      return reply(200, state.comments.slice((page - 1) * 100, page * 100));
+    }
     if (path === `/repos/${REPO}/git/ref/heads/main`) return reply(200, { object: { sha: state.mainSha } });
     if (path === `/repos/${REPO}/compare/${MAIN}...${HEAD}`) return reply(200, { status: state.compare });
     if (path === `/repos/${REPO}/pulls/7/merge` && init.method === "PUT") {
@@ -169,7 +180,8 @@ test("AT5b a merge PUT that fails in flight is read back: merged → exit 0; not
 
 test("AT6 a required check run (e.g. the CI aggregator or floor guard once listed) must report success", async () => {
   const config = { ...DEFAULT_CONFIG, requiredCheckRuns: ["floor-guard"] };
-  let f = fakeGitHub();
+  assert.deepEqual(DEFAULT_CONFIG.requiredCheckRuns, ["floor-guard"], "GI-1b: the floor guard is a required check");
+  let f = fakeGitHub({ checkRuns: [{ name: "build", status: "completed", conclusion: "success" }] });
   assert.equal((await run(f, { config })).code, 1, "missing required check");
   f = fakeGitHub({ checkRuns: [{ name: "build", status: "completed", conclusion: "success" }, { name: "floor-guard", status: "completed", conclusion: "skipped" }] });
   assert.equal((await run(f, { config })).code, 1, "a skipped required check is not success");
@@ -202,6 +214,9 @@ test("AT8 --dry-run never merges; paginated check runs beyond page 1 are judged"
   assert.equal((await run(f, { dryRun: true })).code, 0);
   assert.equal(merges(f).length, 0);
   const many = Array.from({ length: 150 }, (_, i) => ({ name: `job${i}`, status: "completed", conclusion: "success" }));
+  many[0] = { name: "floor-guard", status: "completed", conclusion: "success" };
+  const ok = fakeGitHub({ checkRuns: many.slice() });
+  assert.equal((await run(ok, { dryRun: true })).code, 0, "150 green runs over two pages pass");
   many[140] = { name: "job140", status: "completed", conclusion: "failure" };
   const g = fakeGitHub({ checkRuns: many });
   assert.equal((await run(g)).code, 1, "a failure on page 2 is seen");
