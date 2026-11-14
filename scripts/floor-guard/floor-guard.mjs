@@ -8,6 +8,13 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
+// Hit text is cut at 200 characters, except the two step-body rules (GI-4c), whose was/now text holds a whole step:
+// a SHA-pinned setup step is past 200, and a cut text is read as unknown (KK-only), so they keep up to 1000 (DEVOS-209,
+// note 0026). scripts/gates/kk-only.mjs holds the same two numbers; a test checks they match.
+export const TEXT_CUT = 200;
+export const STEP_BODY_CUT = 1000;
+export const STEP_BODY_RULES = Object.freeze(["ci-step-removed", "ci-step-changed"]);
+export const cutFor = (rule) => (STEP_BODY_RULES.includes(rule) ? STEP_BODY_CUT : TEXT_CUT);
 export const CEILINGS = Object.freeze({ ciTimeoutMinutes: 30, testTimeoutMs: 120000 });
 
 // Paths owned by the guard: a change to any of them must come alone (with only a decision note or the GI-1 contract
@@ -348,7 +355,7 @@ function constFalseExpr(e, depth = 0) {
  */
 export function analyse(files, show) {
   const hits = [];
-  const hit = (rule, file, line, text) => hits.push({ id: hitId(rule, file, text), rule, file, line, text: String(text).trim().slice(0, 200) });
+  const hit = (rule, file, line, text) => hits.push({ id: hitId(rule, file, text), rule, file, line, text: String(text).trim().slice(0, cutFor(rule)) });
 
   const touched = files.map((f) => f.path).concat(files.map((f) => f.oldPath));
   if (touched.some(isGuard)) {
@@ -432,8 +439,8 @@ export function analyse(files, show) {
         const b = workflowShape(before), h = workflowShape(after);
         for (const [job, steps] of Object.entries(b.jobs)) {
           // GI-4c (DEVOS-167): the hit carries what the step ran (`ran:` for a removal, `was:`/`now:` for an edit), so
-          // the gate evaluator can tell from the stored result whether security scanning went. The text is still cut at
-          // 200 characters; the evaluator treats a cut text as unknown and fails closed.
+          // the gate evaluator can tell from the stored result whether security scanning went. A step's text is cut at
+          // STEP_BODY_CUT (a job's at TEXT_CUT); the evaluator treats a cut text as unknown and fails closed.
           if (!(job in h.jobs)) { hit("ci-job-removed", p, 0, `job ${job} removed; ran: ${steps.map((s) => oneLine(b.bodies[job][s])).join(" ;; ")}`); continue; }
           for (const s of steps) {
             if (!h.jobs[job].includes(s)) hit("ci-step-removed", p, 0, `job ${job}: step ${s} removed; ran: ${oneLine(b.bodies[job][s])}`);

@@ -8,8 +8,10 @@
 // flag this pattern itself as a new suppression; it matches the same text and suppresses nothing (GI-4 contract).
 const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
 const SECURITY_WORDS = /secur|secret|gitleaks|\bnose[c]\b|audit|licen[cs]e|codeql|semgrep|trivy|snyk|xss|no-eval|detect-/i;
-// GI-1 cuts hit text to 200 characters; a token past the cut cannot be ruled out, so a full-length text fails closed.
-const CUT = 200;
+// GI-1 cuts hit text to 200 characters, and a step body (ci-step-removed/-changed) to 1000 (DEVOS-209); a token past
+// the cut cannot be ruled out, so a full-length text fails closed. Same numbers as the floor guard (test K4).
+export const CUT = 200;
+export const STEP_BODY_CUT = 1000;
 // Hits spec §4.4 sends to KK (security scanning, policy, D13): a Codex Keep never clears them, only KK's recorded answer.
 export const KK_ONLY = (h) => {
   const text = String(h?.text ?? "");
@@ -17,7 +19,7 @@ export const KK_ONLY = (h) => {
   // (a lint-rule-off of a "security/…" rule, a suppression in src/security/ or of no-eval) goes to KK (PR84-r2, r3).
   if (SECURITY_WORDS.test(`${h?.file ?? ""} ${text}`)) return true;
   // A full-length (cut) text may hide a security token past the cut, for every rule, so it fails closed (PR84-r4).
-  if (text.length >= CUT) return true;
+  if (text.length >= (CI_BODY_RULES.has(h?.rule) ? STEP_BODY_CUT : CUT)) return true;
   // A guard change mixed with other changes must stand alone (spec §4.5); only KK can accept it (merge path GI-1b).
   if (h?.rule === "gitleaksignore-added" || h?.rule === "policy-weakened" || h?.rule === "guard-change-not-isolated") return true;
   if (h?.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text);
@@ -45,7 +47,10 @@ const PLAIN_ACTIONS = new Set(["actions/checkout", "actions/setup-node", "pnpm/a
 // `with:` and `env:` count only as a bare key (a flow mapping on the same line could set NODE_OPTIONS and the like;
 // their nested lines pass only when they are keys on this list). `shell:` only names a standard shell, because a
 // custom shell template runs any program (pre-review findings 3 and 4).
-const PLAIN_KEYS = /^(if|timeout-minutes|working-directory|id|name|node-version|version|cache|path|key|retention-days|fetch-depth)\s*:/;
+// DEVOS-209: plus the setup-action keys `node-version-file`, `package-manager-cache`, `sparse-checkout`; and
+// `persist-credentials` only as `false` and checkout's `ref` only as the PR's head or base SHA (PLAIN_FIXED).
+const PLAIN_KEYS = /^(if|timeout-minutes|working-directory|id|name|node-version|node-version-file|version|cache|package-manager-cache|path|key|retention-days|fetch-depth|sparse-checkout)\s*:/;
+const PLAIN_FIXED = /^persist-credentials\s*:\s*false$|^ref\s*:\s*\$\{\{\s*github\.event\.pull_request\.(head|base)\.sha\s*\}\}$/;
 const BARE_KEYS = /^(with|env)\s*:$|^run_install\s*:\s*(true|false)$/;
 const PLAIN_SHELL = /^shell\s*:\s*(bash|sh|pwsh|powershell|cmd|python)$/;
 // The markers the floor guard writes around a body. Any further occurrence (a step name or a command carrying one)
@@ -138,6 +143,7 @@ function plainBody(body) {
   return lines.every((l, i) => {
     const t = l.trim();
     if (/^(run|uses)\s*:/.test(t)) return plainLine(t);
+    if (PLAIN_FIXED.test(t)) return true;
     return plainLine(t) && SAFE_VALUE.test(t);
   });
 }
