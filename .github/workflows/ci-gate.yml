@@ -20,9 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # The workflow and the gate script both come from the PR (pull_request runs the PR's own workflow file), so
-      # changes to them are guarded by the floor guard (DEVOS-141) and Codex review, not by this job. The base
-      # commit's workflow list is read too, so a PR that deletes or narrows a check still has to pass it.
+      # The workflow file comes from the PR (pull_request runs the PR's own workflow file); changes to it are
+      # caught by the floor guard's content rules (DEVOS-141) and Codex review. The base commit's workflow list
+      # is read too, so a PR that deletes or narrows a check still has to pass it. The gate's CODE runs from the
+      # PR's BASE commit (DEVOS-202, notes 0017 and 0023), the way floor-guard.yml runs the base guard: see the
+      # "Use the base commit's copy" step.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -41,6 +43,39 @@ jobs:
           node-version-file: .nvmrc
       - name: Install the gate's one dependency (yaml, pinned by the lockfile)
         run: pnpm install --frozen-lockfile --filter . --ignore-scripts
+      # DEVOS-202: a third checkout, so the two above stay exactly as they were.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .gate-src
+          persist-credentials: false
+      - name: Use the base commit's copy of the gate's code and its yaml (DEVOS-202)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          for f in scripts/ci/ci-gate.mjs scripts/release/merge.mjs scripts/release/required-checks.json scripts/floor-guard/floor-guard.mjs scripts/gates/kk-only.mjs; do
+            [[ -f ".gate-src/$f" ]] || { echo "ci-gate: the base commit $BASE_SHA has no $f; refusing to judge with the head's copy"; exit 2; }
+          done
+          # Pre-review (DEVOS-202): nothing the head adds may sit on the gate's module-resolution path or run at
+          # install time. A head with a node_modules under scripts/, a symlinked scripts/ (or gate directory), a
+          # .pnpmfile.cjs, or an .npmrc unlike the base's is refused rather than judged.
+          [[ ! -L scripts && "$(realpath scripts)" == "$PWD/scripts" ]] || { echo "ci-gate: the head's scripts/ is a symlink; refusing"; exit 2; }
+          for d in scripts/ci scripts/release scripts/floor-guard scripts/gates; do [[ ! -L "$d" ]] || { echo "ci-gate: the head's $d is a symlink; refusing"; exit 2; }; done
+          if [[ -n "$(find scripts -name node_modules -print -quit)" ]]; then echo "ci-gate: the head has a node_modules under scripts/; refusing"; exit 2; fi
+          if [[ -e .pnpmfile.cjs || -e .gate-src/.pnpmfile.cjs ]]; then echo "ci-gate: a .pnpmfile.cjs is present; refusing"; exit 2; fi
+          if ! cmp -s <(cat .npmrc 2>/dev/null) <(cat .gate-src/.npmrc 2>/dev/null); then echo "ci-gate: the head's .npmrc differs from the base's; refusing"; exit 2; fi
+          # The head's copies are replaced, so the next step's `node scripts/ci/ci-gate.mjs` and every relative
+          # import from it (merge.mjs, required-checks.json, floor-guard.mjs, kk-only.mjs) are the base's.
+          for d in scripts/ci scripts/release scripts/floor-guard; do rm -rf "$d"; cp -R ".gate-src/$d" "$d"; done
+          mkdir -p scripts/gates; cp ".gate-src/scripts/gates/kk-only.mjs" scripts/gates/kk-only.mjs
+          # yaml from the base lockfile, installed outside the workspace; the head's node_modules/yaml points to it.
+          gate="$RUNNER_TEMP/gate-base"
+          rm -rf "$gate"; mv .gate-src "$gate"
+          (cd "$gate" && pnpm install --frozen-lockfile --filter . --ignore-scripts --ignore-pnpmfile)
+          [[ -f "$gate/node_modules/yaml/package.json" ]] || { echo "ci-gate: the base install has no yaml"; exit 2; }
+          mkdir -p node_modules; rm -rf node_modules/yaml; ln -s "$(realpath "$gate/node_modules/yaml")" node_modules/yaml
+          echo "gate version: base $BASE_SHA"
       - name: Wait for every PR check on the head SHA
         timeout-minutes: 28
         env:

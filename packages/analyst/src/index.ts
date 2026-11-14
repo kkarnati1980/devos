@@ -49,6 +49,9 @@ export {
   RequirementsPipeline,
   ingestStatus,
   requirementsCard,
+  withholdPreflightText,
+  PREFLIGHT_WITHHELD_TEXT,
+  type ApprovalDecisions,
   type DocRow,
   type DocStatus,
   type PipelinePorts,
@@ -66,6 +69,7 @@ export {
 export { MemoryRequirementsStore, type MemoryRequirement, type MemorySpec } from "./memory-store.js";
 export {
   buildPreflight,
+  preflightDecisions,
   preflightEntries,
   preflightLine,
   PreflightError,
@@ -76,6 +80,8 @@ export {
   QUESTION_DEFAULT,
   SECRET_DEFAULT,
   SECRET_NAME,
+  ANSWER_MAX,
+  type PreflightDecisionRow,
   type PreflightEnvelope,
   type PreflightItem,
 } from "./preflight.js";

@@ -192,7 +192,7 @@ export async function buildRuntime(
 export function requirementsServices(
   store: NonNullable<RequirementsServices["store"]>,
   approvals: Pick<Approvals, "raiseCard" | "expireCardsById">,
-  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null> } & DecidedCardLister & PendingCardLister,
+  cards: { get(id: string): Promise<{ id: string; gate: string; status: string } | null>; comments?(id: string): Promise<{ body: string }[]> } & DecidedCardLister & PendingCardLister,
   runner: ModelRunner | null = null,
   expiryLog?: ExpiryLog,
   /** The longest one expiry write can take, connection wait included (`approvalStepBoundMs`; Codex PR88-r4, PR88-r5, PR88-r6). */
@@ -221,7 +221,7 @@ export function requirementsServices(
     },
     expiryLog,
   );
-  return { pipeline, store, cards: { get: (id) => cards.get(id) } };
+  return { pipeline, store, cards: { get: (id) => cards.get(id), ...(cards.comments ? { comments: (id: string) => cards.comments!(id) } : {}) } };
 }
 
 type HeldFn<T> = (assertHeld: () => void) => Promise<T>;
