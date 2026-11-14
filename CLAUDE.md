@@ -8,7 +8,7 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 - **Claude builds:** Architect (module contracts + plan), Builder (implements one module in its own worktree), Tester (acceptance tests + evidence).
 - **Codex reviews** read-only; it never edits code. Auto-fix is off.
 - **Release** integrates in dependency order and deploys.
-- **KK** answers decision cards and approves gates, or the runner approves G2–G4 under KK's recorded delegation (ADR-0013 §2, with its four conditions). G5, a first production launch, and anything involving money, data deletion, legal, D11 or D13 stay with KK.
+- **KK** answers decision cards and approves gates, or the runner approves G2–G4 under KK's recorded delegation (ADR-0013 §2: its four conditions plus stored floor-guard, pass-rule and merge-gate results, decided by `scripts/gates/evaluate-gate.mjs` exit 0; a missing result pauses only that gate, with no KK card). G5, a first production launch, and anything involving money, data deletion, legal, D11 or D13 stay with KK.
 - **Runners:** runner A takes Lane A, unlaned issues and the gates; runner B takes Lanes B and C. Neither touches the other's branches or PRs (ADR-0013).
 
 ## Before coding
@@ -71,3 +71,4 @@ Codex (CLI `codex exec review` and, if enabled, the GitHub code-review app) revi
 - **Scope:** change touches only the assigned module's files; one module or task sub-issue = one PR.
 - **Build standard:** for an app, check the floor (F1–F3) and the modules in its `selection.md`, and cite the module or check ID (e.g. `SM-02-L2`) in each finding; a rule from an unselected module is advisory, never blocking. For DevOS itself, check ADR-0011.
 - **Boundaries (D11/D13):** no circumvention of copy protection/DRM/licensing/paywalls, no lifting proprietary code, no malware/exploits; referenced-repo licences kept intact.
+- **Floor guard markers (GI-1b):** the Release merge path reads these from the summary of your PASS for the exact SHA. If the diff changes a guard path (`scripts/floor-guard/**`, `scripts/test/floor-guard.test.mjs`, `.github/workflows/floor-guard.yml`) and you PASS it, write `FLOOR-GUARD CHANGE <path>` once per changed path. Only for a floor-guard hit you judge justified, write `FLOOR-GUARD KEEP <id> <file>:<line> <reason>`; never for one in money, data deletion, security scanning, legal, D11 or D13 (those go to KK). Write markers plain in the summary: no backticks, quotes or trailing punctuation after the path or `file:line`.
