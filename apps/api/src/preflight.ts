@@ -12,7 +12,14 @@ export interface PreflightReader {
    * the mode), read from ONE database snapshot; null when the project does not exist. One read, not two, so a spec
    * version committed between them can never pair an `approved` state with the new, unapproved list (Codex PR122-r2).
    */
-  preflightSnapshot(projectId: string): Promise<{ state: PreflightState | null; items: PreflightItem[] | null } | null>;
+  preflightSnapshot(projectId: string): Promise<PreflightSnapshot | null>;
+}
+
+export interface PreflightSnapshot {
+  state: PreflightState | null;
+  items: PreflightItem[] | null;
+  /** The newest doc's intake card (its approval id), from the same snapshot; the project page scopes answers to it. */
+  approvalId?: string | null;
 }
 
 /** The vault read (Vault.hasProject satisfies it). Reads no ciphertext. */
@@ -64,8 +71,11 @@ export interface PreflightDecisionView {
 export interface PreflightViewReader extends PreflightReader {
   /** The project row by slug, or null. */
   projectBySlug(slug: string): Promise<{ id: string; continuousRun: boolean } | null>;
-  /** The project decision log, oldest first, bounded by the store. */
-  decisions(projectId: string): Promise<PreflightDecisionView[]>;
+  /**
+   * The decision log rows recorded with one intake card (approval), oldest first, bounded by the store. PF numbers
+   * restart with every spec version, so only the newest doc's card's rows answer its items (Codex PR127-r1).
+   */
+  decisions(projectId: string, approvalId: string): Promise<PreflightDecisionView[]>;
 }
 
 export interface PreflightView {
@@ -89,10 +99,12 @@ export interface PreflightView {
 export async function preflightView(slug: string, reader: PreflightViewReader, vault: SecretPresence | null): Promise<PreflightView | null> {
   const project = await reader.projectBySlug(slug);
   if (!project) return null;
-  // One snapshot for the state and the list (same read as preflightOpen, Codex PR122-r2).
-  const [snap, decisions] = await Promise.all([reader.preflightSnapshot(project.id), reader.decisions(project.id)]);
+  // One snapshot for the state, the list and the newest doc's card (same read as preflightOpen, Codex PR122-r2);
+  // answers only from that card, never an earlier version's PF-n (Codex PR127-r1).
+  const snap = await reader.preflightSnapshot(project.id);
   const state = snap?.state ?? null;
   const items = snap?.items ?? [];
+  const decisions = snap?.approvalId ? await reader.decisions(project.id, snap.approvalId) : [];
   const names = items.filter((i) => i.kind === "secret").map((i) => i.text);
   let missing = names;
   let unverified = names.length > 0;

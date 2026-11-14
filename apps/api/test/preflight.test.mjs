@@ -72,10 +72,11 @@ test("AT4 (CR-a2): `PF-1: yes` records PF-1 as kk and every other decision item 
 
 test("AT-CA3a (CR-a3): the pre-flight view shows state, the list, missing secret names and the decision log; reads only", async () => {
   const log = [{ itemId: "PF-1", answer: "yes", source: "kk", createdAt: "2026-11-14T10:00:00.000Z" }];
+  const CARD = "33333333-3333-4333-8333-333333333333";
   const viewReader = (state, list = items, over = {}) => ({
-    ...reader(state, list),
+    preflightSnapshot: async () => (state === null ? null : { state, items: list, approvalId: CARD }),
     projectBySlug: async (slug) => (slug === "shop" ? { id: P, continuousRun: true } : null),
-    decisions: async () => log,
+    decisions: async (_pid, approvalId) => (approvalId === CARD ? log : [{ itemId: "PF-1", answer: "old version's answer", source: "kk", createdAt: "2026-11-13T10:00:00.000Z" }]),
     ...over,
   });
   assert.equal(await preflightView("nope", viewReader("pending"), vault([])), null, "unknown slug");
@@ -101,6 +102,13 @@ test("AT-CA3a (CR-a3): the pre-flight view shows state, the list, missing secret
   const asked = [];
   await preflightView("shop", viewReader("approved"), { hasProject: async (pid, n) => { asked.push(n); return false; }, reveal: async () => { throw new Error("must not reveal"); } });
   assert.ok(asked.every((n) => n === preflightSecretName("SMS_API_KEY")));
+  // Codex PR127-r1: answers come only from the newest doc's card (PF numbers restart per version). An earlier
+  // version's rows are never asked for; a doc with no card yet shows no answers and reads no log.
+  const asks = [];
+  const scoped = await preflightView("shop", viewReader("pending", items, { decisions: async (pid, a) => { asks.push(a); return a === CARD ? [] : log; } }), null);
+  assert.deepEqual([scoped.decisions, asks], [[], [CARD]]);
+  const noCard = await preflightView("shop", viewReader("pending", items, { preflightSnapshot: async () => ({ state: "pending", items, approvalId: null }), decisions: async () => { throw new Error("must not read"); } }), null);
+  assert.deepEqual(noCard.decisions, []);
   // A store fault propagates (the route maps it to a fixed 500 code).
   await assert.rejects(preflightView("shop", viewReader("approved", items, { decisions: async () => { throw new Error("db"); } }), null));
 });
