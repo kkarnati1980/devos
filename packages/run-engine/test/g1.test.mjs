@@ -136,6 +136,9 @@ test("AT4 probe-start: creates the g1-probe project, task and run, queues it; ne
   const v = await probeStart(db, jobs(async (i) => queued.push(i)));
   assert.equal(v.code, 0);
   assert.equal(db.rows.project[0].slug, "g1-probe");
+  // DEVOS-205: a system project, created with continuous-run off and its pre-flight approved (preflightOpen stays true).
+  assert.equal(db.rows.project[0].continuousRun, false);
+  assert.equal(db.rows.project[0].preflightState, "approved");
   assert.equal(db.rows.run[0].model, PROBE_MODEL);
   assert.equal(queued[0].runId, v.out.runId);
   assert.equal(queued[0].reserveUsd, PROBE_RESERVE_USD);

@@ -73,11 +73,25 @@ export async function checkReceipts(db: Db, verify: (chain: string) => Promise<{
   return ok({ chains, receipts: total });
 }
 
+/**
+ * DEVOS-205 (ADR-0012 CR-a2): the probe project is a system project that never gets an intake card, so it is created
+ * with continuous-run off and its pre-flight approved (the migration's backfill values); otherwise CR-c's
+ * `preflightOpen` gate would keep it closed for good.
+ */
+export const PROBE_PROJECT_DATA = Object.freeze({
+  slug: PROBE_SLUG,
+  name: "G1 probe (server check, no spend)",
+  capUsd: PROBE_MAX_COST_USD * 10,
+  lanes: 1,
+  continuousRun: false,
+  preflightState: "approved",
+});
+
 /** Find or create the probe project and its task (only rows of the `g1-probe` project are written). */
 async function probeProject(db: Db): Promise<{ projectId: string; taskId: string; pausedAt: Date | null }> {
   const project =
     (await db.project.findUnique({ where: { slug: PROBE_SLUG } })) ??
-    (await db.project.create({ data: { slug: PROBE_SLUG, name: "G1 probe (server check, no spend)", capUsd: PROBE_MAX_COST_USD * 10, lanes: 1 } }));
+    (await db.project.create({ data: { ...PROBE_PROJECT_DATA } }));
   const task =
     (await db.task.findFirst({ where: { projectId: project.id, title: "g1-probe run-resume" } })) ??
     (await db.task.create({ data: { projectId: project.id, kind: "test", title: "g1-probe run-resume" } }));

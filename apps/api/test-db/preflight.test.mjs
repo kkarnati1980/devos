@@ -103,3 +103,18 @@ test("CR-a2 pre-review 2 (db): the sync lister picks up a rejected intake card u
   assert.equal(await store.preflightState(rejected.id), "rejected");
   assert.deepEqual(ours(await store.draftsAwaitingDecision(1000)), [], "once rejected it drops out of the batch");
 });
+
+test("DEVOS-205 (db): approving a doc without a pre-flight on a pending project opens the state; rejected stays", async () => {
+  const store = new PrismaRequirementsStore(db, 5000);
+  const mk = async (state) => {
+    const p = await project({ preflightState: state });
+    const doc = await db.requirementsDoc.create({ data: { projectId: p.id, version: 1, repoPath: "docs/requirements.md", status: "draft" } });
+    return { p, doc };
+  };
+  const pending = await mk("pending");
+  assert.equal(await store.approveDoc(pending.doc.id), true);
+  assert.equal(await store.preflightState(pending.p.id), "approved");
+  const rejected = await mk("rejected");
+  assert.equal(await store.approveDoc(rejected.doc.id), true);
+  assert.equal(await store.preflightState(rejected.p.id), "rejected");
+});
