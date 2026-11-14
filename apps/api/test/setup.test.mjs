@@ -116,6 +116,28 @@ test("M1.4 AT1: the wizard asks for all three caps; they are saved, confirmed an
   }
 });
 
+test("DEVOS-176 AT-CA9a: analyst.model_pass is a settings field, default off, saved on and off with an audit event", async () => {
+  const s = await start();
+  try {
+    const kk = await session(s.port);
+    await kk.put("/setup/caps", CAPS);
+    assert.equal((await kk.get("/settings")).json.settings.analystModelPass, false, "default off");
+    const on = await kk.put("/settings", { analystModelPass: true });
+    assert.equal(on.status, 200, on.text);
+    assert.equal(on.json.settings.analystModelPass, true);
+    assert.equal((await kk.get("/settings")).json.settings.analystModelPass, true);
+    const off = await kk.put("/settings", { analystModelPass: false });
+    assert.equal(off.json.settings.analystModelPass, false);
+    assert.equal((await kk.get("/settings")).json.settings.analystModelPass, false);
+    const last = s.settings.audits.at(-1);
+    assert.equal(last.action, "settings.updated");
+    assert.deepEqual(last.details, { fields: ["analystModelPass"], analystModelPass: false }, "the new value is audited");
+    assert.deepEqual(s.settings.audits.at(-2).details, { fields: ["analystModelPass"], analystModelPass: true });
+  } finally {
+    await s.app.close();
+  }
+});
+
 test("M1.4 AT2: invalid settings are refused with a field code and change nothing", async () => {
   const s = await start();
   try {
@@ -134,6 +156,9 @@ test("M1.4 AT2: invalid settings are refused with a field code and change nothin
       [{ deadlockAttempts: 6 }, "invalid:deadlockAttempts"],
       [{ deadlockAttempts: 2.5 }, "invalid:deadlockAttempts"],
       [{ maxLanes: 5 }, "unknown-field:maxLanes"],
+      [{ analystModelPass: "true" }, "invalid:analystModelPass"],
+      [{ analystModelPass: 1 }, "invalid:analystModelPass"],
+      [{ analystModelPass: null }, "invalid:analystModelPass"],
       [{}, "body-empty"],
       [[1], "body-must-be-object"],
     ];

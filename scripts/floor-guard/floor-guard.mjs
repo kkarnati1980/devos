@@ -140,6 +140,16 @@ function normaliseYamlLine(raw) {
   return line.replace(/^(\s*(?:-\s+)?)(["'])([^"']*)\2(\s*:)/, "$1$3$4");
 }
 
+/**
+ * A step body on one line for hit text (GI-4c): lines trimmed and joined with " ⏎ " (not " | ", which a YAML block
+ * scalar `run: |` already uses); an empty body is "(empty)". Indentation is dropped here, so an indent-only edit
+ * shows the same `was:` and `now:` text, though the hit still fires (bodies are compared with indentation kept).
+ */
+export function oneLine(body) {
+  const t = String(body ?? "").split("\n").map((l) => l.trim()).filter(Boolean).join(" ⏎ ");
+  return t || "(empty)";
+}
+
 /** Workflow structure, line-based (no YAML dependency): jobs → step identities, plus the trigger names. */
 export function workflowShape(src) {
   // YAML comments and quoted keys are normalised first (PR70-r15): `steps: # checks` is `steps:`, `"build":` is
@@ -408,10 +418,13 @@ export function analyse(files, show) {
       if (before != null) {
         const b = workflowShape(before), h = workflowShape(after);
         for (const [job, steps] of Object.entries(b.jobs)) {
-          if (!(job in h.jobs)) { hit("ci-job-removed", p, 0, `job ${job} removed`); continue; }
+          // GI-4c (DEVOS-167): the hit carries what the step ran (`ran:` for a removal, `was:`/`now:` for an edit), so
+          // the gate evaluator can tell from the stored result whether security scanning went. The text is still cut at
+          // 200 characters; the evaluator treats a cut text as unknown and fails closed.
+          if (!(job in h.jobs)) { hit("ci-job-removed", p, 0, `job ${job} removed; ran: ${steps.map((s) => oneLine(b.bodies[job][s])).join(" ;; ")}`); continue; }
           for (const s of steps) {
-            if (!h.jobs[job].includes(s)) hit("ci-step-removed", p, 0, `job ${job}: step ${s} removed`);
-            else if (b.bodies[job][s] !== h.bodies[job][s]) hit("ci-step-changed", p, 0, `job ${job}: step ${s} changed`);
+            if (!h.jobs[job].includes(s)) hit("ci-step-removed", p, 0, `job ${job}: step ${s} removed; ran: ${oneLine(b.bodies[job][s])}`);
+            else if (b.bodies[job][s] !== h.bodies[job][s]) hit("ci-step-changed", p, 0, `job ${job}: step ${s} changed; was: ${oneLine(b.bodies[job][s])}; now: ${oneLine(h.bodies[job][s])}`);
           }
         }
         for (const t of b.on) if (!h.on.includes(t)) hit("ci-trigger-removed", p, 0, `trigger ${t} removed`);
