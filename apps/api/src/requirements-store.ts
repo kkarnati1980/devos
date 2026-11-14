@@ -278,7 +278,27 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
-  /** `PreflightReader` for `preflightOpen` (apps/api/src/preflight.ts): the state and the newest doc's list. */
+  /**
+   * `PreflightReader` for `preflightOpen` (apps/api/src/preflight.ts): the state and the newest doc's list in one
+   * SQL statement, so both come from the same snapshot even under READ COMMITTED (Codex PR122-r2).
+   */
+  preflightSnapshot(projectId: string): Promise<{ state: "pending" | "approved" | "rejected" | null; items: import("@devos/analyst").PreflightItem[] | null } | null> {
+    return this.tx(async (tx) => {
+      const rows: { state: string; preflight: unknown }[] = await tx.$queryRaw`
+        SELECT p.preflight_state AS state,
+               (SELECT d.preflight FROM requirements_doc d WHERE d.project_id = p.id ORDER BY d.version DESC LIMIT 1) AS preflight
+        FROM project p WHERE p.id = ${projectId}::uuid`;
+      const r = rows[0];
+      if (!r) return null;
+      const s = r.state;
+      return {
+        state: s === "pending" || s === "approved" || s === "rejected" ? s : null,
+        items: Array.isArray(r.preflight) ? (r.preflight as import("@devos/analyst").PreflightItem[]) : null,
+      };
+    });
+  }
+
+  /** The project's pre-flight state (decision log and project page reads; `preflightOpen` uses `preflightSnapshot`). */
   preflightState(projectId: string): Promise<"pending" | "approved" | "rejected" | null> {
     return this.tx(async (tx) => {
       const p = await tx.project.findUnique({ where: { id: projectId }, select: { preflightState: true } });

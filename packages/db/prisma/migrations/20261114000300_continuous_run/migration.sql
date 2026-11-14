@@ -9,7 +9,7 @@ ALTER TABLE "project" ADD COLUMN "continuous_run" BOOLEAN NOT NULL DEFAULT false
 ALTER TABLE "project" ALTER COLUMN "continuous_run" SET DEFAULT true;
 ALTER TABLE "project" ADD COLUMN "preflight_state" TEXT NOT NULL DEFAULT 'approved';
 ALTER TABLE "project" ALTER COLUMN "preflight_state" SET DEFAULT 'pending';
-ALTER TABLE "project" ADD CONSTRAINT "project_preflight_state_check" CHECK ("preflight_state" IN ('pending', 'approved', 'rejected'));
+ALTER TABLE "project" ADD CONSTRAINT "project_preflight_state_valid" CHECK ("preflight_state" IN ('pending', 'approved', 'rejected'));
 
 -- AlterTable
 ALTER TABLE "requirements_doc" ADD COLUMN "preflight" JSONB;
@@ -26,7 +26,7 @@ CREATE TABLE "project_decision" (
     "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "project_decision_pkey" PRIMARY KEY ("id"),
-    CONSTRAINT "project_decision_source_check" CHECK ("source" IN ('kk', 'default', 'default-provisional'))
+    CONSTRAINT "project_decision_source_valid" CHECK ("source" IN ('kk', 'default', 'default-provisional'))
 );
 
 -- CreateIndex
