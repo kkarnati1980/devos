@@ -281,22 +281,47 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
+  /** CR-a3 (DEVOS-199): the project row by slug, for the project page's pre-flight view. */
+  projectBySlug(slug: string): Promise<{ id: string; continuousRun: boolean } | null> {
+    return this.tx(async (tx) => {
+      const p = await tx.project.findUnique({ where: { slug }, select: { id: true, continuousRun: true } });
+      return p ? { id: p.id, continuousRun: p.continuousRun === true } : null;
+    });
+  }
+
+  /** CR-a3 (DEVOS-199): the decision log rows of one intake card (approval), oldest first, at most 500 rows. */
+  decisions(projectId: string, approvalId: string): Promise<{ itemId: string; answer: string; source: string; createdAt: string }[]> {
+    return this.tx(async (tx) => {
+      const rows = await tx.projectDecision.findMany({
+        where: { projectId, approvalId },
+        orderBy: [{ createdAt: "asc" }, { itemId: "asc" }],
+        take: 500,
+        select: { itemId: true, answer: true, source: true, createdAt: true },
+      });
+      return rows.map((r: { itemId: string; answer: string; source: string; createdAt: Date }) => ({ itemId: r.itemId, answer: r.answer, source: r.source, createdAt: r.createdAt.toISOString() }));
+    });
+  }
+
   /**
    * `PreflightReader` for `preflightOpen` (apps/api/src/preflight.ts): the state and the newest doc's list in one
    * SQL statement, so both come from the same snapshot even under READ COMMITTED (Codex PR122-r2).
    */
-  preflightSnapshot(projectId: string): Promise<{ state: "pending" | "approved" | "rejected" | null; items: import("@devos/analyst").PreflightItem[] | null } | null> {
+  preflightSnapshot(projectId: string): Promise<import("./preflight.js").PreflightSnapshot | null> {
     return this.tx(async (tx) => {
-      const rows: { state: string; preflight: unknown }[] = await tx.$queryRaw`
-        SELECT p.preflight_state AS state,
-               (SELECT d.preflight FROM requirements_doc d WHERE d.project_id = p.id ORDER BY d.version DESC LIMIT 1) AS preflight
-        FROM project p WHERE p.id = ${projectId}::uuid`;
+      const rows: { state: string; preflight: unknown; approval_id: string | null }[] = await tx.$queryRaw`
+        SELECT p.preflight_state AS state, d.preflight AS preflight, d.approval_id::text AS approval_id
+        FROM project p
+        LEFT JOIN LATERAL (
+          SELECT r.preflight, r.approval_id FROM requirements_doc r WHERE r.project_id = p.id ORDER BY r.version DESC LIMIT 1
+        ) d ON true
+        WHERE p.id = ${projectId}::uuid`;
       const r = rows[0];
       if (!r) return null;
       const s = r.state;
       return {
         state: s === "pending" || s === "approved" || s === "rejected" ? s : null,
         items: Array.isArray(r.preflight) ? (r.preflight as import("@devos/analyst").PreflightItem[]) : null,
+        approvalId: r.approval_id ?? null,
       };
     });
   }
