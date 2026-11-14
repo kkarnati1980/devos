@@ -170,7 +170,7 @@ export async function buildRuntime(
   const requirementsStore = new PrismaRequirementsStore(db as ConstructorParameters<typeof PrismaRequirementsStore>[0], Math.max(t, REQUIREMENTS_TX_MS));
   // Codex PR88-r5: one expiry write can wait up to maxWait for a connection and then run up to timeout, so the hold
   // reserves the approvals store's whole step bound (built with `t` above), not its transaction timeout alone.
-  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(t),
+  const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(approvalStore),
     // DEVOS-176: the `analyst.model_pass` setting, read before each pass (a change applies without a restart).
     async () => (await setup.settings!.get()).analystModelPass);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
