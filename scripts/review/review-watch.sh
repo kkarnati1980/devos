@@ -152,9 +152,18 @@ rerun_cigate() {  # sha
   local sha="$1" id
   [[ -s "$STATE/$sha.fgred" && ! -e "$STATE/$sha.cigate-rerun" && -s "$VDIR/$sha.json" ]] || return 0
   [[ "$(jq -r .verdict "$VDIR/$sha.json")" == "PASS" ]] || return 0
-  jq -r .summary "$VDIR/$sha.json" | grep -q 'FLOOR-GUARD KEEP ' || return 0
+  # A here-string, not a pipe: grep -q exiting early must not fail a pipefail pipeline (pre-review L2).
+  grep -q 'FLOOR-GUARD KEEP ' <<<"$(jq -r .summary "$VDIR/$sha.json")" || return 0
   id="$(cat "$STATE/$sha.fgred")"
   [[ "$id" =~ ^[0-9]{1,20}$ ]] || { log "${sha:0:7}: no ci-gate run to re-run"; touch "$STATE/$sha.cigate-rerun"; return 0; }
+  # Pre-review L1: a run that is no longer failed (re-run by hand, or in progress) is never POSTed again.
+  local conc
+  conc="$(gh_api GET "/repos/$REPO/actions/runs/$id" | jq -r '"\(.status) \(.conclusion)"')" || { log "${sha:0:7}: cannot read ci-gate run $id; retry next tick"; return 0; }
+  if [[ "$conc" != "completed failure" ]]; then
+    log "${sha:0:7}: ci-gate run $id is '$conc', not failed; no re-run needed"
+    [[ $DRY -eq 1 ]] || touch "$STATE/$sha.cigate-rerun"
+    return 0
+  fi
   if [[ $DRY -eq 1 ]]; then log "${sha:0:7}: WOULD re-run ci-gate run $id"; return 0; fi
   printf '{}' > "$TMP/rerun.json"
   if gh_api POST "/repos/$REPO/actions/runs/$id/rerun-failed-jobs" "$TMP/rerun.json" >/dev/null; then
@@ -271,7 +280,7 @@ for i in $(seq 0 $((count - 1))); do
   if [[ -s "$STATE/$sha.msg" ]]; then
     tried[$sha]=1
     if [[ $DRY -eq 1 ]]; then log "PR #$pr ${sha:0:7}: WOULD retry publication"; continue; fi
-    if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed"; fi
+    if publish "$pr" "$sha"; then log "PR #$pr ${sha:0:7}: publication completed"; rerun_cigate "$sha"; fi
     continue
   fi
   # A stored verdict without a message (e.g. from a manual run): build the message and publish it.
@@ -295,6 +304,8 @@ for i in $(seq 0 $((count - 1))); do
   fi
   set +e; ci_green "$sha"; ci=$?; set -e
   if [[ $ci -eq 3 ]]; then log "PR #$pr ${sha:0:7}: cannot read workflow runs - the token needs 'Actions: Read'"; unreadable=$((unreadable + 1)); continue; fi
+  # Pre-review L1: a head that is green (or red for another reason) carries no stale floor-guard marker.
+  if [[ $ci -ne 4 && $ci -ne 3 && $DRY -eq 0 ]]; then rm -f "$STATE/$sha.fgred"; fi
   if [[ $ci -eq 4 ]]; then
     log "PR #$pr ${sha:0:7}: only floor-guard/ci-gate red; reviewable for FLOOR-GUARD KEEP lines"
     if [[ $DRY -eq 0 ]]; then
