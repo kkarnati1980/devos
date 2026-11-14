@@ -10,9 +10,21 @@ import { fileURLToPath } from "node:url";
 
 export const CEILINGS = Object.freeze({ ciTimeoutMinutes: 30, testTimeoutMs: 120000 });
 
-// Paths owned by the guard: exempt from content patterns, but a change to any of them must come
-// alone (with only a decision note or the GI-1 contract beside it).
-export const GUARD_PATHS = [/^scripts\/floor-guard\//, /^scripts\/test\/floor-guard\.test\.mjs$/, /^\.github\/workflows\/floor-guard\.yml$/];
+// Paths owned by the guard: a change to any of them must come alone (with only a decision note or the GI-1 contract
+// beside it), and the Release path needs a `FLOOR-GUARD CHANGE <path>` marker for each (GI-1b).
+// DEVOS-189: the shared KK-only classifier (DEVOS-181) and its table are guard paths too, so loosening which hits only
+// KK can clear needs the same isolation and the same Codex marker as a guard change (note 0022).
+export const GUARD_PATHS = [
+  /^scripts\/floor-guard\//,
+  /^scripts\/test\/floor-guard\.test\.mjs$/,
+  /^\.github\/workflows\/floor-guard\.yml$/,
+  /^scripts\/gates\/kk-only\.mjs$/,
+  /^scripts\/test\/kk-only\.test\.mjs$/,
+];
+// Exempt from the content rules: only the guard itself, whose tests hold the very patterns it matches. The KK-only
+// classifier and its table are guard paths but NOT exempt, so a suppression, a skipped test or a deleted test there
+// is still a hit (DEVOS-189 pre-review, note 0022).
+const CONTENT_EXEMPT = [/^scripts\/floor-guard\//, /^scripts\/test\/floor-guard\.test\.mjs$/, /^\.github\/workflows\/floor-guard\.yml$/];
 const GUARD_COMPANIONS = [/^docs\/decisions\/[^/]+\.md$/, /^docs\/modules\/GI-1\.md$/];
 
 const CODE = /\.(m?[jt]sx?|c[jt]s|sh|bash|ya?ml|json|py)$/;
@@ -72,6 +84,7 @@ const RX = {
 };
 
 const isGuard = (p) => GUARD_PATHS.some((r) => r.test(p));
+const isExempt = (p) => CONTENT_EXEMPT.some((r) => r.test(p));
 const isTest = (p) => TEST_FILE.test(p);
 
 export class GuardError extends Error {}
@@ -138,6 +151,16 @@ function normaliseYamlLine(raw) {
   }
   const line = raw.slice(0, cut).replace(/\s+$/, "");
   return line.replace(/^(\s*(?:-\s+)?)(["'])([^"']*)\2(\s*:)/, "$1$3$4");
+}
+
+/**
+ * A step body on one line for hit text (GI-4c): lines trimmed and joined with " ⏎ " (not " | ", which a YAML block
+ * scalar `run: |` already uses); an empty body is "(empty)". Indentation is dropped here, so an indent-only edit
+ * shows the same `was:` and `now:` text, though the hit still fires (bodies are compared with indentation kept).
+ */
+export function oneLine(body) {
+  const t = String(body ?? "").split("\n").map((l) => l.trim()).filter(Boolean).join(" ⏎ ");
+  return t || "(empty)";
 }
 
 /** Workflow structure, line-based (no YAML dependency): jobs → step identities, plus the trigger names. */
@@ -349,7 +372,7 @@ export function analyse(files, show) {
         return { ...l, text: b.text };
       });
     }
-    if (isGuard(p) || isGuard(f.oldPath)) continue;
+    if (isExempt(p) || isExempt(f.oldPath)) continue;
     const test = isTest(p), oldTest = isTest(f.oldPath);
     const code = CODE.test(p) || p.endsWith(".gitleaksignore");
 
@@ -408,10 +431,13 @@ export function analyse(files, show) {
       if (before != null) {
         const b = workflowShape(before), h = workflowShape(after);
         for (const [job, steps] of Object.entries(b.jobs)) {
-          if (!(job in h.jobs)) { hit("ci-job-removed", p, 0, `job ${job} removed`); continue; }
+          // GI-4c (DEVOS-167): the hit carries what the step ran (`ran:` for a removal, `was:`/`now:` for an edit), so
+          // the gate evaluator can tell from the stored result whether security scanning went. The text is still cut at
+          // 200 characters; the evaluator treats a cut text as unknown and fails closed.
+          if (!(job in h.jobs)) { hit("ci-job-removed", p, 0, `job ${job} removed; ran: ${steps.map((s) => oneLine(b.bodies[job][s])).join(" ;; ")}`); continue; }
           for (const s of steps) {
-            if (!h.jobs[job].includes(s)) hit("ci-step-removed", p, 0, `job ${job}: step ${s} removed`);
-            else if (b.bodies[job][s] !== h.bodies[job][s]) hit("ci-step-changed", p, 0, `job ${job}: step ${s} changed`);
+            if (!h.jobs[job].includes(s)) hit("ci-step-removed", p, 0, `job ${job}: step ${s} removed; ran: ${oneLine(b.bodies[job][s])}`);
+            else if (b.bodies[job][s] !== h.bodies[job][s]) hit("ci-step-changed", p, 0, `job ${job}: step ${s} changed; was: ${oneLine(b.bodies[job][s])}; now: ${oneLine(h.bodies[job][s])}`);
           }
         }
         for (const t of b.on) if (!h.on.includes(t)) hit("ci-trigger-removed", p, 0, `trigger ${t} removed`);

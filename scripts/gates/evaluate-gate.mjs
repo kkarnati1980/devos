@@ -16,30 +16,9 @@ export const DELEGATED_GATES = new Set(["G2", "G3", "G4"]);
 const SHA = /^[0-9a-f]{40}$/;
 // No whitespace or Markdown/HTML delimiters, so a link cannot break out of the approval comment (GC7).
 const LINK = /^https:\/\/[^\s()[\]<>]+$/;
-// Secret-scanning and security-linter suppressions. Written with a one-character class so the floor guard does not
-// flag this pattern itself as a new suppression; it matches the same text and suppresses nothing (GI-4 contract).
-const SECURITY_SUPPRESSION = /gitleaks[:]allow|\bnose[c]\b/;
-const SECURITY_WORDS = /secur|secret|gitleaks|\bnose[c]\b|audit|licen[cs]e|codeql|semgrep|trivy|snyk|xss|no-eval|detect-/i;
-// GI-1 cuts hit text to 200 characters; a token past the cut cannot be ruled out, so a full-length text fails closed.
-const CUT = 200;
-// Hits spec §4.4 sends to KK (security scanning, policy, D13): a Codex Keep never clears them, only KK's recorded answer.
-export const KK_ONLY = (h) => {
-  const text = String(h.text ?? "");
-  // Checked first, for every rule: a hit whose file or text names security scanning, secrets or licence checks
-  // (a lint-rule-off of a "security/…" rule, a suppression in src/security/ or of no-eval) goes to KK (PR84-r2, r3).
-  if (SECURITY_WORDS.test(`${h.file ?? ""} ${text}`)) return true;
-  // A full-length (cut) text may hide a security token past the cut, for every rule, so it fails closed (PR84-r4).
-  if (text.length >= CUT) return true;
-  if (h.rule === "gitleaksignore-added" || h.rule === "policy-weakened") return true;
-  if (h.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text);
-  // A CI hit names the step or job, not what it ran, so whether it removed or disabled security scanning cannot be
-  // established from the stored result (Codex PR84-r1): every ci-* hit fails closed to KK-only. The usual answer is
-  // to restore the change; a Codex Keep alone never clears it.
-  if (/^ci-/.test(h.rule ?? "")) return true;
-  // Lint ignores can drop files from security linting.
-  if (h.rule === "lint-rule-off") return /\bignores?\b/.test(text);
-  return false;
-};
+// The KK-only hit classifier is shared with the Release merge path (DEVOS-181): one module, one test table.
+export { KK_ONLY, ciBodyIsPlain } from "./kk-only.mjs";
+import { KK_ONLY } from "./kk-only.mjs";
 
 export class CannotRun extends Error {}
 
