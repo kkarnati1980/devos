@@ -1,5 +1,6 @@
 // M2.2-d3c1 (docs/modules/M2.2.md, "M2.2-d3c — Behaviour"): the periodic `syncApproval` job, and the question-card
 // port that does not ask KK again a question he already decided in an earlier spec version.
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { RaiseCard } from "@devos/analyst";
 import { syncApproval, type RequirementsServices } from "./requirements.js";
 
@@ -99,11 +100,34 @@ export function skipDecidedQuestions(raise: RaiseCard, cards: DecidedCardLister)
     const c = draft.card as { gate: string; action: string; target: string; projectId?: string | null };
     if (c.projectId) {
       // A failed lookup must not drop the question (pre-review finding 4): a possible repeat card is the lesser harm.
-      const prior = await decidedKeys(cards, c.projectId).then((m) => m.get(key(c.action, c.target)) ?? null, () => null);
+      const prior = await scanFor(cards, c.projectId).then((m) => m.get(key(c.action, c.target)) ?? null, () => null);
       if (prior) return { id: prior };
     }
     return raise(draft, reason);
   };
+}
+
+/**
+ * DEVOS-166: one decided-card scan per submission. Inside `withDecidedScan`, every question card of that submission
+ * shares one scan per (lister, project); a failed scan is shared too, so all of them are raised (the lesser harm).
+ * The scope ends with the submission, so a card KK decides between two submissions is seen by the second. Outside a
+ * scope (no submission hook), each question scans on its own, as before.
+ */
+type ScanScope = Map<DecidedCardLister, Map<string, Promise<Map<string, string>>>>;
+const scanScope = new AsyncLocalStorage<ScanScope>();
+
+export function withDecidedScan<T>(fn: () => Promise<T>): Promise<T> {
+  return scanScope.run(new Map(), fn);
+}
+
+function scanFor(cards: DecidedCardLister, projectId: string): Promise<Map<string, string>> {
+  const scope = scanScope.getStore();
+  if (!scope) return decidedKeys(cards, projectId);
+  let byProject = scope.get(cards);
+  if (!byProject) scope.set(cards, (byProject = new Map()));
+  let scan = byProject.get(projectId);
+  if (!scan) byProject.set(projectId, (scan = decidedKeys(cards, projectId)));
+  return scan;
 }
 
 const key = (action: string, target: string) => `${action}\u0000${target}`;
