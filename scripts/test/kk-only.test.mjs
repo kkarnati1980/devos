@@ -57,6 +57,10 @@ const TABLE = [
   ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ sparse-checkout: README.md ⏎ path: .", true],
   ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ ref: ${{ github.event.pull_request.base.sha }} ⏎ path: ./", true],
   ["ci-step-changed", ".github/workflows/ci.yml", "job build: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ ref: ${{ github.event.pull_request.head.sha }}", false],
+  // Codex PR129-r1: a side `path:` must be a checkout input, never an env entry or a key before `with:`.
+  ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ with: ⏎ ref: ${{ github.event.pull_request.base.sha }} ⏎ env: ⏎ path: .gate-base", true],
+  ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ env: ⏎ path: .gate-base ⏎ with: ⏎ sparse-checkout: README.md", true],
+  ["ci-step-changed", ".github/workflows/release-images.yml", "job s: step uses:actions/checkout changed; was: uses: actions/checkout@v4; now: uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 ⏎ path: .gate-base ⏎ with: ⏎ sparse-checkout: README.md", true],
   // Pre-review finding 1: a step text of exactly 200 characters may be an older guard's cut, so it fails closed.
   ["ci-step-removed", ".github/workflows/ci.yml", ("job ci: step X removed; ran: run: pnpm build" + " ".repeat(200)).slice(0, 200), true],
   // Ordinary weakenings stay Codex-keepable.

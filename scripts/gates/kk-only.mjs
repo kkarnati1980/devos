@@ -149,7 +149,12 @@ function plainBody(body) {
   const runs = lines.filter((l) => /^run\s*:/.test(l.trim()));
   if (runs.length > 1 || (runs.length === 1 && !/^run\s*:/.test(lines.at(-1).trim()))) return false;
   const trimmed = lines.map((l) => l.trim());
-  if (trimmed.some((t) => NARROWING.test(t)) && !trimmed.some(sidePath)) return false;
+  // The body is flattened, so a `path:` could sit under `env:` instead of `with:` (Codex PR129-r1). A narrowing key is
+  // plain only in a body with no `env:` key, whose side `path:` comes after its `with:` key (both nest only there).
+  if (trimmed.some((t) => NARROWING.test(t))) {
+    const w = trimmed.findIndex((t) => /^with\s*:$/.test(t));
+    if (w < 0 || trimmed.some((t) => /^env\s*:/.test(t)) || !trimmed.slice(w + 1).some(sidePath)) return false;
+  }
   return lines.every((l, i) => {
     const t = l.trim();
     if (/^(run|uses)\s*:/.test(t)) return plainLine(t);
