@@ -85,6 +85,9 @@ test("DEVOS-197: tool and setup failures exit 2, never 0", () => {
     assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "1", STUB_FINDINGS: "[]" }).status, 2, "exit 1 with an empty report");
     assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: '[{"RuleID":"x","File":"f","StartLine":1}]' }).status, 2, "exit 0 with findings");
     assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: "not json" }).status, 2, "report not JSON");
+    assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: "" }).status, 2, "empty report with commits to scan (Codex PR120-r1)");
+    assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: "[" }).status, 2, "truncated report");
+    assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: "{}" }).status, 2, "report that is not a list");
     assert.equal(run(dir, ["--base", "base"], { ...env, STUB_STATUS: "0", STUB_FINDINGS: "none" }).status, 2, "report missing with commits to scan");
     const old = run(dir, ["--base", "base"], { ...env, STUB_VERSION: "8.18.0" });
     assert.equal(old.status, 2, "a gitleaks that is not the CI-pinned version");
@@ -108,6 +111,8 @@ test("DEVOS-197: no new commits passes without needing a report", () => {
     const bin = stub(dir);
     const r = run(dir, ["--base", "base"], { GITLEAKS: bin, STUB_ARGS: join(dir, "args.json"), STUB_STATUS: "0", STUB_FINDINGS: "none" });
     assert.equal(r.status, 0, r.out);
+    const empty = run(dir, ["--base", "base"], { GITLEAKS: bin, STUB_ARGS: join(dir, "args.json"), STUB_STATUS: "0", STUB_FINDINGS: "" });
+    assert.equal(empty.status, 0, "an empty report is accepted only when there was nothing to scan");
     assert.match(r.out, /PASS \(0 commit\(s\) in base\.\.HEAD/);
   } finally {
     rmSync(dir, { recursive: true, force: true });

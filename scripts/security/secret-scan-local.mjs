@@ -82,7 +82,14 @@ export function main(argv, env = process.env) {
     }
     let findings = [];
     if (existsSync(reportPath)) {
-      try { findings = JSON.parse(readFileSync(reportPath, "utf8") || "[]"); } catch { console.error("secret-scan:local: gitleaks report is not JSON"); return 2; }
+      const text = readFileSync(reportPath, "utf8");
+      // Codex PR120-r1: an empty or truncated report is never proof of a clean scan. Only with no commits to scan
+      // may it be empty (nothing was scanned).
+      if (text.trim() === "" && n === 0 && run.status === 0) findings = [];
+      else {
+        try { findings = JSON.parse(text); } catch { console.error("secret-scan:local: gitleaks report is empty or not JSON"); return 2; }
+        if (!Array.isArray(findings)) { console.error("secret-scan:local: gitleaks report is not a list"); return 2; }
+      }
     } else if (run.status === 1 || n > 0) {
       console.error("secret-scan:local: gitleaks report missing");
       return 2;
