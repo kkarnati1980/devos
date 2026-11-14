@@ -12,6 +12,7 @@ export interface TeardownPrismaLike {
   provisionStep: any;
   auditEvent: any;
   vaultSecret: any;
+  isolationStack: any;
   $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T>;
 }
 
@@ -126,10 +127,19 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
     }, { timeout: this.ms, maxWait: this.ms });
   }
 
+  /**
+   * DEVOS-175: the project's `isolation_stack` rows (S4) are deleted in the same transaction that marks it purged,
+   * so its unique stack index, subnet and network are freed for a later project (otherwise `isolation-index-taken`).
+   * Only this project's rows; the count goes into the `teardown.purged` audit event.
+   */
   async markPurged(projectId: string): Promise<void> {
     await this.tdb.$transaction(async (tx: any) => {
+      const stacks = (await tx.isolationStack.deleteMany({ where: { projectId } })) as { count: number };
       await tx.project.update({ where: { id: projectId }, data: { stage: "purged" } });
-      await tx.auditEvent.create({ data: { actor: "system", projectId, action: "teardown.purged", summary: "Project purged; the leftover scan found 0" } });
+      await tx.auditEvent.create({ data: {
+        actor: "system", projectId, action: "teardown.purged", summary: "Project purged; the leftover scan found 0",
+        details: { isolationStacksDeleted: stacks.count },
+      } });
     }, { timeout: this.ms, maxWait: this.ms });
   }
 }
