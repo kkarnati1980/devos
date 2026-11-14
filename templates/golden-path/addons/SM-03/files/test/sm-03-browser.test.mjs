@@ -187,10 +187,25 @@ test("SM-03-L2: html`` escapes every value and refuses unsafe places", () => {
   assert.throws(() => html`<a title="${html`" href="${evilUrl}`}">click</a>`, /may not hold a quote/); // Codex PR98-r5
   assert.throws(() => html`<a title='${html`' href='${evilUrl}`}'>click</a>`, /may not hold a quote/);
   assert.throws(() => html`<p title="${[html`<b>`, html`" onclick="${"alert(1)"}`]}">x</p>`, /may not hold a quote/);
-  assert.throws(() => html`<title>${html`<b title="</title><a href='">${evilUrl}'`}</title>`, /inside <title>/);
+  assert.throws(() => html`<title>${html`</title><a href="${"/ok"}">x</a>`}</title>`, /inside <title>/);
   assert.throws(() => html`<textarea>${html`<b>x</b>`}</textarea>`, /inside <textarea>/);
-  assert.throws(() => html`<svg>${html`<title><b onclick="</title>${"alert(1)"}">x</b></title>`}</svg>`, /inside <svg> or <math>/);
+  assert.throws(() => html`<svg>${html`<title>${"t"}</title>`}</svg>`, /inside <svg> or <math>/);
   assert.throws(() => html`<svg>${html`<div>${html`<textarea>t</textarea>`}</div>`}</svg>`, /inside <svg> or <math>/);
+  // Codex PR98-r6: where this parser and the browser may disagree on whether a text-state element is open, they
+  // must meet again at its end tag, so such an end tag is refused inside a tag, attribute value or comment...
+  assert.throws(() => html`<svg><foreignObject><title><b onclick="</title>${"x"}">x</b></title></foreignObject></svg>`, /<\/title> may not appear/);
+  assert.throws(() => html`<svg><desc><title><!-- </title><a href="--> ${"x"}</title></desc></svg>`, /<\/title> may not appear/);
+  assert.throws(() => html`<svg><p><title><b title="</TITLE >">${"x"}</b></title></p></svg>`, /<\/title> may not appear/);
+  assert.throws(() => html`<svg><title><b title="</tit${"le"}>">x</b></title></svg>`, /may not appear/); // completed by a value
+  assert.throws(() => html`<p title="a<${"/title>"}">x</p>`, /may not end a piece/);
+  // ...and text-state start tags are refused inside <select>, which some browsers parse as markup there.
+  assert.throws(() => html`<select><title></select><a href="${evilUrl}">click</a></title>`, /inside <select>/);
+  assert.throws(() => html`<select><textarea>${"x"}</textarea></select>`, /inside <select>/);
+  assert.throws(() => html`<select><xmp></select><b onclick="</xmp>">x</b>`, /inside <select>/);
+  // </math> inside <svg> does not end the SVG subtree (the browser ignores it), so <title> there stays markup.
+  assert.throws(() => html`<svg></math><title><a href="${evilUrl}">x</a></title></svg>`, /URL attribute/);
+  assert.equal(String(html`<select><option value="${"a"}">${"A"}</option></select><textarea>${"t"}</textarea>`), '<select><option value="a">A</option></select><textarea>t</textarea>');
+  assert.equal(String(html`<p title="${"a"}">2 &lt; 3</p><!-- note -->`), '<p title="a">2 &lt; 3</p><!-- note -->');
   // Still allowed: a quote-free fragment in an attribute (a URL there is judged whole), escaped text in RCDATA,
   // and an RCDATA-free fragment inside SVG.
   assert.equal(String(html`<a title="${html`${"a"}-${"b"}`}">x</a>`), '<a title="a-b">x</a>');

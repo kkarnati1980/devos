@@ -103,10 +103,34 @@ function decodeEntities(s) {
   });
 }
 
+// End tags that switch the browser's tokenizer out of a text state (RCDATA, RAWTEXT, script data). Where this parser
+// and the browser can disagree about whether such an element is open (foreign content, its HTML integration points,
+// HTML elements that break out of it), the first of these end tags is where the two views meet again. So one of
+// them may appear only where this parser itself reads it as an end tag: never inside a tag, a quoted attribute
+// value or a comment (Codex PR98-r6). A "<" or a partial name at the end of a piece is refused there too, since the
+// next value could complete it.
+const TEXT_END_NAMES = ["title", "textarea", "style", "xmp", "iframe", "noembed", "noframes", "noscript", "script", "plaintext"];
+function assertNoTextEndTag(s, i) {
+  if (i + 1 === s.length) throw new TypeError("html: a \"<\" may not end a piece inside a tag, attribute value or comment");
+  if (s[i + 1] !== "/") return;
+  const rest = s.slice(i + 2, i + 2 + 12).toLowerCase();
+  for (const name of TEXT_END_NAMES) {
+    const complete = rest.startsWith(name) && (i + 2 + name.length === s.length || /[\t\n\f\r />]/.test(s[i + 2 + name.length]));
+    const partial = i + 2 + rest.length === s.length && rest.length < name.length && name.startsWith(rest);
+    if (complete || partial) throw new TypeError(`html: </${name}> may not appear inside a tag, attribute value or comment`);
+  }
+}
+// Start tags that open a text state, refused inside <select>: the select parsing mode ignores them in some browsers
+// (so their content is markup there) and honours them in others (Codex PR98-r6). <script> is raw text in both.
+const IGNORED_IN_SELECT = new Set([...RCDATA, ...RAW_TEXT].filter((n) => n !== "script"));
+
 class MarkupState {
   mode = "text"; // text | lt (a "<" ended the last piece) | tag | quote | raw | rcdata | comment
   tag = ""; // current tag source since "<"
-  tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false; foreign = 0; // SVG/MathML subtree depth
+  tagName = ""; quote = ""; quoteAt = 0; attr = ""; raw = ""; valued = false;
+  fstack = []; // open SVG/MathML roots, innermost last
+  get foreign() { return this.fstack.length; }
+  inSelect = false;
   sawRcdata = false; // this parse entered RCDATA (<title>/<textarea> outside SVG/MathML) at least once
   feed(s) {
     for (let i = 0; i < s.length; i++) {
@@ -119,6 +143,7 @@ class MarkupState {
         else if (c === "<" && i + 1 === s.length) this.mode = "lt";
         else if (c === "<" && /[a-zA-Z\/!?]/.test(s[i + 1])) { this.mode = "tag"; this.tag = "<"; this.tagName = ""; }
       } else if (this.mode === "comment") {
+        if (c === "<") assertNoTextEndTag(s, i);
         if (s.startsWith("-->", i)) { this.mode = "text"; i += 2; }
       } else if (this.mode === "raw" || this.mode === "rcdata") {
         // An end tag counts only with a terminator after its name, as in the browser (</scripts> does not end it).
@@ -130,6 +155,7 @@ class MarkupState {
           this.mode = "tag"; this.tag = "<"; this.tagName = ""; this.raw = "";
         }
       } else if (this.mode === "quote") {
+        if (c === "<") assertNoTextEndTag(s, i);
         if (c === this.quote) {
           // A URL attribute that holds a value is judged as a whole when it closes, the way the browser reads it:
           // entities decoded, then leading spaces and control characters dropped (isSafeUrl).
@@ -140,6 +166,7 @@ class MarkupState {
         }
         this.tag += c;
       } else { // tag
+        if (c === "<") assertNoTextEndTag(s, i);
         this.tag += c;
         if (!this.tagName && /[\s/>"']/.test(c)) this.tagName = (/^<([a-zA-Z][^\s/>"']*)/.exec(this.tag)?.[1] ?? "-").toLowerCase();
         if (c === '"' || c === "'") {
@@ -155,8 +182,20 @@ class MarkupState {
           // parsed as markup (SVG <title>/<desc>/<foreignObject> are HTML integration points), so a nested
           // <a href="${…}"> is a real attribute that must be URL-validated, not RCDATA text. Treating the whole
           // foreign subtree as markup only ever adds validation, never removes it, which is the safe direction.
-          if (!closing && !selfClose && (name === "svg" || name === "math")) this.foreign++;
-          else if (closing && (closeName === "svg" || closeName === "math") && this.foreign > 0) this.foreign--;
+          // An end tag pops back to its own open root, as the browser's foreign-content rule does (</math> inside an
+          // <svg> is ignored there, so it must not end the SVG subtree here either).
+          if (!closing && !selfClose && (name === "svg" || name === "math")) this.fstack.push(name);
+          else if (closing && (closeName === "svg" || closeName === "math")) {
+            const at = this.fstack.lastIndexOf(closeName);
+            if (at >= 0) this.fstack.length = at;
+          }
+          if (this.foreign === 0) {
+            if (!closing && name === "select") this.inSelect = true;
+            else if (closing && closeName === "select") this.inSelect = false;
+            else if (!closing && this.inSelect && IGNORED_IN_SELECT.has(name)) {
+              throw new TypeError(`html: <${name}> inside <select> is not supported (browsers parse it differently there)`);
+            }
+          }
           const rcdata = this.foreign === 0 && RCDATA.has(name);
           this.mode = !closing && RAW_TEXT.has(name) ? "raw" : !closing && rcdata ? "rcdata" : "text";
           if (this.mode !== "text") this.raw = name;
