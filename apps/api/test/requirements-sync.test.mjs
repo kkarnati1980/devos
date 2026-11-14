@@ -222,3 +222,16 @@ test("AT-Q3 (DEVOS-166) outside a submission each question still scans; a failed
   });
   assert.equal(fails, 1, "the failed scan is shared, not retried per question");
 });
+
+test("AT-Q3 (DEVOS-166) concurrent submissions each make their own scan", async () => {
+  const { withDecidedScan } = await import("../dist/requirements-sync.js");
+  const reads = [];
+  const lister = { list: async (f) => { reads.push(f.projectId); await new Promise((r) => setTimeout(r, 5)); return []; } };
+  const port = skipDecidedQuestions(async () => ({ id: "new" }), lister);
+  const q = (p, t) => ({ card: { gate: "decision", action: "a", target: t, projectId: p, reason: "r" } });
+  const submission = (p) => withDecidedScan(async () => { await port(q(p, "t1"), "r"); await port(q(p, "t2"), "r"); });
+  await Promise.all([submission(P1), submission(P1), submission(P2)]);
+  // Three submissions, one scan each (two statuses per scan), even two at once for the same project.
+  assert.equal(reads.filter((p) => p === P1).length, 4);
+  assert.equal(reads.filter((p) => p === P2).length, 2);
+});
