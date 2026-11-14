@@ -64,3 +64,17 @@ export {
   type SubmitResult,
 } from "./pipeline.js";
 export { MemoryRequirementsStore, type MemoryRequirement, type MemorySpec } from "./memory-store.js";
+export {
+  buildPreflight,
+  preflightLine,
+  PreflightError,
+  ACCEPTANCE_DEFAULT,
+  BUDGET_TEXT,
+  PUBLIC_URL_DEFAULT,
+  PUBLIC_URL_TEXT,
+  QUESTION_DEFAULT,
+  SECRET_DEFAULT,
+  SECRET_NAME,
+  type PreflightEnvelope,
+  type PreflightItem,
+} from "./preflight.js";
