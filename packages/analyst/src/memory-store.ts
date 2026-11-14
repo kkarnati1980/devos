@@ -24,7 +24,9 @@ export interface MemoryRequirement {
 export class MemoryRequirementsStore implements RequirementsStore {
   readonly projects = new Map<string, ProjectRow>();
   readonly specs: MemorySpec[] = [];
-  readonly docs: (DocRow & { repoPath: string })[] = [];
+  readonly docs: (DocRow & { repoPath: string; preflight?: unknown })[] = [];
+  /** ADR-0012 CR-a2: `project.preflight_state` per project (absent = never set, i.e. backfilled `approved`). */
+  readonly preflightState = new Map<string, "pending" | "approved" | "rejected">();
   /** projectId → key → row */
   readonly requirements = new Map<string, Map<string, MemoryRequirement>>();
   /** projectId → ordinal → milestone */
@@ -51,8 +53,17 @@ export class MemoryRequirementsStore implements RequirementsStore {
     const spec: MemorySpec = { id: randomUUID(), projectId: pid, version: specVersion, ...input.spec };
     this.specs.push(spec);
     for (const d of docs) if (d.status === "draft") d.status = "superseded";
-    const doc = { id: randomUUID(), projectId: pid, version: docVersion, status: "draft" as DocStatus, approvalId: null, repoPath: input.repoPath };
+    const doc = {
+      id: randomUUID(),
+      projectId: pid,
+      version: docVersion,
+      status: "draft" as DocStatus,
+      approvalId: null,
+      repoPath: input.repoPath,
+      ...(input.preflight ? { preflight: structuredClone(input.preflight) } : {}),
+    };
     this.docs.push(doc);
+    if (input.preflight) this.preflightState.set(pid, "pending");
 
     const ms = this.milestones.get(pid) ?? new Map();
     this.milestones.set(pid, ms);

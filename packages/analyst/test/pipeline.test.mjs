@@ -33,9 +33,9 @@ const SPEC = `# Shop
 - Should the cache use Redis or Postgres?
 `;
 
-function setup({ stage = "intake", raiseReq, raiseQ, runner } = {}) {
+function setup({ stage = "intake", raiseReq, raiseQ, runner, continuousRun, secretNames } = {}) {
   const store = new MemoryRequirementsStore();
-  store.addProject({ id: P1, name: "Shop", stage });
+  store.addProject({ id: P1, name: "Shop", stage, ...(continuousRun === undefined ? {} : { continuousRun, capUsd: 15 }) });
   const reqCards = [];
   const qCards = [];
   let n = 0;
@@ -43,6 +43,7 @@ function setup({ stage = "intake", raiseReq, raiseQ, runner } = {}) {
     store,
     now: NOW,
     runner,
+    ...(secretNames ? { secretNames } : {}),
     raiseRequirementsCard: raiseReq ?? (async (card) => {
       reqCards.push(card);
       return { id: `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}` };
@@ -249,4 +250,33 @@ test("PL7 requirementsCard is accepted by the M2.3 card rules for long counts an
   const c = requirementsCard(P1, 12345, a);
   assert.ok(cardOk(c));
   assert.ok(!c.reason.includes("script") && !c.reason.includes("sk-live"));
+});
+
+test("AT2 (CR-a2): in continuous-run mode one requirements card carries the pre-flight and no decision card is raised; off, as before", async () => {
+  const on = setup({ continuousRun: true, secretNames: async () => ["PAYMENTS_KEY"] });
+  const r = await on.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(on.reqCards.length, 1);
+  assert.equal(on.reqCards[0].gate, "requirements");
+  assert.equal(on.qCards.length, 0, "no separate decision card");
+  assert.ok(r.preflight.length >= 3);
+  assert.match(on.reqCards[0].reason, /\nPre-flight: \d+ questions, 1 secrets — PF-1: .*payment provider/);
+  assert.match(on.reqCards[0].reason, /secret PAYMENTS_KEY \(enter in setup wizard\)/);
+  assert.ok(on.reqCards[0].reason.length <= 2000);
+  assert.match(r.architectLog, /Redis/, "technical questions still go to the Architect log");
+  const doc = on.store.docs.at(-1);
+  assert.deepEqual(doc.preflight, r.preflight, "the list KK saw is stored with the doc");
+  assert.equal(on.store.preflightState.get(P1), "pending");
+  // The card's action and target are unchanged by the mode.
+  const off = setup({ continuousRun: false });
+  const r0 = await off.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.equal(off.reqCards[0].action, on.reqCards[0].action);
+  assert.equal(off.reqCards[0].target, on.reqCards[0].target);
+  assert.ok(!/Pre-flight/.test(off.reqCards[0].reason));
+  assert.ok(off.qCards.length > 0, "mode off raises the decision cards as before");
+  assert.equal(r0.preflight, null);
+  assert.equal(off.store.preflightState.has(P1), false);
+  // A project row without the field (before CR-a2's store) behaves as off.
+  const legacy = setup();
+  await legacy.pipeline.submitSpec(P1, { kind: "paste", text: SPEC });
+  assert.deepEqual(legacy.qCards.length, off.qCards.length);
 });

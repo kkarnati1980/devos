@@ -6,7 +6,8 @@ import { ingest as defaultIngest, IngestError, type IngestResult, type SpecFileF
 import { analyzeSpec, type Analysis, type Priority } from "./analyze.js";
 import { assistAnalysis, type ModelRunner } from "./assist.js";
 import { renderRequirementsMd } from "./render.js";
-import { planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
+import { buildPreflight, preflightLine, type PreflightItem } from "./preflight.js";
+import { CARD_REASON_MAX, planQuestions, raiseQuestionCards, renderArchitectLog, type RaiseCard, type RouteResult } from "./route.js";
 
 export type SpecSourceFormat = SpecFileFormat | "paste";
 export type DocStatus = "draft" | "approved" | "superseded";
@@ -25,6 +26,10 @@ export interface ProjectRow {
   id: string;
   name: string;
   stage: string;
+  /** ADR-0012 CR-a2: `project.continuous_run`. Absent = off (today's behaviour). */
+  continuousRun?: boolean;
+  /** The project's M1.7 budget envelope cap (`project.cap_usd`), for the pre-flight budget item. */
+  capUsd?: number;
 }
 
 export interface RequirementRowInput {
@@ -45,6 +50,12 @@ export interface SaveAnalysisInput {
   requirements: RequirementRowInput[];
   milestones: { ordinal: number; name: string; gateName: string }[];
   repoPath: string;
+  /**
+   * ADR-0012 CR-a2: in continuous-run mode, this version's pre-flight list. The store writes it to the new doc and
+   * sets `project.preflight_state` to `pending` in the same transaction (rule 4: a new version re-opens the
+   * pre-flight). Absent or null outside the mode: nothing changes.
+   */
+  preflight?: PreflightItem[] | null;
 }
 
 export interface SaveAnalysisResult {
@@ -107,6 +118,8 @@ export interface PipelinePorts {
    * (fail-safe: no model spend, deterministic only) and is reported as `assist-failed`.
    */
   modelPassOn?: () => Promise<boolean>;
+  /** ADR-0012 CR-a2: the secret names the app needs (from the S5 selection); absent = none yet. */
+  secretNames?: (projectId: string) => Promise<string[]>;
   ingest?: (bytes: Uint8Array, originalName: string) => Promise<IngestResult>;
   now?: () => Date;
 }
@@ -125,6 +138,8 @@ export interface SubmitResult {
   architectLog: string;
   counts: { requirements: number; milestones: number; openQuestions: number; proposed: number };
   questionCards: RouteResult;
+  /** ADR-0012 CR-a2: the pre-flight list on the intake card, or null outside continuous-run mode. */
+  preflight: PreflightItem[] | null;
   droppedKeys: string[];
   droppedMilestones: number[];
   analysisWarnings: Analysis["warnings"];
@@ -149,7 +164,7 @@ function isoDate(d: Date): string {
 }
 
 /** The requirements card. No spec text: only counts and the version, so it never trips the secret check. */
-export function requirementsCard(projectId: string, docVersion: number, a: Analysis): RequirementsCard {
+export function requirementsCard(projectId: string, docVersion: number, a: Analysis, preflight?: readonly PreflightItem[] | null): RequirementsCard {
   const by = { must: 0, should: 0, could: 0 };
   for (const r of a.requirements) by[r.priority] += 1;
   const proposed = a.requirements.filter((r) => r.proposed).length;
@@ -158,6 +173,12 @@ export function requirementsCard(projectId: string, docVersion: number, a: Analy
     proposed > 0 ? `${proposed} requirements were proposed by the model from spec text; check them before approving.` : null,
     `Approving accepts ${REPO_PATH} version ${docVersion} as the plan the build follows. Rejecting keeps it as a draft for a revised spec.`,
   ].filter((l): l is string => l !== null);
+  if (preflight) {
+    // ADR-0012 CR-a: the one intake card carries the pre-flight; action and target stay as they are.
+    const room = CARD_REASON_MAX - lines.join("\n").length - 1;
+    const line = preflightLine(preflight, room);
+    if (line) lines.push(line);
+  }
   return {
     gate: "requirements",
     action: "requirements.approve",
@@ -239,6 +260,13 @@ export class RequirementsPipeline {
       }
     }
 
+    // ADR-0012 CR-a2: in continuous-run mode the requirements card is the one intake card. Its pre-flight list
+    // replaces the separate non-technical question cards; technical questions still go to the Architect log.
+    const continuous = project.continuousRun === true;
+    const preflight = continuous
+      ? buildPreflight(analysis, this.ports.secretNames ? await this.ports.secretNames(projectId) : [], { maxCostUsd: project.capUsd ?? 0 })
+      : null;
+
     const ordinals = new Map(analysis.milestones.map((m) => [m.name, m.ordinal]));
     const saved = await this.ports.store.saveAnalysis({
       projectId,
@@ -258,6 +286,7 @@ export class RequirementsPipeline {
       })),
       milestones: analysis.milestones.map((m) => ({ ordinal: m.ordinal, name: m.name, gateName: `G${m.ordinal}` })),
       repoPath: REPO_PATH,
+      ...(preflight ? { preflight } : {}),
     });
 
     const at = this.now();
@@ -271,9 +300,10 @@ export class RequirementsPipeline {
     const plan = planQuestions(analysis, meta);
     const architectLog = renderArchitectLog(plan, { ...meta, generatedAt: isoDate(at) });
 
-    const approvalId = await this.ensureCardFor(saved.docId, projectId, saved.docVersion, analysis, warnings);
+    const approvalId = await this.ensureCardFor(saved.docId, projectId, saved.docVersion, analysis, warnings, preflight);
     // Question cards never wait on the requirements card, and one failure never stops the others (DV-FR-012).
-    const questionCards = await raiseQuestionCards(plan, this.ports.raiseQuestionCard);
+    // In continuous-run mode every card-routed question is a pre-flight item, so none is raised on its own.
+    const questionCards = await raiseQuestionCards(continuous ? { ...plan, cards: [] } : plan, this.ports.raiseQuestionCard);
 
     return {
       specId: saved.specId,
@@ -290,6 +320,7 @@ export class RequirementsPipeline {
         proposed: analysis.requirements.filter((r) => r.proposed).length,
       },
       questionCards,
+      preflight,
       droppedKeys: saved.droppedKeys,
       droppedMilestones: saved.droppedMilestones,
       analysisWarnings: analysis.warnings,
@@ -303,10 +334,11 @@ export class RequirementsPipeline {
     docVersion: number,
     analysis: Analysis,
     warnings: PipelineWarningCode[],
+    preflight: readonly PreflightItem[] | null,
   ): Promise<string | null> {
     let id: string;
     try {
-      ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis)));
+      ({ id } = await this.ports.raiseRequirementsCard(requirementsCard(projectId, docVersion, analysis, preflight)));
     } catch {
       // The doc stays a draft with no card and the result says so; submitting the spec again raises a fresh one.
       warnings.push("card-failed");
