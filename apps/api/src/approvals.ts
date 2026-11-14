@@ -113,6 +113,17 @@ export function purgeConfirmationHash(target: string): string {
   return createHash("sha256").update(`PURGE ${target}`, "utf8").digest("hex");
 }
 
+/** `ApprovalStore.list` filter; every field given must match exactly (DEVOS-190 added gate, action, target). */
+export interface ListFilter {
+  status?: CardStatus;
+  projectId?: string;
+  gate?: GateName;
+  action?: string;
+  target?: string;
+  cursor?: string;
+  limit: number;
+}
+
 /**
  * Persistence. Each method is one transaction; `decide` locks the card row so concurrent decisions serialise.
  * Implementations: MemoryApprovalStore (tests) and PrismaApprovalStore (Postgres).
@@ -121,7 +132,11 @@ export interface ApprovalStore {
   /** Create the card (or return the pending duplicate), add blockers, set the tasks blocked, audit. */
   raise(input: CardInput, blocks: readonly string[], audit: AuditEntry, now: Date): Promise<{ card: Card; created: boolean }>;
   get(id: string): Promise<Card | null>;
-  list(filter: { status?: CardStatus; projectId?: string; cursor?: string; limit: number }): Promise<Card[]>;
+  /**
+   * Cards newest first (createdAt, then id), paged by `cursor` (the last card's id). DEVOS-190: `gate`, `action` and
+   * `target` narrow the page to exactly matching cards, so the analyst's no-repeat scan reads only its own gate.
+   */
+  list(filter: ListFilter): Promise<Card[]>;
   blockedTasks(approvalId: string): Promise<{ id: string; title: string; status: TaskState }[]>;
   comments(approvalId: string): Promise<CardComment[]>;
   /**
@@ -515,10 +530,13 @@ export class MemoryApprovalStore implements ApprovalStore {
     return c ? { ...c } : null;
   }
 
-  async list(f: { status?: CardStatus; projectId?: string; cursor?: string; limit: number }) {
+  async list(f: ListFilter) {
     let all = [...this.cards.values()].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : -1));
     if (f.status) all = all.filter((c) => c.status === f.status);
     if (f.projectId) all = all.filter((c) => c.projectId === f.projectId);
+    if (f.gate) all = all.filter((c) => c.gate === f.gate);
+    if (f.action !== undefined) all = all.filter((c) => c.action === f.action);
+    if (f.target !== undefined) all = all.filter((c) => c.target === f.target);
     if (f.cursor) {
       const i = all.findIndex((c) => c.id === f.cursor);
       all = i < 0 ? [] : all.slice(i + 1);
@@ -722,11 +740,14 @@ export class PrismaApprovalStore implements ApprovalStore {
     });
   }
 
-  list(f: { status?: CardStatus; projectId?: string; cursor?: string; limit: number }) {
+  list(f: ListFilter) {
     return this.tx(async (tx) => {
       const where: Record<string, unknown> = {};
       if (f.status) where.status = f.status;
       if (f.projectId) where.projectId = f.projectId;
+      if (f.gate) where.gate = f.gate;
+      if (f.action !== undefined) where.action = f.action;
+      if (f.target !== undefined) where.target = f.target;
       if (f.cursor) {
         const c = await tx.approval.findUnique({ where: { id: f.cursor }, select: { id: true, createdAt: true } });
         if (!c) return [];

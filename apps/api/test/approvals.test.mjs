@@ -496,3 +496,35 @@ test("DEVOS-134: the gate comes from the matched rules' constraints.gateName; un
   assert.equal((await a.cardForDecision({ ...d, matchedRuleIds: ["r-typo"] }, { action: "app.other", resource: "app:y", projectId: PROJECT })).gate, "decision");
   assert.equal((await a.cardForDecision(d, { action: "project.purge", resource: "project:demo", projectId: PROJECT })).gate, "purge");
 });
+
+test("DEVOS-190 list filters by gate, action and target, newest first, paged by cursor", async () => {
+  const { approvals, store, session } = setup();
+  const mk = (over) => approvals.raiseCard(card(over), []);
+  const a1 = await mk({ action: "question.a", target: "req:1" });
+  const other = await mk({ gate: "first_launch", action: "question.a", target: "req:1" });
+  const a2 = await mk({ action: "question.a", target: "req:2" });
+  const b1 = await mk({ action: "question.b", target: "req:1" });
+  const a3 = await mk({ action: "question.a", target: "req:3" });
+  const ids = (cards) => cards.map((c) => c.id);
+  // Gate only: every decision card, none of the other gate.
+  const decision = await store.list({ projectId: PROJECT, gate: "decision", limit: 10 });
+  assert.deepEqual(new Set(ids(decision)), new Set([a1.id, a2.id, b1.id, a3.id]));
+  assert.ok(!ids(decision).includes(other.id));
+  // Gate + action, paged two at a time: the same cards as one read, in the same order, never another action.
+  const all = await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", limit: 10 });
+  assert.deepEqual(new Set(ids(all)), new Set([a1.id, a2.id, a3.id]));
+  const p1 = await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", limit: 2 });
+  const p2 = await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", limit: 2, cursor: p1.at(-1).id });
+  assert.deepEqual([...ids(p1), ...ids(p2)], ids(all));
+  assert.equal(p1.length, 2);
+  assert.equal(p2.length, 1);
+  // Gate + action + target: exactly one; another project or an unknown target: none.
+  assert.deepEqual(ids(await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", target: "req:2", limit: 10 })), [a2.id]);
+  assert.deepEqual(await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", target: "req:9", limit: 10 }), []);
+  assert.deepEqual(await store.list({ projectId: "55555555-5555-4555-8555-555555555555", gate: "decision", limit: 10 }), []);
+  // With a status: only the decided cards of that gate and action (the analyst's no-repeat read).
+  await approvals.reject(session, a2.id, "no");
+  await approvals.reject(session, b1.id, "no");
+  await approvals.reject(session, other.id, "no");
+  assert.deepEqual(ids(await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", status: "rejected", limit: 10 })), [a2.id]);
+});

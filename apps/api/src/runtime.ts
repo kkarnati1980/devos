@@ -173,6 +173,8 @@ export async function buildRuntime(
   const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(approvalStore),
     // DEVOS-176: the `analyst.model_pass` setting, read before each pass (a change applies without a restart).
     async () => (await setup.settings!.get()).analystModelPass);
+  // CR-a3 (DEVOS-199): the pre-flight view asks the vault only whether a secret name is set.
+  requirements.vault = vault ? { hasProject: (projectId, name) => vault.hasProject(projectId, name) } : null;
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep };

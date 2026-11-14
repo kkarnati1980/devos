@@ -3,6 +3,8 @@ import { getSource, isSlug } from "../../../lib/source";
 import { formatIst, formatUsd, label, safeHttpUrl } from "../../../lib/format";
 import { MODULE_STATUSES } from "../../../lib/types";
 import { ReadinessPanel } from "../../readiness-panel";
+import { parseApiOrigin } from "../../../lib/headers.mjs";
+import { PreflightPanel } from "./preflight-panel";
 
 export default async function ProjectPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -10,6 +12,8 @@ export default async function ProjectPage({ params }: { params: Promise<{ slug: 
   const project = await getSource().getProject(slug);
   if (!project) notFound();
   const repo = safeHttpUrl(project.repoUrl);
+  // ADR-0012 CR-a3: the pre-flight is read from the API client-side, with KK's session.
+  const apiOrigin = parseApiOrigin(process.env.DEVOS_API_ORIGIN);
   return (
     <>
       <p><a href="/">← All projects</a></p>
@@ -73,6 +77,8 @@ export default async function ProjectPage({ params }: { params: Promise<{ slug: 
           {project.log.map((l) => `${l.ts} ${l.level.toUpperCase()} ${l.text}`).join("\n")}
         </pre>
       </section>
+
+      {apiOrigin ? <PreflightPanel apiOrigin={apiOrigin} slug={project.slug} /> : null}
 
       <ReadinessPanel scope={project.slug} />
     </>

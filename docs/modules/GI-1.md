@@ -69,7 +69,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 
 ## Follow-up GI-4c (DEVOS-167, note 0021) — what a removed or changed CI step ran
 - `ci-step-removed` text ends `; ran: <the step's body on one line>`, `ci-step-changed` ends `; was: <base body>; now: <head body>`, and `ci-job-removed` ends `; ran: <each step body, joined with " ;; ">`. A body is the step's lines other than its own `name:` (so `run:`, `uses:`, `with:`, `env:`, `if:` …), trimmed and joined with ` ⏎ ` (not ` | `, which a YAML block scalar `run: |` uses); indentation is dropped, so an indent-only edit reads the same in `was:` and `now:`, although the hit still fires.
-- The hit text is still cut at 200 characters, and hit ids follow the new text. Nothing else changes: the same hits fire, with the same rules, files and lines.
+- The hit text is still cut at 200 characters (since DEVOS-209, note 0026: 1000 for `ci-step-removed` and `ci-step-changed`), and hit ids follow the new text. Nothing else changes: the same hits fire, with the same rules, files and lines.
 - Why: the gate evaluator (`scripts/gates/evaluate-gate.mjs`, GI-4) can then tell from the stored result whether a removed or edited step ran security scanning. Narrowing its `KK_ONLY` on that basis was a separate PR (DEVOS-186). Since DEVOS-189 `scripts/gates/kk-only.mjs` is itself a guard path, so any later change to `KK_ONLY` must come alone and be named by a `FLOOR-GUARD CHANGE` marker (note 0022).
 
 ## Decision: CI-gate and Release scripts are not guard paths (DEVOS-196, note 0023)
@@ -95,6 +95,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 | AT6 | A guard change mixed with any other change is a hit; alone with a decision note it is not |
 | AT7 | The CI job runs the base copy of the guard and finishes in ≤ 120 s |
 | AT8 | (GI-4c) A removed `npm audit` step named "Checks", a removed `pnpm build` step, an edited step and a removed job each carry their body in the hit text (`ran:` / `was:`/`now:`), and a body past the cut stays cut at 200 characters |
+| AT8b | (DEVOS-209, note 0026; for step bodies this replaces AT8's 200) A `ci-step-removed`/`ci-step-changed` text keeps up to 1000 characters, so a SHA-pinned setup step is stored whole; a body past 1000 stays cut at 1000; a removed job and every other rule stay cut at 200 |
 
 ## Green (stored on DEVOS-140 after merge)
 - **GC1:** a throwaway PR adding `.skip` to an existing test gets `floor-guard` exit 1. "Cannot merge" is enforced by the Release path (DEVOS-143) and the ruleset (DEVOS-145) once `floor-guard` is a required check.
