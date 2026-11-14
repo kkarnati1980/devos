@@ -4,6 +4,7 @@
 - **Source:** KK's spec `claude/devos-gate-integrity-spec-v1.0.0.md` §4 (12 Nov 2026). The patterns of §4.2 are a minimum: the Architect may add patterns, never remove one.
 - **Applies:** D1 (Codex PASS on the same SHA), ADR-0013 (runner decides technical design; one task = one PR), ADR-0011 (no new network egress), C1 (no new third-party Action), C2 (under 2 minutes).
 - **Owned files (the guard paths):** `scripts/floor-guard/**`, `scripts/test/floor-guard.test.mjs`, `.github/workflows/floor-guard.yml`; plus this contract and `docs/decisions/0017-floor-guard.md`.
+- **Guard paths from DEVOS-189 (note 0022):** also `scripts/gates/kk-only.mjs` and `scripts/test/kk-only.test.mjs`, the KK-only classifier the gate evaluator and the Release merge path share (DEVOS-181). They stay owned by GI-4; they are guard paths so that a change to them must come alone and be named by a `FLOOR-GUARD CHANGE` marker.
 
 ## Interface
 - `node scripts/floor-guard/floor-guard.mjs --base <rev> --head <rev> [--report <file.json>]` diffs `merge-base(base, head)..head` with `git diff --unified=0 --find-renames`, and matches each file header against the `git diff -z --name-status` pairs so paths containing ` b/` split right (GI-1c). It reads the diff and the base/head copies of changed files only; never a PR description.
@@ -76,6 +77,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 
 ## Pass rule
 - `node --test scripts/test/floor-guard.test.mjs` (part of `pnpm test`) exits 0. It holds one fixture diff per rule above expecting exit 1 and the rule's name, a clean diff expecting exit 0, forced errors (unknown ref, not a repository, missing arguments, unreadable diff) expecting exit 2, the isolation rule, dispositions, and the CLI.
+- From DEVOS-189: the same command also covers the KK-only classifier paths as guard paths (isolation test "guard isolation (DEVOS-189)"), 168 tests passing.
 - AT7: the `floor-guard` job on this PR's head SHA succeeds, and its log (`gh run view --log --job <id>`) shows `wall: <n>s` with n ≤ 120.
 
 ## Acceptance tests

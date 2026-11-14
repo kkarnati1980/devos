@@ -12,7 +12,15 @@ export const CEILINGS = Object.freeze({ ciTimeoutMinutes: 30, testTimeoutMs: 120
 
 // Paths owned by the guard: exempt from content patterns, but a change to any of them must come
 // alone (with only a decision note or the GI-1 contract beside it).
-export const GUARD_PATHS = [/^scripts\/floor-guard\//, /^scripts\/test\/floor-guard\.test\.mjs$/, /^\.github\/workflows\/floor-guard\.yml$/];
+// DEVOS-189: the shared KK-only classifier (DEVOS-181) and its table are guard paths too, so loosening which hits only
+// KK can clear needs the same isolation and the same Codex marker as a guard change (note 0022).
+export const GUARD_PATHS = [
+  /^scripts\/floor-guard\//,
+  /^scripts\/test\/floor-guard\.test\.mjs$/,
+  /^\.github\/workflows\/floor-guard\.yml$/,
+  /^scripts\/gates\/kk-only\.mjs$/,
+  /^scripts\/test\/kk-only\.test\.mjs$/,
+];
 const GUARD_COMPANIONS = [/^docs\/decisions\/[^/]+\.md$/, /^docs\/modules\/GI-1\.md$/];
 
 const CODE = /\.(m?[jt]sx?|c[jt]s|sh|bash|ya?ml|json|py)$/;

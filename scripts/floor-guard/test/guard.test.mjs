@@ -295,6 +295,18 @@ test("guard isolation: a guard change beside any other change is a hit; alone (p
   assert.deepEqual(alone.hits, []);
 });
 
+test("guard isolation (DEVOS-189): the shared KK-only classifier and its table are guard paths", () => {
+  for (const g of ["scripts/gates/kk-only.mjs", "scripts/test/kk-only.test.mjs"]) {
+    const mixed = check({ [g]: "a\n" }, { [g]: "b\n", "scripts/gates/evaluate-gate.mjs": "export const x = 2;\n" });
+    assert.ok(rules(mixed).includes("guard-change-not-isolated"), g);
+    const alone = check({ [g]: "a\n" }, { [g]: "b\n", "docs/decisions/0099-x.md": "note\n" });
+    assert.deepEqual(alone.hits, [], g);
+  }
+  // A path that only starts like one is not a guard path.
+  const near = check({ "scripts/gates/kk-only.mjs.bak": "a\n" }, { "scripts/gates/kk-only.mjs.bak": "b\n", "packages/x/src/a.ts": "export const a = 2;\n" });
+  assert.ok(!rules(near).includes("guard-change-not-isolated"));
+});
+
 test("dispositions: Keep only from a Codex verdict on the same SHA naming id and file:line; a new SHA voids it", () => {
   const r = check({ [T]: testSrc("expect(1).toBe(1);") }, { [T]: testSrc("expect(1).toBe(1);").replace('it("a"', 'it.skip("a"') });
   const [h] = r.hits;
