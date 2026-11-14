@@ -114,9 +114,9 @@ export async function syncApproval(svc: RequirementsServices, projectId: string,
 }
 
 /**
- * DEVOS-204: how far behind `now` the re-answer cursor stays. A comment's time is taken before its transaction
+ * DEVOS-204: how old a comment must be before re-answers read it. A comment's time is taken before its transaction
  * commits (M2.3 `comment`, bounded by the store's 10 s timeout and wait), so one made just before `now` may not be
- * visible yet; the cursor never passes `now - REANSWER_SETTLE_MS`, so such a comment is still read on a later tick.
+ * visible yet; only comments older than `now - REANSWER_SETTLE_MS` are read, all of them committed (Codex PR130-r1).
  */
 export const REANSWER_SETTLE_MS = 30_000;
 
@@ -127,13 +127,17 @@ async function syncReanswers(svc: RequirementsServices, pipeline: RequirementsPi
   const card = await cards.get(approvalId);
   if (!card || card.gate !== "requirements" || card.status !== "approved" || !card.decidedAt) return;
   const all = await cards.comments(card.id);
+  // Codex PR130-r1: only the settled prefix (comments at least REANSWER_SETTLE_MS old) is read. Every comment in it
+  // has committed, so a comment that commits late can never land before rows already written from a later one;
+  // younger comments wait for a later tick (the lister keeps the project listed until the cursor passes them).
+  const cutoff = now.getTime() - REANSWER_SETTLE_MS;
   const comments: { id: string; body: string; createdAt: Date }[] = [];
-  for (const c of all) if (c.id && c.createdAt) comments.push({ id: c.id, body: c.body, createdAt: c.createdAt });
+  for (const c of all) if (c.id && c.createdAt && c.createdAt.getTime() <= cutoff) comments.push({ id: c.id, body: c.body, createdAt: c.createdAt });
   const newest = comments.reduce<number | null>((m, c) => (m === null || c.createdAt.getTime() > m ? c.createdAt.getTime() : m), null);
-  // No comment after the decision: nothing to read and nothing to write (pre-review finding 2: a sync of an
-  // approved doc stays read-only then).
+  // No settled comment after the decision: nothing to read and nothing to write (pre-review finding 2: a sync of
+  // an approved doc stays read-only then).
   if (newest === null || newest <= card.decidedAt.getTime()) return;
-  const seenUpTo = new Date(Math.min(newest, now.getTime() - REANSWER_SETTLE_MS));
+  const seenUpTo = new Date(newest);
   await pipeline.applyReanswers({ id: card.id, gate: card.gate, status: card.status, decidedAt: card.decidedAt }, comments, seenUpTo);
 }
 
