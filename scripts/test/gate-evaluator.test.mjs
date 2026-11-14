@@ -253,10 +253,10 @@ test("AT10 (DEVOS-186, GI-4c): a CI hit whose stored body shows only known non-s
     "job build: step name:Build removed; ran: run: pnpm --filter @devos/api build",
     "job build: step name:Install removed; ran: run: pnpm install --frozen-lockfile",
     "job build: step uses:actions/checkout removed; ran: uses: actions/checkout@v4",
-    "job build: step name:Build changed; was: run: pnpm build ⏎ timeout-minutes: 10; now: run: pnpm build ⏎ timeout-minutes: 20",
+    "job build: step name:Build changed; was: timeout-minutes: 10 ⏎ run: pnpm build; now: timeout-minutes: 20 ⏎ run: pnpm build",
   ]) assert.equal(run(text.includes("changed;") ? "ci-step-changed" : "ci-step-removed", text), "", text);
   // End to end: the hit text the floor guard itself writes for a removed build step is cleared.
-  const shape = workflowShape("on: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - name: Build\n        run: pnpm build\n        shell: bash\n");
+  const shape = workflowShape("on: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - name: Build\n        shell: bash\n        run: pnpm build\n");
   assert.equal(run("ci-step-removed", `job build: step name:Build removed; ran: ${oneLine(shape.bodies.build["name:Build"])}`), "");
   // KK-only: a security command, a script the text cannot resolve, a local action, a block scalar, chaining,
   // `test`/`lint`, an extra word, the old body-less text, and every body-less ci-* rule.
@@ -292,6 +292,11 @@ test("AT10 (DEVOS-186, GI-4c): a CI hit whose stored body shows only known non-s
     ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm --config.node-options=--require=./x.cjs build"],
     // Pre-review round 2: pnpm's -w/--workspace take no value, so they cannot hide a test/lint script; run_install args
     ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm -w test build"],
+    // Codex PR106-r1: a run value carrying a literal " ⏎ " cannot hide a command; run must be the last line
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ name:; bash scripts/verify-deps.sh"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ if: x"],
+    ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm build ⏎ run: pnpm build"],
+    ["ci-step-removed", "job build: step name:B removed; ran: if: ${{ always() }} ⏎ run: pnpm build"],
     ["ci-step-removed", "job build: step name:B removed; ran: run: pnpm --workspace lint build"],
     ["ci-step-removed", "job build: step name:B removed; ran: uses: pnpm/action-setup@v4 ⏎ with: ⏎ run_install: {args: [--config.node-options=--require=./x.cjs]}"],
     ["ci-disabled", "if: false"],

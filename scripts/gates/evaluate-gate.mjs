@@ -130,7 +130,27 @@ export function ciBodyIsPlain(h) {
   if (!m || (m[1] === "ran") !== (h.rule === "ci-step-removed")) return false;
   const parts = m[1] === "was" ? m[2].split("; now: ") : [m[2]];
   if (m[1] === "was" && parts.length !== 2) return false;
-  return parts.every((p) => p.split(" ;; ").every((step) => step.split(" ⏎ ").every(plainLine)));
+  return parts.every(plainBody);
+}
+
+// A value on a shaping key: plain words only, so it cannot carry a command or a second separator.
+const SAFE_VALUE = /^[A-Za-z_][\w-]*\s*:\s*[\w@./=:-]*$/;
+
+/**
+ * One step body. The guard joins lines with " ⏎ ", and a YAML value may itself contain " ⏎ ", so a `run:` value could
+ * hide a second command behind what reads as a new line (Codex PR106-r1). So: at most one `run:` line and it must be
+ * the last line (anything after it could be part of its value), and every other line is a `uses:` ref or a shaping
+ * key with a plain-word value.
+ */
+function plainBody(body) {
+  const lines = body.split(" ⏎ ");
+  const runs = lines.filter((l) => /^run\s*:/.test(l.trim()));
+  if (runs.length > 1 || (runs.length === 1 && !/^run\s*:/.test(lines.at(-1).trim()))) return false;
+  return lines.every((l, i) => {
+    const t = l.trim();
+    if (/^(run|uses)\s*:/.test(t)) return plainLine(t);
+    return plainLine(t) && SAFE_VALUE.test(t);
+  });
 }
 
 export class CannotRun extends Error {}
