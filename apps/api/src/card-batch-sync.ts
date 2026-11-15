@@ -20,6 +20,8 @@ export type BatchLog = (e: { level: "info" | "warn"; msg: string; projectId?: st
 /** Runner decision (CR-b2d): the day's batches are claimed on the first tick at or after 08:00 IST, until CR-e moves it into the M4.6 report. */
 export const FLUSH_HOUR_IST = 8;
 const BATCH = 100;
+// Codex PR143-r1: at most this many pages of 100 in one daily pass (5,000 projects); a longer pass resumes next tick.
+const FLUSH_PAGES_MAX = 50;
 
 function istHour(now: Date): number {
   return new Date(now.getTime() + 330 * 60_000).getUTCHours();
@@ -85,17 +87,29 @@ export class CardBatchJob {
         // which claims nothing for a project that already has the day's batch (one per project per IST day).
         const day = istDay(now);
         const daily = this.flushedDay !== day;
-        const ids = await this.safe(() => (daily ? this.lister.projectsToFlush(day, BATCH) : this.lister.projectsWithOpenBatch(BATCH)), "card-batch-list-failed");
-        if (daily && !this.lastListFailed) this.flushedDay = day;
-        for (const projectId of ids) {
-          try {
-            const r = await this.queue.flushBatch(projectId, now);
-            if (r.outcome === "raised" || r.outcome === "recorded") flushed++;
-            if (r.outcome === "refused" && r.batchId && r.members) await this.handOff(projectId, r.batchId, r.members, now);
-          } catch {
-            this.log({ level: "warn", msg: "card-batch-flush-failed", projectId });
+        // Codex PR143-r1: the daily pass drains every page of eligible projects before the day counts as flushed. A
+        // flushed project leaves the list (it now has the day's batch) or stays as an open batch already seen this
+        // tick, so the pass ends when a page is short or brings no project not yet seen; FLUSH_PAGES_MAX bounds it, and
+        // a pass cut by that bound or by a failed read stays open, so the next tick lists again.
+        const seen = new Set<string>();
+        let drained = !daily;
+        for (let page = 0; page < (daily ? FLUSH_PAGES_MAX : 1); page++) {
+          const ids = await this.safe(() => (daily ? this.lister.projectsToFlush(day, BATCH) : this.lister.projectsWithOpenBatch(BATCH)), "card-batch-list-failed");
+          if (this.lastListFailed) break;
+          const fresh = ids.filter((id) => !seen.has(id));
+          for (const projectId of fresh) {
+            seen.add(projectId);
+            try {
+              const r = await this.queue.flushBatch(projectId, now);
+              if (r.outcome === "raised" || r.outcome === "recorded") flushed++;
+              if (r.outcome === "refused" && r.batchId && r.members) await this.handOff(projectId, r.batchId, r.members, now);
+            } catch {
+              this.log({ level: "warn", msg: "card-batch-flush-failed", projectId });
+            }
           }
+          if (ids.length < BATCH || fresh.length === 0) { drained = true; break; }
         }
+        if (daily && drained) this.flushedDay = day;
       }
       return { applied, flushed };
     } finally {

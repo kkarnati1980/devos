@@ -224,3 +224,29 @@ test("CR-b2d job: a failed daily list read is retried on the next tick", async (
   await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
   assert.equal(approvalStore.cards.size, 1);
 });
+
+test("CR-b2d job (Codex PR143-r1): the daily pass drains every page, so the 101st eligible project still gets its batch", async () => {
+  const ids = Array.from({ length: 101 }, (_, i) => `p-${String(i).padStart(3, "0")}`);
+  const flushed = [];
+  let lists = 0;
+  const queue = { applyBatch: async () => ({ outcome: "none", followUps: [] }), settle: async () => {}, flushBatch: async (id) => { flushed.push(id); return { outcome: "raised" }; } };
+  const lister = {
+    // A flushed project has the day's batch, so it leaves the list; each read returns at most one page of 100.
+    projectsToFlush: async (_day, limit) => { lists++; return ids.filter((id) => !flushed.includes(id)).slice(0, limit); },
+    projectsWithOpenBatch: async () => [],
+    batchesToApply: async () => [],
+  };
+  const job = new CardBatchJob(queue, null, async () => "x", lister, () => {});
+  const r = await job.tick(AT_0800_IST);
+  assert.equal(r.flushed, 101);
+  assert.deepEqual(flushed, ids);
+  assert.equal(lists, 2, "a full page is followed by the next; the short page ends the pass");
+  await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
+  assert.equal(lists, 2, "the day counts as flushed only after the pass drained");
+  // A full page of open batches already seen this tick (still raising) brings nothing new, so the pass ends there.
+  const stuck = Array.from({ length: 100 }, (_, i) => `s-${i}`);
+  let reads = 0;
+  const job2 = new CardBatchJob({ ...queue, flushBatch: async () => ({ outcome: "raising" }) }, null, async () => "x", { ...lister, projectsToFlush: async () => { reads++; return stuck; } }, () => {});
+  await job2.tick(AT_0800_IST);
+  assert.equal(reads, 2);
+});
