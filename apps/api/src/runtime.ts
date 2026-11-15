@@ -27,6 +27,7 @@ import type { ModelRunner } from "@devos/analyst";
 import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
 import { buildProvisionSweep, PrismaProvisioningRows, type ProvisionModule, type ProvisionWiring } from "./provision-runtime.js";
 import type { ProvisionSweepJob } from "./provision-sweep.js";
+import { PrismaProvisionReader, type ProvisionServices } from "./provision-routes.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -89,6 +90,8 @@ export interface Runtime {
   runnerWatchdog: RunnerWatchdogJob | null;
   /** DEVOS-224 (M2.4-d1): provisions approved projects (start-up and every 60 s); null when off. main.ts starts it. */
   provisionSweep: ProvisionSweepJob | null;
+  /** DEVOS-225 (M2.4-d2): the status and retry routes; null parts → 503 `provision-not-configured`. */
+  provision: ProvisionServices;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -137,7 +140,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null } };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -252,7 +255,8 @@ export async function buildRuntime(
     : { off: opts.loadProvision ? "provision-load-failed" : "provision-not-loaded" };
   const provisionSweep = "off" in sweep ? null : sweep;
   if ("off" in sweep) log({ level: "warn", msg: "provision-sweep-off", code: sweep.off });
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep };
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
+    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep } };
 }
 
 /**

@@ -70,6 +70,24 @@ export async function startStubApi(allowedOrigin) {
         },
       });
     }
+    // M2.4-d2 (DEVOS-225): a parked provisioning run with a name conflict; the code field carries seeded markup.
+    if (req.method === "GET" && url === "/projects/by-slug/xss-probe/provision") {
+      const P = "11111111-1111-4111-8111-111111111111";
+      return json(200, {
+        projectId: P,
+        stage: "provisioning",
+        parked: !state.provisionRetried,
+        steps: [
+          { key: "github/repo", provider: "github", kind: "repo", status: "failed", attempts: 1, code: "name_conflict", updatedAt: "2026-11-16T00:00:00.000Z" },
+          { key: "github/core", provider: "github", kind: "core_commit", status: "pending", attempts: 0, code: "<img src=x onerror=window.__xss4=1>", updatedAt: "2026-11-16T00:00:00.000Z" },
+        ],
+      });
+    }
+    if (req.method === "POST" && url === "/projects/11111111-1111-4111-8111-111111111111/provision") {
+      state.provisionRetried = true;
+      state.received.push({ url, body });
+      return json(202, { queued: true });
+    }
     // ADR-0012 CR-b2c (DEVOS-216): an approved batch of 12 long questions (AT8a: all 12 listed, though the card's
     // reason clips at 2,000 characters) and a rejected batch whose blocked tasks stay stopped (AT11, page part).
     if (req.method === "GET" && url === "/projects/by-slug/xss-probe/batches") {
