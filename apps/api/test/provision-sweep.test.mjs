@@ -73,3 +73,13 @@ test("d1: one project's failure does not stop the others; ticks never overlap", 
   assert.deepEqual(h.building, ["b"]);
   assert.ok(h.logs.some((l) => l.projectId === "a" && l.code === "provision-failed"));
 });
+
+test("d1: the name_conflict card is a deduplicable decision card in plain language", async () => {
+  const { nameConflictCard } = await import("../dist/provision-sweep.js");
+  const c = nameConflictCard({ id: "p1", slug: "shop" }, "github/repo");
+  assert.equal(c.gate, "decision");
+  assert.equal(c.action, "provision.name_conflict");
+  assert.equal(c.target, "project:p1/github/repo");
+  assert.equal(c.projectId, "p1");
+  assert.match(c.reason, /rename the project, or tell DevOS to adopt/);
+});

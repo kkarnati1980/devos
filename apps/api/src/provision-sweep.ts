@@ -121,3 +121,20 @@ export class ProvisionSweepJob {
     this.timer = null;
   }
 }
+
+/**
+ * The M2.3 card for a `name_conflict` (decision 2): a non-technical call for KK, so it is a plain-language "rename or
+ * adopt" card. `Approvals.raiseCard` dedupes against a pending twin (same gate, action, target), so a re-run never
+ * opens a second card for the same (project, step).
+ */
+export function nameConflictCard(p: ProvisioningProject, step: string) {
+  return {
+    gate: "decision" as const,
+    action: "provision.name_conflict",
+    target: `project:${p.id}/${step}`,
+    reason:
+      `Setting up project "${p.slug}" stopped: something named for it already exists (step ${step}), and DevOS did not ` +
+      `create it, so DevOS will not touch it. Choose: rename the project, or tell DevOS to adopt the existing one.`,
+    projectId: p.id,
+  };
+}
