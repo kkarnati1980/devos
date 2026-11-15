@@ -20,7 +20,7 @@ const audits = (projectId) => db.auditEvent.count({ where: { projectId, action: 
 test("d2 reader: project by id and slug, steps ordered by key with enums as text", async () => {
   const r = new PrismaProvisionReader(db, 5000);
   const p = await mk({ stage: "provisioning" });
-  await db.provisionStep.create({ data: { projectId: p.id, key: "github/repo", provider: "github", kind: "repo", status: "done", attempts: 1 } });
+  await db.provisionStep.create({ data: { projectId: p.id, key: "github/repo", provider: "github", kind: "repo", status: "done", attempts: 1, externalId: "123" } });
   await db.provisionStep.create({ data: { projectId: p.id, key: "coolify/project", provider: "coolify", kind: "project", status: "failed", attempts: 2, lastError: "provider_error: boom" } });
   assert.deepEqual(await r.project(p.id), { id: p.id, stage: "provisioning" });
   assert.deepEqual(await r.projectBySlug(p.slug), { id: p.id, stage: "provisioning" });
