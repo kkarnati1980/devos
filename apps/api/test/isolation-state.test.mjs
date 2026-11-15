@@ -1,11 +1,22 @@
 // S4-a2b: GET /internal/isolation-state — the HTTP half of S4 AT4 (loopback only, token, exact fields).
-import { test } from "node:test";
+import { before, test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { request } from "node:http";
 import { Socket } from "node:net";
 import {
   ISOLATION_STATE_PATH, buildIsolationState, defaultGateway, isolationStateConfig, isolationStateHandler, readDefaultGateway, startIsolationStateServer, tokenMatches,
 } from "../dist/isolation-state.js";
+
+// The endpoint loads @devos/isolation at run time (S4.md decision, 15 Nov). The api test script builds only policy,
+// analyst and run-engine, and must stay unchanged (floor guard), so a clean `pnpm --filter @devos/api test` builds the
+// isolation package here first (Codex PR117-r5). Bounded, and it fails the suite if the build fails.
+before(() => {
+  const pkg = fileURLToPath(new URL("../../../packages/isolation/", import.meta.url));
+  if (!existsSync(`${pkg}dist/index.js`)) execFileSync("pnpm", ["--filter", "@devos/isolation", "run", "build"], { stdio: "inherit", timeout: 120_000 });
+});
 
 // A test value built from parts, so it does not look like a real key to secret scanners.
 const TOKEN = ["test", "isolation", "state", "token", "only", "x"].join("-");
