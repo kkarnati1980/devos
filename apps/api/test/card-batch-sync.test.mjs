@@ -224,3 +224,92 @@ test("CR-b2d job: a failed daily list read is retried on the next tick", async (
   await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
   assert.equal(approvalStore.cards.size, 1);
 });
+
+// CR-b2e (DEVOS-222): the memory form of PrismaQueueStore.memberCardsToApply / recordMemberAnswer.
+function memberAnswers(store, approvalStore) {
+  return {
+    async memberCardsToApply() {
+      const out = [];
+      for (const m of store.questions) {
+        const b = m.batchId ? store.batches.get(m.batchId) : null;
+        if (!b || b.state !== "refused" || !b.handedOffAt) continue;
+        for (const c of approvalStore.cards.values()) {
+          if (c.gate !== "decision" || c.target !== `question:${m.id}` || c.projectId !== m.projectId || c.status !== "approved") continue;
+          if (store.decisions.some((d) => d.approvalId === c.id && d.itemId === `Q-${m.id}`)) continue;
+          out.push({ question: m, cardId: c.id });
+        }
+      }
+      return out;
+    },
+    async recordMemberAnswer(row) {
+      if (store.decisions.some((d) => d.approvalId === row.approvalId && d.itemId === row.itemId)) return false;
+      store.decisions.push({ ...row });
+      return true;
+    },
+  };
+}
+
+test("CR-b2e job: an approved member card with `BQ-1: no` writes one kk row and one follow-up log line; a replay writes nothing more", async () => {
+  const w = wire({ tasks: false });
+  const { approvalStore, store, q, logs, lister } = w;
+  Object.assign(lister, memberAnswers(store, approvalStore));
+  await q.queueQuestion(P, { gate: "decision", text: "Dark header?", default: "yes", blocks: [T1] }, AT_0730_IST);
+  await q.queueQuestion(P, { gate: "decision", text: "Sticky footer?", default: "no", blocks: [] }, new Date(AT_0730_IST.getTime() + 1));
+  await w.job.tick(AT_0800_IST);
+  const [b] = [...store.batches.values()];
+  assert.ok(b.handedOffAt, "refused (T1 does not exist) and handed off");
+  const cards = [...approvalStore.cards.values()];
+  const dark = cards.find((c) => c.reason.startsWith("Dark"));
+  const sticky = cards.find((c) => c.reason.startsWith("Sticky"));
+  assert.match(dark.reason, /\nTo answer, comment "BQ-1: <your answer>", then approve\./, "the card tells KK how to answer");
+  // KK answers on the Dark card (one comment before the decision counts; one after does not) and approves it.
+  await approvalStore.comment(dark.id, "kk", "BQ-1: no", new Date(AT_0800_IST.getTime() + 30_000));
+  await approvalStore.comment(dark.id, "kk", "BQ-1: maybe", new Date(AT_0800_IST.getTime() + 120_000));
+  dark.status = "approved";
+  dark.decidedAt = new Date(AT_0800_IST.getTime() + 60_000);
+  // The Sticky card is rejected: nothing is recorded, its tasks stay as M2.3 keeps them.
+  sticky.status = "rejected";
+  sticky.decidedAt = new Date(AT_0800_IST.getTime() + 60_000);
+  const before = store.decisions.length;
+  const r = await w.job.tick(AT_0800_IST);
+  assert.equal(r.applied, 1);
+  const written = store.decisions.slice(before);
+  assert.deepEqual(written.map((d) => [d.itemId.startsWith("Q-"), d.source, d.answer, d.approvalId]), [[true, "kk", "no", dark.id]]);
+  const follow = logs.filter((l) => l.msg === "card-batch-follow-up");
+  assert.equal(follow.length, 1);
+  assert.deepEqual(Object.keys(follow[0]).sort(), ["level", "msg", "projectId", "questionId", "tasks"]);
+  assert.equal(follow[0].tasks, 1);
+  // Replay: nothing more written, nothing more logged.
+  const again = await w.job.tick(AT_0800_IST);
+  assert.equal(again.applied, 0);
+  assert.equal(store.decisions.length, before + 1);
+  assert.equal(logs.filter((l) => l.msg === "card-batch-follow-up").length, 1);
+  for (const l of logs) assert.ok(!JSON.stringify(l).match(/Dark|Sticky|maybe/), JSON.stringify(l));
+});
+
+test("CR-b2e job: a member card approved without a BQ-1 line records the default and logs no follow-up; a crash before the write logs again", async () => {
+  const w = wire({ tasks: false });
+  const { approvalStore, store, q, logs, lister } = w;
+  const ma = memberAnswers(store, approvalStore);
+  let crash = true;
+  Object.assign(lister, { memberCardsToApply: ma.memberCardsToApply, recordMemberAnswer: async (row) => { if (crash) { crash = false; throw new Error("db down"); } return ma.recordMemberAnswer(row); } });
+  await q.queueQuestion(P, { gate: "decision", text: "Dark header?", default: "yes", blocks: [T1] }, AT_0730_IST);
+  await q.queueQuestion(P, { gate: "decision", text: "Sticky footer?", default: "no", blocks: [] }, new Date(AT_0730_IST.getTime() + 1));
+  await w.job.tick(AT_0800_IST);
+  const cards = [...approvalStore.cards.values()];
+  const dark = cards.find((c) => c.reason.startsWith("Dark"));
+  const sticky = cards.find((c) => c.reason.startsWith("Sticky"));
+  for (const c of [dark, sticky]) { c.status = "approved"; c.decidedAt = new Date(AT_0800_IST.getTime() + 60_000); }
+  await approvalStore.comment(dark.id, "kk", "BQ-1: no", new Date(AT_0800_IST.getTime() + 30_000));
+  await w.job.tick(AT_0800_IST); // the first write fails after its follow-up line
+  assert.equal(logs.filter((l) => l.msg === "card-batch-apply-failed").length, 1);
+  await w.job.tick(AT_0800_IST);
+  const rows = store.decisions.filter((d) => d.approvalId === dark.id || d.approvalId === sticky.id).map((d) => [d.approvalId === dark.id ? "dark" : "sticky", d.source, d.answer]).sort();
+  assert.deepEqual(rows, [["dark", "kk", "no"], ["sticky", "default", "no"]]);
+  const follow = logs.filter((l) => l.msg === "card-batch-follow-up");
+  assert.ok(follow.length >= 1 && follow.every((l) => l.questionId === store.questions.find((x) => x.text === "Dark header?").id), "follow-up only for the changed answer, at least once");
+  // A further tick writes nothing more.
+  const n = store.decisions.length;
+  await w.job.tick(AT_0800_IST);
+  assert.equal(store.decisions.length, n);
+});
