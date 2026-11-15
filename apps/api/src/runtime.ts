@@ -13,7 +13,7 @@ import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.j
 import { parseSmtpConfig } from "./smtp.js";
 import { ExpiringRequirementsPipeline, approvalStepBoundMs, type ExpiryLog, type PendingCardLister } from "./requirements-expiry.js";
 import { PrismaRequirementsStore } from "./requirements-store.js";
-import type { RequirementsServices } from "./requirements.js";
+import { reanswerSettleMs, type RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 import type { ModelRunner } from "@devos/analyst";
@@ -218,7 +218,14 @@ export function requirementsServices(
     },
     expiryLog,
   );
-  return { pipeline, store, cards: { get: (id) => cards.get(id), ...(cards.comments ? { comments: (id: string) => cards.comments!(id) } : {}) } };
+  return {
+    pipeline,
+    store,
+    cards: { get: (id) => cards.get(id), ...(cards.comments ? { comments: (id: string) => cards.comments!(id) } : {}) },
+    // Codex PR130-r2: comments are written through the same approvals store, so a comment commits within its step
+    // bound; re-answers wait that bound plus a margin (never less than 30 s) before reading one.
+    reanswerSettleMs: reanswerSettleMs(expireStepMs),
+  };
 }
 
 type HeldFn<T> = (assertHeld: () => void) => Promise<T>;
