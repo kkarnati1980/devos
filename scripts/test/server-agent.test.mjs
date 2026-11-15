@@ -521,6 +521,7 @@ f="$FAKE_DIR/body$n"; [[ -f "$f" ]] || f="$FAKE_DIR/body$(( ${bodies.length} - 1
   });
   const args = fs.existsSync(path.join(bin, "curl.args")) ? fs.readFileSync(path.join(bin, "curl.args"), "utf8") : "";
   const calls = Number(fs.existsSync(path.join(bin, "n")) ? fs.readFileSync(path.join(bin, "n"), "utf8") : 0);
+  fs.rmSync(bin, { recursive: true, force: true });
   return { code: Number(r.match(/rc=(\d+)\s*$/)[1]), out: r, args, calls };
 }
 const health = (lastRunAt) => JSON.stringify({ status: "ok", sha: "a".repeat(40), startedAt: "2026-11-15T00:00:00.000Z", watchdog: { lastRunAt } });

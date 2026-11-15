@@ -13,6 +13,7 @@
 set -uo pipefail
 MAX_AGE="${WATCHDOG_MAX_AGE_SECONDS:-2100}"   # 35 minutes
 WAIT="${WATCHDOG_WAIT_SECONDS:-60}"
+[[ "$WAIT" =~ ^[0-9]{1,2}$ ]] && (( WAIT <= 90 )) || WAIT=60  # stays under the agent's 120 s limit
 POLL="${WATCHDOG_POLL_SECONDS:-5}"
 CONF="${DEVOS_DIR:-/root/.devos}/server-agent.conf"
 PORT="$(sed -n 's/^API_PORT=\([0-9]\{2,5\}\)$/\1/p' "$CONF" 2>/dev/null | head -n1)"
