@@ -42,6 +42,7 @@ function setup() {
 const status = async (id) => (await db.task.findUnique({ where: { id }, select: { status: true } })).status;
 const batchCards = (projectId) => db.approval.findMany({ where: { projectId, gate: "decision" } });
 const ask = (text, dflt, blocks = []) => ({ gate: "decision", text, default: dflt, blocks });
+const flushIds = async (store, day, limit, after) => (await store.projectsToFlush(day, limit, after)).map((r) => r.projectId);
 
 test("CR-b2b: the queue writes the question with its provisional row once; ids are scoped to the project", async () => {
   const { projectId, tasks: [t1] } = await fixture(1);
@@ -209,7 +210,7 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   const { projectId } = await fixture(0);
   const { store, queue } = setup();
   await queue.queueQuestion(projectId, ask("Light or dark theme?", "light"), DAY1);
-  assert.ok((await store.projectsToFlush("2026-11-14")).includes(projectId));
+  assert.ok((await flushIds(store, "2026-11-14")).includes(projectId));
   const [x, y] = await Promise.all([store.claim(projectId, "2026-11-14", randomUUID()), store.claim(projectId, "2026-11-14", randomUUID())]);
   assert.equal(x.id, y.id, "the second claim gets the first one's raising batch");
   assert.equal(await db.cardBatch.count({ where: { projectId } }), 1);
@@ -220,14 +221,44 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   assert.ok(!(await store.projectsWithOpenBatch()).includes(projectId));
   // A question queued after the day's batch waits for 15 Nov: it takes no slot on 14 Nov.
   await queue.queueQuestion(projectId, ask("Show the product grid in two columns?", "yes"), DAY1_LATE);
-  assert.ok(!(await store.projectsToFlush("2026-11-14")).includes(projectId));
-  assert.ok((await store.projectsToFlush("2026-11-15")).includes(projectId));
+  assert.ok(!(await flushIds(store, "2026-11-14")).includes(projectId));
+  assert.ok((await flushIds(store, "2026-11-15")).includes(projectId));
   assert.ok((await store.projectsToFlush("2026-11-15", 2.5)).length <= 2, "a fractional limit is an integer");
   // A batch whose card is still pending is not listed for apply.
   const f = await queue.flushBatch(projectId, DAY2);
   assert.equal(f.outcome, "raised");
   assert.ok(!(await store.batchesToApply()).includes(f.batchId));
 });
+test("CR-b2d (db, Codex PR143-r2): projectsToFlush pages by keyset cursor; each page starts after the last row, none repeats", async () => {
+  const { store, queue } = setup();
+  const mine = [];
+  for (let i = 0; i < 3; i++) {
+    const { projectId } = await fixture(0);
+    // Same instant for two of them: the cursor's project_id tiebreak keeps both.
+    await queue.queueQuestion(projectId, ask(`Keyset question ${i}?`, "yes"), new Date(DAY1.getTime() + (i === 2 ? 1 : 0)));
+    mine.push(projectId);
+  }
+  const seen = [];
+  let after = null;
+  for (let page = 0; page < 10_000; page++) {
+    const rows = await store.projectsToFlush("2026-11-14", 2, after);
+    for (const r of rows) {
+      assert.equal(typeof r.since, "string");
+      seen.push(r);
+    }
+    if (rows.length < 2) break;
+    after = rows[rows.length - 1];
+  }
+  const ids = seen.map((r) => r.projectId);
+  assert.equal(new Set(ids).size, ids.length, "no project is listed on two pages");
+  for (const id of mine) assert.ok(ids.includes(id), "every eligible project is reached");
+  // The pages are in strict (since, project_id) order, compared in Postgres.
+  for (let i = 1; i < seen.length; i++) {
+    const [{ ok }] = await db.$queryRawUnsafe(`SELECT ($1::timestamptz, $2::uuid) > ($3::timestamptz, $4::uuid) AS ok`, seen[i].since, seen[i].projectId, seen[i - 1].since, seen[i - 1].projectId);
+    assert.ok(ok, `row ${i} sorts after row ${i - 1}`);
+  }
+});
+
 
 test("CR-b2b (db, Codex PR140-r1): one batch takes at most BATCH_MEMBERS_MAX questions, oldest first; the rest wait for the next day", async () => {
   const { BATCH_MEMBERS_MAX } = await import("../dist/card-batch-store.js");

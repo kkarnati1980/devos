@@ -25,9 +25,9 @@ function wire({ tasks = true } = {}) {
   const q = new CardBatchQueue(store, approvalBatchCards(approvals), randomUUID);
   const lister = {
     days: [],
-    async projectsToFlush(day) {
+    async projectsToFlush(day, _limit, after) {
       lister.days.push(day);
-      return [P];
+      return after ? [] : [{ projectId: P, since: "2026-11-14 02:00:00+00" }];
     },
     async projectsWithOpenBatch() {
       return [...store.batches.values()].some((b) => b.projectId === P && (b.state === "raising" || (b.state === "refused" && !b.handedOffAt))) ? [P] : [];
@@ -230,9 +230,10 @@ test("CR-b2d job (Codex PR143-r1): the daily pass drains every page, so the 101s
   const flushed = [];
   let lists = 0;
   const queue = { applyBatch: async () => ({ outcome: "none", followUps: [] }), settle: async () => {}, flushBatch: async (id) => { flushed.push(id); return { outcome: "raised" }; } };
+  const row = (id) => ({ projectId: id, since: `2026-11-14 01:00:${id.slice(2)}+00` });
   const lister = {
-    // A flushed project has the day's batch, so it leaves the list; each read returns at most one page of 100.
-    projectsToFlush: async (_day, limit) => { lists++; return ids.filter((id) => !flushed.includes(id)).slice(0, limit); },
+    // A flushed project has the day's batch, so it leaves the list; each read returns at most one page, after the cursor.
+    projectsToFlush: async (_day, limit, after) => { lists++; return ids.filter((id) => !flushed.includes(id) && (!after || id > after.projectId)).slice(0, limit).map(row); },
     projectsWithOpenBatch: async () => [],
     batchesToApply: async () => [],
   };
@@ -243,10 +244,42 @@ test("CR-b2d job (Codex PR143-r1): the daily pass drains every page, so the 101s
   assert.equal(lists, 2, "a full page is followed by the next; the short page ends the pass");
   await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
   assert.equal(lists, 2, "the day counts as flushed only after the pass drained");
-  // A full page of open batches already seen this tick (still raising) brings nothing new, so the pass ends there.
-  const stuck = Array.from({ length: 100 }, (_, i) => `s-${i}`);
-  let reads = 0;
-  const job2 = new CardBatchJob({ ...queue, flushBatch: async () => ({ outcome: "raising" }) }, null, async () => "x", { ...lister, projectsToFlush: async () => { reads++; return stuck; } }, () => {});
-  await job2.tick(AT_0800_IST);
-  assert.equal(reads, 2);
+});
+
+test("CR-b2d job (Codex PR143-r2): 100 stuck open batches cannot hide the 101st eligible project; pages move by keyset cursor", async () => {
+  // 100 projects whose batches stay `raising` (still eligible on every read, oldest first) and one later project
+  // with a queued question. The store is keyset-paginated on (since, projectId), as PrismaQueueStore.projectsToFlush.
+  const stuck = Array.from({ length: 100 }, (_, i) => ({ projectId: `s-${String(i).padStart(3, "0")}`, since: `2026-11-13 10:00:${String(i % 60).padStart(2, "0")}.${String(i).padStart(6, "0")}+00` }));
+  const late = { projectId: "z-late", since: "2026-11-14 01:00:00+00" };
+  const all = [...stuck, late].sort((a, b) => (a.since === b.since ? (a.projectId < b.projectId ? -1 : 1) : a.since < b.since ? -1 : 1));
+  const key = (r) => [r.since, r.projectId];
+  const gt = (a, b) => (a[0] === b[0] ? a[1] > b[1] : a[0] > b[0]);
+  const flushedIds = [];
+  const afters = [];
+  const queue = {
+    applyBatch: async () => ({ outcome: "none", followUps: [] }),
+    settle: async () => {},
+    flushBatch: async (id) => { flushedIds.push(id); return id === late.projectId ? { outcome: "raised" } : { outcome: "raising" }; },
+  };
+  const lister = {
+    projectsToFlush: async (_day, limit, after) => {
+      afters.push(after ?? null);
+      // Stuck batches never leave the list; the late project leaves once it has the day's batch.
+      return all.filter((r) => !(r.projectId === late.projectId && flushedIds.includes(late.projectId)) && (!after || gt(key(r), key(after)))).slice(0, limit);
+    },
+    projectsWithOpenBatch: async () => stuck.map((r) => r.projectId),
+    batchesToApply: async () => [],
+  };
+  const job = new CardBatchJob(queue, null, async () => "x", lister, () => {});
+  const r = await job.tick(AT_0800_IST);
+  assert.ok(flushedIds.includes(late.projectId), "the 101st project is flushed in the same tick");
+  assert.equal(r.flushed, 1);
+  assert.equal(afters.length, 2, "page 2 is read after a full page of 100, and is short");
+  assert.equal(afters[0], null);
+  assert.deepEqual(afters[1], all[99], "page 2 starts after page 1's last row");
+  assert.equal(new Set(flushedIds).size, flushedIds.length, "no project is flushed twice in one pass");
+  // The day is flushed: the next tick only retries open batches (one page), it does not re-list the day.
+  afters.length = 0;
+  await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
+  assert.equal(afters.length, 0);
 });
