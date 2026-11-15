@@ -270,3 +270,52 @@ test("pre-review r2 findings 2 and 4: an expired card stops its tasks like a rej
   assert.equal(store.decisions.length, 1);
   assert.ok((await store.batch(r.batchId)).appliedAt);
 });
+
+test("Codex PR135-r1: an applied batch stays listed until settled, with the same follow-ups; question ids are scoped to the project", async () => {
+  const { store, cards, q } = wire();
+  const Q1 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1";
+  await q.queueQuestion(P, { ...ask("Which colour for the header?", "blue", [T1]), id: Q1 }, DAY1);
+  const r = await q.flushBatch(P, DAY1_LATE);
+  const card = cards.cards.find((c) => c.id === r.cardId);
+  card.status = "approved";
+  card.comments.push("BQ-1: green");
+  // Finding 1: apply commits, then the caller crashes before filing its follow-up.
+  const a1 = await q.applyBatch(r.batchId, DAY2);
+  assert.equal(a1.first, true);
+  assert.deepEqual(a1.followUps.map((f) => f.questionId), [Q1]);
+  const b1 = await store.batch(r.batchId);
+  assert.ok(b1.appliedAt);
+  assert.equal(b1.settledAt, null, "not settled: the sync job still lists it");
+  // The next tick rediscovers it and gets the same follow-up; nothing is written twice.
+  const decisionsBefore = store.decisions.length;
+  const a2 = await q.applyBatch(r.batchId, DAY2);
+  assert.equal(a2.outcome, "approved");
+  assert.equal(a2.first, false);
+  assert.deepEqual(a2.followUps, a1.followUps);
+  assert.equal(store.decisions.length, decisionsBefore);
+  await q.settle(r.batchId, DAY2);
+  assert.ok((await store.batch(r.batchId)).settledAt);
+  const a3 = await q.applyBatch(r.batchId, DAY2);
+  assert.equal(a3.outcome, "settled");
+  assert.deepEqual(a3.followUps, []);
+  // settle on a batch that was never applied does nothing.
+  const P2 = "22222222-2222-4222-8222-222222222222";
+  store.addProject(P2, "Blog");
+  await q.queueQuestion(P2, ask("Serif or sans?", "sans"), DAY1);
+  const r2 = await q.flushBatch(P2, DAY1_LATE);
+  await q.settle(r2.batchId, DAY2);
+  assert.equal((await store.batch(r2.batchId)).settledAt, null);
+  // Finding 2: project P2 reusing P's question id is refused; nothing of P's question comes back and nothing is written.
+  const qBefore = store.questions.length;
+  const dBefore = store.decisions.length;
+  await assert.rejects(
+    q.queueQuestion(P2, { ...ask("Tabs or spaces?", "spaces"), id: Q1 }, DAY2),
+    (e) => e instanceof QueueError && e.code === "id-conflict" && !String(e.message).includes("colour"),
+  );
+  assert.equal(store.questions.length, qBefore);
+  assert.equal(store.decisions.length, dBefore);
+  // The same project retrying its own id still gets its stored question back.
+  const again = await q.queueQuestion(P, { ...ask("Which colour for the header?", "blue", [T1]), id: Q1 }, DAY2);
+  assert.equal(again.id, Q1);
+  assert.equal(again.projectId, P);
+});

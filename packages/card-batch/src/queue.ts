@@ -34,6 +34,12 @@ export interface CardBatch {
   appliedAt: Date | null;
   /** Pre-review r2 finding 1: when the caller confirmed it raised a `refused` batch's members as their own cards. */
   handedOffAt: Date | null;
+  /**
+   * Codex PR135-r1 finding 1: when the caller confirmed (`settle`) that it filed every follow-up of the applied
+   * batch. The sync job lists raised batches with `settledAt` null, so a crash after `apply` but before the
+   * follow-ups are filed leaves the batch listed, and the next tick returns the same `followUps` again.
+   */
+  settledAt: Date | null;
 }
 
 export interface DecisionRow {
@@ -51,6 +57,7 @@ export interface QueueStore {
   /**
    * Inserts the question with `batchId` null and its `default-provisional` decision row (rule 7), together, unless a
    * question with that id exists; returns the stored question (a retried call is safe, pre-review r2 finding 4).
+   * The stored question may belong to another project; `queueQuestion` refuses that (Codex PR135-r1 finding 2).
    */
   queue(q: QueuedQuestion, provisional: DecisionRow): Promise<QueuedQuestion>;
   /**
@@ -73,6 +80,8 @@ export interface QueueStore {
    * set `appliedAt` (a conditional update in Postgres), so two concurrent applies cannot both win.
    */
   apply(batchId: string, rows: readonly DecisionRow[], now: Date): Promise<boolean>;
+  /** Sets `settledAt` on an applied batch (once); the batch then leaves the sync job's list. */
+  markSettled(batchId: string, now: Date): Promise<void>;
   /**
    * Rule 8 step 2: runs `fn` holding the batch's lock (`pg_try_advisory_lock` on one dedicated connection in
    * Postgres), or returns `{ locked: false }` at once when another flush holds it. The lock is released after `fn`.
@@ -100,7 +109,7 @@ export interface BatchCards {
 export const DETERMINISTIC_REFUSALS: readonly string[] = Object.freeze(["card-contains-secret", "invalid-input", "task-not-found", "task-other-project"]);
 
 export class QueueError extends Error {
-  constructor(public readonly code: "not-batchable" | "invalid-input" | "project-not-found", public readonly hit?: string) {
+  constructor(public readonly code: "not-batchable" | "invalid-input" | "project-not-found" | "id-conflict", public readonly hit?: string) {
     super(code);
   }
 }
@@ -150,7 +159,11 @@ export class CardBatchQueue {
     // Pre-review finding 1: a question M2.3 would refuse in any card is refused here, so the caller raises it at once
     // (and sees the refusal) instead of it stalling a batch.
     if (this.cards.check && (await this.cards.check({ projectId, reason: batchReason([q]), blocks: q.blocks }))) throw new QueueError("not-batchable", "card");
-    return this.store.queue(q, { projectId, itemId: `Q-${q.id}`, text, answer: dflt, source: "default-provisional", approvalId: null });
+    const stored = await this.store.queue(q, { projectId, itemId: `Q-${q.id}`, text, answer: dflt, source: "default-provisional", approvalId: null });
+    // Codex PR135-r1 finding 2: idempotency is scoped to the project. An id already used by another project is
+    // refused, and nothing of that project's question is returned.
+    if (stored.projectId !== projectId) throw new QueueError("id-conflict");
+    return stored;
   }
 
   /**
@@ -209,20 +222,17 @@ export class CardBatchQueue {
    * blockers, so the tasks stay blocked). Either way the batch is marked applied; `first` is true only for the call
    * that did (pre-review finding 2). `followUps` lists the questions whose answer differs from their default, with
    * their tasks, and is the same on every call: the caller files one follow-up task per question id, idempotently,
-   * so neither a concurrent apply nor a crash after `apply` can duplicate or lose one (rule 7).
+   * then calls `settle`, so neither a concurrent apply nor a crash after `apply` can duplicate or lose one (rule 7).
+   * A settled batch returns `settled`.
    */
-  /** The caller raised every member of a `refused` batch as its own card (M2.3 dedupes a pending twin on retry). */
-  async handOff(batchId: string, now: Date): Promise<void> {
-    await this.store.markHandedOff(batchId, now);
-  }
-
   async applyBatch(
     batchId: string,
     now: Date,
-  ): Promise<{ outcome: "not-ready" | "approved" | "rejected"; first: boolean; followUps: { questionId: string; answer: string; blocks: string[] }[]; stopped: string[] }> {
+  ): Promise<{ outcome: "not-ready" | "settled" | "approved" | "rejected"; first: boolean; followUps: { questionId: string; answer: string; blocks: string[] }[]; stopped: string[] }> {
     const none = { first: false, followUps: [], stopped: [] };
     const row = await this.store.batch(batchId);
     if (!row || row.state !== "raised" || !row.cardId) return { outcome: "not-ready", ...none };
+    if (row.settledAt) return { outcome: "settled", ...none };
     const card = await this.cards.get(row.cardId);
     // Pre-review r2 finding 2: an expired card is handled like a rejected one (M2.3 keeps its blockers too).
     if (!card || (card.status !== "approved" && card.status !== "rejected" && card.status !== "expired")) return { outcome: "not-ready", ...none };
@@ -241,6 +251,20 @@ export class CardBatchQueue {
     const followUps = members.flatMap((m, i) => (answers[i]!.source === "kk" && answers[i]!.answer !== m.default ? [{ questionId: m.id, answer: answers[i]!.answer, blocks: [...m.blocks] }] : []));
     return { outcome: "approved", first, followUps, stopped: [] };
   }
+
+  /**
+   * Codex PR135-r1 finding 1: the caller filed every follow-up `applyBatch` returned (or there were none). Only an
+   * applied batch can be settled; until then the sync job keeps listing it.
+   */
+  async settle(batchId: string, now: Date): Promise<void> {
+    await this.store.markSettled(batchId, now);
+  }
+
+  /** The caller raised every member of a `refused` batch as its own card (M2.3 dedupes a pending twin on retry). */
+  async handOff(batchId: string, now: Date): Promise<void> {
+    await this.store.markHandedOff(batchId, now);
+  }
+
 }
 
 /** In-memory QueueStore for tests and the API without a database. The lock is a per-batch flag (one process). */
@@ -270,7 +294,7 @@ export class MemoryQueueStore implements QueueStore {
     const open = this.questions.filter((q) => q.projectId === projectId && q.batchId === null);
     if (open.length === 0) return null;
     if ([...this.batches.values()].some((b) => b.projectId === projectId && b.istDay === day)) return null;
-    const b: CardBatch = { id: newId, projectId, istDay: day, state: "raising", cardId: null, appliedAt: null, handedOffAt: null };
+    const b: CardBatch = { id: newId, projectId, istDay: day, state: "raising", cardId: null, appliedAt: null, handedOffAt: null, settledAt: null };
     this.batches.set(newId, b);
     for (const q of open) q.batchId = newId;
     return { ...b };
@@ -303,6 +327,10 @@ export class MemoryQueueStore implements QueueStore {
     for (const r of rows) if (!this.decisions.some((d) => d.approvalId === r.approvalId && d.itemId === r.itemId)) this.decisions.push({ ...r });
     b.appliedAt = now;
     return true;
+  }
+  async markSettled(batchId: string, now: Date) {
+    const b = this.batches.get(batchId);
+    if (b && b.appliedAt && !b.settledAt) b.settledAt = now;
   }
   async withBatchLock<T>(batchId: string, fn: () => Promise<T>): Promise<{ locked: true; value: T } | { locked: false }> {
     if (this.locks.has(batchId)) return { locked: false };
