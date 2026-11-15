@@ -224,8 +224,7 @@ export async function restoreProject(projectId: string, opts: TeardownOptions): 
     // Pre-review finding 3: prove ownership of every resource before the first write, so a mismatch never
     // leaves the project half restored.
     const todo: { r: ActiveResource; ops: ResourceOps }[] = [];
-    // M2.5-a3b pre-review 2: the purge's order (Coolify first, the GitHub repo last), so the stacks are stopped
-    // before the repo turns read-only, as the Archive row orders it; a failed stop leaves the repo writable.
+    // Same order as Archive and Purge (M2.5-a3b); only the GitHub repo has an unarchive op today.
     const ordered = (await opts.store.activeResources(projectId))
       .map((r, i) => ({ r, i }))
       .sort((a, b) => rank(a.r) - rank(b.r) || b.i - a.i)

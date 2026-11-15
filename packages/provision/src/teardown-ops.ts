@@ -194,7 +194,6 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
   };
 }
 
-
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
