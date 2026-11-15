@@ -151,27 +151,27 @@ test("SM-07 idempotent(): parallel callers run the effect once; set-up mistakes 
 // The SQL store against a small emulation of the four statements it sends: the table is a Map keyed by (scope, key),
 // as the primary key makes it. The statements and the table are checked as text, so the app's real database gets
 // exactly these (the app's own test runs them on its database).
-function fakePg() {
+function fakePg({ asText = false } = {}) {
   const rows = new Map();
   const log = [];
-  const id = (p) => JSON.stringify([p[0], p[1]]);
+  const id = (p) => JSON.stringify([p[0], p[1], p[2]]);
   const query = async (text, p) => {
     log.push(text);
-    if (text.startsWith("INSERT INTO idempotency_key") && text.includes("ON CONFLICT (scope, key) DO NOTHING RETURNING key")) {
+    if (text.startsWith("INSERT INTO idempotency_key (scope, owner, key, request_hash, state)") && text.includes("ON CONFLICT (scope, owner, key) DO NOTHING RETURNING key")) {
       if (rows.has(id(p))) return { rows: [] };
-      rows.set(id(p), { request_hash: p[2], state: "running", result: null });
-      return { rows: [{ key: p[1] }] };
+      rows.set(id(p), { request_hash: p[3], state: "running", result: null });
+      return { rows: [{ key: p[2] }] };
     }
-    if (text.startsWith("SELECT request_hash, state, result FROM idempotency_key WHERE scope = $1 AND key = $2")) {
+    if (text.startsWith("SELECT request_hash, state, result FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3")) {
       const r = rows.get(id(p));
-      return { rows: r ? [{ ...r }] : [] };
+      return { rows: r ? [{ ...r, result: asText && r.result !== null ? JSON.stringify(r.result) : r.result }] : [] };
     }
     if (text.startsWith("UPDATE idempotency_key SET state = 'done'") && text.endsWith("AND state = 'running'")) {
       const r = rows.get(id(p));
-      if (r && r.state === "running") Object.assign(r, { state: "done", result: JSON.parse(p[2]) });
+      if (r && r.state === "running") Object.assign(r, { state: "done", result: JSON.parse(p[3]) });
       return { rows: [] };
     }
-    if (text.startsWith("DELETE FROM idempotency_key WHERE scope = $1 AND key = $2 AND state = 'running'")) {
+    if (text.startsWith("DELETE FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3 AND state = 'running'")) {
       if (rows.get(id(p))?.state === "running") rows.delete(id(p));
       return { rows: [] };
     }
@@ -181,7 +181,7 @@ function fakePg() {
 }
 
 test("SM-07-L1 SQL store: the key is stored under a (scope, key) primary key; claim, replay, release", async () => {
-  assert.match(IDEMPOTENCY_SQL, /PRIMARY KEY \(scope, key\)/, "the unique constraint");
+  assert.match(IDEMPOTENCY_SQL, /PRIMARY KEY \(scope, owner, key\)/, "the unique constraint");
   assert.match(IDEMPOTENCY_SQL, /CHECK \(state IN \('running', 'done'\)\)/);
   const pg = fakePg();
   const store = sqlStore(pg.query);
@@ -192,19 +192,55 @@ test("SM-07-L1 SQL store: the key is stored under a (scope, key) primary key; cl
   await assert.rejects(run({ item: "b" }), (e) => e.code === "idempotency-key-reused");
   assert.equal(runs, 1);
   await assert.rejects(idempotent(store, { scope: "orders.create", key: "k-2", request: {} }, async () => { throw new Error("boom"); }), /boom/);
-  assert.equal(pg.rows.has(JSON.stringify(["orders.create", "k-2"])), false, "a failed effect releases its key");
+  assert.equal(pg.rows.has(JSON.stringify(["orders.create", "", "k-2"])), false, "a failed effect releases its key");
   assert.deepEqual(await idempotent(store, { scope: "orders.create", key: "k-2", request: {} }, async () => ({ ok: true })), { result: { ok: true }, replayed: false });
   assert.throws(() => sqlStore(null), /query/);
+});
+
+test("SM-07 SQL store: jsonb handed back as text is parsed, so a replay still works", async () => {
+  const store = sqlStore(fakePg({ asText: true }).query);
+  const run = () => idempotent(store, { scope: "s", key: "k", request: {} }, async () => ({ status: 201, body: { id: 1 } }));
+  await run();
+  assert.deepEqual(await run(), { result: { status: 201, body: { id: 1 } }, replayed: true });
+});
+
+test("SM-07 keys are per caller: one caller can neither replay nor probe another caller's key", async () => {
+  const store = memoryStore();
+  const created = [];
+  const route = withIdempotency(store, "orders.create", async (req, ctx) => {
+    created.push(ctx.caller.id);
+    return { status: 201, body: { owner: ctx.caller.id } };
+  });
+  // Stands in for SM-02's protect(), which sets ctx.caller.
+  const as = (id) => (req, res, ctx) => route(req, res, { ...ctx, caller: { id }, input: { body: { item: "x" } } });
+  const s = await serve({ "POST /a": as("alice"), "POST /b": as("bob") });
+  try {
+    assert.deepEqual(await (await post(s.base, "/a", { key: "k-1" })).json(), { owner: "alice" });
+    const bob = await post(s.base, "/b", { key: "k-1" });
+    assert.equal(bob.status, 201);
+    assert.equal(bob.headers.get("idempotent-replayed"), null, "bob's create is his own, not a replay of alice's");
+    assert.deepEqual(await bob.json(), { owner: "bob" });
+    assert.deepEqual(created, ["alice", "bob"]);
+  } finally { await s.close(); }
+});
+
+test("SM-07 fail closed: when the result cannot be stored, the effect is not run again", async () => {
+  const store = memoryStore();
+  let runs = 0;
+  const bad = () => idempotent(store, { scope: "s", key: "k", request: {} }, async () => { runs++; return { n: 1n }; });
+  await assert.rejects(bad(), TypeError);
+  await assert.rejects(bad(), (e) => e.code === "idempotency-key-in-progress");
+  assert.equal(runs, 1);
 });
 
 test("SM-07 SQL store: a row released between INSERT and SELECT is claimed again; endless contention is a 409", async () => {
   let selects = 0;
   const flaky = async (text, p) => {
-    if (text.startsWith("INSERT")) return { rows: selects >= 1 ? [{ key: p[1] }] : [] };
+    if (text.startsWith("INSERT")) return { rows: selects >= 1 ? [{ key: p[2] }] : [] };
     if (text.startsWith("SELECT")) { selects++; return { rows: [] }; }
     return { rows: [] };
   };
-  assert.deepEqual(await sqlStore(flaky).claim("s", "k", "h"), { state: "new" });
+  assert.deepEqual(await sqlStore(flaky).claim("s", "", "k", "h"), { state: "new" });
   const never = async (text) => ({ rows: [] });
-  await assert.rejects(sqlStore(never).claim("s", "k", "h"), (e) => e.code === "idempotency-claim-contended" && e.status === 409);
+  await assert.rejects(sqlStore(never).claim("s", "", "k", "h"), (e) => e.code === "idempotency-claim-contended" && e.status === 409);
 });

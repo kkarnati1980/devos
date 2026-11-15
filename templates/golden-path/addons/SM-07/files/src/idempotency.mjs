@@ -7,7 +7,9 @@
 //   running:  a caller that arrives while the first is still running is refused (409), never run in parallel;
 //   mismatch: the same key with a different request is refused (422), never answered with another request's result;
 //   failure:  a failed effect frees the key, so a retry runs it again.
-// A process that dies mid-effect leaves its row `running` (fail closed): the key answers 409 until the row is cleared.
+// Keys are per caller: a route behind SM-02's protect() keys by (scope, caller id, key), so one caller can neither
+// replay nor probe another caller's key. A process that dies mid-effect, or a result that cannot be stored, leaves
+// its row `running` (fail closed): the key answers 409 until the row is cleared.
 import { createHash } from "node:crypto";
 
 export const KEY_HEADER = "idempotency-key";
@@ -15,16 +17,18 @@ export const KEY_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const SCOPE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 const MAX_CLAIM_TRIES = 3;
 
-/** The table the SQL store needs. Put it in a migration; the primary key is the unique constraint SM-07-L1 asks for. */
+/** The table the SQL store needs. Put it in a migration; the primary key is the unique constraint SM-07-L1 asks for.
+ * `owner` is the caller id ('' for a route without callers). */
 export const IDEMPOTENCY_SQL = `CREATE TABLE IF NOT EXISTS idempotency_key (
   scope text NOT NULL,
+  owner text NOT NULL DEFAULT '',
   key text NOT NULL,
   request_hash text NOT NULL,
   state text NOT NULL CHECK (state IN ('running', 'done')),
   result jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
-  PRIMARY KEY (scope, key)
+  PRIMARY KEY (scope, owner, key)
 );`;
 
 export class IdempotencyError extends Error {
@@ -49,21 +53,21 @@ export function requestHash(request) {
 /** For tests and single-process apps. Same semantics as the SQL store; a Map key is unique by construction. */
 export function memoryStore() {
   const rows = new Map();
-  const id = (scope, key) => JSON.stringify([scope, key]);
+  const id = (scope, owner, key) => JSON.stringify([scope, owner, key]);
   return {
     rows,
-    async claim(scope, key, hash) {
-      const k = id(scope, key);
+    async claim(scope, owner, key, hash) {
+      const k = id(scope, owner, key);
       const row = rows.get(k);
       if (!row) { rows.set(k, { hash, state: "running", result: null }); return { state: "new" }; }
       return { state: row.state, hash: row.hash, result: row.result };
     },
-    async complete(scope, key, result) {
-      const row = rows.get(id(scope, key));
+    async complete(scope, owner, key, result) {
+      const row = rows.get(id(scope, owner, key));
       if (row && row.state === "running") Object.assign(row, { state: "done", result: JSON.parse(JSON.stringify(result ?? null)) });
     },
-    async release(scope, key) {
-      const k = id(scope, key);
+    async release(scope, owner, key) {
+      const k = id(scope, owner, key);
       if (rows.get(k)?.state === "running") rows.delete(k);
     },
   };
@@ -73,26 +77,27 @@ export function memoryStore() {
 export function sqlStore(query) {
   if (typeof query !== "function") throw new TypeError("sqlStore: query must be a function");
   return {
-    async claim(scope, key, hash) {
+    async claim(scope, owner, key, hash) {
       for (let i = 0; i < MAX_CLAIM_TRIES; i++) {
         const ins = await query(
-          "INSERT INTO idempotency_key (scope, key, request_hash, state) VALUES ($1, $2, $3, 'running') ON CONFLICT (scope, key) DO NOTHING RETURNING key",
-          [scope, key, hash],
+          "INSERT INTO idempotency_key (scope, owner, key, request_hash, state) VALUES ($1, $2, $3, $4, 'running') ON CONFLICT (scope, owner, key) DO NOTHING RETURNING key",
+          [scope, owner, key, hash],
         );
         if (ins.rows.length === 1) return { state: "new" };
-        const sel = await query("SELECT request_hash, state, result FROM idempotency_key WHERE scope = $1 AND key = $2", [scope, key]);
+        const sel = await query("SELECT request_hash, state, result FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3", [scope, owner, key]);
         const row = sel.rows[0];
-        if (row) return { state: row.state, hash: row.request_hash, result: row.result ?? null };
+        // A driver that hands jsonb back as text (custom type parsers) gets it parsed here.
+        if (row) return { state: row.state, hash: row.request_hash, result: typeof row.result === "string" ? JSON.parse(row.result) : row.result ?? null };
         // The row was released between the two statements: claim again.
       }
       throw new IdempotencyError("idempotency-claim-contended", 409);
     },
-    async complete(scope, key, result) {
-      await query("UPDATE idempotency_key SET state = 'done', result = $3, completed_at = now() WHERE scope = $1 AND key = $2 AND state = 'running'",
-        [scope, key, JSON.stringify(result ?? null)]);
+    async complete(scope, owner, key, result) {
+      await query("UPDATE idempotency_key SET state = 'done', result = $4, completed_at = now() WHERE scope = $1 AND owner = $2 AND key = $3 AND state = 'running'",
+        [scope, owner, key, JSON.stringify(result ?? null)]);
     },
-    async release(scope, key) {
-      await query("DELETE FROM idempotency_key WHERE scope = $1 AND key = $2 AND state = 'running'", [scope, key]);
+    async release(scope, owner, key) {
+      await query("DELETE FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3 AND state = 'running'", [scope, owner, key]);
     },
   };
 }
@@ -109,11 +114,12 @@ function checkArgs(store, scope) {
  * 400 `idempotency-key-invalid`, 409 `idempotency-key-in-progress`, 422 `idempotency-key-reused`.
  * `result` must be JSON (it is stored and replayed as JSON).
  */
-export async function idempotent(store, { scope, key, request }, fn) {
+export async function idempotent(store, { scope, owner = "", key, request }, fn) {
   checkArgs(store, scope);
+  if (typeof owner !== "string" || owner.length > 200) throw new TypeError("idempotency: owner must be a short string");
   if (typeof key !== "string" || !KEY_PATTERN.test(key)) throw new IdempotencyError("idempotency-key-invalid", 400);
   const hash = requestHash(request);
-  const claim = await store.claim(scope, key, hash);
+  const claim = await store.claim(scope, owner, key, hash);
   if (claim.state !== "new") {
     if (claim.hash !== hash) throw new IdempotencyError("idempotency-key-reused", 422);
     if (claim.state === "done") return { result: claim.result, replayed: true };
@@ -124,11 +130,13 @@ export async function idempotent(store, { scope, key, request }, fn) {
     result = await fn();
   } catch (e) {
     // A failed release must not hide the effect's own error; the row then stays `running` (fail closed).
-    await store.release(scope, key).catch(() => {});
+    await store.release(scope, owner, key).catch(() => {});
     throw e;
   }
+  // If the result is not JSON (BigInt, a cycle) or this write fails, the effect has run and the row stays `running`
+  // (fail closed: retries get 409, the effect never runs twice).
   const stored = JSON.parse(JSON.stringify(result ?? null));
-  await store.complete(scope, key, stored);
+  await store.complete(scope, owner, key, stored);
   return { result: stored, replayed: false };
 }
 
@@ -139,7 +147,8 @@ const sendJson = (res, status, body, extra = {}) => {
 
 /**
  * A create route keyed by the `Idempotency-Key` header. `handler(req, ctx)` returns `{ status, body }` and does not
- * write `res` itself, so the first answer can be stored and replayed. The request is the method, the path and
+ * write `res` itself, so the first answer can be stored and replayed.
+ * Behind SM-02's `protect()` the key belongs to `ctx.caller.id`. The request is the method, the path and
  * `ctx.input` (put SM-01's `validated()` outside this wrapper) or `fingerprint(req, ctx)` when given.
  * A missing key is a 400 `idempotency-key-required`. A replay carries `idempotent-replayed: true`.
  */
@@ -153,7 +162,7 @@ export function withIdempotency(store, scope, handler, { fingerprint } = {}) {
     const path = new URL(req.url || "/", "http://app").pathname;
     const request = fingerprint ? fingerprint(req, ctx) : { method: req.method, path, input: ctx.input ?? null };
     try {
-      const { result, replayed } = await idempotent(store, { scope, key: raw, request }, async () => {
+      const { result, replayed } = await idempotent(store, { scope, owner: ctx.caller?.id ?? "", key: raw, request }, async () => {
         const out = await handler(req, ctx);
         if (!out || !Number.isInteger(out.status) || out.status < 200 || out.status > 599) throw new TypeError("withIdempotency: handler must return { status, body }");
         if (out.status >= 500) throw Object.assign(new Error("handler-failed"), { reply: out }); // not stored: a retry runs again
