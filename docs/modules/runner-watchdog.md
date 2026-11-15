@@ -13,9 +13,9 @@ Every 30 minutes, read the newest comment time on the two runner logs (DEVOS-75 
 2. **Pure core, thin shell.** 217a is a pure function `step(observation, state, now) → { notices, state }` with no I/O, so every acceptance test runs on fixtures. 217b adds the Linear read, the notifier call, the stored state and the timer.
 3. **State is stored (217b), not in memory,** so a redeploy inside a 6-hour window never repeats an alert.
 4. **"Activity" is the newest comment `createdAt` on either issue,** by anyone. An edited old comment is not new activity.
-5. **Cap pause:** when the newest comment across both issues is a `RUN END … idle: weekly cap reached` line, the silence is expected: a "paused by the weekly cap" note goes out at most once per 24 hours, and no silent alert.
+5. **Cap pause:** when the newest comment across both issues is a `RUN END … idle: weekly cap reached` line, the silence is expected: a "paused by the weekly cap" note goes out at most once per 24 hours, and no silent alert. This holds only until the next weekly reset (Saturday 13:30 IST) plus 2 hours: runners still silent after that have stopped for another reason (for example, a payment problem), so the silent alert applies (pre-review finding 1).
 6. **While Linear cannot be read,** no silence judgement is made (the times are unknown). After 2 hours of failed reads, the "Linear API unreachable from the server" alert goes out (6-hour limit). The first good read clears the failure clock.
-7. **Recovery:** after a silent alert, the first observation with a comment newer than the silence start sends one "build runners active again" line and clears the alert state.
+7. **Recovery:** after a silent alert, the first observation with a comment newer than the silence start sends one "build runners active again" line and clears the alert state. A newer comment that is already 2 hours old when first seen (after a Linear outage) moves the silence forward instead, so the two notices never go out together (pre-review finding 2).
 
 ## Interface (217a)
 ```ts
@@ -55,7 +55,7 @@ Constants: `SILENT_MS = 2 h`, `REPEAT_MS = 6 h`, `CAP_NOTE_MS = 24 h`, `LINEAR_D
 |---|---|
 | AT1 | With a newest comment 2 h 05 m old, exactly one silent alert is produced; a second step 30 minutes later produces none (6-hour limit) |
 | AT2 | With a newest comment 1 h 50 m old, no notice is produced |
-| AT3 | With a newest comment that is a weekly-cap idle RUN END, one "paused by the weekly cap" note is produced, not a silent alert, and no second note within 24 hours |
+| AT3 | With a newest comment that is a weekly-cap idle RUN END, one "paused by the weekly cap" note is produced, not a silent alert, and no second note within 24 hours; 2 hours after the next weekly reset, a silent alert is produced instead |
 | AT4 | When every Linear read fails for 2 hours, the "Linear API unreachable" alert is produced once (6-hour limit); before 2 hours, none |
 | AT5 | After a silent alert, a newer comment produces exactly one "active again" notice, and a later silence alerts again |
 | AT6 | No secret appears in a notice or a log: a comment body holding a fake key never reaches a notice, and the 217b log scan finds no key-shaped text |
@@ -73,4 +73,4 @@ CI green and Codex PASS on the exact head SHA (D1).
 - **v0.1.0 (15 Nov 2026, runner B):** contract, decisions and split.
 
 ## Build record
-- 15 Nov 2026, runner B: contract written; 217a built first.
+- 15 Nov 2026, runner B: contract written; DEVOS-219 built first. Pre-review: 3 findings, 2 fixed (cap pause ends at the weekly reset; no recovery and silent alert in one step). Not fixed (low): a newer cap-idle line after a silent alert counts as recovery, because a run did start, so the account and connectors work again.

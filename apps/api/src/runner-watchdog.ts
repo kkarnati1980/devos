@@ -14,6 +14,8 @@ export const REPEAT_MS = 6 * HOUR;
 export const CAP_NOTE_MS = 24 * HOUR;
 /** Linear reads failing for this long → the Linear-unreachable alert. */
 export const LINEAR_DOWN_MS = 2 * HOUR;
+/** The weekly usage cap resets every Saturday at 13:30 IST = 08:00 UTC. */
+const RESET_DAY = 6, RESET_HOUR_UTC = 8;
 /** The timer period (DEVOS-220). */
 export const TICK_MS = 30 * MIN;
 
@@ -62,6 +64,13 @@ export function formatIst(iso: string): string {
   return `${hh}:${mm} IST, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 }
 
+/** The first weekly cap reset strictly after `atMs`. */
+export function nextWeeklyReset(atMs: number): number {
+  const d = new Date(atMs);
+  const r = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + ((RESET_DAY - d.getUTCDay() + 7) % 7), RESET_HOUR_UTC);
+  return r > atMs ? r : r + 7 * 24 * HOUR;
+}
+
 const ms = (iso: string | null): number | null => {
   if (iso === null) return null;
   const t = Date.parse(iso);
@@ -106,16 +115,20 @@ export function step(obs: Observation, state: WatchdogState, nowMs: number): { n
   const at = newest ? ms(newest.at) : null;
   if (!newest || at === null) return { notices, state: next };
 
+  // Recovery only while the newer comment is itself recent: a newer comment seen late (after a Linear outage) that is
+  // already 2 h old moves the silence forward instead, so "active again" and "silent" never go out together.
   const openSince = ms(next.silentSince);
-  if (openSince !== null && at > openSince) {
+  if (openSince !== null && at > openSince && nowMs - at < SILENT_MS) {
     notices.push(notice(TITLE_ACTIVE, `The build runners logged work again at ${formatIst(newest.at)}. Nothing is needed from you.`));
     next.silentSince = null;
     next.silentAlertAt = null;
-  }
+  } else if (openSince !== null && at > openSince) next.silentSince = newest.at; // the alert stays open, newer time
 
   if (nowMs - at < SILENT_MS) return { notices, state: next };
 
-  if (isCapIdle(newest.body)) {
+  // A cap idle explains the silence only until the next weekly reset (plus the silence window): runners that stay
+  // silent after the reset have stopped for another reason (pre-review finding 1), so the silent alert applies.
+  if (isCapIdle(newest.body) && nowMs < nextWeeklyReset(at) + SILENT_MS) {
     if (due(next.capNoteAt, CAP_NOTE_MS, nowMs)) {
       notices.push(notice(TITLE_CAP,
         `The build runners have been idle since ${formatIst(newest.at)} because this week's usage cap is reached. ` +

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseNotice } from "../dist/notify.js";
 import {
-  EMPTY_STATE, SILENT_MS, TICK_MS, TITLE_ACTIVE, TITLE_CAP, TITLE_LINEAR, TITLE_SILENT, formatIst, isCapIdle, step,
+  EMPTY_STATE, SILENT_MS, TICK_MS, nextWeeklyReset, TITLE_ACTIVE, TITLE_CAP, TITLE_LINEAR, TITLE_SILENT, formatIst, isCapIdle, step,
 } from "../dist/runner-watchdog.js";
 
 const MIN = 60_000;
@@ -74,6 +74,35 @@ test("AT3: a weekly-cap idle as the newest comment gives one cap note, not a sil
   assert.match(out[0][0].body, /usage cap is reached/);
   assert.equal(all.filter((n) => n.title === TITLE_CAP).length, 2, "the second note comes only at the 24-hour mark");
   assert.equal(out.at(-1)[0].title, TITLE_CAP);
+});
+
+test("AT3: the cap pause ends 2 hours after the next weekly reset; runners still silent then get a silent alert", () => {
+  // T0 is Sunday 15 Nov 10:00Z; the next reset is Saturday 21 Nov 08:00Z (13:30 IST).
+  const reset = Date.parse("2026-11-21T08:00:00Z");
+  assert.equal(nextWeeklyReset(T0), reset);
+  assert.equal(nextWeeklyReset(reset), reset + 7 * 24 * 60 * MIN, "a cap line posted at the reset belongs to the next week");
+  assert.equal(nextWeeklyReset(Date.parse("2026-11-21T07:59:00Z")), reset);
+  const { out } = run([
+    [seen(T0, CAP), T0 + 125 * MIN],
+    [seen(T0, CAP), reset + SILENT_MS - MIN],
+    [seen(T0, CAP), reset + SILENT_MS],
+  ]);
+  assert.equal(out[0][0].title, TITLE_CAP);
+  assert.equal(out[1].filter((n) => n.title.startsWith(TITLE_SILENT)).length, 0, "still inside the pause");
+  assert.equal(out[2].length, 1);
+  assert.equal(out[2][0].title, `${TITLE_SILENT} 15:30 IST, 15 Nov 2026`);
+});
+
+test("AT5: a newer comment first seen when already 2 h old gives a silent alert only, never 'active again' with it", () => {
+  const t1 = T0 + 200 * MIN;
+  const { out, state } = run([
+    [seen(T0), T0 + 125 * MIN],
+    [{ ok: false }, t1 + 10 * MIN],
+    [seen(t1), t1 + 130 * MIN],
+  ]);
+  assert.equal(out[2].filter((n) => n.title === TITLE_ACTIVE).length, 0);
+  assert.equal(state.silentSince, iso(t1), "the open alert moves to the newer time; its repeat follows the 6-hour limit");
+  assert.deepEqual(out[2], []);
 });
 
 test("AT3: the cap prefix is read strictly (runner A, runner B, and nothing else)", () => {
