@@ -60,7 +60,7 @@ test("SM-07-L1 create route: a double submit creates once and replays the first 
   } finally { await s.close(); }
 });
 
-test("SM-07-L1 create route: missing, malformed or repeated keys are refused before the handler runs", async () => {
+test("SM-07-L1 create route: missing, malformed or over-long keys are refused before the handler runs", async () => {
   const o = orders(memoryStore());
   const s = await serve(o.routes);
   try {
@@ -148,40 +148,41 @@ test("SM-07 idempotent(): parallel callers run the effect once; set-up mistakes 
   assert.throws(() => idempotentJob(store, "s", null), /handler/);
 });
 
-// The SQL store against a small emulation of the four statements it sends: the table is a Map keyed by (scope, key),
-// as the primary key makes it. The statements and the table are checked as text, so the app's real database gets
-// exactly these (the app's own test runs them on its database).
-function fakePg({ asText = false } = {}) {
+// The SQL store against a small emulation of the four statements it sends: the table is a Map keyed by (scope,
+// owner, key), as the primary key makes it, and `result` is held as jsonb text, as `result::text` returns it. The
+// statements and the table are checked as text, so the app's real database gets exactly these (the app's own test
+// runs them on its database).
+function fakePg() {
   const rows = new Map();
-  const log = [];
   const id = (p) => JSON.stringify([p[0], p[1], p[2]]);
   const query = async (text, p) => {
-    log.push(text);
-    if (text.startsWith("INSERT INTO idempotency_key (scope, owner, key, request_hash, state)") && text.includes("ON CONFLICT (scope, owner, key) DO NOTHING RETURNING key")) {
+    if (text.startsWith("INSERT INTO idempotency_key (scope, owner, key, request_hash, claim_id, state)") && text.includes("ON CONFLICT (scope, owner, key) DO NOTHING RETURNING key")) {
       if (rows.has(id(p))) return { rows: [] };
-      rows.set(id(p), { request_hash: p[3], state: "running", result: null });
+      rows.set(id(p), { request_hash: p[3], claim_id: p[4], state: "running", result: null });
       return { rows: [{ key: p[2] }] };
     }
-    if (text.startsWith("SELECT request_hash, state, result FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3")) {
+    if (text.startsWith("SELECT request_hash, state, result::text AS result FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3")) {
       const r = rows.get(id(p));
-      return { rows: r ? [{ ...r, result: asText && r.result !== null ? JSON.stringify(r.result) : r.result }] : [] };
+      return { rows: r ? [{ request_hash: r.request_hash, state: r.state, result: r.result }] : [] };
     }
-    if (text.startsWith("UPDATE idempotency_key SET state = 'done'") && text.endsWith("AND state = 'running'")) {
+    const mine = (r) => r && r.state === "running" && r.claim_id === p[3];
+    if (text.startsWith("UPDATE idempotency_key SET state = 'done', result = $5::jsonb") && text.endsWith("AND claim_id = $4 AND state = 'running'")) {
       const r = rows.get(id(p));
-      if (r && r.state === "running") Object.assign(r, { state: "done", result: JSON.parse(p[3]) });
+      if (mine(r)) Object.assign(r, { state: "done", result: JSON.stringify(JSON.parse(p[4])) });
       return { rows: [] };
     }
-    if (text.startsWith("DELETE FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3 AND state = 'running'")) {
-      if (rows.get(id(p))?.state === "running") rows.delete(id(p));
+    if (text.startsWith("DELETE FROM idempotency_key WHERE scope = $1 AND owner = $2 AND key = $3 AND claim_id = $4 AND state = 'running'")) {
+      if (mine(rows.get(id(p)))) rows.delete(id(p));
       return { rows: [] };
     }
     throw new Error(`unexpected SQL: ${text}`);
   };
-  return { query, rows, log };
+  return { query, rows };
 }
 
-test("SM-07-L1 SQL store: the key is stored under a (scope, key) primary key; claim, replay, release", async () => {
+test("SM-07-L1 SQL store: the key is stored under a (scope, owner, key) primary key; claim, replay, release", async () => {
   assert.match(IDEMPOTENCY_SQL, /PRIMARY KEY \(scope, owner, key\)/, "the unique constraint");
+  assert.match(IDEMPOTENCY_SQL, /claim_id text NOT NULL/);
   assert.match(IDEMPOTENCY_SQL, /CHECK \(state IN \('running', 'done'\)\)/);
   const pg = fakePg();
   const store = sqlStore(pg.query);
@@ -197,11 +198,34 @@ test("SM-07-L1 SQL store: the key is stored under a (scope, key) primary key; cl
   assert.throws(() => sqlStore(null), /query/);
 });
 
-test("SM-07 SQL store: jsonb handed back as text is parsed, so a replay still works", async () => {
-  const store = sqlStore(fakePg({ asText: true }).query);
-  const run = () => idempotent(store, { scope: "s", key: "k", request: {} }, async () => ({ status: 201, body: { id: 1 } }));
-  await run();
-  assert.deepEqual(await run(), { result: { status: 201, body: { id: 1 } }, replayed: true });
+test("SM-07 SQL store: plain string, number and boolean results replay as themselves", async () => {
+  const store = sqlStore(fakePg().query);
+  for (const [k, v] of [["s1", "msg-123"], ["s2", "123"], ["s3", 42], ["s4", true], ["s5", null]]) {
+    const run = () => idempotent(store, { scope: "s", key: k, request: {} }, async () => v);
+    await run();
+    assert.deepEqual(await run(), { result: v, replayed: true }, k);
+  }
+});
+
+test("SM-07 claim token: a slow first claim cannot free or finish a newer claim on the same key", async () => {
+  for (const store of [memoryStore(), sqlStore(fakePg().query)]) {
+    const p = store.rows ? null : true;
+    await store.claim("s", "", "k", "h", "old");
+    // An operator clears the stuck row; a new request claims the key.
+    if (store.rows) store.rows.clear(); else await store.release("s", "", "k", "old");
+    assert.deepEqual(await store.claim("s", "", "k", "h", "new"), { state: "new" });
+    await store.release("s", "", "k", "old");
+    await store.complete("s", "", "k", "old", { from: "old" });
+    assert.deepEqual(await store.claim("s", "", "k", "h", "third"), { state: "running", hash: "h", result: null }, p ? "sql" : "memory");
+    await store.complete("s", "", "k", "new", { from: "new" });
+    assert.deepEqual(await store.claim("s", "", "k", "h", "fourth"), { state: "done", hash: "h", result: { from: "new" } });
+  }
+});
+
+test("SM-07 request hash reads values as JSON: two different dates are two requests", async () => {
+  assert.notEqual(requestHash({ at: new Date(0) }), requestHash({ at: new Date(1) }));
+  assert.equal(requestHash({ at: new Date(0) }), requestHash({ at: new Date(0).toISOString() }));
+  assert.throws(() => requestHash({ n: 1n }), TypeError);
 });
 
 test("SM-07 keys are per caller: one caller can neither replay nor probe another caller's key", async () => {
@@ -240,7 +264,7 @@ test("SM-07 SQL store: a row released between INSERT and SELECT is claimed again
     if (text.startsWith("SELECT")) { selects++; return { rows: [] }; }
     return { rows: [] };
   };
-  assert.deepEqual(await sqlStore(flaky).claim("s", "", "k", "h"), { state: "new" });
+  assert.deepEqual(await sqlStore(flaky).claim("s", "", "k", "h", "t"), { state: "new" });
   const never = async (text) => ({ rows: [] });
-  await assert.rejects(sqlStore(never).claim("s", "", "k", "h"), (e) => e.code === "idempotency-claim-contended" && e.status === 409);
+  await assert.rejects(sqlStore(never).claim("s", "", "k", "h", "t"), (e) => e.code === "idempotency-claim-contended" && e.status === 409);
 });
