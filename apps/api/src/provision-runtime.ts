@@ -29,6 +29,8 @@ export interface ProvisionModule {
   deployKeySteps(gh: unknown, cf: unknown, store: Store, p: P, owner: string): Step[];
   applicationSteps(cf: unknown, gh: unknown, store: Store, p: P, o: { owner: string; serverUuid: string; tailnetIp: string; range: Range; hooks: { afterStack: AfterStack } }): Step[];
   appSecretSteps(cf: unknown, store: Store, secrets: ProjectSecrets, p: P): Step[];
+  /** M2.4-d3a: the `backup_schedule/nightly` inventory record (decision 9). */
+  backupScheduleStep(store: Store, p: { id: string; slug: string }): Step;
 }
 
 export interface ProjectSecrets {
@@ -149,6 +151,7 @@ export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { o
       ...mod.deployKeySteps(gh, cf, store, p, cfg.owner),
       ...mod.applicationSteps(cf, gh, store, p, appOpts),
       ...mod.appSecretSteps(cf, store, secrets, p),
+      mod.backupScheduleStep(store, p),
     ];
   };
   return new ProvisionSweepJob({
@@ -185,6 +188,22 @@ export class PrismaProvisioningRows implements ProvisioningRows {
 
   async markBuilding(projectId: string): Promise<void> {
     const t = this.timeoutMs;
-    await this.db.$transaction((tx: any) => tx.project.updateMany({ where: { id: projectId, stage: "provisioning", pausedAt: null, archivedAt: null }, data: { stage: "building" } }), { timeout: t, maxWait: t });
+    // M2.4-d3a: the budget record. The move and its audit row commit together, and only the one move from
+    // `provisioning` writes it, so a re-run or a second tick never records the budget twice.
+    await this.db.$transaction(async (tx: any) => {
+      const moved = await tx.project.updateMany({ where: { id: projectId, stage: "provisioning", pausedAt: null, archivedAt: null }, data: { stage: "building" } });
+      if (moved.count !== 1) return;
+      const p: { capUsd: unknown } | null = await tx.project.findUnique({ where: { id: projectId }, select: { capUsd: true } });
+      const cap = Number(p?.capUsd ?? Number.NaN);
+      await tx.auditEvent.create({
+        data: {
+          actor: "system",
+          action: "provision.budget_recorded",
+          summary: Number.isFinite(cap) ? `Provisioned with a project budget cap of $${cap.toFixed(2)}` : "Provisioned; the project budget cap could not be read",
+          details: { capUsd: Number.isFinite(cap) ? cap.toFixed(6) : null },
+          projectId,
+        },
+      });
+    }, { timeout: t, maxWait: t });
   }
 }

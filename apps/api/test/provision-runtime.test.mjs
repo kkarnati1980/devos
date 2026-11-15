@@ -28,6 +28,7 @@ function fakeModule(rec) {
     deployKeySteps: () => [step("coolify/private_key"), step("github/deploy_key")],
     applicationSteps: (cf, gh, store, p, o) => { rec.appOpts = o; return [step("github/deploy_compose"), step("coolify/application:preview")]; },
     appSecretSteps: (cf, store, secrets) => { rec.secrets = secrets; return [step("coolify/app_secret:preview/SESSION_SECRET")]; },
+    backupScheduleStep: (store, p) => { rec.backup = p; return step("backup_schedule/nightly"); },
   };
 }
 
@@ -65,8 +66,9 @@ test("d1 wiring: the full step list runs in contract order, then the project mov
   assert.equal(await job.tick(), 1);
   assert.deepEqual(rec.runs.map((r) => r.keys), [[
     "github/repo", "github/core", "coolify/project", "coolify/environment/preview", "coolify/port/preview", "coolify/private_key", "github/deploy_key",
-    "github/deploy_compose", "coolify/application:preview", "coolify/app_secret:preview/SESSION_SECRET",
+    "github/deploy_compose", "coolify/application:preview", "coolify/app_secret:preview/SESSION_SECRET", "backup_schedule/nightly",
   ]]);
+  assert.deepEqual(rec.backup, project, "d3a: the backup record is the last step");
   assert.equal(rec.building, project.id);
   assert.deepEqual(rec.cfProject, project, "the Coolify project step is registered before the stack steps");
   assert.deepEqual(rec.repo, { p: project, owner: "devos-bot" });

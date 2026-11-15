@@ -39,3 +39,19 @@ test("d1 rows: only live provisioning projects are listed; markBuilding moves on
   await rows.markBuilding(paused.id);
   assert.equal(await stage(paused.id), "provisioning", "a project paused during its run is not moved to building");
 });
+
+test("d3a budget record: the move to building writes one provision.budget_recorded audit row with the cap, in the same transaction", async () => {
+  const rows = new PrismaProvisioningRows(db, 5000);
+  const p = await mk({ stage: "provisioning", capUsd: "42.5" });
+  const intake = await mk({});
+  const budget = (id) => db.auditEvent.findMany({ where: { projectId: id, action: "provision.budget_recorded" } });
+  await rows.markBuilding(p.id);
+  await rows.markBuilding(p.id);
+  const ev = await budget(p.id);
+  assert.equal(ev.length, 1, "a repeat writes no second budget record");
+  assert.equal(String(ev[0].actor), "system");
+  assert.deepEqual(ev[0].details, { capUsd: "42.500000" });
+  assert.equal(ev[0].summary, "Provisioned with a project budget cap of $42.50");
+  await rows.markBuilding(intake.id);
+  assert.equal((await budget(intake.id)).length, 0, "no move, no record");
+});
