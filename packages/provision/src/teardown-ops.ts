@@ -6,6 +6,8 @@ import { ProviderError } from "./http.js";
 import type { GitHubClient } from "./github.js";
 import type { CoolifyClient } from "./coolify.js";
 import { ownershipMarker, type ProviderName } from "./runner.js";
+import { applicationName, listApplications } from "./application.js";
+import { STACK_ENVS } from "./stack.js";
 
 /** One inventory row as teardown sees it. */
 export interface InventoryItem {
@@ -123,6 +125,52 @@ export function coolifyProjectOps(cf: CoolifyClient, projectId: string): Resourc
   };
 }
 
+const APP_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos:<project id>` (M2.4-c2's
+ * marker). Archive stops the app; there is no un-archive (Restore leaves stacks stopped; the next deploy starts
+ * them). Remove deletes the app with its volumes, configuration and connected networks in one call.
+ */
+export function coolifyApplicationOps(cf: CoolifyClient, projectId: string): ResourceOps {
+  const uuid = (item: InventoryItem): string => {
+    if (!APP_UUID_RE.test(item.externalId)) throw new Error("coolify-uuid-invalid");
+    return item.externalId;
+  };
+  return {
+    provider: "coolify",
+    kind: "application",
+    inspect: async (item) => {
+      const id = uuid(item);
+      const r = await cf.http.get<{ uuid?: unknown; description?: unknown }>(`/api/v1/applications/${id}`);
+      // Only a 404 proves absence; a 200 must carry this application (same uuid, a string or null description).
+      if (r.status === 404) return null;
+      const b = r.body;
+      if (r.status !== 200 || !b || typeof b !== "object" || b.uuid !== id || !(b.description == null || typeof b.description === "string")) {
+        throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/applications/{uuid} returned an inconclusive response (${r.status})`, r.status);
+      }
+      return { owned: ((b.description as string | null | undefined) ?? "").includes(ownershipMarker(projectId)) };
+    },
+    archive: async (item) => {
+      const id = uuid(item);
+      // Stop is idempotent: stopping a stopped app is a no-op at Coolify.
+      const r = await cf.http.get<unknown>(`/api/v1/applications/${id}/stop`);
+      if (r.status !== 200) {
+        throw new ProviderError("coolify", r.status === 404 ? "http" : "bad-response", `coolify stop of an application returned ${r.status}`, r.status);
+      }
+    },
+    remove: async (item) => {
+      const id = uuid(item);
+      const q = "delete_configurations=true&delete_volumes=true&docker_cleanup=true&delete_connected_networks=true";
+      try {
+        await cf.http.write("DELETE", `/api/v1/applications/${id}?${q}`);
+      } catch (e) {
+        if (!gone(e)) throw e;
+      }
+    },
+  };
+}
+
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
@@ -178,6 +226,13 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
         }
         if (x.name === `devos-${p.slug}` || (x.description ?? "").includes(marker)) {
           hits.push({ provider: "coolify", kind: "project", externalId: x.uuid, name: x.name });
+        }
+      }
+      // M2.5-a3b: applications too (M2.4-c2 names them `devos-<slug>-preview|live` and marks the description).
+      const appNames = new Set(STACK_ENVS.map((env) => applicationName(p.slug, env)));
+      for (const a of await listApplications(cf)) {
+        if (appNames.has(a.name) || (a.description ?? "").includes(marker)) {
+          hits.push({ provider: "coolify", kind: "application", externalId: a.uuid, name: a.name });
         }
       }
       return hits;
