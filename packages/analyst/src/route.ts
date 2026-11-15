@@ -19,30 +19,45 @@ export interface Classification {
 
 // Money, users, legal, content, scope, accounts and dates are KK's (ADR-0013). Checked first, so a question
 // that mixes both ("which database fits the budget?") still goes to KK.
+/**
+ * ADR-0012 rule 6 (CR-b1, DEVOS-210): the stop-and-ask word groups, exported so the card-batch allow-list and this
+ * router read one list and cannot drift. `NON_TECHNICAL` matches exactly what it matched before the split.
+ */
+export const MONEY_WORDS: readonly string[] = Object.freeze([
+  "price", "prices", "pricing", "budget", "budgets", "cost", "costs", "costing", "pay", "pays", "paid", "payment",
+  "payments", "billing", "invoice", "invoices", "subscription", "subscriptions", "spend", "money", "fee", "fees",
+  "charge", "charges", "charging", "free", "plan", "plans", "tier", "tiers", "revenue", "refund", "refunds",
+  "discount", "discounts",
+  // Buying anything is a money decision, even when it names a technology (PR57-r2).
+  "buy", "buys", "buying", "bought", "purchase", "purchases", "purchased", "purchasing", "procure", "procurement",
+  "rent", "renting", "lease", "leasing", "hire", "hiring", "premium", "paywall", "trial", "quote", "quotes",
+  "commercial", "sponsor", "sponsorship",
+]);
+
+export const LEGAL_WORDS: readonly string[] = Object.freeze([
+  "legal", "law", "laws", "lawyer", "licence", "licences", "license", "licenses", "licensing", "terms", "privacy",
+  "gdpr", "dpdp", "consent", "compliance", "regulation", "regulatory", "contract", "contracts", "vendor", "vendors",
+]);
+
+// Data deletion is always KK's (ADR-0013 §6, stop-and-ask), even when it names a database (PR57-r1).
+export const DELETION_WORDS: readonly string[] = Object.freeze([
+  "delete", "deletes", "deleted", "deleting", "deletion", "remove", "removes", "removal", "erase", "erasure",
+  "purge", "purges", "purging", "wipe", "wipes", "wiping", "drop", "drops", "destroy", "destroys", "truncate",
+  "data", "record", "records", "retention", "retain", "archive", "archives", "backup", "backups", "restore",
+]);
+
+/** The rest of M2.2-c's non-technical topics (users, content, scope, dates, markets…); not stop-and-ask words. */
+export const OTHER_NON_TECHNICAL_WORDS: readonly string[] = Object.freeze([
+  "user", "users", "customer", "customers", "audience", "persona", "personas", "role", "roles", "who",
+  "content", "copy", "wording", "text", "tone", "brand", "branding", "logo", "name", "naming", "colour", "colours",
+  "color", "colors", "scope", "priority", "priorities", "mvp", "deadline", "deadlines", "launch", "date", "dates",
+  "account", "accounts", "pilot", "market", "markets", "region", "regions", "country", "countries",
+  "include", "includes", "exclude", "excludes", "phase", "phases", "feature", "features",
+  "client", "clients", "staff", "shift", "shifts", "period", "live",
+]);
+
 const NON_TECHNICAL = new RegExp(
-  "\\b(" +
-    [
-      "price", "prices", "pricing", "budget", "budgets", "cost", "costs", "costing", "pay", "pays", "paid", "payment",
-      "payments", "billing", "invoice", "invoices", "subscription", "subscriptions", "spend", "money", "fee", "fees",
-      "user", "users", "customer", "customers", "audience", "persona", "personas", "role", "roles", "who",
-      "legal", "law", "laws", "lawyer", "licence", "licences", "license", "licenses", "licensing", "terms", "privacy",
-      "gdpr", "dpdp", "consent", "compliance", "regulation", "regulatory", "contract", "contracts", "vendor", "vendors",
-      "content", "copy", "wording", "text", "tone", "brand", "branding", "logo", "name", "naming", "colour", "colours",
-      "color", "colors", "scope", "priority", "priorities", "mvp", "deadline", "deadlines", "launch", "date", "dates",
-      "account", "accounts", "pilot", "market", "markets", "region", "regions", "country", "countries",
-      "charge", "charges", "charging", "free", "plan", "plans", "tier", "tiers", "revenue", "refund", "refunds",
-      "discount", "discounts", "include", "includes", "exclude", "excludes", "phase", "phases", "feature", "features",
-      "client", "clients", "staff", "shift", "shifts", "period", "live",
-      // Buying anything is a money decision, even when it names a technology (PR57-r2).
-      "buy", "buys", "buying", "bought", "purchase", "purchases", "purchased", "purchasing", "procure", "procurement",
-      "rent", "renting", "lease", "leasing", "hire", "hiring", "premium", "paywall", "trial", "quote", "quotes",
-      "commercial", "sponsor", "sponsorship",
-      // Data deletion is always KK's (ADR-0013 §6, stop-and-ask), even when it names a database (PR57-r1).
-      "delete", "deletes", "deleted", "deleting", "deletion", "remove", "removes", "removal", "erase", "erasure",
-      "purge", "purges", "purging", "wipe", "wipes", "wiping", "drop", "drops", "destroy", "destroys", "truncate",
-      "data", "record", "records", "retention", "retain", "archive", "archives", "backup", "backups", "restore",
-    ].join("|") +
-    ")\\b",
+  "\\b(" + [...MONEY_WORDS, ...LEGAL_WORDS, ...DELETION_WORDS, ...OTHER_NON_TECHNICAL_WORDS].join("|") + ")\\b",
   "i",
 );
 
