@@ -339,15 +339,21 @@ export class PrismaQueueStore implements QueueStore {
     });
   }
 
-  /** Projects with a batch still `raising`, or refused and not handed off (the job's retries), oldest first. */
-  projectsWithOpenBatch(limit = CARD_BATCH_LIST_MAX) {
+  /**
+   * Projects with a batch still `raising`, or refused and not handed off (the job's retries), oldest first by
+   * (`since`, `project_id`), after `after` (keyset pagination; the job rotates its retry window, Codex PR143-r4).
+   */
+  projectsWithOpenBatch(limit = CARD_BATCH_LIST_MAX, after?: FlushCursor | null): Promise<FlushRow[]> {
     return this.tx(async (tx) => {
       const rows = await tx.$queryRawUnsafe(
-        `SELECT project_id FROM card_batch WHERE state = 'raising' OR (state = 'refused' AND handed_off_at IS NULL)
-          GROUP BY project_id ORDER BY min(created_at), project_id LIMIT $1::int`,
-        listLimit(limit),
+        `SELECT project_id, min(created_at)::text AS since FROM card_batch
+          WHERE state = 'raising' OR (state = 'refused' AND handed_off_at IS NULL)
+          GROUP BY project_id
+         HAVING $2::timestamptz IS NULL OR (min(created_at), project_id) > ($2::timestamptz, $3::uuid)
+          ORDER BY min(created_at), project_id LIMIT $1::int`,
+        listLimit(limit), after?.since ?? null, after?.projectId ?? null,
       );
-      return rows.map((r: any) => r.project_id as string);
+      return rows.map((r: any) => ({ projectId: r.project_id as string, since: r.since as string }));
     });
   }
 

@@ -214,11 +214,11 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   const [x, y] = await Promise.all([store.claim(projectId, "2026-11-14", randomUUID()), store.claim(projectId, "2026-11-14", randomUUID())]);
   assert.equal(x.id, y.id, "the second claim gets the first one's raising batch");
   assert.equal(await db.cardBatch.count({ where: { projectId } }), 1);
-  assert.ok((await store.projectsWithOpenBatch()).includes(projectId), "a raising batch is retried");
+  assert.ok((await store.projectsWithOpenBatch()).map((r) => r.projectId).includes(projectId), "a raising batch is retried");
   await store.markRefused(x.id);
-  assert.ok((await store.projectsWithOpenBatch()).includes(projectId), "a refused batch not yet handed off is retried");
+  assert.ok((await store.projectsWithOpenBatch()).map((r) => r.projectId).includes(projectId), "a refused batch not yet handed off is retried");
   await store.markHandedOff(x.id, DAY1_LATE);
-  assert.ok(!(await store.projectsWithOpenBatch()).includes(projectId));
+  assert.ok(!(await store.projectsWithOpenBatch()).map((r) => r.projectId).includes(projectId));
   // A question queued after the day's batch waits for 15 Nov: it takes no slot on 14 Nov.
   await queue.queueQuestion(projectId, ask("Show the product grid in two columns?", "yes"), DAY1_LATE);
   assert.ok(!(await flushIds(store, "2026-11-14")).includes(projectId));
@@ -250,6 +250,9 @@ test("CR-b2d (db, Codex PR143-r2): projectsToFlush pages by keyset cursor; each 
     after = rows[rows.length - 1];
   }
   const ids = seen.map((r) => r.projectId);
+  // The retry list pages the same way (Codex PR143-r4): limit 1 from a cursor never repeats the cursor's project.
+  const [first] = await store.projectsWithOpenBatch(1);
+  if (first) assert.ok(!(await store.projectsWithOpenBatch(100, first)).some((r) => r.projectId === first.projectId));
   assert.equal(new Set(ids).size, ids.length, "no project is listed on two pages");
   for (const id of mine) assert.ok(ids.includes(id), "every eligible project is reached");
   // The pages are in strict (since, project_id) order, compared in Postgres.
