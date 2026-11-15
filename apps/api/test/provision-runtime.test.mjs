@@ -145,5 +145,10 @@ test("d1 wiring: off, with a fixed code, without a vault or any required setting
   assert.deepEqual(provisionConfig({ ...ENV, GIT_SHA: "unknown" }), { off: "provision-devos-sha-unknown" });
   assert.deepEqual(provisionConfig({ ...ENV, DEVOS_COOLIFY_URL: "http://coolify:8000/api" }), { off: "provision-coolify-url-not-set" });
   assert.deepEqual(provisionConfig({ ...ENV, DEVOS_TAILNET_IP: "999.1.1.1" }), { off: "provision-tailnet-ip-not-set" });
+  // Codex PR145-r3: a valid IPv4 outside 100.64.0.0/10 turns the sweep off instead of parking every project.
+  for (const ip of ["192.168.1.10", "100.63.255.255", "100.128.0.1", "10.0.0.1"]) {
+    assert.deepEqual(provisionConfig({ ...ENV, DEVOS_TAILNET_IP: ip }), { off: "provision-tailnet-ip-not-tailnet" }, ip);
+  }
+  for (const ip of ["100.64.0.0", "100.127.255.255", "100.100.1.2"]) assert.ok(!("off" in provisionConfig({ ...ENV, DEVOS_TAILNET_IP: ip })), ip);
   assert.deepEqual(wire({ w: { env: { ...ENV, DEVOS_PROJECT_PORTS: "bad" } } }).job, { off: "provision-port-range-invalid" });
 });

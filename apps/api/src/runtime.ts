@@ -1,5 +1,9 @@
 // Runtime wiring of the database-backed parts (readiness + policy engine), kept out of main.ts so it is testable.
 // Secrets are read by name only and never logged.
+import { randomUUID } from "node:crypto";
+import { CardBatchQueue } from "@devos/card-batch";
+import { CardBatchJob } from "./card-batch-sync.js";
+import { PrismaQueueStore, approvalBatchCards, prismaTaskProjects, type PrismaTxLike } from "./card-batch-store.js";
 import { PolicyEngine, PrismaPolicyStore, type PrismaLike } from "@devos/policy";
 import type { KkSessionRegistry } from "./auth.js";
 import { stdoutSink, withTimeout } from "./http.js";
@@ -75,6 +79,10 @@ export interface Runtime {
   requirementsSync: RequirementsSyncJob | null;
   /** DEVOS-171: closes analyst runs left open past max_seconds + grace (start-up and every 5 min); main.ts starts it. */
   analystSweep: AnalystRunSweepJob | null;
+  /** CR-b2d (DEVOS-218): applies decided batch cards and flushes each project's daily batch; main.ts starts it. */
+  cardBatch: CardBatchJob | null;
+  /** CR-b2d (DEVOS-218): the batched-question queue (rule 6–7 entry point for agents, M3.2). */
+  cardBatchQueue: CardBatchQueue | null;
   /** S4-a2b: the stack rows GET /internal/isolation-state reads; null without a database. */
   isolation: PrismaIsolationStore | null;
   /** DEVOS-220: the 30-minute runner watchdog; null without a vault or a Linear loader. main.ts starts it. */
@@ -129,7 +137,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, isolation: null, runnerWatchdog: null, provisionSweep: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -197,6 +205,11 @@ export async function buildRuntime(
   requirements.batches = new PrismaBatchViewStore(db as unknown as PrismaViewTxLike, t);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
+  // CR-b2d (DEVOS-218): the batched-question queue over Postgres (CR-b2b store; its raise lock is a session lock on
+  // its own bounded pg connection, so it spans M2.3's transactions).
+  const queueStore = new PrismaQueueStore(db as unknown as PrismaTxLike, { databaseUrl, timeoutMs: t });
+  const cardBatchQueue = new CardBatchQueue(queueStore, approvalBatchCards(approvalsCore, prismaTaskProjects(db as unknown as PrismaTxLike, t), queueStore), randomUUID);
+  const cardBatch = new CardBatchJob(cardBatchQueue, approvalsCore, (id) => queueStore.projectName(id), queueStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   // S4-a2b: the read side of GET /internal/isolation-state (and, in the M2.4-d wiring, the afterStack hook store).
   const isolation = new PrismaIsolationStore(db, t);
   // DEVOS-220: the runner watchdog reads Linear with the H8 key from the vault (by name, at call time) and alerts
@@ -239,7 +252,7 @@ export async function buildRuntime(
     : { off: opts.loadProvision ? "provision-load-failed" : "provision-not-loaded" };
   const provisionSweep = "off" in sweep ? null : sweep;
   if ("off" in sweep) log({ level: "warn", msg: "provision-sweep-off", code: sweep.off });
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog, provisionSweep };
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep };
 }
 
 /**

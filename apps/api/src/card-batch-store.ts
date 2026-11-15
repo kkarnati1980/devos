@@ -12,6 +12,7 @@ import pg from "pg";
 import type { BatchCards, CardBatch, DecisionRow, QueueStore, QueuedQuestion } from "@devos/card-batch";
 import { looksSecret } from "./notify.js";
 import type { Approvals } from "./approvals.js";
+import type { FlushCursor, FlushRow } from "./card-batch-sync.js";
 
 export interface PrismaTxLike {
   $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T>;
@@ -300,14 +301,72 @@ export class PrismaQueueStore implements QueueStore {
   }
 
   /**
-   * Projects a flush on IST day `day` can act on: a question not yet in a batch while the project has no batch for
-   * `day` (pre-review CR-b2b finding 6: one waiting for tomorrow takes no slot), or a batch still `raising` or
-   * refused and not handed off.
+   * CR-b2e (DEVOS-222): members of handed-off batches whose own `question:<id>` card KK approved and whose final
+   * `Q-<id>` row for that card is not written yet, oldest decision first, bounded.
    */
-  projectsToFlush(day: string, limit = CARD_BATCH_LIST_MAX) {
+  memberCardsToApply(limit = CARD_BATCH_LIST_MAX) {
     return this.tx(async (tx) => {
       const rows = await tx.$queryRawUnsafe(
-        `SELECT project_id FROM (
+        `SELECT q.id, q.project_id, q.text, q.source, q.default_answer, q.blocks, q.queued_at, q.batch_id, a.id AS card_id
+           FROM queued_question q
+           JOIN card_batch b ON b.id = q.batch_id AND b.state = 'refused' AND b.handed_off_at IS NOT NULL
+           JOIN approval a ON a.project_id = q.project_id AND a.gate = 'decision' AND a.target = 'question:' || q.id::text
+                          AND a.status = 'approved'
+          WHERE NOT EXISTS (SELECT 1 FROM project_decision d WHERE d.project_id = q.project_id AND d.item_id = 'Q-' || q.id::text
+                              AND d.approval_id IS NOT NULL)
+          ORDER BY a.decided_at, a.id, q.id LIMIT $1::int`,
+        listLimit(limit),
+      );
+      return rows.map((r: any) => ({ question: toQuestion(r), cardId: r.card_id as string }));
+    });
+  }
+
+  /**
+   * CR-b2e: the question's final row, once per question (pre-review CR-b2e #1: even if two member cards exist for it,
+   * only the first applied writes); true when this call wrote it. The xact lock serialises two writers of one item.
+   */
+  recordMemberAnswer(row: DecisionRow) {
+    return this.tx(async (tx) => {
+      await tx.$queryRawUnsafe("SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:member-answer'), hashtext($1::text))) AS l", `${row.projectId} ${row.itemId}`);
+      const ins = await tx.$queryRawUnsafe(
+        `INSERT INTO project_decision (project_id, item_id, text, answer, source, approval_id)
+         SELECT $1::uuid, $2, $3, $4, $5, $6::uuid
+          WHERE NOT EXISTS (SELECT 1 FROM project_decision d WHERE d.project_id = $1::uuid AND d.item_id = $2 AND d.approval_id IS NOT NULL)
+         ON CONFLICT (approval_id, item_id) DO NOTHING RETURNING item_id`,
+        row.projectId, row.itemId, row.text, row.answer, row.source, row.approvalId,
+      );
+      return ins.length === 1;
+    });
+  }
+
+  /**
+   * Projects with a batch still `raising`, or refused and not handed off (the job's retries), oldest first by
+   * (`since`, `project_id`), after `after` (keyset pagination; the job rotates its retry window, Codex PR143-r4).
+   */
+  projectsWithOpenBatch(limit = CARD_BATCH_LIST_MAX, after?: FlushCursor | null): Promise<FlushRow[]> {
+    return this.tx(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(
+        `SELECT project_id, min(created_at)::text AS since FROM card_batch
+          WHERE state = 'raising' OR (state = 'refused' AND handed_off_at IS NULL)
+          GROUP BY project_id
+         HAVING $2::timestamptz IS NULL OR (min(created_at), project_id) > ($2::timestamptz, $3::uuid)
+          ORDER BY min(created_at), project_id LIMIT $1::int`,
+        listLimit(limit), after?.since ?? null, after?.projectId ?? null,
+      );
+      return rows.map((r: any) => ({ projectId: r.project_id as string, since: r.since as string }));
+    });
+  }
+
+  /**
+   * Projects a flush on IST day `day` can act on: a question not yet in a batch while the project has no batch for
+   * `day` (pre-review CR-b2b finding 6: one waiting for tomorrow takes no slot), or a batch still `raising` or
+   * refused and not handed off. Oldest first by (`since`, `project_id`); `after` is the previous page's last row, so
+   * each page moves past the projects already listed (keyset pagination, Codex PR143-r2).
+   */
+  projectsToFlush(day: string, limit = CARD_BATCH_LIST_MAX, after?: FlushCursor | null): Promise<FlushRow[]> {
+    return this.tx(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(
+        `SELECT project_id, min(since)::text AS since FROM (
            SELECT q.project_id, min(q.queued_at) AS since FROM queued_question q
             WHERE q.batch_id IS NULL
               AND NOT EXISTS (SELECT 1 FROM card_batch d WHERE d.project_id = q.project_id AND d.ist_day = $2)
@@ -315,10 +374,12 @@ export class PrismaQueueStore implements QueueStore {
            UNION ALL
            SELECT project_id, min(created_at) FROM card_batch
             WHERE state = 'raising' OR (state = 'refused' AND handed_off_at IS NULL) GROUP BY project_id
-         ) p GROUP BY project_id ORDER BY min(since), project_id LIMIT $1::int`,
-        listLimit(limit), day,
+         ) p GROUP BY project_id
+         HAVING $3::timestamptz IS NULL OR (min(since), project_id) > ($3::timestamptz, $4::uuid)
+         ORDER BY min(since), project_id LIMIT $1::int`,
+        listLimit(limit), day, after?.since ?? null, after?.projectId ?? null,
       );
-      return rows.map((r: any) => r.project_id as string);
+      return rows.map((r: any) => ({ projectId: r.project_id as string, since: r.since as string }));
     });
   }
 }
