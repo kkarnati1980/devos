@@ -71,7 +71,7 @@ export function inventoryDiff(a: InventoryRow[], b: InventoryRow[]): string | nu
 }
 
 function nextPhase(p: Phase): Phase {
-  return PHASES[Math.min(PHASES.indexOf(p) + 1, PHASES.length - 1)];
+  return PHASES[Math.min(PHASES.indexOf(p) + 1, PHASES.length - 1)] ?? "done";
 }
 
 function due(last: PhaseRecord, d: ProbeDeps): boolean {
@@ -140,5 +140,65 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     }
     default:
       return { exit: 1, phase, cycle, code: "unknown-phase" };
+  }
+}
+
+/**
+ * The probe project's row: paused from creation, so the provisioning sweep (which lists only unpaused
+ * `provisioning` projects) never picks it; only the probe runs provisioning for it. Cap 0: it spends nothing.
+ */
+export const PROBE_PROJECT_DATA = {
+  slug: PROBE_SLUG,
+  name: "DevOS provisioning probe (AT13)",
+  capUsd: 0,
+  continuousRun: false,
+  preflightState: "approved",
+} as const;
+
+/** Find or create the probe project; only that row is written. Bounded like every DevOS DB call (ADR-0011 §9). */
+export async function ensureProbeProject(db: any, now: Date, timeoutMs: number): Promise<{ id: string; slug: string; name: string }> {
+  return db.$transaction(async (tx: any) => {
+    const found = await tx.project.findUnique({ where: { slug: PROBE_SLUG }, select: { id: true, slug: true, name: true, pausedAt: true } });
+    if (found) {
+      if (!found.pausedAt) await tx.project.updateMany({ where: { id: found.id, pausedAt: null }, data: { pausedAt: now } });
+      return { id: found.id, slug: found.slug, name: found.name };
+    }
+    const p = await tx.project.create({ data: { ...PROBE_PROJECT_DATA, pausedAt: now }, select: { id: true, slug: true, name: true } });
+    await tx.auditEvent.create({ data: { actor: "system", action: "provision.probe_started", summary: "AT13 provisioning probe project created", projectId: p.id } });
+    return p;
+  }, { timeout: timeoutMs, maxWait: timeoutMs });
+}
+
+const PHASE_ACTION = "provision.probe_phase";
+
+function asRecord(details: unknown): PhaseRecord | null {
+  const d = details as Partial<PhaseRecord> | null;
+  if (!d || typeof d !== "object") return null;
+  if (!Number.isInteger(d.cycle) || !PHASES.includes(d.phase as Phase) || typeof d.at !== "string" || typeof d.fingerprint !== "string") return null;
+  return d as PhaseRecord;
+}
+
+/** The phase log as append-only audit rows on the probe project (no migration). An unreadable newest row is an error, never a fresh start. */
+export class PrismaProbeLog {
+  constructor(private readonly db: any, private readonly projectId: string, private readonly timeoutMs: number) {}
+
+  async last(): Promise<PhaseRecord | null> {
+    const t = this.timeoutMs;
+    const row: { details: unknown } | null = await this.db.$transaction((tx: any) => tx.auditEvent.findFirst({
+      where: { projectId: this.projectId, action: PHASE_ACTION },
+      orderBy: { occurredAt: "desc" },
+      select: { details: true },
+    }), { timeout: t, maxWait: t });
+    if (!row) return null;
+    const r = asRecord(row.details);
+    if (!r) throw new Error("probe-phase-unreadable");
+    return r;
+  }
+
+  async record(r: PhaseRecord): Promise<void> {
+    const t = this.timeoutMs;
+    await this.db.$transaction((tx: any) => tx.auditEvent.create({
+      data: { actor: "system", action: PHASE_ACTION, summary: `AT13 probe cycle ${r.cycle}: ${r.phase}${r.result ? ` (${r.result.code})` : ""}`, details: r, projectId: this.projectId },
+    }), { timeout: t, maxWait: t });
   }
 }
