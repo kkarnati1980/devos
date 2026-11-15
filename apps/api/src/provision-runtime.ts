@@ -23,6 +23,7 @@ export interface ProvisionModule {
   coreTemplateFiles(apply: ApplyTemplate, o: { devosSha: string }): unknown[];
   runProvision(projectId: string, steps: Step[], o: { store: Store; authorize: Authorize }): Promise<unknown>;
   githubRepoStep(gh: unknown, p: P, owner: string): Step;
+  coolifyProjectStep(cf: unknown, p: { id: string; slug: string }): Step;
   githubCoreStep(gh: unknown, p: { slug: string }, owner: string, files: unknown[], version: string, assertLock: () => Promise<void>): Step;
   stackSteps(cf: unknown, store: Store, p: P, range: Range): Step[];
   deployKeySteps(gh: unknown, cf: unknown, store: Store, p: P, owner: string): Step[];
@@ -50,7 +51,7 @@ export interface ProvisionPolicy {
 
 /** The projects the sweep reads and moves. */
 export interface ProvisioningRows {
-  listProvisioning(): Promise<ProvisioningProject[]>;
+  listProvisioning(exclude: readonly string[]): Promise<ProvisioningProject[]>;
   markBuilding(projectId: string): Promise<void>;
 }
 
@@ -142,6 +143,8 @@ export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { o
     return [
       mod.githubRepoStep(gh, p, cfg.owner),
       mod.githubCoreStep(gh, p, cfg.owner, files, cfg.devosSha.slice(0, 12), () => store.assertLockHeld(p.id)),
+      // stackSteps holds only environments and ports; they need the Coolify project's done row (PR145-r1).
+      mod.coolifyProjectStep(cf, p),
       ...mod.stackSteps(cf, store, p, range),
       ...mod.deployKeySteps(gh, cf, store, p, cfg.owner),
       ...mod.applicationSteps(cf, gh, store, p, appOpts),
@@ -149,7 +152,7 @@ export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { o
     ];
   };
   return new ProvisionSweepJob({
-    listProvisioning: () => w.rows.listProvisioning(),
+    listProvisioning: (exclude) => w.rows.listProvisioning(exclude),
     provision: (p) => mod.runProvision(p.id, steps(p), { store, authorize: policyAuthorizer(w.policy, p.id) }),
     markBuilding: (id) => w.rows.markBuilding(id),
     // Both provider tokens must be in the vault before any project runs: a missing one would otherwise be a
@@ -159,10 +162,7 @@ export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { o
       if (!(await vault.reveal("coolify_api_token"))) return "provision-coolify-token-not-set";
       return null;
     },
-    raiseNameConflict: async (projectId, step) => {
-      const p = (await w.rows.listProvisioning()).find((x) => x.id === projectId);
-      if (p) await w.raiseCard(nameConflictCard(p, step));
-    },
+    raiseNameConflict: async (p, step) => { await w.raiseCard(nameConflictCard(p, step)); },
     log: w.log,
   });
 }
@@ -172,10 +172,10 @@ export class PrismaProvisioningRows implements ProvisioningRows {
   constructor(private readonly db: any, private readonly timeoutMs: number) {}
 
   // Every call is bounded (ADR-0011 §9): a stalled read must not hold the sweep's tick forever (pre-review M2).
-  async listProvisioning(): Promise<ProvisioningProject[]> {
+  async listProvisioning(exclude: readonly string[] = []): Promise<ProvisioningProject[]> {
     const t = this.timeoutMs;
     const rows: { id: string; slug: string; name: string }[] = await this.db.$transaction((tx: any) => tx.project.findMany({
-      where: { stage: "provisioning", pausedAt: null, archivedAt: null },
+      where: { stage: "provisioning", pausedAt: null, archivedAt: null, ...(exclude.length ? { id: { notIn: [...exclude] } } : {}) },
       select: { id: true, slug: true, name: true },
       orderBy: { createdAt: "asc" },
       take: 50,

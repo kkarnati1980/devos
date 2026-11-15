@@ -26,13 +26,14 @@ const isStepError = (e: unknown): e is StepErrorLike =>
 
 export interface ProvisionSweepDeps {
   /** Projects in stage `provisioning`, oldest first. */
-  listProvisioning(): Promise<ProvisioningProject[]>;
+  /** Projects in `provisioning`, oldest first, leaving out `exclude` (the parked ones) before any limit (PR145-r1). */
+  listProvisioning(exclude: readonly string[]): Promise<ProvisioningProject[]>;
   /** Runs the project's full ordered step list (runProvision with the M1.7 authorizer); throws StepError on a stop. */
   provision(p: ProvisioningProject): Promise<unknown>;
   /** `provisioning` → `building`, only from `provisioning` (a no-op otherwise). */
   markBuilding(projectId: string): Promise<void>;
   /** Opens the "rename or adopt" card for (project, step) unless one is already open; never throws on a duplicate. */
-  raiseNameConflict(projectId: string, step: string): Promise<void>;
+  raiseNameConflict(p: ProvisioningProject, step: string): Promise<void>;
   /**
    * Checked once per tick before any project: a fixed code (e.g. a provider token not yet in the vault) skips the
    * whole tick without counting a failure for anyone, so entering the token later needs no restart (pre-review M1).
@@ -51,6 +52,8 @@ export class ProvisionSweepJob {
   private running = false;
   private readonly failures = new Map<string, number>();
   private readonly parked = new Set<string>();
+  /** name_conflict cards not yet delivered: retried at the start of every tick until raised (PR145-r1). */
+  private readonly cardsOwed = new Map<string, { p: ProvisioningProject; step: string }>();
 
   constructor(private readonly d: ProvisionSweepDeps) {}
 
@@ -71,7 +74,8 @@ export class ProvisionSweepJob {
     try {
       let projects: ProvisioningProject[];
       try {
-        projects = await this.d.listProvisioning();
+        await this.deliverCards();
+        projects = await this.d.listProvisioning([...this.parked]);
       } catch {
         this.d.log({ level: "warn", msg: "provision-sweep-list-failed" });
         return 0;
@@ -115,17 +119,26 @@ export class ProvisionSweepJob {
     const step = isStepError(e) ? e.step : undefined;
     const retryable = isStepError(e) ? e.retryable : true;
     if (isStepError(e) && e.code === "name_conflict") {
-      try {
-        await this.d.raiseNameConflict(p.id, e.step);
-      } catch {
-        this.d.log({ level: "warn", msg: "provision-card-failed", projectId: p.id, step });
-      }
+      this.cardsOwed.set(`${p.id}\n${e.step}`, { p, step: e.step });
+      await this.deliverCards();
     }
     const n = (this.failures.get(p.id) ?? 0) + 1;
     this.failures.set(p.id, n);
     const park = !retryable || n >= (this.d.maxFailures ?? 5);
     if (park) this.parked.add(p.id);
     this.d.log({ level: "warn", msg: park ? "provision-parked" : "provision-failed", projectId: p.id, code, step });
+  }
+
+  /** Raises every owed card; a failure keeps it owed for the next tick (raiseCard dedupes a pending twin). */
+  private async deliverCards(): Promise<void> {
+    for (const [k, c] of this.cardsOwed) {
+      try {
+        await this.d.raiseNameConflict(c.p, c.step);
+        this.cardsOwed.delete(k);
+      } catch {
+        this.d.log({ level: "warn", msg: "provision-card-failed", projectId: c.p.id, step: c.step });
+      }
+    }
   }
 
   /** Runs one tick now, then every `intervalMs` (default 60 s). */

@@ -22,7 +22,9 @@ function fakeModule(rec) {
     runProvision: async (id, steps, o) => { rec.runs.push({ id, keys: steps.map((s) => s.key), authorize: o.authorize }); return []; },
     githubRepoStep: (gh, p, owner) => { rec.repo = { p, owner }; return step("github/repo"); },
     githubCoreStep: (gh, p, owner, files, version, assertLock) => { rec.assertLock = assertLock; rec.coreVersion = version; return step("github/core"); },
-    stackSteps: () => [step("coolify/project"), step("coolify/environment:preview")],
+    coolifyProjectStep: (cf, p) => { rec.cfProject = p; return step("coolify/project"); },
+    // Like the real stackSteps: environments and ports only (PR145-r1).
+    stackSteps: () => [step("coolify/environment/preview"), step("coolify/port/preview")],
     deployKeySteps: () => [step("coolify/private_key"), step("github/deploy_key")],
     applicationSteps: (cf, gh, store, p, o) => { rec.appOpts = o; return [step("github/deploy_compose"), step("coolify/application:preview")]; },
     appSecretSteps: (cf, store, secrets) => { rec.secrets = secrets; return [step("coolify/app_secret:preview/SESSION_SECRET")]; },
@@ -48,7 +50,7 @@ function wire(over = {}) {
     databaseUrl: "postgresql://x@localhost/devos",
     vault,
     policy,
-    rows: { listProvisioning: async () => (rec.building ? [] : [project]), markBuilding: async (id) => { rec.building = id; } },
+    rows: { listProvisioning: async (exclude) => (rec.building || exclude.includes(project.id) ? [] : [project]), markBuilding: async (id) => { rec.building = id; } },
     raiseCard: async (c) => { rec.cards.push(c); },
     log: (e) => rec.logs.push(e),
     env: ENV,
@@ -62,10 +64,11 @@ test("d1 wiring: the full step list runs in contract order, then the project mov
   assert.equal(typeof job.tick, "function");
   assert.equal(await job.tick(), 1);
   assert.deepEqual(rec.runs.map((r) => r.keys), [[
-    "github/repo", "github/core", "coolify/project", "coolify/environment:preview", "coolify/private_key", "github/deploy_key",
+    "github/repo", "github/core", "coolify/project", "coolify/environment/preview", "coolify/port/preview", "coolify/private_key", "github/deploy_key",
     "github/deploy_compose", "coolify/application:preview", "coolify/app_secret:preview/SESSION_SECRET",
   ]]);
   assert.equal(rec.building, project.id);
+  assert.deepEqual(rec.cfProject, project, "the Coolify project step is registered before the stack steps");
   assert.deepEqual(rec.repo, { p: project, owner: "devos-bot" });
   assert.equal(rec.cfOrigin, "http://devos-coolify:8000");
   assert.equal(rec.coreSha, ENV.GIT_SHA);

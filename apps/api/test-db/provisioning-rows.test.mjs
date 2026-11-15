@@ -25,6 +25,7 @@ test("d1 rows: only live provisioning projects are listed; markBuilding moves on
   const listed = (await rows.listProvisioning()).map((p) => p.id);
   assert.ok(listed.includes(live.id));
   for (const p of [paused, archived, intake]) assert.ok(!listed.includes(p.id), p.slug);
+  assert.ok(!(await rows.listProvisioning([live.id])).some((p) => p.id === live.id), "an excluded (parked) project is left out in the query");
   const one = (await rows.listProvisioning()).find((p) => p.id === live.id);
   assert.deepEqual(one, { id: live.id, slug: live.slug, name: live.name });
 

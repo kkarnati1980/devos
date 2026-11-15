@@ -10,10 +10,10 @@ class StepError extends Error {
 function harness({ projects = [{ id: "p1", slug: "one", name: "One" }], provision = async () => [] } = {}) {
   const logs = [], building = [], cards = [], calls = [];
   const job = new ProvisionSweepJob({
-    listProvisioning: async () => projects.filter((p) => !building.includes(p.id)),
+    listProvisioning: async (exclude) => projects.filter((p) => !building.includes(p.id) && !exclude.includes(p.id)),
     provision: async (p) => { calls.push(p.id); return provision(p); },
     markBuilding: async (id) => { building.push(id); },
-    raiseNameConflict: async (id, step) => { cards.push(`${id}/${step}`); },
+    raiseNameConflict: async (p, step) => { cards.push(`${p.id}/${step}`); },
     log: (e) => logs.push(e),
   });
   return { job, logs, building, cards, calls };
@@ -123,4 +123,40 @@ test("d1 (pre-review M1): a ready() code skips the tick for everyone and counts 
   code = null;
   await job.tick();
   assert.deepEqual(calls, ["p1"]);
+});
+
+test("PR145-r1: parked projects are excluded before the list limit, so newer projects are never starved", async () => {
+  const seen = [];
+  const all = Array.from({ length: 3 }, (_, i) => ({ id: `p${i}`, slug: `s${i}`, name: `N${i}` }));
+  const job = new ProvisionSweepJob({
+    // A list limited to 1: without the exclusion, the parked p0 would hide p1 and p2 for ever.
+    listProvisioning: async (exclude) => { seen.push([...exclude]); return all.filter((p) => !exclude.includes(p.id)).slice(0, 1); },
+    provision: async (p) => { if (p.id === "p0") { const e = new Error("x"); e.name = "StepError"; e.code = "policy_denied"; e.step = "github/repo"; e.retryable = false; throw e; } },
+    markBuilding: async (id) => { const i = all.findIndex((p) => p.id === id); all.splice(i, 1); },
+    raiseNameConflict: async () => {},
+    log: () => {},
+  });
+  await job.tick();
+  assert.equal(job.isParked("p0"), true);
+  assert.equal(await job.tick(), 1, "the next tick reaches p1 past the parked p0");
+  assert.deepEqual(seen.at(-1), ["p0"]);
+});
+
+test("PR145-r1: a name_conflict card that fails to raise is retried on later ticks until delivered, though the project is parked", async () => {
+  let failCard = 1;
+  const cards = [];
+  const job = new ProvisionSweepJob({
+    listProvisioning: async (exclude) => [{ id: "p1", slug: "one", name: "One" }].filter((p) => !exclude.includes(p.id)),
+    provision: async () => { const e = new Error("x"); e.name = "StepError"; e.code = "name_conflict"; e.step = "github/repo"; e.retryable = false; throw e; },
+    markBuilding: async () => {},
+    raiseNameConflict: async (p, step) => { if (failCard-- > 0) throw new Error("db down"); cards.push(`${p.id}/${step}`); },
+    log: () => {},
+  });
+  await job.tick();
+  assert.equal(job.isParked("p1"), true);
+  assert.deepEqual(cards, []);
+  await job.tick();
+  assert.deepEqual(cards, ["p1/github/repo"], "delivered on a later tick");
+  await job.tick();
+  assert.deepEqual(cards, ["p1/github/repo"], "delivered once; nothing owed afterwards");
 });
