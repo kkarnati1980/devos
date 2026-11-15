@@ -29,8 +29,8 @@ function wire({ tasks = true } = {}) {
       lister.days.push(day);
       return after ? [] : [{ projectId: P, since: "2026-11-14 02:00:00+00" }];
     },
-    async projectsWithOpenBatch() {
-      return [...store.batches.values()].some((b) => b.projectId === P && (b.state === "raising" || (b.state === "refused" && !b.handedOffAt))) ? [P] : [];
+    async projectsWithOpenBatch(_limit, after) {
+      return !after && [...store.batches.values()].some((b) => b.projectId === P && (b.state === "raising" || (b.state === "refused" && !b.handedOffAt))) ? [{ projectId: P, since: "2026-11-14 02:30:00+00" }] : [];
     },
     async batchesToApply() {
       return [...store.batches.values()].filter((b) => b.state === "raised" && !b.settledAt).map((b) => b.id);
@@ -267,7 +267,7 @@ test("CR-b2d job (Codex PR143-r2): 100 stuck open batches cannot hide the 101st 
       // Stuck batches never leave the list; the late project leaves once it has the day's batch.
       return all.filter((r) => !(r.projectId === late.projectId && flushedIds.includes(late.projectId)) && (!after || gt(key(r), key(after)))).slice(0, limit);
     },
-    projectsWithOpenBatch: async () => stuck.map((r) => r.projectId),
+    projectsWithOpenBatch: async () => [],
     batchesToApply: async () => [],
   };
   const job = new CardBatchJob(queue, null, async () => "x", lister, () => {});
@@ -325,4 +325,35 @@ test("CR-b2d job (Codex PR143-r3): a pass cut by the page bound resumes after it
   await job.tick(new Date(AT_0800_IST.getTime() + 86_400_000));
   assert.equal(reads[51].day, "2026-11-15");
   assert.equal(reads[51].after, null);
+});
+
+test("CR-b2d job (Codex PR143-r4): retry ticks rotate through open batches, so 100 that keep failing cannot starve the 101st", async () => {
+  const open = Array.from({ length: 101 }, (_, i) => ({ projectId: `o-${String(i).padStart(3, "0")}`, since: `2026-11-14 01:00:00.${String(i).padStart(6, "0")}+00` }));
+  const gt = (a, b) => (a.since === b.since ? a.projectId > b.projectId : a.since > b.since);
+  const tried = [];
+  const afters = [];
+  const queue = {
+    applyBatch: async () => ({ outcome: "none", followUps: [] }),
+    settle: async () => {},
+    // Every retry fails again (a transient fault that has cleared only for the 101st, which is never the oldest).
+    flushBatch: async (id) => { tried.push(id); if (id !== "o-100") throw new Error("still failing"); return { outcome: "raised" }; },
+  };
+  const lister = {
+    projectsToFlush: async () => [],
+    projectsWithOpenBatch: async (limit, after) => { afters.push(after ?? null); return open.filter((r) => !after || gt(r, after)).slice(0, limit); },
+    batchesToApply: async () => [],
+  };
+  const job = new CardBatchJob(queue, null, async () => "x", lister, () => {});
+  await job.tick(AT_0800_IST); // the daily pass: nothing to claim, the day is flushed
+  assert.equal(afters.length, 0);
+  const at = (n) => new Date(AT_0800_IST.getTime() + n * 300_000);
+  await job.tick(at(1));
+  assert.deepEqual(afters, [null]);
+  assert.ok(!tried.includes("o-100"), "the first retry page is the oldest 100");
+  const r = await job.tick(at(2));
+  assert.deepEqual(afters[1], open[99], "the next retry page starts after the last one");
+  assert.ok(tried.includes("o-100"), "the 101st open batch is retried");
+  assert.equal(r.flushed, 1);
+  await job.tick(at(3));
+  assert.equal(afters[2], null, "after a short page the window wraps to the start");
 });

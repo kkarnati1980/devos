@@ -19,7 +19,7 @@ export interface BatchLister {
   /** Projects a flush on IST day `day` can act on, oldest first, after `after` (PrismaQueueStore.projectsToFlush). */
   projectsToFlush(day: string, limit: number, after?: FlushCursor | null): Promise<FlushRow[]>;
   /** Projects with a batch still `raising`, or refused and not handed off (retries; PrismaQueueStore). */
-  projectsWithOpenBatch(limit: number): Promise<string[]>;
+  projectsWithOpenBatch(limit: number, after?: FlushCursor | null): Promise<FlushRow[]>;
   /** `raised` batches not yet settled whose card is decided (PrismaQueueStore.batchesToApply). */
   batchesToApply(limit: number): Promise<string[]>;
 }
@@ -48,6 +48,11 @@ export class CardBatchJob {
    * after it, so a pass cut by FLUSH_PAGES_MAX moves on through the list instead of re-reading the same first pages.
    */
   private flushResume: { day: string; after: FlushCursor } | null = null;
+  /**
+   * Codex PR143-r4: where the last retry page ended. Each later tick reads the next page of open batches after it and
+   * wraps to the start after a short page, so open batches that keep failing cannot hold the retry window forever.
+   */
+  private retryAfter: FlushCursor | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -110,12 +115,13 @@ export class CardBatchJob {
         // `seen` still skips a project listed twice in one tick (its key moved between reads).
         const seen = new Set<string>();
         let drained = !daily;
+        let shortPage = false;
         if (this.flushResume && this.flushResume.day !== day) this.flushResume = null;
-        let after: FlushCursor | null = daily ? (this.flushResume?.after ?? null) : null;
+        let after: FlushCursor | null = daily ? (this.flushResume?.after ?? null) : this.retryAfter;
         for (let page = 0; page < (daily ? FLUSH_PAGES_MAX : 1); page++) {
           const cursor: FlushCursor | null = after;
           const rows: FlushRow[] = await this.safe(
-            async () => (daily ? this.lister.projectsToFlush(day, BATCH, cursor) : (await this.lister.projectsWithOpenBatch(BATCH)).map((projectId) => ({ projectId, since: "" }))),
+            async () => (daily ? this.lister.projectsToFlush(day, BATCH, cursor) : this.lister.projectsWithOpenBatch(BATCH, cursor)),
             "card-batch-list-failed",
           );
           if (this.lastListFailed) break;
@@ -130,10 +136,12 @@ export class CardBatchJob {
               this.log({ level: "warn", msg: "card-batch-flush-failed", projectId });
             }
           }
-          if (rows.length < BATCH) { drained = true; break; }
+          if (rows.length < BATCH) { drained = true; shortPage = true; break; }
           after = rows[rows.length - 1]!;
         }
         if (daily) this.flushResume = drained ? null : after ? { day, after } : this.flushResume;
+        // A retry tick reads one page: a full page moves the window on, a short page wraps it to the start (r4).
+        else if (!this.lastListFailed) this.retryAfter = shortPage ? null : after;
         if (daily && drained) this.flushedDay = day;
       }
       return { applied, flushed };
