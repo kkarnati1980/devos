@@ -7,7 +7,7 @@ class StepError extends Error {
   constructor(step, code, retryable) { super(`${code}: provider said token=ghp_secret`); this.name = "StepError"; this.step = step; this.code = code; this.retryable = retryable; }
 }
 
-function harness({ projects = [{ id: "p1", slug: "one" }], provision = async () => [] } = {}) {
+function harness({ projects = [{ id: "p1", slug: "one", name: "One" }], provision = async () => [] } = {}) {
   const logs = [], building = [], cards = [], calls = [];
   const job = new ProvisionSweepJob({
     listProvisioning: async () => projects.filter((p) => !building.includes(p.id)),
@@ -63,7 +63,7 @@ test("d1: one project's failure does not stop the others; ticks never overlap", 
   let release;
   const gate = new Promise((r) => { release = r; });
   const h = harness({
-    projects: [{ id: "a", slug: "a" }, { id: "b", slug: "b" }],
+    projects: [{ id: "a", slug: "a", name: "A" }, { id: "b", slug: "b", name: "B" }],
     provision: async (p) => { if (p.id === "a") throw new Error("boom"); await gate; },
   });
   const first = h.job.tick();
@@ -76,7 +76,7 @@ test("d1: one project's failure does not stop the others; ticks never overlap", 
 
 test("d1: the name_conflict card is a deduplicable decision card in plain language", async () => {
   const { nameConflictCard } = await import("../dist/provision-sweep.js");
-  const c = nameConflictCard({ id: "p1", slug: "shop" }, "github/repo");
+  const c = nameConflictCard({ id: "p1", slug: "shop", name: "Shop" }, "github/repo");
   assert.equal(c.gate, "decision");
   assert.equal(c.action, "provision.name_conflict");
   assert.equal(c.target, "project:p1/github/repo");

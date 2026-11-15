@@ -20,6 +20,8 @@ import { PrismaIsolationStore } from "./isolation-store.js";
 import { PrismaWatchdogStore, RunnerWatchdogJob, type LinearReader } from "./runner-watchdog-runtime.js";
 import type { ModelRunner } from "@devos/analyst";
 import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
+import { buildProvisionSweep, PrismaProvisioningRows, type ProvisionModule, type ProvisionWiring } from "./provision-runtime.js";
+import type { ProvisionSweepJob } from "./provision-sweep.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -76,6 +78,8 @@ export interface Runtime {
   isolation: PrismaIsolationStore | null;
   /** DEVOS-220: the 30-minute runner watchdog; null without a vault or a Linear loader. main.ts starts it. */
   runnerWatchdog: RunnerWatchdogJob | null;
+  /** DEVOS-224 (M2.4-d1): provisions approved projects (start-up and every 60 s); null when off. main.ts starts it. */
+  provisionSweep: ProvisionSweepJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -103,6 +107,11 @@ export async function buildRuntime(
     loadAnalystEngine?: (db: DbClient, policy: PolicyEngine, apiKey: () => Promise<string | null>) => Promise<RunExecutor>;
     /** DEVOS-220: @devos/linear-sync's LinearClient, imported at runtime like @devos/db; `apiKey` reads the vault. */
     loadLinear?: (apiKey: () => Promise<string>) => Promise<LinearReader>;
+    /**
+     * DEVOS-224: @devos/provision, S3's apply() and @devos/isolation's hook factory, imported at runtime like
+     * @devos/db, so the API typechecks on its own. Absent or failing → the provisioning sweep is off (logged).
+     */
+    loadProvision?: () => Promise<{ mod: ProvisionModule; apply: ProvisionWiring["apply"]; isolationHook: (o: { store: PrismaIsolationStore }) => ProvisionWiring["afterStack"] }>;
   },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
@@ -119,7 +128,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, isolation: null, runnerWatchdog: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, isolation: null, runnerWatchdog: null, provisionSweep: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -205,7 +214,29 @@ export async function buildRuntime(
         log: (e) => stdoutSink({ ts: new Date().toISOString(), ...e }),
       })
     : null;
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog };
+  // DEVOS-224 (M2.4-d1): the provisioning sweep. Every create goes through this policy engine (never allowAll); the
+  // tokens are read from the vault by name at call time. Off, with a logged code, without a loader, a vault or its
+  // settings; a load failure never stops the API.
+  const log = (e: object) => stdoutSink({ ts: new Date().toISOString(), ...e });
+  const loaded = opts.loadProvision ? await opts.loadProvision().catch(() => null) : null;
+  const sweep = loaded
+    ? buildProvisionSweep({
+        mod: loaded.mod,
+        apply: loaded.apply,
+        afterStack: loaded.isolationHook({ store: isolation }),
+        db,
+        databaseUrl,
+        vault,
+        policy: engine as unknown as ProvisionWiring["policy"],
+        rows: new PrismaProvisioningRows(db, t),
+        raiseCard: (card) => approvalsCore.raiseCard(card),
+        log,
+        env,
+      })
+    : { off: opts.loadProvision ? "provision-load-failed" : "provision-not-loaded" };
+  const provisionSweep = "off" in sweep ? null : sweep;
+  if ("off" in sweep) log({ level: "warn", msg: "provision-sweep-off", code: sweep.off });
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog, provisionSweep };
 }
 
 /**

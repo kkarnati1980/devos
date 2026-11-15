@@ -9,6 +9,8 @@
 export interface ProvisioningProject {
   id: string;
   slug: string;
+  /** The repo description (github/repo step). */
+  name: string;
 }
 
 /** The fields of `@devos/provision`'s StepError the sweep reads (structural, so no import is needed). */

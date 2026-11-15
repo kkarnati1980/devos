@@ -19,7 +19,7 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog, provisionSweep } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadLinear: async (apiKey) => {
@@ -28,6 +28,15 @@ async function main(): Promise<void> {
       const linearModuleName = "@devos/linear-sync";
       const { LinearClient } = (await import(linearModuleName)) as { LinearClient: new (o: { apiKey: () => Promise<string> }) => LinearReader };
       return new LinearClient({ apiKey });
+    },
+    loadProvision: async () => {
+      // DEVOS-224: the provisioner, S3's template apply() and S4's afterStack hook, imported at runtime like @devos/db.
+      // apply.mjs is resolved from the image's /app/scripts/template (Dockerfile), relative to apps/api/dist.
+      const provisionModuleName = "@devos/provision";
+      const isolationModuleName = "@devos/isolation";
+      const applyUrl = new URL("../../../scripts/template/apply.mjs", import.meta.url).href;
+      const [mod, iso, tpl] = await Promise.all([import(provisionModuleName), import(isolationModuleName), import(applyUrl)]);
+      return { mod, apply: tpl.apply, isolationHook: iso.isolationHook };
     },
     loadDb: async (url) => {
       // @devos/db is a declared dependency of @devos/api (PR14-r1); it is imported at runtime so the
@@ -93,9 +102,11 @@ async function main(): Promise<void> {
   analystSweep?.start();
   // DEVOS-220: the runner watchdog, at start-up and every 30 minutes.
   runnerWatchdog?.start();
-  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); runnerWatchdog?.stop(); isolationServer?.close(); });
-  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); runnerWatchdog?.stop(); isolationServer?.close(); });
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null, runnerWatchdog: runnerWatchdog !== null });
+  // DEVOS-224: provisions approved projects, at start-up and every 60 s.
+  provisionSweep?.start();
+  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); isolationServer?.close(); });
+  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); isolationServer?.close(); });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null, runnerWatchdog: runnerWatchdog !== null, provisionSweep: provisionSweep !== null });
 }
 
 main().catch((e: unknown) => {
