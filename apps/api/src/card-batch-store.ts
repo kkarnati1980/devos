@@ -35,6 +35,21 @@ export interface CardBatchStoreOptions {
 
 const LOCK_SQL = "SELECT pg_try_advisory_lock(hashtext('devos:card-batch:' || $1::text)) AS ok";
 const UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtext('devos:card-batch:' || $1::text)) AS ok";
+/** Races `p` against `ms` (client-side bound, as M2.4's `bounded`, Codex PR44-r2): a half-open link cannot hang. */
+function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<never>((_, reject) => {
+    t = setTimeout(() => reject(new Error(`card-batch-lock-timeout:${what}`)), ms);
+  });
+  return Promise.race([p, timer]).finally(() => clearTimeout(t));
+}
+
+/** A list limit as a positive integer at most CARD_BATCH_LIST_MAX (anything else gives the maximum). */
+function listLimit(v: unknown): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : CARD_BATCH_LIST_MAX;
+  return Math.min(Math.max(1, n), CARD_BATCH_LIST_MAX);
+}
+
 /** Batches or projects one sync tick reads (the rest are reached on later ticks; bounded reads, ADR-0011 §9). */
 export const CARD_BATCH_LIST_MAX = 100;
 
@@ -186,53 +201,74 @@ export class PrismaQueueStore implements QueueStore {
   }
 
   private async openLock(): Promise<LockConnection> {
-    if (this.o.connectLock) return this.o.connectLock();
-    const c = new pg.Client({ connectionString: this.o.databaseUrl, connectionTimeoutMillis: this.timeoutMs, statement_timeout: this.timeoutMs });
-    await c.connect();
+    if (this.o.connectLock) return bounded(this.o.connectLock(), this.timeoutMs, "connect");
+    const c = new pg.Client({ connectionString: this.o.databaseUrl, connectionTimeoutMillis: this.timeoutMs, statement_timeout: this.timeoutMs, query_timeout: this.timeoutMs });
+    c.on("error", () => {});
+    try {
+      await bounded(c.connect(), this.timeoutMs, "connect");
+    } catch (e) {
+      void c.end().catch(() => {});
+      throw e;
+    }
     return c as unknown as LockConnection;
   }
 
   async withBatchLock<T>(batchId: string, fn: () => Promise<T>): Promise<{ locked: true; value: T } | { locked: false }> {
     const conn = await this.openLock();
-    // An idle connection error (the server went away) must not crash the process; the lock is gone with it.
+    // An idle connection error (the server went away) must not crash the process; the lock is gone with it. A lock
+    // lost while `fn` runs is not detected (pre-review CR-b2b finding 4): the bound is M2.3's pending-twin dedupe
+    // and the next flush's lookup by target (contract, CR-b2b runner decisions).
     conn.on("error", () => {});
+    const ms = this.timeoutMs;
     try {
-      const r = await conn.query(LOCK_SQL, [batchId]);
+      const r = await bounded(conn.query(LOCK_SQL, [batchId]), ms, "lock");
       if (r.rows[0]?.ok !== true) return { locked: false };
       try {
         return { locked: true, value: await fn() };
       } finally {
-        await conn.query(UNLOCK_SQL, [batchId]).catch(() => {});
+        await bounded(conn.query(UNLOCK_SQL, [batchId]), ms, "unlock").catch(() => {});
       }
     } finally {
-      await conn.end().catch(() => {});
+      await bounded(conn.end(), ms, "end").catch(() => {});
     }
   }
 
   // The sync job's reads (CR-b2d wiring): bounded, oldest first.
 
-  /** Raised batches not yet settled (rule 9; Codex PR135-r1), oldest first. */
+  /**
+   * Raised batches not yet settled whose card is decided (rule 9; Codex PR135-r1), oldest first. Batches with a
+   * pending card are left out, so they cannot fill the window and starve a decided one (pre-review CR-b2b finding 2).
+   */
   batchesToApply(limit = CARD_BATCH_LIST_MAX) {
     return this.tx(async (tx) => {
       const rows = await tx.$queryRawUnsafe(
-        "SELECT id FROM card_batch WHERE state = 'raised' AND settled_at IS NULL ORDER BY created_at, id LIMIT $1",
-        Math.min(Math.max(1, limit), CARD_BATCH_LIST_MAX),
+        `SELECT cb.id FROM card_batch cb JOIN approval a ON a.id = cb.card_id
+          WHERE cb.state = 'raised' AND cb.settled_at IS NULL AND a.status <> 'pending'
+          ORDER BY cb.created_at, cb.id LIMIT $1::int`,
+        listLimit(limit),
       );
       return rows.map((r: any) => r.id as string);
     });
   }
 
-  /** Projects with a question not yet in a batch, or a batch still `raising` or refused and not handed off. */
-  projectsToFlush(limit = CARD_BATCH_LIST_MAX) {
+  /**
+   * Projects a flush on IST day `day` can act on: a question not yet in a batch while the project has no batch for
+   * `day` (pre-review CR-b2b finding 6: one waiting for tomorrow takes no slot), or a batch still `raising` or
+   * refused and not handed off.
+   */
+  projectsToFlush(day: string, limit = CARD_BATCH_LIST_MAX) {
     return this.tx(async (tx) => {
       const rows = await tx.$queryRawUnsafe(
         `SELECT project_id FROM (
-           SELECT project_id, min(queued_at) AS since FROM queued_question WHERE batch_id IS NULL GROUP BY project_id
+           SELECT q.project_id, min(q.queued_at) AS since FROM queued_question q
+            WHERE q.batch_id IS NULL
+              AND NOT EXISTS (SELECT 1 FROM card_batch d WHERE d.project_id = q.project_id AND d.ist_day = $2)
+            GROUP BY q.project_id
            UNION ALL
            SELECT project_id, min(created_at) FROM card_batch
             WHERE state = 'raising' OR (state = 'refused' AND handed_off_at IS NULL) GROUP BY project_id
-         ) p GROUP BY project_id ORDER BY min(since), project_id LIMIT $1`,
-        Math.min(Math.max(1, limit), CARD_BATCH_LIST_MAX),
+         ) p GROUP BY project_id ORDER BY min(since), project_id LIMIT $1::int`,
+        listLimit(limit), day,
       );
       return rows.map((r: any) => r.project_id as string);
     });
@@ -278,12 +314,21 @@ export function approvalBatchCards(approvals: Approvals, tasks?: TaskProjects): 
   return cards;
 }
 
-/** `TaskProjects` over Prisma (one bounded read). */
-export function prismaTaskProjects(db: { task: { findMany(a: unknown): Promise<{ id: string; projectId: string | null }[]> } }): TaskProjects {
+/** `TaskProjects` over Prisma: one read in a bounded transaction (ADR-0011 timeouts; pre-review CR-b2b finding 3). */
+export function prismaTaskProjects(db: PrismaTxLike, timeoutMs = 10_000): TaskProjects {
   return {
-    async taskProjects(ids) {
-      const rows = await db.task.findMany({ where: { id: { in: [...new Set(ids)] } }, select: { id: true, projectId: true } });
-      return new Map(rows.map((r) => [r.id, r.projectId]));
+    taskProjects(ids) {
+      return db.$transaction(
+        async (tx: any) => {
+          await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
+          const rows: { id: string; project_id: string | null }[] = await tx.$queryRawUnsafe(
+            "SELECT id, project_id FROM task WHERE id = ANY($1::uuid[])",
+            [...new Set(ids)],
+          );
+          return new Map(rows.map((r) => [r.id, r.project_id]));
+        },
+        { timeout: timeoutMs, maxWait: timeoutMs },
+      );
     },
   };
 }

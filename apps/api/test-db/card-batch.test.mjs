@@ -95,6 +95,7 @@ test("AT8b (db): with A's connection dropped between raise and record, B finds t
   const a = new pg.Client({ connectionString: url });
   await a.connect();
   a.on("error", () => {});
+  try {
   const got = await a.query("SELECT pg_try_advisory_lock(hashtext('devos:card-batch:' || $1::text)) AS ok", [claimed.id]);
   assert.equal(got.rows[0].ok, true);
   const name = (await db.project.findUnique({ where: { id: projectId } })).name;
@@ -105,6 +106,9 @@ test("AT8b (db): with A's connection dropped between raise and record, B finds t
   await approvals.approve(KK, raised.id);
   assert.equal(await status(t1), "ready");
   await a.end(); // the crash: the lock goes with the connection
+  } finally {
+    await a.end().catch(() => {});
+  }
   const b = await queue.flushBatch(projectId, DAY1_LATE);
   assert.deepEqual([b.outcome, b.cardId], ["recorded", raised.id]);
   assert.equal((await batchCards(projectId)).length, 1, "one card in total");
@@ -158,4 +162,44 @@ test("CR-b2b: card_batch refuses a second batch for the same project and IST day
   await assert.rejects(db.$executeRawUnsafe("INSERT INTO card_batch (id, project_id, ist_day) VALUES (gen_random_uuid(), $1::uuid, '2026-11-14')", projectId));
   await assert.rejects(db.$executeRawUnsafe("INSERT INTO card_batch (id, project_id, ist_day, state) VALUES (gen_random_uuid(), $1::uuid, '2026-11-15', 'raised')", projectId));
   await assert.rejects(db.$executeRawUnsafe("INSERT INTO card_batch (id, project_id, ist_day) VALUES (gen_random_uuid(), $1::uuid, '15 Nov')", projectId));
+});
+
+test("AT8b (db): B claims the raising row while A holds the lock; after A records, B's re-read under the lock stops (already)", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, store, queue } = setup();
+  await queue.queueQuestion(projectId, ask("Which logo size?", "small", [t1]), DAY1);
+  const claimed = await store.claim(projectId, "2026-11-14", randomUUID());
+  // B has claimed (it got the raising row) but has not yet taken the lock when A records.
+  const bClaim = await store.claim(projectId, "2026-11-14", randomUUID());
+  assert.equal(bClaim.id, claimed.id);
+  const name = (await db.project.findUnique({ where: { id: projectId } })).name;
+  const raised = await approvals.raiseCard({ ...batchCard(name, claimed.id), reason: "1 questions\nBQ-1: Which logo size? (default: small)", projectId }, [t1]);
+  await store.markRaised(claimed.id, raised.id);
+  // B now runs its locked step: the re-read sees `raised` and stops. A stub claim hands B the stale row it held.
+  const stale = Object.create(store);
+  stale.claim = async () => bClaim;
+  const b = await new CardBatchQueue(stale, approvalBatchCards(approvals), randomUUID).flushBatch(projectId, DAY1_LATE);
+  assert.deepEqual([b.outcome, b.cardId], ["already", raised.id]);
+  assert.equal((await batchCards(projectId)).length, 1);
+});
+
+test("CR-b2b (db): two concurrent claims of one project and day make one batch; projectsToFlush skips a project waiting for tomorrow", async () => {
+  const { projectId } = await fixture(0);
+  const { store, queue } = setup();
+  await queue.queueQuestion(projectId, ask("Light or dark theme?", "light"), DAY1);
+  assert.ok((await store.projectsToFlush("2026-11-14")).includes(projectId));
+  const [x, y] = await Promise.all([store.claim(projectId, "2026-11-14", randomUUID()), store.claim(projectId, "2026-11-14", randomUUID())]);
+  assert.equal(x.id, y.id, "the second claim gets the first one's raising batch");
+  assert.equal(await db.cardBatch.count({ where: { projectId } }), 1);
+  await store.markRefused(x.id);
+  await store.markHandedOff(x.id, DAY1_LATE);
+  // A question queued after the day's batch waits for 15 Nov: it takes no slot on 14 Nov.
+  await queue.queueQuestion(projectId, ask("Show prices with tax?", "yes"), DAY1_LATE);
+  assert.ok(!(await store.projectsToFlush("2026-11-14")).includes(projectId));
+  assert.ok((await store.projectsToFlush("2026-11-15")).includes(projectId));
+  assert.ok((await store.projectsToFlush("2026-11-15", 2.5)).length <= 2, "a fractional limit is an integer");
+  // A batch whose card is still pending is not listed for apply.
+  const f = await queue.flushBatch(projectId, DAY2);
+  assert.equal(f.outcome, "raised");
+  assert.ok(!(await store.batchesToApply()).includes(f.batchId));
 });
