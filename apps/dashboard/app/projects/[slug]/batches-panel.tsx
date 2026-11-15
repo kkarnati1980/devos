@@ -54,13 +54,16 @@ export function BatchesPanel({ apiOrigin, slug }: { apiOrigin: string; slug: str
 }
 
 function BatchesBody({ view }: { view: BatchesView }) {
-  if (view.batches.length === 0 && view.waiting.length === 0) {
+  if (view.batches.length === 0 && view.waitingCount === 0) {
     return <p className="muted" data-testid="batches-empty">No build questions so far.</p>;
   }
   return (
     <>
-      {view.waiting.length ? (
-        <p data-testid="batches-waiting">{view.waiting.length} question{view.waiting.length === 1 ? "" : "s"} will join the next daily card.</p>
+      {view.waitingCount ? (
+        <p data-testid="batches-waiting">{view.waitingCount} question{view.waitingCount === 1 ? "" : "s"} will join the next daily card.</p>
+      ) : null}
+      {view.truncated ? (
+        <p className="muted small" data-testid="batches-truncated">Some older questions are not shown here (the list is capped); they are on their cards in Approvals.</p>
       ) : null}
       {view.batches.map((b) => (
         <article key={b.id} className="mcard" data-testid="batch">

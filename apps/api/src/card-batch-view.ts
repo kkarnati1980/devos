@@ -46,7 +46,11 @@ export interface BatchView {
 export interface BatchesView {
   /** Questions queued since the last flush; they join the next daily card. */
   waiting: { text: string; source: string; default: string; queuedAt: string }[];
+  /** How many questions wait in all (`waiting` lists at most BATCH_VIEW_WAITING_MAX). */
+  waitingCount: number;
   batches: BatchView[];
+  /** True when the members read hit BATCH_VIEW_QUESTIONS_MAX: the oldest listed batches may be incomplete. */
+  truncated: boolean;
 }
 
 export interface BatchRow {
@@ -76,6 +80,8 @@ export interface BatchViewSnapshot {
   decisions: { approvalId: string; itemId: string; answer: string; source: string }[];
   /** Tasks still `blocked` by a listed rejected or expired card. */
   stopped: { approvalId: string; id: string; title: string }[];
+  waitingCount: number;
+  truncated: boolean;
 }
 
 export interface BatchViewReader {
@@ -113,7 +119,7 @@ export async function batchesView(slug: string, reader: BatchViewReader): Promis
       stoppedTasks: stopsTasks ? snap.stopped.filter((t) => t.approvalId === b.cardId).map((t) => ({ id: t.id, title: t.title })) : [],
     };
   });
-  return { waiting, batches };
+  return { waiting, waitingCount: Math.max(snap.waitingCount, waiting.length), batches, truncated: snap.truncated };
 }
 
 export interface PrismaViewTxLike {
@@ -143,8 +149,11 @@ export class PrismaBatchViewStore implements Pick<BatchViewReader, "batchSnapsho
         const stopIds = b.filter((r) => r.card_status === "rejected" || r.card_status === "expired").map((r) => r.card_id as string);
         const members: any[] = batchIds.length
           ? await tx.$queryRawUnsafe(
-              `SELECT id, batch_id, text, source, default_answer, queued_at FROM queued_question
-                WHERE batch_id = ANY($1::uuid[]) ORDER BY batch_id, queued_at, id LIMIT $2`,
+              // Newest batch first, so a cut at the bound only ever shortens the oldest listed batches (pre-review #1).
+              `SELECT q.id, q.batch_id, q.text, q.source, q.default_answer, q.queued_at
+                 FROM queued_question q JOIN card_batch b ON b.id = q.batch_id
+                WHERE q.batch_id = ANY($1::uuid[])
+                ORDER BY b.ist_day DESC, b.created_at DESC, b.id, q.queued_at, q.id LIMIT $2`,
               batchIds, BATCH_VIEW_QUESTIONS_MAX,
             )
           : [];
@@ -152,6 +161,10 @@ export class PrismaBatchViewStore implements Pick<BatchViewReader, "batchSnapsho
           `SELECT id, batch_id, text, source, default_answer, queued_at FROM queued_question
             WHERE project_id = $1::uuid AND batch_id IS NULL ORDER BY queued_at, id LIMIT $2`,
           projectId, BATCH_VIEW_WAITING_MAX,
+        );
+        const counted: any[] = await tx.$queryRawUnsafe(
+          "SELECT count(*)::int AS n FROM queued_question WHERE project_id = $1::uuid AND batch_id IS NULL LIMIT $2",
+          projectId, 1,
         );
         const decisions: any[] = cardIds.length
           ? await tx.$queryRawUnsafe(
@@ -174,6 +187,8 @@ export class PrismaBatchViewStore implements Pick<BatchViewReader, "batchSnapsho
           questions: [...members.map(q), ...waiting.map(q)],
           decisions: decisions.map((r) => ({ approvalId: r.approval_id, itemId: r.item_id, answer: r.answer, source: r.source })),
           stopped: stopped.map((r) => ({ approvalId: r.approval_id, id: r.id, title: r.title })),
+          waitingCount: Number(counted[0]?.n ?? 0),
+          truncated: members.length >= BATCH_VIEW_QUESTIONS_MAX,
         };
       },
       { timeout: this.timeoutMs, maxWait: this.timeoutMs, isolationLevel: "RepeatableRead" },

@@ -93,7 +93,9 @@ export interface BatchView {
 }
 export interface BatchesView {
   waiting: { text: string; source: string; default: string; queuedAt: string }[];
+  waitingCount: number;
   batches: BatchView[];
+  truncated: boolean;
 }
 
 /** M1.6 notifications. */

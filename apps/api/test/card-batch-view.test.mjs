@@ -1,4 +1,4 @@
-// ADR-0012 CR-b2c (DEVOS-216): the project page's batch view (AT8a page part, AT11 page part) and its route.
+// ADR-0012 CR-b2c (DEVOS-216): the project page's batch view (AT8a page part, AT11 page part) and its store.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { batchesView, PrismaBatchViewStore, BATCH_VIEW_DAYS } from "../dist/card-batch-view.js";
@@ -18,7 +18,7 @@ test("AT8a (CR-b2c): the page lists all 12 questions of a batch whose card reaso
   const decisions = questions.map((x, i) => ({ approvalId: C2, itemId: `Q-${x.id}`, answer: i === 0 ? "no" : "Architect decides", source: i === 0 ? "kk" : "default" }));
   const v = await batchesView("shop", reader({
     batches: [{ id: "b2", istDay: "2026-11-15", state: "raised", cardId: C2, cardStatus: "approved", applied: true, handedOff: false }],
-    questions, decisions, stopped: [],
+    questions, decisions, stopped: [], waitingCount: 0, truncated: false,
   }));
   assert.equal(v.batches.length, 1);
   const b = v.batches[0];
@@ -47,6 +47,8 @@ test("AT11 page part (CR-b2c): a rejected or expired card lists its stopped task
       { approvalId: C2, id: "t9", title: "pending card's task" },
       { approvalId: "44444444-4444-4444-8444-444444444444", id: "t3", title: "Expired card's task" },
     ],
+    waitingCount: 250,
+    truncated: true,
   }));
   const [b3, b2, b1, b0] = v.batches;
   assert.deepEqual(b1.stoppedTasks, [{ id: "t1", title: "Build search" }, { id: "t2", title: "Index the catalogue" }]);
@@ -57,11 +59,13 @@ test("AT11 page part (CR-b2c): a rejected or expired card lists its stopped task
   assert.deepEqual(b0.questions.map((x) => x.ref), ["BQ-1"]);
   assert.equal(b0.handedOff, true);
   assert.deepEqual(v.waiting.map((w) => w.text), ["waiting one"]);
+  assert.equal(v.waitingCount, 250, "the real count, not the listed rows");
+  assert.equal(v.truncated, true);
 });
 
 test("CR-b2c: an unknown slug is null; a project with no batches is empty", async () => {
-  assert.equal(await batchesView("nope", reader({ batches: [], questions: [], decisions: [], stopped: [] })), null);
-  assert.deepEqual(await batchesView("shop", reader({ batches: [], questions: [], decisions: [], stopped: [] })), { waiting: [], batches: [] });
+  assert.equal(await batchesView("nope", reader({ batches: [], questions: [], decisions: [], stopped: [], waitingCount: 0, truncated: false })), null);
+  assert.deepEqual(await batchesView("shop", reader({ batches: [], questions: [], decisions: [], stopped: [], waitingCount: 0, truncated: false })), { waiting: [], waitingCount: 0, batches: [], truncated: false });
 });
 
 test("CR-b2c store: one REPEATABLE READ transaction with a statement timeout; every read is bounded and scoped", async () => {
@@ -77,6 +81,7 @@ test("CR-b2c store: one REPEATABLE READ transaction with a statement timeout; ev
           { id: "b2", ist_day: "2026-11-15", state: "raising", card_id: null, card_status: null, applied: false, handed_off: false },
         ];
       }
+      if (sql.includes("count(*)")) return [{ n: 7 }];
       if (sql.includes("FROM task_blocker")) return [{ approval_id: C1, id: "t1", title: "Build search" }];
       if (sql.includes("batch_id = ANY")) return [{ id: "qa", batch_id: "b1", text: "Q", source: "builder", default_answer: "no", queued_at: new Date("2026-11-14T03:00:00Z") }];
       return [];
@@ -98,4 +103,7 @@ test("CR-b2c store: one REPEATABLE READ transaction with a statement timeout; ev
   assert.equal(snap.questions[0].queuedAt, "2026-11-14T03:00:00.000Z");
   assert.deepEqual(snap.stopped, [{ approvalId: C1, id: "t1", title: "Build search" }]);
   assert.equal(snap.batches[1].cardId, null);
+  assert.equal(snap.waitingCount, 7);
+  assert.equal(snap.truncated, false);
+  assert.match(calls.find((c) => c.sql.includes("batch_id = ANY")).sql, /ORDER BY b\.ist_day DESC/, "a cut drops the oldest batches' questions first");
 });

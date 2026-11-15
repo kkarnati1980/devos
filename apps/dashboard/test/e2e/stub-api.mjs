@@ -77,6 +77,8 @@ export async function startStubApi(allowedOrigin) {
       return json(200, {
         batches: {
           waiting: [{ text: "Queued after the flush", source: "builder", default: "Architect decides", queuedAt: "2026-11-15T09:00:00.000Z" }],
+          waitingCount: 1,
+          truncated: false,
           batches: [
             {
               id: "b2", istDay: "2026-11-15", state: "raised", cardId: "c2", cardStatus: "approved", applied: true, handedOff: false,
