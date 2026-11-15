@@ -36,6 +36,9 @@ importers:
       '@devos/isolation':
         specifier: workspace:*
         version: link:../../packages/isolation
+      '@devos/linear-sync':
+        specifier: workspace:*
+        version: link:../../packages/linear-sync
       '@devos/policy':
         specifier: workspace:*
         version: link:../../packages/policy

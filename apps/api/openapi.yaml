@@ -120,7 +120,7 @@ paths:
       x-devos-access: open
       security: []
       responses:
-        "200": { description: Process is up; reports the deployed SHA }
+        "200": { description: Process is up; reports the deployed SHA and the runner watchdog's last tick (DEVOS-220) }
   /ready:
     get:
       operationId: ready

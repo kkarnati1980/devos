@@ -5,6 +5,7 @@ import { loadConfig, loadTls, startupErrorCode } from "./config.js";
 import { stdoutSink } from "./http.js";
 import { TailscaleWhoisResolver } from "./identity.js";
 import { buildRuntime, type DbClient } from "./runtime.js";
+import type { LinearReader } from "./runner-watchdog-runtime.js";
 import type { DeadLetterQueue } from "./dead-letters.js";
 import { analystModelPass, buildAnalystEngine, type RunEngineModule } from "./analyst-adapter.js";
 import { ANALYST_MAX_SECONDS } from "./analyst-runner.js";
@@ -18,9 +19,16 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
+    loadLinear: async (apiKey) => {
+      // DEVOS-220: M2.6's LinearClient (endpoint pinned to api.linear.app, timeout, read-only retries), imported at
+      // runtime like @devos/db so the API typechecks on its own.
+      const linearModuleName = "@devos/linear-sync";
+      const { LinearClient } = (await import(linearModuleName)) as { LinearClient: new (o: { apiKey: () => Promise<string> }) => LinearReader };
+      return new LinearClient({ apiKey });
+    },
     loadDb: async (url) => {
       // @devos/db is a declared dependency of @devos/api (PR14-r1); it is imported at runtime so the
       // API typechecks without the generated Prisma client (CI runs prisma generate).
@@ -83,9 +91,11 @@ async function main(): Promise<void> {
   requirementsSync?.start();
   // DEVOS-171: analyst runs the runner could not close (DB down) are closed and settled, at start-up and every 5 min.
   analystSweep?.start();
-  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); isolationServer?.close(); });
-  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); isolationServer?.close(); });
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null });
+  // DEVOS-220: the runner watchdog, at start-up and every 30 minutes.
+  runnerWatchdog?.start();
+  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); runnerWatchdog?.stop(); isolationServer?.close(); });
+  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); runnerWatchdog?.stop(); isolationServer?.close(); });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null, runnerWatchdog: runnerWatchdog !== null });
 }
 
 main().catch((e: unknown) => {
