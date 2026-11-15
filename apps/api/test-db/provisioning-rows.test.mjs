@@ -40,7 +40,7 @@ test("d1 rows: only live provisioning projects are listed; markBuilding moves on
   assert.equal(await stage(paused.id), "provisioning", "a project paused during its run is not moved to building");
 });
 
-test("d3a budget record: the move to building writes one provision.budget_recorded audit row with the cap, in the same transaction", async () => {
+test("d3a budget record: the move to building writes one provision.budget_recorded audit row with the cap; a repeat or a non-move writes none", async () => {
   const rows = new PrismaProvisioningRows(db, 5000);
   const p = await mk({ stage: "provisioning", capUsd: "42.5" });
   const intake = await mk({});

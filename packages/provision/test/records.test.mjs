@@ -28,6 +28,12 @@ test("d3a: two projects get distinct records; another project's row is never ado
   await runProvision(P.id, [backupScheduleStep(store, P)], { store, authorize: allowAll });
   await runProvision(Q.id, [backupScheduleStep(store, Q)], { store, authorize: allowAll });
   assert.deepEqual(store.resources.map((r) => r.externalId).sort(), [backupScheduleId(P.id), backupScheduleId(Q.id)].sort());
+  // Pre-review L2: with only Q's row present, P's lookup ignores it, even under the same name.
+  const only = new MemoryStore();
+  only.resources.push({ projectId: Q.id, provider: "backup_schedule", kind: "nightly", externalId: backupScheduleId(P.id), name: "acme/live" });
+  assert.equal(await backupScheduleStep(only, P).lookup(), null);
+  await assert.rejects(runProvision(P.id, [backupScheduleStep(only, P)], { store: only, authorize: allowAll }),
+    (e) => e instanceof StepError && e.code === "resource_owned_elsewhere");
 });
 
 test("AT12 shape d3a: a deny on provision.backup_schedule.nightly records nothing and counts no attempt", async () => {
