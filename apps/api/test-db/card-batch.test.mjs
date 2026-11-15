@@ -197,7 +197,7 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   await store.markRefused(x.id);
   await store.markHandedOff(x.id, DAY1_LATE);
   // A question queued after the day's batch waits for 15 Nov: it takes no slot on 14 Nov.
-  await queue.queueQuestion(projectId, ask("Show prices with tax?", "yes"), DAY1_LATE);
+  await queue.queueQuestion(projectId, ask("Show the product grid in two columns?", "yes"), DAY1_LATE);
   assert.ok(!(await store.projectsToFlush("2026-11-14")).includes(projectId));
   assert.ok((await store.projectsToFlush("2026-11-15")).includes(projectId));
   assert.ok((await store.projectsToFlush("2026-11-15", 2.5)).length <= 2, "a fractional limit is an integer");

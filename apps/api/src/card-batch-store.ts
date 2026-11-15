@@ -13,7 +13,6 @@ import type { BatchCards, CardBatch, DecisionRow, QueueStore, QueuedQuestion } f
 import { looksSecret } from "./notify.js";
 import type { Approvals } from "./approvals.js";
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
 export interface PrismaTxLike {
   $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T>;
 }
