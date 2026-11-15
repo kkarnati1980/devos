@@ -95,7 +95,7 @@ Guard paths are exempt from the content rules (their tests hold the very pattern
 | AT6 | A guard change mixed with any other change is a hit; alone with a decision note it is not |
 | AT7 | The CI job runs the base copy of the guard and finishes in ≤ 120 s |
 | AT8 | (GI-4c) A removed `npm audit` step named "Checks", a removed `pnpm build` step, an edited step and a removed job each carry their body in the hit text (`ran:` / `was:`/`now:`), and a body past the cut stays cut at 200 characters |
-| AT8b | (DEVOS-209, note 0026; for step bodies this replaces AT8's 200) A `ci-step-removed`/`ci-step-changed` text keeps up to 1000 characters, so a SHA-pinned setup step is stored whole; a body past 1000 stays cut at 1000; a removed job and every other rule stay cut at 200 (except `test-script-changed`, AT8c) |
+| AT8b | (DEVOS-209, note 0026; for step bodies this replaces AT8's 200) A `ci-step-removed`/`ci-step-changed` text keeps up to 1000 characters, so a SHA-pinned setup step is stored whole; a body past 1000 stays cut at 1000; a removed job and every other rule stay cut at 200 |
 | AT8c | (DEVOS-227, note 0027) A `test-script-changed` text keeps up to 1000 characters, so a script's old and new command are stored whole past 200; a text past 1000 stays cut at 1000. In `kk-only.mjs`, such a whole text with no security word is not KK-only; at 1000, or at exactly 200 (an older base guard's cut), it is (test K5) |
 
 ## Green (stored on DEVOS-140 after merge)
