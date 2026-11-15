@@ -137,6 +137,19 @@ test("AT4: a good read clears the failure clock, so a later outage needs its own
   assert.equal(out.flat().length, 0);
 });
 
+test("AT4: flapping Linear reads never alert more than once per 6 hours (Codex PR136-r1)", () => {
+  const { out } = run([
+    [{ ok: false }, T0],
+    [{ ok: false }, T0 + 120 * MIN],               // alert at 2 h
+    [seen(T0 + 140 * MIN), T0 + 150 * MIN],        // one good read
+    [{ ok: false }, T0 + 180 * MIN],
+    [{ ok: false }, T0 + 300 * MIN],               // 2 h of new failures, but only 3 h after the alert
+    [{ ok: false }, T0 + 480 * MIN],               // 6 h after the first alert
+  ]);
+  const alerts = out.map((n) => n.filter((x) => x.title === TITLE_LINEAR).length);
+  assert.deepEqual(alerts, [0, 1, 0, 0, 0, 1]);
+});
+
 test("AT5: after a silent alert, a newer comment gives exactly one 'active again', and a later silence alerts again", () => {
   const back = T0 + 200 * MIN;
   const { out, state } = run([

@@ -14,7 +14,7 @@ Every 30 minutes, read the newest comment time on the two runner logs (DEVOS-75 
 3. **State is stored (217b), not in memory,** so a redeploy inside a 6-hour window never repeats an alert.
 4. **"Activity" is the newest comment `createdAt` on either issue,** by anyone. An edited old comment is not new activity.
 5. **Cap pause:** when the newest comment across both issues is a `RUN END … idle: weekly cap reached` line, the silence is expected: a "paused by the weekly cap" note goes out at most once per 24 hours, and no silent alert. This holds only until the next weekly reset (Saturday 13:30 IST) plus 2 hours: runners still silent after that have stopped for another reason (for example, a payment problem), so the silent alert applies (pre-review finding 1).
-6. **While Linear cannot be read,** no silence judgement is made (the times are unknown). After 2 hours of failed reads, the "Linear API unreachable from the server" alert goes out (6-hour limit). The first good read clears the failure clock.
+6. **While Linear cannot be read,** no silence judgement is made (the times are unknown). After 2 hours of failed reads, the "Linear API unreachable from the server" alert goes out (6-hour limit). The first good read clears the failure clock, but not the last alert time, so flapping reads still get at most one alert per 6 hours (Codex PR136-r1).
 7. **Recovery:** after a silent alert, the first observation with a comment newer than the silence start sends one "build runners active again" line and clears the alert state. A newer comment that is already 2 hours old when first seen (after a Linear outage) moves the silence forward instead, so the two notices never go out together (pre-review finding 2).
 
 ## Interface (217a)
@@ -74,3 +74,4 @@ CI green and Codex PASS on the exact head SHA (D1).
 
 ## Build record
 - 15 Nov 2026, runner B: contract written; DEVOS-219 built first. Pre-review: 3 findings, 2 fixed (cap pause ends at the weekly reset; no recovery and silent alert in one step). Not fixed (low): a newer cap-idle line after a silent alert counts as recovery, because a run did start, so the account and connectors work again. Second round PASS, with 2 low findings recorded, not fixed: a wrong cap line posted just after a reset holds alerts for up to a week (runners post a cap idle only when the ledger is over the cap, so this needs a runner bug); and the cap note's "resume at the reset" wording can be up to 2 hours stale. Fixed: the stale doc comment on `step`.
+- 15 Nov 2026, runner B: Codex PR136-r1 (1 medium, accepted): a good read cleared the last Linear alert time, so flapping reads could alert every 3 hours. It is now kept; an AT4 test runs a flapping sequence (14/14).

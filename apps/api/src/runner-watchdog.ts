@@ -110,8 +110,8 @@ export function step(obs: Observation, state: WatchdogState, nowMs: number): { n
     return { notices, state: next };
   }
 
+  // The failure clock restarts, but the last alert time stays, so flapping reads never beat the 6-hour limit (PR136-r1).
   next.linearFailingSince = null;
-  next.linearAlertAt = null;
   const newest = obs.newest;
   const at = newest ? ms(newest.at) : null;
   if (!newest || at === null) return { notices, state: next };
