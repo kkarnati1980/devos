@@ -74,6 +74,27 @@ function splitTop(s) {
   return parts;
 }
 
+const UID = String.raw`(?:""|\w+)`; // an identifier after quoted names are blanked and `$` is folded
+const UQID = String.raw`${UID}(?:\.${UID})?`;
+// Clause parts that carry a name or a referential action, never a value: a constraint name, a collation, and a
+// REFERENCES target with its MATCH and ON DELETE/UPDATE actions (`SET DEFAULT` there is no column default).
+const NAME_PARTS = new RegExp(
+  String.raw`\bCONSTRAINT\s+${UID}|\bCOLLATE\s+${UQID}|\bREFERENCES\s+${UQID}(?:\s+MATCH\s+(?:FULL|PARTIAL|SIMPLE))?` +
+  String.raw`(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:NO\s+ACTION|RESTRICT|CASCADE|SET\s+NULL|SET\s+DEFAULT))*`, "g");
+
+/**
+ * Whether the part of an `ADD COLUMN` clause after the column name gives existing rows a value (PR125-r3/r6/r8).
+ * Parenthesised parts (type modifiers, CHECK, REFERENCES column lists, expressions) are removed, then names
+ * (constraint, collation, referenced table) and referential actions, so a name like `generated` or `default` and
+ * `ON DELETE SET DEFAULT` never count. What remains passes only with a type that is exactly a serial type, a
+ * `DEFAULT`, or `GENERATED {ALWAYS | BY DEFAULT} AS`; anything else fails closed.
+ */
+export function suppliesValue(def) {
+  const rest = topLevel(def).replace(NAME_PARTS, " ").replace(/\s+/g, " ").trim();
+  if (/^(SMALL|BIG)?SERIAL[248]?(?!\w)/.test(rest)) return true;
+  return /\bGENERATED\s+(ALWAYS|BY\s+DEFAULT)\s+AS\b/.test(rest) || /\bDEFAULT\b/.test(rest);
+}
+
 /** Refusal rule ids for one statement (upper case, literals blanked). */
 export function ruleHits(upperText) {
   // Postgres allows `$` inside an unquoted name, but regex `\b` treats it as a word break, so `where$archive` would
@@ -95,8 +116,7 @@ export function ruleHits(upperText) {
       // value source (PR125-r6); a serial type counts only in the type position. A clause that does not read as
       // `ADD [COLUMN] [IF NOT EXISTS] name type …` fails closed.
       const col = /\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:""|\w+)\s+(.*)$/.exec(clause);
-      const def = col ? col[1] : "";
-      if (!/^(SMALL|BIG)?SERIAL[248]?\b/.test(def) && !/\bDEFAULT\b|\bGENERATED\b/.test(def)) { hits.push("add-not-null-without-default"); break; }
+      if (!col || !suppliesValue(col[1])) { hits.push("add-not-null-without-default"); break; }
     }
   }
   return hits;
