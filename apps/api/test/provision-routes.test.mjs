@@ -101,6 +101,10 @@ test("d2 POST (AT11 CSRF half): refused without CSRF; un-parks with an audit row
     assert.deepEqual(audits, [P1]);
     const g = await call(port, "GET", `/projects/${P1}/provision`, { headers: { cookie: h.cookie } });
     assert.equal(g.json.parked, false);
+    const again = await call(port, "POST", `/projects/${P1}/provision`, { headers: h });
+    assert.equal(again.status, 409, "a project that is not parked is not retried again");
+    assert.ok(again.text.includes("project-not-parked"));
+    assert.deepEqual(audits, [P1], "a refused repeat writes no audit row");
     const wrong = await call(port, "POST", `/projects/${P2}/provision`, { headers: h });
     assert.equal(wrong.status, 409);
     assert.ok(wrong.text.includes("project-not-provisioning"));

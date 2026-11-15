@@ -7,7 +7,7 @@ import { DevosApi, explain, type ProvisionStepView, type ProvisionView } from ".
 
 const CODE_TEXT: Record<string, string> = {
   name_conflict: "needs your decision: something with this name already exists (see Approvals)",
-  approval_required: "needs your approval",
+  approval_required: "blocked by a policy rule that asks for approval (a grant for this step is needed)",
   policy_denied: "not allowed by policy",
   port_range_exhausted: "no free port left",
   compose_drift: "the deploy file was changed by hand",
@@ -40,7 +40,7 @@ export function ProvisioningPanel({ apiOrigin, slug }: { apiOrigin: string; slug
     const r = await api.provision(slug);
     if (!live()) return;
     if (r.ok) { setView(r.data); setMsg(null); }
-    else setMsg(`${panelError(r.code)} (${r.code})`);
+    else { setView(null); setMsg(`${panelError(r.code)} (${r.code})`); }
   }, [api, slug]);
 
   useEffect(() => {

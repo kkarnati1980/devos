@@ -373,7 +373,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: "`project-not-found`" }
-        "409": { description: "`project-not-provisioning`" }
+        "409": { description: "`project-not-provisioning`, or `project-not-parked` (the project is not parked)" }
         "503": { description: "`provision-not-configured` or `provision-store-failed`" }
   /vault/secrets:
     get:

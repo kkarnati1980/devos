@@ -91,6 +91,9 @@ export class ProvisionController {
     const p = await reader.project(id).catch(() => { throw httpError(503, "provision-store-failed"); });
     if (!p) throw httpError(404, "project-not-found");
     if (p.stage !== "provisioning") throw httpError(409, "project-not-provisioning");
+    // Pre-review L1: only a parked project is retried, so a repeated POST cannot reset the park counter of a run
+    // that is still failing and keep it hammering the provider.
+    if (!sweep.isParked(id)) throw httpError(409, "project-not-parked");
     const ok = await reader.recordRetry(id).catch(() => { throw httpError(503, "provision-store-failed"); });
     if (!ok) throw httpError(409, "project-not-provisioning");
     sweep.retry(id);
@@ -120,6 +123,7 @@ export class PrismaProvisionReader implements ProvisionReader {
     const rows = await this.tx((tx) => tx.provisionStep.findMany({
       where: { projectId },
       select: { key: true, provider: true, kind: true, status: true, attempts: true, lastError: true, updatedAt: true },
+      orderBy: { key: "asc" },
       take: 200,
     }));
     return (rows as any[]).map((r) => ({ ...r, provider: String(r.provider), status: String(r.status) }));
