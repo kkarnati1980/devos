@@ -194,6 +194,20 @@ test("B7 marker parsing: KEEP and CHANGE markers inline in the one-line summary 
   assert.equal(kept.exit, 0, "a file name with a space still matches");
 });
 
+test("B7b (DEVOS-223): a summary over several lines counts every marker line up to the blank line; the table never counts", async () => {
+  const multi = "\nFLOOR-GUARD KEEP fg-0123456789 a.yml:0 checkout pin\nFLOOR-GUARD KEEP fg-abcdef0123 b.yml:0 setup-node pin\nFLOOR-GUARD CHANGE scripts/floor-guard/floor-guard.mjs";
+  const table = "| medium | x | FLOOR-GUARD KEEP fg-9999999999 c.yml:0 quoted | y |\nFLOOR-GUARD KEEP fg-8888888888 d.yml:0 after the blank line\n\n";
+  const f = fake({ comments: [passComment(multi, { table })] });
+  const text = await passVerdictText(f.gh, REPO, 7, HEAD, "PR7-r2", "kkarnati1980");
+  const hits = ["fg-0123456789 a.yml", "fg-abcdef0123 b.yml", "fg-9999999999 c.yml", "fg-8888888888 d.yml"].map((x) => { const [id, file] = x.split(" "); return { id, file, line: 0 }; });
+  const d = applyDispositions({ sha: HEAD, exit: 1, hits }, { sha: HEAD, source: "codex", text });
+  assert.deepEqual(d.open.map((h) => h.id), ["fg-9999999999", "fg-8888888888"], "only the summary's two Keeps clear hits");
+  assert.ok(namesChange(text, "scripts/floor-guard/floor-guard.mjs"));
+  // The one-line layout is unchanged.
+  const one = await passVerdictText(fake({ comments: [passComment(" FLOOR-GUARD KEEP fg-0123456789 a.yml:0 ok")] }).gh, REPO, 7, HEAD, "PR7-r2", "kkarnati1980");
+  assert.equal(applyDispositions({ sha: HEAD, exit: 1, hits: [hits[0]] }, { sha: HEAD, source: "codex", text: one }).exit, 0);
+});
+
 test("B8 GC1 (local): a real .skip added to a test is a floor-guard hit the Release path refuses without a Keep", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "devos-gi1b-"));
   const g = (...a) => execFileSync("git", a, { cwd: dir, encoding: "utf8" });
