@@ -74,3 +74,10 @@ ALTER TABLE "card_batch" ADD CONSTRAINT "card_batch_project_id_fkey" FOREIGN KEY
 
 -- AddForeignKey
 ALTER TABLE "card_batch" ADD CONSTRAINT "card_batch_card_id_fkey" FOREIGN KEY ("card_id") REFERENCES "approval"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- Codex PR140-r2 (rule 8): at most one card per batch, ever, enforced atomically with the card's insert. M2.3's raise
+-- dedupes only a pending twin; a second `batch:<id>` card after the first was decided now fails its whole raise
+-- transaction (no card, no blocker), and the next flush's lookup by target records the existing card. Additive only:
+-- a partial unique index on the new `batch:` targets, which no earlier release writes. Prisma's schema cannot express
+-- a partial index, so it lives here only (as `run_open_analyst_started_idx`).
+CREATE UNIQUE INDEX "approval_batch_card_once" ON "approval" ("target") WHERE "gate" = 'decision'::"gate" AND "target" LIKE 'batch:%';
