@@ -301,6 +301,45 @@ export class PrismaQueueStore implements QueueStore {
   }
 
   /**
+   * CR-b2e (DEVOS-222): members of handed-off batches whose own `question:<id>` card KK approved and whose final
+   * `Q-<id>` row for that card is not written yet, oldest decision first, bounded.
+   */
+  memberCardsToApply(limit = CARD_BATCH_LIST_MAX) {
+    return this.tx(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(
+        `SELECT q.id, q.project_id, q.text, q.source, q.default_answer, q.blocks, q.queued_at, q.batch_id, a.id AS card_id
+           FROM queued_question q
+           JOIN card_batch b ON b.id = q.batch_id AND b.state = 'refused' AND b.handed_off_at IS NOT NULL
+           JOIN approval a ON a.project_id = q.project_id AND a.gate = 'decision' AND a.target = 'question:' || q.id::text
+                          AND a.status = 'approved'
+          WHERE NOT EXISTS (SELECT 1 FROM project_decision d WHERE d.project_id = q.project_id AND d.item_id = 'Q-' || q.id::text
+                              AND d.approval_id IS NOT NULL)
+          ORDER BY a.decided_at, a.id, q.id LIMIT $1::int`,
+        listLimit(limit),
+      );
+      return rows.map((r: any) => ({ question: toQuestion(r), cardId: r.card_id as string }));
+    });
+  }
+
+  /**
+   * CR-b2e: the question's final row, once per question (pre-review CR-b2e #1: even if two member cards exist for it,
+   * only the first applied writes); true when this call wrote it. The xact lock serialises two writers of one item.
+   */
+  recordMemberAnswer(row: DecisionRow) {
+    return this.tx(async (tx) => {
+      await tx.$queryRawUnsafe("SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:member-answer'), hashtext($1::text))) AS l", `${row.projectId} ${row.itemId}`);
+      const ins = await tx.$queryRawUnsafe(
+        `INSERT INTO project_decision (project_id, item_id, text, answer, source, approval_id)
+         SELECT $1::uuid, $2, $3, $4, $5, $6::uuid
+          WHERE NOT EXISTS (SELECT 1 FROM project_decision d WHERE d.project_id = $1::uuid AND d.item_id = $2 AND d.approval_id IS NOT NULL)
+         ON CONFLICT (approval_id, item_id) DO NOTHING RETURNING item_id`,
+        row.projectId, row.itemId, row.text, row.answer, row.source, row.approvalId,
+      );
+      return ins.length === 1;
+    });
+  }
+
+  /**
    * Projects with a batch still `raising`, or refused and not handed off (the job's retries), oldest first by
    * (`since`, `project_id`), after `after` (keyset pagination; the job rotates its retry window, Codex PR143-r4).
    */
