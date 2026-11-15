@@ -32,7 +32,7 @@ export class CardBatchJob {
 
   constructor(
     private readonly queue: CardBatchQueue,
-    private readonly approvals: Pick<Approvals, "raiseCard">,
+    private readonly approvals: Pick<Approvals, "raiseCard" | "store">,
     private readonly projectName: (projectId: string) => Promise<string | null>,
     private readonly lister: BatchLister,
     private readonly log: BatchLog,
@@ -93,13 +93,19 @@ export class CardBatchJob {
 
   /**
    * A refused batch's members, each as its own `decision` card at once (the caller side of pre-review CR-b2a
-   * finding 1). A stable target per question lets M2.3's pending-twin dedupe absorb a retry; the hand-off is
+   * finding 1). A stable target per question, looked up in any status before each raise, makes a retry raise each
+   * member at most once (even after KK decided its card); the hand-off is
    * confirmed only when every member was raised, so a failure retries on the next tick.
    */
   private async handOff(projectId: string, batchId: string, members: QueuedQuestion[], now: Date): Promise<void> {
     const name = ((await this.projectName(projectId)) ?? "").replace(/\*/g, "").trim() || "this project";
     for (const m of members) {
       const card = { gate: "decision" as const, action: `Answer a build question for ${name}`.slice(0, 200), target: `question:${m.id}`, reason: `${m.text} (default: ${m.default})`.slice(0, 2000), projectId };
+      // Pre-review CR-b2d finding 1: M2.3 dedupes only a pending twin. A member raised on an earlier tick whose card KK
+      // has since decided is found by target (any status) and skipped, so a retry never raises it again or
+      // re-blocks tasks KK released (as rule 8's lookup for the batch card).
+      const [existing] = await this.approvals.store.list({ projectId, gate: "decision", target: card.target, limit: 1 });
+      if (existing) continue;
       try {
         await this.approvals.raiseCard(card, m.blocks);
       } catch (e) {

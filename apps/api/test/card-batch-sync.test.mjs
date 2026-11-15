@@ -143,3 +143,51 @@ test("CR-b2d job: a batch is settled after its follow-ups; a crash before settle
   assert.ok(b2.settledAt);
   assert.equal(logs.filter((l) => l.msg === "card-batch-follow-up").length, 2);
 });
+
+test("CR-b2d job: a hand-off retry skips a member whose card KK already decided; a refused member is logged without its text", async () => {
+  // T1 does not exist in M2.3, so the batch card is refused and its members are handed off one by one.
+  const { approvals, approvalStore, store, q, job, logs } = wire({ tasks: false });
+  approvalStore.addTask(T2, T2, "ready", P);
+  await q.queueQuestion(P, { gate: "decision", text: "Dark header?", default: "yes", blocks: [T1] }, AT_0730_IST);
+  await q.queueQuestion(P, { gate: "decision", text: "Sticky footer?", default: "no", blocks: [T2] }, new Date(AT_0730_IST.getTime() + 1));
+  await q.queueQuestion(P, { gate: "decision", text: "Round avatars?", default: "yes", blocks: [] }, new Date(AT_0730_IST.getTime() + 2));
+  const raise = approvals.raiseCard.bind(approvals);
+  let failThird = true;
+  approvals.raiseCard = async (input, blocks) => {
+    if (input.target.startsWith("question:") && input.reason.startsWith("Round") && failThird) {
+      failThird = false;
+      throw new Error("db down");
+    }
+    if (input.target.startsWith("question:") && input.reason.startsWith("Sticky") && blocks.length === 0) throw new ApprovalError("invalid-input");
+    return raise(input, blocks);
+  };
+  await job.tick(AT_0800_IST);
+  const [b] = [...store.batches.values()];
+  assert.deepEqual([b.state, b.handedOffAt], ["refused", null], "the third member failed: the hand-off stays open");
+  const sticky = [...approvalStore.cards.values()].find((c) => c.reason.startsWith("Sticky"));
+  assert.equal(approvalStore.tasks.get(T2).status, "blocked");
+  // KK decides the second member's card before the retry; its task is released.
+  await approvalStore.decide(sticky.id, { status: "approved", by: "kk", at: new Date(AT_0800_IST.getTime() + 60_000) }, { action: "approval.decide", summary: "test", details: {} });
+  assert.equal(approvalStore.tasks.get(T2).status, "ready");
+  await job.tick(AT_0800_IST);
+  assert.ok(store.batches.get(b.id).handedOffAt, "handed off once every member is handled");
+  const reasons = [...approvalStore.cards.values()].map((c) => c.reason.split(" ")[0]).sort();
+  assert.deepEqual(reasons, ["Dark", "Round", "Sticky"], "each member raised once, none twice");
+  assert.equal(approvalStore.tasks.get(T2).status, "ready", "a decided member's tasks are never re-blocked");
+  // No log line carries question text or an error message.
+  for (const l of logs) assert.ok(!JSON.stringify(l).match(/Dark|Sticky|Round|db down/), JSON.stringify(l));
+});
+
+test("CR-b2d job: a failing list or flush is logged with a fixed code and the rest of the tick runs", async () => {
+  const { q, job, logs, lister } = wire();
+  await q.queueQuestion(P, { gate: "decision", text: "Dark header?", default: "yes", blocks: [] }, AT_0730_IST);
+  lister.batchesToApply = async () => { throw new Error("secret-ish detail"); };
+  assert.deepEqual(await job.tick(AT_0800_IST), { applied: 0, flushed: 1 });
+  assert.deepEqual(logs.map((l) => l.msg), ["card-batch-list-failed"]);
+  const flush = q.flushBatch.bind(q);
+  q.flushBatch = async () => { throw new Error("db down"); };
+  await job.tick(AT_0800_IST);
+  assert.ok(logs.some((l) => l.msg === "card-batch-flush-failed" && l.projectId === P));
+  assert.ok(!JSON.stringify(logs).includes("secret-ish") && !JSON.stringify(logs).includes("db down"));
+  q.flushBatch = flush;
+});
