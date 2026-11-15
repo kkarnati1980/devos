@@ -235,14 +235,14 @@ function memberAnswers(store, approvalStore) {
         if (!b || b.state !== "refused" || !b.handedOffAt) continue;
         for (const c of approvalStore.cards.values()) {
           if (c.gate !== "decision" || c.target !== `question:${m.id}` || c.projectId !== m.projectId || c.status !== "approved") continue;
-          if (store.decisions.some((d) => d.approvalId === c.id && d.itemId === `Q-${m.id}`)) continue;
+          if (store.decisions.some((d) => d.approvalId && d.projectId === m.projectId && d.itemId === `Q-${m.id}`)) continue;
           out.push({ question: m, cardId: c.id });
         }
       }
       return out;
     },
     async recordMemberAnswer(row) {
-      if (store.decisions.some((d) => d.approvalId === row.approvalId && d.itemId === row.itemId)) return false;
+      if (store.decisions.some((d) => d.approvalId && d.projectId === row.projectId && d.itemId === row.itemId)) return false;
       store.decisions.push({ ...row });
       return true;
     },
@@ -307,7 +307,7 @@ test("CR-b2e job: a member card approved without a BQ-1 line records the default
   const rows = store.decisions.filter((d) => d.approvalId === dark.id || d.approvalId === sticky.id).map((d) => [d.approvalId === dark.id ? "dark" : "sticky", d.source, d.answer]).sort();
   assert.deepEqual(rows, [["dark", "kk", "no"], ["sticky", "default", "no"]]);
   const follow = logs.filter((l) => l.msg === "card-batch-follow-up");
-  assert.ok(follow.length >= 1 && follow.every((l) => l.questionId === store.questions.find((x) => x.text === "Dark header?").id), "follow-up only for the changed answer, at least once");
+  assert.ok(follow.length === 2 && follow.every((l) => l.questionId === store.questions.find((x) => x.text === "Dark header?").id), "follow-up only for the changed answer, logged again after the crash");
   // A further tick writes nothing more.
   const n = store.decisions.length;
   await w.job.tick(AT_0800_IST);

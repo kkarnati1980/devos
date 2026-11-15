@@ -281,7 +281,8 @@ export class PrismaQueueStore implements QueueStore {
            JOIN card_batch b ON b.id = q.batch_id AND b.state = 'refused' AND b.handed_off_at IS NOT NULL
            JOIN approval a ON a.project_id = q.project_id AND a.gate = 'decision' AND a.target = 'question:' || q.id::text
                           AND a.status = 'approved'
-          WHERE NOT EXISTS (SELECT 1 FROM project_decision d WHERE d.approval_id = a.id AND d.item_id = 'Q-' || q.id::text)
+          WHERE NOT EXISTS (SELECT 1 FROM project_decision d WHERE d.project_id = q.project_id AND d.item_id = 'Q-' || q.id::text
+                              AND d.approval_id IS NOT NULL)
           ORDER BY a.decided_at, a.id, q.id LIMIT $1::int`,
         listLimit(limit),
       );
@@ -289,12 +290,18 @@ export class PrismaQueueStore implements QueueStore {
     });
   }
 
-  /** CR-b2e: the member card's final row, once; true when this call wrote it. */
+  /**
+   * CR-b2e: the question's final row, once per question (pre-review CR-b2e #1: even if two member cards exist for it,
+   * only the first applied writes); true when this call wrote it. The xact lock serialises two writers of one item.
+   */
   recordMemberAnswer(row: DecisionRow) {
     return this.tx(async (tx) => {
+      await tx.$queryRawUnsafe("SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:member-answer'), hashtext($1::text))) AS l", `${row.projectId} ${row.itemId}`);
       const ins = await tx.$queryRawUnsafe(
         `INSERT INTO project_decision (project_id, item_id, text, answer, source, approval_id)
-         VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid) ON CONFLICT (approval_id, item_id) DO NOTHING RETURNING item_id`,
+         SELECT $1::uuid, $2, $3, $4, $5, $6::uuid
+          WHERE NOT EXISTS (SELECT 1 FROM project_decision d WHERE d.project_id = $1::uuid AND d.item_id = $2 AND d.approval_id IS NOT NULL)
+         ON CONFLICT (approval_id, item_id) DO NOTHING RETURNING item_id`,
         row.projectId, row.itemId, row.text, row.answer, row.source, row.approvalId,
       );
       return ins.length === 1;
