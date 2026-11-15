@@ -74,6 +74,7 @@ export { MemoryRequirementsStore, type MemoryRequirement, type MemorySpec } from
 export {
   buildPreflight,
   preflightDecisions,
+  preflightReanswers,
   preflightEntries,
   preflightLine,
   PreflightError,
@@ -86,6 +87,7 @@ export {
   SECRET_NAME,
   ANSWER_MAX,
   type PreflightDecisionRow,
+  type PreflightReanswerRow,
   type PreflightEnvelope,
   type PreflightItem,
 } from "./preflight.js";

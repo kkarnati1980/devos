@@ -23,6 +23,8 @@ export function syncIntervalMs(v: string | undefined): number {
 /** The store read the job needs: projects whose newest doc is a draft linked to an approved card, oldest first. */
 export interface DraftLister {
   draftsAwaitingDecision(limit: number): Promise<string[]>;
+  /** DEVOS-204: projects whose approved intake card has comments not yet read for re-answers. */
+  reanswersAwaiting?(limit: number): Promise<string[]>;
 }
 
 export type SyncLog = (entry: { level: "warn"; msg: "requirements-sync-failed"; projectId: string }) => void;
@@ -53,6 +55,16 @@ export class RequirementsSyncJob {
       } catch {
         this.log({ level: "warn", msg: "requirements-sync-failed", projectId: "*" });
         return 0;
+      }
+      // DEVOS-204: re-answers get their own batch, so pending approvals never starve them (or the reverse). A failed
+      // list only skips the re-answers this tick.
+      if (this.lister.reanswersAwaiting) {
+        try {
+          const more = await this.lister.reanswersAwaiting(SYNC_BATCH);
+          ids = [...new Set([...ids, ...more])];
+        } catch {
+          this.log({ level: "warn", msg: "requirements-sync-failed", projectId: "*" });
+        }
       }
       let ok = 0;
       for (const id of ids) {
