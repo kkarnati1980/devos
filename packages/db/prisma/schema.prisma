@@ -368,6 +368,8 @@ model Project {
 
   specs              Spec[]
   decisions          ProjectDecision[]
+  queuedQuestions    QueuedQuestion[]
+  cardBatches        CardBatch[]
   requirementDocs    RequirementsDoc[]
   requirements       Requirement[]
   milestones         Milestone[]
@@ -455,6 +457,50 @@ model ProjectDecision {
   @@unique([commentId, itemId])
   @@index([projectId, itemId, createdAt])
   @@map("project_decision")
+}
+
+/// ADR-0012 CR-b (DEVOS-215): a non-urgent mid-build question waiting for the project's daily batch card (rule 7).
+model QueuedQuestion {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId     String   @map("project_id") @db.Uuid
+  text          String
+  source        String
+  defaultAnswer String   @map("default_answer")
+  /// Task ids the question blocks once its batch card is raised (M2.3 blockers).
+  blocks        String[] @default([]) @db.Uuid
+  queuedAt      DateTime @map("queued_at") @db.Timestamptz(6)
+  /// Null until a flush claims it; then never changes (membership is stable, rule 8).
+  batchId       String?  @map("batch_id") @db.Uuid
+
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  batch   CardBatch? @relation(fields: [batchId], references: [id], onDelete: Restrict)
+
+  @@index([projectId, batchId])
+  @@index([batchId, queuedAt])
+  @@map("queued_question")
+}
+
+/// ADR-0012 CR-b (DEVOS-215): at most one batch per project per IST day (rule 8).
+model CardBatch {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId   String    @map("project_id") @db.Uuid
+  /// `YYYY-MM-DD` in IST (CHECK in the migration).
+  istDay      String    @map("ist_day")
+  /// `raising | raised | refused` (CHECK in the migration).
+  state       String    @default("raising")
+  cardId      String?   @map("card_id") @db.Uuid
+  appliedAt   DateTime? @map("applied_at") @db.Timestamptz(6)
+  handedOffAt DateTime? @map("handed_off_at") @db.Timestamptz(6)
+  settledAt   DateTime? @map("settled_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  card      Approval?        @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  questions QueuedQuestion[]
+
+  @@unique([projectId, istDay])
+  @@index([state, settledAt])
+  @@map("card_batch")
 }
 
 model Requirement {
@@ -833,6 +879,7 @@ model Approval {
   deploys          Deploy[]
   notifications    Notification[]
   grants           ApprovalGrant[]
+  cardBatches      CardBatch[]
 
   @@index([projectId, status])
   @@index([status, createdAt])
