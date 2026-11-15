@@ -12,3 +12,5 @@
 **/.env.*
 docs
 scripts/phase0
+# DEVOS-224: the provisioner's S3 apply() reads the build-standard catalogue (the rest of docs stays out).
+!docs/standards/build-standard.yaml
