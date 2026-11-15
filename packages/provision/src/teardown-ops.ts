@@ -307,3 +307,30 @@ export async function pinnedGitHub(gh: GitHubClient): Promise<GitHubClient> {
   Object.defineProperty(c, "http", { value: http, enumerable: true });
   return c;
 }
+
+const COOLIFY_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * DEVOS-235 purge preflight: Coolify answers 404 for a uuid outside the token's team, so a token for the wrong team
+ * would make every Coolify project, environment and application look gone and blind the leftover scan. Before any
+ * delete, the token must read each of the project's still-active Coolify project rows: a 200 that carries the same
+ * uuid. A 404 (or any other answer) throws `coolify-token-scope`, so the purge stops with `provider_forbidden` and
+ * deletes nothing. A 5xx or timeout stays a transient ProviderError (the purge stops retryable). With no active
+ * Coolify project row there is nothing recorded to prove (docs/modules/M2.5.md, "DEVOS-235 decisions" 2).
+ */
+export function coolifyTokenScopeCheck(cf: CoolifyClient, recorded: () => Promise<readonly InventoryItem[]>): () => Promise<void> {
+  if (typeof recorded !== "function") throw new Error("coolify-recorded-invalid");
+  return async () => {
+    const rows = (await recorded()).filter((r) => r.provider === "coolify" && r.kind === "project");
+    for (const r of rows) {
+      if (!COOLIFY_UUID_RE.test(r.externalId)) throw new Error("coolify-token-scope: a recorded Coolify project id is not a uuid");
+      const res = await cf.http.get<{ uuid?: string }>(`/api/v1/projects/${r.externalId}`);
+      if (res.status === 404) {
+        throw new Error("coolify-token-scope: the Coolify token cannot see this project's Coolify project; use the token of the team that owns it");
+      }
+      if (res.status !== 200 || !res.body || typeof res.body !== "object" || res.body.uuid !== r.externalId) {
+        throw new Error(`coolify-token-scope: Coolify returned an inconclusive answer for the recorded project (${res.status})`);
+      }
+    }
+  };
+}
