@@ -17,6 +17,7 @@ import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.j
 import { parseSmtpConfig } from "./smtp.js";
 import { ExpiringRequirementsPipeline, approvalStepBoundMs, type ExpiryLog, type PendingCardLister } from "./requirements-expiry.js";
 import { PrismaRequirementsStore } from "./requirements-store.js";
+import { PrismaBatchViewStore, type PrismaViewTxLike } from "./card-batch-view.js";
 import { reanswerSettleMs, type RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
@@ -191,6 +192,8 @@ export async function buildRuntime(
     async () => (await setup.settings!.get()).analystModelPass);
   // CR-a3 (DEVOS-199): the pre-flight view asks the vault only whether a secret name is set.
   requirements.vault = vault ? { hasProject: (projectId, name) => vault.hasProject(projectId, name) } : null;
+  // CR-b2c (DEVOS-216): the project page's batch cards (read-only, one REPEATABLE READ snapshot).
+  requirements.batches = new PrismaBatchViewStore(db as unknown as PrismaViewTxLike, t);
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   // CR-b2d (DEVOS-218): the batched-question queue over Postgres (CR-b2b store; its raise lock is a session lock on
