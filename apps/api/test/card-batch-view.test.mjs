@@ -100,6 +100,9 @@ test("CR-b2c store: one REPEATABLE READ transaction with a statement timeout; ev
   assert.match(taskRead.sql, /t\.status = 'blocked'/);
   const decisionRead = calls.find((c) => c.sql.includes("FROM project_decision"));
   assert.deepEqual(decisionRead.v[0], [C1], "answers are read only for raised cards");
+  // PR144-r1: answers only for the listed members, so the bound cannot drop a displayed question's recorded answer.
+  assert.deepEqual(decisionRead.v[1], ["Q-qa"], "answers are read only for the listed questions");
+  assert.match(decisionRead.sql, /item_id = ANY\(\$2::text\[\]\)/);
   assert.equal(snap.questions[0].queuedAt, "2026-11-14T03:00:00.000Z");
   assert.deepEqual(snap.stopped, [{ approvalId: C1, id: "t1", title: "Build search" }]);
   assert.equal(snap.batches[1].cardId, null);

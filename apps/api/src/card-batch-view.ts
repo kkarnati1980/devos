@@ -166,11 +166,13 @@ export class PrismaBatchViewStore implements Pick<BatchViewReader, "batchSnapsho
           "SELECT count(*)::int AS n FROM queued_question WHERE project_id = $1::uuid AND batch_id IS NULL LIMIT $2",
           projectId, 1,
         );
-        const decisions: any[] = cardIds.length
+        // Only the answers of the listed members, so the bound never drops a displayed question's answer (PR144-r1).
+        const memberItems = members.map((m) => `Q-${m.id}`);
+        const decisions: any[] = cardIds.length && memberItems.length
           ? await tx.$queryRawUnsafe(
               `SELECT approval_id, item_id, answer, source FROM project_decision
-                WHERE approval_id = ANY($1::uuid[]) AND item_id LIKE 'Q-%' ORDER BY approval_id, item_id LIMIT $2`,
-              cardIds, BATCH_VIEW_QUESTIONS_MAX,
+                WHERE approval_id = ANY($1::uuid[]) AND item_id = ANY($2::text[]) ORDER BY approval_id, item_id LIMIT $3`,
+              cardIds, memberItems, BATCH_VIEW_QUESTIONS_MAX,
             )
           : [];
         const stopped: any[] = stopIds.length
