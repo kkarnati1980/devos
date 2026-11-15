@@ -12,6 +12,12 @@ import { isolationHook, DEFAULT_LIMITS } from "@devos/isolation";
 import { generateDeployCompose, parseCompose, assertPublished, DEPLOY_COMPOSE_HEADER, COMPOSE_PATH } from "../dist/index.js";
 
 const ROOT = new URL("../../../", import.meta.url);
+/** Compose `mem_limit` (a byte count, or a number with b/k/m/g) in bytes; NaN for anything else. */
+const memBytes = (v) => {
+  const m = /^(\d+(?:\.\d+)?)\s*([bkmg]?)b?$/i.exec(String(v ?? ""));
+  if (!m) return Number.NaN;
+  return Number(m[1]) * { "": 1, b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[m[2].toLowerCase()];
+};
 const { apply } = await import(new URL("scripts/template/apply.mjs", ROOT).href);
 
 function coreCompose() {
@@ -51,8 +57,8 @@ test("d3b: S4's real isolationHook hardens the real core compose.yaml for previe
     for (const [name, svc] of Object.entries(doc.services)) {
       // The core declares its own limits; S4 keeps them when they are within its caps (S4).
       assert.ok(Number(svc.cpus) > 0 && Number(svc.cpus) <= DEFAULT_LIMITS.caps.cpus, `${env} ${name} cpus ${svc.cpus}`);
-      assert.ok(svc.pids_limit > 0, `${env} ${name} pids_limit`);
-      assert.ok(svc.mem_limit !== undefined, `${env} ${name} mem_limit`);
+      assert.ok(svc.pids_limit > 0 && svc.pids_limit <= DEFAULT_LIMITS.caps.pids, `${env} ${name} pids_limit ${svc.pids_limit}`);
+      assert.ok(memBytes(svc.mem_limit) > 0 && memBytes(svc.mem_limit) <= DEFAULT_LIMITS.caps.memBytes, `${env} ${name} mem_limit ${svc.mem_limit}`);
       assert.notEqual(svc.privileged, true);
     }
     const net = `devos-p-shop-${hookEnv}`;

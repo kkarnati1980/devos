@@ -21,7 +21,7 @@ export interface PhaseRecord {
   at: string; // ISO time the phase was entered
   fingerprint: string; // hash of the provisioning code in the image when the cycle started
   inventory1?: InventoryRow[];
-  result?: { ok: boolean; code: string; detail?: string };
+  result?: { ok: boolean; code: string; detail?: string; cause?: string };
 }
 
 export type RunOutcome = "done" | "in_progress" | { error: string };
@@ -81,65 +81,88 @@ function due(last: PhaseRecord, d: ProbeDeps): boolean {
   return d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS;
 }
 
+/** Runs one effect; a throw becomes `{ thrown: true }` (its message is never kept: it may quote a provider body). */
+async function attempt<T>(fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false }> {
+  try { return { ok: true, value: await fn() }; } catch { return { ok: false }; }
+}
+
+/**
+ * Advances the probe by at most one phase and writes at most one phase row per call (so two rows of one call
+ * can never tie on `occurredAt`, pre-review L2). Any failure it can see before `purge` goes to `purge` with its
+ * fixed code, so the probe never leaves resources behind; a run or purge still in progress, or throwing, for
+ * PROBE_PHASE_MAX_MS ends the cycle (pre-review M1).
+ */
 export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
   const off = await d.offReason();
   if (off) return { exit: 3, phase: "idle", cycle: 0, code: "skipped", detail: off };
-  let last = await d.last();
+  const last = await d.last();
   const at = () => d.now().toISOString();
 
   if (!last || (last.phase === "done" && due(last, d))) {
     const cycle = (last?.cycle ?? 0) + 1;
-    last = { cycle, phase: "run1", at: at(), fingerprint: d.fingerprint };
-    await d.record(last);
-  } else if (last.phase === "done") {
+    await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint });
+    return { exit: 3, phase: "run1", cycle, code: "in_progress" };
+  }
+  if (last.phase === "done") {
     // Reported once when it finished; later ticks are skipped until the next cycle is due.
     return { exit: 3, phase: "done", cycle: last.cycle, code: "probed", detail: last.result?.code };
   }
 
   const { cycle, phase } = last;
-  const timedOut = () => d.now().getTime() - Date.parse(last!.at) >= PROBE_PHASE_MAX_MS;
-  const finish = async (ok: boolean, code: string, detail?: string): Promise<ProbeTick> => {
-    await d.record({ ...last!, phase: "done", at: at(), result: { ok, code, detail } });
-    return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail };
+  const timedOut = () => d.now().getTime() - Date.parse(last.at) >= PROBE_PHASE_MAX_MS;
+  const failed = (code: string, detail?: string) => ({ ok: false, code, detail });
+  const toPurge = async (result: { ok: boolean; code: string; detail?: string }): Promise<ProbeTick> => {
+    await d.record({ ...last, phase: "purge", at: at(), result });
+    return { exit: 3, phase: "purge", cycle, code: "in_progress" };
   };
   const advance = async (extra: Partial<PhaseRecord> = {}): Promise<ProbeTick> => {
     const to = nextPhase(phase);
-    await d.record({ ...last!, ...extra, phase: to, at: at() });
+    await d.record({ ...last, ...extra, phase: to, at: at() });
     return { exit: 3, phase: to, cycle, code: "in_progress" };
   };
+  const finish = async (ok: boolean, code: string, detail?: string, cause?: string): Promise<ProbeTick> => {
+    const result = { ok, code, ...(detail !== undefined ? { detail } : {}), ...(cause ? { cause } : {}) };
+    await d.record({ ...last, phase: "done", at: at(), result });
+    return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail };
+  };
+
+  // Pre-review L3: a deploy that changed the provisioning code mid-cycle makes the compare meaningless.
+  if (last.fingerprint !== d.fingerprint && phase !== "purge") return toPurge(failed("fingerprint-changed"));
 
   switch (phase) {
     case "run1":
     case "run2": {
-      const r = await d.provisionOnce();
-      if (r === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
-      if (r !== "done") {
-        const error = r === "in_progress" ? "timeout" : r.error;
-        // Purge whatever the failed run created, then report the run's failure (kept in the record).
-        await d.record({ ...last, phase: "purge", at: at(), result: { ok: false, code: `${phase}-failed`, detail: error } });
-        return { exit: 3, phase: "purge", cycle, code: "in_progress" };
-      }
-      return advance();
+      const r = await attempt(() => d.provisionOnce());
+      const v = r.ok ? r.value : "in_progress";
+      if (v === "done") return advance();
+      if (v === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
+      // Purge whatever the failed run created, then report the run's failure (kept in the record).
+      return toPurge(failed(`${phase}-failed`, v === "in_progress" ? "timeout" : v.error));
     }
-    case "inventory1":
-      return advance({ inventory1: await d.inventory() });
+    case "inventory1": {
+      const r = await attempt(() => d.inventory());
+      return r.ok ? advance({ inventory1: r.value }) : toPurge(failed("inventory1-failed", "error"));
+    }
     case "inventory2": {
-      const diff = inventoryDiff(last.inventory1 ?? [], await d.inventory());
+      const r = await attempt(() => d.inventory());
+      if (!r.ok) return toPurge(failed("inventory2-failed", "error"));
+      const diff = inventoryDiff(last.inventory1 ?? [], r.value);
       // A failed compare still purges the probe's resources: the failure is kept in the record.
-      if (diff) return advance({ result: { ok: false, code: "inventory-differs", detail: diff } });
-      return advance();
+      return diff ? toPurge(failed("inventory-differs", diff)) : advance();
     }
     case "assert": {
-      if (last.result && !last.result.ok) return advance();
-      const failed = await d.liveAsserts();
-      if (failed.length) return advance({ result: { ok: false, code: "live-assert-failed", detail: failed.join(",") } });
-      return advance();
+      const r = await attempt(() => d.liveAsserts());
+      if (!r.ok) return toPurge(failed("live-assert-failed", "error"));
+      return r.value.length ? toPurge(failed("live-assert-failed", r.value.join(","))) : advance();
     }
     case "purge": {
-      const p = await d.purge();
-      if (p === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
-      if (p !== "done") return finish(false, "purge-failed", p === "in_progress" ? "timeout" : p.error);
-      if (last.result && !last.result.ok) return finish(false, last.result.code, last.result.detail);
+      const r = await attempt(() => d.purge());
+      const v = r.ok ? r.value : "in_progress";
+      const earlier = last.result && !last.result.ok ? last.result : undefined;
+      if (v === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
+      // Pre-review L1: the earlier failure stays in the done row as `cause`.
+      if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier?.code);
+      if (earlier) return finish(false, earlier.code, earlier.detail);
       return finish(true, "pass");
     }
     default:
@@ -164,6 +187,10 @@ export async function ensureProbeProject(db: any, now: Date, timeoutMs: number):
   return db.$transaction(async (tx: any) => {
     const found = await tx.project.findUnique({ where: { slug: PROBE_SLUG }, select: { id: true, slug: true, name: true, pausedAt: true } });
     if (found) {
+      // Pre-review M2: only a row the probe created (its `provision.probe_started` audit row) is adopted. A real
+      // project that took the slug is never paused, provisioned or purged; the probe stops with a fixed code.
+      const mine = await tx.auditEvent.findFirst({ where: { projectId: found.id, action: "provision.probe_started" }, select: { id: true } });
+      if (!mine) throw new Error("probe-slug-taken");
       if (!found.pausedAt) await tx.project.updateMany({ where: { id: found.id, pausedAt: null }, data: { pausedAt: now } });
       return { id: found.id, slug: found.slug, name: found.name };
     }
