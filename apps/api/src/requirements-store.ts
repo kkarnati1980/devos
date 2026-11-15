@@ -7,6 +7,7 @@ import {
   type ApprovalDecisions,
   type DocRow,
   type DocStatus,
+  type PreflightReanswerRow,
   type ProjectRow,
   type RequirementsStore,
   type SaveAnalysisInput,
@@ -204,6 +205,61 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
+  /**
+   * DEVOS-204: projects whose newest doc is approved, has a pre-flight and an approved intake card, and that card has
+   * a comment newer than both its decision and the doc's re-answer cursor; oldest such comment first, at most
+   * `limit`. Read-only; the job applies the re-answers through `syncApproval`.
+   */
+  reanswersAwaiting(limit: number): Promise<string[]> {
+    const n = Math.max(1, Math.min(1000, Math.trunc(limit)));
+    return this.tx(async (tx) => {
+      const rows: { project_id: string }[] = await tx.$queryRaw`
+        SELECT d.project_id::text AS project_id FROM (
+          SELECT DISTINCT ON (project_id) project_id, status, approval_id, preflight, answers_synced_at
+          FROM requirements_doc ORDER BY project_id, version DESC
+        ) d
+        JOIN approval a ON a.id = d.approval_id AND a.gate = 'requirements' AND a.status = 'approved'
+        JOIN LATERAL (
+          SELECT min(c.created_at) AS first_new FROM approval_comment c
+          WHERE c.approval_id = a.id AND c.created_at > GREATEST(a.decided_at, COALESCE(d.answers_synced_at, a.decided_at))
+        ) c ON c.first_new IS NOT NULL
+        WHERE d.status = 'approved' AND d.preflight IS NOT NULL AND a.decided_at IS NOT NULL
+        ORDER BY c.first_new, d.project_id
+        LIMIT ${n}`;
+      return rows.map((r) => r.project_id);
+    });
+  }
+
+  /** DEVOS-204: the rows written with this approval (re-answer rows have no `approval_id`). */
+  approvalDecisions(approvalId: string): Promise<{ itemId: string; answer: string }[]> {
+    return this.tx(async (tx) => {
+      const rows = await tx.projectDecision.findMany({ where: { approvalId }, take: 500, select: { itemId: true, answer: true } });
+      return rows.map((r: { itemId: string; answer: string }) => ({ itemId: r.itemId, answer: r.answer }));
+    });
+  }
+
+  /**
+   * DEVOS-204: re-answer rows for an approved doc, in one transaction. The unique (comment, item) index makes a
+   * re-run a no-op; the cursor only moves forward. No project or task state is touched (rule 3).
+   */
+  recordReanswers(docId: string, rows: readonly PreflightReanswerRow[], seenUpTo: Date | null): Promise<boolean> {
+    return this.tx(async (tx) => {
+      const d = await tx.requirementsDoc.findUnique({ where: { id: docId }, select: { projectId: true, status: true } });
+      if (!d || d.status !== "approved") return false;
+      if (rows.length) {
+        await tx.projectDecision.createMany({
+          data: rows.map((r) => ({ projectId: d.projectId, approvalId: null, commentId: r.commentId, itemId: r.itemId, text: r.text, answer: r.answer, source: r.source })),
+          skipDuplicates: true,
+        });
+      }
+      if (seenUpTo) {
+        await tx.$executeRaw`UPDATE requirements_doc SET answers_synced_at = ${seenUpTo}
+          WHERE id = ${docId}::uuid AND (answers_synced_at IS NULL OR answers_synced_at < ${seenUpTo})`;
+      }
+      return true;
+    });
+  }
+
   docForApproval(approvalId: string): Promise<DocRow | null> {
     return this.tx(async (tx) => {
       const r = await tx.requirementsDoc.findFirst({ where: { approvalId }, orderBy: { version: "desc" }, select: { ...DOC_SELECT, preflight: true } });
@@ -281,22 +337,56 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
+  /** CR-a3 (DEVOS-199): the project row by slug, for the project page's pre-flight view. */
+  projectBySlug(slug: string): Promise<{ id: string; continuousRun: boolean } | null> {
+    return this.tx(async (tx) => {
+      const p = await tx.project.findUnique({ where: { slug }, select: { id: true, continuousRun: true } });
+      return p ? { id: p.id, continuousRun: p.continuousRun === true } : null;
+    });
+  }
+
+  /**
+   * CR-a3 (DEVOS-199): the decision log rows of one intake card (approval), oldest first, at most 500 rows.
+   * DEVOS-204: the approval's rows come first (item order), then the re-answers from that card's later comments in
+   * comment order (`created_at`, `id`), so the newest answer per item is always last. Rows written in one
+   * transaction share `created_at`, so that column alone cannot order them (pre-review finding 1).
+   */
+  decisions(projectId: string, approvalId: string): Promise<{ itemId: string; answer: string; source: string; createdAt: string }[]> {
+    return this.tx(async (tx) => {
+      type Row = { itemId: string; answer: string; source: string; createdAt: Date; comment?: { createdAt: Date; id: string } | null };
+      const select = { itemId: true, answer: true, source: true, createdAt: true } as const;
+      const approved: Row[] = await tx.projectDecision.findMany({ where: { projectId, approvalId }, orderBy: [{ createdAt: "asc" }, { itemId: "asc" }], take: 500, select });
+      const later: Row[] = await tx.projectDecision.findMany({
+        where: { projectId, comment: { approvalId } },
+        orderBy: [{ comment: { createdAt: "asc" } }, { commentId: "asc" }, { itemId: "asc" }],
+        take: 500,
+        select: { ...select, comment: { select: { createdAt: true, id: true } } },
+      });
+      const rows = [...approved, ...later].slice(0, 500);
+      return rows.map((r) => ({ itemId: r.itemId, answer: r.answer, source: r.source, createdAt: r.createdAt.toISOString() }));
+    });
+  }
+
   /**
    * `PreflightReader` for `preflightOpen` (apps/api/src/preflight.ts): the state and the newest doc's list in one
    * SQL statement, so both come from the same snapshot even under READ COMMITTED (Codex PR122-r2).
    */
-  preflightSnapshot(projectId: string): Promise<{ state: "pending" | "approved" | "rejected" | null; items: import("@devos/analyst").PreflightItem[] | null } | null> {
+  preflightSnapshot(projectId: string): Promise<import("./preflight.js").PreflightSnapshot | null> {
     return this.tx(async (tx) => {
-      const rows: { state: string; preflight: unknown }[] = await tx.$queryRaw`
-        SELECT p.preflight_state AS state,
-               (SELECT d.preflight FROM requirements_doc d WHERE d.project_id = p.id ORDER BY d.version DESC LIMIT 1) AS preflight
-        FROM project p WHERE p.id = ${projectId}::uuid`;
+      const rows: { state: string; preflight: unknown; approval_id: string | null }[] = await tx.$queryRaw`
+        SELECT p.preflight_state AS state, d.preflight AS preflight, d.approval_id::text AS approval_id
+        FROM project p
+        LEFT JOIN LATERAL (
+          SELECT r.preflight, r.approval_id FROM requirements_doc r WHERE r.project_id = p.id ORDER BY r.version DESC LIMIT 1
+        ) d ON true
+        WHERE p.id = ${projectId}::uuid`;
       const r = rows[0];
       if (!r) return null;
       const s = r.state;
       return {
         state: s === "pending" || s === "approved" || s === "rejected" ? s : null,
         items: Array.isArray(r.preflight) ? (r.preflight as import("@devos/analyst").PreflightItem[]) : null,
+        approvalId: r.approval_id ?? null,
       };
     });
   }

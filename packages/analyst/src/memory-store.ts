@@ -102,7 +102,9 @@ export class MemoryRequirementsStore implements RequirementsStore {
   }
 
   /** ADR-0012 rule 3: the project decision log (`project_decision`), unique on approval and item. */
-  readonly decisions: { projectId: string; approvalId: string; itemId: string; text: string; answer: string; source: string }[] = [];
+  readonly decisions: { projectId: string; approvalId: string | null; commentId?: string; itemId: string; text: string; answer: string; source: string }[] = [];
+  /** DEVOS-204: each approved doc's re-answer cursor (`requirements_doc.answers_synced_at`). */
+  readonly answersSyncedAt = new Map<string, Date>();
 
   private newestDraft(docId: string) {
     const d = this.docs.find((x) => x.id === docId);
@@ -125,6 +127,22 @@ export class MemoryRequirementsStore implements RequirementsStore {
       // DEVOS-205: a doc without a pre-flight on a `pending` project: its approval opens the state (as Prisma).
       this.preflightState.set(d.projectId, "approved");
     }
+    return true;
+  }
+
+  async approvalDecisions(approvalId: string): Promise<{ itemId: string; answer: string }[]> {
+    return this.decisions.filter((x) => x.approvalId === approvalId).map((x) => ({ itemId: x.itemId, answer: x.answer }));
+  }
+
+  async recordReanswers(docId: string, rows: readonly import("./preflight.js").PreflightReanswerRow[], seenUpTo: Date | null): Promise<boolean> {
+    const d = this.docs.find((x) => x.id === docId);
+    if (!d || d.status !== "approved") return false;
+    for (const { commentId, ...row } of rows) {
+      if (this.decisions.some((x) => x.commentId === commentId && x.itemId === row.itemId)) continue;
+      this.decisions.push({ projectId: d.projectId, approvalId: null, commentId, ...row });
+    }
+    const cur = this.answersSyncedAt.get(docId);
+    if (seenUpTo && (!cur || seenUpTo > cur)) this.answersSyncedAt.set(docId, seenUpTo);
     return true;
   }
 

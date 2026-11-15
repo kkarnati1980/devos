@@ -286,6 +286,21 @@ paths:
         "404": { description: "`project-not-found`" }
         "500": { description: "`requirements-store-error`" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/by-slug/{slug}/preflight:
+    get:
+      operationId: getProjectPreflight
+      summary: "ADR-0012 CR-a3: the project page's read-only pre-flight view (state, list, missing secret names, decision log)"
+      x-devos-access: session
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9-]{2,40}$" } }
+      responses:
+        "200": { description: "`{ preflight: { continuousRun, state, open, items, missingSecrets, secretsUnverified, decisions } }`; secret items carry names only" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "500": { description: "`requirements-store-error`" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /projects/{id}/requirements/sync:
     post:
       operationId: syncRequirementsApproval

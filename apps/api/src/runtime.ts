@@ -13,7 +13,7 @@ import { Notifier, PrismaNotificationStore, parseDashboardUrl } from "./notify.j
 import { parseSmtpConfig } from "./smtp.js";
 import { ExpiringRequirementsPipeline, approvalStepBoundMs, type ExpiryLog, type PendingCardLister } from "./requirements-expiry.js";
 import { PrismaRequirementsStore } from "./requirements-store.js";
-import type { RequirementsServices } from "./requirements.js";
+import { reanswerSettleMs, type RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 import { PrismaIsolationStore } from "./isolation-store.js";
@@ -176,6 +176,8 @@ export async function buildRuntime(
   const requirements = requirementsServices(requirementsStore, approvalsCore, approvalStore, runner, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), approvalStepBoundMs(approvalStore),
     // DEVOS-176: the `analyst.model_pass` setting, read before each pass (a change applies without a restart).
     async () => (await setup.settings!.get()).analystModelPass);
+  // CR-a3 (DEVOS-199): the pre-flight view asks the vault only whether a secret name is set.
+  requirements.vault = vault ? { hasProject: (projectId, name) => vault.hasProject(projectId, name) } : null;
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   // S4-a2b: the read side of GET /internal/isolation-state (and, in the M2.4-d wiring, the afterStack hook store).
@@ -221,7 +223,14 @@ export function requirementsServices(
     },
     expiryLog,
   );
-  return { pipeline, store, cards: { get: (id) => cards.get(id), ...(cards.comments ? { comments: (id: string) => cards.comments!(id) } : {}) } };
+  return {
+    pipeline,
+    store,
+    cards: { get: (id) => cards.get(id), ...(cards.comments ? { comments: (id: string) => cards.comments!(id) } : {}) },
+    // Codex PR130-r2: comments are written through the same approvals store, so a comment commits within its step
+    // bound; re-answers wait that bound plus a margin (never less than 30 s) before reading one.
+    reanswerSettleMs: reanswerSettleMs(expireStepMs),
+  };
 }
 
 type HeldFn<T> = (assertHeld: () => void) => Promise<T>;
