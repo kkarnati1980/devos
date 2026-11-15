@@ -73,4 +73,4 @@ CI green and Codex PASS on the exact head SHA (D1).
 - **v0.1.0 (15 Nov 2026, runner B):** contract, decisions and split.
 
 ## Build record
-- 15 Nov 2026, runner B: contract written; DEVOS-219 built first. Pre-review: 3 findings, 2 fixed (cap pause ends at the weekly reset; no recovery and silent alert in one step). Not fixed (low): a newer cap-idle line after a silent alert counts as recovery, because a run did start, so the account and connectors work again.
+- 15 Nov 2026, runner B: contract written; DEVOS-219 built first. Pre-review: 3 findings, 2 fixed (cap pause ends at the weekly reset; no recovery and silent alert in one step). Not fixed (low): a newer cap-idle line after a silent alert counts as recovery, because a run did start, so the account and connectors work again. Second round PASS, with 2 low findings recorded, not fixed: a wrong cap line posted just after a reset holds alerts for up to a week (runners post a cap idle only when the ledger is over the cap, so this needs a runner bug); and the cap note's "resume at the reset" wording can be up to 2 hours stale. Fixed: the stale doc comment on `step`.

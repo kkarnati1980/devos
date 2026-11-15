@@ -88,8 +88,9 @@ const notice = (title: string, body: string): NoticeInput => ({ kind: "info", ti
  * One watchdog step. Rules (contract, Behaviour 1–5):
  * - a failed read judges no silence; failures for 2 h give one Linear-unreachable alert per 6 h;
  * - a good read clears the failure clock; no comment at all judges nothing;
- * - an open silent alert followed by a newer comment gives one "active again" notice;
- * - newest comment ≥ 2 h old: a cap idle gives one cap note per 24 h, anything else one silent alert per 6 h.
+ * - an open silent alert followed by a newer comment under 2 h old gives one "active again" notice;
+ * - newest comment ≥ 2 h old: a cap idle (until the next weekly reset + 2 h) gives one cap note per 24 h,
+ *   anything else one silent alert per 6 h.
  */
 export function step(obs: Observation, state: WatchdogState, nowMs: number): { notices: NoticeInput[]; state: WatchdogState } {
   const now = new Date(nowMs).toISOString();
