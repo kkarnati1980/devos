@@ -25,26 +25,27 @@ jobs:
       # is read too, so a PR that deletes or narrows a check still has to pass it. The gate's CODE runs from the
       # PR's BASE commit (DEVOS-202, notes 0017 and 0023), the way floor-guard.yml runs the base guard: see the
       # "Use the base commit's copy" step.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: .gate-base
           sparse-checkout: .github/workflows
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
         with:
           version: 9.12.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version-file: .nvmrc
+          package-manager-cache: false
       - name: Install the gate's one dependency (yaml, pinned by the lockfile)
         run: pnpm install --frozen-lockfile --filter . --ignore-scripts
       # DEVOS-202: a third checkout, so the two above stay exactly as they were.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: .gate-src

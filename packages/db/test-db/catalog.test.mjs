@@ -21,6 +21,10 @@ const TABLES = [
   "isolation_stack",
   // ADR-0012 CR-a2 (docs/modules/ADR-0012.md)
   "project_decision",
+  // ADR-0012 CR-b2b (DEVOS-215)
+  "queued_question", "card_batch",
+  // DEVOS-220 (docs/modules/runner-watchdog.md)
+  "runner_watchdog_state",
 ];
 
 // Unique keys the contract names (table -> column lists).
@@ -46,7 +50,9 @@ const UNIQUES = {
   run_event: [["run_id", "seq"]],
   provision_step: [["project_id", "key"]],
   isolation_stack: [["project_id", "env"], ["idx"], ["subnet"], ["network"]],
-  project_decision: [["approval_id", "item_id"]],
+  project_decision: [["approval_id", "item_id"], ["comment_id", "item_id"]],
+  card_batch: [["project_id", "ist_day"]],
+  runner_watchdog_state: [["name"]],
   mechanism_flag: [["role", "mechanism"]],
 };
 
@@ -62,6 +68,7 @@ const CHECKS = [
   "isolation_stack_env_valid", "isolation_stack_idx_range", "isolation_stack_slug_valid", "isolation_stack_network_derived",
   "isolation_stack_subnet_derived",
   "project_preflight_state_valid", "project_decision_source_valid",
+  "queued_question_values_valid", "card_batch_ist_day_valid", "card_batch_state_valid", "card_batch_steps_valid",
 ];
 const TRIGGERS = [
   "requirements_doc_one_approved", "vault_secret_global_unique", "deploy_requires_pass",

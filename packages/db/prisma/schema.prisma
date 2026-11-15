@@ -368,6 +368,8 @@ model Project {
 
   specs              Spec[]
   decisions          ProjectDecision[]
+  queuedQuestions    QueuedQuestion[]
+  cardBatches        CardBatch[]
   requirementDocs    RequirementsDoc[]
   requirements       Requirement[]
   milestones         Milestone[]
@@ -411,17 +413,19 @@ model Spec {
 }
 
 model RequirementsDoc {
-  id         String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  projectId  String                @map("project_id") @db.Uuid
-  version    Int
-  repoPath   String                @map("repo_path")
-  commitSha  String?               @map("commit_sha")
-  status     RequirementsDocStatus @default(draft)
-  approvalId String?               @map("approval_id") @db.Uuid
+  id              String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId       String                @map("project_id") @db.Uuid
+  version         Int
+  repoPath        String                @map("repo_path")
+  commitSha       String?               @map("commit_sha")
+  status          RequirementsDocStatus @default(draft)
+  approvalId      String?               @map("approval_id") @db.Uuid
   /// ADR-0012 CR-a2: this version's PreflightItem[] (null outside continuous-run mode).
-  preflight  Json?
-  createdAt  DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+  preflight       Json?
+  /// DEVOS-204: newest KK comment time on the approved intake card already read for re-answers.
+  answersSyncedAt DateTime?             @map("answers_synced_at") @db.Timestamptz(6)
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   project  Project   @relation(fields: [projectId], references: [id], onDelete: Restrict)
   approval Approval? @relation(fields: [approvalId], references: [id], onDelete: Restrict)
@@ -441,14 +445,63 @@ model ProjectDecision {
   /// `kk | default | default-provisional` (CHECK in the migration).
   source     String
   approvalId String?  @map("approval_id") @db.Uuid
+  /// DEVOS-204: set on a re-answer row (a KK comment after the decision); `approval_id` is then null.
+  commentId  String?  @map("comment_id") @db.Uuid
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  project  Project   @relation(fields: [projectId], references: [id], onDelete: Restrict)
-  approval Approval? @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  project  Project          @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  approval Approval?        @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  comment  ApprovalComment? @relation(fields: [commentId], references: [id], onDelete: Restrict)
 
   @@unique([approvalId, itemId])
+  @@unique([commentId, itemId])
   @@index([projectId, itemId, createdAt])
   @@map("project_decision")
+}
+
+/// ADR-0012 CR-b (DEVOS-215): a non-urgent mid-build question waiting for the project's daily batch card (rule 7).
+model QueuedQuestion {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId     String   @map("project_id") @db.Uuid
+  text          String
+  source        String
+  defaultAnswer String   @map("default_answer")
+  /// Task ids the question blocks once its batch card is raised (M2.3 blockers).
+  blocks        String[] @default([]) @db.Uuid
+  queuedAt      DateTime @map("queued_at") @db.Timestamptz(6)
+  /// Null until a flush claims it; then never changes (membership is stable, rule 8).
+  batchId       String?  @map("batch_id") @db.Uuid
+
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  batch   CardBatch? @relation(fields: [batchId], references: [id], onDelete: Restrict)
+
+  @@index([projectId, batchId])
+  @@index([batchId, queuedAt])
+  @@map("queued_question")
+}
+
+/// ADR-0012 CR-b (DEVOS-215): at most one batch per project per IST day (rule 8).
+model CardBatch {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId   String    @map("project_id") @db.Uuid
+  /// `YYYY-MM-DD` in IST (CHECK in the migration).
+  istDay      String    @map("ist_day")
+  /// `raising | raised | refused` (CHECK in the migration).
+  state       String    @default("raising")
+  cardId      String?   @map("card_id") @db.Uuid
+  appliedAt   DateTime? @map("applied_at") @db.Timestamptz(6)
+  handedOffAt DateTime? @map("handed_off_at") @db.Timestamptz(6)
+  settledAt   DateTime? @map("settled_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  card      Approval?        @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  questions QueuedQuestion[]
+
+  @@unique([projectId, istDay])
+  @@index([state, settledAt])
+  @@index([cardId])
+  @@map("card_batch")
 }
 
 model Requirement {
@@ -827,6 +880,7 @@ model Approval {
   deploys          Deploy[]
   notifications    Notification[]
   grants           ApprovalGrant[]
+  cardBatches      CardBatch[]
 
   @@index([projectId, status])
   @@index([status, createdAt])
@@ -840,7 +894,8 @@ model ApprovalComment {
   body       String
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  approval Approval @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  approval  Approval          @relation(fields: [approvalId], references: [id], onDelete: Restrict)
+  decisions ProjectDecision[]
 
   @@index([approvalId])
   @@map("approval_comment")
@@ -1301,4 +1356,15 @@ model GuardMetric {
 
   @@index([role, windowEnd])
   @@map("guard_metric")
+}
+
+/// DEVOS-220 (docs/modules/runner-watchdog.md): the runner watchdog's state, one row (name 'runner-watchdog'), so a redeploy never
+/// repeats an alert inside its window.
+model RunnerWatchdogState {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String   @unique
+  state     Json
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("runner_watchdog_state")
 }

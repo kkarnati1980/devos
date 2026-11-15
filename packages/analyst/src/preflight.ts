@@ -115,6 +115,16 @@ export const ANSWER_MAX = 1000;
 // The answer starts with a non-space character: a blank `PF-<n>:` line is no answer (the default stands), pre-review r2.
 const ANSWER_LINE = /^\s*PF-(\d{1,4})\s*:\s*(\S.*?)\s*$/;
 
+/** The `PF-<n>: <answer>` lines of one comment, id → answer; the last line for an id wins. */
+function commentAnswers(body: string): Map<string, string> {
+  const answers = new Map<string, string>();
+  for (const line of String(body ?? "").split(/\r?\n/)) {
+    const m = ANSWER_LINE.exec(line);
+    if (m) answers.set(`PF-${Number(m[1])}`, m[2]!.slice(0, ANSWER_MAX));
+  }
+  return answers;
+}
+
 /**
  * One row per `decision` item, in item order: KK's answer from a `PF-<n>: <answer>` line of his comments, or the
  * item's default. The last line for an id wins (a later comment corrects an earlier one). Lines for unknown ids,
@@ -122,17 +132,51 @@ const ANSWER_LINE = /^\s*PF-(\d{1,4})\s*:\s*(\S.*?)\s*$/;
  */
 export function preflightDecisions(items: readonly PreflightItem[], comments: readonly string[]): PreflightDecisionRow[] {
   const answers = new Map<string, string>();
-  for (const body of comments) {
-    for (const line of String(body ?? "").split(/\r?\n/)) {
-      const m = ANSWER_LINE.exec(line);
-      if (m) answers.set(`PF-${Number(m[1])}`, m[2]!.slice(0, ANSWER_MAX));
-    }
-  }
+  for (const body of comments) for (const [id, a] of commentAnswers(body)) answers.set(id, a);
   const rows: PreflightDecisionRow[] = [];
   for (const it of items) {
     if (it.kind !== "decision") continue;
     const a = answers.get(it.id);
     rows.push(a === undefined ? { itemId: it.id, text: it.text, answer: it.default, source: "default" } : { itemId: it.id, text: it.text, answer: a, source: "kk" });
+  }
+  return rows;
+}
+
+/** DEVOS-204: one re-answer row, keyed by the comment that wrote it (unique on comment and item). */
+export interface PreflightReanswerRow {
+  commentId: string;
+  itemId: string;
+  text: string;
+  answer: string;
+  source: "kk";
+}
+
+/**
+ * DEVOS-204 (ADR-0012 rule 3, last sentence): KK's comments made after the intake card was decided, oldest first,
+ * against the answers recorded with the approval. Each comment is read in order; a `PF-<n>: <answer>` line for a
+ * `decision` item whose answer differs from the item's current answer gives one row and becomes the current answer.
+ * Unchanged answers, unknown ids, `secret` items and other text give nothing. Pure and deterministic: the same
+ * approval rows and comments always give the same rows, so a store keyed on (comment, item) can re-run it safely.
+ */
+export function preflightReanswers(
+  items: readonly PreflightItem[],
+  approved: readonly { itemId: string; answer: string }[],
+  laterComments: readonly { id: string; body: string }[],
+): PreflightReanswerRow[] {
+  const decision = new Map(items.filter((i) => i.kind === "decision").map((i) => [i.id, i] as const));
+  const current = new Map<string, string>();
+  for (const it of decision.values()) current.set(it.id, it.default);
+  for (const r of approved) if (decision.has(r.itemId)) current.set(r.itemId, r.answer);
+  const rows: PreflightReanswerRow[] = [];
+  for (const c of laterComments) {
+    const answers = [...commentAnswers(c.body)].filter(([id]) => decision.has(id));
+    // Item order within a comment, so the output does not depend on line order.
+    answers.sort(([a], [b]) => Number(a.slice(3)) - Number(b.slice(3)));
+    for (const [id, answer] of answers) {
+      if (current.get(id) === answer) continue;
+      current.set(id, answer);
+      rows.push({ commentId: c.id, itemId: id, text: decision.get(id)!.text, answer, source: "kk" });
+    }
   }
   return rows;
 }

@@ -6,14 +6,15 @@ import { PipelineError, type DocRow, type RequirementsPipeline, type Requirement
 import { httpError } from "./auth.js";
 import type { DevosRequest } from "./http.js";
 import { preflightView, type PreflightViewReader, type SecretPresence } from "./preflight.js";
+import { batchesView, type BatchViewReader } from "./card-batch-view.js";
 
 export const REQUIREMENTS = Symbol("devos:requirements");
 
 /** The slice of the M2.3 approval store this module reads (ApprovalStore satisfies it). */
 export interface CardReader {
-  get(id: string): Promise<{ id: string; gate: string; status: string } | null>;
+  get(id: string): Promise<{ id: string; gate: string; status: string; decidedAt?: Date | null } | null>;
   /** ADR-0012 CR-a2: the card's comments, oldest first (ApprovalStore.comments). */
-  comments?(id: string): Promise<{ body: string }[]>;
+  comments?(id: string): Promise<{ id?: string; body: string; createdAt?: Date }[]>;
 }
 
 export interface RequirementRowView {
@@ -30,6 +31,10 @@ export interface RequirementsServices {
   cards: CardReader | null;
   /** CR-a3 (DEVOS-199): the project vault's presence check for the pre-flight view; absent → secrets unverified. */
   vault?: SecretPresence | null;
+  /** DEVOS-204 (Codex PR130-r2): how old a comment must be before re-answers read it (`reanswerSettleMs`). */
+  reanswerSettleMs?: number;
+  /** CR-b2c (DEVOS-216): the batch cards' read side for the project page; absent → 503 batches-not-configured. */
+  batches?: Pick<BatchViewReader, "batchSnapshot"> | null;
 }
 
 /** The dashboard's project slug (apps/dashboard/lib/source.ts `isSlug`). */
@@ -89,18 +94,69 @@ function need<T>(v: T | null, code: string): T {
  * Applies the decision of the newest draft's requirements card, if it has one and it was decided. Idempotent:
  * safe to call on every read and from a periodic job.
  */
-export async function syncApproval(svc: RequirementsServices, projectId: string): Promise<DocRow | null> {
+export async function syncApproval(svc: RequirementsServices, projectId: string, now: Date = new Date()): Promise<DocRow | null> {
   const store = need(svc.store, "requirements-not-configured");
   const pipeline = need(svc.pipeline, "requirements-not-configured");
   const doc = await store.latestDoc(projectId);
-  if (!doc || doc.status !== "draft" || !doc.approvalId || !svc.cards) return doc;
+  if (!doc || !doc.approvalId || !svc.cards) return doc;
+  if (doc.status === "approved") {
+    await syncReanswers(svc, pipeline, doc.approvalId, now);
+    return doc;
+  }
+  if (doc.status !== "draft") return doc;
   const card = await svc.cards.get(doc.approvalId);
   if (!card || (card.status !== "approved" && card.status !== "rejected")) return doc;
   // ADR-0012 CR-a2: KK's comments carry the pre-flight answers (`PF-<n>: …`). A reader without comments gives none,
-  // so every item takes its default (the card is still applied).
-  const comments = card.status === "approved" && svc.cards.comments ? (await svc.cards.comments(card.id)).map((c) => c.body) : [];
+  // so every item takes its default (the card is still applied). DEVOS-204: only comments made up to the decision
+  // count here, whenever the sync runs; later ones are re-answers (`syncReanswers`).
+  const decidedAt = card.decidedAt ? card.decidedAt.getTime() : null;
+  const comments =
+    card.status === "approved" && svc.cards.comments
+      ? (await svc.cards.comments(card.id)).filter((c) => decidedAt === null || !c.createdAt || c.createdAt.getTime() <= decidedAt).map((c) => c.body)
+      : [];
   await pipeline.applyDecision(card, comments);
   return store.latestDoc(projectId);
+}
+
+/**
+ * DEVOS-204: how old a comment must be before re-answers read it. A comment's time is taken before its transaction
+ * commits (M2.3 `comment`, bounded by the approvals store's wait plus timeout), so one made just before `now` may not
+ * be visible yet; only comments older than the settle window are read, all of them committed (Codex PR130-r1). The
+ * window is the floor below, or `reanswerSettleMs(stepBound)` when the services were built with the store's bound.
+ */
+export const REANSWER_SETTLE_MS = 30_000;
+/** Slack added on top of the approvals store's step bound (clock steps between the API and Postgres, scheduling). */
+export const REANSWER_SETTLE_MARGIN_MS = 5_000;
+
+/**
+ * DEVOS-204 (Codex PR130-r2): the settle window for a comment store whose one write can take up to `commentStepMs`
+ * (connection wait plus transaction, `PrismaApprovalStore.stepBoundMs`): that bound plus a margin, never below
+ * REANSWER_SETTLE_MS. With `DEVOS_OUTBOUND_TIMEOUT_MS` at its 30 s maximum the bound is 60 s, so the window is 65 s.
+ */
+export function reanswerSettleMs(commentStepMs: number): number {
+  const step = Number.isFinite(commentStepMs) && commentStepMs > 0 ? commentStepMs : 0;
+  return Math.max(REANSWER_SETTLE_MS, step + REANSWER_SETTLE_MARGIN_MS);
+}
+
+/** DEVOS-204: re-answers from KK's comments made after the approved intake card was decided (ADR-0012 rule 3). */
+async function syncReanswers(svc: RequirementsServices, pipeline: RequirementsPipeline, approvalId: string, now: Date): Promise<void> {
+  const cards = svc.cards!;
+  if (!cards.comments) return;
+  const card = await cards.get(approvalId);
+  if (!card || card.gate !== "requirements" || card.status !== "approved" || !card.decidedAt) return;
+  const all = await cards.comments(card.id);
+  // Codex PR130-r1: only the settled prefix (comments at least the settle window old, PR130-r2) is read. Every comment in it
+  // has committed, so a comment that commits late can never land before rows already written from a later one;
+  // younger comments wait for a later tick (the lister keeps the project listed until the cursor passes them).
+  const cutoff = now.getTime() - (svc.reanswerSettleMs ?? REANSWER_SETTLE_MS);
+  const comments: { id: string; body: string; createdAt: Date }[] = [];
+  for (const c of all) if (c.id && c.createdAt && c.createdAt.getTime() <= cutoff) comments.push({ id: c.id, body: c.body, createdAt: c.createdAt });
+  const newest = comments.reduce<number | null>((m, c) => (m === null || c.createdAt.getTime() > m ? c.createdAt.getTime() : m), null);
+  // No settled comment after the decision: nothing to read and nothing to write (pre-review finding 2: a sync of
+  // an approved doc stays read-only then).
+  if (newest === null || newest <= card.decidedAt.getTime()) return;
+  const seenUpTo = new Date(newest);
+  await pipeline.applyReanswers({ id: card.id, gate: card.gate, status: card.status, decidedAt: card.decidedAt }, comments, seenUpTo);
 }
 
 @Controller("projects")
@@ -169,6 +225,22 @@ export class RequirementsController {
     const view = await preflightView(slug, store as PreflightViewReader, this.svc.vault ?? null).catch(mapError);
     if (!view) throw httpError(404, "project-not-found");
     return { preflight: view };
+  }
+
+  /**
+   * CR-b2c (DEVOS-216): the project page's "Build questions" section — recent batch cards with all their questions,
+   * the answers recorded with each card, and the tasks a rejected or expired card stopped. GET never writes.
+   */
+  @Get("by-slug/:slug/batches")
+  async batches(@Param("slug") slug: string) {
+    if (!SLUG.test(slug)) throw httpError(400, "invalid:slug");
+    const store = need(this.svc.store, "requirements-not-configured") as unknown as Partial<BatchViewReader>;
+    const batches = this.svc.batches ?? null;
+    if (typeof store.projectBySlug !== "function" || !batches) throw httpError(503, "batches-not-configured");
+    const reader: BatchViewReader = { projectBySlug: (s) => store.projectBySlug!(s), batchSnapshot: (id) => batches.batchSnapshot(id) };
+    const view = await batchesView(slug, reader).catch(mapError);
+    if (!view) throw httpError(404, "project-not-found");
+    return { batches: view };
   }
 
   /**

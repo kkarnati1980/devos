@@ -14,8 +14,10 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json .nvmrc .
 COPY apps/api/package.json apps/api/
 COPY apps/dashboard/package.json apps/dashboard/
 COPY packages/analyst/package.json packages/analyst/
+COPY packages/card-batch/package.json packages/card-batch/
 COPY packages/db/package.json packages/db/
 COPY packages/intake/package.json packages/intake/
+COPY packages/linear-sync/package.json packages/linear-sync/
 COPY packages/policy/package.json packages/policy/
 COPY packages/provision/package.json packages/provision/
 COPY packages/run-engine/package.json packages/run-engine/
@@ -24,6 +26,11 @@ COPY packages/teardown/package.json packages/teardown/
 RUN pnpm install --frozen-lockfile
 COPY apps apps
 COPY packages packages
+# DEVOS-224: the provisioner generates each project's S3 core with scripts/template/apply.mjs, which reads the
+# golden-path template and the build-standard catalogue.
+COPY scripts/template scripts/template
+COPY templates templates
+COPY docs/standards/build-standard.yaml docs/standards/build-standard.yaml
 RUN pnpm -r --workspace-concurrency=1 build
 
 FROM base AS runtime

@@ -27,12 +27,24 @@ importers:
       '@devos/analyst':
         specifier: workspace:*
         version: link:../../packages/analyst
+      '@devos/card-batch':
+        specifier: workspace:*
+        version: link:../../packages/card-batch
       '@devos/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@devos/isolation':
+        specifier: workspace:*
+        version: link:../../packages/isolation
+      '@devos/linear-sync':
+        specifier: workspace:*
+        version: link:../../packages/linear-sync
       '@devos/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@devos/provision':
+        specifier: workspace:*
+        version: link:../../packages/provision
       '@devos/run-engine':
         specifier: workspace:*
         version: link:../../packages/run-engine
@@ -45,6 +57,9 @@ importers:
       '@nestjs/platform-express':
         specifier: 11.2.8
         version: 11.2.8(@nestjs/common@11.2.8(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.2.8)
+      pg:
+        specifier: 8.23.1
+        version: 8.23.1
       reflect-metadata:
         specifier: 0.2.2
         version: 0.2.2
@@ -58,6 +73,9 @@ importers:
       '@types/node':
         specifier: ^22.7.0
         version: 22.20.5
+      '@types/pg':
+        specifier: 8.15.6
+        version: 8.15.6
       typescript:
         specifier: ^5.6.3
         version: 5.9.3
@@ -95,6 +113,19 @@ importers:
       '@devos/intake':
         specifier: workspace:*
         version: link:../intake
+    devDependencies:
+      '@types/node':
+        specifier: ^22.7.0
+        version: 22.20.5
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
+  packages/card-batch:
+    dependencies:
+      '@devos/analyst':
+        specifier: workspace:*
+        version: link:../analyst
     devDependencies:
       '@types/node':
         specifier: ^22.7.0

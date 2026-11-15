@@ -7,6 +7,7 @@ import {
   type ApprovalDecisions,
   type DocRow,
   type DocStatus,
+  type PreflightReanswerRow,
   type ProjectRow,
   type RequirementsStore,
   type SaveAnalysisInput,
@@ -93,10 +94,12 @@ export class PrismaRequirementsStore implements RequirementsStore {
       const pid = input.projectId;
       const stage = await this.lockProject(tx, pid);
       if (stage === null) throw new PipelineError("project-not-found", 404);
-      if (stage !== input.expectedStage) throw new PipelineError("project-not-in-intake", 409);
+      // DEVOS-224: an approval now moves the project out of `intake`, so the approved-doc check comes first and a
+      // late submission still gets the specific code.
       if (await tx.requirementsDoc.findFirst({ where: { projectId: pid, status: "approved" }, select: { id: true } })) {
         throw new PipelineError("requirements-already-approved", 409);
       }
+      if (stage !== input.expectedStage) throw new PipelineError("project-not-in-intake", 409);
       const specMax = await tx.spec.aggregate({ where: { projectId: pid }, _max: { version: true } });
       const docMax = await tx.requirementsDoc.aggregate({ where: { projectId: pid }, _max: { version: true } });
       const specVersion = (specMax._max.version ?? 0) + 1;
@@ -204,6 +207,61 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
+  /**
+   * DEVOS-204: projects whose newest doc is approved, has a pre-flight and an approved intake card, and that card has
+   * a comment newer than both its decision and the doc's re-answer cursor; oldest such comment first, at most
+   * `limit`. Read-only; the job applies the re-answers through `syncApproval`.
+   */
+  reanswersAwaiting(limit: number): Promise<string[]> {
+    const n = Math.max(1, Math.min(1000, Math.trunc(limit)));
+    return this.tx(async (tx) => {
+      const rows: { project_id: string }[] = await tx.$queryRaw`
+        SELECT d.project_id::text AS project_id FROM (
+          SELECT DISTINCT ON (project_id) project_id, status, approval_id, preflight, answers_synced_at
+          FROM requirements_doc ORDER BY project_id, version DESC
+        ) d
+        JOIN approval a ON a.id = d.approval_id AND a.gate = 'requirements' AND a.status = 'approved'
+        JOIN LATERAL (
+          SELECT min(c.created_at) AS first_new FROM approval_comment c
+          WHERE c.approval_id = a.id AND c.created_at > GREATEST(a.decided_at, COALESCE(d.answers_synced_at, a.decided_at))
+        ) c ON c.first_new IS NOT NULL
+        WHERE d.status = 'approved' AND d.preflight IS NOT NULL AND a.decided_at IS NOT NULL
+        ORDER BY c.first_new, d.project_id
+        LIMIT ${n}`;
+      return rows.map((r) => r.project_id);
+    });
+  }
+
+  /** DEVOS-204: the rows written with this approval (re-answer rows have no `approval_id`). */
+  approvalDecisions(approvalId: string): Promise<{ itemId: string; answer: string }[]> {
+    return this.tx(async (tx) => {
+      const rows = await tx.projectDecision.findMany({ where: { approvalId }, take: 500, select: { itemId: true, answer: true } });
+      return rows.map((r: { itemId: string; answer: string }) => ({ itemId: r.itemId, answer: r.answer }));
+    });
+  }
+
+  /**
+   * DEVOS-204: re-answer rows for an approved doc, in one transaction. The unique (comment, item) index makes a
+   * re-run a no-op; the cursor only moves forward. No project or task state is touched (rule 3).
+   */
+  recordReanswers(docId: string, rows: readonly PreflightReanswerRow[], seenUpTo: Date | null): Promise<boolean> {
+    return this.tx(async (tx) => {
+      const d = await tx.requirementsDoc.findUnique({ where: { id: docId }, select: { projectId: true, status: true } });
+      if (!d || d.status !== "approved") return false;
+      if (rows.length) {
+        await tx.projectDecision.createMany({
+          data: rows.map((r) => ({ projectId: d.projectId, approvalId: null, commentId: r.commentId, itemId: r.itemId, text: r.text, answer: r.answer, source: r.source })),
+          skipDuplicates: true,
+        });
+      }
+      if (seenUpTo) {
+        await tx.$executeRaw`UPDATE requirements_doc SET answers_synced_at = ${seenUpTo}
+          WHERE id = ${docId}::uuid AND (answers_synced_at IS NULL OR answers_synced_at < ${seenUpTo})`;
+      }
+      return true;
+    });
+  }
+
   docForApproval(approvalId: string): Promise<DocRow | null> {
     return this.tx(async (tx) => {
       const r = await tx.requirementsDoc.findFirst({ where: { approvalId }, orderBy: { version: "desc" }, select: { ...DOC_SELECT, preflight: true } });
@@ -241,6 +299,9 @@ export class PrismaRequirementsStore implements RequirementsStore {
       const newest = await tx.requirementsDoc.findFirst({ where: { projectId: d.projectId }, orderBy: { version: "desc" }, select: DOC_SELECT });
       if (!newest || newest.id !== docId || newest.status !== "draft") return false;
       await tx.requirementsDoc.update({ where: { id: docId }, data: { status: "approved" } });
+      // DEVOS-224 (M2.4-d1): approval queues provisioning, in this transaction and only from `intake`, so it queues
+      // exactly one job and a retried approval queues none (AT11). The provisioning sweep takes `provisioning` projects.
+      await tx.project.updateMany({ where: { id: d.projectId, stage: "intake" }, data: { stage: "provisioning" } });
       await tx.auditEvent.create({
         data: {
           actor: "system",
@@ -289,16 +350,25 @@ export class PrismaRequirementsStore implements RequirementsStore {
     });
   }
 
-  /** CR-a3 (DEVOS-199): the decision log rows of one intake card (approval), oldest first, at most 500 rows. */
+  /**
+   * CR-a3 (DEVOS-199): the decision log rows of one intake card (approval), oldest first, at most 500 rows.
+   * DEVOS-204: the approval's rows come first (item order), then the re-answers from that card's later comments in
+   * comment order (`created_at`, `id`), so the newest answer per item is always last. Rows written in one
+   * transaction share `created_at`, so that column alone cannot order them (pre-review finding 1).
+   */
   decisions(projectId: string, approvalId: string): Promise<{ itemId: string; answer: string; source: string; createdAt: string }[]> {
     return this.tx(async (tx) => {
-      const rows = await tx.projectDecision.findMany({
-        where: { projectId, approvalId },
-        orderBy: [{ createdAt: "asc" }, { itemId: "asc" }],
+      type Row = { itemId: string; answer: string; source: string; createdAt: Date; comment?: { createdAt: Date; id: string } | null };
+      const select = { itemId: true, answer: true, source: true, createdAt: true } as const;
+      const approved: Row[] = await tx.projectDecision.findMany({ where: { projectId, approvalId }, orderBy: [{ createdAt: "asc" }, { itemId: "asc" }], take: 500, select });
+      const later: Row[] = await tx.projectDecision.findMany({
+        where: { projectId, comment: { approvalId } },
+        orderBy: [{ comment: { createdAt: "asc" } }, { commentId: "asc" }, { itemId: "asc" }],
         take: 500,
-        select: { itemId: true, answer: true, source: true, createdAt: true },
+        select: { ...select, comment: { select: { createdAt: true, id: true } } },
       });
-      return rows.map((r: { itemId: string; answer: string; source: string; createdAt: Date }) => ({ itemId: r.itemId, answer: r.answer, source: r.source, createdAt: r.createdAt.toISOString() }));
+      const rows = [...approved, ...later].slice(0, 500);
+      return rows.map((r) => ({ itemId: r.itemId, answer: r.answer, source: r.source, createdAt: r.createdAt.toISOString() }));
     });
   }
 

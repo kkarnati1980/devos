@@ -39,7 +39,9 @@ function fake(over = {}) {
     if (p === `/repos/${REPO}/pulls/7`) return reply(200, state.pr);
     if (p.startsWith(`/repos/${REPO}/pulls/7/files`)) return reply(200, state.files.slice((page - 1) * 100, page * 100));
     if (p.startsWith(`/repos/${REPO}/issues/7/comments`)) return reply(200, state.comments.slice((page - 1) * 100, page * 100));
-    if (p.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)) return reply(200, { total_count: state.statuses.length, statuses: state.statuses });
+    // DEVOS-212: as the real API: the list endpoint carries `creator`; the combined status does not.
+    if (p.startsWith(`/repos/${REPO}/commits/${HEAD}/statuses`)) { const pg = Number(new URL(p, "https://x").searchParams.get("page") ?? 1); return reply(200, state.statuses.slice((pg - 1) * 100, pg * 100)); }
+    if (p.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)) return reply(200, { total_count: state.statuses.length, statuses: state.statuses.map(({ creator, ...rest }) => rest) });
     return reply(404, { message: "not found" });
   };
   return githubClient({ token: "t", fetchImpl, retries: 0, sleep: async () => {} });
