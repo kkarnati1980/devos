@@ -74,6 +74,32 @@ export interface PreflightView {
 /** M2.4-d2 (DEVOS-225): provisioning status; `code` is a fixed error code only. */
 export interface ProvisionStepView { key: string; provider: string; kind: string; status: "pending" | "done" | "failed"; attempts: number; code: string | null; updatedAt: string }
 export interface ProvisionView { projectId: string; stage: string; parked: boolean; steps: ProvisionStepView[] }
+/** ADR-0012 CR-b2c (DEVOS-216): the project page's batch cards (apps/api card-batch-view.ts). */
+export interface BatchQuestionView {
+  ref: string;
+  text: string;
+  source: string;
+  default: string;
+  answer: string | null;
+  answerSource: string | null;
+}
+export interface BatchView {
+  id: string;
+  istDay: string;
+  state: string;
+  cardId: string | null;
+  cardStatus: "pending" | "approved" | "rejected" | "expired" | null;
+  applied: boolean;
+  handedOff: boolean;
+  questions: BatchQuestionView[];
+  stoppedTasks: { id: string; title: string }[];
+}
+export interface BatchesView {
+  waiting: { text: string; source: string; default: string; queuedAt: string }[];
+  waitingCount: number;
+  batches: BatchView[];
+  truncated: boolean;
+}
 
 /** M1.6 notifications. */
 export type ChannelKind = "dashboard" | "mybrain" | "email";
@@ -97,6 +123,9 @@ export interface ChannelView {
   target: string | null;
   configured: boolean;
 }
+
+/** In-flight `connect` per API origin (single flight across the clients on one page). */
+const connecting = new Map<string, Promise<ApiResult<{ login: string; expiresAt: string }>>>();
 
 export class DevosApi {
   private csrf: string | null = null;
@@ -160,9 +189,24 @@ export class DevosApi {
    * keep working); sign in only when there is no valid session.
    */
   async connect(): Promise<ApiResult<{ login: string; expiresAt: string }>> {
-    const r = await this.refresh();
-    if (r.ok || r.status !== 401) return r;
-    return this.signIn();
+    // CR-b2c (DEVOS-216): panels on one page connect at once. Only one of them may sign in (a sign-in rotates the
+    // cookie and ends the other's session); the others wait for it, then read their own CSRF token without rotating.
+    const pending = connecting.get(this.origin);
+    if (pending) {
+      const first = await pending;
+      return first.ok ? this.refresh() : first;
+    }
+    const p = (async () => {
+      const r = await this.refresh();
+      if (r.ok || r.status !== 401) return r;
+      return this.signIn();
+    })();
+    connecting.set(this.origin, p);
+    try {
+      return await p;
+    } finally {
+      connecting.delete(this.origin);
+    }
   }
 
   /** Sign-in: a fresh 12-hour session for KK's tailnet identity; keeps the CSRF token in memory. */
@@ -221,6 +265,10 @@ export class DevosApi {
   }
   retryProvision(projectId: string) {
     return this.call<{ queued: boolean }>("POST", `/projects/${encodeURIComponent(projectId)}/provision`);
+  }
+  /** ADR-0012 CR-b2c (DEVOS-216). */
+  batches(slug: string) {
+    return this.call<{ batches: BatchesView }>("GET", `/projects/by-slug/${encodeURIComponent(slug)}/batches`);
   }
   /** M2.3-b2 (DEVOS-135): the approvals inbox over the M2.3-b1 routes. */
   approvals(query: { status?: ApprovalStatus; cursor?: string } = {}) {
@@ -324,6 +372,7 @@ export const SECRET_LABELS: Record<string, string> = {
 export function explain(code: string): string {
   if (code === "project-not-found") return "No pre-flight for this project yet (the API does not know it).";
   if (code === "preflight-not-configured" || code === "requirements-not-configured") return "The pre-flight needs the database (DATABASE_URL).";
+  if (code === "batches-not-configured") return "Build questions need the database (DATABASE_URL).";
   if (code === "requirements-store-error") return "The pre-flight could not be read. Try again in a minute.";
   if (code === "api-unreachable") return "The DevOS API did not answer. Check you are on the tailnet.";
   if (code === "not-kk") return "This device is not signed in to the tailnet as KK.";

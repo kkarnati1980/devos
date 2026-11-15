@@ -6,6 +6,7 @@ import { PipelineError, type DocRow, type RequirementsPipeline, type Requirement
 import { httpError } from "./auth.js";
 import type { DevosRequest } from "./http.js";
 import { preflightView, type PreflightViewReader, type SecretPresence } from "./preflight.js";
+import { batchesView, type BatchViewReader } from "./card-batch-view.js";
 
 export const REQUIREMENTS = Symbol("devos:requirements");
 
@@ -32,6 +33,8 @@ export interface RequirementsServices {
   vault?: SecretPresence | null;
   /** DEVOS-204 (Codex PR130-r2): how old a comment must be before re-answers read it (`reanswerSettleMs`). */
   reanswerSettleMs?: number;
+  /** CR-b2c (DEVOS-216): the batch cards' read side for the project page; absent → 503 batches-not-configured. */
+  batches?: Pick<BatchViewReader, "batchSnapshot"> | null;
 }
 
 /** The dashboard's project slug (apps/dashboard/lib/source.ts `isSlug`). */
@@ -222,6 +225,22 @@ export class RequirementsController {
     const view = await preflightView(slug, store as PreflightViewReader, this.svc.vault ?? null).catch(mapError);
     if (!view) throw httpError(404, "project-not-found");
     return { preflight: view };
+  }
+
+  /**
+   * CR-b2c (DEVOS-216): the project page's "Build questions" section — recent batch cards with all their questions,
+   * the answers recorded with each card, and the tasks a rejected or expired card stopped. GET never writes.
+   */
+  @Get("by-slug/:slug/batches")
+  async batches(@Param("slug") slug: string) {
+    if (!SLUG.test(slug)) throw httpError(400, "invalid:slug");
+    const store = need(this.svc.store, "requirements-not-configured") as unknown as Partial<BatchViewReader>;
+    const batches = this.svc.batches ?? null;
+    if (typeof store.projectBySlug !== "function" || !batches) throw httpError(503, "batches-not-configured");
+    const reader: BatchViewReader = { projectBySlug: (s) => store.projectBySlug!(s), batchSnapshot: (id) => batches.batchSnapshot(id) };
+    const view = await batchesView(slug, reader).catch(mapError);
+    if (!view) throw httpError(404, "project-not-found");
+    return { batches: view };
   }
 
   /**

@@ -347,3 +347,34 @@ test("M2.4-d2 (DEVOS-225): the project page's Provisioning panel shows each step
   assert.match(await other.page.getByTestId("provisioning-error").innerText(), /^Provisioning has not started for this project\. \(project-not-found\)$/);
   await other.context.close();
 });
+
+test("AT8a/AT11 page part (CR-b2c, DEVOS-216): the project page lists every batch question, its answer, and a rejected card's stopped tasks, escaped", async () => {
+  const { page, context, problems } = await open("/projects/xss-probe");
+  await page.getByTestId("batch").first().waitFor();
+  const batches = page.getByTestId("batch");
+  assert.equal(await batches.count(), 2);
+  const today = batches.nth(0);
+  const qs = await today.getByTestId("batch-question").allInnerTexts();
+  assert.equal(qs.length, 12, "AT8a: all 12 questions are listed, not only the clipped card reason");
+  assert.match(qs[0], /^BQ-1 Use <img src=x onerror=window\.__xss4=1> icons\?/, "question text is shown as text");
+  assert.match(qs[0], /Your answer: no <b>icons<\/b>/);
+  assert.match(qs[11], /^BQ-12 Question 12: /);
+  assert.match(qs[11], /Default used: Architect decides/);
+  assert.match(await today.getByTestId("batch-state").innerText(), /Approved; the answers below were applied\./);
+  assert.equal(await today.getByTestId("batch-stopped-task").count(), 0);
+  const rejected = batches.nth(1);
+  assert.match(await rejected.getByTestId("batch-state").innerText(), /Rejected\. The tasks below stay stopped\./);
+  assert.deepEqual(await rejected.getByTestId("batch-stopped-task").allInnerTexts(), ["Build search <script>window.__xss5=1</script>", "Index the catalogue"]);
+  assert.match(await rejected.getByTestId("batch-question").innerText(), /Default: no/);
+  assert.match(await page.getByTestId("batches-waiting").innerText(), /^1 question will join the next daily card\.$/);
+  assert.equal(await page.evaluate(() => [window.__xss4, window.__xss5]).then((v) => v.every((x) => x === undefined)), true, "no payload ran");
+  assert.equal(await page.locator('[data-testid="batches-panel"] img, [data-testid="batches-panel"] b, [data-testid="batches-panel"] script').count(), 0);
+  assert.equal(await page.locator('[data-testid="batches-panel"] button').count(), 0, "read-only: no decision controls");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems, []);
+  await context.close();
+  const other = await open("/projects/social-content-extraction");
+  await other.page.getByTestId("batches-error").waitFor();
+  assert.match(await other.page.getByTestId("batches-error").innerText(), /^No build questions for this project yet\. \(project-not-found\)$/);
+  await other.context.close();
+});
