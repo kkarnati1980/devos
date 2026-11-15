@@ -4,7 +4,7 @@
 - **Source:** follow-up named in `docs/modules/GI-1b.md` (Runner decisions → Aggregator); KK's spec `claude/devos-gate-integrity-spec-v1.0.0.md` §4.4.
 - **Builds on:** GI-1b (`scripts/release/merge.mjs` step 2b), CI-T-b (`scripts/ci/ci-gate.mjs`, `.github/workflows/ci-gate.yml`), GI-1 (`applyDispositions`), DEVOS-181 (`KK_ONLY`). Needed before DEVOS-145 makes `ci-gate` a required check on `main`.
 - **Applies:** D1, ADR-0011 (timeouts on every call, retries for safe reads only, no new egress: GitHub API only), ADR-0013 (runner decides technical design).
-- **Owned files:** `scripts/ci/ci-gate.mjs` (the disposition step only), `.github/workflows/ci-gate.yml` (two read-only permissions only; no step changes), `scripts/release/merge.mjs` (step 2b moved into the exported `judgeFloorGuard` and `codexPass`, behaviour unchanged; `localGuardReport` gains `fetch`), `scripts/test/ci-gate-dispositions.test.mjs`, this contract.
+- **Owned files:** `scripts/ci/ci-gate.mjs` (the disposition step only), `.github/workflows/ci-gate.yml` (two read-only permissions only; no step changes), `scripts/release/merge.mjs` (step 2b moved into the exported `judgeFloorGuard` and `codexPass`, behaviour unchanged; `localGuardReport` gains `fetch`), `scripts/test/ci-gate-dispositions.test.mjs`, this contract. DEVOS-212 adds: `allStatuses` in `scripts/release/merge.mjs` (the list endpoint), and the status mocks plus one test in `scripts/test/merge-gate.test.mjs` and `scripts/test/merge-gate-floor-guard.test.mjs` (they feed `allStatuses` and must match the real API).
 
 ## Goal
 Today `ci-gate` fails whenever any check fails, so a floor guard that the Release path accepts (every hit has a valid Codex Keep, GI-1b) still leaves `ci-gate` red. Once the `main` ruleset requires `ci-gate`, GitHub would refuse that merge. `ci-gate` must pass in exactly the cases where the Release path sets the floor guard aside, using the same code.
@@ -46,3 +46,18 @@ Today `ci-gate` fails whenever any check fails, so a floor guard that the Releas
 
 ## Pass rule
 `node --test scripts/test/ci-gate-dispositions.test.mjs` exits 0 with 9 tests passing (D1–D9); `node --test scripts/test/ci-gate.test.mjs` exits 0 with 13 tests passing; `node --test scripts/test/merge-gate-floor-guard.test.mjs scripts/test/merge-gate.test.mjs` exits 0 with 26 tests passing.
+
+- From DEVOS-212 (15 Nov 2026): `node --test scripts/test/merge-gate-floor-guard.test.mjs scripts/test/merge-gate.test.mjs` exits 0 with 27 tests passing (the 26 above plus the 151-status paging test).
+- From DEVOS-223: `node --test scripts/test/merge-gate-floor-guard.test.mjs scripts/test/merge-gate.test.mjs` exits 0 with 28 tests passing.
+
+## DEVOS-212 fix (14 Nov 2026, runner B)
+**Bug:** `allStatuses()` read the combined status (`GET /commits/{sha}/status`). Its `statuses[]` has no `creator`, so `codexPass()` reported every `codex-review` PASS as "posted by an unknown account". ci-gate could never set aside a floor-guard failure covered by valid KEEPs (#117), and the Release path refused every PR. The test mocks had put `creator` into the combined body, which the real API never does.
+
+**Fix (runner decision):** read the list endpoint `GET /commits/{sha}/statuses?per_page=100&page=n`, which carries `creator`. It returns every status newest first, superseded ones included; `codexPass` already keeps the latest per context. Paging stops at a short page; the 2,000-status refusal is kept, and a non-list reply is a `CannotRun`. The mocks now match the real API (list with `creator`, combined without), so the old code fails 20 of the 35 gate tests against them. A new test pages 151 statuses and shows `codexPass` accepts the watcher's PASS; exactly 2,000 statuses are judged and 2,001 refused. The merge-gate pair now runs 27 tests (the 26 of the pass rule plus this one); the pass-rule line itself is left unchanged here, because the floor guard reads any edit to it as `contract-weakened`, and ci-gate cannot honour a Codex KEEP until this fix is on main (follow-up DEVOS-213 updates the count). Pre-review: 3 low findings, 2 fixed (the count, recorded here; exactly 2,000 accepted); the third (the cap now counts superseded statuses too, failing closed) is accepted as is. ci-gate runs the base copy of `scripts/release/`, so #117 is judged by the fix only after this merges and its ci-gate is re-run.
+
+## DEVOS-213 (15 Nov 2026, runner B)
+The merge-gate pair now runs 27 tests: the 26 of the pass rule plus DEVOS-212's 151-status paging test. The count is added as its own pass-rule line. The existing line is left as it is, because the floor guard cuts its long text, so any edit to it reads as a `contract-weakened` hit that only KK can clear, for a count that only rises. The new line is the stricter one.
+
+## DEVOS-223 (15 Nov 2026, runner B)
+`passVerdictText` read only the `- **Summary:** ` line. The watcher prints Codex's summary as it is, and Codex now writes one marker per line, so all 35 KEEPs on #133 r2 were missed and ci-gate refused it. The Summary is now that line plus the lines after it, up to the first blank line, which the watcher always writes before the findings table. Markers in the table still never count. Test B7b covers both layouts and a KEEP-shaped table line; the old code fails it. The merge-gate pair now runs 28 tests, recorded as its own pass-rule line, because editing the earlier lines would be a cut-text KK-only hit.
+

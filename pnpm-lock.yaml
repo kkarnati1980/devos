@@ -33,6 +33,9 @@ importers:
       '@devos/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@devos/isolation':
+        specifier: workspace:*
+        version: link:../../packages/isolation
       '@devos/policy':
         specifier: workspace:*
         version: link:../../packages/policy

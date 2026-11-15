@@ -20,6 +20,7 @@ import { PrismaRequirementsStore } from "./requirements-store.js";
 import { reanswerSettleMs, type RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
+import { PrismaIsolationStore } from "./isolation-store.js";
 import type { ModelRunner } from "@devos/analyst";
 import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
@@ -78,6 +79,8 @@ export interface Runtime {
   cardBatch: CardBatchJob | null;
   /** CR-b2d (DEVOS-218): the batched-question queue (rule 6–7 entry point for agents, M3.2). */
   cardBatchQueue: CardBatchQueue | null;
+  /** S4-a2b: the stack rows GET /internal/isolation-state reads; null without a database. */
+  isolation: PrismaIsolationStore | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -119,7 +122,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -190,7 +193,9 @@ export async function buildRuntime(
   const queueStore = new PrismaQueueStore(db as unknown as PrismaTxLike, { databaseUrl, timeoutMs: t });
   const cardBatchQueue = new CardBatchQueue(queueStore, approvalBatchCards(approvalsCore, prismaTaskProjects(db as unknown as PrismaTxLike, t)), randomUUID);
   const cardBatch = new CardBatchJob(cardBatchQueue, approvalsCore, (id) => queueStore.projectName(id), queueStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue };
+  // S4-a2b: the read side of GET /internal/isolation-state (and, in the M2.4-d wiring, the afterStack hook store).
+  const isolation = new PrismaIsolationStore(db, t);
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation };
 }
 
 /**
