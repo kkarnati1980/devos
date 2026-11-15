@@ -339,3 +339,30 @@ test("Codex PR135-r2: an approved card without decidedAt is not applied; a comme
   assert.deepEqual([a2.first, a2.followUps], [false, a1.followUps]);
   assert.deepEqual(store.decisions.filter((d) => d.approvalId === card.id).map((d) => [d.source, d.answer]), [["default", "blue"]]);
 });
+
+test("Codex PR135-r3: a replay returns the follow-ups of the stored rows, even when a late comment becomes visible", async () => {
+  const { store, cards, q } = wire();
+  const q1 = await q.queueQuestion(P, ask("Which colour for the header?", "blue", [T1]), DAY1);
+  const r = await q.flushBatch(P, DAY1_LATE);
+  const card = cards.cards.find((c) => c.id === r.cardId);
+  Object.assign(card, { status: "approved", decidedAt: new Date(DAY1_LATE.getTime() + 60_000) });
+  const a1 = await q.applyBatch(r.batchId, DAY2);
+  assert.deepEqual([a1.first, a1.followUps], [true, []]);
+  // A comment timestamped before the decision commits only now (M2.3 sets createdAt before its transaction).
+  card.comments.push({ body: "BQ-1: green", createdAt: new Date(DAY1_LATE.getTime() + 30_000) });
+  const a2 = await q.applyBatch(r.batchId, DAY2);
+  assert.deepEqual([a2.first, a2.followUps], [false, []], "the replay follows the stored default row");
+  // And the reverse: the stored kk row drives the follow-up on every replay.
+  const w = wire();
+  const qq = await w.q.queueQuestion(P, ask("Should the footer be sticky?", "no", [T2]), DAY1);
+  const rr = await w.q.flushBatch(P, DAY1_LATE);
+  const c2 = w.cards.cards.find((c) => c.id === rr.cardId);
+  Object.assign(c2, { status: "approved", decidedAt: new Date(DAY1_LATE.getTime() + 60_000) });
+  c2.comments.push({ body: "BQ-1: yes", createdAt: new Date(DAY1_LATE.getTime() + 1000) });
+  const b1 = await w.q.applyBatch(rr.batchId, DAY2);
+  c2.comments.length = 0; // whatever the comments read later, the replay is the same
+  const b2 = await w.q.applyBatch(rr.batchId, DAY2);
+  assert.deepEqual(b1.followUps, [{ questionId: qq.id, answer: "yes", blocks: [T2] }]);
+  assert.deepEqual(b2.followUps, b1.followUps);
+  assert.ok(q1.id);
+});
