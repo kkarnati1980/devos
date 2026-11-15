@@ -312,7 +312,8 @@ test("CR-b2e job: a member card approved without a BQ-1 line records the default
   const n = store.decisions.length;
   await w.job.tick(AT_0800_IST);
   assert.equal(store.decisions.length, n);
-=======
+});
+
 test("CR-b2d job (Codex PR143-r1): the daily pass drains every page, so the 101st eligible project still gets its batch", async () => {
   const ids = Array.from({ length: 101 }, (_, i) => `p-${String(i).padStart(3, "0")}`);
   const flushed = [];
