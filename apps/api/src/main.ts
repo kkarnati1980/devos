@@ -14,7 +14,7 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadDb: async (url) => {
@@ -71,9 +71,11 @@ async function main(): Promise<void> {
   requirementsSync?.start();
   // DEVOS-171: analyst runs the runner could not close (DB down) are closed and settled, at start-up and every 5 min.
   analystSweep?.start();
-  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); });
-  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); });
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null });
+  // CR-b2d (DEVOS-218): batched question cards, every 5 min (the daily flush from 08:00 IST).
+  cardBatch?.start();
+  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); });
+  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, cardBatch: cardBatch != null });
 }
 
 main().catch((e: unknown) => {
