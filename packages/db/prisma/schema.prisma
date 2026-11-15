@@ -1310,10 +1310,11 @@ model GuardMetric {
   @@map("guard_metric")
 }
 
-/// DEVOS-220 (docs/modules/runner-watchdog.md): the runner watchdog's state, one row (id 1), so a redeploy never
+/// DEVOS-220 (docs/modules/runner-watchdog.md): the runner watchdog's state, one row (name 'runner-watchdog'), so a redeploy never
 /// repeats an alert inside its window.
 model RunnerWatchdogState {
-  id        Int      @id
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String   @unique
   state     Json
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 

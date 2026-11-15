@@ -1,5 +1,5 @@
 // DEVOS-220 (docs/modules/runner-watchdog.md): PrismaWatchdogStore against real Postgres (api-db workflow), with the
-// runner_watchdog_state migration applied. One row (id 1) survives a new store (a redeploy).
+// runner_watchdog_state migration applied. One row (name runner-watchdog) survives a new store (a redeploy).
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createDb } from "@devos/db";
@@ -21,6 +21,6 @@ test("DEVOS-220: the watchdog state is one row, read back by a new store; an unk
   assert.equal(await db.runnerWatchdogState.count(), 1);
   const b = new PrismaWatchdogStore(db, 3000);
   assert.deepEqual(await b.load(), { ...s, lastRunAt: "2026-11-15T10:30:00.000Z" });
-  await db.runnerWatchdogState.update({ where: { id: 1 }, data: { state: { silentAlertAt: 7, other: "x" } } });
+  await db.runnerWatchdogState.update({ where: { name: "runner-watchdog" }, data: { state: { silentAlertAt: 7, other: "x" } } });
   assert.deepEqual(await b.load(), EMPTY_STATE);
 });

@@ -68,7 +68,10 @@ export class MemoryWatchdogStore implements WatchdogStore {
   async save(s: WatchdogState) { this.state = { ...s }; }
 }
 
-/** One row (id 1) of `runner_watchdog_state`, read and written in bounded transactions (ADR-0011 §9). */
+/** The one row's name in `runner_watchdog_state`. */
+export const WATCHDOG_ROW = "runner-watchdog";
+
+/** One row (name `runner-watchdog`) of `runner_watchdog_state`, read and written in bounded transactions (ADR-0011 §9). */
 export class PrismaWatchdogStore implements WatchdogStore {
   constructor(private readonly db: any, private readonly timeoutMs: number) {}
 
@@ -77,13 +80,13 @@ export class PrismaWatchdogStore implements WatchdogStore {
   }
 
   async load(): Promise<WatchdogState> {
-    const row: { state: unknown } | null = await this.tx((tx: any) => tx.runnerWatchdogState.findUnique({ where: { id: 1 }, select: { state: true } }));
+    const row: { state: unknown } | null = await this.tx((tx: any) => tx.runnerWatchdogState.findUnique({ where: { name: WATCHDOG_ROW }, select: { state: true } }));
     return parseState(row?.state);
   }
 
   async save(state: WatchdogState): Promise<void> {
     const data = { state: parseState(state) };
-    await this.tx((tx: any) => tx.runnerWatchdogState.upsert({ where: { id: 1 }, update: data, create: { id: 1, ...data }, select: { id: true } }));
+    await this.tx((tx: any) => tx.runnerWatchdogState.upsert({ where: { name: WATCHDOG_ROW }, update: data, create: { name: WATCHDOG_ROW, ...data }, select: { id: true } }));
   }
 }
 
