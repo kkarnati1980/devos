@@ -9,7 +9,7 @@ type Step = { key: string };
 type Decision = "allow" | "deny" | "require_approval";
 type Authorize = (action: string, resource: string) => Promise<Decision>;
 type Store = { assertLockHeld(projectId: string): Promise<void> };
-type Range = { start: number; end: number };
+type Range = { from: number; to: number };
 type ApplyTemplate = (o: { out: string; select?: string[]; sha?: string }) => { code: number; error?: string };
 type AfterStack = (project: { id: string; slug: string }, env: { name: "preview" | "live"; port: number; portRangeStart: number; compose: unknown }) => Promise<{ compose: Record<string, unknown> }>;
 type P = { id: string; slug: string; name: string };
@@ -152,6 +152,13 @@ export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { o
     listProvisioning: () => w.rows.listProvisioning(),
     provision: (p) => mod.runProvision(p.id, steps(p), { store, authorize: policyAuthorizer(w.policy, p.id) }),
     markBuilding: (id) => w.rows.markBuilding(id),
+    // Both provider tokens must be in the vault before any project runs: a missing one would otherwise be a
+    // non-retryable provider_error and park the project (pre-review M1). Read by name, never logged.
+    ready: async () => {
+      if (!(await vault.reveal("github_token"))) return "provision-github-token-not-set";
+      if (!(await vault.reveal("coolify_api_token"))) return "provision-coolify-token-not-set";
+      return null;
+    },
     raiseNameConflict: async (projectId, step) => {
       const p = (await w.rows.listProvisioning()).find((x) => x.id === projectId);
       if (p) await w.raiseCard(nameConflictCard(p, step));
@@ -164,18 +171,20 @@ export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { o
 export class PrismaProvisioningRows implements ProvisioningRows {
   constructor(private readonly db: any, private readonly timeoutMs: number) {}
 
+  // Every call is bounded (ADR-0011 §9): a stalled read must not hold the sweep's tick forever (pre-review M2).
   async listProvisioning(): Promise<ProvisioningProject[]> {
-    const rows: { id: string; slug: string; name: string }[] = await this.db.project.findMany({
+    const t = this.timeoutMs;
+    const rows: { id: string; slug: string; name: string }[] = await this.db.$transaction((tx: any) => tx.project.findMany({
       where: { stage: "provisioning", pausedAt: null, archivedAt: null },
       select: { id: true, slug: true, name: true },
       orderBy: { createdAt: "asc" },
       take: 50,
-    });
+    }), { timeout: t, maxWait: t });
     return rows.map((r) => ({ id: r.id, slug: r.slug, name: r.name }));
   }
 
   async markBuilding(projectId: string): Promise<void> {
     const t = this.timeoutMs;
-    await this.db.$transaction((tx: any) => tx.project.updateMany({ where: { id: projectId, stage: "provisioning" }, data: { stage: "building" } }), { timeout: t, maxWait: t });
+    await this.db.$transaction((tx: any) => tx.project.updateMany({ where: { id: projectId, stage: "provisioning", pausedAt: null, archivedAt: null }, data: { stage: "building" } }), { timeout: t, maxWait: t });
   }
 }

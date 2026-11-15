@@ -83,3 +83,44 @@ test("d1: the name_conflict card is a deduplicable decision card in plain langua
   assert.equal(c.projectId, "p1");
   assert.match(c.reason, /rename the project, or tell DevOS to adopt/);
 });
+
+test("d1 (pre-review L6): a stage-move failure after a full run is logged, never counted, and the next tick moves it", async () => {
+  let fail = true;
+  const building = [], logs = [];
+  const job = new ProvisionSweepJob({
+    listProvisioning: async () => (building.includes("p1") ? [] : [{ id: "p1", slug: "one", name: "One" }]),
+    provision: async () => [],
+    markBuilding: async (id) => { if (fail) throw new Error("db"); building.push(id); },
+    raiseNameConflict: async () => {},
+    log: (e) => logs.push(e),
+    maxFailures: 1,
+  });
+  assert.equal(await job.tick(), 0);
+  assert.equal(job.isParked("p1"), false);
+  assert.equal(logs.at(-1).msg, "provision-mark-building-failed");
+  fail = false;
+  assert.equal(await job.tick(), 1);
+  assert.deepEqual(building, ["p1"]);
+});
+
+test("d1 (pre-review M1): a ready() code skips the tick for everyone and counts nothing; a throwing check is a code too", async () => {
+  let code = "provision-github-token-not-set";
+  const calls = [];
+  const job = new ProvisionSweepJob({
+    listProvisioning: async () => [{ id: "p1", slug: "one", name: "One" }],
+    provision: async (p) => { calls.push(p.id); throw new Error("x"); },
+    markBuilding: async () => {},
+    raiseNameConflict: async () => {},
+    ready: async () => { if (code === "throw") throw new Error("vault down"); return code; },
+    log: () => {},
+    maxFailures: 1,
+  });
+  await job.tick();
+  code = "throw";
+  await job.tick();
+  assert.deepEqual(calls, []);
+  assert.equal(job.isParked("p1"), false);
+  code = null;
+  await job.tick();
+  assert.deepEqual(calls, ["p1"]);
+});

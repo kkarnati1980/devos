@@ -35,4 +35,6 @@ test("d1 rows: only live provisioning projects are listed; markBuilding moves on
   await rows.markBuilding(intake.id);
   assert.equal(await stage(intake.id), "intake", "an intake project is never moved to building");
   assert.ok(!(await rows.listProvisioning()).some((p) => p.id === live.id));
+  await rows.markBuilding(paused.id);
+  assert.equal(await stage(paused.id), "provisioning", "a project paused during its run is not moved to building");
 });

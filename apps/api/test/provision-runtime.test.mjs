@@ -17,7 +17,7 @@ function fakeModule(rec) {
     GitHubClient: class { constructor(o) { rec.ghToken = o.token; } },
     CoolifyClient: class { constructor(o) { rec.cfOrigin = o.origin; rec.cfToken = o.token; } },
     PrismaStore: class { constructor(db, o) { rec.storeUrl = o.databaseUrl; } async assertLockHeld(id) { rec.lockChecks.push(id); } },
-    parsePortRange: (raw) => { if (raw === "bad") throw new Error("port-range-invalid"); return { start: 20000, end: 20999 }; },
+    parsePortRange: (raw) => { if (raw === "bad") throw new Error("port-range-invalid"); rec.portsRaw = raw; return { from: 20000, to: 20999 }; },
     coreTemplateFiles: (apply, o) => { rec.coreSha = o.devosSha; return [{ path: ".devos/template.json" }]; },
     runProvision: async (id, steps, o) => { rec.runs.push({ id, keys: steps.map((s) => s.key), authorize: o.authorize }); return []; },
     githubRepoStep: (gh, p, owner) => { rec.repo = { p, owner }; return step("github/repo"); },
@@ -33,7 +33,8 @@ function wire(over = {}) {
   const rec = { runs: [], lockChecks: [], cards: [], logs: [], decided: [], vaultCalls: [] };
   const project = { id: "11111111-1111-4111-8111-111111111111", slug: "shop", name: "Shop" };
   const vault = {
-    reveal: async (n) => { rec.vaultCalls.push(n); return n === "github_token" ? "gh-token-value" : null; },
+    tokens: { github_token: "gh-token-value", coolify_api_token: "cf-token-value", ...over.tokens },
+    async reveal(n) { rec.vaultCalls.push(n); return this.tokens[n] ?? null; },
     hasProject: async () => true,
     putProject: async (id, n) => { rec.vaultCalls.push(`put:${id}:${n}`); return { rotated: false }; },
     matchesProject: async () => true,
@@ -75,13 +76,28 @@ test("d1 wiring: the full step list runs in contract order, then the project mov
 });
 
 test("d1 wiring: tokens come from the vault by name at call time; a missing one fails the call, never an empty token", async () => {
-  const { rec, job } = wire();
+  const { rec, job, w } = wire();
   assert.deepEqual(rec.vaultCalls, [], "nothing is read at build time");
   assert.equal(await rec.ghToken(), "gh-token-value");
+  w.vault.tokens.coolify_api_token = null;
   await assert.rejects(rec.cfToken(), /coolify_api_token-not-set/);
+  w.vault.tokens.coolify_api_token = "cf-token-value";
   await job.tick();
   await rec.secrets.put("p", "preview/SESSION_SECRET", "v");
   assert.ok(rec.vaultCalls.includes("put:p:preview/SESSION_SECRET"), "app secrets go to the project-scoped vault");
+});
+
+test("d1 wiring: a provider token not yet in the vault skips the tick without counting a failure; entered later, it runs (no restart)", async () => {
+  const { rec, job, w } = wire({ tokens: { coolify_api_token: null } });
+  for (let i = 0; i < 7; i++) assert.equal(await job.tick(), 0);
+  assert.equal(rec.runs.length, 0, "nothing ran without the token");
+  assert.ok(rec.logs.every((e) => e.msg === "provision-not-ready" && e.code === "provision-coolify-token-not-set"));
+  assert.ok(!JSON.stringify(rec.logs).includes("token-value"), "no token in any log line");
+  assert.equal(job.isParked("11111111-1111-4111-8111-111111111111"), false, "seven skipped ticks never park the project");
+  w.vault.tokens.coolify_api_token = "cf-token-value";
+  assert.equal(await job.tick(), 1);
+  assert.equal(rec.runs.length, 1);
+  assert.equal(rec.portsRaw, undefined, "no DEVOS_PROJECT_PORTS → the package default range");
 });
 
 test("d1 wiring (AT12): every create asks the policy engine as the provisioner; a deny is a deny", async () => {

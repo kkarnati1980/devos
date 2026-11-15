@@ -33,6 +33,11 @@ export interface ProvisionSweepDeps {
   markBuilding(projectId: string): Promise<void>;
   /** Opens the "rename or adopt" card for (project, step) unless one is already open; never throws on a duplicate. */
   raiseNameConflict(projectId: string, step: string): Promise<void>;
+  /**
+   * Checked once per tick before any project: a fixed code (e.g. a provider token not yet in the vault) skips the
+   * whole tick without counting a failure for anyone, so entering the token later needs no restart (pre-review M1).
+   */
+  ready?(): Promise<string | null>;
   log(e: { level: "info" | "warn"; msg: string; projectId?: string; code?: string; step?: string }): void;
   intervalMs?: number;
   /** Failed ticks in a row before a project is parked (default 5). */
@@ -71,16 +76,31 @@ export class ProvisionSweepJob {
         this.d.log({ level: "warn", msg: "provision-sweep-list-failed" });
         return 0;
       }
-      for (const p of projects) {
-        if (this.parked.has(p.id)) continue;
+      const todo = projects.filter((p) => !this.parked.has(p.id));
+      if (todo.length && this.d.ready) {
+        let notReady: string | null;
+        try { notReady = await this.d.ready(); } catch { notReady = "provision-ready-check-failed"; }
+        if (notReady) {
+          this.d.log({ level: "warn", msg: "provision-not-ready", code: notReady });
+          return 0;
+        }
+      }
+      for (const p of todo) {
         try {
           await this.d.provision(p);
-          await this.d.markBuilding(p.id);
-          this.failures.delete(p.id);
-          done++;
-          this.d.log({ level: "info", msg: "provision-done", projectId: p.id });
         } catch (e) {
           await this.onFailure(p, e);
+          continue;
+        }
+        this.failures.delete(p.id);
+        try {
+          await this.d.markBuilding(p.id);
+          done++;
+          this.d.log({ level: "info", msg: "provision-done", projectId: p.id });
+        } catch {
+          // Every step is done; only the stage move failed. Not a provisioning failure: the next tick's run is all
+          // lookups and moves it again (pre-review L6).
+          this.d.log({ level: "warn", msg: "provision-mark-building-failed", projectId: p.id });
         }
       }
       return done;
