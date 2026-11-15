@@ -248,6 +248,21 @@ test("SM-07 keys are per caller: one caller can neither replay nor probe another
   } finally { await s.close(); }
 });
 
+test("SM-07 memory store: changing a replayed result never changes the stored answer (Codex PR149-r1)", async () => {
+  const store = memoryStore();
+  const run = () => idempotent(store, { scope: "s", key: "k", request: {} }, async () => ({ items: [1] }));
+  (await run()).result.items.push(2);
+  (await run()).result.items.push(3);
+  assert.deepEqual((await run()).result, { items: [1] });
+});
+
+test("SM-07 owner: a long SM-02 caller id (tailnet: plus a 254-character login) is accepted (Codex PR149-r1)", async () => {
+  const store = memoryStore();
+  const owner = `tailnet:${"a".repeat(254)}`;
+  assert.deepEqual(await idempotent(store, { scope: "s", owner, key: "k", request: {} }, async () => 1), { result: 1, replayed: false });
+  await assert.rejects(idempotent(store, { scope: "s", owner: "x".repeat(1025), key: "k", request: {} }, async () => 1), TypeError);
+});
+
 test("SM-07 fail closed: when the result cannot be stored, the effect is not run again", async () => {
   const store = memoryStore();
   let runs = 0;

@@ -16,6 +16,8 @@ export const KEY_HEADER = "idempotency-key";
 export const KEY_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const SCOPE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 const MAX_CLAIM_TRIES = 3;
+// SM-02 caller ids are `tailnet:` plus a login of up to 254 characters; this leaves room for any id scheme.
+const MAX_OWNER_LENGTH = 1024;
 
 /** The table the SQL store needs. Put it in a migration; the primary key is the unique constraint SM-07-L1 asks for.
  * `owner` is the caller id ('' for a route without callers). */
@@ -66,7 +68,8 @@ export function memoryStore() {
       const k = id(scope, owner, key);
       const row = rows.get(k);
       if (!row) { rows.set(k, { hash, token, state: "running", result: null }); return { state: "new" }; }
-      return { state: row.state, hash: row.hash, result: row.result };
+      // A copy, as the SQL store parses a fresh one: a caller that changes a replayed result never changes the stored one.
+      return { state: row.state, hash: row.hash, result: structuredClone(row.result) };
     },
     async complete(scope, owner, key, token, result) {
       const row = rows.get(id(scope, owner, key));
@@ -126,7 +129,7 @@ function checkArgs(store, scope) {
  */
 export async function idempotent(store, { scope, owner = "", key, request }, fn) {
   checkArgs(store, scope);
-  if (typeof owner !== "string" || owner.length > 200) throw new TypeError("idempotency: owner must be a short string");
+  if (typeof owner !== "string" || owner.length > MAX_OWNER_LENGTH) throw new TypeError("idempotency: owner must be a string of at most 1024 characters");
   if (typeof key !== "string" || !KEY_PATTERN.test(key)) throw new IdempotencyError("idempotency-key-invalid", 400);
   const hash = requestHash(request);
   const token = randomUUID();
