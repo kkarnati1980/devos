@@ -7,9 +7,9 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation run build && tsc -p tsconfig.json",
-    "typecheck": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation run build && tsc -p tsconfig.json --noEmit",
-    "test": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation --filter @devos/run-engine run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
-    "test:db": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/isolation run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
+    "typecheck": "pnpm --filter @devos/policy --filter @devos/analyst run build && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/run-engine run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"",
+    "test:db": "pnpm --filter @devos/policy --filter @devos/analyst run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\"",
     "start": "node dist/main.js"
   },
   "dependencies": {

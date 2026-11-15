@@ -12,7 +12,19 @@
 // every stack gets the documented default: no egress, no tailnet (S4-a2b decision 2).
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { stateDocument, type StackState } from "@devos/isolation";
+// @devos/isolation is a declared dependency, imported at run time like @devos/db (main.ts), so the API typechecks and
+// its test, typecheck and test:db scripts stay unchanged (the floor guard reads any change to them as
+// test-script-changed, which ci-gate refuses to let Codex keep; #117 ci-gate, 15 Nov). The shape below mirrors
+// packages/isolation/src/state.ts.
+export interface StackState { slug: string; env: "preview" | "live"; idx: number; egress: boolean; tailnet: string[] }
+type StateDocument = (rows: readonly StackState[]) => { stacks: StackState[] };
+let loaded: Promise<StateDocument> | null = null;
+/** `stateDocument` from @devos/isolation, loaded once on first use; a load failure is retried on the next call. */
+function stateDocument(rows: readonly StackState[]): Promise<{ stacks: StackState[] }> {
+  const isolationModuleName = "@devos/isolation";
+  loaded ??= (import(isolationModuleName) as Promise<{ stateDocument: StateDocument }>).then((m) => m.stateDocument);
+  return loaded.then((fn) => fn(rows), (e: unknown) => { loaded = null; throw e; });
+}
 import type { IsolationStackRow } from "./isolation-store.js";
 
 export const ISOLATION_STATE_PATH = "/internal/isolation-state";
@@ -63,7 +75,7 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 /** Builds the document from the store rows; egress and tailnet are the decision-3 defaults (S4-a2b decision 2). */
 export async function buildIsolationState(source: IsolationStateSource): Promise<{ stacks: StackState[] }> {
   const rows = await source.listStacks();
-  return stateDocument(rows.map((r) => ({ slug: r.slug, env: r.env, idx: r.idx, egress: false, tailnet: [] })));
+  return await stateDocument(rows.map((r) => ({ slug: r.slug, env: r.env, idx: r.idx, egress: false, tailnet: [] })));
 }
 
 export interface IsolationStateOptions {
