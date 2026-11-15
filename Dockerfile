@@ -26,6 +26,11 @@ COPY packages/teardown/package.json packages/teardown/
 RUN pnpm install --frozen-lockfile
 COPY apps apps
 COPY packages packages
+# DEVOS-224: the provisioner generates each project's S3 core with scripts/template/apply.mjs, which reads the
+# golden-path template and the build-standard catalogue.
+COPY scripts/template scripts/template
+COPY templates templates
+COPY docs/standards/build-standard.yaml docs/standards/build-standard.yaml
 RUN pnpm -r --workspace-concurrency=1 build
 
 FROM base AS runtime

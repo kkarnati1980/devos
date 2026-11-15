@@ -42,6 +42,9 @@ importers:
       '@devos/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@devos/provision':
+        specifier: workspace:*
+        version: link:../../packages/provision
       '@devos/run-engine':
         specifier: workspace:*
         version: link:../../packages/run-engine

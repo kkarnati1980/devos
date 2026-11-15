@@ -94,10 +94,12 @@ export class PrismaRequirementsStore implements RequirementsStore {
       const pid = input.projectId;
       const stage = await this.lockProject(tx, pid);
       if (stage === null) throw new PipelineError("project-not-found", 404);
-      if (stage !== input.expectedStage) throw new PipelineError("project-not-in-intake", 409);
+      // DEVOS-224: an approval now moves the project out of `intake`, so the approved-doc check comes first and a
+      // late submission still gets the specific code.
       if (await tx.requirementsDoc.findFirst({ where: { projectId: pid, status: "approved" }, select: { id: true } })) {
         throw new PipelineError("requirements-already-approved", 409);
       }
+      if (stage !== input.expectedStage) throw new PipelineError("project-not-in-intake", 409);
       const specMax = await tx.spec.aggregate({ where: { projectId: pid }, _max: { version: true } });
       const docMax = await tx.requirementsDoc.aggregate({ where: { projectId: pid }, _max: { version: true } });
       const specVersion = (specMax._max.version ?? 0) + 1;
@@ -297,6 +299,9 @@ export class PrismaRequirementsStore implements RequirementsStore {
       const newest = await tx.requirementsDoc.findFirst({ where: { projectId: d.projectId }, orderBy: { version: "desc" }, select: DOC_SELECT });
       if (!newest || newest.id !== docId || newest.status !== "draft") return false;
       await tx.requirementsDoc.update({ where: { id: docId }, data: { status: "approved" } });
+      // DEVOS-224 (M2.4-d1): approval queues provisioning, in this transaction and only from `intake`, so it queues
+      // exactly one job and a retried approval queues none (AT11). The provisioning sweep takes `provisioning` projects.
+      await tx.project.updateMany({ where: { id: d.projectId, stage: "intake" }, data: { stage: "provisioning" } });
       await tx.auditEvent.create({
         data: {
           actor: "system",
