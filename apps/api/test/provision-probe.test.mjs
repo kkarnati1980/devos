@@ -1,7 +1,7 @@
 // DEVOS-228 (M2.4-d3b, docs/modules/M2.4.md "Part 2"): the AT13 probe's phase machine, with fakes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { probeStep, inventoryDiff, PROBE_EVERY_MS } from "../dist/provision-probe.js";
+import { probeStep, inventoryDiff, probeProvisionOnce, PROBE_EVERY_MS, PROBE_PHASE_MAX_MS } from "../dist/provision-probe.js";
 
 const ROWS = [
   { key: "github_repo", provider: "github", externalId: "1", name: "devos-probe-m24" },
@@ -123,4 +123,37 @@ test("inventoryDiff ignores row order and names a missing or extra row", () => {
 
 test("inventoryDiff flags a key recorded twice in one run", () => {
   assert.equal(inventoryDiff([...ROWS, ROWS[0]], ROWS), "duplicate-in-run1:github_repo");
+});
+
+test("a run or purge in progress for longer than the phase limit ends the cycle as a timeout", async () => {
+  const d = fake({ provisionOnce: async () => "in_progress" });
+  assert.equal((await probeStep(d)).code, "in_progress");
+  d.tick(PROBE_PHASE_MAX_MS);
+  const r = await probeStep(d);
+  assert.deepEqual([r.phase, r.code], ["purge", "in_progress"]);
+  const end = await probeStep(d);
+  assert.deepEqual([end.exit, end.code, end.detail], [1, "run1-failed", "timeout"]);
+
+  const e = fake({ purge: async () => "in_progress" });
+  for (let i = 0; i < 5; i++) await probeStep(e); // run1 .. assert, now in purge
+  assert.equal(e.log.at(-1).phase, "purge");
+  e.tick(PROBE_PHASE_MAX_MS);
+  const p = await probeStep(e);
+  assert.deepEqual([p.exit, p.code, p.detail], [1, "purge-failed", "timeout"]);
+});
+
+const P = { id: "11111111-1111-4111-8111-111111111111", slug: "devos-probe-m24", name: "probe" };
+const stop = (code, retryable) => Object.assign(new Error("provider said: secret-ish text"), { name: "StepError", code, retryable });
+
+test("probeProvisionOnce: done, a missing token, a retryable stop, a final stop (fixed codes only)", async () => {
+  const pv = (ready, run) => ({ ready: async () => ready, run });
+  assert.equal(await probeProvisionOnce(pv(null, async () => ({})), P), "done");
+  let ran = false;
+  assert.deepEqual(await probeProvisionOnce(pv("provision-github-token-not-set", async () => { ran = true; }), P), { error: "provision-github-token-not-set" });
+  assert.equal(ran, false, "nothing runs without both tokens");
+  assert.equal(await probeProvisionOnce(pv(null, async () => { throw stop("provider_error", true); }), P), "in_progress");
+  const r = await probeProvisionOnce(pv(null, async () => { throw stop("name_conflict", false); }), P);
+  assert.deepEqual(r, { error: "name_conflict" });
+  assert.equal(JSON.stringify(r).includes("secret-ish"), false);
+  assert.equal(await probeProvisionOnce(pv(null, async () => { throw new Error("boom"); }), P), "in_progress");
 });

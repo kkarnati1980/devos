@@ -5,6 +5,8 @@
 
 export const PROBE_SLUG = "devos-probe-m24";
 export const PROBE_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
+/** A run or purge still "in progress" after this long ends the cycle (`<phase>-timeout`), so a stuck provider never hides. */
+export const PROBE_PHASE_MAX_MS = 2 * 60 * 60 * 1000;
 
 export const PHASES = ["run1", "inventory1", "run2", "inventory2", "assert", "purge", "done"] as const;
 export type Phase = (typeof PHASES)[number];
@@ -95,6 +97,7 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
   }
 
   const { cycle, phase } = last;
+  const timedOut = () => d.now().getTime() - Date.parse(last!.at) >= PROBE_PHASE_MAX_MS;
   const finish = async (ok: boolean, code: string, detail?: string): Promise<ProbeTick> => {
     await d.record({ ...last!, phase: "done", at: at(), result: { ok, code, detail } });
     return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail };
@@ -109,10 +112,11 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     case "run1":
     case "run2": {
       const r = await d.provisionOnce();
-      if (r === "in_progress") return { exit: 3, phase, cycle, code: "in_progress" };
+      if (r === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
       if (r !== "done") {
+        const error = r === "in_progress" ? "timeout" : r.error;
         // Purge whatever the failed run created, then report the run's failure (kept in the record).
-        await d.record({ ...last, phase: "purge", at: at(), result: { ok: false, code: `${phase}-failed`, detail: r.error } });
+        await d.record({ ...last, phase: "purge", at: at(), result: { ok: false, code: `${phase}-failed`, detail: error } });
         return { exit: 3, phase: "purge", cycle, code: "in_progress" };
       }
       return advance();
@@ -133,8 +137,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     }
     case "purge": {
       const p = await d.purge();
-      if (p === "in_progress") return { exit: 3, phase, cycle, code: "in_progress" };
-      if (p !== "done") return finish(false, "purge-failed", p.error);
+      if (p === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
+      if (p !== "done") return finish(false, "purge-failed", p === "in_progress" ? "timeout" : p.error);
       if (last.result && !last.result.ok) return finish(false, last.result.code, last.result.detail);
       return finish(true, "pass");
     }
@@ -200,5 +204,31 @@ export class PrismaProbeLog {
     await this.db.$transaction((tx: any) => tx.auditEvent.create({
       data: { actor: "system", action: PHASE_ACTION, summary: `AT13 probe cycle ${r.cycle}: ${r.phase}${r.result ? ` (${r.result.code})` : ""}`, details: r, projectId: this.projectId },
     }), { timeout: t, maxWait: t });
+  }
+}
+
+/** The runner's stop, read structurally (StepError lives in @devos/provision, loaded at run time). */
+function stepStop(e: unknown): { code: string; retryable: boolean } {
+  const x = e as { name?: unknown; code?: unknown; retryable?: unknown } | null;
+  if (x && x.name === "StepError" && typeof x.code === "string") return { code: x.code, retryable: x.retryable === true };
+  return { code: "provision-failed", retryable: true };
+}
+
+/**
+ * One provisioning run for the probe project through the same provisioner as the sweep. A retryable stop is
+ * "in progress" (the next tick runs again; PROBE_PHASE_MAX_MS bounds it); any other stop is its fixed code.
+ */
+export async function probeProvisionOnce(
+  pv: { ready(): Promise<string | null>; run(p: { id: string; slug: string; name: string }): Promise<unknown> },
+  project: { id: string; slug: string; name: string },
+): Promise<RunOutcome> {
+  const notReady = await pv.ready();
+  if (notReady) return { error: notReady };
+  try {
+    await pv.run(project);
+    return "done";
+  } catch (e) {
+    const s = stepStop(e);
+    return s.retryable ? "in_progress" : { error: s.code };
   }
 }
