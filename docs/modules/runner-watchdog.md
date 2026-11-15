@@ -62,7 +62,8 @@ Constants: `SILENT_MS = 2 h`, `REPEAT_MS = 6 h`, `CAP_NOTE_MS = 24 h`, `LINEAR_D
 | AT7 | (217c) The `runner-watchdog` server check passes when the watchdog's last run is under 35 minutes old, fails when older or missing, and skips when DevOS is not deployed |
 
 ## Pass rule
-- `pnpm --filter @devos/api test` exits 0 on the merged SHA, covering AT1–AT6 in `apps/api/test/runner-watchdog.test.mjs` (DEVOS-219) and `apps/api/test/runner-watchdog-runtime.test.mjs` (DEVOS-220).
+- `pnpm --filter @devos/api test` exits 0 on the merged SHA, covering AT1–AT6 in `apps/api/test/runner-watchdog.test.mjs` (217a) and the runtime test (217b).
+- From DEVOS-220: `node --test apps/api/test/runner-watchdog-runtime.test.mjs` exits 0 after the api build (8 tests), and `pnpm --filter @devos/api run test:db` exits 0 with `runner-watchdog-store.test.mjs`.
 - `node --test scripts/test/server-agent.test.mjs` exits 0 on the merged SHA, covering AT7 (217c) and the server agent's existing tests.
 - After deploy, the `server-check` status on the live SHA includes `runner-watchdog` passed, with a last run under 35 minutes old.
 
