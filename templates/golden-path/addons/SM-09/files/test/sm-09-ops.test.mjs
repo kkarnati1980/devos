@@ -80,7 +80,15 @@ test("SM-09-L2: logs are JSON with a request or job ID, and secrets and personal
   });
   const job = log.child({ jobId: "job-1" });
   job.warn("retrying", { attempt: 2 });
-  const [a, b] = out.lines;
+  log.info("cache", { url: "redis://:hunter3pass@cache:6379", counts: { "ravi@example.com": 3 }, username: "ravi_k", raw: Buffer.from("hunter4"),
+    stripe: "sk_live_abcdefghijklmnop", time: "1999-01-01T00:00:00Z" });
+  const [a, b, c] = out.lines;
+  assert.equal(c.url, "redis://:[redacted]@cache:6379");
+  assert.deepEqual(c.counts, { "[redacted-email]": 3 });
+  assert.equal(c.username, "[redacted]");
+  assert.equal(c.raw, "[binary 7 bytes]");
+  assert.equal(c.stripe, "[redacted-key]");
+  assert.notEqual(c.time, "1999-01-01T00:00:00Z", "a field cannot forge the time");
   assert.equal(a.level, "info");
   assert.equal(a.msg, "signed in");
   assert.equal(a.requestId, "req-12345678");
@@ -93,11 +101,14 @@ test("SM-09-L2: logs are JSON with a request or job ID, and secrets and personal
   assert.equal(a.key, "[redacted-key]");
   assert.deepEqual(a.nested, { profile: { fullName: "[redacted]", city: "Pune" } });
   const text = JSON.stringify(out.lines);
-  for (const leak of ["hunter2", "asha@example.com", "s3cret", "ghp_aaaa", "98765", "Asha K", "abc.def", "sid=1"]) assert.ok(!text.includes(leak), leak);
+  for (const leak of ["hunter2", "hunter3", "ravi", "sk_live", "asha@example.com", "s3cret", "ghp_aaaa", "98765", "Asha K", "abc.def", "sid=1"]) assert.ok(!text.includes(leak), leak);
   assert.deepEqual([b.level, b.msg, b.requestId, b.jobId, b.attempt], ["warn", "retrying", "req-12345678", "job-1", 2]);
   // A field cannot overwrite the line's own context or level.
   logger({ out, context: { jobId: "j9" } }).info("x", { jobId: "forged", level: "debug" });
-  assert.deepEqual([out.lines[2].jobId, out.lines[2].level], ["j9", "info"]);
+  assert.deepEqual([out.lines[3].jobId, out.lines[3].level], ["j9", "info"]);
+  // Non-object fields and an unprintable message never throw.
+  logger({ out }).info(Object.create(null), "plain");
+  assert.deepEqual([out.lines[4].msg, out.lines[4].data], ["[unprintable]", "plain"]);
 });
 
 test("SM-09-L2: redact never throws (cycles, BigInt, depth, size, throwing getters)", () => {
@@ -107,6 +118,13 @@ test("SM-09-L2: redact never throws (cycles, BigInt, depth, size, throwing gette
   assert.equal(redact({ a: { b: { c: { d: { e: { f: 1 } } } } } }).a.b.c.d.e, "[depth]");
   assert.equal(Object.keys(redact(Object.fromEntries(Array.from({ length: 80 }, (_, i) => [`k${i}`, i])))).length, 50);
   assert.ok(redact("x".repeat(5000)).endsWith("…[truncated]"));
+  // A secret straddling the cut is masked before the cut, never left half-visible.
+  const straddle = redact(`${"x".repeat(1990)} ghp_${"a".repeat(30)}`);
+  assert.ok(!straddle.includes("ghp_"), straddle.slice(-40));
+  // The e-mail pattern stays fast on long strings without an @.
+  const t0 = performance.now();
+  for (let i = 0; i < 20; i += 1) redact("a".repeat(20_000));
+  assert.ok(performance.now() - t0 < 1000, "bounded cost");
   const bad = { get boom() { throw new Error("no"); } };
   assert.equal(redact(bad), "[unloggable]");
   assert.deepEqual(redact(new Error("mail asha@example.com")), { name: "Error", message: "mail [redacted-email]" });
@@ -130,18 +148,23 @@ test("SM-09-L2: errors reach monitoring once, redacted, with the request or job 
   // A refused report is logged as a warning and the call still returns.
   assert.equal(await monitor.capture("job blew up", { jobId: "job-7" }), false);
   assert.deepEqual(out.lines.slice(-2).map((l) => [l.level, l.msg, l.jobId ?? l.code]), [["error", "error", "job-7"], ["warn", "error-report-failed", "webhook-500"]]);
+  // A rejection reason that cannot be turned into text is still captured.
+  assert.equal(await monitor.capture(Object.create(null)), false);
+  assert.equal(out.lines.at(-2).error.message, "[unprintable]");
   // No reporter: still logged.
   assert.equal(await errorMonitor({ log: logger({ out }) }).capture(new Error("x")), false);
   assert.throws(() => webhookReporter("http://errors.example.com/intake"), /https/);
   assert.throws(() => webhookReporter("not a url"), /URL/);
 });
 
-test("SM-09-L2: the default reporter goes through safeFetch, so an internal URL is blocked (F2)", async () => {
+test("SM-09-L1/L2: the default reporter and dependency check go through safeFetch, so an internal URL is blocked (F2)", async () => {
   const out = sink();
   const monitor = errorMonitor({ report: webhookReporter("https://127.0.0.1/intake", { timeoutMs: 500 }), log: logger({ out }) });
   assert.equal(await monitor.capture(new Error("x")), false);
   assert.equal(out.lines.at(-1).msg, "error-report-failed");
   assert.match(String(out.lines.at(-1).code), /block|internal|private|loopback/i);
+  // dependencyReady's default path is safeFetch too: an internal URL is refused (and /ready counts it not ready).
+  await assert.rejects(dependencyReady("internal", "https://127.0.0.1/health", { timeoutMs: 300 }).check(), (e) => e.code === "blocked-address");
 });
 
 test("SM-09-L2: watchProcess reports unhandled rejections and crashes, then exits 1 on a crash", async () => {
@@ -156,5 +179,12 @@ test("SM-09-L2: watchProcess reports unhandled rejections and crashes, then exit
   assert.deepEqual(got, ["lost promise", "crash"]);
   assert.deepEqual(exits, [1]);
   undo();
+  // A reporter that never settles cannot keep a crashed process up.
+  const exits2 = [];
+  const undo2 = watchProcess({ capture: () => new Promise(() => {}) }, { proc, exit: (c) => exits2.push(c), exitAfterMs: 30 });
+  proc.emit("uncaughtException", new Error("crash"));
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(exits2, [1]);
+  undo2();
   assert.equal(proc.listenerCount("uncaughtException") + proc.listenerCount("unhandledRejection"), 0);
 });
