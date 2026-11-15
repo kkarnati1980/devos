@@ -80,6 +80,11 @@ export interface QueueStore {
    * set `appliedAt` (a conditional update in Postgres), so two concurrent applies cannot both win.
    */
   apply(batchId: string, rows: readonly DecisionRow[], now: Date): Promise<boolean>;
+  /**
+   * Codex PR135-r3: the final rows stored for one card (approval id), whichever apply wrote them. `applyBatch`
+   * builds its `followUps` from these, never from a fresh read of the comments, so every replay returns the same.
+   */
+  finalRows(approvalId: string): Promise<DecisionRow[]>;
   /** Sets `settledAt` on an applied batch (once); the batch then leaves the sync job's list. */
   markSettled(batchId: string, now: Date): Promise<void>;
   /**
@@ -257,7 +262,13 @@ export class CardBatchQueue {
     const answers = batchAnswers(members, comments);
     const rows: DecisionRow[] = members.map((m, i) => ({ projectId: row.projectId, itemId: `Q-${m.id}`, text: m.text, answer: answers[i]!.answer, source: answers[i]!.source, approvalId: card.id }));
     const first = await this.store.apply(batchId, rows, now);
-    const followUps = members.flatMap((m, i) => (answers[i]!.source === "kk" && answers[i]!.answer !== m.default ? [{ questionId: m.id, answer: answers[i]!.answer, blocks: [...m.blocks] }] : []));
+    // Codex PR135-r3: the follow-ups come from the rows stored with `appliedAt` (written by whichever apply won), so
+    // a comment that commits after the first apply can never change what a replay returns.
+    const stored = new Map((await this.store.finalRows(card.id)).map((d) => [d.itemId, d]));
+    const followUps = members.flatMap((m) => {
+      const d = stored.get(`Q-${m.id}`);
+      return d && d.source === "kk" && d.answer !== m.default ? [{ questionId: m.id, answer: d.answer, blocks: [...m.blocks] }] : [];
+    });
     return { outcome: "approved", first, followUps, stopped: [] };
   }
 
@@ -336,6 +347,9 @@ export class MemoryQueueStore implements QueueStore {
     for (const r of rows) if (!this.decisions.some((d) => d.approvalId === r.approvalId && d.itemId === r.itemId)) this.decisions.push({ ...r });
     b.appliedAt = now;
     return true;
+  }
+  async finalRows(approvalId: string) {
+    return this.decisions.filter((d) => d.approvalId === approvalId).map((d) => ({ ...d }));
   }
   async markSettled(batchId: string, now: Date) {
     const b = this.batches.get(batchId);
