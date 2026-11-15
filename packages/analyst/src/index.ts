@@ -32,6 +32,10 @@ export {
   renderArchitectLog,
   CARD_LINE_MAX,
   CARD_REASON_MAX,
+  MONEY_WORDS,
+  LEGAL_WORDS,
+  DELETION_WORDS,
+  OTHER_NON_TECHNICAL_WORDS,
   type Classification,
   type ClassReason,
   type PlanMeta,
@@ -70,6 +74,7 @@ export { MemoryRequirementsStore, type MemoryRequirement, type MemorySpec } from
 export {
   buildPreflight,
   preflightDecisions,
+  preflightReanswers,
   preflightEntries,
   preflightLine,
   PreflightError,
@@ -82,6 +87,7 @@ export {
   SECRET_NAME,
   ANSWER_MAX,
   type PreflightDecisionRow,
+  type PreflightReanswerRow,
   type PreflightEnvelope,
   type PreflightItem,
 } from "./preflight.js";
