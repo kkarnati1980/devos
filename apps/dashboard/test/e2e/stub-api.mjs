@@ -70,6 +70,31 @@ export async function startStubApi(allowedOrigin) {
         },
       });
     }
+    // ADR-0012 CR-b2c (DEVOS-216): an approved batch of 12 long questions (AT8a: all 12 listed, though the card's
+    // reason clips at 2,000 characters) and a rejected batch whose blocked tasks stay stopped (AT11, page part).
+    if (req.method === "GET" && url === "/projects/by-slug/xss-probe/batches") {
+      const long = (n) => `Question ${n}: ${"which layout should the report use? ".repeat(30)}`.slice(0, 1000);
+      return json(200, {
+        batches: {
+          waiting: [{ text: "Queued after the flush", source: "builder", default: "Architect decides", queuedAt: "2026-11-15T09:00:00.000Z" }],
+          batches: [
+            {
+              id: "b2", istDay: "2026-11-15", state: "raised", cardId: "c2", cardStatus: "approved", applied: true, handedOff: false,
+              questions: Array.from({ length: 12 }, (_, i) => ({
+                ref: `BQ-${i + 1}`, text: i === 0 ? "Use <img src=x onerror=window.__xss4=1> icons?" : long(i + 1), source: "builder",
+                default: "Architect decides", answer: i === 0 ? "no <b>icons</b>" : "Architect decides", answerSource: i === 0 ? "kk" : "default",
+              })),
+              stoppedTasks: [],
+            },
+            {
+              id: "b1", istDay: "2026-11-14", state: "raised", cardId: "c1", cardStatus: "rejected", applied: false, handedOff: false,
+              questions: [{ ref: "BQ-1", text: "Pay for a hosted search service?", source: "builder", default: "no", answer: null, answerSource: null }],
+              stoppedTasks: [{ id: "t1", title: "Build search <script>window.__xss5=1</script>" }, { id: "t2", title: "Index the catalogue" }],
+            },
+          ],
+        },
+      });
+    }
     if (req.method === "GET" && url.startsWith("/projects/by-slug/")) return json(404, { statusCode: 404, code: "project-not-found" });
     if (req.method === "GET" && url === "/setup") {
       return json(200, { capsConfirmed: state.settings.capsConfirmedAt !== null, vaultConfigured: true, secrets: NAMES.map((n) => ({ name: n, set: state.secrets.has(n) })), complete: false });
