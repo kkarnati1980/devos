@@ -185,7 +185,13 @@ export async function archiveProject(projectId: string, opts: ArchiveOptions): P
     // Pre-review finding 3: prove ownership of every resource before the first write, so a mismatch never
     // leaves the project half archived.
     const todo: { r: ActiveResource; ops: ResourceOps }[] = [];
-    for (const r of await opts.store.activeResources(projectId)) {
+    // M2.5-a3b pre-review 2: the purge's order (Coolify first, the GitHub repo last), so the stacks are stopped
+    // before the repo turns read-only, as the Archive row orders it; a failed stop leaves the repo writable.
+    const ordered = (await opts.store.activeResources(projectId))
+      .map((r, i) => ({ r, i }))
+      .sort((a, b) => rank(a.r) - rank(b.r) || b.i - a.i)
+      .map((x) => x.r);
+    for (const r of ordered) {
       const ops = map.get(opsKey(r.provider, r.kind));
       if (!ops?.archive) continue;
       const got = await inspect(ops, r);
@@ -218,7 +224,13 @@ export async function restoreProject(projectId: string, opts: TeardownOptions): 
     // Pre-review finding 3: prove ownership of every resource before the first write, so a mismatch never
     // leaves the project half restored.
     const todo: { r: ActiveResource; ops: ResourceOps }[] = [];
-    for (const r of await opts.store.activeResources(projectId)) {
+    // M2.5-a3b pre-review 2: the purge's order (Coolify first, the GitHub repo last), so the stacks are stopped
+    // before the repo turns read-only, as the Archive row orders it; a failed stop leaves the repo writable.
+    const ordered = (await opts.store.activeResources(projectId))
+      .map((r, i) => ({ r, i }))
+      .sort((a, b) => rank(a.r) - rank(b.r) || b.i - a.i)
+      .map((x) => x.r);
+    for (const r of ordered) {
       const ops = map.get(opsKey(r.provider, r.kind));
       if (!ops?.unarchive) continue;
       const got = await inspect(ops, r);

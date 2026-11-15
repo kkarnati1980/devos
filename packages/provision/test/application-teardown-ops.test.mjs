@@ -51,7 +51,7 @@ test("archive stops the app (one call); there is no un-archive", async () => {
 test("remove is one DELETE with volumes, configuration and networks; 404/410 is already gone; other errors throw", async () => {
   const s = stub({});
   await coolifyApplicationOps(s.cf, PID).remove(ITEM);
-  assert.equal(s.calls.length, 1);
+  assert.deepEqual(s.calls.map(([m]) => m), ["DELETE", "GET"], "one delete, then a read that confirms it is gone");
   const [method, path] = s.calls[0];
   assert.equal(method, "DELETE");
   const u = new URL(path, "http://x");
@@ -89,4 +89,32 @@ test("the Coolify leftover scan finds the project's applications by name or mark
   assert.deepEqual(hits.map((h) => [h.kind, h.externalId]).sort(), [["application", "a-1"], ["application", "a-2"], ["application", "a-3"]]);
   const bad = stub({ "GET /api/v1/projects": { status: 200, body: [] }, "GET /api/v1/applications": { status: 502, body: null } });
   await assert.rejects(coolifyScanner(bad.cf).scan({ id: PID, slug: "acme" }), ProviderError, "an unreadable application list is never a clean scan");
+});
+
+test("pre-review 1: remove waits for a queued delete to show as gone, and gives up with a transient error", async () => {
+  let reads = 0;
+  const present = { status: 200, body: { uuid: UUID, description: "" } };
+  const s = stub({});
+  s.cf.http.get = async (path) => { s.calls.push(["GET", path]); return ++reads < 3 ? present : { status: 404, body: null }; };
+  let t = 0;
+  const opts = { sleep: async (ms) => { t += ms; }, now: () => t, pollMs: 2000, confirmMs: 60000 };
+  await coolifyApplicationOps(s.cf, PID, opts).remove(ITEM);
+  assert.equal(reads, 3, "read until the 404");
+  assert.equal(s.calls.filter(([m]) => m === "DELETE").length, 1, "one delete");
+
+  const stuck = stub({ [`GET /api/v1/applications/${UUID}`]: present });
+  t = 0;
+  await assert.rejects(coolifyApplicationOps(stuck.cf, PID, opts).remove(ITEM), (e) => e instanceof ProviderError && e.transient === true);
+  assert.equal(stuck.calls.filter(([m]) => m === "DELETE").length, 1, "never a second delete");
+  assert.ok(t >= 60000 && t < 64000, `bounded wait (${t} ms)`);
+});
+
+test("pre-review 3: a stop answering 404 for an app that is gone is nothing to stop; one that still exists fails", async () => {
+  const gone = stub({ [`GET /api/v1/applications/${UUID}/stop`]: { status: 404, body: null } });
+  await coolifyApplicationOps(gone.cf, PID).archive(ITEM);
+  const odd = stub({
+    [`GET /api/v1/applications/${UUID}/stop`]: { status: 404, body: null },
+    [`GET /api/v1/applications/${UUID}`]: { status: 200, body: { uuid: UUID, description: "" } },
+  });
+  await assert.rejects(coolifyApplicationOps(odd.cf, PID).archive(ITEM), ProviderError);
 });
