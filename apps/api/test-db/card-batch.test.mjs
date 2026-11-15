@@ -200,7 +200,7 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   await store.markHandedOff(x.id, DAY1_LATE);
   assert.ok(!(await store.projectsWithOpenBatch()).includes(projectId));
   // A question queued after the day's batch waits for 15 Nov: it takes no slot on 14 Nov.
-  await queue.queueQuestion(projectId, ask("Show prices with tax?", "yes"), DAY1_LATE);
+  await queue.queueQuestion(projectId, ask("Show the product grid in two columns?", "yes"), DAY1_LATE);
   assert.ok(!(await store.projectsToFlush("2026-11-14")).includes(projectId));
   assert.ok((await store.projectsToFlush("2026-11-15")).includes(projectId));
   assert.ok((await store.projectsToFlush("2026-11-15", 2.5)).length <= 2, "a fractional limit is an integer");
@@ -238,4 +238,22 @@ test("CR-b2e (db): an approved member card of a handed-off batch is listed until
   assert.equal(await store.recordMemberAnswer({ ...row, answer: "yes", approvalId: twin }), false);
   const rows = await db.$queryRawUnsafe("SELECT answer, source FROM project_decision WHERE project_id = $1::uuid AND item_id = $2 AND approval_id IS NOT NULL", projectId, `Q-${q1}`);
   assert.deepEqual(rows.map((r) => [r.answer, r.source]), [["no", "kk"]]);
+});
+
+test("CR-b2b (db, Codex PR140-r1): one batch takes at most BATCH_MEMBERS_MAX questions, oldest first; the rest wait for the next day", async () => {
+  const { BATCH_MEMBERS_MAX } = await import("../dist/card-batch-store.js");
+  const { projectId } = await fixture(0);
+  const { store } = setup();
+  await db.$queryRawUnsafe(
+    `INSERT INTO queued_question (project_id, text, source, default_answer, blocks, queued_at)
+     SELECT $1::uuid, 'Question ' || g, 'builder', 'yes', '{}', timestamptz '2026-11-14 00:00:00+00' + g * interval '1 second'
+       FROM generate_series(1, $2::int) AS g`,
+    projectId, BATCH_MEMBERS_MAX + 1,
+  );
+  const b = await store.claim(projectId, "2026-11-14", randomUUID());
+  const members = await store.members(b.id);
+  assert.equal(members.length, BATCH_MEMBERS_MAX);
+  assert.equal(members[0].text, "Question 1");
+  const left = await db.$queryRawUnsafe("SELECT text FROM queued_question WHERE project_id = $1::uuid AND batch_id IS NULL", projectId);
+  assert.deepEqual(left.map((r) => r.text), [`Question ${BATCH_MEMBERS_MAX + 1}`], "the newest waits");
 });

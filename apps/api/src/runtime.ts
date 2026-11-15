@@ -191,7 +191,7 @@ export async function buildRuntime(
   // CR-b2d (DEVOS-218): the batched-question queue over Postgres (CR-b2b store; its raise lock is a session lock on
   // its own bounded pg connection, so it spans M2.3's transactions).
   const queueStore = new PrismaQueueStore(db as unknown as PrismaTxLike, { databaseUrl, timeoutMs: t });
-  const cardBatchQueue = new CardBatchQueue(queueStore, approvalBatchCards(approvalsCore, prismaTaskProjects(db as unknown as PrismaTxLike, t)), randomUUID);
+  const cardBatchQueue = new CardBatchQueue(queueStore, approvalBatchCards(approvalsCore, prismaTaskProjects(db as unknown as PrismaTxLike, t), queueStore), randomUUID);
   const cardBatch = new CardBatchJob(cardBatchQueue, approvalsCore, (id) => queueStore.projectName(id), queueStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   // S4-a2b: the read side of GET /internal/isolation-state (and, in the M2.4-d wiring, the afterStack hook store).
   const isolation = new PrismaIsolationStore(db, t);
