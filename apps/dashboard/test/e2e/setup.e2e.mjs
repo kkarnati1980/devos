@@ -323,3 +323,27 @@ test("AT-CA3b (CR-a3, DEVOS-199): the project page shows the pre-flight read-onl
     api.state.denySignIn = false;
   }
 });
+
+test("M2.4-d2 (DEVOS-225): the project page's Provisioning panel shows each step in plain words, escaped, and Try again posts the retry with CSRF", async () => {
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  const { page, context, problems } = await open("/projects/xss-probe");
+  await page.getByTestId("provisioning-step").first().waitFor();
+  const steps = await page.getByTestId("provisioning-step").allInnerTexts();
+  assert.equal(steps.length, 2);
+  assert.match(steps[0], /github\/repo — needs your decision: something with this name already exists/);
+  assert.match(steps[1], /github\/core — waiting \(<img src=x onerror=window\.__xss4=1>\)/, "a code is shown as text");
+  assert.equal(await page.evaluate(() => window.__xss4), undefined, "no payload ran");
+  assert.equal(await page.locator('[data-testid="provisioning-panel"] img').count(), 0);
+  await page.getByTestId("provisioning-retry").click();
+  await page.getByTestId("provisioning-note").filter({ hasText: "Queued" }).waitFor();
+  assert.equal(api.state.received.at(-1).url, "/projects/11111111-1111-4111-8111-111111111111/provision");
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "the retry carried the session's CSRF token");
+  await page.getByTestId("provisioning-retry").waitFor({ state: "detached" });
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems, []);
+  await context.close();
+  const other = await open("/projects/social-content-extraction");
+  await other.page.getByTestId("provisioning-error").waitFor();
+  assert.match(await other.page.getByTestId("provisioning-error").innerText(), /^Provisioning has not started for this project\. \(project-not-found\)$/);
+  await other.context.close();
+});

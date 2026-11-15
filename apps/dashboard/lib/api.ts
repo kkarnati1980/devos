@@ -71,6 +71,10 @@ export interface PreflightView {
   decisions: { itemId: string; answer: string; source: string; createdAt: string }[];
 }
 
+/** M2.4-d2 (DEVOS-225): provisioning status; `code` is a fixed error code only. */
+export interface ProvisionStepView { key: string; provider: string; kind: string; status: "pending" | "done" | "failed"; attempts: number; code: string | null; updatedAt: string }
+export interface ProvisionView { projectId: string; stage: string; parked: boolean; steps: ProvisionStepView[] }
+
 /** M1.6 notifications. */
 export type ChannelKind = "dashboard" | "mybrain" | "email";
 export interface Delivery {
@@ -210,6 +214,13 @@ export class DevosApi {
   /** ADR-0012 CR-a3 (DEVOS-199). */
   preflight(slug: string) {
     return this.call<{ preflight: PreflightView }>("GET", `/projects/by-slug/${encodeURIComponent(slug)}/preflight`);
+  }
+  /** M2.4-d2 (DEVOS-225). */
+  provision(slug: string) {
+    return this.call<ProvisionView>("GET", `/projects/by-slug/${encodeURIComponent(slug)}/provision`);
+  }
+  retryProvision(projectId: string) {
+    return this.call<{ queued: boolean }>("POST", `/projects/${encodeURIComponent(projectId)}/provision`);
   }
   /** M2.3-b2 (DEVOS-135): the approvals inbox over the M2.3-b1 routes. */
   approvals(query: { status?: ApprovalStatus; cursor?: string } = {}) {
