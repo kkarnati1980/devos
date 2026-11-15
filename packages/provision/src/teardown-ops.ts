@@ -317,6 +317,7 @@ const COOLIFY_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
  * uuid. A 404 (or any other answer) throws `coolify-token-scope`, so the purge stops with `provider_forbidden` and
  * deletes nothing. A 5xx or timeout stays a transient ProviderError (the purge stops retryable). With no active
  * Coolify project row there is nothing recorded to prove (docs/modules/M2.5.md, "DEVOS-235 decisions" 2).
+ * Build it, and the purge's Coolify ops and scanner, on one `pinnedCoolify` client, so the proof holds for every call.
  */
 export function coolifyTokenScopeCheck(cf: CoolifyClient, recorded: () => Promise<readonly InventoryItem[]>): () => Promise<void> {
   if (typeof recorded !== "function") throw new Error("coolify-recorded-invalid");
@@ -333,4 +334,16 @@ export function coolifyTokenScopeCheck(cf: CoolifyClient, recorded: () => Promis
       }
     }
   };
+}
+
+/**
+ * DEVOS-235 pre-review: one Coolify token snapshot for a whole purge, as `pinnedGitHub` does for GitHub. A token
+ * swapped in the vault after the preflight (another team's) would answer 404 for every uuid and make the stacks look
+ * gone. Build the purge's Coolify ops, scanner and `coolifyTokenScopeCheck` from this one client.
+ */
+export async function pinnedCoolify(cf: CoolifyClient): Promise<CoolifyClient> {
+  const http = await cf.http.pinned();
+  const c = Object.create(Object.getPrototypeOf(cf)) as CoolifyClient;
+  Object.defineProperty(c, "http", { value: http, enumerable: true });
+  return c;
 }

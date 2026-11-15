@@ -6,12 +6,13 @@ import assert from "node:assert/strict";
 import {
   allowAll, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, stackSteps, parsePortRange, runProvision,
   githubRepoOps, coolifyProjectOps, coolifyEnvironmentOps, coolifyPortOps, coolifyApplicationOps, githubScanner, coolifyScanner,
-  ownershipMarker, applicationName, coolifyTokenScopeCheck,
+  ownershipMarker, applicationName, coolifyTokenScopeCheck, pinnedCoolify,
 } from "@devos/provision";
 import { archiveProject, restoreProject, purgeProject, inventoryScanner, MemoryTeardownStore, TeardownError } from "../dist/index.js";
 import { fakeProviders } from "../../provision/test/fakes.mjs";
 
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
+const OTHER_TEAM = "TESTONLY_coolify_token_of_another_team_0000";
 const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme", name: "Acme app" };
 const RANGE = parsePortRange("20000-20999");
 const json = (status, body) => new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -26,7 +27,8 @@ function fakes() {
     const u = new URL(url);
     const method = init.method ?? "GET";
     const path = u.pathname;
-    calls.push({ method, path, query: u.search });
+    const auth = new Headers(init.headers ?? {}).get("authorization");
+    calls.push({ method, path, query: u.search, auth });
     let m;
     if (u.origin === "https://api.github.com") {
       if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)$/)) && (method === "PATCH" || method === "DELETE")) {
@@ -40,8 +42,9 @@ function fakes() {
       if (method === "GET" && path === "/user/repos") return json(200, Number(u.searchParams.get("page") ?? 1) === 1 ? [...base.repos.values()] : []);
     }
     if (u.origin === "http://coolify.test:8000") {
-      if (coolify.wrongTeam && /^\/api\/v1\/(projects|applications)\/[^/]+/.test(path)) return json(404, { message: "Not found." });
-      if (coolify.wrongTeam && method === "GET" && /^\/api\/v1\/(projects|applications)$/.test(path)) return json(200, []);
+      const wrongTeam = coolify.wrongTeam || auth === `Bearer ${OTHER_TEAM}`;
+      if (wrongTeam && /^\/api\/v1\/(projects|applications)\/[^/]+/.test(path)) return json(404, { message: "Not found." });
+      if (wrongTeam && method === "GET" && /^\/api\/v1\/(projects|applications)$/.test(path)) return json(200, []);
       if (coolify.projectStatus && method === "GET" && /^\/api\/v1\/projects\/[^/]+$/.test(path)) return json(coolify.projectStatus, { message: "injected" });
       if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)\/stop$/)) && method === "GET") {
         const a = base.apps.get(m[1]);
@@ -239,7 +242,6 @@ test("DEVOS-235: an inconclusive 200 (another uuid) or a non-uuid recorded id st
     purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyTokenScopeCheck(s.cf, swapped)] }),
     (e) => e instanceof TeardownError && e.code === "provider_forbidden",
   );
-  s.fake.coolify.projectStatus = 0;
   const proj = rows.find((r) => r.provider === "coolify" && r.kind === "project");
   const real = s.fake.projects.get(proj.externalId);
   const other = async () => rows.map((r) => (r === proj ? { ...r, externalId: "aaaaaaaa-0000-4000-8000-000000000000" } : r));
@@ -257,4 +259,45 @@ test("DEVOS-235: with no active Coolify project row there is nothing to prove; t
   const before = s.fake.calls.length;
   await coolifyTokenScopeCheck(s.cf, async () => [])();
   assert.equal(s.fake.calls.length, before);
+});
+
+test("DEVOS-235 pre-review: a 403 on the preflight read stops the purge as provider_forbidden, not retryable, zero deletes", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.fake.coolify.projectStatus = 403;
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] }),
+    (e) => e instanceof TeardownError && e.code === "provider_forbidden" && e.retryable === false,
+  );
+  assert.equal(s.fake.deletes().length, 0);
+});
+
+test("DEVOS-235 pre-review: a purge built on pinnedCoolify keeps the preflight's token even if the vault token changes", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  let token = TOKEN;
+  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => token, fetchImpl: s.fake.fetchImpl, sleep: async () => {} });
+  const pinned = await pinnedCoolify(cf);
+  token = OTHER_TEAM; // swapped in the vault after the pin: unpinned calls would see every uuid as gone
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: s.fake.fetchImpl, sleep: async () => {} });
+  const ops = [githubRepoOps(gh, P.id), coolifyProjectOps(pinned, P.id), coolifyEnvironmentOps(pinned, P.id), coolifyPortOps(), coolifyApplicationOps(pinned, P.id, { sleep: async () => {} })];
+  const scanners = [githubScanner(gh), coolifyScanner(pinned), inventoryScanner(s.store), s.store.vaultScanner()];
+  const before = s.fake.calls.length;
+  const out = await purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners, preflight: [coolifyTokenScopeCheck(pinned, () => s.store.activeResources(P.id))] });
+  assert.equal(out.purged, true, JSON.stringify(out.report));
+  const cfCalls = s.fake.calls.slice(before).filter((c) => c.path.startsWith("/api/v1/"));
+  assert.ok(cfCalls.length > 0 && cfCalls.every((c) => c.auth === `Bearer ${TOKEN}`), "every Coolify call used the pinned token");
+  assert.equal(s.fake.apps.size, 0, "the applications were really deleted");
+
+  // Control: the same swap without the pin makes the preflight fail closed, nothing deleted.
+  const u = await setup();
+  await archiveProject(P.id, { ...u.base, authorize: allowAll });
+  let t2 = TOKEN;
+  const cf2 = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => t2, fetchImpl: u.fake.fetchImpl, sleep: async () => {} });
+  t2 = OTHER_TEAM;
+  await assert.rejects(
+    purgeProject(P.id, { ...u.base, authorize: allowAll, scanners: u.scanners, preflight: [coolifyTokenScopeCheck(cf2, () => u.store.activeResources(P.id))] }),
+    (e) => e.code === "provider_forbidden",
+  );
+  assert.equal(u.fake.deletes().length, 0);
 });
