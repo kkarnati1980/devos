@@ -21,6 +21,8 @@ const TABLES = [
   "isolation_stack",
   // ADR-0012 CR-a2 (docs/modules/ADR-0012.md)
   "project_decision",
+  // DEVOS-220 (docs/modules/runner-watchdog.md)
+  "runner_watchdog_state",
 ];
 
 // Unique keys the contract names (table -> column lists).
@@ -47,6 +49,7 @@ const UNIQUES = {
   provision_step: [["project_id", "key"]],
   isolation_stack: [["project_id", "env"], ["idx"], ["subnet"], ["network"]],
   project_decision: [["approval_id", "item_id"], ["comment_id", "item_id"]],
+  runner_watchdog_state: [["name"]],
   mechanism_flag: [["role", "mechanism"]],
 };
 
