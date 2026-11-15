@@ -209,3 +209,33 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   assert.equal(f.outcome, "raised");
   assert.ok(!(await store.batchesToApply()).includes(f.batchId));
 });
+
+test("CR-b2e (db): an approved member card of a handed-off batch is listed until its Q-row is written; the row is written once per question, even with a twin card", async () => {
+  const { projectId } = await fixture(0);
+  const { store } = setup();
+  const [b] = await db.$queryRawUnsafe("INSERT INTO card_batch (project_id, ist_day, state, handed_off_at) VALUES ($1::uuid, '2026-11-14', 'refused', now()) RETURNING id", projectId);
+  const question = async (text) =>
+    (await db.$queryRawUnsafe("INSERT INTO queued_question (project_id, text, source, default_answer, blocks, queued_at, batch_id) VALUES ($1::uuid, $2, 'builder', 'yes', '{}', now(), $3::uuid) RETURNING id", projectId, text, b.id))[0].id;
+  const card = async (qid, approved) =>
+    (await db.$queryRawUnsafe(
+      `INSERT INTO approval (project_id, gate, action, target, reason, status, decided_at, decided_by, updated_at)
+       VALUES ($1::uuid, 'decision', 'Answer a build question', $2, 'r', $3::approval_status, ${approved ? "now()" : "NULL"}, ${approved ? "'kk'" : "NULL"}, now()) RETURNING id`,
+      projectId, `question:${qid}`, approved ? "approved" : "pending",
+    ))[0].id;
+  const q1 = await question("Dark header?");
+  const q2 = await question("Sticky footer?");
+  const a1 = await card(q1, true);
+  await card(q2, false);
+  const mine = async () => (await store.memberCardsToApply(100)).filter((d) => d.question.projectId === projectId);
+  const due = await mine();
+  assert.deepEqual(due.map((d) => [d.question.id, d.cardId]), [[q1, a1]], "only the approved member card");
+  const row = { projectId, itemId: `Q-${q1}`, text: "Dark header?", answer: "no", source: "kk", approvalId: a1 };
+  assert.equal(await store.recordMemberAnswer(row), true);
+  assert.equal(await store.recordMemberAnswer(row), false, "a replay writes nothing");
+  assert.deepEqual(await mine(), []);
+  const twin = await card(q1, true);
+  assert.deepEqual(await mine(), [], "a twin card of an answered question is not listed");
+  assert.equal(await store.recordMemberAnswer({ ...row, answer: "yes", approvalId: twin }), false);
+  const rows = await db.$queryRawUnsafe("SELECT answer, source FROM project_decision WHERE project_id = $1::uuid AND item_id = $2 AND approval_id IS NOT NULL", projectId, `Q-${q1}`);
+  assert.deepEqual(rows.map((r) => [r.answer, r.source]), [["no", "kk"]]);
+});
