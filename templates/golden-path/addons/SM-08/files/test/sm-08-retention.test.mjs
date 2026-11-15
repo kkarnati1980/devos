@@ -9,13 +9,13 @@ const DAY = 86_400_000;
 const NOW = Date.parse("2026-11-16T00:00:00.000Z");
 const ago = (days, extraMs = 0) => new Date(NOW - days * DAY + extraMs).toISOString();
 
-// A small emulation of the one DELETE the purge sends, matched as exact text against purgeSql(). The app's own test
+// A small emulation of the one DELETE the purge sends (timestamptz classes), matched as exact text against purgeSql(). The app's own test
 // runs it on its real database; the template has none.
 function fakeDb(tables) {
   const calls = [];
   const query = async (text, params) => {
     calls.push({ text, params });
-    const m = /^DELETE FROM "([a-z_.]+)" WHERE "([a-z_]+)" IN \(SELECT "\2" FROM "\1" WHERE "([a-z_]+)" < \$1::timestamptz ORDER BY "\3" LIMIT \$2\) RETURNING "\2"$/.exec(text);
+    const m = /^DELETE FROM "([a-z_.]+)" WHERE "([a-z_]+)" IN \(SELECT "\2" FROM "\1" WHERE "([a-z_]+)" < \$1::timestamptz ORDER BY "\3" LIMIT \$2\) AND "\3" < \$1::timestamptz RETURNING "\2"$/.exec(text);
     if (!m) throw new Error(`unexpected SQL: ${text}`);
     const [, table, key, column] = m;
     const [cutoff, limit] = params;
@@ -56,7 +56,21 @@ test("SM-08-L1: unsafe table, column or key names are refused, and names are quo
     assert.throws(() => retentionPolicy([cls]), new RegExp(field), `${field}=${JSON.stringify(value)}`);
   }
   const [cls] = retentionPolicy([{ name: "logs", table: "app.log", column: "at", days: 7 }]);
-  assert.equal(purgeSql(cls), 'DELETE FROM "app"."log" WHERE "id" IN (SELECT "id" FROM "app"."log" WHERE "at" < $1::timestamptz ORDER BY "at" LIMIT $2) RETURNING "id"');
+  // The age test is repeated outside the sub-select: a row refreshed (or restored) after the statement started is
+  // re-checked by Postgres and kept, and a non-unique key can never take a current row with it.
+  assert.equal(purgeSql(cls), 'DELETE FROM "app"."log" WHERE "id" IN (SELECT "id" FROM "app"."log" WHERE "at" < $1::timestamptz ORDER BY "at" LIMIT $2) AND "at" < $1::timestamptz RETURNING "id"');
+});
+
+test("SM-08-L1: the cutoff is cast to the age column's type, never left to the session time zone", () => {
+  const [naive, day] = retentionPolicy([
+    { name: "a", table: "t", column: "at", type: "timestamp", days: 1 },
+    { name: "b", table: "u", column: "on_day", type: "date", days: 1 },
+  ]);
+  assert.equal(purgeSql(naive), `DELETE FROM "t" WHERE "id" IN (SELECT "id" FROM "t" WHERE "at" < ($1::timestamptz AT TIME ZONE 'UTC') ORDER BY "at" LIMIT $2) AND "at" < ($1::timestamptz AT TIME ZONE 'UTC') RETURNING "id"`);
+  assert.equal(purgeSql(day), `DELETE FROM "u" WHERE "id" IN (SELECT "id" FROM "u" WHERE "on_day" < ($1::timestamptz AT TIME ZONE 'UTC')::date ORDER BY "on_day" LIMIT $2) AND "on_day" < ($1::timestamptz AT TIME ZONE 'UTC')::date RETURNING "id"`);
+  for (const type of ["text", "TIMESTAMPTZ", 1, null]) {
+    assert.throws(() => retentionPolicy([{ name: "a", table: "t", column: "at", type, days: 1 }]), /type must be one of/, String(type));
+  }
 });
 
 test("SM-08-F1: the purge removes expired rows only (cutoff, newer and NULL rows are kept)", async () => {
@@ -101,6 +115,12 @@ test("SM-08-L1: large purges run in bounded batches, oldest first; maxBatches le
   assert.equal(tables.audit_event.length, 0);
   await assert.rejects(purgeExpired(db.query, p, { batchSize: 0 }), /batchSize/);
   await assert.rejects(purgeExpired(db.query, [{ name: "x", table: '"x"', column: '"c"', key: '"id"', days: 1 }]), /retentionPolicy\(\)/);
+  // A frozen look-alike is refused too: only a policy built by retentionPolicy() reaches the SQL text.
+  const forged = Object.freeze([Object.freeze({ name: "x", table: "t; DROP TABLE u", column: "c", key: "id", type: "timestamptz", days: 1 })]);
+  await assert.rejects(purgeExpired(db.query, forged), /retentionPolicy\(\)/);
+  assert.throws(() => purgeJob(db.query, forged), /retentionPolicy\(\)/);
+  // A client that does not return { rows } fails instead of reporting nothing deleted.
+  await assert.rejects(purgeExpired(async () => [], p), /must return \{ rows \}/);
 });
 
 test("SM-08-L1: the purge job enforces the policy, ignores its payload and stops on abort", async () => {

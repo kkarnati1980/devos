@@ -8,7 +8,14 @@
 const DAY_MS = 86_400_000;
 const NAME = /^[a-z][a-z0-9_.-]{0,63}$/;
 const IDENT = /^[a-z_][a-z0-9_]{0,62}$/;
-const FIELDS = new Set(["name", "table", "column", "key", "days"]);
+const FIELDS = new Set(["name", "table", "column", "key", "type", "days"]);
+// The cutoff ($1, an ISO instant) in the column's own type, so the comparison never depends on the session TimeZone.
+const CUTOFF = Object.freeze({
+  timestamptz: "$1::timestamptz",
+  timestamp: "($1::timestamptz AT TIME ZONE 'UTC')", // a timestamp without time zone holding UTC (e.g. Prisma DateTime)
+  date: "($1::timestamptz AT TIME ZONE 'UTC')::date", // a row dated on the cutoff day (UTC) is kept
+});
+const POLICIES = new WeakSet();
 
 const ident = (what, cls, value, { qualified = false } = {}) => {
   const parts = typeof value === "string" ? value.split(".") : [];
@@ -18,13 +25,14 @@ const ident = (what, cls, value, { qualified = false } = {}) => {
 };
 
 /**
- * Checks and freezes the app's retention policy. Each class: { name, table, column, key = "id", days }.
- * `column` is the row's age (a timestamp); `key` is a unique column used to delete in batches.
+ * Checks and freezes the app's retention policy. Each class: { name, table, column, key = "id", type = "timestamptz", days }.
+ * `column` is the row's age; `type` is its SQL type: "timestamptz", "timestamp" (without time zone, holding UTC) or
+ * "date". `key` is a unique, NOT NULL column (the primary key) used to delete in batches.
  */
 export function retentionPolicy(classes) {
   if (!Array.isArray(classes) || classes.length === 0) throw new TypeError("retention: declare at least one data class");
   const seen = new Set();
-  return Object.freeze(classes.map((c) => {
+  const policy = Object.freeze(classes.map((c) => {
     if (!c || typeof c !== "object" || Array.isArray(c)) throw new TypeError("retention: each data class is an object");
     const name = c.name;
     if (typeof name !== "string" || !NAME.test(name)) throw new TypeError(`retention: class name ${JSON.stringify(name)} must match ${NAME}`);
@@ -40,28 +48,45 @@ export function retentionPolicy(classes) {
       table: ident("table", name, c.table, { qualified: true }),
       column: ident("column", name, c.column),
       key: ident("key", name, c.key ?? "id"),
+      type: (() => {
+        const t = c.type === undefined ? "timestamptz" : c.type;
+        if (typeof t !== "string" || !Object.hasOwn(CUTOFF, t)) throw new TypeError(`retention: class ${JSON.stringify(name)}: type must be one of ${Object.keys(CUTOFF).join(", ")}`);
+        return t;
+      })(),
     });
   }));
+  POLICIES.add(policy);
+  return policy;
 }
+
+const checkPolicy = (policy) => {
+  if (!POLICIES.has(policy)) throw new TypeError("retention: pass a policy from retentionPolicy()");
+};
 
 const int = (name, v, min, max) => {
   if (!Number.isInteger(v) || v < min || v > max) throw new TypeError(`retention: ${name} must be a whole number ${min}-${max}`);
   return v;
 };
 
-/** The DELETE for one batch of one class: only rows whose age column is strictly older than the cutoff ($1, cast to timestamptz so a text parameter works). */
-export const purgeSql = (cls) =>
-  `DELETE FROM ${cls.table} WHERE ${cls.key} IN (SELECT ${cls.key} FROM ${cls.table} WHERE ${cls.column} < $1::timestamptz ORDER BY ${cls.column} LIMIT $2) RETURNING ${cls.key}`;
+/**
+ * The DELETE for one batch of one class: only rows whose age column is strictly older than the cutoff ($1, cast to the
+ * column's type). The age test is repeated outside the sub-select, so a row whose age changed after the statement
+ * started (a refreshed session, a restored recycle-bin row) is re-checked by Postgres and kept.
+ */
+export const purgeSql = (cls) => {
+  const old = `${cls.column} < ${CUTOFF[cls.type]}`;
+  return `DELETE FROM ${cls.table} WHERE ${cls.key} IN (SELECT ${cls.key} FROM ${cls.table} WHERE ${old} ORDER BY ${cls.column} LIMIT $2) AND ${old} RETURNING ${cls.key}`;
+};
 
 /**
  * Deletes expired rows, class by class, at most `batchSize` rows per statement and `maxBatches` statements per
  * class per run. A row whose age is exactly the cutoff, newer, or NULL is kept. The cutoff is fixed once per run.
  * Between batches an aborted `signal` stops the run (its reason is thrown). Returns
- * { classes: [{ name, days, cutoff, deleted, more }] }; `more` means the class hit maxBatches and the next run continues.
+ * { classes: [{ name, days, cutoff, deleted, more }] }; `more` means the class hit maxBatches, so rows may remain for the next run.
  */
 export async function purgeExpired(query, policy, { now = Date.now, batchSize = 1000, maxBatches = 100, signal } = {}) {
   if (typeof query !== "function") throw new TypeError("retention: query must be a function");
-  if (!Array.isArray(policy) || !Object.isFrozen(policy)) throw new TypeError("retention: pass a policy from retentionPolicy()");
+  checkPolicy(policy);
   int("batchSize", batchSize, 1, 100_000);
   int("maxBatches", maxBatches, 1, 100_000);
   const at = now();
@@ -76,7 +101,8 @@ export async function purgeExpired(query, policy, { now = Date.now, batchSize = 
       if (signal?.aborted) throw signal.reason ?? new Error("retention: aborted");
       if (batch === maxBatches) { more = true; break; }
       const res = await query(text, [cutoff, batchSize]);
-      const n = Array.isArray(res?.rows) ? res.rows.length : 0;
+      if (!Array.isArray(res?.rows)) throw new TypeError("retention: query() must return { rows } (RETURNING is used to count)");
+      const n = res.rows.length;
       deleted += n;
       if (n < batchSize) break;
     }
@@ -90,6 +116,6 @@ export async function purgeExpired(query, policy, { now = Date.now, batchSize = 
  * job's payload can never widen what is deleted. Schedule it daily, e.g. queue.enqueue("retention.purge").
  */
 export function purgeJob(query, policy, options = {}) {
-  if (!Array.isArray(policy) || !Object.isFrozen(policy)) throw new TypeError("retention: pass a policy from retentionPolicy()");
+  checkPolicy(policy);
   return (_payload, ctx = {}) => purgeExpired(query, policy, { ...options, signal: ctx.signal });
 }
