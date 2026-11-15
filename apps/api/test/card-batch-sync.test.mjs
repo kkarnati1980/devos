@@ -29,6 +29,9 @@ function wire({ tasks = true } = {}) {
       lister.days.push(day);
       return [P];
     },
+    async projectsWithOpenBatch() {
+      return [...store.batches.values()].some((b) => b.projectId === P && (b.state === "raising" || (b.state === "refused" && !b.handedOffAt))) ? [P] : [];
+    },
     async batchesToApply() {
       return [...store.batches.values()].filter((b) => b.state === "raised" && !b.settledAt).map((b) => b.id);
     },
@@ -151,6 +154,7 @@ test("CR-b2d job: a hand-off retry skips a member whose card KK already decided;
   await q.queueQuestion(P, { gate: "decision", text: "Dark header?", default: "yes", blocks: [T1] }, AT_0730_IST);
   await q.queueQuestion(P, { gate: "decision", text: "Sticky footer?", default: "no", blocks: [T2] }, new Date(AT_0730_IST.getTime() + 1));
   await q.queueQuestion(P, { gate: "decision", text: "Round avatars?", default: "yes", blocks: [] }, new Date(AT_0730_IST.getTime() + 2));
+  await q.queueQuestion(P, { gate: "decision", text: "Logo colour?", default: "blue", blocks: [] }, new Date(AT_0730_IST.getTime() + 3));
   const raise = approvals.raiseCard.bind(approvals);
   let failThird = true;
   approvals.raiseCard = async (input, blocks) => {
@@ -158,7 +162,7 @@ test("CR-b2d job: a hand-off retry skips a member whose card KK already decided;
       failThird = false;
       throw new Error("db down");
     }
-    if (input.target.startsWith("question:") && input.reason.startsWith("Sticky") && blocks.length === 0) throw new ApprovalError("invalid-input");
+    if (input.target.startsWith("question:") && input.reason.startsWith("Logo")) throw new ApprovalError("card-contains-secret");
     return raise(input, blocks);
   };
   await job.tick(AT_0800_IST);
@@ -175,7 +179,10 @@ test("CR-b2d job: a hand-off retry skips a member whose card KK already decided;
   assert.deepEqual(reasons, ["Dark", "Round", "Sticky"], "each member raised once, none twice");
   assert.equal(approvalStore.tasks.get(T2).status, "ready", "a decided member's tasks are never re-blocked");
   // No log line carries question text or an error message.
-  for (const l of logs) assert.ok(!JSON.stringify(l).match(/Dark|Sticky|Round|db down/), JSON.stringify(l));
+  const refusedLog = logs.filter((l) => l.msg === "card-batch-question-refused");
+  assert.equal(refusedLog.length, 1, "the member M2.3 refuses outright is logged once, and the hand-off still completes");
+  assert.deepEqual(Object.keys(refusedLog[0]).sort(), ["level", "msg", "projectId", "questionId"]);
+  for (const l of logs) assert.ok(!JSON.stringify(l).match(/Dark|Sticky|Round|Logo|db down/), JSON.stringify(l));
 });
 
 test("CR-b2d job: a failing list or flush is logged with a fixed code and the rest of the tick runs", async () => {
@@ -186,8 +193,34 @@ test("CR-b2d job: a failing list or flush is logged with a fixed code and the re
   assert.deepEqual(logs.map((l) => l.msg), ["card-batch-list-failed"]);
   const flush = q.flushBatch.bind(q);
   q.flushBatch = async () => { throw new Error("db down"); };
-  await job.tick(AT_0800_IST);
+  await job.tick(new Date("2026-11-15T02:40:00Z")); // the next IST day's pass
   assert.ok(logs.some((l) => l.msg === "card-batch-flush-failed" && l.projectId === P));
   assert.ok(!JSON.stringify(logs).includes("secret-ish") && !JSON.stringify(logs).includes("db down"));
   q.flushBatch = flush;
+});
+
+test("CR-b2d job: the day's batches are claimed by one pass from 08:00 IST; a question queued at 14:00 IST waits for the next day", async () => {
+  const { approvalStore, q, job, lister } = wire();
+  // The day's pass runs at 08:00 IST with nothing queued.
+  await job.tick(AT_0800_IST);
+  await q.queueQuestion(P, { gate: "decision", text: "Dark header?", default: "yes", blocks: [] }, new Date("2026-11-14T08:30:00Z")); // 14:00 IST
+  await job.tick(new Date("2026-11-14T08:35:00Z"));
+  assert.equal(approvalStore.cards.size, 0, "no card at 14:05 IST");
+  // 23:59 IST is still 14 Nov; 08:05 IST on 15 Nov is a new IST day (UTC still 15 Nov 02:35).
+  await job.tick(new Date("2026-11-14T18:29:00Z"));
+  assert.equal(approvalStore.cards.size, 0);
+  await job.tick(new Date("2026-11-15T02:35:00Z"));
+  assert.equal(approvalStore.cards.size, 1, "raised by the next day's pass");
+  assert.equal(lister.days.at(-1), "2026-11-15");
+});
+
+test("CR-b2d job: a failed daily list read is retried on the next tick", async () => {
+  const { approvalStore, q, job, lister } = wire();
+  await q.queueQuestion(P, { gate: "decision", text: "Dark header?", default: "yes", blocks: [] }, AT_0730_IST);
+  const list = lister.projectsToFlush;
+  lister.projectsToFlush = async () => { lister.projectsToFlush = list; throw new Error("db down"); };
+  await job.tick(AT_0800_IST);
+  assert.equal(approvalStore.cards.size, 0);
+  await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
+  assert.equal(approvalStore.cards.size, 1);
 });

@@ -75,7 +75,7 @@ async function main(): Promise<void> {
   cardBatch?.start();
   process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); });
   process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); });
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, cardBatch: cardBatch != null });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, cardBatch: cardBatch !== null });
 }
 
 main().catch((e: unknown) => {

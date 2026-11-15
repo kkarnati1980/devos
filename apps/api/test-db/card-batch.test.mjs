@@ -194,8 +194,11 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   const [x, y] = await Promise.all([store.claim(projectId, "2026-11-14", randomUUID()), store.claim(projectId, "2026-11-14", randomUUID())]);
   assert.equal(x.id, y.id, "the second claim gets the first one's raising batch");
   assert.equal(await db.cardBatch.count({ where: { projectId } }), 1);
+  assert.ok((await store.projectsWithOpenBatch()).includes(projectId), "a raising batch is retried");
   await store.markRefused(x.id);
+  assert.ok((await store.projectsWithOpenBatch()).includes(projectId), "a refused batch not yet handed off is retried");
   await store.markHandedOff(x.id, DAY1_LATE);
+  assert.ok(!(await store.projectsWithOpenBatch()).includes(projectId));
   // A question queued after the day's batch waits for 15 Nov: it takes no slot on 14 Nov.
   await queue.queueQuestion(projectId, ask("Show prices with tax?", "yes"), DAY1_LATE);
   assert.ok(!(await store.projectsToFlush("2026-11-14")).includes(projectId));

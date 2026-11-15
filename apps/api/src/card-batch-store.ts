@@ -269,6 +269,18 @@ export class PrismaQueueStore implements QueueStore {
     });
   }
 
+  /** Projects with a batch still `raising`, or refused and not handed off (the job's retries), oldest first. */
+  projectsWithOpenBatch(limit = CARD_BATCH_LIST_MAX) {
+    return this.tx(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(
+        `SELECT project_id FROM card_batch WHERE state = 'raising' OR (state = 'refused' AND handed_off_at IS NULL)
+          GROUP BY project_id ORDER BY min(created_at), project_id LIMIT $1::int`,
+        listLimit(limit),
+      );
+      return rows.map((r: any) => r.project_id as string);
+    });
+  }
+
   /**
    * Projects a flush on IST day `day` can act on: a question not yet in a batch while the project has no batch for
    * `day` (pre-review CR-b2b finding 6: one waiting for tomorrow takes no slot), or a batch still `raising` or

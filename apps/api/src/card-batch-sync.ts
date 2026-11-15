@@ -9,13 +9,15 @@ import { ApprovalError, type Approvals } from "./approvals.js";
 export interface BatchLister {
   /** Projects a flush on IST day `day` can act on (PrismaQueueStore.projectsToFlush). */
   projectsToFlush(day: string, limit: number): Promise<string[]>;
+  /** Projects with a batch still `raising`, or refused and not handed off (retries; PrismaQueueStore). */
+  projectsWithOpenBatch(limit: number): Promise<string[]>;
   /** `raised` batches not yet settled whose card is decided (PrismaQueueStore.batchesToApply). */
   batchesToApply(limit: number): Promise<string[]>;
 }
 
 export type BatchLog = (e: { level: "info" | "warn"; msg: string; projectId?: string; batchId?: string; questionId?: string; tasks?: number }) => void;
 
-/** Runner decision (CR-b2d): the daily flush runs at the first tick at or after 08:00 IST, until CR-e moves it into the M4.6 report. */
+/** Runner decision (CR-b2d): the day's batches are claimed on the first tick at or after 08:00 IST, until CR-e moves it into the M4.6 report. */
 export const FLUSH_HOUR_IST = 8;
 const BATCH = 100;
 
@@ -28,6 +30,8 @@ export const CARD_BATCH_TICK_MS = 5 * 60_000;
 
 export class CardBatchJob {
   private running = false;
+  /** The IST day whose daily flush pass completed (pre-review CR-b2d r2 finding 1). */
+  private flushedDay: string | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -75,7 +79,15 @@ export class CardBatchJob {
         }
       }
       if (istHour(now) >= FLUSH_HOUR_IST) {
-        for (const projectId of await this.safe(() => this.lister.projectsToFlush(istDay(now), BATCH), "card-batch-list-failed")) {
+        // Pre-review CR-b2d r2 finding 1: the day's batches are claimed by ONE pass, the first tick at or after
+        // 08:00 IST whose list read succeeds; a question queued later waits for the next day's pass. Later ticks
+        // only retry batches still `raising` or refused and not handed off (rule 10). A restart repeats the pass,
+        // which claims nothing for a project that already has the day's batch (one per project per IST day).
+        const day = istDay(now);
+        const daily = this.flushedDay !== day;
+        const ids = await this.safe(() => (daily ? this.lister.projectsToFlush(day, BATCH) : this.lister.projectsWithOpenBatch(BATCH)), "card-batch-list-failed");
+        if (daily && !this.lastListFailed) this.flushedDay = day;
+        for (const projectId of ids) {
           try {
             const r = await this.queue.flushBatch(projectId, now);
             if (r.outcome === "raised" || r.outcome === "recorded") flushed++;
@@ -100,7 +112,7 @@ export class CardBatchJob {
   private async handOff(projectId: string, batchId: string, members: QueuedQuestion[], now: Date): Promise<void> {
     const name = ((await this.projectName(projectId)) ?? "").replace(/\*/g, "").trim() || "this project";
     for (const m of members) {
-      const card = { gate: "decision" as const, action: `Answer a build question for ${name}`.slice(0, 200), target: `question:${m.id}`, reason: `${m.text} (default: ${m.default})`.slice(0, 2000), projectId };
+      const card = { gate: "decision" as const, action: `Answer a build question for ${name}`.slice(0, 200), target: `question:${m.id}`, reason: `${m.text} (default: ${m.default})\nApproving keeps the default.`.slice(0, 2000), projectId };
       // Pre-review CR-b2d finding 1: M2.3 dedupes only a pending twin. A member raised on an earlier tick whose card KK
       // has since decided is found by target (any status) and skipped, so a retry never raises it again or
       // re-blocks tasks KK released (as rule 8's lookup for the batch card).
@@ -128,10 +140,15 @@ export class CardBatchJob {
     await this.queue.handOff(batchId, now);
   }
 
+  private lastListFailed = false;
+
   private async safe(fn: () => Promise<string[]>, msg: string): Promise<string[]> {
     try {
-      return await fn();
+      const out = await fn();
+      this.lastListFailed = false;
+      return out;
     } catch {
+      this.lastListFailed = true;
       this.log({ level: "warn", msg });
       return [];
     }

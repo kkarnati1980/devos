@@ -75,9 +75,9 @@ export interface Runtime {
   /** DEVOS-171: closes analyst runs left open past max_seconds + grace (start-up and every 5 min); main.ts starts it. */
   analystSweep: AnalystRunSweepJob | null;
   /** CR-b2d (DEVOS-218): applies decided batch cards and flushes each project's daily batch; main.ts starts it. */
-  cardBatch?: CardBatchJob | null;
+  cardBatch: CardBatchJob | null;
   /** CR-b2d (DEVOS-218): the batched-question queue (rule 6–7 entry point for agents, M3.2). */
-  cardBatchQueue?: CardBatchQueue | null;
+  cardBatchQueue: CardBatchQueue | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -119,7 +119,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
