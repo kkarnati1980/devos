@@ -43,6 +43,11 @@ export class CardBatchJob {
   private running = false;
   /** The IST day whose daily flush pass completed (pre-review CR-b2d r2 finding 1). */
   private flushedDay: string | null = null;
+  /**
+   * Codex PR143-r3: where an unfinished daily pass stopped (its IST day and the last row read). The next tick resumes
+   * after it, so a pass cut by FLUSH_PAGES_MAX moves on through the list instead of re-reading the same first pages.
+   */
+  private flushResume: { day: string; after: FlushCursor } | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -96,15 +101,17 @@ export class CardBatchJob {
         // which claims nothing for a project that already has the day's batch (one per project per IST day).
         const day = istDay(now);
         const daily = this.flushedDay !== day;
-        // Codex PR143-r1/r2: the daily pass drains every page of eligible projects before the day counts as flushed.
+        // Codex PR143-r1/r2/r3: the daily pass drains every page of eligible projects before the day counts as flushed.
         // Pages are keyset-paginated on (`since`, `projectId`): each page starts after the previous page's last row,
         // so open batches still `raising` (which stay eligible) cannot fill every page and hide a later project. The
-        // pass ends at a short page; FLUSH_PAGES_MAX bounds it, and a pass cut by that bound or by a failed read stays
-        // open, so the next tick lists again from the start. `seen` still skips a project listed twice in one pass
-        // (its key moved between reads).
+        // pass ends at a short page. FLUSH_PAGES_MAX bounds one tick; a pass cut by that bound keeps its cursor
+        // (`flushResume`, for this IST day) and the next tick resumes after it, so every eligible project is reached
+        // within ceil(n / 5,000) ticks. A failed read keeps the cursor too, and the next tick retries that page.
+        // `seen` still skips a project listed twice in one tick (its key moved between reads).
         const seen = new Set<string>();
         let drained = !daily;
-        let after: FlushCursor | null = null;
+        if (this.flushResume && this.flushResume.day !== day) this.flushResume = null;
+        let after: FlushCursor | null = daily ? (this.flushResume?.after ?? null) : null;
         for (let page = 0; page < (daily ? FLUSH_PAGES_MAX : 1); page++) {
           const cursor: FlushCursor | null = after;
           const rows: FlushRow[] = await this.safe(
@@ -126,6 +133,7 @@ export class CardBatchJob {
           if (rows.length < BATCH) { drained = true; break; }
           after = rows[rows.length - 1]!;
         }
+        if (daily) this.flushResume = drained ? null : after ? { day, after } : this.flushResume;
         if (daily && drained) this.flushedDay = day;
       }
       return { applied, flushed };
