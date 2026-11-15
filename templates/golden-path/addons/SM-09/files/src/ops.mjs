@@ -145,7 +145,8 @@ export function errorMonitor({ report = null, log: lg = logger(), release = proc
   return Object.freeze({
     async capture(err, context = {}) {
       const e = redact(err instanceof Error ? err : new Error(safeString(err)));
-      const ids = { ...(context.requestId ? { requestId: redact(String(context.requestId)) } : {}), ...(context.jobId ? { jobId: redact(String(context.jobId)) } : {}) };
+      const c = context !== null && typeof context === "object" ? context : {};
+      const ids = { ...(c.requestId ? { requestId: redact(safeString(c.requestId)) } : {}), ...(c.jobId ? { jobId: redact(safeString(c.jobId)) } : {}) };
       lg.error("error", { ...ids, error: e });
       if (!report) return false;
       try {

@@ -151,6 +151,9 @@ test("SM-09-L2: errors reach monitoring once, redacted, with the request or job 
   // A rejection reason that cannot be turned into text is still captured.
   assert.equal(await monitor.capture(Object.create(null)), false);
   assert.equal(out.lines.at(-2).error.message, "[unprintable]");
+  // Nor does a missing or unprintable context.
+  assert.equal(await monitor.capture(new Error("y"), null), false);
+  assert.equal(await monitor.capture(new Error("z"), { requestId: Object.create(null) }), false);
   // No reporter: still logged.
   assert.equal(await errorMonitor({ log: logger({ out }) }).capture(new Error("x")), false);
   assert.throws(() => webhookReporter("http://errors.example.com/intake"), /https/);
