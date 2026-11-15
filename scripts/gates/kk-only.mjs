@@ -19,10 +19,11 @@ export const KK_ONLY = (h) => {
   // (a lint-rule-off of a "security/…" rule, a suppression in src/security/ or of no-eval) goes to KK (PR84-r2, r3).
   if (SECURITY_WORDS.test(`${h?.file ?? ""} ${text}`)) return true;
   // A full-length (cut) text may hide a security token past the cut, for every rule, so it fails closed (PR84-r4).
-  if (text.length >= (CI_BODY_RULES.has(h?.rule) ? STEP_BODY_CUT : CUT)) return true;
+  if (text.length >= (LONG_TEXT_RULES.has(h?.rule) ? STEP_BODY_CUT : CUT)) return true;
   // A step text of exactly 200 characters may come from a guard before DEVOS-209 (CI runs the base copy), which cut
-  // step bodies at 200, so it is read as cut too (pre-review finding 1).
-  if (CI_BODY_RULES.has(h?.rule) && text.length === CUT) return true;
+  // step bodies at 200, so it is read as cut too (pre-review finding 1). The same holds for a test-script text from a
+  // guard before DEVOS-227 (note 0027).
+  if (LONG_TEXT_RULES.has(h?.rule) && text.length === CUT) return true;
   // A guard change mixed with other changes must stand alone (spec §4.5); only KK can accept it (merge path GI-1b).
   if (h?.rule === "gitleaksignore-added" || h?.rule === "policy-weakened" || h?.rule === "guard-change-not-isolated") return true;
   if (h?.rule === "suppression-added") return SECURITY_SUPPRESSION.test(text) || /\bsecurity\//.test(text);
@@ -41,6 +42,9 @@ export const KK_ONLY = (h) => {
 // `ci-job-removed` is not among them: job-level keys (`uses:` of a reusable workflow, `services:`, `container:`,
 // `env:`) never reach the hit text, so a removed job always stays KK-only (pre-review finding 2).
 const CI_BODY_RULES = new Set(["ci-step-removed", "ci-step-changed"]);
+// The rules whose text the floor guard keeps up to STEP_BODY_CUT: the step bodies, and a test script's old and new
+// command (DEVOS-227, note 0027). Same list as the guard's LONG_TEXT_RULES (test K4).
+export const LONG_TEXT_RULES = new Set([...CI_BODY_RULES, "test-script-changed"]);
 // Package-manager scripts accepted as non-security by name. `test` and `lint` are left out on purpose: either can run
 // security checks (a security self-test, a security lint plugin), and the stored text cannot show which.
 const PM_SCRIPTS = new Set(["install", "ci", "build", "typecheck", "format", "pack", "e2e"]);
