@@ -2,7 +2,7 @@
 // all on the PR's current head SHA, and merges pinned to that SHA (docs/modules/GI-3.md, AT1–AT9).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BACKOFF_CAP_MS, DEFAULT_CONFIG, backoffMs, githubClient, main, release } from "../release/merge.mjs";
+import { BACKOFF_CAP_MS, CannotRun, DEFAULT_CONFIG, allStatuses, codexPass, backoffMs, githubClient, main, release } from "../release/merge.mjs";
 
 const REPO = "kkarnati1980/devos";
 const HEAD = "a".repeat(40);
@@ -46,8 +46,12 @@ function fakeGitHub(over = {}) {
       const slice = state.checkRuns.slice((page - 1) * 100, page * 100);
       return reply(200, { total_count: state.checkRuns.length, check_runs: slice });
     }
-    if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)) return reply(200, { total_count: state.statuses.length, statuses: state.statuses });
-    if (path.startsWith(`/repos/${REPO}/commits/${OLD}/status`)) return reply(200, { total_count: 1, statuses: state.oldShaStatuses });
+    // DEVOS-212: as the real API: the list endpoint carries `creator`; the combined status does not.
+    if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/statuses`)) { const pg = Number(new URL(path, "https://x").searchParams.get("page") ?? 1); return reply(200, state.statuses.slice((pg - 1) * 100, pg * 100)); }
+    if (path.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)) return reply(200, { total_count: state.statuses.length, statuses: state.statuses.map(({ creator, ...rest }) => rest) });
+    // DEVOS-212: as the real API: the list endpoint carries `creator`; the combined status does not.
+    if (path.startsWith(`/repos/${REPO}/commits/${OLD}/statuses`)) { const pg = Number(new URL(path, "https://x").searchParams.get("page") ?? 1); return reply(200, state.oldShaStatuses.slice((pg - 1) * 100, pg * 100)); }
+    if (path.startsWith(`/repos/${REPO}/commits/${OLD}/status`)) return reply(200, { total_count: 1, statuses: state.oldShaStatuses.map(({ creator, ...rest }) => rest) });
     if (path.startsWith(`/repos/${REPO}/actions/runs?head_sha=${HEAD}`)) return reply(200, { total_count: state.workflowRuns.length, workflow_runs: state.workflowRuns });
     if (path.startsWith(`/repos/${REPO}/pulls/7/files`)) {
       const page = Number(new URL(url).searchParams.get("page"));
@@ -156,7 +160,7 @@ test("AT5 GC5: a commit after the PASS voids it — the head moved between check
   assert.match(r.reasons[0], /head moved/);
   assert.equal(merges(f).length, 1, "the merge PUT is never retried");
   // And a PASS that only exists on the old SHA does not count for the new head: statuses are read per head SHA.
-  assert.ok(f.calls.some((c) => c.path.startsWith(`/repos/${REPO}/commits/${HEAD}/status`)));
+  assert.ok(f.calls.some((c) => c.path.startsWith(`/repos/${REPO}/commits/${HEAD}/statuses?`)));
   // The PASS sits on the old SHA; the PR's head is a new commit with no review yet: refused, and the old SHA is never read.
   const g = fakeGitHub({ statuses: [] });
   const r2 = await run(g);
@@ -287,4 +291,25 @@ test("DEVOS-148 a GET network error is retried after a backoff", async () => {
   const f = fakeGitHub({ netFailures: 1 });
   assert.equal((await release(f.gh, { repo: REPO, pr: 7 })).code, 0);
   assert.equal(f.sleeps.length, 1);
+});
+
+// DEVOS-212: allStatuses reads the list endpoint (it carries `creator`), page by page, and codexPass accepts the
+// watcher's PASS read through it.
+test("DEVOS-212: allStatuses pages the /statuses list and keeps creator; codexPass accepts the watcher's PASS", async () => {
+  const pass = { context: "codex-review", state: "success", description: "Codex PASS (PR7-r1)", creator: { login: DEFAULT_CONFIG.codexCreator }, created_at: "2026-11-14T10:00:00Z" };
+  const filler = Array.from({ length: 150 }, (_, i) => ({ context: `ci-${i}`, state: "success", creator: { login: "github-actions[bot]" }, created_at: "2026-11-14T09:00:00Z" }));
+  const all = [pass, ...filler];
+  const paths = [];
+  const gh = { get: async (p) => { paths.push(p); const pg = Number(new URL(p, "https://x").searchParams.get("page")); return all.slice((pg - 1) * 100, pg * 100); } };
+  const got = await allStatuses(gh, "o/r", "abc");
+  assert.equal(got.length, 151);
+  assert.deepEqual(paths, ["/repos/o/r/commits/abc/statuses?per_page=100&page=1", "/repos/o/r/commits/abc/statuses?per_page=100&page=2"]);
+  assert.deepEqual(codexPass(got, 7), { passLabel: "PR7-r1", reasons: [] });
+  // The combined-status shape (no creator) is still refused, and a non-list reply cannot be judged.
+  assert.match(codexPass([{ ...pass, creator: undefined }], 7).reasons[0], /unknown account/);
+  await assert.rejects(allStatuses({ get: async () => ({ statuses: [] }) }, "o/r", "abc"), CannotRun);
+  // Exactly 2,000 statuses are judged; 2,001 are refused rather than judged in part.
+  const pager = (n) => ({ get: async (p) => { const pg = Number(new URL(p, "https://x").searchParams.get("page")); return filler.concat(Array(n).fill(filler[0])).slice(0, n).slice((pg - 1) * 100, pg * 100); } });
+  assert.equal((await allStatuses(pager(2000), "o/r", "abc")).length, 2000);
+  await assert.rejects(allStatuses(pager(2001), "o/r", "abc"), /more than 2,000/);
 });

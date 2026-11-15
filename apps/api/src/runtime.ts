@@ -16,6 +16,7 @@ import { PrismaRequirementsStore } from "./requirements-store.js";
 import { reanswerSettleMs, type RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
+import { PrismaIsolationStore } from "./isolation-store.js";
 import { PrismaWatchdogStore, RunnerWatchdogJob, type LinearReader } from "./runner-watchdog-runtime.js";
 import type { ModelRunner } from "@devos/analyst";
 import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
@@ -71,6 +72,8 @@ export interface Runtime {
   requirementsSync: RequirementsSyncJob | null;
   /** DEVOS-171: closes analyst runs left open past max_seconds + grace (start-up and every 5 min); main.ts starts it. */
   analystSweep: AnalystRunSweepJob | null;
+  /** S4-a2b: the stack rows GET /internal/isolation-state reads; null without a database. */
+  isolation: PrismaIsolationStore | null;
   /** DEVOS-220: the 30-minute runner watchdog; null without a vault or a Linear loader. main.ts starts it. */
   runnerWatchdog: RunnerWatchdogJob | null;
 }
@@ -116,7 +119,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, runnerWatchdog: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, isolation: null, runnerWatchdog: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -182,6 +185,8 @@ export async function buildRuntime(
   requirements.vault = vault ? { hasProject: (projectId, name) => vault.hasProject(projectId, name) } : null;
   const requirementsSync = new RequirementsSyncJob(requirements, requirementsStore, (e) => stdoutSink({ ts: new Date().toISOString(), ...e }), syncIntervalMs(env.DEVOS_REQUIREMENTS_SYNC_MS));
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
+  // S4-a2b: the read side of GET /internal/isolation-state (and, in the M2.4-d wiring, the afterStack hook store).
+  const isolation = new PrismaIsolationStore(db, t);
   // DEVOS-220: the runner watchdog reads Linear with the H8 key from the vault (by name, at call time) and alerts
   // through M1.6. It only reads Linear. Without a vault or a Linear loader it is off.
   // A Linear client that cannot be loaded turns the watchdog off (logged) and never stops the API (pre-review L2).
@@ -200,7 +205,7 @@ export async function buildRuntime(
         log: (e) => stdoutSink({ ts: new Date().toISOString(), ...e }),
       })
     : null;
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, runnerWatchdog };
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog };
 }
 
 /**
