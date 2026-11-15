@@ -2,8 +2,8 @@
 // Contracts: docs/modules/GI-4.md and docs/modules/GI-1b.md ("Shared KK-only classifier").
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { KK_ONLY, ciBodyIsPlain, CUT, STEP_BODY_CUT } from "../gates/kk-only.mjs";
-import { TEXT_CUT, STEP_BODY_CUT as GUARD_STEP_BODY_CUT, STEP_BODY_RULES } from "../floor-guard/floor-guard.mjs";
+import { KK_ONLY, ciBodyIsPlain, CUT, STEP_BODY_CUT, LONG_TEXT_RULES } from "../gates/kk-only.mjs";
+import { TEXT_CUT, STEP_BODY_CUT as GUARD_STEP_BODY_CUT, STEP_BODY_RULES, LONG_TEXT_RULES as GUARD_LONG_TEXT_RULES } from "../floor-guard/floor-guard.mjs";
 import * as evaluator from "../gates/evaluate-gate.mjs";
 import { notKeepable } from "../release/merge.mjs";
 
@@ -96,4 +96,23 @@ test("K4 the classifier's cut lengths are the floor guard's (DEVOS-209)", () => 
   const body = (n) => { const t = "job ci: step X removed; ran: run: pnpm build"; return t + " ".repeat(n - t.length); };
   assert.equal(KK_ONLY({ rule: "ci-step-removed", file: ".github/workflows/ci.yml", line: 0, text: body(STEP_BODY_CUT - 1) }), false);
   assert.equal(KK_ONLY({ rule: "ci-step-removed", file: ".github/workflows/ci.yml", line: 0, text: body(STEP_BODY_CUT) }), true);
+});
+
+test("K5 a test-script text keeps up to the step cut; at the cut, or at exactly 200, it fails closed (DEVOS-227)", () => {
+  assert.deepEqual([...LONG_TEXT_RULES].sort(), [...GUARD_LONG_TEXT_RULES].sort());
+  assert.ok(LONG_TEXT_RULES.has("test-script-changed"));
+  const p = "apps/api/package.json";
+  const old = "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/run-engine run build && tsc -p tsconfig.json && node --test \"test/*.test.mjs\"";
+  const now = old.replace("--filter @devos/run-engine", "--filter @devos/card-batch --filter @devos/run-engine");
+  const text = `script "test": "${old}" -> "${now}"`;
+  assert.ok(text.length > CUT && text.length < STEP_BODY_CUT, String(text.length));
+  // A whole text past 200 with no security word is an ordinary hit a Codex Keep may clear.
+  assert.equal(KK_ONLY({ rule: "test-script-changed", file: p, line: 0, text }), false);
+  // At the cut it fails closed, and so does exactly 200 (an older base guard's cut).
+  assert.equal(KK_ONLY({ rule: "test-script-changed", file: p, line: 0, text: (text + "x".repeat(STEP_BODY_CUT)).slice(0, STEP_BODY_CUT) }), true);
+  assert.equal(KK_ONLY({ rule: "test-script-changed", file: p, line: 0, text: text.slice(0, CUT) }), true);
+  // Security words are still read first, whatever the length.
+  assert.equal(KK_ONLY({ rule: "test-script-changed", file: p, line: 0, text: 'script "test": "pnpm audit && vitest" -> "vitest"' }), true);
+  // Every other rule keeps the 200 cut: a 250-character text of another rule reads as cut, so KK-only.
+  assert.equal(KK_ONLY({ rule: "test-only", file: "a.test.ts", line: 1, text: "x".repeat(250) }), true);
 });

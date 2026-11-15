@@ -12,6 +12,7 @@ import pg from "pg";
 import type { BatchCards, CardBatch, DecisionRow, QueueStore, QueuedQuestion } from "@devos/card-batch";
 import { looksSecret } from "./notify.js";
 import type { Approvals } from "./approvals.js";
+import type { FlushCursor, FlushRow } from "./card-batch-sync.js";
 
 export interface PrismaTxLike {
   $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T>;
@@ -353,12 +354,13 @@ export class PrismaQueueStore implements QueueStore {
   /**
    * Projects a flush on IST day `day` can act on: a question not yet in a batch while the project has no batch for
    * `day` (pre-review CR-b2b finding 6: one waiting for tomorrow takes no slot), or a batch still `raising` or
-   * refused and not handed off.
+   * refused and not handed off. Oldest first by (`since`, `project_id`); `after` is the previous page's last row, so
+   * each page moves past the projects already listed (keyset pagination, Codex PR143-r2).
    */
-  projectsToFlush(day: string, limit = CARD_BATCH_LIST_MAX) {
+  projectsToFlush(day: string, limit = CARD_BATCH_LIST_MAX, after?: FlushCursor | null): Promise<FlushRow[]> {
     return this.tx(async (tx) => {
       const rows = await tx.$queryRawUnsafe(
-        `SELECT project_id FROM (
+        `SELECT project_id, min(since)::text AS since FROM (
            SELECT q.project_id, min(q.queued_at) AS since FROM queued_question q
             WHERE q.batch_id IS NULL
               AND NOT EXISTS (SELECT 1 FROM card_batch d WHERE d.project_id = q.project_id AND d.ist_day = $2)
@@ -366,10 +368,12 @@ export class PrismaQueueStore implements QueueStore {
            UNION ALL
            SELECT project_id, min(created_at) FROM card_batch
             WHERE state = 'raising' OR (state = 'refused' AND handed_off_at IS NULL) GROUP BY project_id
-         ) p GROUP BY project_id ORDER BY min(since), project_id LIMIT $1::int`,
-        listLimit(limit), day,
+         ) p GROUP BY project_id
+         HAVING $3::timestamptz IS NULL OR (min(since), project_id) > ($3::timestamptz, $4::uuid)
+         ORDER BY min(since), project_id LIMIT $1::int`,
+        listLimit(limit), day, after?.since ?? null, after?.projectId ?? null,
       );
-      return rows.map((r: any) => r.project_id as string);
+      return rows.map((r: any) => ({ projectId: r.project_id as string, since: r.since as string }));
     });
   }
 }

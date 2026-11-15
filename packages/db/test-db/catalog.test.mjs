@@ -23,6 +23,8 @@ const TABLES = [
   "project_decision",
   // ADR-0012 CR-b2b (DEVOS-215)
   "queued_question", "card_batch",
+  // DEVOS-220 (docs/modules/runner-watchdog.md)
+  "runner_watchdog_state",
 ];
 
 // Unique keys the contract names (table -> column lists).
@@ -50,6 +52,7 @@ const UNIQUES = {
   isolation_stack: [["project_id", "env"], ["idx"], ["subnet"], ["network"]],
   project_decision: [["approval_id", "item_id"], ["comment_id", "item_id"]],
   card_batch: [["project_id", "ist_day"]],
+  runner_watchdog_state: [["name"]],
   mechanism_flag: [["role", "mechanism"]],
 };
 

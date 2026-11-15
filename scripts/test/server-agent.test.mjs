@@ -502,6 +502,74 @@ test("DEVOS-83 dashboard-tailnet-only: skipped while nothing answers; fails with
   assert.match(exposed.out, /EXPOSED/);
 });
 
+// DEVOS-221 (runner-watchdog.md AT7): runner-watchdog reads watchdog.lastRunAt from /health over the same pinned
+// HTTPS call as health-sha. Fakes on PATH: tailscale and curl. FAKE_BODIES holds one /health body per call
+// (the last one repeats), so the start-up null can be polled.
+const WCHECK = path.join(ROOT, "scripts/server/checks/runner-watchdog.sh");
+function runWatchdogCheck({ bodies = [], curlRc = 0, httpCode = "200", wait = "60" } = {}) {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-wcheck-"));
+  const w = (n, body) => { fs.writeFileSync(path.join(bin, n), `#!/usr/bin/env bash\n${body}\n`); fs.chmodSync(path.join(bin, n), 0o755); };
+  w("tailscale", `if [[ "$1" == ip ]]; then echo 100.64.0.7; else printf '%s' '{"Self":{"DNSName":"devos.tail1234.ts.net."}}'; fi`);
+  bodies.forEach((b, i) => fs.writeFileSync(path.join(bin, `body${i}`), b));
+  w("curl", `echo "$*" >> "$FAKE_DIR/curl.args"; n=$(cat "$FAKE_DIR/n" 2>/dev/null || echo 0); echo $((n+1)) > "$FAKE_DIR/n"
+f="$FAKE_DIR/body$n"; [[ -f "$f" ]] || f="$FAKE_DIR/body$(( ${bodies.length} - 1 ))"
+[[ "$FAKE_CURL_RC" == 0 ]] || exit "$FAKE_CURL_RC"; cat "$f"; printf '\n%s' "$FAKE_CODE"`);
+  const r = execFileSync("bash", ["-c", `bash "${WCHECK}"; echo "rc=$?"`], {
+    env: { PATH: `${bin}:${process.env.PATH}`, DEVOS_DIR: bin, FAKE_DIR: bin, FAKE_CURL_RC: String(curlRc), FAKE_CODE: httpCode,
+           WATCHDOG_WAIT_SECONDS: wait, WATCHDOG_POLL_SECONDS: "1" },
+    encoding: "utf8",
+  });
+  const args = fs.existsSync(path.join(bin, "curl.args")) ? fs.readFileSync(path.join(bin, "curl.args"), "utf8") : "";
+  const calls = Number(fs.existsSync(path.join(bin, "n")) ? fs.readFileSync(path.join(bin, "n"), "utf8") : 0);
+  fs.rmSync(bin, { recursive: true, force: true });
+  return { code: Number(r.match(/rc=(\d+)\s*$/)[1]), out: r, args, calls };
+}
+const health = (lastRunAt) => JSON.stringify({ status: "ok", sha: "a".repeat(40), startedAt: "2026-11-15T00:00:00.000Z", watchdog: { lastRunAt } });
+const minsAgo = (m) => new Date(Date.now() - m * 60_000).toISOString();
+
+test("DEVOS-221 AT7 runner-watchdog: passes when the last run is under 35 minutes old, on the pinned, verified HTTPS call", () => {
+  for (const m of [0, 12, 34]) {
+    const r = runWatchdogCheck({ bodies: [health(minsAgo(m))] });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /under 35 min/);
+  }
+  const r = runWatchdogCheck({ bodies: [health(minsAgo(1))] });
+  assert.match(r.args, /https:\/\/devos\.tail1234\.ts\.net:3001\/health/);
+  assert.match(r.args, /--resolve devos\.tail1234\.ts\.net:3001:100\.64\.0\.7/);
+  assert.doesNotMatch(r.args, /(^|\s)(-k|--insecure)(\s|$)/, "certificate verification is never turned off");
+});
+
+test("DEVOS-221 AT7 runner-watchdog: fails when the last run is 35 minutes old or more, or in the future", () => {
+  for (const m of [35, 36, 600]) {
+    const r = runWatchdogCheck({ bodies: [health(minsAgo(m))] });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /the watchdog has stopped/);
+  }
+  assert.equal(runWatchdogCheck({ bodies: [health(minsAgo(-10))] }).code, 1);
+  assert.equal(runWatchdogCheck({ bodies: [health("yesterday")] }).code, 1);
+});
+
+test("DEVOS-221 AT7 runner-watchdog: fails when missing; a start-up null is polled again before it fails", () => {
+  const never = runWatchdogCheck({ bodies: [health(null)], wait: "3" });
+  assert.equal(never.code, 1, never.out);
+  assert.match(never.out, /has not run/);
+  assert.ok(never.calls >= 2, "a null is read again before failing");
+  const absent = runWatchdogCheck({ bodies: [JSON.stringify({ status: "ok", sha: "a".repeat(40) })] });
+  assert.equal(absent.code, 1);
+  assert.match(absent.out, /no watchdog field/);
+  assert.equal(runWatchdogCheck({ bodies: ["<html>"] }).code, 1);
+  assert.equal(runWatchdogCheck({ bodies: [health(minsAgo(1))], httpCode: "503" }).code, 1);
+  const late = runWatchdogCheck({ bodies: [health(null), health(minsAgo(0))], wait: "10" });
+  assert.equal(late.code, 0, late.out);
+  assert.equal(late.calls, 2);
+});
+
+test("DEVOS-221 AT7 runner-watchdog: skipped when nothing answers; a TLS failure fails", () => {
+  assert.equal(runWatchdogCheck({ bodies: [""], curlRc: 7 }).code, 3);
+  assert.equal(runWatchdogCheck({ bodies: [""], curlRc: 60 }).code, 1);
+  assert.equal(runWatchdogCheck({ bodies: [""], curlRc: 28 }).code, 1);
+});
+
 // DEVOS-82: the installer refuses a Coolify token without write permission at install time, not at the first deploy.
 const TOKEN_CHECK = path.join(ROOT, "scripts/server/coolify-token-check.sh");
 const INSTALLER = path.join(ROOT, "scripts/server/install-server-agent.sh");

@@ -5,10 +5,19 @@
 import { batchAnswers, istDay, type CardBatchQueue, type DecisionRow, type QueuedQuestion } from "@devos/card-batch";
 import { ApprovalError, type Approvals } from "./approvals.js";
 
+/** One project a daily flush can act on, with the sort key the keyset cursor uses (Codex PR143-r2). */
+export interface FlushRow {
+  projectId: string;
+  /** The project's oldest waiting item, as the store's own timestamp text (round-trips at full precision). */
+  since: string;
+}
+/** The last row of the previous page: the next page lists only projects after it in (`since`, `projectId`) order. */
+export type FlushCursor = FlushRow;
+
 /** Which projects have work for the job. One bounded read each (the Postgres store implements it). */
 export interface BatchLister {
-  /** Projects a flush on IST day `day` can act on (PrismaQueueStore.projectsToFlush). */
-  projectsToFlush(day: string, limit: number): Promise<string[]>;
+  /** Projects a flush on IST day `day` can act on, oldest first, after `after` (PrismaQueueStore.projectsToFlush). */
+  projectsToFlush(day: string, limit: number, after?: FlushCursor | null): Promise<FlushRow[]>;
   /** Projects with a batch still `raising`, or refused and not handed off (retries; PrismaQueueStore). */
   projectsWithOpenBatch(limit: number): Promise<string[]>;
   /** `raised` batches not yet settled whose card is decided (PrismaQueueStore.batchesToApply). */
@@ -41,6 +50,8 @@ export type BatchLog = (e: { level: "info" | "warn"; msg: string; projectId?: st
 /** Runner decision (CR-b2d): the day's batches are claimed on the first tick at or after 08:00 IST, until CR-e moves it into the M4.6 report. */
 export const FLUSH_HOUR_IST = 8;
 const BATCH = 100;
+// Codex PR143-r1: at most this many pages of 100 in one daily pass (5,000 projects); a longer pass resumes next tick.
+const FLUSH_PAGES_MAX = 50;
 
 function istHour(now: Date): number {
   return new Date(now.getTime() + 330 * 60_000).getUTCHours();
@@ -107,17 +118,37 @@ export class CardBatchJob {
         // which claims nothing for a project that already has the day's batch (one per project per IST day).
         const day = istDay(now);
         const daily = this.flushedDay !== day;
-        const ids = await this.safe(() => (daily ? this.lister.projectsToFlush(day, BATCH) : this.lister.projectsWithOpenBatch(BATCH)), "card-batch-list-failed");
-        if (daily && !this.lastListFailed) this.flushedDay = day;
-        for (const projectId of ids) {
-          try {
-            const r = await this.queue.flushBatch(projectId, now);
-            if (r.outcome === "raised" || r.outcome === "recorded") flushed++;
-            if (r.outcome === "refused" && r.batchId && r.members) await this.handOff(projectId, r.batchId, r.members, now);
-          } catch {
-            this.log({ level: "warn", msg: "card-batch-flush-failed", projectId });
+        // Codex PR143-r1/r2: the daily pass drains every page of eligible projects before the day counts as flushed.
+        // Pages are keyset-paginated on (`since`, `projectId`): each page starts after the previous page's last row,
+        // so open batches still `raising` (which stay eligible) cannot fill every page and hide a later project. The
+        // pass ends at a short page; FLUSH_PAGES_MAX bounds it, and a pass cut by that bound or by a failed read stays
+        // open, so the next tick lists again from the start. `seen` still skips a project listed twice in one pass
+        // (its key moved between reads).
+        const seen = new Set<string>();
+        let drained = !daily;
+        let after: FlushCursor | null = null;
+        for (let page = 0; page < (daily ? FLUSH_PAGES_MAX : 1); page++) {
+          const cursor: FlushCursor | null = after;
+          const rows: FlushRow[] = await this.safe(
+            async () => (daily ? this.lister.projectsToFlush(day, BATCH, cursor) : (await this.lister.projectsWithOpenBatch(BATCH)).map((projectId) => ({ projectId, since: "" }))),
+            "card-batch-list-failed",
+          );
+          if (this.lastListFailed) break;
+          for (const { projectId } of rows) {
+            if (seen.has(projectId)) continue;
+            seen.add(projectId);
+            try {
+              const r = await this.queue.flushBatch(projectId, now);
+              if (r.outcome === "raised" || r.outcome === "recorded") flushed++;
+              if (r.outcome === "refused" && r.batchId && r.members) await this.handOff(projectId, r.batchId, r.members, now);
+            } catch {
+              this.log({ level: "warn", msg: "card-batch-flush-failed", projectId });
+            }
           }
+          if (rows.length < BATCH) { drained = true; break; }
+          after = rows[rows.length - 1]!;
         }
+        if (daily && drained) this.flushedDay = day;
       }
       return { applied, flushed };
     } finally {
@@ -202,7 +233,7 @@ export class CardBatchJob {
 
   private lastListFailed = false;
 
-  private async safe(fn: () => Promise<string[]>, msg: string): Promise<string[]> {
+  private async safe<T>(fn: () => Promise<T[]>, msg: string): Promise<T[]> {
     try {
       const out = await fn();
       this.lastListFailed = false;

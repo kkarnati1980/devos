@@ -1,5 +1,6 @@
 // M1.2 routes. Every route is listed in openapi.yaml; the contract test checks both directions.
 import { Body, Controller, Delete, Get, HttpCode, Inject, Param, Post, Put, Req, Res } from "@nestjs/common";
+import { watchdogHeartbeat } from "./runner-watchdog-runtime.js";
 import type { Response } from "express";
 import { Access, GRANTS, KK_SESSIONS, KkSessionRegistry, READINESS, SESSIONS, SETUP, httpError } from "./auth.js";
 import type { KkSession } from "./auth.js";
@@ -73,7 +74,8 @@ export class HealthController {
   @Get("health")
   @Access("open")
   health() {
-    return { status: "ok", sha: process.env.GIT_SHA ?? "unknown", startedAt: this.startedAt };
+    // DEVOS-220: the runner watchdog's last completed tick (null until it runs; DEVOS-221's server check reads it).
+    return { status: "ok", sha: process.env.GIT_SHA ?? "unknown", startedAt: this.startedAt, watchdog: { lastRunAt: watchdogHeartbeat.lastRunAt } };
   }
 
   @Get("ready")
