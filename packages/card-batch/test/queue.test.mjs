@@ -33,10 +33,11 @@ function fakeCards() {
     },
     async get(id) {
       const c = cards.find((x) => x.id === id);
-      return c ? { id: c.id, status: c.status, decidedAt: c.decidedAt ?? null } : null;
+      // A decided M2.3 card always has decidedAt; tests that do not set one get a far-future time.
+      return c ? { id: c.id, status: c.status, decidedAt: c.decidedAt !== undefined ? c.decidedAt : c.status === "pending" ? null : new Date("2100-01-01T00:00:00Z") } : null;
     },
     async comments(id) {
-      return cards.find((x) => x.id === id).comments.map((c) => (typeof c === "string" ? { body: c } : c));
+      return cards.find((x) => x.id === id).comments.map((c) => (typeof c === "string" ? { body: c, createdAt: new Date(0) } : c));
     },
   };
   return f;
@@ -318,4 +319,23 @@ test("Codex PR135-r1: an applied batch stays listed until settled, with the same
   const again = await q.queueQuestion(P, { ...ask("Which colour for the header?", "blue", [T1]), id: Q1 }, DAY2);
   assert.equal(again.id, Q1);
   assert.equal(again.projectId, P);
+});
+
+test("Codex PR135-r2: an approved card without decidedAt is not applied; a comment without createdAt never counts", async () => {
+  const { store, cards, q } = wire();
+  await q.queueQuestion(P, ask("Which colour for the header?", "blue", [T1]), DAY1);
+  const r = await q.flushBatch(P, DAY1_LATE);
+  const card = cards.cards.find((c) => c.id === r.cardId);
+  Object.assign(card, { status: "approved", decidedAt: null });
+  assert.equal((await q.applyBatch(r.batchId, DAY2)).outcome, "not-ready", "fail closed: no decision time");
+  assert.equal((await store.batch(r.batchId)).appliedAt, null);
+  card.decidedAt = new Date(DAY1_LATE.getTime() + 60_000);
+  card.comments.push({ body: "BQ-1: green" }, { body: "BQ-1: red", createdAt: new Date("invalid") });
+  const a1 = await q.applyBatch(r.batchId, DAY2);
+  assert.deepEqual([a1.outcome, a1.followUps], ["approved", []], "untimed comments are ignored");
+  // A later timed comment is ignored too, so a replay before settle returns the same follow-ups.
+  card.comments.push({ body: "BQ-1: green", createdAt: new Date(DAY2.getTime() + 60_000) });
+  const a2 = await q.applyBatch(r.batchId, DAY2);
+  assert.deepEqual([a2.first, a2.followUps], [false, a1.followUps]);
+  assert.deepEqual(store.decisions.filter((d) => d.approvalId === card.id).map((d) => [d.source, d.answer]), [["default", "blue"]]);
 });

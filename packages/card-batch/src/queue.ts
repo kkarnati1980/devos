@@ -95,9 +95,13 @@ export interface BatchCards {
   raiseCard(input: { gate: "decision"; action: string; target: string; reason: string; projectId: string }, blocks: readonly string[]): Promise<{ id: string }>;
   /** Newest card with this target, any status (M2.3 store listing with the DEVOS-190 target filter). */
   findByTarget(projectId: string, target: string): Promise<{ id: string } | null>;
-  get(id: string): Promise<{ id: string; status: string; decidedAt?: Date | null } | null>;
-  /** The card's comments, oldest first (`batchAnswers` takes the last `BQ-<n>:` line; pre-review finding 3). */
-  comments(id: string): Promise<{ body: string; createdAt?: Date }[]>;
+  /** `decidedAt` is set on every decided M2.3 card (CHECK `approval_decided_has_time`); Codex PR135-r2 requires it. */
+  get(id: string): Promise<{ id: string; status: string; decidedAt: Date | null } | null>;
+  /**
+   * The card's comments, oldest first (`batchAnswers` takes the last `BQ-<n>:` line; pre-review finding 3). Each has
+   * its `createdAt` (Codex PR135-r2): only comments made up to the decision count.
+   */
+  comments(id: string): Promise<{ body: string; createdAt: Date }[]>;
   /**
    * Pre-review finding 1: the checks M2.3's `raiseCard` would refuse for good (a secret-shaped reason, a blocked
    * task that does not exist or belongs to another project), run at queue time; returns the refusal code or null.
@@ -242,9 +246,14 @@ export class CardBatchQueue {
       return { outcome: "rejected", first, followUps: [], stopped: [...new Set(members.flatMap((m) => m.blocks))] };
     }
     // Pre-review finding 4: only comments made up to the decision count (as CR-a's intake card), so the answers, and
-    // the follow-ups below, are the same on every call.
-    const decidedAt = card.decidedAt ? card.decidedAt.getTime() : null;
-    const comments = (await this.cards.comments(card.id)).filter((c) => decidedAt === null || !c.createdAt || c.createdAt.getTime() <= decidedAt).map((c) => c.body);
+    // the follow-ups below, are the same on every call. Codex PR135-r2: fail closed on a missing timestamp. An
+    // approved card without a valid `decidedAt` is not applied (`not-ready`), and a comment without a valid
+    // `createdAt` never counts, so a later comment can never change a replayed apply.
+    const decidedAt = card.decidedAt instanceof Date ? card.decidedAt.getTime() : NaN;
+    if (!Number.isFinite(decidedAt)) return { outcome: "not-ready", ...none };
+    const comments = (await this.cards.comments(card.id))
+      .filter((c) => c.createdAt instanceof Date && Number.isFinite(c.createdAt.getTime()) && c.createdAt.getTime() <= decidedAt)
+      .map((c) => c.body);
     const answers = batchAnswers(members, comments);
     const rows: DecisionRow[] = members.map((m, i) => ({ projectId: row.projectId, itemId: `Q-${m.id}`, text: m.text, answer: answers[i]!.answer, source: answers[i]!.source, approvalId: card.id }));
     const first = await this.store.apply(batchId, rows, now);
