@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.json && node --test --test-concurrency=1 \"test/*.test.mjs\"",
+    "test": "pnpm --filter @devos/isolation run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test/*.test.mjs\"",
     "test:db": "pnpm --filter @devos/db run build && tsc -p tsconfig.json && node --test --test-concurrency=1 \"test-db/*.test.mjs\""
   },
   "dependencies": {
@@ -24,6 +24,7 @@
   },
   "devDependencies": {
     "@devos/db": "workspace:*",
+    "@devos/isolation": "workspace:*",
     "@types/node": "^22.7.0",
     "@types/pg": "8.15.6",
     "typescript": "^5.6.3"
