@@ -60,7 +60,14 @@ export function blankLiterals(text) {
 }
 
 /** Text outside parentheses only (subqueries, CTE bodies and column lists removed). */
-const topLevel = (text) => { let d = 0, out = ""; for (const c of text) { if (c === "(") d++; else if (c === ")") d = Math.max(0, d - 1); else if (d === 0) out += c; } return out; };
+// Each removed group leaves a space, so `AS(SELECT 1)DELETE` reads as `AS DELETE`, never `ASDELETE` (PR125-r9).
+const topLevel = (text) => {
+  let d = 0, out = "";
+  for (const c of text) {
+    if (c === "(") { if (d === 0) out += " "; d++; } else if (c === ")") { if (d > 0) { d--; if (d === 0) out += " "; } } else if (d === 0) out += c;
+  }
+  return out;
+};
 
 function splitTop(s) {
   const parts = [];

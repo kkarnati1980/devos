@@ -268,6 +268,16 @@ test("SM-06-L2: a referenced table, constraint name or referential action is no 
   for (const sql of passed) assert.deepEqual(rules(sql), [], sql);
 });
 
+// Codex PR125-r9 finding 1.
+test("SM-06-L2: a parenthesised group with no spaces around it still separates keywords (r9)", () => {
+  assert.deepEqual(rules("WITH x AS(SELECT 1)DELETE FROM users;"), ["delete-without-where"]);
+  assert.deepEqual(rules("WITH x AS(SELECT 1)UPDATE users SET a = 1;"), ["update-without-where"]);
+  assert.deepEqual(rules("WITH x AS(SELECT 1)DELETE FROM users WHERE(id = 1);"), []);
+  assert.deepEqual(rules("UPDATE users SET a = 1 WHERE(id IN(SELECT id FROM x));"), []);
+  assert.deepEqual(rules("ALTER TABLE t ADD COLUMN n numeric(10,2)NOT NULL;"), ["add-not-null-without-default"]);
+  assert.deepEqual(rules("ALTER TABLE t ADD COLUMN n numeric(10,2)NOT NULL DEFAULT(0);"), []);
+});
+
 // Codex PR125-r7 finding 1.
 test("SM-06-L2: an absolute --dir is read as given, not joined onto cwd (r7)", () => {
   const root = mkdtempSync(join(tmpdir(), "sm06-abs-"));
