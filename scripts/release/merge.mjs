@@ -150,7 +150,7 @@ export async function guardPathsTouched(gh, repo, pr, changedFiles) {
 /**
  * GI-1b: the text of the review watcher's PASS comment for this exact SHA and label (first line
  * "### Codex review <label> — **PASS**", a "**Commit:** `<sha>`" line, posted by the watcher's account). The
- * watcher renders the verdict summary on one line, so each "FLOOR-GUARD KEEP|CHANGE" marker is moved onto its own
+ * watcher prints the verdict summary as Codex wrote it (one or several lines, DEVOS-223); each "FLOOR-GUARD KEEP|CHANGE" marker is moved onto its own
  * line before it is matched. Returns null when no such comment exists.
  */
 export async function passVerdictText(gh, repo, pr, sha, label, creator) {
