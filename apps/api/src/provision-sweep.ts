@@ -76,8 +76,8 @@ export class ProvisionSweepJob {
         this.d.log({ level: "warn", msg: "provision-sweep-list-failed" });
         return 0;
       }
-      const todo = projects.filter((p) => !this.parked.has(p.id));
-      if (todo.length && this.d.ready) {
+      const runnable = projects.filter((p) => !this.parked.has(p.id));
+      if (runnable.length && this.d.ready) {
         let notReady: string | null;
         try { notReady = await this.d.ready(); } catch { notReady = "provision-ready-check-failed"; }
         if (notReady) {
@@ -85,7 +85,7 @@ export class ProvisionSweepJob {
           return 0;
         }
       }
-      for (const p of todo) {
+      for (const p of runnable) {
         try {
           await this.d.provision(p);
         } catch (e) {
