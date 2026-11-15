@@ -84,7 +84,11 @@ export function provisionConfig(env: NodeJS.ProcessEnv): ProvisionConfig | { off
     return { off: "provision-coolify-url-not-set" };
   }
   if (!UUID_LIKE_RE.test(serverUuid)) return { off: "provision-coolify-server-not-set" };
+  // Codex PR145-r3: the address must be a tailnet (CGNAT, 100.64.0.0/10) address, the same rule as M2.4-c2's
+  // isTailnetIpv4, or every project's step list would throw `tailnet-ip-invalid` and park after five ticks.
   if (!IPV4_RE.test(tailnetIp)) return { off: "provision-tailnet-ip-not-set" };
+  const [o1 = -1, o2 = -1] = tailnetIp.split(".").map(Number);
+  if (o1 !== 100 || o2 < 64 || o2 > 127) return { off: "provision-tailnet-ip-not-tailnet" };
   if (!SHA_RE.test(devosSha)) return { off: "provision-devos-sha-unknown" };
   return { owner, coolifyOrigin: origin.origin, serverUuid, tailnetIp, devosSha, portsRaw: env.DEVOS_PROJECT_PORTS };
 }
