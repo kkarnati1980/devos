@@ -372,3 +372,46 @@ test("CR-b2d job (Codex PR143-r2): 100 stuck open batches cannot hide the 101st 
   await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
   assert.equal(afters.length, 0);
 });
+
+test("CR-b2d job (Codex PR143-r3): a pass cut by the page bound resumes after its cursor on the next tick, so the project after 5,000 stuck batches is reached", async () => {
+  const stuck = Array.from({ length: 5000 }, (_, i) => ({ projectId: `s-${String(i).padStart(4, "0")}`, since: `2026-11-13 10:00:00.${String(i).padStart(6, "0")}+00` }));
+  const late = { projectId: "z-late", since: "2026-11-14 01:00:00+00" };
+  const all = [...stuck, late];
+  const gt = (a, b) => (a.since === b.since ? a.projectId > b.projectId : a.since > b.since);
+  const flushedIds = [];
+  const reads = [];
+  const queue = {
+    applyBatch: async () => ({ outcome: "none", followUps: [] }),
+    settle: async () => {},
+    flushBatch: async (id) => { flushedIds.push(id); return id === late.projectId ? { outcome: "raised" } : { outcome: "raising" }; },
+  };
+  let failNext = false;
+  const lister = {
+    projectsToFlush: async (day, limit, after) => {
+      if (failNext) { failNext = false; throw new Error("db down"); }
+      reads.push({ day, after: after ?? null });
+      return all.filter((r) => !(r.projectId === late.projectId && flushedIds.includes(late.projectId)) && (!after || gt(r, after))).slice(0, limit);
+    },
+    projectsWithOpenBatch: async () => [],
+    batchesToApply: async () => [],
+  };
+  const job = new CardBatchJob(queue, null, async () => "x", lister, () => {});
+  const t1 = await job.tick(AT_0800_IST);
+  assert.equal(t1.flushed, 0);
+  assert.equal(reads.length, 50, "one tick reads at most 50 pages");
+  assert.ok(!flushedIds.includes(late.projectId));
+  // A failed read on the next tick keeps the cursor; the tick after retries from the same place.
+  failNext = true;
+  await job.tick(new Date(AT_0800_IST.getTime() + 300_000));
+  assert.equal(reads.length, 50);
+  const t3 = await job.tick(new Date(AT_0800_IST.getTime() + 600_000));
+  assert.deepEqual(reads[50].after, stuck[4999], "the next pass resumes after the last row read, not from the start");
+  assert.equal(t3.flushed, 1, "the project after the 5,000 stuck batches is flushed");
+  assert.equal(reads.length, 51, "the short page ends the pass");
+  await job.tick(new Date(AT_0800_IST.getTime() + 900_000));
+  assert.equal(reads.length, 51, "the day counts as flushed");
+  // The next IST day starts its pass from the beginning.
+  await job.tick(new Date(AT_0800_IST.getTime() + 86_400_000));
+  assert.equal(reads[51].day, "2026-11-15");
+  assert.equal(reads[51].after, null);
+});
