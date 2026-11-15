@@ -201,7 +201,14 @@ export class PrismaQueueStore implements QueueStore {
   }
 
   private async openLock(): Promise<LockConnection> {
-    if (this.o.connectLock) return bounded(this.o.connectLock(), this.timeoutMs, "connect");
+    if (this.o.connectLock) {
+      const pending = this.o.connectLock();
+      // Pre-review CR-b2b r2: a connection that arrives after the bound is ended, never leaked.
+      return bounded(pending, this.timeoutMs, "connect").catch((e) => {
+        void pending.then((c) => c.end()).catch(() => {});
+        throw e;
+      });
+    }
     const c = new pg.Client({ connectionString: this.o.databaseUrl, connectionTimeoutMillis: this.timeoutMs, statement_timeout: this.timeoutMs, query_timeout: this.timeoutMs });
     c.on("error", () => {});
     try {

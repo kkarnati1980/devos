@@ -95,19 +95,22 @@ test("AT8b (db): with A's connection dropped between raise and record, B finds t
   const a = new pg.Client({ connectionString: url });
   await a.connect();
   a.on("error", () => {});
+  let open = true;
+  let raised;
   try {
-  const got = await a.query("SELECT pg_try_advisory_lock(hashtext('devos:card-batch:' || $1::text)) AS ok", [claimed.id]);
-  assert.equal(got.rows[0].ok, true);
-  const name = (await db.project.findUnique({ where: { id: projectId } })).name;
-  const card = batchCard(name, claimed.id);
-  const raised = await approvals.raiseCard({ ...card, reason: "1 questions\nBQ-1: Should the footer be sticky? (default: no)", projectId }, [t1]);
-  // While A holds the lock, B does nothing.
-  assert.equal((await queue.flushBatch(projectId, DAY1_LATE)).outcome, "busy");
-  await approvals.approve(KK, raised.id);
-  assert.equal(await status(t1), "ready");
-  await a.end(); // the crash: the lock goes with the connection
+    const got = await a.query("SELECT pg_try_advisory_lock(hashtext('devos:card-batch:' || $1::text)) AS ok", [claimed.id]);
+    assert.equal(got.rows[0].ok, true);
+    const name = (await db.project.findUnique({ where: { id: projectId } })).name;
+    const card = batchCard(name, claimed.id);
+    raised = await approvals.raiseCard({ ...card, reason: "1 questions\nBQ-1: Should the footer be sticky? (default: no)", projectId }, [t1]);
+    // While A holds the lock, B does nothing.
+    assert.equal((await queue.flushBatch(projectId, DAY1_LATE)).outcome, "busy");
+    await approvals.approve(KK, raised.id);
+    assert.equal(await status(t1), "ready");
+    open = false;
+    await a.end(); // the crash: the lock goes with the connection
   } finally {
-    await a.end().catch(() => {});
+    if (open) await a.end().catch(() => {});
   }
   const b = await queue.flushBatch(projectId, DAY1_LATE);
   assert.deepEqual([b.outcome, b.cardId], ["recorded", raised.id]);
