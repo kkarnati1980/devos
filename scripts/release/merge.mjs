@@ -150,7 +150,7 @@ export async function guardPathsTouched(gh, repo, pr, changedFiles) {
 /**
  * GI-1b: the text of the review watcher's PASS comment for this exact SHA and label (first line
  * "### Codex review <label> — **PASS**", a "**Commit:** `<sha>`" line, posted by the watcher's account). The
- * watcher renders the verdict summary on one line, so each "FLOOR-GUARD KEEP|CHANGE" marker is moved onto its own
+ * watcher prints the verdict summary as Codex wrote it (one or several lines, DEVOS-223); each "FLOOR-GUARD KEEP|CHANGE" marker is moved onto its own
  * line before it is matched. Returns null when no such comment exists.
  */
 export async function passVerdictText(gh, repo, pr, sha, label, creator) {
@@ -166,10 +166,16 @@ export async function passVerdictText(gh, repo, pr, sha, label, creator) {
   // shared account cannot replace the watcher's.
   const match = comments.find((c) => c?.user?.login === creator && (!c.updated_at || c.updated_at === c.created_at) && String(c.body ?? "").split("\n")[0].trim() === head && String(c.body).includes(`**Commit:** \`${sha}\``));
   if (!match) return null;
-  // Markers count only on the Summary line, never in the findings table, whose cells quote PR text (finding 1).
-  const summary = String(match.body).split("\n").find((l) => l.startsWith("- **Summary:** "));
-  if (!summary) return null;
-  return summary.slice("- **Summary:** ".length).replace(/[ \t]*(FLOOR-GUARD (?:KEEP|CHANGE) )/g, "\n$1");
+  // Markers count only in the Summary, never in the findings table, whose cells quote PR text (finding 1). The
+  // watcher prints Codex's summary as it is, so it can run over several lines (one marker per line, DEVOS-223): the
+  // Summary is its "- **Summary:** " line plus the lines after it, up to the first blank line, which the watcher
+  // always writes before the table.
+  const lines = String(match.body).split("\n");
+  const at = lines.findIndex((l) => l.startsWith("- **Summary:** "));
+  if (at < 0) return null;
+  const block = [lines[at].slice("- **Summary:** ".length)];
+  for (let i = at + 1; i < lines.length && lines[i].trim() !== ""; i++) block.push(lines[i]);
+  return block.join("\n").replace(/[ \t]*(FLOOR-GUARD (?:KEEP|CHANGE) )/g, "\n$1");
 }
 
 // Hits a Codex Keep never clears (spec §4.4: security scanning, policy and money go to KK; §4.5: a guard change must
