@@ -500,6 +500,7 @@ model CardBatch {
 
   @@unique([projectId, istDay])
   @@index([state, settledAt])
+  @@index([cardId])
   @@map("card_batch")
 }
 

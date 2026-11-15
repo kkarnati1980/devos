@@ -58,6 +58,9 @@ CREATE INDEX "queued_question_batch_id_queued_at_idx" ON "queued_question"("batc
 CREATE INDEX "card_batch_state_settled_at_idx" ON "card_batch"("state", "settled_at");
 
 -- CreateIndex
+CREATE INDEX "card_batch_card_id_idx" ON "card_batch"("card_id");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "card_batch_project_id_ist_day_key" ON "card_batch"("project_id", "ist_day");
 
 -- AddForeignKey
