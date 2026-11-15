@@ -206,3 +206,21 @@ test("CR-b2b (db): two concurrent claims of one project and day make one batch; 
   assert.equal(f.outcome, "raised");
   assert.ok(!(await store.batchesToApply()).includes(f.batchId));
 });
+
+test("CR-b2b (db, Codex PR140-r1): one batch takes at most BATCH_MEMBERS_MAX questions, oldest first; the rest wait for the next day", async () => {
+  const { BATCH_MEMBERS_MAX } = await import("../dist/card-batch-store.js");
+  const { projectId } = await fixture(0);
+  const { store } = setup();
+  await db.$queryRawUnsafe(
+    `INSERT INTO queued_question (project_id, text, source, default_answer, blocks, queued_at)
+     SELECT $1::uuid, 'Question ' || g, 'builder', 'yes', '{}', timestamptz '2026-11-14 00:00:00+00' + g * interval '1 second'
+       FROM generate_series(1, $2::int) AS g`,
+    projectId, BATCH_MEMBERS_MAX + 1,
+  );
+  const b = await store.claim(projectId, "2026-11-14", randomUUID());
+  const members = await store.members(b.id);
+  assert.equal(members.length, BATCH_MEMBERS_MAX);
+  assert.equal(members[0].text, "Question 1");
+  const left = await db.$queryRawUnsafe("SELECT text FROM queued_question WHERE project_id = $1::uuid AND batch_id IS NULL", projectId);
+  assert.deepEqual(left.map((r) => r.text), [`Question ${BATCH_MEMBERS_MAX + 1}`], "the newest waits");
+});
