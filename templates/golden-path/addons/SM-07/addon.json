@@ -1,0 +1,12 @@
+{
+  "id": "SM-07",
+  "name": "Idempotency",
+  "files": [
+    "src/idempotency.mjs",
+    "test/sm-07-idempotency.test.mjs"
+  ],
+  "checks": {
+    "SM-07-L1": "test/sm-07-idempotency.test.mjs"
+  },
+  "usage": "Put IDEMPOTENCY_SQL in a migration (a (scope, owner, key) primary key; behind SM-02's protect() keys are per caller) and build sqlStore(query) over your database client. Wrap each create route as validated(schemas, withIdempotency(store, \"orders.create\", (req, ctx) => ({ status, body }))): clients send an Idempotency-Key header; a repeat with the same request replays the first answer (header idempotent-replayed: true), the same key with another request is 422, a key still running is 409, and a thrown error or a 5xx frees the key. Wrap each job handler as idempotentJob(store, \"email.welcome\", handler) and enqueue jobs with payload.idempotencyKey. A process that dies mid-effect leaves its key running (409) until the row is deleted. Clients send random UUID keys; on a route without callers (no SM-02 protect()) all clients share one key space, so a public create route that returns anything private needs a fingerprint or a per-client owner."
+}
