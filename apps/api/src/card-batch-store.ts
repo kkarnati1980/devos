@@ -13,7 +13,6 @@ import type { BatchCards, CardBatch, DecisionRow, QueueStore, QueuedQuestion } f
 import { looksSecret } from "./notify.js";
 import type { Approvals } from "./approvals.js";
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
 export interface PrismaTxLike {
   $transaction<T>(fn: (tx: any) => Promise<T>, o?: { timeout?: number; maxWait?: number }): Promise<T>;
 }
@@ -52,6 +51,13 @@ function listLimit(v: unknown): number {
 
 /** Batches or projects one sync tick reads (the rest are reached on later ticks; bounded reads, ADR-0011 §9). */
 export const CARD_BATCH_LIST_MAX = 100;
+/**
+ * Codex PR140-r1 finding 1: at most this many questions join one batch (oldest first); the rest wait for the next
+ * IST day's batch. It keeps every per-batch read bounded and below FINAL_ROWS_MAX, so `finalRows` always returns
+ * every member's row and no follow-up can be missed.
+ */
+export const BATCH_MEMBERS_MAX = 500;
+const FINAL_ROWS_MAX = 1000;
 
 function toQuestion(r: any): QueuedQuestion {
   return {
@@ -146,7 +152,11 @@ export class PrismaQueueStore implements QueueStore {
         newId, projectId, day,
       );
       if (!made.length) return null; // the project already had its batch for this IST day
-      await tx.$queryRawUnsafe("UPDATE queued_question SET batch_id = $1::uuid WHERE project_id = $2::uuid AND batch_id IS NULL", newId, projectId);
+      await tx.$queryRawUnsafe(
+        `UPDATE queued_question SET batch_id = $1::uuid WHERE id IN (
+           SELECT id FROM queued_question WHERE project_id = $2::uuid AND batch_id IS NULL ORDER BY queued_at, id LIMIT $3::int)`,
+        newId, projectId, BATCH_MEMBERS_MAX,
+      );
       return toBatch(made[0]);
     });
   }
@@ -160,7 +170,7 @@ export class PrismaQueueStore implements QueueStore {
 
   members(batchId: string) {
     return this.tx(async (tx) => {
-      const rows = await tx.$queryRawUnsafe(`SELECT ${QUESTION_COLS} FROM queued_question WHERE batch_id = $1::uuid ORDER BY queued_at, id`, batchId);
+      const rows = await tx.$queryRawUnsafe(`SELECT ${QUESTION_COLS} FROM queued_question WHERE batch_id = $1::uuid ORDER BY queued_at, id LIMIT $2::int`, batchId, BATCH_MEMBERS_MAX);
       return rows.map(toQuestion);
     });
   }
@@ -200,8 +210,8 @@ export class PrismaQueueStore implements QueueStore {
   finalRows(approvalId: string) {
     return this.tx(async (tx) => {
       const rows = await tx.$queryRawUnsafe(
-        "SELECT project_id, item_id, text, answer, source, approval_id FROM project_decision WHERE approval_id = $1::uuid ORDER BY item_id LIMIT 1000",
-        approvalId,
+        "SELECT project_id, item_id, text, answer, source, approval_id FROM project_decision WHERE approval_id = $1::uuid ORDER BY item_id LIMIT $2::int",
+        approvalId, FINAL_ROWS_MAX,
       );
       return rows.map((r: any): DecisionRow => ({ projectId: r.project_id, itemId: r.item_id, text: r.text, answer: r.answer, source: r.source, approvalId: r.approval_id }));
     });
@@ -231,24 +241,44 @@ export class PrismaQueueStore implements QueueStore {
     return c as unknown as LockConnection;
   }
 
+  /** The lock connections held by `withBatchLock` in this process, for the fence below. */
+  private readonly held = new Map<string, { conn: LockConnection; lost: boolean }>();
+
   async withBatchLock<T>(batchId: string, fn: () => Promise<T>): Promise<{ locked: true; value: T } | { locked: false }> {
     const conn = await this.openLock();
-    // An idle connection error (the server went away) must not crash the process; the lock is gone with it. A lock
-    // lost while `fn` runs is not detected (pre-review CR-b2b finding 4): the bound is M2.3's pending-twin dedupe
-    // and the next flush's lookup by target (contract, CR-b2b runner decisions).
-    conn.on("error", () => {});
+    const entry = { conn, lost: false };
+    // A connection error (the server went away) must not crash the process; the lock is gone with it, so the entry
+    // is marked lost and the fence refuses the raise (Codex PR140-r1 finding 2).
+    conn.on("error", () => {
+      entry.lost = true;
+    });
     const ms = this.timeoutMs;
     try {
       const r = await bounded(conn.query(LOCK_SQL, [batchId]), ms, "lock");
       if (r.rows[0]?.ok !== true) return { locked: false };
+      this.held.set(batchId, entry);
       try {
         return { locked: true, value: await fn() };
       } finally {
+        this.held.delete(batchId);
         await bounded(conn.query(UNLOCK_SQL, [batchId]), ms, "unlock").catch(() => {});
       }
     } finally {
       await bounded(conn.end(), ms, "end").catch(() => {});
     }
+  }
+
+  /**
+   * Codex PR140-r1 finding 2: the fence `approvalBatchCards` runs right before raising a batch card. A bounded round
+   * trip on the lock's own session proves the session, and so its session lock, is still alive at that moment; a
+   * lost or dead connection throws, the raise does not happen, and the batch stays `raising` for the next flush,
+   * whose lookup by target finds any card another holder raised.
+   */
+  async assertBatchLock(batchId: string): Promise<void> {
+    const entry = this.held.get(batchId);
+    if (!entry || entry.lost) throw new Error("batch-lock-lost");
+    const r = await bounded(entry.conn.query("SELECT 1 AS ok"), this.timeoutMs, "fence");
+    if (entry.lost || Number(r.rows[0]?.ok) !== 1) throw new Error("batch-lock-lost");
   }
 
   // The sync job's reads (CR-b2d wiring): bounded, oldest first.
@@ -316,9 +346,18 @@ export interface TaskProjects {
  * (CR-b2a pre-review finding 1), with the same rules as M2.3: a secret-shaped reason, and blocked tasks that are
  * missing or belong to another project.
  */
-export function approvalBatchCards(approvals: Approvals, tasks?: TaskProjects): BatchCards {
+export interface BatchLockFence {
+  assertBatchLock(batchId: string): Promise<void>;
+}
+
+export function approvalBatchCards(approvals: Approvals, tasks?: TaskProjects, lock?: BatchLockFence): BatchCards {
   const cards: BatchCards = {
-    raiseCard: (input, blocks) => approvals.raiseCard(input, blocks),
+    async raiseCard(input, blocks) {
+      // Codex PR140-r1 finding 2: a batch card is raised only while this process still holds that batch's lock.
+      const batch = /^batch:(.+)$/.exec(input.target);
+      if (lock && batch) await lock.assertBatchLock(batch[1]!);
+      return approvals.raiseCard(input, blocks);
+    },
     async findByTarget(projectId, target) {
       const page = await approvals.store.list({ projectId, gate: "decision", target, limit: 1 });
       return page[0] ? { id: page[0].id } : null;
