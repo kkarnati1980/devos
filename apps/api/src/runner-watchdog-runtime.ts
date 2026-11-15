@@ -90,6 +90,9 @@ export class PrismaWatchdogStore implements WatchdogStore {
 /** The watchdog's last completed tick, read by GET /health (the heartbeat DEVOS-221's server check reads). */
 export const watchdogHeartbeat: { lastRunAt: string | null } = { lastRunAt: null };
 
+/** The fixed codes Notifier.notify throws (`parseNotice` codes and the store error); any other text is not logged. */
+const NOTIFY_CODES = /^(notifications-store-error|notice-contains-secret|body-must-be-object|(invalid|missing|unknown-field):[a-zA-Z]{1,20})$/;
+
 export type WatchdogLog = (e: { level: "info" | "warn"; msg: string; code?: string; notices?: number }) => void;
 
 export interface RunnerWatchdogDeps {
@@ -136,7 +139,7 @@ export class RunnerWatchdogJob {
           await this.d.notify(n);
         } catch (e) {
           // NoticeError and the store error carry fixed codes; anything else is reported as one code, never its text.
-          const code = e instanceof Error && /^[a-z0-9:-]{1,60}$/.test(e.message) ? e.message : "notify-failed";
+          const code = e instanceof Error && NOTIFY_CODES.test(e.message) ? e.message : "notify-failed";
           this.d.log({ level: "warn", msg: "runner-watchdog-notify-failed", code });
           return false;
         }

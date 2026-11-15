@@ -184,13 +184,17 @@ export async function buildRuntime(
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   // DEVOS-220: the runner watchdog reads Linear with the H8 key from the vault (by name, at call time) and alerts
   // through M1.6. It only reads Linear. Without a vault or a Linear loader it is off.
-  const runnerWatchdog = vault && opts.loadLinear
+  // A Linear client that cannot be loaded turns the watchdog off (logged) and never stops the API (pre-review L2).
+  const linear = vault && opts.loadLinear
+    ? await opts.loadLinear(async () => {
+        const key = await vault.reveal("linear_api_key");
+        if (!key) throw new Error("linear-key-not-set");
+        return key;
+      }).catch(() => { stdoutSink({ ts: new Date().toISOString(), level: "warn", msg: "runner-watchdog-linear-load-failed" }); return null; })
+    : null;
+  const runnerWatchdog = linear
     ? new RunnerWatchdogJob({
-        linear: await opts.loadLinear(async () => {
-          const key = await vault.reveal("linear_api_key");
-          if (!key) throw new Error("linear-key-not-set");
-          return key;
-        }),
+        linear,
         store: new PrismaWatchdogStore(db, t),
         notify: (n) => notifier.notify(n),
         log: (e) => stdoutSink({ ts: new Date().toISOString(), ...e }),
