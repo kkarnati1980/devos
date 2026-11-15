@@ -3,7 +3,7 @@
 - **Linear:** DEVOS-217 · P2 (build-process support) · Lane C · High. Split into DEVOS-219 (core), DEVOS-220 (runtime wiring) and DEVOS-221 (server check), one PR each.
 - **Source:** KK's decision, 15 Nov 2026 (20:45 IST), after two long silent stops: 13–14 Nov (Linear and Gmail down, about 18 h) and 14–15 Nov (every scheduled run refused at start while the account payment was fixed, about 21 h). A run that never starts cannot alert, so the check lives outside Claude, on the DevOS server.
 - **Applies:** ADR-0011 (a timeout on every outbound call, retries only for reads, no secret in logs or email), F2 (server-side fetches only to the allow-listed Linear endpoint), M1.6 (notification channels), M2.6 (`LinearClient`), the server-agent contract (server checks), ADR-0013 (runner technical decisions recorded here).
-- **Owned files:** `apps/api/src/runner-watchdog.ts`, `apps/api/test/runner-watchdog.test.mjs` (217a); `apps/api/src/runner-watchdog-runtime.ts`, its test, the state table migration in `packages/db/prisma/`, the `main.ts`/`runtime.ts`/`health` wiring lines (217b); `scripts/server/checks/runner-watchdog.sh` and its test case in `scripts/test/server-agent.test.mjs` (217c); this contract.
+- **Owned files:** `apps/api/src/runner-watchdog.ts`, `apps/api/test/runner-watchdog.test.mjs` (DEVOS-219); `apps/api/src/runner-watchdog-runtime.ts`, `apps/api/test/runner-watchdog-runtime.test.mjs`, the `RunnerWatchdogState` model in `packages/db/prisma/schema.prisma` and migration `20261115000100_runner_watchdog_state`, the wiring lines in `apps/api/src/main.ts`, `runtime.ts`, `routes.ts` (`/health`) and `openapi.yaml`, the `@devos/linear-sync` dependency in `apps/api/package.json` (+ lockfile) and its manifest line in `Dockerfile` (DEVOS-220); `scripts/server/checks/runner-watchdog.sh` and its test case in `scripts/test/server-agent.test.mjs` (DEVOS-221); this contract.
 
 ## Goal
 Every 30 minutes, read the newest comment time on the two runner logs (DEVOS-75 for runner A, DEVOS-89 for runner B). When neither has had a comment for 2 hours, tell KK once, in plain language, through the existing M1.6 channels (email and the MyBrain bell), and tell him again when the runners are back. Tell him separately when the server itself cannot reach Linear for 2 hours. Stay quiet when the silence is the weekly cap.
@@ -62,7 +62,7 @@ Constants: `SILENT_MS = 2 h`, `REPEAT_MS = 6 h`, `CAP_NOTE_MS = 24 h`, `LINEAR_D
 | AT7 | (217c) The `runner-watchdog` server check passes when the watchdog's last run is under 35 minutes old, fails when older or missing, and skips when DevOS is not deployed |
 
 ## Pass rule
-- `pnpm --filter @devos/api test` exits 0 on the merged SHA, covering AT1–AT6 in `apps/api/test/runner-watchdog.test.mjs` (217a) and the runtime test (217b).
+- `pnpm --filter @devos/api test` exits 0 on the merged SHA, covering AT1–AT6 in `apps/api/test/runner-watchdog.test.mjs` (DEVOS-219) and the runtime test (217b).
 - `node --test scripts/test/server-agent.test.mjs` exits 0 on the merged SHA, covering AT7 (217c) and the server agent's existing tests.
 - After deploy, the `server-check` status on the live SHA includes `runner-watchdog` passed, with a last run under 35 minutes old.
 
@@ -74,4 +74,5 @@ CI green and Codex PASS on the exact head SHA (D1).
 
 ## Build record
 - 15 Nov 2026, runner B: contract written; DEVOS-219 built first. Pre-review: 3 findings, 2 fixed (cap pause ends at the weekly reset; no recovery and silent alert in one step). Not fixed (low): a newer cap-idle line after a silent alert counts as recovery, because a run did start, so the account and connectors work again. Second round PASS, with 2 low findings recorded, not fixed: a wrong cap line posted just after a reset holds alerts for up to a week (runners post a cap idle only when the ledger is over the cap, so this needs a runner bug); and the cap note's "resume at the reset" wording can be up to 2 hours stale. Fixed: the stale doc comment on `step`.
+- 15 Nov 2026, runner B (DEVOS-220): `@devos/linear-sync` is imported at run time like `@devos/db`, so the api scripts stay unchanged (the floor guard reads any change to them as KK-only; see S4.md, 15 Nov). The Linear read asks for the 50 newest comments per log and takes the newest by `createdAt` itself, whatever order Linear returns. A notice the notifier cannot send leaves the state unsaved, so the next tick sends it again (at least once). The heartbeat is `watchdog.lastRunAt` in `/health`.
 - 15 Nov 2026, runner B: Codex PR136-r1 (1 medium, accepted): a good read cleared the last Linear alert time, so flapping reads could alert every 3 hours. It is now kept; an AT4 test runs a flapping sequence (14/14).

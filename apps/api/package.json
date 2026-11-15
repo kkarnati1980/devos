@@ -15,6 +15,7 @@
   "dependencies": {
     "@devos/analyst": "workspace:*",
     "@devos/db": "workspace:*",
+    "@devos/linear-sync": "workspace:*",
     "@devos/policy": "workspace:*",
     "@devos/run-engine": "workspace:*",
     "@nestjs/common": "11.2.8",

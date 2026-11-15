@@ -1309,3 +1309,13 @@ model GuardMetric {
   @@index([role, windowEnd])
   @@map("guard_metric")
 }
+
+/// DEVOS-220 (docs/modules/runner-watchdog.md): the runner watchdog's state, one row (id 1), so a redeploy never
+/// repeats an alert inside its window.
+model RunnerWatchdogState {
+  id        Int      @id
+  state     Json
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("runner_watchdog_state")
+}

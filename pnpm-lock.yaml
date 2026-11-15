@@ -30,6 +30,9 @@ importers:
       '@devos/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@devos/linear-sync':
+        specifier: workspace:*
+        version: link:../../packages/linear-sync
       '@devos/policy':
         specifier: workspace:*
         version: link:../../packages/policy
