@@ -119,6 +119,25 @@ test("AT8b (db): with A's connection dropped between raise and record, B finds t
   assert.equal((await queue.flushBatch(projectId, DAY1_LATE)).outcome, "none");
 });
 
+test("AT8b (db, Codex PR140-r2): a second card for a decided batch is refused by the database with the raise; no task is re-blocked", async () => {
+  const { projectId, tasks: [t1] } = await fixture(1);
+  const { approvals, store, queue } = setup();
+  await queue.queueQuestion(projectId, ask("Should the footer be sticky?", "no", [t1]), DAY1);
+  const claimed = await store.claim(projectId, "2026-11-14", randomUUID());
+  const name = (await db.project.findUnique({ where: { id: projectId } })).name;
+  const card = { ...batchCard(name, claimed.id), reason: "1 questions\nBQ-1: Should the footer be sticky? (default: no)", projectId };
+  // A late holder A whose fence passed: its raise reaches M2.3 after B's card was raised and KK approved it.
+  const first = await approvals.raiseCard(card, [t1]);
+  await approvals.approve(KK, first.id);
+  assert.equal(await status(t1), "ready");
+  await assert.rejects(approvals.raiseCard(card, [t1]), "the second batch card is refused atomically (approval_batch_card_once)");
+  assert.equal((await batchCards(projectId)).length, 1, "one card in total");
+  assert.equal(await status(t1), "ready", "the refused raise rolled back its blockers");
+  // The next flush records the existing card by target.
+  const r = await queue.flushBatch(projectId, DAY1_LATE);
+  assert.deepEqual([r.outcome, r.cardId], ["recorded", first.id]);
+});
+
 test("AT11 (db, M2.3 half): approving with BQ-1 records kk/default rows and the blocked tasks become ready; rejecting keeps them blocked", async () => {
   const { projectId, tasks: [t1, t2, t3, t4] } = await fixture(4);
   const { approvals, store, queue } = setup();
