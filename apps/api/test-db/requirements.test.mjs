@@ -106,6 +106,8 @@ test("AT-D3 approval: only the newest draft, once; then the store refuses a new 
   assert.equal(await pl.applyDecision({ id: r2.approvalId, gate: "requirements", status: "approved" }), "ignored");
   assert.equal(await db.requirementsDoc.count({ where: { projectId: p.id, status: "approved" } }), 1);
   assert.equal(await db.auditEvent.count({ where: { projectId: p.id, action: "requirements.approved" } }), 1);
+  // DEVOS-224 AT11 (trigger): the approval moved the project to provisioning once; the repeat changed nothing.
+  assert.equal((await db.project.findUnique({ where: { id: p.id }, select: { stage: true } })).stage, "provisioning");
   const specs = await db.spec.count({ where: { projectId: p.id } });
   await rejectsCode(store.saveAnalysis({ projectId: p.id, expectedStage: "intake", spec: { sourceFormat: "paste", originalName: null, fileSha256: "a".repeat(64), text: "x" }, requirements: [], milestones: [], repoPath: "docs/requirements.md" }), "requirements-already-approved");
   assert.equal(await db.spec.count({ where: { projectId: p.id } }), specs, "the refused save rolled back");
