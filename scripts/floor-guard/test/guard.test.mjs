@@ -438,3 +438,17 @@ test("GI-4c (DEVOS-167): a ci-* step or job hit carries what the step ran, so it
   h = r.hits.find((x) => x.rule === "ci-job-removed");
   assert.equal(h.text.length, 200);
 });
+
+test("AT8c (DEVOS-227, note 0027) a test-script-changed text keeps up to 1000 characters; past that it is cut at 1000", () => {
+  const P = "apps/api/package.json";
+  const oldCmd = "pnpm --filter @devos/policy --filter @devos/analyst --filter @devos/run-engine run build && tsc -p tsconfig.json && node --test test/a.test.mjs";
+  const newCmd = oldCmd.replace("--filter @devos/run-engine", "--filter @devos/card-batch --filter @devos/run-engine");
+  const pkg = (cmd) => `{\n  "scripts": {\n    "test": "${cmd}"\n  }\n}\n`;
+  let r = check({ [P]: pkg(oldCmd) }, { [P]: pkg(newCmd) });
+  let h = r.hits.find((x) => x.rule === "test-script-changed");
+  assert.equal(h.text, `script "test": "${oldCmd}" -> "${newCmd}"`);
+  assert.ok(h.text.length > 200, String(h.text.length));
+  r = check({ [P]: pkg(oldCmd) }, { [P]: pkg(newCmd + " " + "x".repeat(1100)) });
+  h = r.hits.find((x) => x.rule === "test-script-changed");
+  assert.equal(h.text.length, 1000);
+});
