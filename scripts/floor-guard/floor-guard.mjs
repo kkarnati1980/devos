@@ -10,11 +10,14 @@ import { fileURLToPath } from "node:url";
 
 // Hit text is cut at 200 characters, except the two step-body rules (GI-4c), whose was/now text holds a whole step:
 // a SHA-pinned setup step is past 200, and a cut text is read as unknown (KK-only), so they keep up to 1000 (DEVOS-209,
-// note 0026). scripts/gates/kk-only.mjs holds the same two numbers; a test checks they match.
+// note 0026). `test-script-changed` keeps up to 1000 too: its text holds a script's old and new command, and two long
+// build lists pass 200, so a plain change would read as cut (DEVOS-227, note 0027). scripts/gates/kk-only.mjs holds the
+// same numbers and rules; a test checks they match.
 export const TEXT_CUT = 200;
 export const STEP_BODY_CUT = 1000;
 export const STEP_BODY_RULES = Object.freeze(["ci-step-removed", "ci-step-changed"]);
-export const cutFor = (rule) => (STEP_BODY_RULES.includes(rule) ? STEP_BODY_CUT : TEXT_CUT);
+export const LONG_TEXT_RULES = Object.freeze([...STEP_BODY_RULES, "test-script-changed"]);
+export const cutFor = (rule) => (LONG_TEXT_RULES.includes(rule) ? STEP_BODY_CUT : TEXT_CUT);
 export const CEILINGS = Object.freeze({ ciTimeoutMinutes: 30, testTimeoutMs: 120000 });
 
 // Paths owned by the guard: a change to any of them must come alone (with only a decision note or the GI-1 contract
