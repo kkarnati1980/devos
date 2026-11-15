@@ -1,0 +1,144 @@
+// DEVOS-228 (M2.4-d3b, docs/modules/M2.4.md "Part 2"): the AT13 live probe's phase machine.
+// One call to `probeStep` advances at most one phase, so each server-agent tick fits its 120 s check limit.
+// Every effect is injected (provisioning, inventory, live asserts, purge, the phase log), so the order and
+// the outcomes are tested without GitHub or Coolify. Output is fixed codes only: never a provider message.
+
+export const PROBE_SLUG = "devos-probe-m24";
+export const PROBE_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
+
+export const PHASES = ["run1", "inventory1", "run2", "inventory2", "assert", "purge", "done"] as const;
+export type Phase = (typeof PHASES)[number];
+
+/** One inventory row, as AT13 compares it (key, provider, external id, name). */
+export interface InventoryRow { key: string; provider: string; externalId: string; name: string }
+
+/** The newest phase record of the current cycle (stored as an audit row `provision.probe_phase`). */
+export interface PhaseRecord {
+  cycle: number;
+  phase: Phase;
+  at: string; // ISO time the phase was entered
+  fingerprint: string; // hash of the provisioning code in the image when the cycle started
+  inventory1?: InventoryRow[];
+  result?: { ok: boolean; code: string; detail?: string };
+}
+
+export type RunOutcome = "done" | "in_progress" | { error: string };
+export type PurgeOutcome = "done" | "in_progress" | { error: string };
+
+export interface ProbeDeps {
+  /** null when the sweep is off (provisionConfig / vault): the probe is skipped. */
+  offReason(): Promise<string | null>;
+  last(): Promise<PhaseRecord | null>;
+  record(r: PhaseRecord): Promise<void>;
+  /** Ensure the probe project exists (cap 0) and run provisioning once for it, resumably. */
+  provisionOnce(): Promise<RunOutcome>;
+  inventory(): Promise<InventoryRow[]>;
+  /** AT13's live asserts; each failure is a fixed code. */
+  liveAsserts(): Promise<string[]>;
+  /** M2.5 purge over the recorded ids only. */
+  purge(): Promise<PurgeOutcome>;
+  fingerprint: string;
+  now(): Date;
+}
+
+/** exit 0 pass, 1 fail, 3 skipped / in progress (the server agent's codes). */
+export interface ProbeTick { exit: 0 | 1 | 3; phase: Phase | "idle"; cycle: number; code: string; detail?: string }
+
+const full = (r: InventoryRow) => `${r.provider}\u0000${r.externalId}\u0000${r.name}`;
+
+/**
+ * The first difference between two inventories (by step key, in key order), or null when they are equal row
+ * for row. A key that appears twice in one run is itself a difference (`duplicate:`).
+ */
+export function inventoryDiff(a: InventoryRow[], b: InventoryRow[]): string | null {
+  const index = (rows: InventoryRow[], run: string): Map<string, string> | string => {
+    const m = new Map<string, string>();
+    for (const r of rows) {
+      if (m.has(r.key)) return `duplicate-in-${run}:${r.key}`;
+      m.set(r.key, full(r));
+    }
+    return m;
+  };
+  const x = index(a, "run1"), y = index(b, "run2");
+  if (typeof x === "string") return x;
+  if (typeof y === "string") return y;
+  for (const k of [...new Set([...x.keys(), ...y.keys()])].sort()) {
+    if (!y.has(k)) return `missing-in-run2:${k}`;
+    if (!x.has(k)) return `extra-in-run2:${k}`;
+    if (x.get(k) !== y.get(k)) return `differs:${k}`;
+  }
+  return null;
+}
+
+function nextPhase(p: Phase): Phase {
+  return PHASES[Math.min(PHASES.indexOf(p) + 1, PHASES.length - 1)];
+}
+
+function due(last: PhaseRecord, d: ProbeDeps): boolean {
+  if (last.fingerprint !== d.fingerprint) return true;
+  return d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS;
+}
+
+export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
+  const off = await d.offReason();
+  if (off) return { exit: 3, phase: "idle", cycle: 0, code: "skipped", detail: off };
+  let last = await d.last();
+  const at = () => d.now().toISOString();
+
+  if (!last || (last.phase === "done" && due(last, d))) {
+    const cycle = (last?.cycle ?? 0) + 1;
+    last = { cycle, phase: "run1", at: at(), fingerprint: d.fingerprint };
+    await d.record(last);
+  } else if (last.phase === "done") {
+    // Reported once when it finished; later ticks are skipped until the next cycle is due.
+    return { exit: 3, phase: "done", cycle: last.cycle, code: "probed", detail: last.result?.code };
+  }
+
+  const { cycle, phase } = last;
+  const finish = async (ok: boolean, code: string, detail?: string): Promise<ProbeTick> => {
+    await d.record({ ...last!, phase: "done", at: at(), result: { ok, code, detail } });
+    return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail };
+  };
+  const advance = async (extra: Partial<PhaseRecord> = {}): Promise<ProbeTick> => {
+    const to = nextPhase(phase);
+    await d.record({ ...last!, ...extra, phase: to, at: at() });
+    return { exit: 3, phase: to, cycle, code: "in_progress" };
+  };
+
+  switch (phase) {
+    case "run1":
+    case "run2": {
+      const r = await d.provisionOnce();
+      if (r === "in_progress") return { exit: 3, phase, cycle, code: "in_progress" };
+      if (r !== "done") {
+        // Purge whatever the failed run created, then report the run's failure (kept in the record).
+        await d.record({ ...last, phase: "purge", at: at(), result: { ok: false, code: `${phase}-failed`, detail: r.error } });
+        return { exit: 3, phase: "purge", cycle, code: "in_progress" };
+      }
+      return advance();
+    }
+    case "inventory1":
+      return advance({ inventory1: await d.inventory() });
+    case "inventory2": {
+      const diff = inventoryDiff(last.inventory1 ?? [], await d.inventory());
+      // A failed compare still purges the probe's resources: the failure is kept in the record.
+      if (diff) return advance({ result: { ok: false, code: "inventory-differs", detail: diff } });
+      return advance();
+    }
+    case "assert": {
+      if (last.result && !last.result.ok) return advance();
+      const failed = await d.liveAsserts();
+      if (failed.length) return advance({ result: { ok: false, code: "live-assert-failed", detail: failed.join(",") } });
+      return advance();
+    }
+    case "purge": {
+      const p = await d.purge();
+      if (p === "in_progress") return { exit: 3, phase, cycle, code: "in_progress" };
+      if (p !== "done") return finish(false, "purge-failed", p.error);
+      if (last.result && !last.result.ok) return finish(false, last.result.code, last.result.detail);
+      return finish(true, "pass");
+    }
+    default:
+      return { exit: 1, phase, cycle, code: "unknown-phase" };
+  }
+}
