@@ -317,6 +317,20 @@ paths:
         "404": { description: "`project-not-found`" }
         "500": { description: "`requirements-store-error`" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /projects/by-slug/{slug}/provision:
+    get:
+      operationId: getProvisionStatusBySlug
+      summary: "M2.4-d2: the same status document by slug, for the project page's panel (read-only)"
+      x-devos-access: session
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9-]{2,40}$" } }
+      responses:
+        "200": { description: "`{ projectId, stage, parked, steps }`, as GET /projects/{id}/provision" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "503": { description: "`provision-not-configured` or `provision-store-failed`" }
   /projects/{id}/provision:
     get:
       operationId: getProvisionStatus
@@ -325,7 +339,7 @@ paths:
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
-        "200": { description: "`{ stage, parked, steps: [{ key, provider, kind, status, attempts, code, updatedAt }] }`, in run order; `code` is the fixed error code only" }
+        "200": { description: "`{ projectId, stage, parked, steps: [{ key, provider, kind, status, attempts, code, updatedAt }] }`, in run order; `code` is the fixed error code only" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }

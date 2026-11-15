@@ -22,6 +22,7 @@ async function start({ configured = true } = {}) {
   const retried = [];
   const reader = {
     project: async (id) => projects.get(id) ?? null,
+    projectBySlug: async (slug) => (slug === "shop" ? projects.get(P1) : null),
     steps: async () => [
       row("vault/app_secret/preview/SESSION_SECRET", "pending"),
       row("coolify/port/preview"),
@@ -75,6 +76,12 @@ test("d2 GET: session required; steps in run order with only the fixed code; par
     assert.equal(g.json.steps[0].code, "name_conflict");
     assert.ok(!g.text.includes("ghp_secret") && !g.text.includes("devos-shop"), "the provider message never leaves the API");
     assert.ok(!("externalId" in g.json.steps[0]) && !("lastError" in g.json.steps[0]));
+    assert.equal(g.json.projectId, P1);
+    const bySlug = await call(port, "GET", "/projects/by-slug/shop/provision", { headers: { cookie: h.cookie } });
+    assert.equal(bySlug.status, 200);
+    assert.deepEqual(bySlug.json, g.json, "the slug view is the same document");
+    assert.equal((await call(port, "GET", "/projects/by-slug/other/provision", { headers: { cookie: h.cookie } })).status, 404);
+    assert.equal((await call(port, "GET", "/projects/by-slug/Bad_Slug/provision", { headers: { cookie: h.cookie } })).status, 400);
     assert.equal((await call(port, "GET", `/projects/nope/provision`, { headers: { cookie: h.cookie } })).status, 400);
     assert.equal((await call(port, "GET", `/projects/6b7d1c1e-2f6a-4a8e-9d55-0c1f2a3b4c5d/provision`, { headers: { cookie: h.cookie } })).status, 404);
   } finally { await app.close(); }

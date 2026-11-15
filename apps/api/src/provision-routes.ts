@@ -8,6 +8,7 @@ import { writeAudit } from "./settings.js";
 
 export const PROVISION = Symbol("devos:provision");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SLUG = /^[a-z0-9-]{2,40}$/;
 const CODE = /^[a-z][a-z0-9_-]{0,63}$/;
 
 /** The d1 step order: the status lists steps in the order the sweep runs them. */
@@ -22,6 +23,8 @@ export interface StepView { key: string; provider: string; kind: string; status:
 
 export interface ProvisionReader {
   project(id: string): Promise<{ id: string; stage: string } | null>;
+  /** The dashboard knows a project by its slug; the panel reads this and posts the retry by id. */
+  projectBySlug(slug: string): Promise<{ id: string; stage: string } | null>;
   steps(projectId: string): Promise<StepRow[]>;
   /** Writes the `provision.retry` audit event; false when the project is no longer in `provisioning`. */
   recordRetry(projectId: string): Promise<boolean>;
@@ -59,14 +62,25 @@ export class ProvisionController {
     return { reader: this.svc.reader, sweep: this.svc.sweep };
   }
 
+  private async view(p: { id: string; stage: string } | null) {
+    if (!p) throw httpError(404, "project-not-found");
+    const { reader, sweep } = this.wired();
+    const rows = await reader.steps(p.id).catch(() => { throw httpError(503, "provision-store-failed"); });
+    return { projectId: p.id, stage: p.stage, parked: sweep.isParked(p.id), steps: stepViews(rows) };
+  }
+
   @Get(":id/provision")
   async status(@Param("id") id: string) {
     if (!UUID.test(id)) throw httpError(400, "invalid:id");
-    const { reader, sweep } = this.wired();
-    const p = await reader.project(id).catch(() => { throw httpError(503, "provision-store-failed"); });
-    if (!p) throw httpError(404, "project-not-found");
-    const rows = await reader.steps(id).catch(() => { throw httpError(503, "provision-store-failed"); });
-    return { stage: p.stage, parked: sweep.isParked(id), steps: stepViews(rows) };
+    const { reader } = this.wired();
+    return this.view(await reader.project(id).catch(() => { throw httpError(503, "provision-store-failed"); }));
+  }
+
+  @Get("by-slug/:slug/provision")
+  async statusBySlug(@Param("slug") slug: string) {
+    if (!SLUG.test(slug)) throw httpError(400, "invalid:slug");
+    const { reader } = this.wired();
+    return this.view(await reader.projectBySlug(slug).catch(() => { throw httpError(503, "provision-store-failed"); }));
   }
 
   @Post(":id/provision")
@@ -95,6 +109,11 @@ export class PrismaProvisionReader implements ProvisionReader {
   async project(id: string) {
     const p: { id: string; stage: unknown } | null = await this.tx((tx) => tx.project.findUnique({ where: { id }, select: { id: true, stage: true } }));
     return p ? { id: p.id as string, stage: String(p.stage) } : null;
+  }
+
+  async projectBySlug(slug: string) {
+    const p: { id: string; stage: unknown } | null = await this.tx((tx) => tx.project.findUnique({ where: { slug }, select: { id: true, stage: true } }));
+    return p ? { id: p.id, stage: String(p.stage) } : null;
   }
 
   async steps(projectId: string): Promise<StepRow[]> {
