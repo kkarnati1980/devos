@@ -17,6 +17,7 @@ import { reanswerSettleMs, type RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 import { PrismaIsolationStore } from "./isolation-store.js";
+import { PrismaWatchdogStore, RunnerWatchdogJob, type LinearReader } from "./runner-watchdog-runtime.js";
 import type { ModelRunner } from "@devos/analyst";
 import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
@@ -73,6 +74,8 @@ export interface Runtime {
   analystSweep: AnalystRunSweepJob | null;
   /** S4-a2b: the stack rows GET /internal/isolation-state reads; null without a database. */
   isolation: PrismaIsolationStore | null;
+  /** DEVOS-220: the 30-minute runner watchdog; null without a vault or a Linear loader. main.ts starts it. */
+  runnerWatchdog: RunnerWatchdogJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -98,6 +101,8 @@ export async function buildRuntime(
      * importing the run engine at runtime like @devos/db, so the API typechecks on its own. `apiKey` reads the vault.
      */
     loadAnalystEngine?: (db: DbClient, policy: PolicyEngine, apiKey: () => Promise<string | null>) => Promise<RunExecutor>;
+    /** DEVOS-220: @devos/linear-sync's LinearClient, imported at runtime like @devos/db; `apiKey` reads the vault. */
+    loadLinear?: (apiKey: () => Promise<string>) => Promise<LinearReader>;
   },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
@@ -114,7 +119,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, isolation: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, isolation: null, runnerWatchdog: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -182,7 +187,25 @@ export async function buildRuntime(
   const analystSweep = new AnalystRunSweepJob(new PrismaAnalystRunSweeper(db as unknown as AnalystRowsDb, t), (e) => stdoutSink({ ts: new Date().toISOString(), ...e }));
   // S4-a2b: the read side of GET /internal/isolation-state (and, in the M2.4-d wiring, the afterStack hook store).
   const isolation = new PrismaIsolationStore(db, t);
-  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation };
+  // DEVOS-220: the runner watchdog reads Linear with the H8 key from the vault (by name, at call time) and alerts
+  // through M1.6. It only reads Linear. Without a vault or a Linear loader it is off.
+  // A Linear client that cannot be loaded turns the watchdog off (logged) and never stops the API (pre-review L2).
+  const linear = vault && opts.loadLinear
+    ? await opts.loadLinear(async () => {
+        const key = await vault.reveal("linear_api_key");
+        if (!key) throw new Error("linear-key-not-set");
+        return key;
+      }).catch(() => { stdoutSink({ ts: new Date().toISOString(), level: "warn", msg: "runner-watchdog-linear-load-failed" }); return null; })
+    : null;
+  const runnerWatchdog = linear
+    ? new RunnerWatchdogJob({
+        linear,
+        store: new PrismaWatchdogStore(db, t),
+        notify: (n) => notifier.notify(n),
+        log: (e) => stdoutSink({ ts: new Date().toISOString(), ...e }),
+      })
+    : null;
+  return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, runnerWatchdog };
 }
 
 /**
