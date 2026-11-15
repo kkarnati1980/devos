@@ -55,3 +55,18 @@ test("d3a budget record: the move to building writes one provision.budget_record
   await rows.markBuilding(intake.id);
   assert.equal((await budget(intake.id)).length, 0, "no move, no record");
 });
+
+test("d3a budget record: a failed audit insert rolls the move back, so the project stays in provisioning (pre-review L2)", async () => {
+  const p = await mk({ stage: "provisioning", capUsd: "10" });
+  // The real transaction, with an audit insert that fails after the stage update has run inside it.
+  const failing = {
+    $transaction: (fn, o) => db.$transaction((tx) => fn(new Proxy(tx, {
+      get: (t, k) => (k === "auditEvent" ? { create: async () => { throw new Error("audit-insert-failed"); } } : t[k]),
+    })), o),
+  };
+  await assert.rejects(new PrismaProvisioningRows(failing, 5000).markBuilding(p.id), /audit-insert-failed/);
+  assert.equal(await stage(p.id), "provisioning", "the move to building is rolled back with its audit row");
+  assert.equal(await db.auditEvent.count({ where: { projectId: p.id, action: "provision.budget_recorded" } }), 0);
+  await new PrismaProvisioningRows(db, 5000).markBuilding(p.id);
+  assert.equal(await stage(p.id), "building", "the next tick moves it");
+});
