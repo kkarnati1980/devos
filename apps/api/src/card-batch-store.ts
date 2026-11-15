@@ -196,6 +196,17 @@ export class PrismaQueueStore implements QueueStore {
     });
   }
 
+  /** Codex PR135-r3: the final rows stored for one card, so a replayed apply returns what the winner recorded. */
+  finalRows(approvalId: string) {
+    return this.tx(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(
+        "SELECT project_id, item_id, text, answer, source, approval_id FROM project_decision WHERE approval_id = $1::uuid ORDER BY item_id LIMIT 1000",
+        approvalId,
+      );
+      return rows.map((r: any): DecisionRow => ({ projectId: r.project_id, itemId: r.item_id, text: r.text, answer: r.answer, source: r.source, approvalId: r.approval_id }));
+    });
+  }
+
   async markSettled(batchId: string, now: Date) {
     await this.tx((tx) => tx.$queryRawUnsafe("UPDATE card_batch SET settled_at = $2 WHERE id = $1::uuid AND applied_at IS NOT NULL AND settled_at IS NULL", batchId, now));
   }
