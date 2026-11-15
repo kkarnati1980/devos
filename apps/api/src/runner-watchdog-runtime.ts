@@ -109,8 +109,8 @@ export interface RunnerWatchdogDeps {
 
 /**
  * The 30-minute job. A tick reads Linear, loads the state, runs the core, sends its notices, then saves the state.
- * If a notice cannot be sent (the notifier throws), the state is not saved, so the next tick tries again; nothing
- * is sent twice for a tick whose state was saved. A state that cannot be loaded or saved skips the tick (logged).
+ * The state is saved before any notice is sent, so a notice goes out at most once (Codex PR139-r1); a send that fails
+ * is logged and not retried. A state that cannot be loaded or saved skips the tick and sends nothing (logged).
  * Ticks never overlap. `lastRunAt` is the time of the last tick that saved its state (the /health heartbeat).
  */
 export class RunnerWatchdogJob {
@@ -137,6 +137,16 @@ export class RunnerWatchdogJob {
         return false;
       }
       const r = step(obs, state, nowMs);
+      // At most once (Codex PR139-r1, ADR-0011 §9, M1.6): a delivery is not idempotent, and Notifier.notify can
+      // deliver and then throw while recording the outcome. So the state that records the alert is saved first, and
+      // a notice is sent only after that save succeeds. A failed send is logged and never retried; the core's own
+      // repeat window (6 hours) brings the alert back if the silence lasts.
+      try {
+        await this.d.store.save(r.state);
+      } catch {
+        this.d.log({ level: "warn", msg: "runner-watchdog-state-save-failed" });
+        return false;
+      }
       for (const n of r.notices) {
         try {
           await this.d.notify(n);
@@ -144,14 +154,7 @@ export class RunnerWatchdogJob {
           // NoticeError and the store error carry fixed codes; anything else is reported as one code, never its text.
           const code = e instanceof Error && NOTIFY_CODES.test(e.message) ? e.message : "notify-failed";
           this.d.log({ level: "warn", msg: "runner-watchdog-notify-failed", code });
-          return false;
         }
-      }
-      try {
-        await this.d.store.save(r.state);
-      } catch {
-        this.d.log({ level: "warn", msg: "runner-watchdog-state-save-failed" });
-        return false;
       }
       this.lastRunAt = r.state.lastRunAt;
       watchdogHeartbeat.lastRunAt = r.state.lastRunAt;

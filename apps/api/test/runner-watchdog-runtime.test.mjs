@@ -85,25 +85,33 @@ test("a tick sends the core's notices, then saves the state and the heartbeat; t
   assert.equal(sent.length, 1, "6-hour limit holds across ticks through the store");
 });
 
-test("a failed send saves nothing, so the next tick sends again; a store failure skips the tick", async () => {
+test("at most once (Codex PR139-r1): the state is saved before sending, a failed send is not retried, a failed save sends nothing", async () => {
   const now = { t: T0 + 125 * MIN };
-  let fail = true;
-  const sent = [];
-  const { j, store, lines } = job({ logs: { "DEVOS-75": [c(T0)], "DEVOS-89": [c(T0)] }, now, notify: async (n) => { if (fail) throw new Error("notifications-store-error"); sent.push(n); } });
-  assert.equal(await j.tick(), false);
-  assert.deepEqual(store.state, EMPTY_STATE);
-  assert.ok(lines.some((l) => l.includes("runner-watchdog-notify-failed") && l.includes("notifications-store-error")));
-  fail = false;
-  now.t += 30 * MIN;
+  let calls = 0;
+  const { j, store, lines } = job({ logs: { "DEVOS-75": [c(T0)], "DEVOS-89": [c(T0)] }, now, notify: async () => { calls++; throw new Error("notifications-store-error"); } });
   assert.equal(await j.tick(), true);
-  assert.equal(sent.length, 1);
+  assert.equal(calls, 1);
+  assert.equal(store.state.silentAlertAt, new Date(now.t).toISOString(), "the alert is recorded before the send");
+  assert.ok(lines.some((l) => l.includes("runner-watchdog-notify-failed") && l.includes("notifications-store-error")));
+  now.t += 30 * MIN;
+  await j.tick();
+  assert.equal(calls, 1, "a send that may have delivered is never repeated by the next tick");
 
-  const broken = { load: async () => { throw new Error("db down: postgres://user:pw@host"); }, save: async () => {} };
-  const b = job({ logs: { "DEVOS-75": [c(T0)], "DEVOS-89": [c(T0)] }, now, store: broken });
+  // A store that cannot save sends nothing at all.
+  const sent = [];
+  const noSave = { load: async () => ({ ...EMPTY_STATE }), save: async () => { throw new Error("db down: postgres://user:pw@host"); } };
+  const b = job({ logs: { "DEVOS-75": [c(T0)], "DEVOS-89": [c(T0)] }, now, store: noSave, notify: async (n) => { sent.push(n); } });
   assert.equal(await b.j.tick(), false);
-  assert.deepEqual(b.sent, []);
-  assert.ok(b.lines.some((l) => l.includes("runner-watchdog-state-load-failed")));
-  assert.equal(b.lines.join("\n").includes("postgres://"), false);
+  assert.deepEqual(sent, []);
+  assert.ok(b.lines.some((l) => l.includes("runner-watchdog-state-save-failed")));
+
+  // A store that cannot load skips the tick.
+  const broken = { load: async () => { throw new Error("db down: postgres://user:pw@host"); }, save: async () => {} };
+  const d = job({ logs: { "DEVOS-75": [c(T0)], "DEVOS-89": [c(T0)] }, now, store: broken });
+  assert.equal(await d.j.tick(), false);
+  assert.deepEqual(d.sent, []);
+  assert.ok(d.lines.some((l) => l.includes("runner-watchdog-state-load-failed")));
+  assert.equal([...b.lines, ...d.lines].join("\n").includes("postgres://"), false);
 });
 
 test("ticks never overlap", async () => {
