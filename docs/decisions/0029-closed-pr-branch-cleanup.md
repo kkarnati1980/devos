@@ -13,7 +13,7 @@
 4. **Token.** `permissions: {}` at the top, and the one job gets `contents: write` (the delete) and `pull-requests: write` (the comment KK asked for in item 3 needs it; `contents: write` alone cannot comment). No other secret.
 5. **ADR-0011 / D7.** `actions/checkout` pinned to the same full SHA as the other workflows (v5.1.0); job timeout 3 minutes; a 10-second timeout on every REST call; no retries (a delete is not safe to repeat blindly, and a failed read only stops the run).
 6. **Comment.** After a delete: "Branch deleted automatically because this PR was closed without merging. Use 'Restore branch' above to bring it back."
-7. **Backlog, list only.** `node scripts/ci/cleanup-closed-pr-branch.mjs --list-backlog` (with `GITHUB_REPOSITORY` and `GITHUB_TOKEN`) lists the existing `kishore/devos-*` branches of closed, unmerged PRs that no open PR uses. It deletes nothing. The list goes on DEVOS-197; deleting it needs KK's separate "go" after he has seen it.
+7. **Backlog, list only.** `node scripts/ci/cleanup-closed-pr-branch.mjs --list-backlog` (with `GITHUB_REPOSITORY` and `GITHUB_TOKEN`) lists the existing `kishore/devos-*` branches of closed, unmerged PRs that no open PR uses as its head or its base (Codex PR168-r1). It deletes nothing. The list goes on DEVOS-197; deleting it needs KK's separate "go" after he has seen it.
 
 ## Consequences
 - A time-of-check window of milliseconds remains between the reads and the delete (a new PR or protection added in between is not seen); a protection added in that window makes GitHub refuse the delete, which fails the run.

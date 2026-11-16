@@ -143,8 +143,8 @@ export async function cleanup({ event, repo, api, log = () => {} }) {
 }
 
 /**
- * List only (decision 5): the branches that still exist and belong to closed, unmerged PRs with the runners' prefix.
- * Deletes nothing. Returns `[{ pr, branch, closedAt }]`, newest first.
+ * List only (decision 5): the branches that still exist and belong to closed, unmerged PRs with the runners' prefix,
+ * leaving out any branch an open PR uses as its head or its base. Deletes nothing. Returns `[{ pr, branch, closedAt }]`, newest first.
  */
 export async function listBacklog({ repo, api }) {
   const branches = new Set();
@@ -162,7 +162,8 @@ export async function listBacklog({ repo, api }) {
     if (r.status !== 200 || !Array.isArray(r.body)) throw new CleanupError(`list PRs: HTTP ${r.status}`);
     for (const p of r.body) {
       const ref = p?.head?.ref;
-      if (p?.state === "open") { open.add(ref); continue; }
+      // Codex PR168-r1: an open PR uses a branch as its head OR its base; deleting a base would close that PR.
+      if (p?.state === "open") { open.add(ref); if (p?.base?.ref) open.add(p.base.ref); continue; }
       if (p?.merged_at || p?.head?.repo?.full_name !== repo || !nameAllowed(ref) || !branches.has(ref) || seen.has(ref)) continue;
       seen.add(ref);
       out.push({ pr: p.number, branch: ref, closedAt: p.closed_at });

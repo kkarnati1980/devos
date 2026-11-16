@@ -198,9 +198,9 @@ test("makeApi sends the token, a timeout signal and JSON; maps a timeout to a Cl
   assert.throws(() => makeApi({ token: "" }), /GITHUB_TOKEN/);
 });
 
-test("listBacklog lists only existing kishore/devos-* branches of closed, unmerged, non-fork PRs and deletes nothing", async () => {
+test("listBacklog lists only existing kishore/devos-* branches of closed, unmerged, non-fork PRs that no open PR uses as head or base, and deletes nothing", async () => {
   const { api, calls } = fakeApi({
-    [`GET /repos/${REPO}/branches?per_page=100&page=1`]: { status: 200, body: [{ name: "main" }, { name: "kishore/devos-1-a" }, { name: "kishore/devos-2-b" }, { name: "kishore/devos-3-c" }, { name: "kishore/devos-5-e" }] },
+    [`GET /repos/${REPO}/branches?per_page=100&page=1`]: { status: 200, body: [{ name: "main" }, { name: "kishore/devos-1-a" }, { name: "kishore/devos-2-b" }, { name: "kishore/devos-3-c" }, { name: "kishore/devos-5-e" }, { name: "kishore/devos-7-g" }] },
     [`GET /repos/${REPO}/pulls?state=all&per_page=100&page=1`]: { status: 200, body: [
       { number: 1, state: "closed", merged_at: null, closed_at: "t1", head: { ref: "kishore/devos-1-a", repo: { full_name: REPO } } },
       { number: 2, state: "closed", merged_at: "t", head: { ref: "kishore/devos-2-b", repo: { full_name: REPO } } },
@@ -208,6 +208,9 @@ test("listBacklog lists only existing kishore/devos-* branches of closed, unmerg
       { number: 4, state: "closed", merged_at: null, head: { ref: "kishore/devos-4-gone", repo: { full_name: REPO } } },
       { number: 5, state: "closed", merged_at: null, head: { ref: "kishore/devos-5-e", repo: { full_name: REPO } } },
       { number: 6, state: "open", head: { ref: "kishore/devos-5-e", repo: { full_name: REPO } } },
+      { number: 7, state: "closed", merged_at: null, head: { ref: "kishore/devos-7-g", repo: { full_name: REPO } } },
+      // Codex PR168-r1: an open PR that targets kishore/devos-7-g as its base keeps that branch off the list
+      { number: 8, state: "open", head: { ref: "kishore/devos-8-h", repo: { full_name: REPO } }, base: { ref: "kishore/devos-7-g" } },
     ] },
   });
   const list = await listBacklog({ repo: REPO, api });
