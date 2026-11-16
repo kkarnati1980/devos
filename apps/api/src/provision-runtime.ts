@@ -123,11 +123,21 @@ export interface ProvisionWiring {
   env: NodeJS.ProcessEnv;
 }
 
+/** The provisioner for one project at a time: its step list, store and policy check (M2.4-d3b reuses it for the AT13 probe). */
+export interface Provisioner {
+  store: Store;
+  steps(p: ProvisioningProject): Step[];
+  /** Runs every step for `p` under its lock, with M1.7 on every create. Throws the runner's StepError on a stop. */
+  run(p: ProvisioningProject): Promise<unknown>;
+  /** Both provider tokens are in the vault (read by name, never logged), or a fixed code. */
+  ready(): Promise<string | null>;
+}
+
 /**
- * The provisioning sweep, or `{ off }` with a fixed code: no vault, or a missing setting. It never runs with
+ * The provisioner, or `{ off }` with a fixed code: no vault, or a missing setting. It never runs with
  * `allowAll` (fail closed, ADR-0006); every create goes through the policy engine.
  */
-export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { off: string } {
+export function buildProvisioner(w: ProvisionWiring): Provisioner | { off: string } {
   if (!w.vault) return { off: "provision-vault-not-configured" };
   const cfg = provisionConfig(w.env);
   if ("off" in cfg) return cfg;
@@ -158,17 +168,29 @@ export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { o
       mod.backupScheduleStep(store, p),
     ];
   };
-  return new ProvisionSweepJob({
-    listProvisioning: (exclude) => w.rows.listProvisioning(exclude),
-    provision: (p) => mod.runProvision(p.id, steps(p), { store, authorize: policyAuthorizer(w.policy, p.id) }),
-    markBuilding: (id) => w.rows.markBuilding(id),
+  return {
+    store,
+    steps,
+    run: (p) => mod.runProvision(p.id, steps(p), { store, authorize: policyAuthorizer(w.policy, p.id) }),
     // Both provider tokens must be in the vault before any project runs: a missing one would otherwise be a
-    // non-retryable provider_error and park the project (pre-review M1). Read by name, never logged.
+    // non-retryable provider_error and park the project (pre-review M1).
     ready: async () => {
       if (!(await vault.reveal("github_token"))) return "provision-github-token-not-set";
       if (!(await vault.reveal("coolify_api_token"))) return "provision-coolify-token-not-set";
       return null;
     },
+  };
+}
+
+/** The provisioning sweep over every live `provisioning` project, or `{ off }` with a fixed code. */
+export function buildProvisionSweep(w: ProvisionWiring): ProvisionSweepJob | { off: string } {
+  const pv = buildProvisioner(w);
+  if ("off" in pv) return pv;
+  return new ProvisionSweepJob({
+    listProvisioning: (exclude) => w.rows.listProvisioning(exclude),
+    provision: (p) => pv.run(p),
+    markBuilding: (id) => w.rows.markBuilding(id),
+    ready: () => pv.ready(),
     raiseNameConflict: async (p, step) => { await w.raiseCard(nameConflictCard(p, step)); },
     log: w.log,
   });

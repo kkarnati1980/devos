@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Release merge path v1.1.0 (DEVOS-143, gate integrity Part 3; contract docs/modules/GI-3.md).
+// Release merge path v1.2.0 (DEVOS-143, gate integrity Part 3; contract docs/modules/GI-3.md).
 // v1.1.0 (DEVOS-149, GI-1b; contract docs/modules/GI-1b.md): floor guard required; a failing floor guard is
 // accepted only with valid Codex Keeps for that SHA; a PR touching a guard path needs a PASS naming the change.
+// v1.2.0 (DEVOS-239, GI-1e): a KK-only hit is accepted with exactly one KK "keep" record for that occurrence and SHA.
 // The ONE way a runner merges a PR into main. It merges only when every stored result is green for the
 // PR's CURRENT head SHA, and pins the merge to that SHA, so any commit after the review voids the PASS (GC5).
 //
@@ -17,6 +18,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { GUARD_PATHS } from "../floor-guard/floor-guard.mjs";
 import { KK_ONLY } from "../gates/kk-only.mjs";
+import { answersFor, kkKeepProblem } from "./kk-answers.mjs";
 
 export const DEFAULT_CONFIG = JSON.parse(readFileSync(new URL("./required-checks.json", import.meta.url), "utf8"));
 const OK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
@@ -249,11 +251,12 @@ export function codexPass(statuses, pr, config = DEFAULT_CONFIG) {
 
 /**
  * GI-1b step 2b, shared with ci-gate (GI-1d): guard-path changes must be named by the PASS, and a failed floor
- * guard is disposed of only when every hit of the re-run on this SHA has a valid Codex Keep and none is KK-only.
+ * guard is disposed of only when every hit of the re-run on this SHA has a valid Codex Keep, or, for a KK-only hit,
+ * exactly one KK "keep" record for that occurrence and SHA (`kkAnswers`, DEVOS-239; shape in ./kk-answers.mjs).
  * `mainSha` is the base to re-run against, or a function that reads it (called at most once).
  * @returns {Promise<{ reasons: string[], disposed: boolean, mainSha: string | null }>}
  */
-export async function judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles, floorGuardFailed, otherFloorGuardRed, mainSha: base, guardReport = localGuardReport, config = DEFAULT_CONFIG }) {
+export async function judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles, floorGuardFailed, otherFloorGuardRed, mainSha: base, guardReport = localGuardReport, config = DEFAULT_CONFIG, kkAnswers = [] }) {
   const reasons = [];
   let mainSha = typeof base === "string" ? base : null;
   const readMain = async () => (mainSha ??= await base());
@@ -277,10 +280,24 @@ export async function judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFil
         else if (report.hits.length === 0) reasons.push(`floor guard failed in CI on ${sha.slice(0, 7)} but finds no hit on a re-run; re-run the check, a red check is never set aside without a hit`);
         else {
           const d = applyDispositions(report, { sha, source: "codex", text: verdictText });
-          const kk = report.hits.filter(notKeepable);
-          for (const h of kk) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} cannot be kept by Codex: restore it or escalate to KK (spec §4.4/§4.5)`);
-          for (const h of d.open) if (!kk.includes(h)) reasons.push(`floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line} has no "FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} <reason>" in the PASS for ${sha.slice(0, 7)}`);
-          if (d.exit === 0 && kk.length === 0) disposed = true;
+          const before = reasons.length;
+          if (d.exit !== 0 && d.exit !== 1) reasons.push(`floor-guard dispositions could not be applied on ${sha.slice(0, 7)}`);
+          // Open hits are matched by occurrence, never by object identity, so a copy that returns cloned hits still refuses.
+          const isOpen = (h) => !Array.isArray(d.open) || d.open.some((o) => o?.id === h.id && o?.file === h.file && o?.line === h.line);
+          for (const h of report.hits) {
+            const where = `floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line}`;
+            if (notKeepable(h)) {
+              // DEVOS-239: only KK's one recorded "keep" for this occurrence and SHA clears a KK-only hit.
+              const why = kkKeepProblem(kkAnswers, h, sha);
+              if (why) reasons.push(`${where} cannot be kept by Codex and ${why}: restore it or escalate to KK (spec §4.4/§4.5)`);
+            } else if (answersFor(kkAnswers, h, sha).length && kkKeepProblem(kkAnswers, h, sha)) {
+              // As in the gate evaluator: any KK record other than one keep (restore, conflicting) overrides a Codex Keep.
+              reasons.push(`${where}: ${kkKeepProblem(kkAnswers, h, sha)}; KK's answer overrides a Codex Keep`);
+            } else if (isOpen(h)) {
+              reasons.push(`${where} has no "FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} <reason>" in the PASS for ${sha.slice(0, 7)}`);
+            }
+          }
+          if (reasons.length === before) disposed = true;
         }
       }
     }
@@ -289,7 +306,7 @@ export async function judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFil
 }
 
 // Reads every stored result for the PR's current head and returns { ok, sha, reasons[] }. Never merges.
-export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardReport = localGuardReport }) {
+export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardReport = localGuardReport, kkAnswers = [] }) {
   const reasons = [];
   const p = await gh.get(`/repos/${repo}/pulls/${pr}`);
   const sha = p?.head?.sha;
@@ -330,7 +347,7 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
   const fg = config.floorGuard;
   const fgFailed = fg ? red.filter((x) => x.check === fg.check && x.failed) : [];
   const otherFgRed = fg ? red.filter((x) => (x.check === fg.check || x.path === fg.workflowPath) && !x.failed) : [];
-  const judged = await judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles: p.changed_files, floorGuardFailed: fgFailed.length > 0, otherFloorGuardRed: otherFgRed.length > 0, mainSha: () => mainHead(gh, repo, config), guardReport, config });
+  const judged = await judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles: p.changed_files, floorGuardFailed: fgFailed.length > 0, otherFloorGuardRed: otherFgRed.length > 0, mainSha: () => mainHead(gh, repo, config), guardReport, config, kkAnswers });
   reasons.push(...judged.reasons);
   const disposed = judged.disposed;
   let mainSha = judged.mainSha; // read once: the guard re-run and the compare in step 3 judge the same main
@@ -351,8 +368,8 @@ export async function evaluate(gh, { repo, pr, config = DEFAULT_CONFIG, guardRep
 }
 
 // The Release path: evaluate, then merge pinned to the evaluated SHA. GitHub refuses (409) if the head moved.
-export async function release(gh, { repo, pr, dryRun = false, config = DEFAULT_CONFIG, log = () => {}, guardReport }) {
-  const v = await evaluate(gh, { repo, pr, config, ...(guardReport ? { guardReport } : {}) });
+export async function release(gh, { repo, pr, dryRun = false, config = DEFAULT_CONFIG, log = () => {}, guardReport, kkAnswers = [] }) {
+  const v = await evaluate(gh, { repo, pr, config, kkAnswers, ...(guardReport ? { guardReport } : {}) });
   if (!v.ok) {
     log(`REFUSED PR #${pr} at ${v.sha.slice(0, 7)}:`);
     for (const r of v.reasons) log(`  - ${r}`);
