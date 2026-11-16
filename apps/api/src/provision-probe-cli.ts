@@ -148,7 +148,9 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main(process.env).then(
-    (r) => { process.stdout.write(`${JSON.stringify(r.out)}\n`); process.exitCode = r.code; },
-    (e) => { process.stdout.write(`${JSON.stringify({ error: errorCode(e) })}\n`); process.exitCode = 1; },
+    // Codex PR167-r2: exit once the line is written, so a provider read cut off by a budget (still retrying in the
+    // background) never keeps the process past the agent's check limit.
+    (r) => { process.stdout.write(`${JSON.stringify(r.out)}\n`, () => process.exit(r.code)); },
+    (e) => { process.stdout.write(`${JSON.stringify({ error: errorCode(e) })}\n`, () => process.exit(1)); },
   );
 }

@@ -281,3 +281,15 @@ test("Codex PR167-r1: a Compose read that crosses the deadline starts no later G
   assert.ok(out.includes("compose-unreadable:preview"));
   for (const c of out) assert.match(c, /-unreadable(:|$)|^more-\d+$/);
 });
+
+test("Codex PR167-r2: a read that never answers (a transport still retrying) is cut off at the deadline", async () => {
+  const w = world();
+  const hang = { get: () => new Promise(() => {}) };
+  w.mod.pinnedCoolify = async () => ({ http: hang });
+  const t0 = Date.now();
+  const out = await probeLiveAsserts({ mod: w.mod, gh: "GH", cf: "CF", projectId: PID, steps: async () => steps(), budgetMs: 150 });
+  const took = Date.now() - t0;
+  assert.ok(took < 1000, `took ${took} ms`);
+  // GitHub answered at once; every Coolify read was cut off or refused.
+  assert.deepEqual(out, ["app-unreadable:preview", "app-unreadable:production", "env-unreadable:preview", "env-unreadable:production"]);
+});

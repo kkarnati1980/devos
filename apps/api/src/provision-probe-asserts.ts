@@ -123,11 +123,22 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
   const late = () => now() >= deadline;
   const steps = await d.steps();
   // Codex PR167-r1: the budget is checked at every GET, including the ones inside `CoreRepo` (tree, blob), so no read
-  // starts after the deadline; a refused read throws, and its check reports `*-unreadable`.
+  // starts after the deadline. Codex PR167-r2: a read already started is cut off at the deadline too (the transport's
+  // own retries can outlast it); the GET left behind is read-only and ends with the process (the CLI exits at once).
+  // A refused or cut-off read throws, and its check reports `*-unreadable`.
   const budgeted = (h: ReadHttp): ReadHttp => ({
     get: async <T>(path: string) => {
-      if (late()) throw new Error("probe-assert-budget");
-      return h.get<T>(path);
+      const left = deadline - now();
+      if (left <= 0) throw new Error("probe-assert-budget");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cut = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("probe-assert-budget")), left);
+      });
+      try {
+        return await Promise.race([h.get<T>(path), cut]);
+      } finally {
+        clearTimeout(timer);
+      }
     },
   });
   const gh = budgeted((await d.mod.pinnedGitHub(d.gh)).http);
