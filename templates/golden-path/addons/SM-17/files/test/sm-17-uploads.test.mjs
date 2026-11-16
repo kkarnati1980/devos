@@ -3,7 +3,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, rmSync, statSync, readdirSync, mkdirSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync, readdirSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { checkUpload, createStore, readBody, sniffType, UploadError } from "../src/uploads.mjs";
@@ -86,13 +86,21 @@ test("SM-17-L1 storage: names are random, never the user's, and the folder is ou
   assert.throws(() => store.read("b".repeat(32) + ".png"), code("not-found"), "a well-formed name that was never stored");
   // The store refuses a folder inside the web root, the web root itself, a link into it, and a relative path.
   assert.throws(() => createStore({ dir: join(web, "uploads"), webRoot: web }), TypeError);
+  assert.deepEqual(readdirSync(web), [], "a refused folder is not created under the web root");
   assert.throws(() => createStore({ dir: web, webRoot: web }), TypeError);
   symlinkSync(web, join(root, "link-to-web"));
   assert.throws(() => createStore({ dir: join(root, "link-to-web", "up"), webRoot: web }), TypeError);
+  assert.deepEqual(readdirSync(web), [], "nor through a link");
   assert.throws(() => createStore({ dir: "data/uploads", webRoot: web }), TypeError);
   assert.throws(() => createStore({ dir: join(web, "..x"), webRoot: web }), TypeError, "a folder inside whose name starts with ..");
   assert.ok(createStore({ dir: join(app, "uploads"), webRoot: web }), "a sibling of the web root is fine");
-  // save() takes only bytes that checkUpload passed.
+  // An existing folder is tightened to owner-only.
+  const open = join(root, "open"); mkdirSync(open, { mode: 0o777 }); chmodSync(open, 0o777);
+  createStore({ dir: open, webRoot: web });
+  assert.equal(statSync(open).mode & 0o077, 0, "an existing upload folder is made owner-only");
+  // The stored extension comes from the sniffed type, never from the caller.
+  assert.match(store.save(PNG, { type: "png", ext: "pdf", size: PNG.length }), /\.png$/);
+  // save() refuses bytes whose type or size do not match the check passed with them.
   assert.throws(() => store.save(ELF, { type: "png", ext: "png", size: ELF.length }), TypeError);
   assert.throws(() => store.save(PNG), TypeError);
 });

@@ -2,8 +2,8 @@
 // SM-17-L1: a renamed binary is rejected; an oversize file is rejected; stored names are random and outside the
 // web root.
 import { randomBytes } from "node:crypto";
-import { mkdirSync, realpathSync, writeFileSync, readFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync, readFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export class UploadError extends Error {
   constructor(code, message) { super(message); this.name = "UploadError"; this.code = code; }
@@ -66,6 +66,14 @@ export function readBody(req, maxBytes = DEFAULT_MAX_BYTES) {
   });
 }
 
+// The real path of p, resolving links through its nearest existing ancestor, without creating anything.
+function realOf(p) {
+  const rest = [];
+  let cur = resolve(p);
+  while (!existsSync(cur)) { rest.unshift(basename(cur)); const up = dirname(cur); if (up === cur) break; cur = up; }
+  return join(realpathSync.native(cur), ...rest);
+}
+
 const ID = /^[0-9a-f]{32}\.(png|jpg|gif|webp|pdf)$/;
 
 /**
@@ -76,12 +84,18 @@ const ID = /^[0-9a-f]{32}\.(png|jpg|gif|webp|pdf)$/;
  */
 export function createStore({ dir, webRoot = resolve("public") } = {}) {
   if (typeof dir !== "string" || !isAbsolute(dir)) throw new TypeError("createStore: dir must be an absolute path");
+  // Checked before anything is created, so a refused folder is never made under the web root.
+  const web = realOf(webRoot);
+  const check = (p) => {
+    const rel = relative(web, p);
+    const outside = rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);   // "..x" is a folder inside
+    if (!outside) throw new TypeError("createStore: dir must be outside the web root");
+  };
+  check(realOf(dir));
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const real = realpathSync(dir);
-  let web; try { web = realpathSync(webRoot); } catch { web = resolve(webRoot); }
-  const rel = relative(web, real);
-  const outside = rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);   // "..x" is a folder inside
-  if (!outside) throw new TypeError("createStore: dir must be outside the web root");
+  const real = realpathSync.native(dir);
+  check(real);                 // again, now that it exists
+  chmodSync(real, 0o700);      // an existing folder is tightened too
   const path = (id) => {
     if (typeof id !== "string" || !ID.test(id)) throw new UploadError("not-found", "no such file");
     return join(real, id);
@@ -92,7 +106,7 @@ export function createStore({ dir, webRoot = resolve("public") } = {}) {
       if (!checked || !Object.hasOwn(TYPES, checked.type) || checked.size !== bytes.length || sniffType(bytes) !== checked.type) {
         throw new TypeError("save: pass the bytes and the result of checkUpload for them");
       }
-      const id = `${randomBytes(16).toString("hex")}.${checked.ext}`;
+      const id = `${randomBytes(16).toString("hex")}.${TYPES[checked.type].ext}`;   // never the caller's ext
       writeFileSync(path(id), bytes, { flag: "wx", mode: 0o600 });
       return id;
     },
