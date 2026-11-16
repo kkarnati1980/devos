@@ -32,6 +32,7 @@ import { PrismaProvisionReader, type ProvisionServices } from "./provision-route
 import type { TeardownServices } from "./teardown-routes.js";
 import { buildTeardownServices, buildTeardownSweep, type TeardownRuntimeModule, type TeardownSweepCards } from "./teardown-runtime.js";
 import type { TeardownSweepJob } from "./teardown-sweep.js";
+import { buildLinearSync, type LinearSyncJob, type LinearSyncModule } from "./linear-sync-runtime.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -100,6 +101,8 @@ export interface Runtime {
   teardown: TeardownServices;
   /** DEVOS-245 (M2.5-b2): the purge card and the teardown jobs; null when off (logged `teardown-sweep-off`). */
   teardownSweep: TeardownSweepJob | null;
+  /** DEVOS-163 (M2.6-b2b1): the scheduled Linear sync; null when off (logged `linear-sync-off`). main.ts starts it. */
+  linearSync: LinearSyncJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -134,6 +137,8 @@ export async function buildRuntime(
     loadProvision?: () => Promise<{ mod: ProvisionModule; apply: ProvisionWiring["apply"]; isolationHook: (o: { store: PrismaIsolationStore }) => ProvisionWiring["afterStack"] }>;
     /** DEVOS-244: @devos/teardown, imported at runtime like @devos/provision. Absent or failing → the archive/restore routes answer 503. */
     loadTeardown?: () => Promise<TeardownRuntimeModule>;
+    /** DEVOS-163: @devos/linear-sync for the scheduled sync, imported at runtime. Absent or failing → the sync is off. */
+    loadLinearSync?: () => Promise<LinearSyncModule>;
   },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
@@ -150,7 +155,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null }, teardown: { reader: null, actions: null } as TeardownServices, teardownSweep: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null }, teardown: { reader: null, actions: null } as TeardownServices, teardownSweep: null, linearSync: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -283,8 +288,13 @@ export async function buildRuntime(
   const teardownSweep = "off" in ts ? null : ts;
   // DEVOS-246 (M2.5-b3): the panel's purge card link and KK's early ask go through the same job's card rules.
   const teardownRoutes: TeardownServices = { ...teardown, purge: teardownSweep };
+  // DEVOS-163 (M2.6-b2b1): the 10-minute Linear sync over active projects; off unless DEVOS_LINEAR_SYNC=on.
+  const lsMod = opts.loadLinearSync ? await opts.loadLinearSync().catch(() => null) : null;
+  const ls = buildLinearSync({ mod: lsMod, db, vault, env, log });
+  if ("off" in ls) log({ level: ls.off === "linear-sync-disabled" ? "info" : "warn", msg: "linear-sync-off", code: ls.off });
+  const linearSync = "off" in ls ? null : ls;
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
-    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown: teardownRoutes, teardownSweep };
+    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown: teardownRoutes, teardownSweep, linearSync };
 }
 
 /**
