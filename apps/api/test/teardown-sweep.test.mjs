@@ -28,13 +28,14 @@ const purgeRule = {
 };
 
 function setup({ purgeImpl, purgeTimeoutMs } = {}) {
+    const failDue = { n: 0 };
   let now = T0;
   const kk = new KkSessionRegistry();
   const policyStore = new MemoryPolicyStore({ mode: "enforce", rules: [purgeRule] });
   const engine = new PolicyEngine({ store: policyStore, hmacKey: KEY, now: () => now, verifyKkSession: kk.verify });
   const store = new MemoryApprovalStore();
   const approvals = new Approvals({ store, grants: engine, notifier: null, verifyKkSession: kk.verify, now: () => now });
-  const projects = new Map([[P, { id: P, slug: "acme", stage: "archived", purgeAfter: new Date(T0 - DAY) }]]);
+  const projects = new Map([[P, { id: P, slug: "acme", stage: "archived", archivedAt: new Date(T0 - 31 * DAY), purgeAfter: new Date(T0 - DAY) }]]);
   const counts = { [P]: { github: 2, coolify: 5 } };
   const calls = { purge: [], providerCalls: 0, keep: [] };
   const logs = [];
@@ -49,13 +50,18 @@ function setup({ purgeImpl, purgeTimeoutMs } = {}) {
     return { purged: true, report: { hits: [], errors: [] } };
   };
   const job = new TeardownSweepJob({
-    listDue: async (at, limit) => [...projects.values()].filter((p) => p.stage === "archived" && p.purgeAfter && p.purgeAfter <= at).slice(0, limit).map((p) => ({ ...p })),
+    listDue: async (at, limit) => {
+      if (failDue.n > 0) { failDue.n--; throw new Error("db blip"); }
+      return [...projects.values()].filter((p) => p.stage === "archived" && p.purgeAfter && p.purgeAfter <= at).slice(0, limit).map((p) => ({ ...p }));
+    },
     project: async (id) => (projects.has(id) ? { ...projects.get(id) } : null),
     activeCounts: async (id) => ({ ...(counts[id] ?? {}) }),
     cards: (f) => approvals.store.list(f),
     raise: (c) => approvals.raiseCard(c),
     expire: (ids, reason) => approvals.expireCardsById(ids, reason),
-    usableGrant: async (approvalId, at) => [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses < g.maxUses)?.id ?? null,
+    unspentGrant: async (approvalId, at) => {
+      return [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses === 0)?.id ?? null;
+    },
     purge,
     keepArchived: async (id, from, to, approvalId) => {
       const p = projects.get(id);
@@ -70,7 +76,7 @@ function setup({ purgeImpl, purgeTimeoutMs } = {}) {
   });
   const session = kk.mint("kk@example.com");
   const purgeCards = (status) => approvals.store.list({ action: PURGE_ACTION, limit: 50, ...(status ? { status } : {}) });
-  return { job, approvals, store, engine, policyStore, projects, counts, calls, logs, session, purgeCards, advance: (ms) => (now += ms), now: () => now };
+  return { failDue, job, approvals, store, engine, policyStore, projects, counts, calls, logs, session, purgeCards, advance: (ms) => (now += ms), now: () => now };
 }
 
 const approve = (s, id) => s.approvals.approve(s.session, id, { confirmation: `PURGE project:${P}` });
@@ -218,7 +224,7 @@ test("decision (c): a non-retryable stop raises one plain-language card naming w
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
 });
 
-test("decision (c): leftovers after the purge raise the stop card; a retryable stop waits for the next daily run", async () => {
+test("decision (c): one attempt per approval: a retryable stop never re-runs on the same card; the daily run asks again", async () => {
   let mode = "retry";
   const s = setup({
     purgeImpl: async () => {
@@ -231,13 +237,14 @@ test("decision (c): leftovers after the purge raise the stop card; a retryable s
   await s.approvals.approve(s.session, c.id, { confirmation: `PURGE project:${P}`, maxUses: 3, expiresInHours: 72 });
   await s.job.tick();
   assert.equal(s.calls.purge.length, 1);
-  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-retry" && l.code === "delete_unconfirmed"));
-  s.advance(60 * 60_000);
-  await s.job.tick();
-  assert.equal(s.calls.purge.length, 1, "not before the next daily run");
-  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
-  mode = "leftover";
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-unfinished" && l.code === "delete_unconfirmed"));
   s.advance(DAY);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 1, "the spent card is never run again, even with uses left");
+  const fresh = await s.purgeCards("pending");
+  assert.equal(fresh.length, 1, "the daily run raises a fresh card");
+  mode = "leftover";
+  await approve(s, fresh[0].id);
   await s.job.tick();
   assert.equal(s.calls.purge.length, 2);
   const stops = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 });
@@ -245,14 +252,64 @@ test("decision (c): leftovers after the purge raise the stop card; a retryable s
   assert.match(stops[0].reason, /the leftover check still found resources of this project/);
 });
 
-test("decision (c): the purge has a 10-minute limit; over it is retried by the next daily run", async () => {
+test("pre-review 2: a non-retryable stop on a multi-use grant is never re-run", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("provider_forbidden", false, "403"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await s.approvals.approve(s.session, c.id, { confirmation: `PURGE project:${P}`, maxUses: 3, expiresInHours: 72 });
+  await s.job.tick();
+  s.advance(DAY);
+  await s.job.tick();
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 1);
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
+});
+
+test("pre-review 1: approve, Restore, Archive again → the old card never purges", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await s.approvals.approve(s.session, c.id, { confirmation: `PURGE project:${P}`, expiresInHours: 72 });
+  const p = s.projects.get(P);
+  p.stage = "building";
+  await s.job.tick();
+  s.advance(60_000);
+  p.stage = "archived";
+  p.archivedAt = new Date(s.now());
+  p.purgeAfter = new Date(s.now() + 30 * DAY);
+  await s.job.tick();
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 0);
+  assert.equal(p.stage, "archived");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "card-before-archive"));
+});
+
+test("pre-review 5: a failed daily run is tried again on the next tick", async () => {
+  const s = setup();
+  s.failDue.n = 1;
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0);
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 1);
+});
+
+test("decision (c): the purge has a 10-minute limit; a run that ends after it still reports its outcome", async () => {
   assert.equal(PURGE_TIME_LIMIT_MS, 10 * 60_000);
-  const s = setup({ purgeImpl: () => new Promise(() => {}), purgeTimeoutMs: 20 });
+  const s = setup({
+    purgeImpl: () => new Promise((r) => setTimeout(() => r({ purged: false, report: { hits: [{ provider: "coolify", kind: "application" }], errors: [] } }), 60)),
+    purgeTimeoutMs: 20,
+  });
   await s.job.tick();
   const [c] = await s.purgeCards("pending");
   await approve(s, c.id);
   await s.job.tick();
-  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-retry" && l.code === "teardown-purge-timeout"));
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-timeout"));
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1, "late leftovers still raise the stop card");
   await assert.rejects(withLimit(new Promise(() => {}), 5), (e) => e instanceof PurgeTimeout);
   assert.equal(await withLimit(Promise.resolve(7), 1000), 7);
 });
@@ -271,7 +328,7 @@ test("the daily run starts at 03:10 IST, once per IST day", async () => {
 test("a project not yet past purge_after gets no card; a second due project gets its own", async () => {
   const s = setup();
   s.projects.get(P).purgeAfter = new Date(T0 + DAY);
-  s.projects.set(Q, { id: Q, slug: "beta", stage: "archived", purgeAfter: new Date(T0 - 1) });
+  s.projects.set(Q, { id: Q, slug: "beta", stage: "archived", archivedAt: new Date(T0 - 30 * DAY), purgeAfter: new Date(T0 - 1) });
   await s.job.tick();
   const cards = await s.purgeCards();
   assert.deepEqual(cards.map((c) => c.projectId), [Q]);
@@ -296,4 +353,33 @@ test("wiring: buildTeardownSweep is off, with a code, without its modules, the v
   assert.deepEqual(buildTeardownSweep({ ...mods, vault: { reveal: async () => null } }), { off: "teardown-approvals-off" });
   const off = buildTeardownSweep({ ...mods, vault: { reveal: async () => null }, cards: { list: async () => [], raise: async () => ({}), expire: async () => [] } });
   assert.ok("off" in off && typeof off.off === "string");
+});
+
+test("pre-review 6: the production queries: an unspent grant only, and Keep archived is conditional and audited", async () => {
+  const seen = [];
+  const tx = {
+    approvalGrant: { findMany: async (q) => { seen.push(["grant", q]); return [{ id: "g1", uses: 0, maxUses: 1 }]; } },
+    project: { updateMany: async (q) => { seen.push(["update", q]); return { count: 1 }; } },
+    auditEvent: { create: async (q) => { seen.push(["audit", q]); return {}; } },
+  };
+  const db = { $transaction: async (fn, o) => { seen.push(["tx", o]); return fn(tx); } };
+  class Store { project() { return null; } activeResources() { return []; } }
+  const mod = { GitHubClient: class {}, CoolifyClient: class {} };
+  const job = buildTeardownSweep({
+    mod, td: { PrismaTeardownStore: Store }, db, databaseUrl: "postgresql://x", vault: { reveal: async () => null },
+    policy: { decide: async () => ({ enforcedOutcome: "deny" }) }, cards: { list: async () => [], raise: async () => ({}), expire: async () => [] },
+    env: { DEVOS_GITHUB_OWNER: "acme", DEVOS_COOLIFY_URL: "https://coolify.example.com", DEVOS_COOLIFY_SERVER_UUID: "srv-1", DEVOS_TAILNET_IP: "100.64.0.7", GIT_SHA: "a".repeat(40) }, timeoutMs: 1000, log: () => {},
+  });
+  assert.ok(!("off" in job), JSON.stringify(job.off));
+  const now = new Date(T0);
+  assert.equal(await job.d.unspentGrant("a1", now), "g1");
+  const g = seen.find((x) => x[0] === "grant")[1];
+  assert.deepEqual(g.where, { approvalId: "a1", revokedAt: null, expiresAt: { gt: now }, uses: 0 });
+  const from = new Date(T0), to = new Date(T0 + KEEP_ARCHIVED_MS);
+  assert.equal(await job.d.keepArchived(P, from, to, "a1"), true);
+  assert.deepEqual(seen.find((x) => x[0] === "update")[1], { where: { id: P, stage: "archived", purgeAfter: from }, data: { purgeAfter: to } });
+  const audit = seen.find((x) => x[0] === "audit")[1].data;
+  assert.equal(audit.action, "teardown.keep_archived");
+  assert.equal(audit.details.approvalId, "a1");
+  assert.ok(seen.filter((x) => x[0] === "tx").every((x) => x[1].timeout === 1000 && x[1].maxWait === 1000), "every read bounded");
 });

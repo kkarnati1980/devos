@@ -44,7 +44,12 @@ export interface TeardownProject {
   slug: string;
   stage: string;
   purgeAfter: Date | null;
+  archivedAt: Date | null;
 }
+
+/** A card belongs to the project's current archive only if it was raised at or after `archived_at`. */
+const raisedThisArchive = (c: { createdAt: Date }, p: TeardownProject): boolean =>
+  p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime();
 
 export interface PurgeResultLike {
   purged: boolean;
@@ -63,8 +68,11 @@ export interface TeardownSweepDeps {
   raise(card: ReturnType<typeof purgeCard> | ReturnType<typeof purgeStoppedCard>): Promise<unknown>;
   /** `Approvals.expireCardsById`. */
   expire(ids: readonly string[], reason: string): Promise<string[]>;
-  /** The card's own grant when it is unrevoked, unexpired and has a use left; read-only (nothing is consumed). */
-  usableGrant(approvalId: string, now: Date): Promise<string | null>;
+  /**
+   * The card's own grant when it is unrevoked, unexpired and still unspent (`uses = 0`); read-only. One purge attempt
+   * per approval: the purge's single policy check, before any provider call, spends a use.
+   */
+  unspentGrant(approvalId: string, now: Date): Promise<string | null>;
   /** Purge under the card's grant (teardownWiring + purgeProject); throws `TeardownError` on a stop. */
   purge(projectId: string, grantId: string): Promise<PurgeResultLike>;
   /** `purge_after` from `from` to `to`, only while the project is archived and `purge_after` is still `from`. */
@@ -119,6 +127,7 @@ const STOP_WORDS: Record<string, string> = {
   approval_required: "the approval for this purge was no longer valid",
   policy_denied: "a DevOS rule does not allow this purge",
   leftover: "after deleting, the leftover check still found resources of this project",
+  incomplete: "the purge did not finish",
   "scan-error": "after deleting, the leftover check could not reach every provider",
 };
 
@@ -166,7 +175,11 @@ export class TeardownSweepJob {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private lastDailyDay: string | null = null;
-  /** Approved cards whose purge stopped retryably: tried again only by the next daily run (decision c). */
+  /**
+   * Approved cards whose purge failed before its policy check (the grant is still unspent, so nothing was written at a
+   * provider): tried again by the next daily run, not every tick. In memory only; after a restart one more early try
+   * is harmless for the same reason.
+   */
   private readonly waitForDaily = new Set<string>();
   private readonly now: () => number;
 
@@ -184,20 +197,20 @@ export class TeardownSweepJob {
       await this.step("teardown-restored-pass-failed", () => this.closeRestored());
       await this.step("teardown-keep-pass-failed", () => this.keepArchivedPass());
       await this.step("teardown-approved-pass-failed", () => this.approvedPass());
-      if (daily) {
-        await this.step("teardown-due-pass-failed", () => this.duePass());
-        this.lastDailyDay = day;
-      }
+      // Pre-review 5: a failed daily run is tried again on the next tick, not a day later.
+      if (daily && (await this.step("teardown-due-pass-failed", () => this.duePass()))) this.lastDailyDay = day;
     } finally {
       this.running = false;
     }
   }
 
-  private async step(code: string, fn: () => Promise<void>): Promise<void> {
+  private async step(code: string, fn: () => Promise<void>): Promise<boolean> {
     try {
       await fn();
+      return true;
     } catch {
       this.d.log({ level: "warn", msg: "teardown-sweep-failed", code });
+      return false;
     }
   }
 
@@ -230,51 +243,70 @@ export class TeardownSweepJob {
     }
   }
 
-  /** 3. Decision (c): an approved card with a usable grant runs the purge under that grant. */
+  /**
+   * 3. Decision (c): an approved card runs one purge under its grant, only while that grant is unspent (one attempt
+   * per approval: the policy check before any provider call spends a use, so this survives a restart) and only for the
+   * archive period the card was raised in (pre-review 1: a Restore, then a new Archive, never purges on an old card).
+   */
   private async approvedPass(): Promise<void> {
     const approved = await this.d.cards({ status: "approved", action: PURGE_ACTION, limit: CARD_PAGE });
     const seen = new Set<string>();
     for (const c of approved) {
       const pid = c.projectId;
       if (!pid || c.target !== target(pid) || seen.has(pid) || this.waitForDaily.has(c.id)) continue;
-      const grant = await this.d.usableGrant(c.id, new Date(this.now()));
+      const grant = await this.d.unspentGrant(c.id, new Date(this.now()));
       if (!grant) continue;
-      seen.add(pid);
       const p = await this.d.project(pid);
-      // The card is raised only from Archive's state; a project restored after the approval is KK's newer word.
-      if (!p || p.stage !== "archived") {
-        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: pid, approvalId: c.id, code: p ? `stage-${p.stage}` : "project-missing" });
+      if (!p || !raisedThisArchive(c, p)) {
+        // The card is raised only from Archive's state; a Restore after it is KK's newer word.
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: pid, approvalId: c.id, code: !p ? "project-missing" : p.stage === "archived" ? "card-before-archive" : `stage-${p.stage}` });
         continue;
       }
+      seen.add(pid);
       await this.runPurge(p, c.id, grant);
     }
   }
 
   private async runPurge(p: TeardownProject, approvalId: string, grantId: string): Promise<void> {
+    const run = this.d.purge(p.id, grantId);
     let result: PurgeResultLike;
     try {
-      result = await withLimit(this.d.purge(p.id, grantId), this.d.purgeTimeoutMs ?? PURGE_TIME_LIMIT_MS);
+      result = await withLimit(run, this.d.purgeTimeoutMs ?? PURGE_TIME_LIMIT_MS);
     } catch (e) {
-      const stop = teardownStop(e);
-      if (e instanceof PurgeTimeout || !stop || stop.retryable) {
-        // Retryable (or unknown, or over the limit; the run goes on under the project lock): the next daily run tries
-        // again while the grant has a use left. Only a fixed code is logged, never an error's text.
-        this.waitForDaily.add(approvalId);
-        const code = e instanceof PurgeTimeout ? "teardown-purge-timeout" : stop ? stop.code : "teardown-purge-failed";
-        this.d.log({ level: "warn", msg: "teardown-purge-retry", projectId: p.id, approvalId, code });
+      if (e instanceof PurgeTimeout) {
+        // The run goes on under the project lock; its outcome is still reported when it ends (pre-review 4).
+        this.d.log({ level: "warn", msg: "teardown-purge-timeout", projectId: p.id, approvalId, code: "teardown-purge-timeout" });
+        run.then((r) => this.afterResult(p, approvalId, r), (x) => this.afterError(p, approvalId, grantId, x)).catch(() => undefined);
         return;
       }
-      // A grant with uses left is not run again before the next daily run (whose stop card is then deduped).
-      this.waitForDaily.add(approvalId);
-      this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code: stop.code });
-      await this.raiseStopped(p, stop.code);
+      await this.afterError(p, approvalId, grantId, e);
       return;
     }
-    if (result.purged) {
+    await this.afterResult(p, approvalId, result);
+  }
+
+  private async afterError(p: TeardownProject, approvalId: string, grantId: string, e: unknown): Promise<void> {
+    const stop = teardownStop(e);
+    const code = stop ? stop.code : "teardown-purge-failed";
+    // Only a fixed code is logged, never an error's text (it may quote a provider body).
+    if (stop && !stop.retryable) {
+      this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
+      await this.raiseStopped(p, code);
+      return;
+    }
+    // Retryable or unknown. With the grant spent, more deleting needs a new card (the daily run raises it); with the
+    // grant unspent, nothing was written and the next daily run tries again.
+    this.waitForDaily.add(approvalId);
+    const spent = !(await this.d.unspentGrant(approvalId, new Date(this.now())).catch(() => grantId));
+    this.d.log({ level: "warn", msg: spent ? "teardown-purge-unfinished" : "teardown-purge-retry", projectId: p.id, approvalId, code });
+  }
+
+  private async afterResult(p: TeardownProject, approvalId: string, r: PurgeResultLike): Promise<void> {
+    if (r.purged) {
       this.d.log({ level: "info", msg: "teardown-purged", projectId: p.id, approvalId });
       return;
     }
-    const code = result.report.errors.length ? "scan-error" : "leftover";
+    const code = r.report.errors.length ? "scan-error" : r.report.hits.length ? "leftover" : "incomplete";
     this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
     await this.raiseStopped(p, code);
   }
@@ -303,8 +335,9 @@ export class TeardownSweepJob {
   }
 
   /**
-   * One card per `purge_after` period: none while one is pending, an approved one still has a grant, KK has rejected
-   * one (Keep archived), or a stop card is open; re-raised once after an unanswered (expired) one, then nothing.
+   * One card per `purge_after` period: none while one is pending, an approved one of this archive still has an unspent
+   * grant, KK has rejected one (Keep archived), or a stop card is open; re-raised once after an unanswered (expired)
+   * one, then nothing.
    */
   private async shouldRaise(p: TeardownProject): Promise<boolean> {
     if (p.stage !== "archived" || !p.purgeAfter) return false;
@@ -313,8 +346,8 @@ export class TeardownSweepJob {
     if (cards.some((c) => c.status === "pending")) return false;
     const period = cards.filter((c) => c.createdAt.getTime() >= since);
     if (period.some((c) => c.status === "rejected")) return false;
-    for (const c of cards.filter((x) => x.status === "approved")) {
-      if (await this.d.usableGrant(c.id, new Date(this.now()))) return false;
+    for (const c of cards.filter((x) => x.status === "approved" && raisedThisArchive(x, p))) {
+      if (await this.d.unspentGrant(c.id, new Date(this.now()))) return false;
     }
     const stops = await this.d.cards({ status: "pending", action: PURGE_STOPPED_ACTION, target: target(p.id), limit: 1 });
     if (stops.length) return false;

@@ -147,11 +147,11 @@ export function buildTeardownSweep(w: {
         where: { stage: "archived", purgeAfter: { lte: now } },
         orderBy: [{ purgeAfter: "asc" }, { id: "asc" }],
         take: limit,
-        select: { id: true, slug: true, stage: true, purgeAfter: true },
-      })).then((rows: any[]) => rows.map((p) => ({ id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null }))),
+        select: { id: true, slug: true, stage: true, purgeAfter: true, archivedAt: true },
+      })).then((rows: any[]) => rows.map((p) => ({ id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null, archivedAt: p.archivedAt ?? null }))),
     project: async (id) => {
       const p = await store.project(id);
-      return p ? { id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null } : null;
+      return p ? { id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null, archivedAt: p.archivedAt ?? null } : null;
     },
     activeCounts: async (id) => {
       const out: Record<string, number> = {};
@@ -161,14 +161,14 @@ export function buildTeardownSweep(w: {
     cards: (f) => cards.list(f),
     raise: (card) => cards.raise(card),
     expire: (ids, reason) => cards.expire(ids, reason),
-    usableGrant: async (approvalId, now) => {
+    unspentGrant: async (approvalId, now) => {
       const rows: { id: string; uses: number; maxUses: number }[] = await tx((t) => t.approvalGrant.findMany({
-        where: { approvalId, revokedAt: null, expiresAt: { gt: now } },
+        where: { approvalId, revokedAt: null, expiresAt: { gt: now }, uses: 0 },
         orderBy: [{ expiresAt: "desc" }, { id: "asc" }],
         take: 5,
         select: { id: true, uses: true, maxUses: true },
       }));
-      return rows.find((g) => g.uses < g.maxUses)?.id ?? null;
+      return rows.find((g) => g.uses === 0 && g.maxUses >= 1)?.id ?? null;
     },
     purge: async (projectId, grantId) => {
       const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs });
