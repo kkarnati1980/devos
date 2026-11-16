@@ -19,7 +19,7 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision, teardown, teardownSweep } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision, teardown, teardownSweep, linearSync } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadLinear: async (apiKey) => {
@@ -37,6 +37,11 @@ async function main(): Promise<void> {
       const applyUrl = new URL("../../../scripts/template/apply.mjs", import.meta.url).href;
       const [mod, iso, tpl] = await Promise.all([import(provisionModuleName), import(isolationModuleName), import(applyUrl)]);
       return { mod, apply: tpl.apply, isolationHook: iso.isolationHook };
+    },
+    loadLinearSync: async () => {
+      // DEVOS-163: @devos/linear-sync's client, API and schedule, imported at runtime like @devos/teardown.
+      const linearSyncModuleName = "@devos/linear-sync";
+      return import(linearSyncModuleName);
     },
     loadTeardown: async () => {
       // DEVOS-244: @devos/teardown, imported at runtime like @devos/provision.
@@ -114,9 +119,10 @@ async function main(): Promise<void> {
   // DEVOS-224: provisions approved projects, at start-up and every 60 s.
   provisionSweep?.start();
   teardownSweep?.start();
-  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); teardownSweep?.stop(); isolationServer?.close(); });
-  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); teardownSweep?.stop(); isolationServer?.close(); });
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null, cardBatch: cardBatch !== null, runnerWatchdog: runnerWatchdog !== null, provisionSweep: provisionSweep !== null, teardownSweep: teardownSweep !== null });
+  linearSync?.start();
+  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); teardownSweep?.stop(); void linearSync?.stop(); isolationServer?.close(); });
+  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); teardownSweep?.stop(); void linearSync?.stop(); isolationServer?.close(); });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null, cardBatch: cardBatch !== null, runnerWatchdog: runnerWatchdog !== null, provisionSweep: provisionSweep !== null, teardownSweep: teardownSweep !== null, linearSync: linearSync !== null });
 }
 
 main().catch((e: unknown) => {
