@@ -35,12 +35,13 @@ if (a[0] === "inspect") { const c = Object.values(sc.networks).flatMap((n) => Ob
 if (a[0] === "ps") out(sc.image || "");
 if (a[0] === "run") {
   if (sc.runFails) process.exit(125);
+  const drop = sc.drop || [];
   const prog = fs.readFileSync(0, "utf8");
   if (!prog.includes("net.connect")) process.exit(2);
   const i = a.indexOf("-"); const url = a[i + 1]; const targets = a.slice(i + 2);
   const net = a[a.indexOf("--network") + 1];
   fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ run: { net, url, targets } }) + "\n");
-  const lines = targets.map((t) => t + " " + ((sc.outcomes || {})[net + " " + t] || "timeout"));
+  const lines = targets.filter((t) => !drop.includes(net + " " + t)).map((t) => t + " " + ((sc.outcomes || {})[net + " " + t] || "timeout"));
   lines.push("egress " + ((sc.egress || {})[net] || "blocked"));
   out(lines.join("\n"));
 }
@@ -58,7 +59,7 @@ const base = () => ({
   },
 });
 
-function run(name, scenario, { rules = "", noDocker = false } = {}) {
+function run(name, scenario, { rules = "", noDocker = false, noTailscale = false } = {}) {
   const dir = path.join(tmp, name);
   const bin = path.join(dir, "bin");
   fs.mkdirSync(path.join(dir, "devos/isolation"), { recursive: true });
@@ -67,7 +68,7 @@ function run(name, scenario, { rules = "", noDocker = false } = {}) {
   fs.writeFileSync(path.join(dir, "scenario.json"), JSON.stringify(scenario));
   fs.writeFileSync(path.join(dir, "log"), "");
   if (!noDocker) fs.writeFileSync(path.join(bin, "docker"), FAKE, { mode: 0o755 });
-  fs.writeFileSync(path.join(bin, "ip"), "#!/usr/bin/env bash\necho '5: tailscale0    inet 100.101.102.103/32 scope global tailscale0'\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "ip"), noTailscale ? "#!/usr/bin/env bash\nexit 1\n" : "#!/usr/bin/env bash\necho '5: tailscale0    inet 100.101.102.103/32 scope global tailscale0'\n", { mode: 0o755 });
   for (const t of ["timeout", "bash", "node", "sed", "head", "tr", "grep"]) {
     const real = spawnSync("bash", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
     fs.symlinkSync(real, path.join(bin, t));
@@ -91,7 +92,7 @@ test("pass: AT11 on every devos-p container (not docker0); AT10 from each probe 
   assert.ok(!runs.some((c) => c.includes("devos-p-shop-live")), "a real project's network is never joined");
   const probe = r.calls.filter((c) => c.run).map((c) => c.run);
   const pv = probe.find((p) => p.net === "devos-p-devos-probe-s4-preview");
-  assert.deepEqual(pv.targets, ["10.208.7.1:22", "10.208.7.1:8000", "10.208.7.1:6001", "10.208.7.1:6002", "10.208.7.1:3001", "10.208.7.1:3000", "169.254.169.254:80", "100.101.102.103:443", "10.208.8.2:5432"]);
+  assert.deepEqual(pv.targets, ["10.208.7.1:22", "10.208.7.1:8000", "10.208.7.1:6001", "10.208.7.1:6002", "10.208.7.1:3001", "10.208.7.1:3000", "169.254.169.254:80", "100.101.102.103:443", "10.208.8.2:5432", "1.1.1.1:443"]);
   assert.equal(pv.url, "https://api.github.com/zen");
 });
 
@@ -142,10 +143,49 @@ test("fail: no API image to probe with, or the probe container does not run; ski
   assert.deepEqual([r3.code, r3.out], [3, "skipped: docker not installed"]);
 });
 
-test("a network whose bridge is not devos-p<idx> is not a project network, even with a devos-p name", () => {
+test("a network whose bridge is not devos-p<idx> is not a project network; with one probe network AT10 is incomplete (exit 3)", () => {
   const sc = base();
   sc.networks["devos-p-devos-probe-s4-preview"].bridge = "br-123";
   const r = run("bridge", sc);
+  assert.equal(r.code, 3, r.out);
+  assert.match(r.out, /^skipped: AT10 incomplete \(devos-p-devos-probe-s4-live: no other probe env container to try\)/m);
+  assert.ok(!r.calls.some((c) => Array.isArray(c) && c[0] === "run" && c.includes("devos-p-devos-probe-s4-preview")));
+});
+
+test("declared egress passes with status-200 (no raw 1.1.1.1 target, no note); a target missing from the output fails", () => {
+  const sc = base();
+  sc.egress = { "devos-p-devos-probe-s4-live": "status-200" };
+  const r = run("declared", sc, { rules: '-A DEVOS-ISO-FWD -s 10.208.8.0/24 -m comment --comment "devos-probe-s4/live egress" -j RETURN\n' });
   assert.equal(r.code, 0, r.out);
-  assert.match(r.out, /AT10 passed on 1 probe network\(s\)/);
+  assert.ok(!r.out.includes("note:"), r.out);
+  const live = r.calls.filter((c) => c.run).map((c) => c.run).find((p) => p.net === "devos-p-devos-probe-s4-live");
+  assert.ok(!live.targets.includes("1.1.1.1:443"));
+  const sc2 = base();
+  sc2.drop = ["devos-p-devos-probe-s4-preview 10.208.7.1:6001"];
+  const r2 = run("dropped", sc2);
+  assert.equal(r2.code, 1);
+  assert.ok(r2.out.includes("AT10 devos-p-devos-probe-s4-preview: 10.208.7.1:6001 not probed"), r2.out);
+});
+
+test("undeclared egress: raw TCP to 1.1.1.1:443 that connects fails even when fetch reports blocked", () => {
+  const sc = base();
+  sc.outcomes = { "devos-p-devos-probe-s4-preview 1.1.1.1:443": "open" };
+  const r = run("raw443", sc);
+  assert.equal(r.code, 1);
+  assert.ok(r.out.includes("AT10 devos-p-devos-probe-s4-preview: 1.1.1.1:443 open"), r.out);
+});
+
+test("no tailscale0 IPv4 makes AT10 incomplete (exit 3), not a pass", () => {
+  const r = run("nots", base(), { noTailscale: true });
+  assert.equal(r.code, 3, r.out);
+  assert.match(r.out, /no tailscale0 IPv4/);
+});
+
+test("AT11: no-new-privileges:false fails; the bare and :true forms pass", () => {
+  const sc = base();
+  sc.networks["devos-p-shop-live"].containers.bbbbbbbbbbbb.limits = '250000000 134217728 64 ["no-new-privileges:false"]';
+  sc.networks["devos-p-devos-probe-s4-live"].containers.dddddddddddd.limits = '250000000 134217728 64 ["no-new-privileges"]';
+  const r = run("nnp", sc);
+  assert.equal(r.code, 1);
+  assert.deepEqual(r.out.split("\n").filter((l) => l.startsWith("AT11")), ["AT11 bbbbbbbbbbbb on devos-p-shop-live: no no-new-privileges"]);
 });

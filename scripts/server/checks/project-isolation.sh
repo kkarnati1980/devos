@@ -7,19 +7,22 @@
 #        host's admin and DevOS ports, the metadata address, the other probe env's containers and the host's tailnet
 #        address (each must time out or be unreachable within 3 s; refused or open fails), and one HTTPS GET, which
 #        must fail without declared egress and return 200 with it.
-# Exit 0 pass, 1 fail, 3 skipped (no docker; or AT11 passed and no probe network exists, so AT10 could not run).
+# Exit 0 pass, 1 fail, 3 skipped (no docker; or nothing failed but AT10 could not run in full: no probe network, no
+# tailscale0 IPv4, or no container of the other probe env to try). Undeclared egress is also proved without DNS: raw TCP
+# to 1.1.1.1:443 must time out or be unreachable.
 # Prints at most 10 failure lines and a summary; only addresses, ports and fixed outcomes. Never a secret.
 set -uo pipefail
 DIR="${DEVOS_DIR:-/root/.devos}"
 EX="${ISO_EXEC_SECONDS:-15}"          # each docker call
-RUN_S="${ISO_PROBE_SECONDS:-60}"       # the probe container, whole run
+RUN_S="${ISO_PROBE_SECONDS:-30}"       # the probe container, whole run: connects run in parallel (3 s), then HTTPS (5 s)
 PROBE_SLUG="devos-probe-s4"
 ADMIN_PORTS="22 8000 6001 6002 3001 3000"
 EGRESS_URL="https://api.github.com/zen"
+PUBLIC_IP="1.1.1.1"                    # raw TCP 443 without DNS: proves the firewall, not the resolver, blocks egress
 command -v docker >/dev/null 2>&1 || { echo "skipped: docker not installed"; exit 3; }
 d() { timeout "$EX" docker "$@" 2>/dev/null; }
 IPV4='^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$'
-fails=() checked=0
+fails=() checked=0 incomplete=()
 fail() { fails+=("$1"); }
 
 # --- AT11: limits on every container attached to a devos-p<idx> bridge ------------------------------------------
@@ -38,7 +41,7 @@ for n in "${!bridge_of[@]}"; do
     read -r cpu mem pids sec <<<"$line"
     checked=$((checked + 1))
     [[ "$cpu" =~ ^[1-9][0-9]*$ && "$mem" =~ ^[1-9][0-9]*$ && "$pids" =~ ^[1-9][0-9]*$ ]] || fail "AT11 ${id:0:12} on $n: missing cpu/memory/pids limit"
-    [[ "$sec" == *'"no-new-privileges'* ]] || fail "AT11 ${id:0:12} on $n: no no-new-privileges"
+    [[ "$sec" == *'"no-new-privileges"'* || "$sec" == *'"no-new-privileges:true"'* ]] || fail "AT11 ${id:0:12} on $n: no no-new-privileges"
   done
 done
 
@@ -55,7 +58,7 @@ if (( ${#probe_nets[@]} )); then
   PROG='const net=require("net");const [,,url,...t]=process.argv;
 const tcp=(h,p)=>new Promise(r=>{const s=net.connect({host:h,port:+p});const done=x=>{s.destroy();r(x)};s.setTimeout(3000,()=>done("timeout"));
 s.on("connect",()=>done("open"));s.on("error",e=>done(e.code==="ECONNREFUSED"?"refused":/EHOSTUNREACH|ENETUNREACH|EACCES|EPERM/.test(e.code)?"unreachable":"error"))});
-(async()=>{for(const x of t){const[h,p]=x.split(":");console.log(x+" "+await tcp(h,p))}
+(async()=>{const r=await Promise.all(t.map(x=>{const[h,p]=x.split(":");return tcp(h,p)}));t.forEach((x,i)=>console.log(x+" "+r[i]));
 let e="blocked";try{const r=await fetch(url,{signal:AbortSignal.timeout(5000)});e="status-"+r.status}catch{}console.log("egress "+e)})();'
   for n in "${probe_nets[@]}"; do
     [[ -n "$img" ]] || break
@@ -65,15 +68,18 @@ let e="blocked";try{const r=await fetch(url,{signal:AbortSignal.timeout(5000)});
     targets=()
     for p in $ADMIN_PORTS; do targets+=("$gw:$p"); done
     targets+=("169.254.169.254:80")
-    [[ -n "$ts" ]] && targets+=("$ts:443")
+    if [[ -n "$ts" ]]; then targets+=("$ts:443"); else incomplete+=("$n: no tailscale0 IPv4"); fi
+    dbn=0
     for o in "${probe_nets[@]}"; do
       [[ "$o" == "$n" ]] && continue
       for ip in $(d network inspect --format '{{range .Containers}}{{.IPv4Address}} {{end}}' "$o" | tr ' ' '\n' | sed 's#/.*##' | head -n 5); do
-        [[ "$ip" =~ $IPV4 ]] && targets+=("$ip:5432")
+        [[ "$ip" =~ $IPV4 ]] && { targets+=("$ip:5432"); dbn=$((dbn + 1)); }
       done
     done
+    (( dbn > 0 )) || incomplete+=("$n: no other probe env container to try")
     declared=false
     grep -q -- "--comment \"${PROBE_SLUG}/${env} egress\"" "$DIR/isolation/installed.rules" 2>/dev/null && declared=true
+    [[ "$declared" == true ]] || targets+=("$PUBLIC_IP:443")
     out="$(timeout "$RUN_S" docker run --rm -i --network "$n" --cap-drop ALL --security-opt no-new-privileges:true --read-only \
       --user 65534:65534 --cpus 0.25 --memory 128m --pids-limit 32 --entrypoint node "$img" - "$EGRESS_URL" "${targets[@]}" <<<"$PROG" 2>/dev/null)" \
       || { fail "AT10 $n: the probe container did not run"; continue; }
@@ -99,5 +105,6 @@ if (( ${#fails[@]} )); then
 fi
 [[ "$at10" == ran && -z "${at10_declared:-}" ]] && echo "note: AT10's declared-egress half is not yet testable (no probe stack has declared egress, DEVOS-201)"
 if [[ "$at10" == skipped ]]; then echo "skipped: AT11 passed on $checked container(s); no ${PROBE_SLUG} network, so AT10 did not run"; exit 3; fi
+if (( ${#incomplete[@]} )); then echo "skipped: AT10 incomplete (${incomplete[*]:0:4}); everything probed passed, AT11 on $checked container(s)"; exit 3; fi
 echo "ok: AT11 passed on $checked container(s); AT10 passed on ${#probe_nets[@]} probe network(s)"
 exit 0
