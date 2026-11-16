@@ -164,20 +164,20 @@ test("AT3: Keep archived (reject) moves purge_after by 30 days, once; no purge; 
   assert.equal((await s.purgeCards("pending")).length, 1, "a new card after the new purge_after");
 });
 
-test("decision 1: an unanswered card is re-raised once after it expires (7 days), then nothing happens", async () => {
+test("decision 1: the job itself expires an unanswered card after 7 days and re-raises it once, then nothing happens (Codex PR181-r2)", async () => {
   const s = setup();
   await s.job.tick();
   s.advance(8 * DAY);
-  await s.approvals.expireCards();
   await s.job.tick();
   assert.equal((await s.purgeCards("pending")).length, 1, "re-raised once");
   s.advance(8 * DAY);
-  await s.approvals.expireCards();
   await s.job.tick();
   s.advance(DAY);
   await s.job.tick();
   assert.equal((await s.purgeCards("pending")).length, 0);
-  assert.equal((await s.purgeCards("expired")).length, 2);
+  const expired = await s.purgeCards("expired");
+  assert.equal(expired.length, 2);
+  assert.ok(s.store.audit.some((a) => a.details?.reason === "purge-card-unanswered-7-days" || JSON.stringify(a).includes("purge-card-unanswered-7-days")));
   assert.equal(s.calls.purge.length, 0);
 });
 

@@ -24,6 +24,8 @@ export const CARD_PAGE = 50;
 export const DUE_PAGE = 100;
 /** Decision 1: the card is raised once, then re-raised once after an unanswered one; then nothing happens. */
 export const MAX_UNANSWERED = 2;
+/** Decision 1: a purge card unanswered for 7 days expires (then it is re-raised once). */
+export const PURGE_CARD_WINDOW_MS = 7 * 86_400_000;
 
 const IST_OFFSET_MS = 330 * 60_000;
 const SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -231,16 +233,24 @@ export class TeardownSweepJob {
     }
   }
 
-  /** 1. Restore closes the project's pending purge card, so at most one card is open and only for an archived project. */
+  /**
+   * 1. Restore closes the project's pending purge card, so at most one card is open and only for an archived project;
+   * and a purge card unanswered for 7 days expires (Codex PR181-r2: nothing else in the API ages cards out), so the
+   * daily run can re-raise it once. Only this job's own purge cards are expired here.
+   */
   private async closeRestored(): Promise<void> {
     const pending = await this.d.cards({ status: "pending", action: PURGE_ACTION, limit: CARD_PAGE });
-    const stale: string[] = [];
+    const restored: string[] = [];
+    const unanswered: string[] = [];
+    const cutoff = this.now() - PURGE_CARD_WINDOW_MS;
     for (const c of pending) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
       const p = await this.d.project(c.projectId);
-      if (p && p.stage !== "archived") stale.push(c.id);
+      if (p && p.stage !== "archived") restored.push(c.id);
+      else if (c.createdAt.getTime() <= cutoff) unanswered.push(c.id);
     }
-    if (stale.length) await this.d.expire(stale, "project-not-archived");
+    if (restored.length) await this.d.expire(restored, "project-not-archived");
+    if (unanswered.length) await this.d.expire(unanswered, "purge-card-unanswered-7-days");
   }
 
   /** 2. Decision (d): "Keep archived" on a card raised after `purge_after` moves `purge_after` by 30 days, once. */
