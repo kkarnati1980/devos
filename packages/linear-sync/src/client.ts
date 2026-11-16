@@ -35,6 +35,14 @@ export interface LinearClientOptions {
   now?: () => number;
 }
 
+/** Per-call options. `signal` is the caller's budget: once it aborts, the call stops (no further attempt, no backoff
+ * wait, the request in flight is cancelled) and fails with LinearError("timeout"). DEVOS-97 (M2.6-b2b3 decision 5). */
+export interface LinearCallOptions {
+  signal?: AbortSignal;
+}
+
+const budgetEnded = () => new LinearError("timeout", "Linear call budget ended");
+
 export class LinearClient {
   private pausedUntil = 0;
   private readonly o: Required<Omit<LinearClientOptions, "apiKey">> & { apiKey: LinearClientOptions["apiKey"] };
@@ -48,36 +56,51 @@ export class LinearClient {
   }
 
   /** A read (GraphQL query): retried on network errors, timeouts, 429 and 5xx. */
-  query<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
-    return this.call<T>(query, variables, true);
+  query<T>(query: string, variables: Record<string, unknown> = {}, opts: LinearCallOptions = {}): Promise<T> {
+    return this.call<T>(query, variables, true, opts.signal);
   }
 
   /** A write (GraphQL mutation): never retried; the caller re-reads before trying again. */
-  mutate<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
-    return this.call<T>(query, variables, false);
+  mutate<T>(query: string, variables: Record<string, unknown> = {}, opts: LinearCallOptions = {}): Promise<T> {
+    return this.call<T>(query, variables, false, opts.signal);
   }
 
-  private async call<T>(query: string, variables: Record<string, unknown>, retry: boolean): Promise<T> {
+  private async call<T>(query: string, variables: Record<string, unknown>, retry: boolean, signal?: AbortSignal): Promise<T> {
     const attempts = retry ? this.o.maxAttempts : 1;
     let last: LinearError | undefined;
     for (let i = 0; i < attempts; i++) {
+      if (signal?.aborted) throw budgetEnded();
       if (this.o.now() < this.pausedUntil) {
         throw new LinearError("rate-limited", "Linear rate limit headroom is low; paused", 429, this.pausedUntil - this.o.now());
       }
       try {
-        return await this.once<T>(query, variables);
+        return await this.once<T>(query, variables, signal);
       } catch (e) {
+        if (signal?.aborted) throw budgetEnded();
         last = e instanceof LinearError ? e : new LinearError("network", "request failed");
         const transient = last.code === "network" || last.code === "timeout" || (last.code === "http" && (last.status === 429 || (last.status ?? 0) >= 500));
         if (!retry || !transient || i === attempts - 1) throw last;
         const backoff = this.o.baseDelayMs * 2 ** i;
-        await this.o.sleep(Math.max(last.retryAfterMs ?? 0, backoff / 2 + Math.random() * backoff / 2));
+        await this.wait(Math.max(last.retryAfterMs ?? 0, backoff / 2 + Math.random() * backoff / 2), signal);
       }
     }
     throw last ?? new LinearError("network", "request failed");
   }
 
-  private async once<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+  /** The backoff wait, cut short when the caller's budget ends. */
+  private async wait(ms: number, signal?: AbortSignal): Promise<void> {
+    if (!signal) return this.o.sleep(ms);
+    let onAbort: (() => void) | undefined;
+    try {
+      await Promise.race([
+        this.o.sleep(ms),
+        new Promise<void>((_, rej) => { onAbort = () => rej(budgetEnded()); signal.addEventListener("abort", onAbort, { once: true }); }),
+      ]);
+    } finally { if (onAbort) signal.removeEventListener("abort", onAbort); }
+    if (signal.aborted) throw budgetEnded();
+  }
+
+  private async once<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
     let key: string;
     // Bounded (Codex PR35-r3): a stalled vault read must not let a fenced write start after the lock is gone.
     // Worst case for one write: keyTimeoutMs + timeoutMs = 25 s, inside WRITE_MARGIN_MS (60 s).
@@ -95,6 +118,7 @@ export class LinearClient {
           ? new LinearError("no-key", "Linear API key is not set")
           : new LinearError("bad-response", "Linear API key is not available from the vault");
     } finally { if (timer) clearTimeout(timer); }
+    if (signal?.aborted) throw budgetEnded();
     let res: Response;
     try {
       res = await this.o.fetchImpl(LINEAR_ENDPOINT, {
@@ -103,7 +127,7 @@ export class LinearClient {
         redirect: "manual",
         headers: { "content-type": "application/json", authorization: key },
         body: JSON.stringify({ query, variables }),
-        signal: AbortSignal.timeout(this.o.timeoutMs),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(this.o.timeoutMs)]) : AbortSignal.timeout(this.o.timeoutMs),
       });
     } catch (e) {
       const name = (e as { name?: string })?.name;

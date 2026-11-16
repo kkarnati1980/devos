@@ -5,7 +5,7 @@
 
 /** The read half of LinearClient this needs (retried reads only). */
 export interface LinkReader {
-  query<T>(query: string, variables?: Record<string, unknown>): Promise<T>;
+  query<T>(query: string, variables?: Record<string, unknown>, opts?: { signal?: AbortSignal }): Promise<T>;
 }
 
 /** Linear's ids are UUIDs; anything else is never sent. */
@@ -36,7 +36,8 @@ export interface LinearLinks {
  * The URLs of the stored Linear project and issues. Ids that are not UUIDs are skipped (never sent). An unknown
  * project or issue is simply absent; a Linear failure throws (the caller answers with a fixed code).
  */
-export async function linearLinks(client: LinkReader, ids: { projectId: string | null; issueIds: readonly string[] }): Promise<LinearLinks> {
+export async function linearLinks(client: LinkReader, ids: { projectId: string | null; issueIds: readonly string[] }, opts: { signal?: AbortSignal } = {}): Promise<LinearLinks> {
+  const call = { signal: opts.signal };
   const projectId = ids.projectId && LINEAR_ID.test(ids.projectId) ? ids.projectId : null;
   const issueIds = [...new Set(ids.issueIds.filter((x) => typeof x === "string" && LINEAR_ID.test(x)))].slice(0, LINK_MAX_ISSUES);
   const out: LinearLinks = { project: null, issues: {} };
@@ -44,13 +45,13 @@ export async function linearLinks(client: LinkReader, ids: { projectId: string |
     // `project(id)` errors when the id is unknown; the issues read below would still be useful, so a missing project
     // is read through the list filter instead, which answers with an empty list.
     const d = await client.query<{ projects: { nodes: { id: string; url: string }[] } }>(
-      `query($id: ID!) { projects(filter: { id: { eq: $id } }, first: 1, includeArchived: true) { nodes { id url } } }`, { id: projectId });
+      `query($id: ID!) { projects(filter: { id: { eq: $id } }, first: 1, includeArchived: true) { nodes { id url } } }`, { id: projectId }, call);
     const p = d?.projects?.nodes?.find((n) => n?.id === projectId);
     out.project = p ? linearUrl(p.url) : null;
   }
   if (issueIds.length) {
     const d = await client.query<{ issues: { nodes: { id: string; url: string }[] } }>(
-      `query($ids: [ID!]) { issues(filter: { id: { in: $ids } }, first: ${LINK_MAX_ISSUES}, includeArchived: true) { nodes { id url } } }`, { ids: issueIds });
+      `query($ids: [ID!]) { issues(filter: { id: { in: $ids } }, first: ${LINK_MAX_ISSUES}, includeArchived: true) { nodes { id url } } }`, { ids: issueIds }, call);
     const wanted = new Set(issueIds);
     for (const n of d?.issues?.nodes ?? []) {
       const url = n && wanted.has(n.id) ? linearUrl(n.url) : null;

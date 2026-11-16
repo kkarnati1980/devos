@@ -22,7 +22,7 @@ export interface LinearLinksService {
   /** The stored ids of the project with this slug, or null when there is no such project. */
   ids(slug: string): Promise<LinearIdsRow | null>;
   /** Linear's URLs for those ids (only https://linear.app ones), read-only. */
-  links(ids: { projectId: string | null; issueIds: string[] }): Promise<{ project: string | null; issues: Record<string, string> }>;
+  links(ids: { projectId: string | null; issueIds: string[] }, signal?: AbortSignal): Promise<{ project: string | null; issues: Record<string, string> }>;
 }
 
 export interface LinearLinksView {
@@ -72,23 +72,26 @@ export class LinearLinksController {
     const issueIds = row.modules.map((m) => m.linearIssue).filter((x): x is string => typeof x === "string" && x.length > 0);
     if (!row.linearProjectId && issueIds.length === 0) return { enabled: true, project: null, modules: [] };
     let t: NodeJS.Timeout | undefined;
+    // DEVOS-97: the bound also ends the client's work (retries, backoff, the request in flight), not only the answer.
+    const budget = new AbortController();
     try {
       const got = await Promise.race([
-        this.svc.links({ projectId: row.linearProjectId, issueIds }),
-        new Promise<never>((_, reject) => { t = setTimeout(() => reject(new Error("timeout")), LinearLinksController.timeoutMs); }),
+        this.svc.links({ projectId: row.linearProjectId, issueIds }, budget.signal),
+        new Promise<never>((_, reject) => { t = setTimeout(() => { budget.abort(); reject(new Error("timeout")); }, LinearLinksController.timeoutMs); }),
       ]);
       return linksView(row, got);
     } catch {
       throw httpError(502, "linear-unreachable");
     } finally {
       clearTimeout(t);
+      budget.abort();   // nothing of this request keeps running after the answer
     }
   }
 }
 
 export interface LinearLinksModule {
-  LinearClient: new (o: { apiKey: () => Promise<string> }) => { query<T>(q: string, v?: Record<string, unknown>): Promise<T> };
-  linearLinks: (client: unknown, ids: { projectId: string | null; issueIds: readonly string[] }) => Promise<{ project: string | null; issues: Record<string, string> }>;
+  LinearClient: new (o: { apiKey: () => Promise<string> }) => { query<T>(q: string, v?: Record<string, unknown>, opts?: { signal?: AbortSignal }): Promise<T> };
+  linearLinks: (client: unknown, ids: { projectId: string | null; issueIds: readonly string[] }, opts?: { signal?: AbortSignal }) => Promise<{ project: string | null; issues: Record<string, string> }>;
 }
 
 type Db = {
@@ -134,6 +137,6 @@ export function buildLinearLinks(w: {
       ]);
       return { linearProjectId: res?.externalId ?? null, modules };
     },
-    links: (ids) => linearLinks(client, ids),
+    links: (ids, signal) => linearLinks(client, ids, { signal }),
   };
 }

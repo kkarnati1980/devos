@@ -9,7 +9,7 @@ const I2 = "33333333-3333-4333-8333-333333333333";
 
 function reader(answer) {
   const calls = [];
-  return { calls, async query(q, v) { calls.push({ q, v }); return answer(q, v); } };
+  return { calls, async query(q, v, o) { calls.push({ q, v, o }); return answer(q, v); } };
 }
 
 test("linearUrl keeps only https URLs on linear.app", () => {
@@ -47,3 +47,15 @@ test("an unknown project is absent, issues are capped, a Linear failure throws",
   const failing = reader(() => { throw new Error("Linear down"); });
   await assert.rejects(linearLinks(failing, { projectId: P, issueIds: [] }), /Linear down/);
 });
+
+test("DEVOS-97: the caller's signal reaches every read", async () => {
+  const r = reader((q) => (q.includes("projects") ? { projects: { nodes: [] } } : { issues: { nodes: [] } }));
+  const ctl = new AbortController();
+  await linearLinks(r, { projectId: P, issueIds: [I1] }, { signal: ctl.signal });
+  assert.equal(r.calls.length, 2);
+  for (const c of r.calls) assert.equal(c.o.signal, ctl.signal);
+  const none = reader((q) => (q.includes("projects") ? { projects: { nodes: [] } } : { issues: { nodes: [] } }));
+  await linearLinks(none, { projectId: P, issueIds: [] });
+  assert.equal(none.calls[0].o.signal, undefined);
+});
+
