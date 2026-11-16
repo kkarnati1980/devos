@@ -59,7 +59,8 @@ export async function probeFingerprint(root: string): Promise<string> {
 /**
  * The probe's inventory: one row per `done` provision step, keyed by the step key, joined to its active resource row
  * by provider, kind and external id. A done step whose resource row is missing, or a step done without an external id,
- * is kept with an empty name so the compare names it (a silent drop could hide a lost row).
+ * is kept with an empty name or id (a silent drop could hide a lost row); `inventoryIncomplete` then fails the read
+ * and names it (Codex PR164-r2), so the same gap in both reads cannot pass the compare.
  */
 export async function readProbeInventory(db: any, projectId: string, timeoutMs: number): Promise<InventoryRow[]> {
   // Pre-review 3: bounded like PrismaProbeLog (ADR-0011: a timeout on every outbound call), one consistent read.
@@ -68,7 +69,7 @@ export async function readProbeInventory(db: any, projectId: string, timeoutMs: 
     await tx.resource.findMany({ where: { projectId, status: "active" }, select: { provider: true, kind: true, externalId: true, name: true } }),
   ], { timeout: timeoutMs, maxWait: timeoutMs }) as [any[], any[]];
   const byId = new Map<string, string>();
-  for (const r of resources) byId.set(`${r.provider}\u0000${r.kind}\u0000${r.externalId}`, String(r.name));
+  for (const r of resources) byId.set(`${r.provider}\u0000${r.kind}\u0000${r.externalId}`, r.name == null ? "" : String(r.name));
   return steps.map((s) => ({
     key: String(s.key),
     provider: String(s.provider),
