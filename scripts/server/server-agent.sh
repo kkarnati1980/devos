@@ -6,7 +6,8 @@
 # deployment is in flight: its self-test would see the DevOS API restarting). The redacted output goes to the
 # agent log; the result is kept in agent/isolation.state, which the project-isolation-apply check reports.
 # "Not set up" (exit 3, or no state listener yet) is skipped only until the first ok run; after that it fails.
-# A deploy marker older than ISOLATION_DEFER_MAX (1 h) no longer defers it. Bearer redaction covers base64.
+# A deploy marker older than ISOLATION_DEFER_MAX (30 min) no longer defers it. It runs again right before the
+# server checks of a new SHA. Exit 4 (disabled by --remove) is recorded as a failure. Bearer redaction covers base64.
 # v1.4.0 (DEVOS-90): server re-checks without a new main SHA. Every 6 hours, and within a tick (about 3 minutes)
 # of a "/recheck" comment by an allowed author on the open draft tracking PR (head branch devos-recheck), the
 # agent runs the installed checks again on the currently deployed SHA and posts a fresh server-check status.
@@ -364,8 +365,10 @@ cert_renewal() {
 # isolation.state is "<epoch> <ok|skipped|fail (exit n)|fail (timeout)>"; checks/project-isolation-apply.sh
 # reports it. "Not set up" is "skipped" only until the first ok run (marker isolation.enforced): before it, exit 3
 # or a refused connection to the state listener (curl exit 7: the token exists, the listener is not deployed
-# yet) is skipped; after it, every non-zero exit is a failure, so isolation can never stop silently.
-ISOLATION_DEFER_MAX="${ISOLATION_DEFER_MAX:-3600}"   # an in-flight deploy marker older than this no longer defers
+# yet) is skipped; after it, every non-zero exit is a failure, so isolation can never stop silently. Exit 4
+# (KK ran --remove; isolation/disabled exists) is always "fail (disabled)": kept off, and visible.
+ISOLATION_DEFER_MAX="${ISOLATION_DEFER_MAX:-1800}"   # an in-flight deploy marker older than this no longer defers
+                                                      # (below the check's 2700 s, so a long deploy is never stale)
 isolation_tick() {
   local f rc st now
   [[ -f "$BIN/isolation-apply.sh" ]] || { log "isolation: not installed yet"; return 0; }
@@ -379,11 +382,12 @@ isolation_tick() {
   if [[ $DRY -eq 1 ]]; then log "WOULD run isolation-apply.sh"; return 0; fi
   set +e; DEVOS_DIR="$DIR" timeout "$ISOLATION_TIMEOUT" bash "$BIN/isolation-apply.sh" > "$TMP/iso.out" 2>&1 </dev/null; rc=$?; set -e
   redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done
-  case "$rc" in 0) st=ok;; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
-  if [[ ! -e "$ST/isolation.enforced" ]]; then
+  case "$rc" in 0) st=ok;; 4) st="fail (disabled)";; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
+  if [[ ! -e "$ST/isolation.enforced" && $rc -ne 4 ]]; then
     if (( rc == 3 )) || { (( rc == 1 )) && grep -qx 'state fetch failed (curl exit 7): nothing changed' "$TMP/iso.out"; }; then st=skipped; fi
   fi
-  printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"
+  { printf '%s %s\n' "$(date +%s)" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
+    || log "isolation: could not write isolation.state"
   [[ "$st" == ok && ! -e "$ST/isolation.enforced" ]] && { touch "$ST/isolation.enforced"; log "isolation: enforced from now on (a skip is a failure)"; }
   log "isolation: $st"
 }
@@ -619,6 +623,7 @@ else
 fi
 
 if [[ ! -s "$ST/$sha.checks.state" ]]; then
+  isolation_tick   # S4-b2a: a fresh run with the script this SHA installed, so its server-check reports it
   run_checks "$sha"
   echo "$(date +%s) $sha normal" > "$ST/recheck.state"   # DEVOS-90: the 6-hour clock restarts after normal checks
 fi

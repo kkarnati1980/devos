@@ -317,6 +317,24 @@ test("AT8 --remove leaves only the M0.1/M0.2 rules", () => {
   assert.equal(run(h, ["--remove"]).code, 0, "remove is idempotent");
 });
 
+test("S4-b2a: --remove keeps the block off (isolation/disabled) until KK deletes the marker", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  assert.equal(run(h, ["--remove"]).code, 0);
+  const marker = path.join(h, "devos/isolation/disabled");
+  assert.ok(fs.existsSync(marker), "--remove writes the marker");
+  const before = restores(h);
+  const r = run(h);
+  assert.equal(r.code, 4, r.out);
+  assert.match(r.out, /disabled: --remove was run; delete .*isolation\/disabled/);
+  assert.equal(restores(h), before, "a disabled run changes nothing");
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+  assert.equal(run(h, ["--dry-run"]).code, 0, "--dry-run still works while disabled");
+  fs.rmSync(marker);
+  assert.equal(run(h).code, 0, "deleting the marker turns the block back on");
+  assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/);
+});
+
 test("skipped (exit 3) without a token; refuses a non-loopback state URL", () => {
   let h = host(STATE, { token: null });
   let r = run(h);

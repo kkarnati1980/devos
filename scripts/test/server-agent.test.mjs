@@ -56,6 +56,7 @@ const baseFiles = () => ({
   "scripts/server/server-agent.sh": real("scripts/server/server-agent.sh"),
   "scripts/server/cert-renew.sh": real("scripts/server/cert-renew.sh"),
   "scripts/server/isolation-apply.sh": fakeIso,
+  "scripts/server/checks/project-isolation-apply.sh": null,   // only AT-b2a-1c installs the real check
   "scripts/server/install-server-agent.sh": real("scripts/server/install-server-agent.sh"),
   "scripts/server/checks/ok.sh": "#!/usr/bin/env bash\necho fine\n",
   "scripts/server/checks/leaky.sh": `#!/usr/bin/env bash\necho "key ${SK} token ${GH_TOKEN} cf ${CF_TOKEN}"\nexit 1\n`,
@@ -727,17 +728,17 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   const r1 = await runAgent();
   assert.equal(r1.code, 0, r1.out);
   assert.match(r1.out, /isolation: not installed yet/);
-  assert.equal(isoCount(), 0);
   assert.ok(fs.existsSync(path.join(D(), "bin/isolation-apply.sh")), "installed from the allow-list");
+  assert.equal(isoCount(), 1, "run once, after the install and before the new SHA's server checks");
   const r2 = await runAgent();
-  assert.equal(isoCount(), 1, r2.out);
+  assert.equal(isoCount(), 2, r2.out);
   assert.match(r2.out, /isolation: ok/);
   assert.doesNotMatch(r2.out, /abcdefghijklmnop1234/, "isolation output is redacted");
   assert.doesNotMatch(r2.out, /ghi\/jkl012345/, "a base64 Bearer value is redacted whole");
   assert.match(isoState(), /^\d{1,12} ok\n$/);
   assert.ok(fs.existsSync(path.join(D(), "agent/isolation.enforced")), "the first ok marks isolation as enforced");
   await runAgent();
-  assert.equal(isoCount(), 2, "runs again on the next tick (not daily)");
+  assert.equal(isoCount(), 3, "runs again on the next tick (not daily)");
   // Once enforced, "not set up" and a missing listener are failures, never a silent skip (pre-review 1/2).
   await runAgent({ FAKE_ISO_RC: "3" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 3\)\n$/);
@@ -745,6 +746,8 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
   await runAgent({ FAKE_ISO_RC: "1" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "4" });
+  assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
   assert.equal(r6.code, 0, r6.out);
   assert.match(isoState(), /^\d{1,12} fail \(timeout\)\n$/, "the agent's timeout bounds the run");
@@ -767,7 +770,28 @@ test("S4-b2a AT-b2a-1b: before the first ok, no token (exit 3) or no listener ye
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/, "a listener that answers with an error is a failure");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "self-test failed after the change; previous block restored" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "4" });
+  assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "disabled is a failure even before the first ok");
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.enforced")));
+});
+
+test("S4-b2a AT-b2a-1c: a new SHA's server-check reports isolation-apply.sh as installed by that SHA (pre-review r2)", async () => {
+  resetMock(); freshState();
+  const sha1 = commit({ ...baseFiles(), "xb2a1c": "1" }, "s4-b2a working script");
+  M.main = sha1; green(sha1); pass(sha1);
+  await runAgent(); await runAgent();
+  assert.match(isoState(), /ok\n$/);
+  const broken = '#!/usr/bin/env bash\necho x >> "$DEVOS_DIR/iso.count"; exit 1\n';
+  const sha2 = commit({ ...baseFiles(), "scripts/server/isolation-apply.sh": broken,
+    "scripts/server/checks/project-isolation-apply.sh": real("scripts/server/checks/project-isolation-apply.sh"), "xb2a1c": "2" }, "s4-b2a broken script");
+  M.main = sha2; green(sha2); pass(sha2);
+  reqs.length = 0;
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  const sc = statusPosts("server-check").find(() => true);
+  assert.ok(sc, r.out);
+  assert.equal(sc.state, "failure", "the broken script's result is in this SHA's server-check");
+  assert.match(isoState(), /fail \(exit 1\)\n$/);
 });
 
 test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed copy missing from bin/ is repaired", async () => {
@@ -782,10 +806,10 @@ test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed
   assert.equal(isoCount(), 0);
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state")), "a deferral writes no result");
   // A marker older than ISOLATION_DEFER_MAX (a stuck deploy, or GitHub down) no longer defers (pre-review 3).
-  const old = new Date(Date.now() - 2 * 3600 * 1000);
+  const old = new Date(Date.now() - 1801 * 1000);
   fs.utimesSync(path.join(D(), `agent/deploy-started.${sha}`), old, old);
   const r3 = await runAgent({ DEPLOY_TIMEOUT: "0" });
-  assert.match(r3.out, /is older than 3600s; not deferring/);
+  assert.match(r3.out, /is older than 1800s; not deferring/);
   assert.equal(isoCount(), 1, r3.out);
   M.deployStatus = "finished";
   await runAgent();
