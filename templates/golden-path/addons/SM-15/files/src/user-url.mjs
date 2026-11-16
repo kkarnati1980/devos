@@ -8,6 +8,8 @@ import { safeFetch, SafeFetchError } from "./safe-fetch.mjs";
 /** The most a user URL fetch may use. A caller may lower each cap, never raise it. */
 export const USER_URL_LIMITS = Object.freeze({ maxUrlLength: 2048, timeoutMs: 8_000, maxBytes: 2_000_000, maxRedirects: 3 });
 const METHODS = new Set(["GET", "HEAD"]);
+/** The only ports a user URL, or any redirect it follows, may use (the floor's per-hop allowPorts rule). */
+export const USER_URL_PORTS = Object.freeze([80, 443]);
 
 function cap(value, max, name) {
   if (value === undefined) return max;
@@ -50,7 +52,7 @@ export function makeUserUrlFetcher({ transport = safeFetch } = {}) {
     const maxBytes = cap(opts.maxBytes, USER_URL_LIMITS.maxBytes, "maxBytes");
     const maxRedirects = cap(opts.maxRedirects, USER_URL_LIMITS.maxRedirects, "maxRedirects");
     const url = parseUserUrl(input);
-    return transport(url.href, { method, headers: { ...(opts.headers || {}) }, timeoutMs, maxBytes, maxRedirects, allowHosts: [], lookup: opts.lookup });
+    return transport(url.href, { method, headers: { ...(opts.headers || {}) }, timeoutMs, maxBytes, maxRedirects, allowHosts: [], allowPorts: [...USER_URL_PORTS], lookup: opts.lookup });
   };
 }
 
@@ -67,6 +69,7 @@ const MESSAGES = {
   timeout: "The site took too long to answer.",
   "too-large": "The page is too large to fetch.",
   redirects: "The link redirects too many times.",
+  port: "Only links on the standard web ports can be fetched.",
 };
 export function publicMessage(err) {
   return (err instanceof SafeFetchError && Object.hasOwn(MESSAGES, err.code)) ? MESSAGES[err.code] : "The page could not be fetched.";
