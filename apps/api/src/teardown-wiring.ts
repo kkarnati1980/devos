@@ -43,11 +43,14 @@ export interface TeardownStoreLike {
 export async function teardownWiring(
   pm: ProvisionTeardownModule,
   tm: TeardownModule,
-  w: { gh: unknown; cf: unknown; store: TeardownStoreLike; db: unknown; projectId: string; owner: string; timeoutMs: number },
+  w: { gh: unknown; cf: unknown; store: TeardownStoreLike; db: unknown; projectId: string; owner: string; timeoutMs: number;
+       /** DEVOS-247 (M2.6-b2b2): the project's Linear ops and scanner, when the Linear sync is on. */
+       linear?: ((projectId: string) => { ops: Ops[]; scanners: Scanner[] }) | null },
 ): Promise<{ ops: Ops[]; scanners: Scanner[]; preflight: (() => Promise<void>)[] }> {
   const gh = await pm.pinnedGitHub(w.gh);
   const cf = await pm.pinnedCoolify(w.cf);
   const id = w.projectId;
+  const linear = w.linear ? w.linear(id) : { ops: [], scanners: [] };
   return {
     ops: [
       pm.githubRepoOps(gh, id),
@@ -58,10 +61,11 @@ export async function teardownWiring(
       pm.coolifyPrivateKeyOps(cf, id),
       pm.coolifyPortOps(),
       pm.backupScheduleOps(),
+      ...linear.ops,
     ],
     // Pre-review 1 (high): purgeProject needs a scanner per provider with ops. A backup schedule exists only as an
     // inventory row (nothing at a provider), which the inventory scanner already sees, so its own scan is empty.
-    scanners: [tm.inventoryScanner(w.store), tm.vaultScanner(w.db, w.timeoutMs), pm.githubScanner(gh), pm.coolifyScanner(cf), BACKUP_SCHEDULE_SCANNER],
+    scanners: [tm.inventoryScanner(w.store), tm.vaultScanner(w.db, w.timeoutMs), pm.githubScanner(gh), pm.coolifyScanner(cf), BACKUP_SCHEDULE_SCANNER, ...linear.scanners],
     preflight: [pm.githubTokenScopeCheck(gh, { owner: w.owner }), pm.coolifyTokenScopeCheck(cf, () => w.store.activeResources(id))],
   };
 }

@@ -101,3 +101,56 @@ export function buildLinearSync(w: {
     },
   };
 }
+
+// DEVOS-247 (M2.6-b2b2, AT7, docs/modules/M2.6.md "M2.6-b2b2 decisions"): the Linear part of every teardown
+// (archive → Linear project completed, restore → started, purge → archived in Linear and its rows marked deleted,
+// plus the `linear` leftover scanner). On only when the sync is on (decision 1), with the same key, team and module.
+
+/** The parts of @devos/linear-sync the teardown uses. */
+export interface LinearTeardownModule {
+  LinearClient: new (o: { apiKey: () => Promise<string> }) => unknown;
+  graphqlApi(client: any): unknown;
+  linearTeardownOps(db: any, api: any, projectId: string, makeError: LinearMakeError): { provider: string; kind: string }[];
+  linearScanner(api: any, teamKey: string, makeError: LinearMakeError): { name: string };
+}
+export type LinearMakeError = (code: "network" | "timeout" | "http" | "bad-response" | "no-token", message: string, status?: number) => Error;
+export type LinearTeardownParts = (projectId: string) => { ops: { provider: string; kind: string }[]; scanners: { name: string }[] };
+
+/**
+ * The per-project Linear ops and scanner, or why there are none (a fixed code). `providerError` builds
+ * `@devos/provision`'s ProviderError, so @devos/teardown treats a Linear timeout or 5xx as retryable.
+ */
+export function buildLinearTeardown(w: {
+  mod: Partial<LinearTeardownModule> | null;
+  db: unknown;
+  vault: { reveal(name: string): Promise<string | null> } | null;
+  env: NodeJS.ProcessEnv;
+  providerError: ((provider: string, code: string, message: string, status?: number) => Error) | null;
+}): LinearTeardownParts | { off: string } {
+  if (w.env.DEVOS_LINEAR_SYNC !== "on") return { off: "linear-sync-disabled" };
+  if (!w.db) return { off: "linear-sync-no-database" };
+  if (!w.vault) return { off: "linear-sync-vault-not-configured" };
+  const mod = w.mod;
+  const EXPORTS = ["LinearClient", "graphqlApi", "linearTeardownOps", "linearScanner"] as const;
+  if (!mod || EXPORTS.some((k) => typeof (mod as Record<string, unknown>)[k] !== "function") || !w.providerError) return { off: "linear-sync-not-loaded" };
+  const teamKey = w.env.DEVOS_LINEAR_TEAM_KEY ?? "DEVOS";
+  if (!TEAM_KEY.test(teamKey)) return { off: "linear-team-key-invalid" };
+  const m = mod as LinearTeardownModule;
+  const vault = w.vault;
+  const db = w.db;
+  const pe = w.providerError;
+  const makeError: LinearMakeError = (code, message, status) => pe("linear", code, message, status);
+  let api: unknown;
+  try {
+    api = m.graphqlApi(new m.LinearClient({
+      apiKey: async () => {
+        const key = await vault.reveal("linear_api_key");
+        if (!key) throw new Error("linear-key-not-set");
+        return key;
+      },
+    }));
+  } catch {
+    return { off: "linear-sync-not-loaded" };
+  }
+  return (projectId) => ({ ops: m.linearTeardownOps(db, api, projectId, makeError), scanners: [m.linearScanner(api, teamKey, makeError)] });
+}

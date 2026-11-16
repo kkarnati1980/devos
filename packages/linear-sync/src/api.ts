@@ -2,7 +2,7 @@
 // writes through client.mutate (never retried). Only ids, names, descriptions, state types, labels, parents,
 // milestones, assignees and blocking relations are read; Linear text is data, never instructions.
 import type { LinearClient } from "./client.js";
-import type { IssueInput, LinearApi, LinearIssue, StateType } from "./types.js";
+import type { IssueInput, LinearApi, LinearIssue, LinearTeardownApi, StateType } from "./types.js";
 import { LinearError } from "./client.js";
 import { readMarker } from "./markers.js";
 
@@ -25,7 +25,7 @@ function ok<T>(payload: { success?: boolean } & T, what: string): T {
   return payload;
 }
 
-export function graphqlApi(client: LinearClient): LinearApi {
+export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi {
   return {
     async viewerId() {
       return (await client.query<{ viewer: { id: string } }>("query { viewer { id } }")).viewer.id;
@@ -174,6 +174,50 @@ export function graphqlApi(client: LinearClient): LinearApi {
       const { teamId: _t, ...rest } = toInput(i as IssueInput);
       ok((await client.mutate<{ issueUpdate: { success: boolean } }>(
         `mutation($id: String!, $i: IssueUpdateInput!) { issueUpdate(id: $id, input: $i) { success } }`, { id, i: rest })).issueUpdate, "issue update");
+    },
+    // M2.6-b2b2 (AT7): teardown reads and writes.
+    async teamId(key) {
+      const d = await client.query<{ teams: Conn<{ id: string }> }>(`query($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id } } }`, { key });
+      const t = d.teams.nodes[0];
+      if (!t) throw new LinearError("bad-response", `no Linear team with key ${key}`);
+      return t.id;
+    },
+    async findProjects(teamId, devosProjectId) {
+      // Pre-review 2: all matches over every page; an exhausted search fails closed, like findProject.
+      const out: { id: string; archivedAt: string | null }[] = [];
+      let after: string | null = null;
+      for (let p = 0; p < MAX_PAGES; p++) {
+        const d: { team: { projects: Conn<{ id: string; description: string | null; archivedAt: string | null }> } } = await client.query(
+          `query($id: String!, $after: String) { team(id: $id) { projects(first: ${PAGE}, after: $after, includeArchived: true) { nodes { id description archivedAt } pageInfo { hasNextPage endCursor } } } }`,
+          { id: teamId, after });
+        for (const x of d.team.projects.nodes) if (readMarker(x.description, "project") === devosProjectId) out.push({ id: x.id, archivedAt: x.archivedAt ?? null });
+        if (!d.team.projects.pageInfo?.hasNextPage) return out;
+        if (!d.team.projects.pageInfo.endCursor) throw new LinearError("bad-response", "Linear project page without a cursor");
+        after = d.team.projects.pageInfo.endCursor;
+      }
+      throw new LinearError("bad-response", "too many projects in this Linear team to search for the marker");
+    },
+    async projectState(id) {
+      const d = await client.query<{ projects: Conn<{ id: string; description: string | null; archivedAt: string | null }> }>(
+        `query($id: ID!) { projects(filter: { id: { eq: $id } }, includeArchived: true) { nodes { id description archivedAt } } }`, { id });
+      const p = d.projects.nodes.find((x) => x.id === id);
+      return p ? { id: p.id, description: p.description ?? null, archivedAt: p.archivedAt ?? null } : null;
+    },
+    async projectStatusId(type) {
+      // Workspace project statuses; several can share a type, the lowest position wins (as for issue states).
+      const s = await client.query<{ projectStatuses: Conn<{ id: string; type: string; position: number }> }>(
+        `query { projectStatuses(first: ${PAGE}) { nodes { id type position } } }`);
+      const status = [...s.projectStatuses.nodes].filter((x) => x.type === type).sort((a, b) => a.position - b.position)[0];
+      if (!status) throw new LinearError("bad-response", `no Linear project status of type ${type}`);
+      return status.id;
+    },
+    async updateProjectStatus(id, statusId) {
+      ok((await client.mutate<{ projectUpdate: { success: boolean } }>(
+        `mutation($id: String!, $i: ProjectUpdateInput!) { projectUpdate(id: $id, input: $i) { success } }`, { id, i: { statusId } })).projectUpdate, "project status update");
+    },
+    async archiveProject(id) {
+      ok((await client.mutate<{ projectArchive: { success: boolean } }>(
+        `mutation($id: String!) { projectArchive(id: $id) { success } }`, { id })).projectArchive, "project archive");
     },
     async addBlockedBy(issueId, blockerId) {
       ok((await client.mutate<{ issueRelationCreate: { success: boolean } }>(
