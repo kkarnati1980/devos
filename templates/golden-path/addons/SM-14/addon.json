@@ -1,0 +1,13 @@
+{
+  "id": "SM-14",
+  "name": "Dependencies",
+  "files": [
+    "package-lock.json",
+    "scripts/deps-check.mjs",
+    "test/sm-14-deps.test.mjs"
+  ],
+  "checks": {
+    "SM-14-L1": "test/sm-14-deps.test.mjs"
+  },
+  "usage": "Commit package-lock.json and refresh it with npm install whenever package.json changes (the starter lockfile matches the core, which has no dependency). In CI, on every push: npm ci (so the build uses exactly the locked versions), then npm audit --json --package-lock-only > audit.json || true, then node scripts/deps-check.mjs --audit audit.json --out evidence/sm-14-scan.json and fail the job on a non-zero exit. The check fails on a missing, old-format (lockfile version 1) or stale lockfile (a dependency in package.json that the lockfile does not declare and resolve), on any high or critical vulnerability, and when the audit did not run or cannot be read (it fails closed). deps-check.mjs only reads files; it never runs npm or reaches the network. Store evidence/sm-14-scan.json as the scan_report evidence (check, ok, findings, the lockfile's sha256, counts per severity, time). Add-on dependencies must keep permissive licences (MIT, ISC, BSD, Apache-2.0); anything else is a decision for the app owner first (D13)."
+}
