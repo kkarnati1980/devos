@@ -3,7 +3,7 @@
 // This add-on brings no driver and no dependency. Amounts are whole numbers in the service's own unit (e.g. US cents),
 // so sums never drift.
 // - paidServices([{ name, unit, monthlyCap }]): the declaration. There is no default cap: each cap is the app owner's decision.
-// - costMeter({ services, store }).charge(service, estimate, fn): refuses (CapExceededError, before fn runs) when the
+// - costMeter({ services, store }).charge(service, estimate, fn): estimate is an upper bound (>= 1); refuses (CapExceededError, before fn runs) when the
 //   month-to-date spend plus the estimate would pass the cap; otherwise runs fn and records its real cost.
 // - meter.report(): the budget record for the project budget: month, and per service its unit, cap and spend.
 // - memoryStore() (one process, tests) and pgStore(query) (the paid_usage table, PAID_USAGE_SQL) keep the spend.
@@ -122,12 +122,16 @@ export function pgStore(query) {
 /**
  * The meter. `charge(service, estimate, fn)`:
  * 1. reserves `estimate` against this month's cap; if that would pass the cap, throws CapExceededError and fn never runs;
+ *    The estimate must be an upper bound of the real cost (e.g. max tokens × price) and at least 1: concurrent calls
+ *    are held under the cap by their estimates, so each concurrent underestimate adds its own overrun.
  * 2. runs fn; if it returns { cost }, the reservation is corrected to that real cost (which may pass the cap: it is
- *    what was spent, and the next charge is refused);
+ *    what was spent, and the next charge is refused). If that correction fails (a bad cost, a store error), the
+ *    estimate stays, onError is told, and fn's result is still returned: the call was paid for, so it must not fail
+ *    and invite a paid retry;
  * 3. if fn throws, the reservation stays: a failed paid call may still have been billed, so the meter over-counts
  *    rather than under-counts. Returns fn's result.
  */
-export function costMeter({ services, store = memoryStore(), now = Date.now, timeZone = "UTC" } = {}) {
+export function costMeter({ services, store = memoryStore(), now = Date.now, timeZone = "UTC", onError = () => {} } = {}) {
   if (!SERVICES.has(services)) throw new TypeError("cost: pass services from paidServices()");
   for (const m of ["reserve", "adjust", "read"]) if (typeof store?.[m] !== "function") throw new TypeError(`cost: store.${m} must be a function`);
   monthOf(0, timeZone); // an unknown time zone throws here, not on the first paid call
@@ -142,7 +146,7 @@ export function costMeter({ services, store = memoryStore(), now = Date.now, tim
   return Object.freeze({
     async charge(name, estimate, fn) {
       const s = service(name);
-      whole(`${name}: estimate`, estimate, 0);
+      whole(`${name}: estimate`, estimate, 1);
       if (estimate > MAX / 2) throw new TypeError(`cost: ${name}: estimate is too large`);
       if (typeof fn !== "function") throw new TypeError("cost: charge() needs a function to run");
       const m = month();
@@ -150,8 +154,12 @@ export function costMeter({ services, store = memoryStore(), now = Date.now, tim
       if (!r.ok) throw new CapExceededError(s.name, m, r.spent, estimate, s.monthlyCap);
       const result = await fn();
       if (result && typeof result === "object" && Object.hasOwn(result, "cost")) {
-        whole(`${name}: reported cost`, result.cost, 0);
-        if (result.cost !== estimate) await store.adjust(s.name, m, result.cost - estimate);
+        try {
+          whole(`${name}: reported cost`, result.cost, 0);
+          if (result.cost !== estimate) await store.adjust(s.name, m, result.cost - estimate);
+        } catch (err) {
+          try { onError(err); } catch { /* reporting must not break the app */ }
+        }
       }
       return result;
     },

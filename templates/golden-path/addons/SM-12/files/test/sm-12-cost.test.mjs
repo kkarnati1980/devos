@@ -42,7 +42,6 @@ test("SM-12-L1: a paid call is refused before it runs when it would pass the cap
   assert.equal(calls, 2, "the refused call never ran, so it spent nothing");
   await meter.charge("openai", 350, paid(350)); // exactly up to the cap is allowed
   await assert.rejects(meter.charge("openai", 1, paid(1)), CapExceededError);
-  await meter.charge("openai", 0, async () => ({ text: "free" })); // a zero estimate always fits
   assert.equal(calls, 3);
 
   // Services are counted apart; a failed call keeps its reservation (it may have been billed).
@@ -52,9 +51,29 @@ test("SM-12-L1: a paid call is refused before it runs when it would pass the cap
   assert.deepEqual(r.services.map((x) => [x.service, x.spent, x.remaining]), [["openai", 1000, 0], ["transcribe", 10, 50]]);
 
   await assert.rejects(meter.charge("dalle", 1, paid(1)), /undeclared paid service "dalle"/);
-  for (const bad of [-1, 1.5, "10", Number.MAX_SAFE_INTEGER]) await assert.rejects(meter.charge("transcribe", bad, paid(1)), TypeError, String(bad));
+  for (const bad of [0, -1, 1.5, "10", Number.MAX_SAFE_INTEGER]) await assert.rejects(meter.charge("transcribe", bad, paid(1)), TypeError, String(bad));
   await assert.rejects(meter.charge("transcribe", 1), /needs a function/);
-  await assert.rejects(meter.charge("transcribe", 1, async () => ({ cost: -3 })), /reported cost/);
+});
+
+test("SM-12-L1: a paid result is never thrown away after the call; underestimates overrun only by their own difference", async () => {
+  const errors = [];
+  const broken = { ...memoryStore(), adjust: async () => { throw new Error("db down"); } };
+  const meter = costMeter({ services: services(), store: broken, now: () => NOV, onError: (e) => errors.push(e.message) });
+  assert.deepEqual(await meter.charge("openai", 100, async () => ({ cost: 40, text: "paid" })), { cost: 40, text: "paid" });
+  assert.deepEqual(await meter.charge("openai", 100, async () => ({ cost: -3, text: "paid" })), { cost: -3, text: "paid" });
+  assert.deepEqual(errors.length, 2);
+  assert.match(errors[0], /db down/);
+  assert.match(errors[1], /reported cost/);
+  assert.equal((await meter.report()).services[0].spent, 200, "the estimates stay recorded");
+  const loud = costMeter({ services: services(), now: () => NOV, onError: () => { throw new Error("boom"); } });
+  assert.deepEqual(await loud.charge("openai", 5, async () => ({ cost: "x" })), { cost: "x" });
+
+  // 20 concurrent calls estimated at 2 that really cost 3 (cap 60): the estimates admit 30, so spend ends at most
+  // 30 × 3 = 90, i.e. each admitted underestimate adds its own difference. Upper-bound estimates keep it under the cap.
+  const low = costMeter({ services: services(), now: () => NOV });
+  await Promise.allSettled(Array.from({ length: 40 }, () => low.charge("transcribe", 2, async () => { await new Promise((r) => setImmediate(r)); return { cost: 3 }; })));
+  const spent = (await low.report()).services[1].spent;
+  assert.ok(spent > 60 && spent <= 90, `spent ${spent}`);
 });
 
 test("SM-12-L1: the budget month turns over in the declared time zone, and concurrent charges never pass the cap", async () => {
