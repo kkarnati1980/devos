@@ -3,7 +3,20 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import https from "node:https";
 import { safeFetch, isBlockedAddress, redirectHeaders } from "../src/safe-fetch.mjs";
+
+// Egress guard (pre-review, low): every socket these tests open must go to the loopback stub. safeFetch pins the
+// address through the request's lookup option, so read it there; any other target throws before a socket exists,
+// and safeFetch reports it as code "request". A regression then fails the test with no real egress.
+const realRequest = { http: http.request, https: https.request };
+const pinned = (o) => { let a; o.lookup?.(o.hostname, {}, (_e, addr) => { a = addr; }); return a; };
+for (const [name, mod] of [["http", http], ["https", https]]) {
+  mod.request = function guarded(o, ...rest) {
+    if (pinned(o) !== "127.0.0.1") throw new Error(`test egress guard: refused a socket to ${o.hostname}`);
+    return realRequest[name].call(this, o, ...rest);
+  };
+}
 
 let srv, port;
 before(async () => {
@@ -25,7 +38,7 @@ before(async () => {
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   port = srv.address().port;
 });
-after(() => srv.close());
+after(() => { http.request = realRequest.http; https.request = realRequest.https; srv.close(); });
 
 const stub = { allowHosts: ["stub.test"], lookup: async (h) => (h === "stub.test" ? [{ address: "127.0.0.1", family: 4 }]
   : h === "evil.test" ? [{ address: "10.1.2.3", family: 4 }]
@@ -123,13 +136,13 @@ test("Teredo 2001::/32 is refused; other 2001: space is not (DEVOS-64 floor line
   for (const a of ["2001:4860:4860::8888", "2001:1::1"]) assert.equal(isBlockedAddress(a), false, a);
 });
 test("allowPorts limits the port of every hop, before any connection; bad lists are refused (DEVOS-64 floor line)", async () => {
-  let connects = 0;
-  const counted = { ...stub, allowHosts: ["public.test"], lookup: async () => { connects++; return [{ address: "127.0.0.1", family: 4 }]; } };
+  let lookups = 0;
+  const counted = { ...stub, allowHosts: ["public.test"], lookup: async () => { lookups++; return [{ address: "127.0.0.1", family: 4 }]; } };
   // The URL passed in: an explicit port off the list, and the scheme's default port off the list. The name resolves
   // to the stub, so a connection would reach it; the refusal comes first.
   await assert.rejects(safeFetch(`http://public.test:${port}/ok`, { ...counted, allowPorts: [80, 443] }), (e) => e.code === "port" && e.message.includes(String(port)));
   await assert.rejects(safeFetch("https://example.com/", { ...stub, allowPorts: [80] }), (e) => e.code === "port" && /443/.test(e.message));
-  assert.equal(connects, 1, "one lookup, then refused");
+  assert.equal(lookups, 1, "one lookup, then refused");
   // An internal target on an unlisted port is still reported as blocked-address (the address check comes first).
   await assert.rejects(safeFetch("http://10.0.0.1:2375/", { ...stub, allowPorts: [80, 443] }), (e) => e.code === "blocked-address");
   // A listed port is fetched; a redirect to another port is refused on that hop (far.test resolves to a public

@@ -4,11 +4,24 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import https from "node:https";
 import { SafeFetchError, safeFetch } from "../src/safe-fetch.mjs";
 import { fetchUserUrl, makeUserUrlFetcher, parseUserUrl, publicMessage, USER_URL_LIMITS, USER_URL_PORTS } from "../src/user-url.mjs";
 
 let srv, port;
 const timers = new Set();
+// Egress guard (pre-review, low): every socket these tests open must go to the loopback stub. safeFetch pins the
+// address through the request's lookup option, so read it there; any other target throws before a socket exists,
+// and safeFetch reports it as code "request". A regression then fails the test with no real egress.
+const realRequest = { http: http.request, https: https.request };
+const pinned = (o) => { let a; o.lookup?.(o.hostname, {}, (_e, addr) => { a = addr; }); return a; };
+for (const [name, mod] of [["http", http], ["https", https]]) {
+  mod.request = function guarded(o, ...rest) {
+    if (pinned(o) !== "127.0.0.1") throw new Error(`test egress guard: refused a socket to ${o.hostname}`);
+    return realRequest[name].call(this, o, ...rest);
+  };
+}
+
 before(async () => {
   srv = http.createServer((req, res) => {
     if (req.url === "/ok") { res.end("hello"); return; }
@@ -34,7 +47,7 @@ before(async () => {
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   port = srv.address().port;
 });
-after(() => { for (const t of timers) clearInterval(t); srv.closeAllConnections(); srv.close(); });
+after(() => { http.request = realRequest.http; https.request = realRequest.https; for (const t of timers) clearInterval(t); srv.closeAllConnections(); srv.close(); });
 
 // Names the resolver answers in these tests. Any other name fails to resolve, so no case here can open a socket
 // to a real address even if a check regressed (the case would then fail with "dns").
