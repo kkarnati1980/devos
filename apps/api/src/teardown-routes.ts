@@ -42,6 +42,7 @@ export const PURGE_ASK_STATUS: Readonly<Record<string, number>> = Object.freeze(
   "project-not-found": 404,
   not_archived: 409,
   "purge-already-approved": 409,
+  "purge-waits-for-daily-run": 409,
 });
 
 export interface TeardownServices {

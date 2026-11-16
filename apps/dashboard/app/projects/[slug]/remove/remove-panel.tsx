@@ -30,7 +30,8 @@ export function removeError(code: string): string {
     case "provider_error":
     case "delete_unconfirmed": return "A provider did not answer as expected. Try again in a few minutes.";
     case "unsupported_resource": return "The project has a kind of resource DevOS does not know how to handle yet.";
-    case "purge-already-approved": return "You already approved deleting this project; DevOS will do it within a few minutes.";
+    case "purge-already-approved": return "You already approved deleting this project; DevOS is doing it or will within a few minutes.";
+    case "purge-waits-for-daily-run": return "You already approved deleting this project; the last try hit a temporary problem, so DevOS tries again at 03:10 IST.";
     case "teardown-timeout": return "This is taking longer than expected; it carries on in the background. Reload this page in a minute.";
     case "api-unreachable": return "The DevOS API did not answer in time. If you pressed Archive or Restore, it may still be running: reload this page in a minute.";
     default: return explain(code);

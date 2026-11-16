@@ -528,3 +528,61 @@ test("M2.5-b3: unknown and not-archived projects are refused; a pending card fro
   assert.equal((await s.store.get(old.approvalId)).status, "expired");
   assert.equal(await s.job.pendingCard(s.projects.get(P)), r.approvalId);
 });
+
+// Pre-review (M2.5-b3) 1 and 2: the ask after a stopped, waiting or still-running approved purge. The grant stays
+// unspent here (a stop before the policy check spent it), which is the case that could dead-end KK's ask.
+function askHarness(purgeImpl) {
+  const now = T0;
+  const p = { id: P, slug: "acme", stage: "archived", archivedAt: new Date(T0 - 2 * DAY), purgeAfter: new Date(T0 + 28 * DAY) };
+  const approved = { id: "33333333-2222-4333-8444-555555555555", status: "approved", action: PURGE_ACTION, target: `project:${P}`, projectId: P, createdAt: new Date(T0 - DAY), decidedAt: new Date(T0 - DAY) };
+  const cards = [approved];
+  const raised = [];
+  const job = new TeardownSweepJob({
+    listDue: async () => [],
+    project: async (id) => (id === P ? { ...p } : null),
+    activeCounts: async () => ({ github: 1 }),
+    cards: async (f) => cards.filter((c) => (!f.status || c.status === f.status) && c.action === f.action && (!f.target || c.target === f.target)),
+    raise: async (c) => {
+      if (c.action !== PURGE_ACTION) return { id: "stop" };
+      const card = { ...c, id: `44444444-2222-4333-8444-55555555555${raised.length}`, status: "pending", createdAt: new Date(now) };
+      raised.push(card);
+      cards.push(card);
+      return card;
+    },
+    expire: async () => [],
+    unspentGrant: async () => "g1",
+    purge: purgeImpl,
+    keepArchived: async () => false,
+    log: () => {},
+    now: () => now,
+    purgeTimeoutMs: 5,
+  });
+  return { job, raised };
+}
+
+test("pre-review 1 (M2.5-b3): after an approved purge stopped for good, the early ask raises a new card", async () => {
+  const h = askHarness(async () => { throw new TeardownError("policy_denied", false, "denied"); });
+  assert.deepEqual(await h.job.askPurge(P), { ok: false, code: "purge-already-approved" }, "before the job ran it, the approval is queued");
+  await h.job.tick();
+  const r = await h.job.askPurge(P);
+  assert.equal(r.ok, true);
+  assert.equal(r.raised, true);
+  assert.equal(h.raised.length, 1);
+});
+
+test("pre-review 1 (M2.5-b3): a retryable stop with the grant unspent answers purge-waits-for-daily-run", async () => {
+  const h = askHarness(async () => { throw new TeardownError("provider_error", true, "blip"); });
+  await h.job.tick();
+  assert.deepEqual(await h.job.askPurge(P), { ok: false, code: "purge-waits-for-daily-run" });
+  assert.equal(h.raised.length, 0);
+});
+
+test("pre-review 2 (M2.5-b3): while a purge runs past its 10-minute limit, the ask raises no second card", async () => {
+  let finish;
+  const h = askHarness(() => new Promise((resolve) => { finish = resolve; }));
+  await h.job.tick();
+  assert.deepEqual(await h.job.askPurge(P), { ok: false, code: "purge-already-approved" });
+  finish({ purged: true, report: { hits: [], errors: [] } });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.raised.length, 0);
+});

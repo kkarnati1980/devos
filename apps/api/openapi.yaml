@@ -455,7 +455,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { description: "Forbidden (session, Origin, CSRF)" }
         "404": { description: "`project-not-found`" }
-        "409": { description: "`not_archived` or `purge-already-approved` (an approved card's purge has not run yet)" }
+        "409": { description: "`not_archived`, `purge-already-approved` (an approved card's purge has not run yet, or is running) or `purge-waits-for-daily-run` (the approved purge hit a temporary problem; the 03:10 IST run tries again)" }
         "503": { description: "`teardown-not-configured`, `teardown-store-failed` or `teardown-failed`" }
   /vault/secrets:
     get:
