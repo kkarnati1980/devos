@@ -1,9 +1,34 @@
 // DEVOS-163 (M2.6-b2b1, docs/modules/M2.6.md "M2.6-b2b split and M2.6-b2b1 decisions"): the scheduled Linear sync's
-// runtime wiring. The schedule starts and stops with the process (the real @devos/linear-sync schedule and sweep, with
-// the Linear client, API and per-project sync faked), and it is off, with a fixed code, unless switched on.
+// runtime wiring. The schedule starts and stops with the process, and it is off, with a fixed code, unless switched on.
+// The module is faked here (the api test build does not build @devos/linear-sync); its sweep and schedule follow the
+// package's contract (one project at a time, failures isolated; ticks never overlap; stop waits), which the package's
+// own tests (packages/linear-sync/test/schedule.test.mjs) prove on the real code.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import * as linearSync from "@devos/linear-sync";
+
+/** As @devos/linear-sync's syncActiveProjects: one at a time, in order; a throw is recorded, the rest still sync. */
+async function syncActiveProjects({ list, syncOne }) {
+  const r = { synced: [], skipped: [], inactive: [], failed: [] };
+  for (const id of await list()) {
+    try { r[await syncOne(id)].push(id); } catch (e) { r.failed.push({ projectId: id, error: e instanceof Error ? e.message : String(e) }); }
+  }
+  return r;
+}
+
+/** As @devos/linear-sync's startSchedule: the next tick only after the current one ends; stop waits for a running tick. */
+function startSchedule(tick, { intervalMs, log }) {
+  let timer = null;
+  let running = null;
+  let stopped = false;
+  const arm = () => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      running = (async () => { try { await tick(); } catch (e) { log?.(String(e)); } })().finally(() => { running = null; arm(); });
+    }, intervalMs);
+  };
+  arm();
+  return { stop: async () => { stopped = true; clearTimeout(timer); await running; } };
+}
 import { buildLinearSync } from "../dist/linear-sync-runtime.js";
 
 const P1 = "11111111-2222-4333-8444-555555555555";
@@ -26,9 +51,8 @@ function fakeModule({ projects = [P1, P2], failFor = null } = {}) {
         return "synced";
       };
     },
-    // The real sweep and schedule from the package.
-    syncActiveProjects: linearSync.syncActiveProjects,
-    startSchedule: linearSync.startSchedule,
+    syncActiveProjects,
+    startSchedule: (tick, opts) => { seen.intervals = [...(seen.intervals ?? []), opts.intervalMs]; return startSchedule(tick, opts); },
   };
   return { mod, seen };
 }
