@@ -3,7 +3,8 @@
 // every open PR. Run by .github/workflows/cleanup-closed-pr-branch.yml on `pull_request_target: [closed]`.
 //
 // Safety (decision 2): only `kishore/devos-*` branches of this repo; never `main`, the default branch, a protected
-// branch, a branch a ruleset forbids deleting, or a branch that is the head of another open PR. Every skip is logged
+// branch, a ruleset-covered branch, the head of any open PR (this one too, if reopened), the base of an open PR, or a
+// PR that no longer re-reads as closed and unmerged. Every skip is logged
 // with its reason. This file never runs PR code: it reads only the event JSON and calls the REST API.
 //
 // Usage:
