@@ -1,5 +1,5 @@
 export { LinearClient, LinearError, LINEAR_ENDPOINT, LINEAR_KEY_NOT_SET } from "./client.js";
-export type { LinearClientOptions } from "./client.js";
+export type { LinearCallOptions, LinearClientOptions } from "./client.js";
 export { marker, withMarker, stripMarkers, readMarker } from "./markers.js";
 export type { MarkerKind } from "./markers.js";
 export { syncProject, moduleState, taskState, LANE_LABEL, INTERNAL_TASK_KINDS } from "./sync.js";
