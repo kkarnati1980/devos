@@ -268,7 +268,7 @@ export async function buildRuntime(
   const td = opts.loadTeardown ? await opts.loadTeardown().catch(() => null) : null;
   const tw = buildTeardownServices({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownServices>[0]["policy"], env, timeoutMs: t });
   if ("off" in tw) log({ level: "warn", msg: "teardown-routes-off", code: tw.off });
-  const teardown: TeardownServices = "off" in tw ? { reader: null, actions: null } : tw;
+  const teardown: TeardownServices = "off" in tw ? { reader: null, actions: null } : { ...tw, log };
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
     provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown };
 }

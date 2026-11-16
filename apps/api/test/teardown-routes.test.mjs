@@ -10,7 +10,7 @@ import { createApp } from "../dist/app.js";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { loadConfig } from "../dist/config.js";
 import { TeardownController, teardownFailure, scanView, activeCounts, TEARDOWN_ROUTE_TIMEOUT_MS } from "../dist/teardown-routes.js";
-import { kkAuthorizer } from "../dist/teardown-runtime.js";
+import { kkAuthorizer, buildTeardownServices, PrismaTeardownReader } from "../dist/teardown-runtime.js";
 import { fakeProviders } from "../../../packages/provision/test/fakes.mjs";
 
 const KK = "kk@example.com";
@@ -40,7 +40,7 @@ function fakes() {
   return { ...base, fetchImpl, calls };
 }
 
-async function start({ policy = "allow", actions: override, configured = true, login = KK, days = 30 } = {}) {
+async function start({ policy = "allow", actions: override, configured = true, login = KK, days = 30, log, readerOverride = {} } = {}) {
   const fake = fakes();
   const sleep = async () => {};
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep });
@@ -65,6 +65,7 @@ async function start({ policy = "allow", actions: override, configured = true, l
     activeResources: (id) => store.activeResources(id),
     lastScan: async () => store.scans.at(-1) ?? null,
     archiveDays: async () => days,
+    ...readerOverride,
   };
   const app = await createApp({
     config: loadConfig(ENV),
@@ -72,7 +73,7 @@ async function start({ policy = "allow", actions: override, configured = true, l
     grants: null,
     log: () => {},
     kkSessions: new KkSessionRegistry(),
-    teardown: configured ? { reader, actions } : undefined,
+    teardown: configured ? { reader, actions, log } : undefined,
   });
   await app.listen(0, "127.0.0.1");
   return { app, port: app.getHttpServer().address().port, fake, store, decisions };
@@ -254,4 +255,62 @@ test("teardownFailure, scanView and activeCounts keep only fixed codes and known
   assert.equal(scanView(null), null);
   assert.deepEqual(scanView({ hits: "nope", errors: [{ scanner: 7, error: 9 }] }), { scannedAt: "", hits: [], errors: [{ scanner: "", code: "error" }] });
   assert.deepEqual(activeCounts([{ provider: "github" }, { provider: "coolify" }, { provider: "coolify" }]), { coolify: 2, github: 1 });
+});
+
+test("pre-review 1: a run that ends after its 504 is logged by fixed code only", async () => {
+  const saved = TeardownController.timeoutMs;
+  TeardownController.timeoutMs = 30;
+  const logs = [];
+  let fail;
+  const late = { archive: () => new Promise((_, rej) => { fail = () => rej(new TeardownError("provider_error", true, "coolify said token=sk-late")); }), restore: () => new Promise((res) => setTimeout(res, 80)) };
+  const a = await start({ actions: late, log: (e) => logs.push(e) });
+  try {
+    const h = await session(a.port);
+    assert.equal((await call(a.port, "POST", `/projects/${P.id}/archive`, { headers: h })).status, 504);
+    fail();
+    assert.equal((await call(a.port, "POST", `/projects/${P.id}/restore`, { headers: h })).status, 504);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.deepEqual(logs, [
+      { level: "warn", msg: "teardown-late-failed", code: "provider_error", op: "archive", projectId: P.id },
+      { level: "info", msg: "teardown-late-done", op: "restore", projectId: P.id },
+    ]);
+    assert.ok(!JSON.stringify(logs).includes("sk-late"));
+  } finally { TeardownController.timeoutMs = saved; await a.app.close(); }
+});
+
+test("pre-review 3: a restore that succeeded answers 200 even when the re-read fails", async () => {
+  const a = await start({ actions: { archive: async () => ({ archivedAt: new Date(), purgeAfter: new Date() }), restore: async () => {} }, readerOverride: { project: async () => { throw new Error("db down"); } } });
+  try {
+    const h = await session(a.port);
+    const r = await call(a.port, "POST", `/projects/${P.id}/restore`, { headers: h });
+    assert.deepEqual([r.status, r.json], [200, { stage: null }]);
+  } finally { await a.app.close(); }
+});
+
+test("pre-review 4: production wiring is off with a code; the reader bounds every query and defaults archive_days to 30", async () => {
+  const base = { mod: {}, td: {}, db: {}, databaseUrl: "postgresql://x", vault: { reveal: async () => null }, policy: { decide: async () => ({ enforcedOutcome: "deny" }) }, env: {}, timeoutMs: 1000 };
+  assert.deepEqual(buildTeardownServices({ ...base, td: null }), { off: "teardown-not-loaded" });
+  assert.deepEqual(buildTeardownServices({ ...base, mod: null }), { off: "teardown-not-loaded" });
+  assert.deepEqual(buildTeardownServices({ ...base, vault: null }), { off: "teardown-vault-not-configured" });
+  const offCfg = buildTeardownServices(base);
+  assert.ok("off" in offCfg && /^provision-/.test(offCfg.off), JSON.stringify(offCfg));
+
+  const opts = [];
+  const db = {
+    $transaction: async (fn, o) => { opts.push(o); return fn({
+      project: { findUnique: async ({ where }) => (where.slug === "acme" ? { id: P.id, slug: "acme", stage: "archived", archivedAt: null, purgeAfter: null } : null) },
+      appSettings: { findFirst: async () => null },
+    }); },
+  };
+  const store = { project: async () => null, activeResources: async () => [{ provider: "github", kind: "repo", id: "r" }], lastScan: async () => null };
+  const reader = new PrismaTeardownReader(db, store, 777);
+  assert.equal(await reader.archiveDays(), 30);
+  assert.deepEqual(await reader.projectBySlug("acme"), { id: P.id, slug: "acme", stage: "archived", archivedAt: null, purgeAfter: null });
+  assert.equal(await reader.projectBySlug("zzz"), null);
+  assert.deepEqual(await reader.activeResources(P.id), [{ provider: "github", kind: "repo" }]);
+  assert.deepEqual(opts, [{ timeout: 777, maxWait: 777 }, { timeout: 777, maxWait: 777 }, { timeout: 777, maxWait: 777 }]);
+  let d;
+  const auth = kkAuthorizer({ decide: async (r) => ((d = r), { enforcedOutcome: "require_approval" }) }, { identity: { id: "kk:a@b", type: "kk" } }, P.id);
+  assert.equal(await auth("teardown.restore", `project:${P.id}`), "require_approval");
+  assert.deepEqual(d, { identity: { id: "kk:a@b", type: "kk" }, action: { type: "teardown.restore", resource: `project:${P.id}`, projectId: P.id } });
 });

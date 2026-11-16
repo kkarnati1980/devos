@@ -34,6 +34,8 @@ export interface TeardownActions {
 export interface TeardownServices {
   reader: TeardownReader | null;
   actions: TeardownActions | null;
+  /** Pre-review 1: the outcome of a run that ended after its 504 is logged by fixed code (absent → not logged). */
+  log?: (e: Record<string, unknown>) => void;
 }
 
 /** Decision 4: TeardownError codes → HTTP status; the body carries only the code. */
@@ -90,9 +92,18 @@ export function activeCounts(rows: readonly { provider: string }[]): Record<stri
   return out;
 }
 
-function bounded<T>(p: Promise<T>, ms: number): Promise<T> {
+/**
+ * The run raced against the route bound. After a 504 the run goes on under the project lock; its late outcome is
+ * logged by fixed code only (`teardown-late-done` / `teardown-late-failed`), so "still running" and "failed" differ.
+ */
+function bounded<T>(p: Promise<T>, ms: number, late: (e: Record<string, unknown>) => void): Promise<T> {
   let t: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => { t = setTimeout(() => reject(httpError(504, "teardown-timeout")), ms); });
+  const timeout = new Promise<never>((_, reject) => {
+    t = setTimeout(() => {
+      p.then(() => late({ level: "info", msg: "teardown-late-done" }), (e) => late({ level: "warn", msg: "teardown-late-failed", code: teardownFailure(e).code }));
+      reject(httpError(504, "teardown-timeout"));
+    }, ms);
+  });
   return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 }
 
@@ -114,6 +125,10 @@ export class TeardownController {
   private actions(): TeardownActions {
     if (!this.svc.reader || !this.svc.actions) throw httpError(503, "teardown-not-configured");
     return this.svc.actions;
+  }
+
+  private late(op: string, projectId: string) {
+    return (e: Record<string, unknown>) => { try { this.svc.log?.({ ...e, op, projectId }); } catch { /* logging never fails a route */ } };
   }
 
   private read<T>(p: Promise<T>): Promise<T> {
@@ -155,7 +170,7 @@ export class TeardownController {
     const days = await this.read(this.reader().archiveDays());
     if (!Number.isInteger(days) || days < 1 || days > 365) throw httpError(503, "archive-days-invalid");
     const session = this.kk.mint(req.devos.login!);
-    const r = await bounded(actions.archive(session, id, days), TeardownController.timeoutMs).catch((e) => {
+    const r = await bounded(actions.archive(session, id, days), TeardownController.timeoutMs, this.late("archive", id)).catch((e) => {
       if (e && typeof e === "object" && typeof (e as { getStatus?: unknown }).getStatus === "function") throw e;
       const f = teardownFailure(e);
       throw httpError(f.status, f.code);
@@ -169,12 +184,13 @@ export class TeardownController {
     if (!UUID.test(id)) throw httpError(400, "invalid:id");
     const actions = this.actions();
     const session = this.kk.mint(req.devos.login!);
-    await bounded(actions.restore(session, id), TeardownController.timeoutMs).catch((e) => {
+    await bounded(actions.restore(session, id), TeardownController.timeoutMs, this.late("restore", id)).catch((e) => {
       if (e && typeof e === "object" && typeof (e as { getStatus?: unknown }).getStatus === "function") throw e;
       const f = teardownFailure(e);
       throw httpError(f.status, f.code);
     });
-    const p = await this.read(this.reader().project(id));
+    // Pre-review 3: the restore succeeded; a failed re-read must not turn that into an error KK would retry.
+    const p = await this.reader().project(id).catch(() => null);
     return { stage: p?.stage ?? null };
   }
 }
