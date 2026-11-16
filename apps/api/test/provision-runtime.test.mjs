@@ -1,7 +1,7 @@
 // DEVOS-224 (M2.4-d1, docs/modules/M2.4.md "d1 runtime wiring"): the sweep's wiring, over a fake @devos/provision.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildProvisionSweep, policyAuthorizer, provisionConfig, PROVISIONER_IDENTITY } from "../dist/provision-runtime.js";
+import { buildProvisionSweep, buildProvisioner, policyAuthorizer, provisionConfig, PROVISIONER_IDENTITY } from "../dist/provision-runtime.js";
 
 const ENV = {
   DEVOS_GITHUB_OWNER: "devos-bot",
@@ -151,4 +151,21 @@ test("d1 wiring: off, with a fixed code, without a vault or any required setting
   }
   for (const ip of ["100.64.0.0", "100.127.255.255", "100.100.1.2"]) assert.ok(!("off" in provisionConfig({ ...ENV, DEVOS_TAILNET_IP: ip })), ip);
   assert.deepEqual(wire({ w: { env: { ...ENV, DEVOS_PROJECT_PORTS: "bad" } } }).job, { off: "provision-port-range-invalid" });
+});
+
+test("d3b: buildProvisioner runs one project with the sweep's full step list and policy, and is off like the sweep", async () => {
+  const { rec, w } = wire();
+  const pv = buildProvisioner(w);
+  const probe = { id: "22222222-2222-4222-8222-222222222222", slug: "devos-probe-m24", name: "probe" };
+  assert.equal(await pv.ready(), null);
+  await pv.run(probe);
+  assert.equal(rec.runs.length, 1);
+  assert.equal(rec.runs[0].id, probe.id);
+  assert.equal(rec.runs[0].keys.length, 11);
+  assert.equal(rec.runs[0].keys.at(-1), "backup_schedule/nightly");
+  await rec.runs[0].authorize("provision.github.repo", `project:${probe.id}/github/repo`);
+  assert.equal(rec.decided.at(-1).action.projectId, probe.id, "every create goes through the policy for the probe project");
+  assert.deepEqual(buildProvisioner({ ...w, vault: null }), { off: "provision-vault-not-configured" });
+  const noTok = wire({ tokens: { coolify_api_token: null } });
+  assert.equal(await buildProvisioner(noTok.w).ready(), "provision-coolify-token-not-set");
 });

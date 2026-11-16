@@ -17,6 +17,7 @@ COPY packages/analyst/package.json packages/analyst/
 COPY packages/card-batch/package.json packages/card-batch/
 COPY packages/db/package.json packages/db/
 COPY packages/intake/package.json packages/intake/
+COPY packages/isolation/package.json packages/isolation/
 COPY packages/linear-sync/package.json packages/linear-sync/
 COPY packages/policy/package.json packages/policy/
 COPY packages/provision/package.json packages/provision/
