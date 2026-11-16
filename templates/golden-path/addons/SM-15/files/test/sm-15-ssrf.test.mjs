@@ -4,11 +4,24 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import https from "node:https";
 import { SafeFetchError, safeFetch } from "../src/safe-fetch.mjs";
-import { fetchUserUrl, makeUserUrlFetcher, parseUserUrl, publicMessage, USER_URL_LIMITS } from "../src/user-url.mjs";
+import { fetchUserUrl, makeUserUrlFetcher, parseUserUrl, publicMessage, USER_URL_LIMITS, USER_URL_PORTS } from "../src/user-url.mjs";
 
 let srv, port;
 const timers = new Set();
+// Egress guard (pre-review, low): every socket these tests open must go to the loopback stub. safeFetch pins the
+// address through the request's lookup option, so read it there; any other target throws before a socket exists,
+// and safeFetch reports it as code "request". A regression then fails the test with no real egress.
+const realRequest = { http: http.request, https: https.request };
+const pinned = (o) => { let a; o.lookup?.(o.hostname, {}, (_e, addr) => { a = addr; }); return a; };
+for (const [name, mod] of [["http", http], ["https", https]]) {
+  mod.request = function guarded(o, ...rest) {
+    if (pinned(o) !== "127.0.0.1") throw new Error(`test egress guard: refused a socket to ${o.hostname}`);
+    return realRequest[name].call(this, o, ...rest);
+  };
+}
+
 before(async () => {
   srv = http.createServer((req, res) => {
     if (req.url === "/ok") { res.end("hello"); return; }
@@ -23,6 +36,7 @@ before(async () => {
     }
     const hop = req.url.match(/^\/hop\/(\d+)$/);
     if (hop) { const n = Number(hop[1]); res.writeHead(302, { location: n > 0 ? `/hop/${n - 1}` : "/ok" }); res.end(); return; }
+    if (req.url === "/to-port-8080") { res.writeHead(302, { location: "http://far.test:8080/ok" }); res.end(); return; }
     const to = { "/to-metadata": "http://169.254.169.254/latest/meta-data/", "/to-loopback-v6": "http://[::1]/",
       "/to-decimal": "http://2130706433/", "/to-internal-name": "http://internal.test/", "/to-file": "file:///etc/passwd",
       "/to-gopher": "gopher://127.0.0.1:6379/_INFO", "/to-mapped": "http://[::ffff:10.0.0.1]/" }[req.url];
@@ -33,20 +47,22 @@ before(async () => {
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   port = srv.address().port;
 });
-after(() => { for (const t of timers) clearInterval(t); srv.closeAllConnections(); srv.close(); });
+after(() => { http.request = realRequest.http; https.request = realRequest.https; for (const t of timers) clearInterval(t); srv.closeAllConnections(); srv.close(); });
 
 // Names the resolver answers in these tests. Any other name fails to resolve, so no case here can open a socket
 // to a real address even if a check regressed (the case would then fail with "dns").
 const NAMES = {
   "localhost": ["127.0.0.1"], "localhost.": ["127.0.0.1"], "internal.test": ["10.1.2.3"], "metadata.google.internal": ["169.254.169.254"],
   "mixed.test": ["93.184.216.34", "192.168.1.5"], "v6ula.test": ["fd00::1"], "v6mapped.test": ["::ffff:127.0.0.1"],
-  "nip.test": ["127.0.0.1"], "aws6.test": ["fd00:ec2::254"],
+  "nip.test": ["127.0.0.1"], "aws6.test": ["fd00:ec2::254"], "far.test": ["93.184.216.34"],
 };
 const lookup = async (h) => { if (!NAMES[h]) { const e = new Error("not found"); e.code = "ENOTFOUND"; throw e; }
   return NAMES[h].map((address) => ({ address, family: address.includes(":") ? 6 : 4 })); };
 
 // The stub stands in for a public server: "public.test" reaches it only through this test wrapper, the one bypass.
-const viaStub = (url, o) => safeFetch(url, { ...o, allowHosts: ["public.test"], lookup: async (h) => (h === "public.test" ? [{ address: "127.0.0.1", family: 4 }] : lookup(h)) });
+// The stub listens on a random port, so the wrapper adds that one port to the user-URL ports (the same seam).
+const withStubPort = (o) => ({ ...o, allowPorts: [...o.allowPorts, port] });
+const viaStub = (url, o) => safeFetch(url, { ...withStubPort(o), allowHosts: ["public.test"], lookup: async (h) => (h === "public.test" ? [{ address: "127.0.0.1", family: 4 }] : lookup(h)) });
 const stubFetch = makeUserUrlFetcher({ transport: viaStub });
 const pub = (path) => `http://public.test:${port}${path}`;
 
@@ -107,14 +123,14 @@ test("SM-15-L1 corpus: DNS rebinding: one lookup per request and per hop, and a 
   // The resolver answers the stub's address once, then an internal one: a second lookup for the connection would
   // have gone to 10.9.9.9 and failed.
   let seen = 0;
-  const rebinding = makeUserUrlFetcher({ transport: (url, o) => safeFetch(url, { ...o, allowHosts: ["public.test"],
+  const rebinding = makeUserUrlFetcher({ transport: (url, o) => safeFetch(url, { ...withStubPort(o), allowHosts: ["public.test"],
     lookup: async () => [{ address: ++seen === 1 ? "127.0.0.1" : "10.9.9.9", family: 4 }] }) });
   const r = await rebinding(pub("/ok"), { timeoutMs: 2000 });
   assert.equal(r.status, 200); assert.equal(r.text(), "hello");
   assert.equal(seen, 1, "one lookup, and the socket used its answer");
   // Over redirects: one lookup per hop, never more.
   let perHop = 0;
-  const counting = makeUserUrlFetcher({ transport: (url, o) => safeFetch(url, { ...o, allowHosts: ["public.test"],
+  const counting = makeUserUrlFetcher({ transport: (url, o) => safeFetch(url, { ...withStubPort(o), allowHosts: ["public.test"],
     lookup: async () => { perHop++; return [{ address: "127.0.0.1", family: 4 }]; } }) });
   assert.equal((await counting(pub("/hop/1"))).status, 200);   // /hop/1 -> /hop/0 -> /ok
   assert.equal(perHop, 3, "one lookup per hop");
@@ -140,7 +156,7 @@ test("SM-15-L1 caps: a caller may lower each cap but never raise it; the default
   const spy = makeUserUrlFetcher({ transport: async (url, o) => { calls.push({ url, o }); return { status: 200 }; } });
   await spy("https://example.com/a?b=1", { headers: { accept: "text/html" } });
   assert.deepEqual(calls[0], { url: "https://example.com/a?b=1", o: { method: "GET", headers: { accept: "text/html" },
-    timeoutMs: USER_URL_LIMITS.timeoutMs, maxBytes: USER_URL_LIMITS.maxBytes, maxRedirects: USER_URL_LIMITS.maxRedirects, allowHosts: [], lookup: undefined } });
+    timeoutMs: USER_URL_LIMITS.timeoutMs, maxBytes: USER_URL_LIMITS.maxBytes, maxRedirects: USER_URL_LIMITS.maxRedirects, allowHosts: [], allowPorts: [80, 443], lookup: undefined } });
   await spy("https://example.com/", { timeoutMs: 100, maxBytes: 10, maxRedirects: 0, method: "head" });
   assert.deepEqual([calls[1].o.timeoutMs, calls[1].o.maxBytes, calls[1].o.maxRedirects, calls[1].o.method], [100, 10, 0, "HEAD"]);
   for (const bad of [{ timeoutMs: USER_URL_LIMITS.timeoutMs + 1 }, { maxBytes: USER_URL_LIMITS.maxBytes + 1 }, { maxRedirects: USER_URL_LIMITS.maxRedirects + 1 },
@@ -163,6 +179,17 @@ test("SM-15-L1: a user URL never uses allowHosts, a body or a method other than 
   await refused(`http://example.com/${"\u00e9".repeat(1000)}`, "url");   // 1019 characters typed, over 6000 once encoded
   assert.equal(parseUserUrl("  https://Example.COM/x  ").href, "https://example.com/x");
   assert.throws(() => makeUserUrlFetcher({ transport: "safeFetch" }), TypeError);
+});
+
+test("SM-15-L1 ports: a user URL and every redirect it follows may use only ports 80 and 443 (DEVOS-64 floor line)", async () => {
+  // far.test resolves to a public address, so only the port rule stands between it and a connection.
+  await refused("http://far.test:8080/", "port");
+  await refused("https://far.test:22/", "port");
+  await refusedBy(stubFetch, pub("/to-port-8080"), "port");
+  // An internal address on an odd port is still reported as blocked (address check first).
+  await refused("http://172.17.0.1:2375/", "blocked-address");
+  assert.equal(publicMessage(new SafeFetchError("port", "refused port 8080")), "Only links on the standard web ports can be fetched.");
+  assert.ok(Object.isFrozen(USER_URL_PORTS)); assert.deepEqual([...USER_URL_PORTS], [80, 443]);
 });
 
 test("SM-15-L1: what the user is told never says whether an internal name exists", async () => {
