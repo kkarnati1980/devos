@@ -1,0 +1,13 @@
+{
+  "id": "SM-13",
+  "name": "MyBrain integration",
+  "files": [
+    "src/mybrain-link.mjs",
+    "scripts/mybrain-scan.mjs",
+    "test/sm-13-mybrain.test.mjs"
+  ],
+  "checks": {
+    "SM-13-L1": "test/sm-13-mybrain.test.mjs"
+  },
+  "usage": "Link-out profile: MyBrain opens the app as a plain link, never in a frame and never cross-origin. In src/server.mjs's entry point wrap the server: applyLinkOut(createApp({ config })) from src/mybrain-link.mjs. Every response then carries Content-Security-Policy frame-ancestors 'none' (a route's own CSP is kept, only its frame-ancestors is forced to 'none') and X-Frame-Options: DENY, and any Access-Control-Allow-* header a route sets is removed; do not add CORS. KK's login is his tailnet identity: select SM-02 and use its tailnetLogins with identityProxy: \"tailscale-serve\". The app holds no MyBrain token, key, cookie or session; it never calls MyBrain (the embed and API modes are SM-13 Full and need KK's card). Evidence: start the app and run node scripts/mybrain-scan.mjs --url http://127.0.0.1:<port> --paths /health,/ready,<your pages> --out scan-report.json; it checks GET and a foreign-origin OPTIONS on each path, scans the repo (not test/) for a MyBrain credential name, and exits 0 only when clean."
+}
