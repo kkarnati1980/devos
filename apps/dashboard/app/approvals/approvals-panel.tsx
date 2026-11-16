@@ -129,6 +129,9 @@ export function ApprovalsPanel({ apiOrigin }: { apiOrigin: string }) {
   );
 }
 
+/** DEVOS-110: the AT13 probe's grant card (apps/api `PROBE_GRANT_CARD_ACTION`). */
+const PROBE_GRANT_CARD_ACTION = "teardown.probe-grant";
+
 function Detail({ d, busy, act, api }: {
   d: ApprovalDetail;
   busy: boolean;
@@ -142,6 +145,9 @@ function Detail({ d, busy, act, api }: {
   const [comment, setComment] = useState("");
   const pending = c.status === "pending";
   const purge = c.gate === "purge";
+  // DEVOS-110 (#173 pre-review 2): the probe's grant card always issues a fixed grant (90 days, 30 uses), so its form
+  // shows that instead of inputs the server would ignore.
+  const fixedGrant = c.action === PROBE_GRANT_CARD_ACTION;
   return (
     <section className="panel" data-testid="approval-detail">
       <h2>{c.action}</h2>
@@ -161,9 +167,15 @@ function Detail({ d, busy, act, api }: {
         <><h3>Blocked tasks</h3><ul>{d.blockedTasks.map((t) => <li key={t.id}>{t.title} <span className="muted small">{t.status}</span></li>)}</ul></>
       ) : null}
       {pending ? (
-        <form onSubmit={(e) => { e.preventDefault(); void act(() => api.approve(c.id, { expiresInHours: Number(hours), maxUses: Number(uses), ...(purge ? { confirmation: phrase } : {}) }), "Approved."); }}>
-          <label>Valid for (hours) <input type="number" required min={1} max={2160} step={1} value={hours} onChange={(e) => setHours(e.target.value)} data-testid="approve-hours" /></label>
-          <label>Uses <input type="number" required min={1} max={100} step={1} value={uses} onChange={(e) => setUses(e.target.value)} data-testid="approve-uses" /></label>
+        <form onSubmit={(e) => { e.preventDefault(); void act(() => api.approve(c.id, fixedGrant ? {} : { expiresInHours: Number(hours), maxUses: Number(uses), ...(purge ? { confirmation: phrase } : {}) }), "Approved."); }}>
+          {fixedGrant ? (
+            <p data-testid="approve-fixed">Approving gives the self-test permission for 90 days, at most 30 uses, on its own test project only.</p>
+          ) : (
+            <>
+              <label>Valid for (hours) <input type="number" required min={1} max={2160} step={1} value={hours} onChange={(e) => setHours(e.target.value)} data-testid="approve-hours" /></label>
+              <label>Uses <input type="number" required min={1} max={100} step={1} value={uses} onChange={(e) => setUses(e.target.value)} data-testid="approve-uses" /></label>
+            </>
+          )}
           {purge ? (
             <label>Type <code data-testid="purge-phrase">PURGE {c.target}</code> to confirm the deletion
               <input value={phrase} required onChange={(e) => setPhrase(e.target.value)} data-testid="approve-phrase" autoComplete="off" /></label>
