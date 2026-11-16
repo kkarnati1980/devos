@@ -26,6 +26,7 @@ before(async () => {
 [[ "$1" == -w ]] && shift 2
 echo "$*" >> "$FAKE_LOG/iptables.log"
 op="$1" ch="$2"; shift 2; f="$FAKE_NF/$ch"
+[[ "$op" == -S && -n "\${FAKE_IPT_S_SLEEP:-}" ]] && sleep "$FAKE_IPT_S_SLEEP"
 case "$op" in
   -S) [[ -f "$f" ]] || exit 1; [[ "$ch" == INPUT || "$ch" == FORWARD ]] && echo "-P $ch DROP" || echo "-N $ch"; cat "$f" ;;
   -C) [[ -f "$f" ]] && grep -qxF -- "-A $ch $*" "$f" ;;
@@ -52,8 +53,12 @@ while IFS= read -r l; do
 done <<<"$in"
 if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sleep 0.3; fi`);
   // curl: logs argv (to prove the token is not on it) and prints FAKE_STATE; FAKE_CURL_RC fails the fetch.
-  w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
+  w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ -z "\${FAKE_CURL_SLEEP:-}" ]] || sleep "$FAKE_CURL_SLEEP"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
   w("tailscale", `exit 1`);
+  // conntrack (S4-b2d): logs argv; FAKE_CT_RC fails it with another message; with no match the real one exits 1.
+  w("conntrack", `echo "$*" >> "$FAKE_LOG/conntrack.log"; [[ "\${FAKE_CT_RC:-0}" == 0 ]] || { echo "conntrack v1.4.7 (conntrack-tools): Operation failed: injected" >&2; exit "$FAKE_CT_RC"; }
+[[ -n "\${FAKE_CT_NOMATCH:-}" ]] && { echo "conntrack v1.4.7 (conntrack-tools): 0 flow entries have been deleted." >&2; exit 1; }
+echo "conntrack v1.4.7 (conntrack-tools): 3 flow entries have been deleted." >&2`);
   up = net.createServer((s) => s.end()).listen(0, "127.0.0.1");
   await new Promise((r) => up.once("listening", r));
   upPort = up.address().port;
@@ -519,4 +524,220 @@ test("S4-b2b (pre-review): broken markers (an orphan BEGIN) are refused and the 
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /markers in .* are broken \(hand edit\?\); not written/);
   assert.equal(afterRules(h), broken, "nothing after the orphan BEGIN is dropped");
+});
+
+// --- S4-b2d: conntrack clean-up for stacks whose rights shrank, and the run deadline -------------------------
+const ctLog = (h) => { const f = path.join(h, "log/conntrack.log"); return fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim().split("\n").filter(Boolean) : []; };
+const pending = (h) => path.join(h, "devos/isolation/conntrack.pending");
+
+test("S4-b2d: the first apply cuts the pool's old connections once; an unchanged run cuts nothing", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h), ["-D -s 10.208.0.0/14"]);
+  assert.equal(fs.existsSync(pending(h)), false);
+  assert.equal(run(h).code, 0);
+  assert.equal(ctLog(h).length, 1, "no clean-up on an unchanged run");
+});
+
+test("S4-b2d: only stacks that lost a right are cut (egress revoked, tailnet removed, stack gone); a grant cuts nothing", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const n0 = ctLog(h).length;
+  // Grant: alpha gains egress -> nothing cut.
+  setState(h, { stacks: [STATE.stacks[0], { ...STATE.stacks[1], egress: true }] });
+  assert.equal(run(h).code, 0);
+  assert.equal(ctLog(h).length, n0, "a grant cuts nothing");
+  // Revoke beta's egress (idx 257 -> 10.209.1.0/24) and alpha's tailnet entry (idx 0 -> 10.208.0.0/24).
+  setState(h, { stacks: [{ ...STATE.stacks[0], egress: false }, { ...STATE.stacks[1], egress: true, tailnet: [] }] });
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n0).sort(), ["-D -s 10.208.0.0/24", "-D -s 10.209.1.0/24"]);
+  // Remove beta entirely.
+  const n1 = ctLog(h).length;
+  setState(h, { stacks: [{ ...STATE.stacks[1], egress: true, tailnet: [] }] });
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n1), ["-D -s 10.209.1.0/24"]);
+});
+
+test("S4-b2d: 'no entry matched' counts as done; a failed clean-up is kept pending and retried next tick", () => {
+  const h = host(STATE);
+  assert.equal(run(h, [], { FAKE_CT_NOMATCH: "1" }).code, 0, "0 flow entries deleted is a success");
+  assert.equal(fs.existsSync(pending(h)), false);
+  setState(h, { stacks: [STATE.stacks[1]] });
+  let r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /conntrack clean-up incomplete, retried next tick: 10\.209\.1\.0\/24/);
+  assert.match(r.out, /self-test passed; old connections not yet cut/);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24");
+  assert.match(nf(h, "DEVOS-ISO-FWD"), /alpha\/preview/, "the new block is in place regardless");
+  r = run(h);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /unchanged/);
+  assert.equal(ctLog(h).at(-1), "-D -s 10.209.1.0/24", "retried on the unchanged tick");
+  assert.equal(fs.existsSync(pending(h)), false);
+});
+
+test("S4-b2d (Codex PR163-r4): a pending cut is retried on a tick whose state fetch fails or whose document is refused", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  setState(h, { stacks: [STATE.stacks[1]] });
+  assert.equal(run(h, [], { FAKE_CT_RC: "2" }).code, 1);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24");
+  // The state endpoint is down: the fetch fails, but the queued cut still runs and the list is cleared.
+  let r = run(h, [], { FAKE_CURL_RC: "7" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /state fetch failed \(curl exit 7\): nothing changed/);
+  assert.equal(ctLog(h).at(-1), "-D -s 10.209.1.0/24", "retried before the fetch");
+  assert.equal(fs.existsSync(pending(h)), false);
+  // A refused document: same, and a cut that fails again stays pending.
+  setState(h, { stacks: [STATE.stacks[0]] });
+  assert.equal(run(h, [], { FAKE_CT_RC: "2" }).code, 1);
+  const n = ctLog(h).length;
+  setState(h, "{\"stacks\":[{\"slug\":\"BAD\"}]}");
+  r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /refused/);
+  assert.ok(ctLog(h).length > n, "retried before validation");
+  assert.ok(fs.existsSync(pending(h)), "still pending after another failure");
+  // Disabled by --remove: no cut is attempted (the block is off on purpose).
+  fs.writeFileSync(path.join(h, "devos/isolation/disabled"), "x\n");
+  const m = ctLog(h).length;
+  assert.equal(run(h).code, 4);
+  assert.equal(ctLog(h).length, m);
+});
+
+test("S4-b2d: a pending list entry that is not a pool source is never passed to conntrack", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(pending(h), "0.0.0.0/0\n-F\n10.209.1.0/24\n");
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(1), ["-D -s 10.209.1.0/24"]);
+});
+
+test("S4-b2d: no change starts after the run deadline; nothing changes and the next tick retries", () => {
+  const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=0\n" });
+  const r = run(h, [], { FAKE_CURL_SLEEP: "1.2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /deadline: \d+ s spent before the change \(limit 0 s\); nothing changed/);
+  assert.equal(restores(h), 0);
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+  const ok = host(STATE);
+  assert.equal(run(ok, [], { FAKE_CURL_SLEEP: "1.2" }).code, 0, "the default 25 s deadline allows a slow fetch");
+});
+
+test("Codex PR163-r1: a deadline used up by the iptables queries just before the change still defers it; nothing changes", () => {
+  // The first apply makes no iptables query before the early check, so it passes; install_block's queries then
+  // take 2 s each, past the 1 s deadline, and iptables-restore must not start.
+  const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=1\n" });
+  const r = run(h, [], { FAKE_IPT_S_SLEEP: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /deadline: \d+ s spent before the change \(limit 1 s\); nothing changed/);
+  assert.equal(restores(h), 0, "iptables-restore never started");
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+  assert.equal(fs.existsSync(pending(h)), false, "the cut queued for the deferred change is withdrawn");
+  assert.equal(fs.existsSync(installed(h)), false, "nothing recorded");
+  const ok = run(h, [], {});
+  assert.equal(ok.code, 0, ok.out);
+});
+
+test("S4-b2d (pre-review): a failed boot step after a revoke still cuts the revoked stack, now and on later ticks", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD); // M0.1's block gone: boot persistence fails from now on
+  const n0 = ctLog(h).length;
+  setState(h, { stacks: [STATE.stacks[1]] });
+  let r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24", "queued before the change");
+  r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /not persisted for boot/);
+  assert.equal(ctLog(h).at(-1), "-D -s 10.209.1.0/24", "the unchanged tick still runs the clean-up");
+  assert.equal(fs.existsSync(pending(h)), false);
+  assert.ok(ctLog(h).length > n0);
+});
+
+test("S4-b2d (pre-review): a drift repair (same block re-installed) cuts the whole pool", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "nf/DEVOS-ISO-FWD"), ""); // hand flush
+  const n0 = ctLog(h).length;
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n0), ["-D -s 10.208.0.0/14"]);
+});
+
+test("S4-b2d (pre-review): the block kept after an already-failing probe is cut too", () => {
+  const h = host(STATE);
+  targets(h, downPort);
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /block kept/);
+  assert.deepEqual(ctLog(h), ["-D -s 10.208.0.0/14"]);
+});
+
+test("S4-b2d (pre-review): without the conntrack tool the run says so, exits 1 and keeps the cut pending", () => {
+  const h = host(STATE);
+  const nob = path.join(h, "bin");
+  fs.mkdirSync(nob);
+  for (const f of fs.readdirSync(bin)) if (f !== "conntrack") fs.symlinkSync(path.join(bin, f), path.join(nob, f));
+  // Only the core tools the script needs, so a real conntrack in /usr/bin cannot be found.
+  const core = path.join(h, "core");
+  fs.mkdirSync(core);
+  for (const t of ["bash", "jq", "flock", "sed", "grep", "cat", "cut", "sort", "comm", "head", "tr", "mv", "rm", "mkdir", "chmod",
+    "date", "sha256sum", "timeout", "awk", "ls", "paste", "mktemp", "stat", "sleep", "kill", "printf", "env"]) {
+    const w = spawnSync("bash", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
+    if (w.startsWith("/")) fs.symlinkSync(w, path.join(core, t));
+  }
+  const r = run(h, [], { PATH: `${nob}:${core}` });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /conntrack not installed/);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.0.0/14");
+  assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/, "the block itself does not need conntrack");
+});
+
+test("S4-b2d (pre-review r2): the cut is queued before the change, so a failed record cannot lose it", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  setState(h, { stacks: [STATE.stacks[1]] });
+  fs.mkdirSync(path.join(h, "devos/isolation/installed.rules.tmp")); // record() cannot write its temp file
+  const r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /could not record/);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24", "queued before iptables-restore ran");
+});
+
+test("S4-b2d (pre-review r2): a rolled-back change leaves the pending list as it was (no NAT reset for nothing)", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(pending(h), "10.208.3.0/24\n"); // an older cut still due
+  const l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [STATE.stacks[1]] }); // would cut beta's /24
+    // Codex PR163-r4: a due cut is now retried before the fetch, so conntrack keeps failing here to keep it due.
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid), FAKE_CT_RC: "2" });
+    assert.match(r.out, /rolled back to the previous block/);
+    assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.3.0/24", "beta's cut was dropped with the rollback");
+  } finally { l.stop(); }
+  const f = host(STATE);
+  setState(f, { stacks: [STATE.stacks[1]] });
+  assert.equal(run(f, [], { FAKE_RESTORE_RC: "1" }).code, 1);
+  assert.equal(fs.existsSync(pending(f)), false, "a refused restore queues nothing");
+});
+
+test("S4-b2d (pre-review r2): drift plus a state change in one tick still cuts the whole pool", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "nf/DEVOS-ISO-FWD"), "");
+  setState(h, { stacks: [...STATE.stacks, { slug: "gamma", env: "live", idx: 9, egress: false, tailnet: [] }] });
+  const n0 = ctLog(h).length;
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n0), ["-D -s 10.208.0.0/14"]);
+});
+
+test("S4-b2d (pre-review r2): a pending entry with an octet above 255 is dropped, not retried forever", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(pending(h), "10.208.999.0/24\n");
+  assert.equal(run(h).code, 0);
+  assert.equal(ctLog(h).length, 1, "only the first apply's pool cut");
 });
