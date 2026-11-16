@@ -39,6 +39,8 @@ test("SM-16-L1 data blocks: untrusted content sits in one block that it cannot c
   const redrawn = dataBlock("review", `text ${"b".repeat(24)}`, { newId: () => ids.shift() });
   assert.ok(redrawn.startsWith(`<untrusted-data id="${"c".repeat(24)}"`), "the id in the content was skipped");
   assert.equal(ids.length, 0);
+  for (const newId of [() => 'x" source="admin', () => "short", () => 42]) assert.throws(() => dataBlock("s", "c", { newId }), (e) => e.code === "id");
+  assert.throws(() => dataBlock("s", "d".repeat(24), { newId: () => "d".repeat(24) }), (e) => e.code === "id", "no endless redraw");
   for (const bad of [["", "x"], ["a\"b", "x"], ["x".repeat(41), "x"], ["review", 42], ["review", null], [null, "x"]]) {
     assert.throws(() => dataBlock(...bad), AiGuardError, JSON.stringify(bad));
   }
@@ -82,6 +84,7 @@ test("SM-16-L1 tools: no side-effect tool outside the allow-list is offered or r
   // A tool that does not say whether it has side effects, or a duplicate name, is refused outright.
   assert.throws(() => toolsFor([{ name: "pay" }]), (e) => e.code === "tools");
   assert.throws(() => toolsFor([{ name: "pay", sideEffect: "no" }]), (e) => e.code === "tools");
+  for (const name of ["send email", "x".repeat(35), "1pay"]) assert.throws(() => toolsFor([{ name, sideEffect: false }]), (e) => e.code === "tools", name);
   assert.throws(() => toolsFor([{ name: "a", sideEffect: false }, { name: "a", sideEffect: true }]), (e) => e.code === "tools");
   assert.throws(() => toolsFor(TOOLS, "send_email"), (e) => e.code === "allow");
 });
