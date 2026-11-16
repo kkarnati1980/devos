@@ -3,7 +3,8 @@
 # `secret-scan` red on every open PR. The logic and every safety check live in scripts/ci/cleanup-closed-pr-branch.mjs.
 #
 # pull_request_target runs with this repo's token, so this workflow NEVER checks out or runs PR code: the checkout
-# below is the base repo's default-branch commit (no `ref`), sparse to scripts/ci, with no stored credentials. The
+# below takes no `ref`, so it is GITHUB_SHA, a commit of this repo's own branch (note 0029), sparse to scripts/ci,
+# with no stored credentials. The
 # branch name reaches the script only through the event file, never through `${{ }}` in a shell line.
 name: cleanup-closed-pr-branch
 on:

@@ -37,6 +37,8 @@ const happy = (over = {}) => ({
   [`GET /repos/${REPO}/branches/${B}`]: { status: 200, body: { name: B, protected: false } },
   [`GET /repos/${REPO}/rules/branches/${B}`]: { status: 200, body: [] },
   [`GET /repos/${REPO}/pulls?state=open&per_page=100&head=${encodeURIComponent(`kkarnati1980:${B}`)}`]: { status: 200, body: [] },
+  [`GET /repos/${REPO}/pulls?state=open&per_page=100&base=${encodeURIComponent(B)}`]: { status: 200, body: [] },
+  [`GET /repos/${REPO}/pulls/999`]: { status: 200, body: { number: 999, state: "closed", merged: false } },
   [`DELETE /repos/${REPO}/git/refs/heads/${B}`]: { status: 204, body: null },
   [`POST /repos/${REPO}/issues/999/comments`]: { status: 201, body: { id: 1 } },
   ...over,
@@ -53,7 +55,7 @@ test("AT1 closed, unmerged kishore/devos-999-x: the branch is deleted and the co
   assert.deepEqual(post.body, { body: COMMENT });
   assert.match(COMMENT, /Restore branch/);
   // the checks run before the delete, the comment after it
-  assert.deepEqual(calls.map((c) => c.method), ["GET", "GET", "GET", "DELETE", "POST"]);
+  assert.deepEqual(calls.map((c) => c.method), ["GET", "GET", "GET", "GET", "GET", "DELETE", "POST"]);
   assert.ok(logs.some((l) => l.startsWith("deleted:")));
 });
 
@@ -76,6 +78,27 @@ test("AT3 the branch is also the head of another open PR: not deleted", async ()
   assert.equal(r.deleted, false);
   assert.match(r.reason, /open PR #1000/);
   assert.ok(!calls.some((c) => c.method === "DELETE" || c.method === "POST"));
+});
+
+test("AT3a the closed PR was reopened before the job ran (it heads an open PR again, or re-reads as open): not deleted", async () => {
+  for (const over of [
+    { [`GET /repos/${REPO}/pulls?state=open&per_page=100&head=${encodeURIComponent(`kkarnati1980:${B}`)}`]: { status: 200, body: [{ number: 999, head: { ref: B } }] } },
+    { [`GET /repos/${REPO}/pulls/999`]: { status: 200, body: { number: 999, state: "open", merged: false } } },
+    { [`GET /repos/${REPO}/pulls?state=open&per_page=100&base=${encodeURIComponent(B)}`]: { status: 200, body: [{ number: 1001 }] } },
+  ]) {
+    const { api, calls } = fakeApi(happy(over));
+    const r = await cleanup({ event: event(), repo: REPO, api });
+    assert.equal(r.deleted, false, JSON.stringify(over));
+    assert.ok(!calls.some((c) => c.method === "DELETE" || c.method === "POST"));
+  }
+});
+
+test("AT3d a 422 at delete counts as gone only for 'Reference does not exist'; any other 422 fails the run with no comment", async () => {
+  const gone = fakeApi(happy({ [`DELETE /repos/${REPO}/git/refs/heads/${B}`]: { status: 422, body: { message: "Reference does not exist" } } }));
+  assert.equal((await cleanup({ event: event(), repo: REPO, api: gone.api })).deleted, false);
+  const refused = fakeApi(happy({ [`DELETE /repos/${REPO}/git/refs/heads/${B}`]: { status: 422, body: { message: "Cannot delete this protected branch" } } }));
+  await assert.rejects(cleanup({ event: event(), repo: REPO, api: refused.api }), /delete .*HTTP 422/);
+  assert.ok(!refused.calls.some((c) => c.method === "POST"));
 });
 
 test("AT3b a protected branch, a ruleset-covered branch or an unreadable rule list: not deleted", async () => {
@@ -145,7 +168,7 @@ test("AT6 the workflow never checks out or runs PR code", () => {
     for (const step of job.steps) {
       if (step.uses) {
         assert.match(step.uses, /^actions\/checkout@[0-9a-f]{40}$/, `${name}: only a SHA-pinned checkout is used`);
-        assert.equal(step.with?.ref, undefined, "checkout takes no ref, so it is the base repo's default-branch commit");
+        assert.equal(step.with?.ref, undefined, "checkout takes no ref, so it is GITHUB_SHA on this repo's own branch");
         assert.equal(step.with?.repository, undefined);
         assert.equal(step.with?.["persist-credentials"], false);
       }

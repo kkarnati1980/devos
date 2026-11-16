@@ -104,18 +104,36 @@ export async function cleanup({ event, repo, api, log = () => {} }) {
     log(`skip: ${reason}`); return { deleted: false, reason };
   }
 
-  // 3. It must not be the head of another open PR.
+  // 3. It must not be the head of any open PR (the closed PR itself included: it may have been reopened since the
+  //    event fired, pre-review finding 1), nor the base of one (deleting a base closes the PRs that target it).
   const open = await api("GET", `/repos/${repo}/pulls?state=open&per_page=100&head=${encodeURIComponent(`${owner}:${branch}`)}`);
   if (open.status !== 200 || !Array.isArray(open.body)) fail(`list open PRs for ${branch}`, open);
-  const others = open.body.filter((p) => p?.number !== pr && p?.head?.ref === branch);
-  if (others.length > 0) {
-    const reason = `branch ${branch} is the head of open PR ${others.map((p) => `#${p.number}`).join(", ")}`;
+  const heads = open.body.filter((p) => p?.head?.ref === branch);
+  if (heads.length > 0) {
+    const reason = `branch ${branch} is the head of open PR ${heads.map((p) => `#${p.number}`).join(", ")}`;
+    log(`skip: ${reason}`); return { deleted: false, reason };
+  }
+  const based = await api("GET", `/repos/${repo}/pulls?state=open&per_page=100&base=${encodeURIComponent(branch)}`);
+  if (based.status !== 200 || !Array.isArray(based.body)) fail(`list PRs based on ${branch}`, based);
+  if (based.body.length > 0) {
+    const reason = `branch ${branch} is the base of open PR ${based.body.map((p) => `#${p?.number}`).join(", ")}`;
     log(`skip: ${reason}`); return { deleted: false, reason };
   }
 
-  // 4. Delete, then tell the PR how to restore it.
+  // 4. The PR must still be closed and unmerged right before the delete (it may have been reopened).
+  const now = await api("GET", `/repos/${repo}/pulls/${pr}`);
+  if (now.status !== 200) fail(`re-read PR #${pr}`, now);
+  if (now.body?.state !== "closed" || now.body?.merged !== false) {
+    const reason = `PR #${pr} is no longer closed and unmerged (state ${now.body?.state}, merged ${now.body?.merged})`;
+    log(`skip: ${reason}`); return { deleted: false, reason };
+  }
+
+  // 5. Delete, then tell the PR how to restore it. A 422 is "gone" only when GitHub says the ref does not exist; any
+  //    other 422 (a protection or ruleset that appeared after the checks) fails the run (pre-review finding 3).
   const del = await api("DELETE", `/repos/${repo}/git/refs/heads/${refPath(branch)}`);
-  if (del.status === 404 || del.status === 422) { const reason = `branch ${branch} was already gone at delete`; log(`skip: ${reason}`); return { deleted: false, reason }; }
+  if (del.status === 404 || (del.status === 422 && /reference does not exist/i.test(String(del.body?.message ?? "")))) {
+    const reason = `branch ${branch} was already gone at delete`; log(`skip: ${reason}`); return { deleted: false, reason };
+  }
   if (del.status !== 204) fail(`delete ${branch}`, del);
   log(`deleted: ${branch} (PR #${pr} closed without merging)`);
   const c = await api("POST", `/repos/${repo}/issues/${pr}/comments`, { body: COMMENT });
