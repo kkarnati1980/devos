@@ -52,7 +52,7 @@ while IFS= read -r l; do
 done <<<"$in"
 if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sleep 0.3; fi`);
   // curl: logs argv (to prove the token is not on it) and prints FAKE_STATE; FAKE_CURL_RC fails the fetch.
-  w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; cat "$FAKE_STATE"`);
+  w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
   w("tailscale", `exit 1`);
   up = net.createServer((s) => s.end()).listen(0, "127.0.0.1");
   await new Promise((r) => up.once("listening", r));
@@ -315,6 +315,36 @@ test("AT8 --remove leaves only the M0.1/M0.2 rules", () => {
   assert.equal(nf(h, "DEVOS-ISO-IN"), null);
   assert.equal(fs.existsSync(installed(h)), false);
   assert.equal(run(h, ["--remove"]).code, 0, "remove is idempotent");
+});
+
+test("S4-b2a: --remove keeps the block off (isolation/disabled) until KK deletes the marker", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  assert.equal(run(h, ["--remove"]).code, 0);
+  const marker = path.join(h, "devos/isolation/disabled");
+  assert.ok(fs.existsSync(marker), "--remove writes the marker");
+  const before = restores(h);
+  const r = run(h);
+  assert.equal(r.code, 4, r.out);
+  assert.match(r.out, /disabled: --remove was run; delete .*isolation\/disabled/);
+  assert.equal(restores(h), before, "a disabled run changes nothing");
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+  assert.equal(run(h, ["--dry-run"]).code, 0, "--dry-run still works while disabled");
+  fs.rmSync(marker);
+  assert.equal(run(h).code, 0, "deleting the marker turns the block back on");
+  assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/);
+});
+
+test("S4-b2a (Codex PR158-r1): a --remove that lands while a run fetches the state still wins", () => {
+  const h = host(STATE);
+  const marker = path.join(h, "devos/isolation/disabled");
+  fs.mkdirSync(path.dirname(marker), { recursive: true });   // --remove creates it
+  const before = restores(h);
+  // The fake curl writes the marker during the fetch, as a --remove finishing in that window would.
+  const r = run(h, [], { FAKE_CURL_TOUCH: marker });
+  assert.equal(r.code, 4, r.out);
+  assert.equal(restores(h), before, "nothing applied after the marker appeared");
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
 });
 
 test("skipped (exit 3) without a token; refuses a non-loopback state URL", () => {

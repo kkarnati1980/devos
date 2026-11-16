@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.0.1
+# Version: 1.1.0
+# v1.1.0 (DEVOS-127, S4-b2a): --remove also writes $DEVOS_DIR/isolation/disabled, and an apply run refuses with
+# exit 4 while that file exists, so KK's console rollback is not undone by the agent's next tick. To turn the
+# block back on: rm /root/.devos/isolation/disabled (the next agent tick applies it again).
 # v1.0.1 (DEVOS-237): the token minimum is 32 characters (was 16), the same as the API.
 # Contract: docs/modules/S4.md (decisions 1-5, S4-b). Run as root by the server agent (allow-list, D1-passed
 # SHA only) or by KK for --remove. Never run with arguments taken from GitHub content.
 #
 #   isolation-apply.sh            fetch the approved state, apply the block if it changed, self-test, roll back
 #   isolation-apply.sh --dry-run  fetch the state and print the generated block; changes nothing
-#   isolation-apply.sh --remove   delete the S4 jumps and chains; M0.1/M0.2 rules stay as they are
+#   isolation-apply.sh --remove   delete the S4 jumps and chains and keep them off (isolation/disabled);
+#                                 M0.1/M0.2 rules stay as they are
 #
 # The block is two chains, DEVOS-ISO-FWD (jumped to first from DOCKER-USER and from FORWARD, so tailscaled's
 # own `ts-forward` jump at FORWARD 1 cannot accept tailnet-bound pool traffic before it) and DEVOS-ISO-IN (jumped to first
@@ -27,7 +31,8 @@
 # DevOS API) runs before and after: if it passed before and fails after, the previous block is restored (or
 # the block removed if there was none); if it already failed before, the block is kept and the failure
 # reported. One run at a time ($DEVOS_DIR/isolation/.lock). Worst case stays under the agent's 60 s timeout.
-# Exit 0 applied or unchanged, 1 failed (previous block kept or restored), 3 skipped (not set up yet).
+# Exit 0 applied or unchanged, 1 failed (previous block kept or restored), 3 skipped (not set up yet),
+# 4 disabled by --remove (nothing changed).
 # Prints no token and no secret.
 set -uo pipefail
 DIR="${DEVOS_DIR:-/root/.devos}"
@@ -64,9 +69,14 @@ remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if n
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
-  if remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"; echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched)"; exit 0; fi
+  if remove_block; then
+    rm -f "$ISO/installed.rules" "$ISO/live.sha256"
+    date -u +%FT%TZ > "$ISO/disabled" || { echo "removed, but could not write $ISO/disabled: the agent will apply the block again"; exit 1; }
+    echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched); kept off until $ISO/disabled is deleted"; exit 0
+  fi
   echo "remove failed: some S4 rules are still in place (see iptables -S DOCKER-USER / INPUT)"; exit 1
 fi
+[[ "$MODE" == apply && -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 
 for c in jq curl flock iptables iptables-restore; do
   command -v "$c" >/dev/null 2>&1 || { echo "skipped: $c not installed"; exit 3; }
@@ -232,6 +242,9 @@ selftest() {  # every target host:port must accept a TCP connection within 3 s
 mkdir -p "$ISO" && chmod 700 "$ISO" || { echo "cannot create $ISO"; exit 1; }
 # One run at a time (the agent tick and KK's --remove must not interleave).
 exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply run holds $ISO/.lock"; exit 3; }
+# Codex PR158-r1: --remove may have run (and released the lock) while this run fetched the state, so the marker
+# is checked again under the lock, before anything is applied.
+[[ -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
