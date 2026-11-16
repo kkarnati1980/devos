@@ -1089,3 +1089,122 @@ if out="$(gh_all_runs abc)"; then echo "ok \${#out}"; else echo "fail $(ls "$TMP
   fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(out, "fail 0\nfail 0", "a failed or non-JSON page must fail the call and leave no temp files");
 });
+
+// ---- DEVOS-234 d3c-3: checks/provision-probe.sh steps the AT13 probe detached in the API container ----
+// Fakes on PATH: `docker` (ps → one API id; `exec` runs the command here, `exec -d` runs it in the background) and
+// `node` (the probe CLI: `step` replays FAKE_DIR/steps line by line as "exit|sleep|json", `report` prints
+// FAKE_DIR/report as "exit|json"). PROBE_STATE_DIR stands in for /tmp/devos-probe inside the container.
+const PCHECK = path.join(ROOT, "scripts/server/checks/provision-probe.sh");
+function probeFakes({ steps = [], report = "3|{}", api = true } = {}) {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-pcheck-"));
+  const w = (n, body) => { fs.writeFileSync(path.join(bin, n), `#!/usr/bin/env bash\n${body}\n`); fs.chmodSync(path.join(bin, n), 0o755); };
+  fs.writeFileSync(path.join(bin, "steps"), steps.join("\n") + "\n");
+  fs.writeFileSync(path.join(bin, "report"), report + "\n");
+  w("docker", `echo "$*" >> "$FAKE_DIR/docker.args"
+case "$1" in
+  ps) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit 0;;
+  exec) shift; if [[ "$1" == -d ]]; then shift 2; shift; ( sleep "\${FAKE_DSLEEP:-0}"; sh -c "$2" ) >/dev/null 2>&1 & exit 0; fi
+        shift; shift; exec sh -c "$2";;
+esac
+exit 1`);
+  w("node", `[[ "$1 $2 $3" == "deploy/with-db-url.mjs node apps/api/dist/provision-probe-cli.js" ]] || exit 99
+case "$4" in
+  step) n=$(cat "$FAKE_DIR/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/n"
+        l="$(sed -n "\${n}p" "$FAKE_DIR/steps")"; [[ -n "$l" ]] || exit 98
+        IFS='|' read -r rc sl js <<<"$l"; sleep "$sl"; echo "$js"; exit "$rc";;
+  report) IFS='|' read -r rc js < "$FAKE_DIR/report"; echo "$js"; exit "$rc";;
+esac
+exit 97`);
+  return { bin, state: path.join(bin, "state"), api };
+}
+function runProbeCheck(f, { finishBy = "20", dsleep = "0" } = {}) {
+  const r = spawnSync("bash", [PCHECK], {
+    env: { PATH: `${f.bin}:${process.env.PATH}`, FAKE_DIR: f.bin, FAKE_API: f.api ? "1" : "0", PROBE_STATE_DIR: f.state,
+           PROBE_POLL_SECONDS: "0.2", PROBE_FINISH_BY_SECONDS: finishBy, PROBE_EXEC_SECONDS: "10", FAKE_DSLEEP: dsleep },
+    encoding: "utf8",
+  });
+  const args = fs.existsSync(path.join(f.bin, "docker.args")) ? fs.readFileSync(path.join(f.bin, "docker.args"), "utf8") : "";
+  const steps = Number(fs.existsSync(path.join(f.bin, "n")) ? fs.readFileSync(path.join(f.bin, "n"), "utf8") : 0);
+  return { code: r.status, out: r.stdout + r.stderr, args, steps };
+}
+const pj = (o) => JSON.stringify({ command: "step", ...o });
+const inProg = (phase) => `3|0|${pj({ exit: 3, phase, cycle: 1, code: "in_progress" })}`;
+
+test("DEVOS-234 d3c-3 provision-probe: steps detached until the cycle ends; a passed cycle passes", () => {
+  const f = probeFakes({ steps: [inProg("run1"), inProg("inventory1"), inProg("run2"), `0|0|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const r = runProbeCheck(f);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.steps, 4);
+  assert.match(r.out, /probe cycle passed/);
+  // every step was started detached (docker exec -d), never as a blocking exec
+  assert.equal((r.args.match(/^exec -d abcdef123456 sh -c .*provision-probe-cli\.js step/gm) ?? []).length, 4, r.args);
+  assert.doesNotMatch(r.args.split("\n").filter((l) => !l.startsWith("exec -d")).join("\n"), /cli\.js step/);
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a failed cycle fails; the probe off (no grant) is skipped", () => {
+  const fail = probeFakes({ steps: [inProg("purge"), `1|0|${pj({ exit: 1, phase: "done", cycle: 1, code: "inventory-differs" })}`] });
+  const r1 = runProbeCheck(fail);
+  assert.equal(r1.code, 1, r1.out);
+  assert.match(r1.out, /failed \(code inventory-differs\)/);
+  const off = probeFakes({ steps: [`3|0|${pj({ exit: 3, phase: "idle", cycle: 0, code: "skipped", detail: "probe-purge-not-approved" })}`] });
+  const r2 = runProbeCheck(off);
+  assert.equal(r2.code, 3, r2.out);
+  assert.equal(r2.steps, 1);
+  for (const f of [fail, off]) fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: between cycles it reports the newest finished cycle (read-only report)", () => {
+  const probed = `3|0|${pj({ exit: 3, phase: "done", cycle: 2, code: "probed", detail: "pass" })}`;
+  for (const [report, want] of [["0|{\"command\":\"report\",\"code\":\"pass\"}", 0], ["1|{\"command\":\"report\",\"code\":\"purge-failed\"}", 1], ["3|{\"command\":\"report\",\"code\":\"no-cycle\"}", 3]]) {
+    const f = probeFakes({ steps: [probed], report });
+    const r = runProbeCheck(f);
+    assert.equal(r.code, want, r.out);
+    assert.equal(r.steps, 1);
+    assert.match(r.out, /report: \{"command":"report"/);
+    fs.rmSync(f.bin, { recursive: true, force: true });
+  }
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a step longer than the time box is left running and picked up by the next run", () => {
+  const f = probeFakes({ steps: [`0|3|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const first = runProbeCheck(f, { finishBy: "1" });
+  assert.equal(first.code, 3, first.out);
+  assert.match(first.out, /still in progress/);
+  // a second run while it still runs starts nothing new; once it ends, its result is read exactly once
+  spawnSync("sleep", ["3.5"]);
+  const second = runProbeCheck(f);
+  assert.equal(second.code, 0, second.out);
+  assert.equal(second.steps, 1, "the step was run once in all");
+  assert.ok(fs.existsSync(path.join(f.state, "rc.last")) && !fs.existsSync(path.join(f.state, "rc")));
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a detached start that is slow to run is never started twice", () => {
+  const f = probeFakes({ steps: [inProg("run1"), `0|0|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const r = runProbeCheck(f, { dsleep: "1" });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.steps, 2, "one step per start, none doubled");
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a step whose process is gone without an exit code is started again", () => {
+  const f = probeFakes({ steps: [`0|0|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  fs.mkdirSync(f.state);
+  fs.writeFileSync(path.join(f.state, "pid"), "999999\n"); // no such process
+  const r = runProbeCheck(f);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.steps, 1);
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: skipped without docker's API container; a CLI usage exit fails", () => {
+  const none = probeFakes({ api: false });
+  const r1 = runProbeCheck(none);
+  assert.equal(r1.code, 3, r1.out);
+  assert.match(r1.out, /no running DevOS API container/);
+  assert.equal(r1.steps, 0);
+  const usage = probeFakes({ steps: [`2|0|{"error":"usage"}`] });
+  assert.equal(runProbeCheck(usage).code, 1);
+  for (const f of [none, usage]) fs.rmSync(f.bin, { recursive: true, force: true });
+});
