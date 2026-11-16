@@ -319,7 +319,7 @@ test("DEVOS-110: the CLI's live-assert wiring uses the purge kit's module and cl
   // Another project's journal gives this probe no ids: every check reports its missing row, nothing is read.
   const other = world();
   const codes = await liveAssertsFor({ provisionMod: other.mod, gh: "GH", cf: "CF" }, db, "22222222-2222-4222-8222-222222222222", 4321)();
-  // (capCodes may fold the tail into one "more-<n>" code.)
-  assert.ok(codes.length > 0 && codes.every((c) => c.startsWith("journal-missing:") || /^more-\d+$/.test(c)), codes.join(","));
+  // (capCodes folds the tail into one "more-<n>" code; pre-review low 2: the exact list.)
+  assert.deepEqual(codes, ["journal-missing:coolify/application/preview", "journal-missing:coolify/application/production", "more-2"]);
   assert.deepEqual(other.reads, [], "no provider read without a journalled id");
 });
