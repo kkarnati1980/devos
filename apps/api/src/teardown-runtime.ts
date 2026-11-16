@@ -3,6 +3,7 @@
 // call), PrismaTeardownStore with the provisioning advisory lock, and the M1.7 engine deciding for KK's own session
 // (never `allowAll`). Off, with a code, when the modules, the vault or the provisioning settings are missing.
 import type { KkSession } from "./auth.js";
+import type { LinearTeardownParts } from "./linear-sync-runtime.js";
 import { provisionConfig, vaultToken, type ProvisionModule } from "./provision-runtime.js";
 import { teardownWiring, type ProvisionTeardownModule, type TeardownModule, type TeardownStoreLike } from "./teardown-wiring.js";
 import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
@@ -82,6 +83,8 @@ export function buildTeardownServices(w: {
   policy: TeardownPolicy;
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
+  /** DEVOS-247: the Linear teardown parts (null when the Linear sync is off). */
+  linear?: LinearTeardownParts | null;
 }): TeardownServices | { off: string } {
   if (!w.mod || !w.td) return { off: "teardown-not-loaded" };
   if (!w.vault) return { off: "teardown-vault-not-configured" };
@@ -94,7 +97,7 @@ export function buildTeardownServices(w: {
   const gh = new w.mod.GitHubClient({ token: vaultToken(w.vault as never, "github_token") });
   const cf = new w.mod.CoolifyClient({ origin: cfg.coolifyOrigin, token: vaultToken(w.vault as never, "coolify_api_token") });
   const ops = async (projectId: string) =>
-    (await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs })).ops;
+    (await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs, linear: w.linear ?? null })).ops;
   const actions: TeardownActions = {
     archive: async (session, projectId, windowDays) =>
       td.archiveProject(projectId, { store, authorize: kkAuthorizer(w.policy, session, projectId), ops: await ops(projectId), windowDays }) as Promise<{ archivedAt: Date; purgeAfter: Date }>,
@@ -152,6 +155,8 @@ export function buildTeardownSweep(w: {
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
   log: TeardownSweepDeps["log"];
+  /** DEVOS-247: the Linear teardown parts (null when the Linear sync is off). */
+  linear?: LinearTeardownParts | null;
 }): TeardownSweepJob | { off: string } {
   if (!w.mod || !w.td) return { off: "teardown-not-loaded" };
   if (!w.vault) return { off: "teardown-vault-not-configured" };
@@ -195,7 +200,7 @@ export function buildTeardownSweep(w: {
       return rows.find((g) => g.uses === 0 && g.maxUses >= 1)?.id ?? null;
     },
     purge: async (projectId, grantId, cardCreatedAt) => {
-      const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs });
+      const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs, linear: w.linear ?? null });
       const authorize = purgeCardAuthorizer(w.policy, projectId, grantId, cardCreatedAt, async () => (await store.project(projectId))?.archivedAt ?? null);
       return td.purgeProject(projectId, { store, authorize, ops: wiring.ops, scanners: wiring.scanners, preflight: wiring.preflight });
     },

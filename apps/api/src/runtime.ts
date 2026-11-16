@@ -32,7 +32,7 @@ import { PrismaProvisionReader, type ProvisionServices } from "./provision-route
 import type { TeardownServices } from "./teardown-routes.js";
 import { buildTeardownServices, buildTeardownSweep, type TeardownRuntimeModule, type TeardownSweepCards } from "./teardown-runtime.js";
 import type { TeardownSweepJob } from "./teardown-sweep.js";
-import { buildLinearSync, type LinearSyncJob, type LinearSyncModule } from "./linear-sync-runtime.js";
+import { buildLinearSync, buildLinearTeardown, type LinearSyncJob, type LinearSyncModule, type LinearTeardownModule } from "./linear-sync-runtime.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -272,9 +272,16 @@ export async function buildRuntime(
     : { off: opts.loadProvision ? "provision-load-failed" : "provision-not-loaded" };
   const provisionSweep = "off" in sweep ? null : sweep;
   if ("off" in sweep) log({ level: "warn", msg: "provision-sweep-off", code: sweep.off });
+  // DEVOS-163/247 (M2.6-b2b): @devos/linear-sync, used by the sync job and by every teardown (AT7).
+  const lsMod = opts.loadLinearSync ? await opts.loadLinearSync().catch(() => null) : null;
+  const pe = (loaded?.mod as { ProviderError?: unknown } | undefined)?.ProviderError;
+  const lt = buildLinearTeardown({ mod: lsMod as Partial<LinearTeardownModule> | null, db, vault, env,
+    providerError: typeof pe === "function" ? (p, c, m, st) => new (pe as new (...a: unknown[]) => Error)(p, c, m, st) : null });
+  if ("off" in lt && lt.off !== "linear-sync-disabled") log({ level: "warn", msg: "linear-teardown-off", code: lt.off });
+  const linearTeardown = typeof lt === "function" ? lt : null;
   // DEVOS-244 (M2.5-b1): archive/restore for KK, on the same provider modules and vault as the sweep.
   const td = opts.loadTeardown ? await opts.loadTeardown().catch(() => null) : null;
-  const tw = buildTeardownServices({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownServices>[0]["policy"], env, timeoutMs: t });
+  const tw = buildTeardownServices({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownServices>[0]["policy"], env, timeoutMs: t, linear: linearTeardown });
   if ("off" in tw) log({ level: "warn", msg: "teardown-routes-off", code: tw.off });
   const teardown: TeardownServices = "off" in tw ? { reader: null, actions: null } : { ...tw, log };
   // DEVOS-245 (M2.5-b2): purge cards and purges under their grants, on the same modules, vault and approvals core.
@@ -283,13 +290,12 @@ export async function buildRuntime(
     raise: (card) => approvalsCore.raiseCard(card),
     expire: (ids, reason) => approvalsCore.expireCardsById(ids, reason),
   };
-  const ts = buildTeardownSweep({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownSweep>[0]["policy"], cards: purgeCards, env, timeoutMs: t, log });
+  const ts = buildTeardownSweep({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownSweep>[0]["policy"], cards: purgeCards, env, timeoutMs: t, log, linear: linearTeardown });
   if ("off" in ts) log({ level: "warn", msg: "teardown-sweep-off", code: ts.off });
   const teardownSweep = "off" in ts ? null : ts;
   // DEVOS-246 (M2.5-b3): the panel's purge card link and KK's early ask go through the same job's card rules.
   const teardownRoutes: TeardownServices = { ...teardown, purge: teardownSweep };
   // DEVOS-163 (M2.6-b2b1): the 10-minute Linear sync over active projects; off unless DEVOS_LINEAR_SYNC=on.
-  const lsMod = opts.loadLinearSync ? await opts.loadLinearSync().catch(() => null) : null;
   const ls = buildLinearSync({ mod: lsMod, db, vault, env, log });
   if ("off" in ls) log({ level: ls.off === "linear-sync-disabled" ? "info" : "warn", msg: "linear-sync-off", code: ls.off });
   const linearSync = "off" in ls ? null : ls;

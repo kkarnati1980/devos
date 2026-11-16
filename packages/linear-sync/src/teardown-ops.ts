@@ -1,0 +1,123 @@
+// M2.6-b2b2 (DEVOS-247, AT7, docs/modules/M2.6.md "M2.6-b2b2 decisions"): the Linear side of M2.5's teardown.
+// Archive marks the project's Linear project completed, Restore marks it started again, and Purge archives it in
+// Linear (never deletes it); the purge then marks its `resource` rows deleted (G2 evidence). Every Linear write runs
+// under the same per-project advisory lock as the sync (`devos:linear-sync`), so a sync that is mid-run never
+// interleaves with it. Shaped as `@devos/provision` ResourceOps / LeftoverScanner (structurally; no dependency).
+import { LinearError } from "./client.js";
+import { readMarker } from "./markers.js";
+import { type PrismaLike } from "./prisma-store.js";
+import type { LinearTeardownApi } from "./types.js";
+
+/** The provider error codes `@devos/teardown` understands (`@devos/provision` ProviderError). */
+export type TeardownErrorCode = "network" | "timeout" | "http" | "bad-response" | "no-token";
+/** Builds the caller's provider error (in production `new ProviderError("linear", code, message, status)`). */
+export type MakeError = (code: TeardownErrorCode, message: string, status?: number) => Error;
+
+export interface LinearInventoryItem { provider: string; kind: string; externalId: string; name: string }
+export interface LinearResourceOps {
+  provider: "linear";
+  kind: "project" | "milestone";
+  inspect(item: LinearInventoryItem): Promise<{ owned: boolean } | null>;
+  remove(item: LinearInventoryItem): Promise<void>;
+  archive?(item: LinearInventoryItem): Promise<void>;
+  unarchive?(item: LinearInventoryItem): Promise<void>;
+}
+
+/** Longest a teardown write waits for a running sync to release the project's lock. */
+export const TEARDOWN_LOCK_WAIT_MS = 60_000;
+/** The lock transaction's bound: the wait, one Linear write (client timeout 15 s, writes never retried) and slack. */
+export const TEARDOWN_LOCK_TX_MS = 120_000;
+
+/**
+ * Maps any failure to the caller's provider error with a fixed message (Linear's own error text is never passed on:
+ * it ends up in cards and logs). Network, timeout, 5xx and 429 stay transient, so the teardown retries them.
+ */
+export function toProviderError(e: unknown, makeError: MakeError, what: string): Error {
+  if (e instanceof LinearError) {
+    switch (e.code) {
+      case "network": return makeError("network", `linear ${what}: network error`);
+      case "timeout": return makeError("timeout", `linear ${what}: timed out`);
+      case "rate-limited": return makeError("http", `linear ${what}: rate limited`, 429);
+      case "http": return makeError("http", `linear ${what}: HTTP ${e.status ?? "error"}`, e.status);
+      default: return makeError("bad-response", `linear ${what}: refused or unexpected response`);
+    }
+  }
+  if (e instanceof Error && e.message === "linear-key-not-set") return makeError("no-token", `linear ${what}: the Linear key is not set`);
+  if (e instanceof Error && e.message === "linear-sync-lock-busy") return makeError("timeout", `linear ${what}: a Linear sync still holds the project's lock`);
+  return makeError("bad-response", `linear ${what}: unexpected error`);
+}
+
+/**
+ * Runs `fn` while holding the project's sync lock. Unlike the sync (which skips a held lock), a teardown write waits
+ * for it, at most TEARDOWN_LOCK_WAIT_MS (Postgres `lock_timeout` covers advisory locks); a lock still held after that
+ * is `linear-sync-lock-busy`, which the caller maps to a retryable timeout. The transaction only holds the lock.
+ */
+export async function withSyncLock<T>(db: PrismaLike, projectId: string, fn: () => Promise<T>,
+                                      o: { waitMs?: number; txMs?: number } = {}): Promise<T> {
+  const waitMs = o.waitMs ?? TEARDOWN_LOCK_WAIT_MS;
+  const txMs = o.txMs ?? TEARDOWN_LOCK_TX_MS;
+  if (!Number.isInteger(waitMs) || waitMs < 1 || txMs <= waitMs) throw new Error("linear-sync: teardown lock bounds are invalid");
+  return db.$transaction(async (tx: any) => {
+    await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = ${waitMs}`);
+    try {
+      // `::text`: pg_advisory_xact_lock returns void, which the raw query cannot read back.
+      await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('devos:linear-sync'), hashtext($1))::text AS ok`, projectId);
+    } catch {
+      throw new Error("linear-sync-lock-busy");
+    }
+    return fn();
+  }, { timeout: txMs, maxWait: 10_000 });
+}
+
+/**
+ * The teardown ops for one DevOS project's Linear rows (provider `linear`).
+ * - `project`: proven ours by its marker (`devos-ref: project/<id>`) and by the row's name (the DevOS project id).
+ *   Archive → status completed; Restore → status started; Purge → archived in Linear. A Linear project that is
+ *   already archived or gone counts as removed, so a re-run after a crash does not write again.
+ * - `milestone`: a milestone is archived with its project and has no Linear write of its own; its row is marked
+ *   deleted by the purge (inspect answers "nothing left to remove").
+ */
+export function linearTeardownOps(db: PrismaLike, api: LinearTeardownApi, projectId: string, makeError: MakeError): LinearResourceOps[] {
+  const call = async <T>(what: string, fn: () => Promise<T>): Promise<T> => {
+    try { return await fn(); } catch (e) { throw toProviderError(e, makeError, what); }
+  };
+  const locked = (what: string, fn: () => Promise<void>) => call(what, () => withSyncLock(db, projectId, fn));
+  const project: LinearResourceOps = {
+    provider: "linear",
+    kind: "project",
+    async inspect(item) {
+      const p = await call("project lookup", () => api.projectState(item.externalId));
+      if (!p || p.archivedAt) return null;
+      return { owned: item.name === projectId && readMarker(p.description, "project") === projectId };
+    },
+    archive: (item) => locked("project complete", () => api.setProjectStatus(item.externalId, "completed")),
+    unarchive: (item) => locked("project restart", () => api.setProjectStatus(item.externalId, "started")),
+    remove: (item) => locked("project archive", () => api.archiveProject(item.externalId)),
+  };
+  const milestone: LinearResourceOps = {
+    provider: "linear",
+    kind: "milestone",
+    inspect: async () => null,
+    remove: async () => { throw makeError("bad-response", "linear milestone: no delete of its own (archived with its project)"); },
+  };
+  return [project, milestone];
+}
+
+/**
+ * The independent leftover check for Linear (M2.5 decision 6): the project's Linear project, found by its marker in
+ * the team (archived ones included), is a hit unless it is archived. A failed read is an error (fixed text), never "clean".
+ */
+export function linearScanner(api: LinearTeardownApi, teamKey: string, makeError: MakeError): { name: "linear"; scan(p: { id: string; slug: string }): Promise<{ provider: string; kind: string; externalId: string; name: string }[]> } {
+  return {
+    name: "linear",
+    async scan(p) {
+      let hit: Awaited<ReturnType<LinearTeardownApi["findProject"]>>;
+      try {
+        hit = await api.findProject(await api.teamId(teamKey), p.id);
+      } catch (e) {
+        throw toProviderError(e, makeError, "leftover scan");
+      }
+      return hit && !hit.archivedAt ? [{ provider: "linear", kind: "project", externalId: hit.id, name: p.id }] : [];
+    },
+  };
+}

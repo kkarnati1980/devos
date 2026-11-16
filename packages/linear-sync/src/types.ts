@@ -47,3 +47,17 @@ export interface SyncStore {
   /** M2.6-b (AT6): KK completed or cancelled a human task in Linear; the DevOS task becomes done (audited). */
   completeHumanTask(taskId: string, how: "completed" | "canceled"): Promise<boolean>;   // true when a row changed
 }
+
+/** M2.6-b2b2 (AT7): the Linear calls the teardown ops and the leftover scanner make. */
+export interface LinearTeardownApi {
+  /** The id of the team with this key; fails when there is none. */
+  teamId(key: string): Promise<string>;
+  /** As LinearApi.findProject, with `archivedAt` (null when the project is not archived). */
+  findProject(teamId: string, devosProjectId: string): Promise<{ id: string; name: string; description: string; archivedAt?: string | null } | null>;
+  /** The project by id, archived included, or null when it no longer exists. */
+  projectState(id: string): Promise<{ id: string; description: string | null; archivedAt: string | null } | null>;
+  /** Moves the project to the workspace's first project status of this type. */
+  setProjectStatus(id: string, type: "completed" | "started"): Promise<void>;
+  /** Archives the project in Linear (not a delete). */
+  archiveProject(id: string): Promise<void>;
+}
