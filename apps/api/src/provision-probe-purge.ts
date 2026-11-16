@@ -4,75 +4,13 @@
 import type { PurgeOutcome } from "./provision-probe.js";
 import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
 
-type Ops = { provider: string; kind: string };
-type Scanner = { name: string };
 type Authorize = (action: string, resource: string) => Promise<"allow" | "deny" | "require_approval">;
 
-/** The `@devos/provision` teardown exports the probe uses, read structurally (the package is loaded at run time). */
-export interface ProvisionTeardownModule {
-  pinnedGitHub(gh: unknown): Promise<unknown>;
-  pinnedCoolify(cf: unknown): Promise<unknown>;
-  githubRepoOps(gh: unknown, projectId: string): Ops;
-  githubDeployKeyOps(gh: unknown, projectId: string): Ops;
-  coolifyProjectOps(cf: unknown, projectId: string): Ops;
-  coolifyEnvironmentOps(cf: unknown, projectId: string): Ops;
-  coolifyApplicationOps(cf: unknown, projectId: string): Ops;
-  coolifyPrivateKeyOps(cf: unknown, projectId: string): Ops;
-  coolifyPortOps(): Ops;
-  backupScheduleOps(): Ops;
-  githubScanner(gh: unknown): Scanner;
-  coolifyScanner(cf: unknown): Scanner;
-  githubTokenScopeCheck(gh: unknown, o: { owner: string }): () => Promise<void>;
-  coolifyTokenScopeCheck(cf: unknown, recorded: () => Promise<readonly unknown[]>): () => Promise<void>;
-}
-
-/** The `@devos/teardown` exports the probe uses. */
-export interface TeardownModule {
-  archiveProject(projectId: string, o: Record<string, unknown>): Promise<unknown>;
-  purgeProject(projectId: string, o: Record<string, unknown>): Promise<{ purged: boolean; report: { hits: { provider: string; kind: string }[]; errors: unknown[] } }>;
-  inventoryScanner(store: unknown): Scanner;
-  vaultScanner(db: unknown, timeoutMs?: number): Scanner;
-}
-
-export interface TeardownStoreLike {
-  activeResources(projectId: string): Promise<readonly unknown[]>;
-}
-
-/**
- * Decision 2: the production teardown wiring, built once per purge from one pinned GitHub and one pinned Coolify
- * client (DEVOS-235 decision 4), so every op, scanner and check of that purge uses the same token snapshot.
- * M2.5-b (DEVOS-112) reuses it.
- */
-export async function teardownWiring(
-  pm: ProvisionTeardownModule,
-  tm: TeardownModule,
-  w: { gh: unknown; cf: unknown; store: TeardownStoreLike; db: unknown; projectId: string; owner: string; timeoutMs: number },
-): Promise<{ ops: Ops[]; scanners: Scanner[]; preflight: (() => Promise<void>)[] }> {
-  const gh = await pm.pinnedGitHub(w.gh);
-  const cf = await pm.pinnedCoolify(w.cf);
-  const id = w.projectId;
-  return {
-    ops: [
-      pm.githubRepoOps(gh, id),
-      pm.githubDeployKeyOps(gh, id),
-      pm.coolifyProjectOps(cf, id),
-      pm.coolifyEnvironmentOps(cf, id),
-      pm.coolifyApplicationOps(cf, id),
-      pm.coolifyPrivateKeyOps(cf, id),
-      pm.coolifyPortOps(),
-      pm.backupScheduleOps(),
-    ],
-    // Pre-review 1 (high): purgeProject needs a scanner per provider with ops. A backup schedule exists only as an
-    // inventory row (nothing at a provider), which the inventory scanner already sees, so its own scan is empty.
-    scanners: [tm.inventoryScanner(w.store), tm.vaultScanner(w.db, w.timeoutMs), pm.githubScanner(gh), pm.coolifyScanner(cf), BACKUP_SCHEDULE_SCANNER],
-    preflight: [pm.githubTokenScopeCheck(gh, { owner: w.owner }), pm.coolifyTokenScopeCheck(cf, () => w.store.activeResources(id))],
-  };
-}
-
-const BACKUP_SCHEDULE_SCANNER = { name: "backup_schedule", scan: async (): Promise<never[]> => [] };
-
-/** The resource string `@devos/teardown` authorizes (its `check`), shared so the grant pre-check asks the same question. */
-export const teardownResource = (projectId: string): string => `project:${projectId}`;
+// The wiring itself lives in teardown-wiring.ts (M2.5-b1); re-exported so existing imports keep working.
+export { teardownWiring, teardownResource } from "./teardown-wiring.js";
+export type { ProvisionTeardownModule, TeardownModule, TeardownStoreLike } from "./teardown-wiring.js";
+import { teardownResource } from "./teardown-wiring.js";
+import type { Ops, ProvisionTeardownModule, Scanner, TeardownModule, TeardownStoreLike } from "./teardown-wiring.js";
 
 /** Decision 3: the actions the probe's KK grant must cover; one cycle uses one of each (more on a retried purge). */
 export const PROBE_GRANT_ACTIONS = ["teardown.archive", "teardown.purge"] as const;
