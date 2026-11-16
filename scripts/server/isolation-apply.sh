@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.3.0
+# Version: 1.4.0
+# v1.4.0 (DEVOS-127, S4-b2c): the IPv6 defence-in-depth drop. Chain DEVOS-ISO6 (`-i devos-p+ -j DROP`: every IPv6
+# packet from a project bridge, which S4 names devos-p<idx>) is jumped to first from the ip6tables DOCKER-USER,
+# FORWARD and INPUT on every apply run, and kept in /etc/ufw/after6.rules for boot. A failure there does not stop
+# the IPv4 block; the run exits 1. --remove deletes it too. IPv6 tailnet entries stay refused (S4.md S4-b2c 6).
 # v1.3.0 (DEVOS-127, S4-b2d): after a successful apply, the conntrack entries of every stack whose rights shrank
 # (a rule with its /24 as source is gone: stack removed, egress or a tailnet entry revoked; on the first apply,
 # the whole pool) are deleted, so a connection opened before the change cannot outlive it. A clean-up that cannot
@@ -44,7 +48,9 @@
 # reported. One run at a time ($DEVOS_DIR/isolation/.lock). Worst case stays under the agent's 60 s timeout.
 # Exit 0 applied or unchanged, 1 failed (previous block kept or restored), 3 skipped (not set up yet),
 # 4 disabled by --remove (nothing changed).
-# Prints no token and no secret.
+# Prints no token and no secret. S4-b2c: the IPv6 step before the fetch has its own budget (V6_BUDGET 8 s, about
+# 18 s worst case) that is not counted against the IPv4 deadline; S4-b decision 11 still holds if the agent's 60 s
+# timeout kills a run: the new IPv4 block is kept, never no block.
 set -uo pipefail
 DIR="${DEVOS_DIR:-/root/.devos}"
 ISO="$DIR/isolation"
@@ -56,8 +62,10 @@ M01_END="# END DEVOS UFW AND DOCKER"
 POOL="10.208.0.0/14"
 FWD=DEVOS-ISO-FWD
 IN=DEVOS-ISO-IN
+ISO6=DEVOS-ISO6
 conf() { sed -n "s/^$1=\\([A-Za-z0-9._:\\/ -]\\{1,300\\}\\)\$/\\1/p" "$CONF" 2>/dev/null | head -n1; }
 UFW_AFTER="$(conf ISOLATION_UFW_AFTER_RULES)"; UFW_AFTER="${UFW_AFTER:-/etc/ufw/after.rules}"
+UFW_AFTER6="$(conf ISOLATION_UFW_AFTER6_RULES)"; UFW_AFTER6="${UFW_AFTER6:-/etc/ufw/after6.rules}"
 
 MODE=apply
 case "${1:-}" in
@@ -98,7 +106,8 @@ boot_text() {  # installed block in $1 -> the after.rules marker block
   echo "$BOOT_END"
 }
 boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when after.rules holds what it should
-  local f="$UFW_AFTER" rest want tmp mode
+  # S4-b2c: $2/$3/$4/$5 = file, text function, BEGIN and END markers (default: the IPv4 after.rules block)
+  local f="${2:-$UFW_AFTER}" textfn="${3:-boot_text}" BOOT_BEGIN="${4:-$BOOT_BEGIN}" BOOT_END="${5:-$BOOT_END}" rest want tmp mode
   [[ -f "$f" ]] || { [[ -z "$1" ]] && return 0; echo "boot persistence: $f missing (ufw not set up?)"; return 1; }
   # Pre-review: an orphan BEGIN (hand edit) would make the sed range delete to the end of the file, so the
   # markers must be absent, or exactly one BEGIN followed by exactly one END.
@@ -111,7 +120,7 @@ boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when 
   rest="$(sed "/^$BOOT_BEGIN/,/^$BOOT_END\$/d" "$f")" || { echo "boot persistence: cannot read $f"; return 1; }
   if [[ -n "$1" ]]; then
     grep -qxF -- "$M01_END" <<<"$rest" || { echo "boot persistence: M0.1's DEVOS UFW AND DOCKER block is not in $f; not written"; return 1; }
-    want="$rest"$'\n'"$(boot_text "$1")"
+    want="$rest"$'\n'"$("$textfn" "$1")"
     LC_ALL=C grep -q '[^ -~]' <<<"$want" && { echo "boot persistence: non-ASCII text; not written"; return 1; }
   else
     want="$rest"
@@ -122,6 +131,71 @@ boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when 
   BOOT_TMP="$tmp"; trap 'rm -f "${BOOT_TMP:-}"' EXIT; trap 'exit 143' TERM  # a timeout kill between mktemp and mv leaves no temp file
   if printf '%s\n' "$want" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$f"; then BOOT_TMP=""; return 0; fi
   rm -f "$tmp"; BOOT_TMP=""; echo "boot persistence: could not replace $f"; return 1
+}
+
+# --- S4-b2c: the IPv6 defence-in-depth drop ------------------------------------------------------------------
+# Project networks have no IPv6 and a fixed bridge name devos-p<idx> (S4-b2c decision 1), so one static rule drops
+# every IPv6 packet that enters from a project bridge, forwarded or to the host. It does not depend on the state.
+BOOT6_BEGIN="# BEGIN DEVOS S4 ISOLATION6"
+BOOT6_END="# END DEVOS S4 ISOLATION6"
+ip6t() { timeout 5 ip6tables -w 3 "$@"; }
+# Pre-review (low): the IPv6 step has its own small budget, so a hanging ip6tables cannot use up the IPv4 run:
+# no query or restore starts after V6_BUDGET s of the step (worst case about 8 + 10 s), and the time the step
+# took is not counted against the IPv4 change deadline (T0 moves forward by it).
+V6_BUDGET=8
+v6_time() { (( SECONDS - V6_T0 <= V6_BUDGET )) || { echo "IPv6 drop: time budget (${V6_BUDGET} s) used up; retried next tick"; return 1; }; }
+V6_RULE="-A $ISO6 -i devos-p+ -j DROP"
+v6_block() { printf '*filter\n:%s - [0:0]\n%s\nCOMMIT\n' "$ISO6" "$V6_RULE"; }
+boot6_text() {  # the after6.rules marker block ($1 unused: the block is static)
+  echo "$BOOT6_BEGIN (isolation-apply.sh; generated, do not edit; removed by --remove)"
+  v6_block | grep -vx 'COMMIT'
+  echo "-I DOCKER-USER 1 -j $ISO6"
+  echo "-I FORWARD 1 -j $ISO6"
+  echo "-I INPUT 1 -j $ISO6"
+  echo "COMMIT"
+  echo "$BOOT6_END"
+}
+v6_jump_ops() {  # -> restore lines that leave exactly one jump to DEVOS-ISO6, first, in each built-in chain
+  local chain n first rules
+  for chain in DOCKER-USER FORWARD INPUT; do
+    v6_time || return 1
+    rules="$(ip6t -S "$chain" 2>/dev/null)" || { echo "IPv6 drop: cannot read the IPv6 $chain chain"; return 1; }
+    n="$(grep -cxF -- "-A $chain -j $ISO6" <<<"$rules")"
+    first="$(grep '^-A ' <<<"$rules" | sed -n 1p)"
+    [[ "$n" == 1 && "$first" == "-A $chain -j $ISO6" ]] && continue
+    while (( n-- > 0 )); do echo "-D $chain -j $ISO6"; done
+    echo "-I $chain 1 -j $ISO6"
+  done
+}
+v6_sync() {  # 0 when the IPv6 drop is live (one rule, every jump first, once) and in after6.rules
+  command -v ip6tables >/dev/null 2>&1 && command -v ip6tables-restore >/dev/null 2>&1 || { echo "IPv6 drop: ip6tables not installed"; return 1; }
+  ip6t -S DOCKER-USER >/dev/null 2>&1 || { echo "IPv6 drop: the IPv6 DOCKER-USER chain is missing (M0.1 not applied?)"; return 1; }
+  local ops tx have
+  v6_time || return 1
+  have="$(ip6t -S "$ISO6" 2>/dev/null | grep '^-A ')"
+  ops="$(v6_jump_ops)" || { tail -n1 <<<"$ops"; return 1; }  # on failure the cause is its last line
+  if [[ "$have" != "$V6_RULE" || -n "$ops" ]]; then
+    tx="$(v6_block | grep -vx 'COMMIT')"$'\n'"${ops:+$ops$'\n'}COMMIT"
+    v6_time || return 1
+    printf '%s\n' "$tx" | timeout 10 ip6tables-restore -w 3 --noflush || { echo "IPv6 drop: ip6tables-restore refused the transaction"; return 1; }
+  fi
+  boot_sync x "$UFW_AFTER6" boot6_text "$BOOT6_BEGIN" "$BOOT6_END" || { echo "IPv6 drop: not persisted for boot"; return 1; }
+}
+v6_remove() {  # deletes the IPv6 jumps, the chain and the after6.rules block; 0 if nothing of it is left
+  local chain rc=0
+  if command -v ip6tables >/dev/null 2>&1; then
+    # Pre-review (low): a failed query must not read as "nothing left", so ip6tables must answer first.
+    if ip6t -S INPUT >/dev/null 2>&1; then
+      for chain in DOCKER-USER FORWARD INPUT; do
+        while ip6t -C "$chain" -j "$ISO6" 2>/dev/null; do ip6t -D "$chain" -j "$ISO6" || { rc=1; break; }; done
+      done
+      if ip6t -S "$ISO6" >/dev/null 2>&1; then ip6t -F "$ISO6" && ip6t -X "$ISO6" || rc=1; fi
+    else
+      echo "remove: ip6tables does not answer; the IPv6 drop may still be in place (ip6tables -S DEVOS-ISO6)"; rc=1
+    fi
+  fi
+  boot_sync "" "$UFW_AFTER6" boot6_text "$BOOT6_BEGIN" "$BOOT6_END" || rc=1
+  return $rc
 }
 
 # --- S4-b2d: conntrack clean-up and the run deadline ---------------------------------------------------------
@@ -169,13 +243,19 @@ ct_queue() {  # $1 = previous block, $2 = new block, $3 = 1 when the live chains
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
-  if remove_block; then
-    rm -f "$ISO/installed.rules" "$ISO/live.sha256"
-    boot_sync "" || { echo "removed, but the boot block is still in $UFW_AFTER: delete the DEVOS S4 ISOLATION lines there"; date -u +%FT%TZ > "$ISO/disabled"; exit 1; }
-    date -u +%FT%TZ > "$ISO/disabled" || { echo "removed, but could not write $ISO/disabled: the agent will apply the block again"; exit 1; }
+  # Codex PR165-r1: each step runs whatever the others did, so a failure in one family cannot leave the other's
+  # boot block in place or the agent free to re-apply. The marker comes first (the next tick sees it even if a
+  # later step fails); every failure is named and the run still exits 1.
+  RM_RC=0
+  date -u +%FT%TZ > "$ISO/disabled" || { echo "remove: could not write $ISO/disabled: the agent will apply the block again"; RM_RC=1; }
+  if remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"
+  else echo "remove: some IPv4 S4 rules are still in place (iptables -S DOCKER-USER, FORWARD, INPUT)"; RM_RC=1; fi
+  boot_sync "" || { echo "remove: the boot block is still in $UFW_AFTER: delete the DEVOS S4 ISOLATION lines there"; RM_RC=1; }
+  v6_remove || { echo "remove: the IPv6 drop or its block in $UFW_AFTER6 is still in place (ip6tables -S DEVOS-ISO6)"; RM_RC=1; }
+  if (( RM_RC == 0 )); then
     echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched); kept off until $ISO/disabled is deleted"; exit 0
   fi
-  echo "remove failed: some S4 rules are still in place (see iptables -S DOCKER-USER / INPUT)"; exit 1
+  echo "remove failed: some S4 rules are still in place (see above); kept off until $ISO/disabled is deleted"; exit 1
 fi
 [[ "$MODE" == apply && -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 
@@ -190,6 +270,19 @@ done
 if [[ "$MODE" == apply && -s "$ISO/conntrack.pending" ]]; then
   ( exec 9>"$ISO/.lock" && flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; ct_flush ) || true
 fi
+# S4-b2c decision 3: the IPv6 drop is static, so it is kept in place on every apply run before the state fetch
+# (under the lock, unless --remove turned the block off): a fetch failure or a refused document cannot hold it
+# back. A failure does not stop the IPv4 block; the run carries on and then exits 1 on every path.
+V6_RC=0
+if [[ "$MODE" == apply ]]; then
+  V6_T0=$SECONDS
+  # Pre-review (low): only a held lock skips the step; a lock file that cannot be opened is a failure.
+  V6_MSG="$(mkdir -p "$ISO" && chmod 700 "$ISO" && exec 9>"$ISO/.lock" || { echo "IPv6 drop: cannot open $ISO/.lock"; exit 1; }
+    flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; v6_sync)"; V6_RC=$?
+  T0=$(( T0 + SECONDS - V6_T0 ))
+  (( V6_RC == 0 )) || echo "IPv6 drop not in place: $V6_MSG"
+fi
+done_ok() { (( V6_RC == 0 )) || exit 1; exit 0; }  # $1 names the path, for the reader
 
 # --- 1. fetch and validate the approved state -------------------------------------------------------------
 PORT="$(conf API_INTERNAL_PORT)"; PORT="${PORT:-3002}"
@@ -244,7 +337,7 @@ while IFS=$'\t' read -r idx slug env egress tailnet; do
   if [[ -n "$tailnet" ]]; then
     read -r -a cidrs <<<"$tailnet"
     for c in "${cidrs[@]}"; do
-      v4_in_tailnet "$c" || { echo "refused: tailnet entry for $slug/$env is not an IPv4 CIDR inside 100.64.0.0/10 (IPv6 entries wait for S4-b2); nothing changed"; exit 1; }
+      v4_in_tailnet "$c" || { echo "refused: tailnet entry for $slug/$env is not an IPv4 CIDR inside 100.64.0.0/10 (IPv6 entries are refused: project networks have no IPv6, S4-b2c decision 6); nothing changed"; exit 1; }
       v4+="$c "
     done
   fi
@@ -288,7 +381,7 @@ generate() {
 }
 BLOCK="$(generate)"
 
-if [[ "$MODE" == dry ]]; then printf '%s\n' "$BLOCK"; echo "# dry run: nothing changed (${#STACKS[@]} stacks)"; exit 0; fi
+if [[ "$MODE" == dry ]]; then printf '%s\n' "$BLOCK"; echo "# dry run: nothing changed (${#STACKS[@]} stacks)"; echo "# IPv6 block (ip6tables, static; S4-b2c):"; v6_block; exit 0; fi
 
 # --- 3. apply when changed ---------------------------------------------------------------------------------
 # One iptables-restore transaction carries the chain rebuild AND the jump changes, so DOCKER-USER/INPUT never
@@ -365,7 +458,7 @@ if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK";
   rc=0; ct_flush || rc=1
   boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; exit 1; }
   (( rc == 0 )) || exit 1
-  echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
+  echo "unchanged: ${#STACKS[@]} stacks, block already in place"; done_ok "unchanged"
 fi
 
 # Probe before the change: the S4 chains match only pool sources, so they cannot break a host probe. If the
@@ -410,3 +503,4 @@ ct_ok=0; ct_flush || ct_ok=1
 boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; exit 1; }
 (( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; exit 1; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"
+done_ok "applied"

@@ -284,7 +284,12 @@ export function hardenCompose(input: unknown, env: StackEnv, net: StackNetwork, 
     s.pids_limit = l.pids;
   }
   doc.networks = {
-    [net.name]: { name: net.name, driver: "bridge", enable_ipv6: false, ipam: { config: [{ subnet: net.subnet, gateway: net.gateway }] } },
+    // S4-b2c decision 1: a fixed Linux bridge name, so the host's IPv6 drop matches `-i devos-p+`.
+    [net.name]: {
+      name: net.name, driver: "bridge", enable_ipv6: false,
+      driver_opts: { "com.docker.network.bridge.name": `devos-p${net.idx}` },
+      ipam: { config: [{ subnet: net.subnet, gateway: net.gateway }] },
+    },
   };
   return doc;
 }
