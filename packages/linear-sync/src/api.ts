@@ -203,14 +203,17 @@ export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi 
       const p = d.projects.nodes.find((x) => x.id === id);
       return p ? { id: p.id, description: p.description ?? null, archivedAt: p.archivedAt ?? null } : null;
     },
-    async setProjectStatus(id, type) {
+    async projectStatusId(type) {
       // Workspace project statuses; several can share a type, the lowest position wins (as for issue states).
       const s = await client.query<{ projectStatuses: Conn<{ id: string; type: string; position: number }> }>(
         `query { projectStatuses(first: ${PAGE}) { nodes { id type position } } }`);
       const status = [...s.projectStatuses.nodes].filter((x) => x.type === type).sort((a, b) => a.position - b.position)[0];
       if (!status) throw new LinearError("bad-response", `no Linear project status of type ${type}`);
+      return status.id;
+    },
+    async updateProjectStatus(id, statusId) {
       ok((await client.mutate<{ projectUpdate: { success: boolean } }>(
-        `mutation($id: String!, $i: ProjectUpdateInput!) { projectUpdate(id: $id, input: $i) { success } }`, { id, i: { statusId: status.id } })).projectUpdate, "project status update");
+        `mutation($id: String!, $i: ProjectUpdateInput!) { projectUpdate(id: $id, input: $i) { success } }`, { id, i: { statusId } })).projectUpdate, "project status update");
     },
     async archiveProject(id) {
       ok((await client.mutate<{ projectArchive: { success: boolean } }>(

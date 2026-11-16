@@ -56,8 +56,10 @@ export interface LinearTeardownApi {
   findProjects(teamId: string, devosProjectId: string): Promise<{ id: string; archivedAt: string | null }[]>;
   /** The project by id, archived included, or null when it no longer exists. */
   projectState(id: string): Promise<{ id: string; description: string | null; archivedAt: string | null } | null>;
-  /** Moves the project to the workspace's first project status of this type. */
-  setProjectStatus(id: string, type: "completed" | "started"): Promise<void>;
+  /** The workspace's first project status of this type (a read). */
+  projectStatusId(type: "completed" | "started"): Promise<string>;
+  /** Moves the project to that status (one write). */
+  updateProjectStatus(id: string, statusId: string): Promise<void>;
   /** Archives the project in Linear (not a delete). */
   archiveProject(id: string): Promise<void>;
 }

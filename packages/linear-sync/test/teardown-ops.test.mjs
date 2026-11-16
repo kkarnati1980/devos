@@ -33,7 +33,8 @@ function fakeApi(db, project = { id: "lp1", description: `Mirror\n\ndevos-ref: p
     teamId: async () => "team-1",
     findProjects: async (_t, pid) => [L.project, ...(L.extra ?? [])].filter((p) => p && p.description.includes(`project/${pid}`)).map((p) => ({ id: p.id, archivedAt: p.archivedAt })),
     projectState: async (id) => (L.project && L.project.id === id ? { ...L.project } : null),
-    setProjectStatus: async (id, type) => { L.writes.push(["status", id, type, db.inTx]); },
+    projectStatusId: async (type) => { L.reads = (L.reads ?? []).concat([["statusId", type, db.inTx]]); return `st-${type}`; },
+    updateProjectStatus: async (id, sid) => { L.writes.push(["status", id, sid.slice(3), db.inTx]); },
     archiveProject: async (id) => { L.writes.push(["archive", id, db.inTx]); L.project.archivedAt = "2026-11-17T00:00:00Z"; },
   };
   return L;
@@ -47,6 +48,7 @@ test("AT7: archive marks the Linear project completed, inside the sync's advisor
   assert.deepEqual(await project.inspect(row), { owned: true });
   await project.archive(row);
   assert.deepEqual(L.writes, [["status", "lp1", "completed", true]]);
+  assert.deepEqual(L.reads, [["statusId", "completed", false]], "the status read runs before the lock, not inside it");
   const q = db.log.find((x) => x[0] === "query");
   assert.match(q[1], /pg_advisory_xact_lock\(hashtext\('devos:linear-sync'\), hashtext\(\$1\)\)/);
   assert.match(q[1], /^SELECT 1 AS locked FROM \(SELECT pg_advisory_xact_lock/);
@@ -93,7 +95,7 @@ test("AT7: a milestone row has nothing of its own to remove (it is archived with
 test("errors: Linear failures map to provider errors with fixed text; transient ones stay transient; a held lock is a timeout", async () => {
   const db = fakeDb(); const L = fakeApi(db);
   const [project] = linearTeardownOps(db, L.api, PID, makeError);
-  L.api.setProjectStatus = async () => { throw new LinearError("graphql", "Linear says: <secret-looking text>"); };
+  L.api.updateProjectStatus = async () => { throw new LinearError("graphql", "Linear says: <secret-looking text>"); };
   await assert.rejects(project.archive(row), (e) => e instanceof FakeProviderError && e.code === "bad-response" && !/secret/.test(e.message));
   L.api.archiveProject = async () => { throw new LinearError("timeout", "slow"); };
   await assert.rejects(project.remove(row), (e) => e.code === "timeout");
@@ -112,6 +114,16 @@ test("errors: Linear failures map to provider errors with fixed text; transient 
   const [p3] = linearTeardownOps(broken, K.api, PID, makeError);
   await assert.rejects(p3.archive(row), (e) => e.code === "bad-response" && !/lock/.test(e.message));
   assert.deepEqual(K.writes, []);
+});
+
+test("pre-review r2: the write is fenced: refused (busy, retryable, nothing written) once less than the write margin is left", async () => {
+  const db = fakeDb(); let t = 0; let wrote = false;
+  await assert.rejects(withSyncLock(db, PID, async (guard) => { t = 70_000; await guard(); wrote = true; }, { waitMs: 60_000, txMs: 120_000, now: () => t }), /linear-sync-lock-busy/);
+  assert.equal(wrote, false);
+  t = 0;
+  await withSyncLock(db, PID, async (guard) => { t = 50_000; await guard(); wrote = true; }, { waitMs: 60_000, txMs: 120_000, now: () => t });
+  assert.equal(wrote, true);
+  assert.ok(db.log.some((x) => x[0] === "query" && x[1] === "SELECT 1"), "the guard pings the lock's transaction");
 });
 
 test("withSyncLock refuses bounds where the transaction cannot outlive the wait", async () => {
@@ -139,11 +151,12 @@ function gql(handler) {
   return { a: graphqlApi(new LinearClient({ apiKey: () => "k", fetchImpl, sleep: async () => {} })), calls };
 }
 
-test("GraphQL: the status write uses the lowest-position workspace status of the type; archive uses projectArchive", async () => {
+test("GraphQL: the status id is the lowest-position workspace status of the type; the write sends it; archive uses projectArchive", async () => {
   const { a, calls } = gql((b) => (/projectStatuses/.test(b.query)
     ? { projectStatuses: { nodes: [{ id: "st-late", type: "completed", position: 5 }, { id: "st-done", type: "completed", position: 1 }, { id: "st-go", type: "started", position: 0 }] } }
     : /projectUpdate/.test(b.query) ? { projectUpdate: { success: true } } : { projectArchive: { success: true } }));
-  await a.setProjectStatus("lp1", "completed");
+  assert.equal(await a.projectStatusId("completed"), "st-done");
+  await a.updateProjectStatus("lp1", "st-done");
   assert.deepEqual(calls[1].variables, { id: "lp1", i: { statusId: "st-done" } });
   await a.archiveProject("lp1");
   assert.match(calls[2].query, /projectArchive\(id: \$id\)/);
@@ -152,7 +165,7 @@ test("GraphQL: the status write uses the lowest-position workspace status of the
 
 test("GraphQL: no status of the type, or a refused archive, fails closed", async () => {
   const { a } = gql((b) => (/projectStatuses/.test(b.query) ? { projectStatuses: { nodes: [{ id: "st-go", type: "started", position: 0 }] } } : { projectArchive: { success: false } }));
-  await assert.rejects(a.setProjectStatus("lp1", "completed"), /no Linear project status/);
+  await assert.rejects(a.projectStatusId("completed"), /no Linear project status/);
   await assert.rejects(a.archiveProject("lp1"), /refused/);
 });
 

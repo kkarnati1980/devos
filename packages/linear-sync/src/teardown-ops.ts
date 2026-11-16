@@ -5,7 +5,7 @@
 // interleaves with it. Shaped as `@devos/provision` ResourceOps / LeftoverScanner (structurally; no dependency).
 import { LinearError } from "./client.js";
 import { readMarker } from "./markers.js";
-import { type PrismaLike } from "./prisma-store.js";
+import { WRITE_MARGIN_MS, type PrismaLike } from "./prisma-store.js";
 import type { LinearTeardownApi } from "./types.js";
 
 /** The provider error codes `@devos/teardown` understands (`@devos/provision` ProviderError). */
@@ -25,7 +25,7 @@ export interface LinearResourceOps {
 
 /** Longest a teardown write waits for a running sync to release the project's lock. */
 export const TEARDOWN_LOCK_WAIT_MS = 60_000;
-/** The lock transaction's bound: the wait, one Linear write (client timeout 15 s, writes never retried) and slack. */
+/** The lock transaction's bound: the wait, then at least WRITE_MARGIN_MS left for the one write (guarded). */
 export const TEARDOWN_LOCK_TX_MS = 120_000;
 
 /**
@@ -52,12 +52,14 @@ export function toProviderError(e: unknown, makeError: MakeError, what: string):
  * for it, at most TEARDOWN_LOCK_WAIT_MS (Postgres `lock_timeout` covers advisory locks); a lock still held after that
  * is `linear-sync-lock-busy`, which the caller maps to a retryable timeout. The transaction only holds the lock.
  */
-export async function withSyncLock<T>(db: PrismaLike, projectId: string, fn: () => Promise<T>,
-                                      o: { waitMs?: number; txMs?: number } = {}): Promise<T> {
+export async function withSyncLock<T>(db: PrismaLike, projectId: string, fn: (guard: () => Promise<void>) => Promise<T>,
+                                      o: { waitMs?: number; txMs?: number; now?: () => number } = {}): Promise<T> {
   const waitMs = o.waitMs ?? TEARDOWN_LOCK_WAIT_MS;
   const txMs = o.txMs ?? TEARDOWN_LOCK_TX_MS;
+  const now = o.now ?? Date.now;
   if (!Number.isInteger(waitMs) || waitMs < 1 || txMs <= waitMs) throw new Error("linear-sync: teardown lock bounds are invalid");
   return db.$transaction(async (tx: any) => {
+    const deadline = now() + txMs;
     await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = ${waitMs}`);
     try {
       // Wrapped so the row has a typed column: the pg adapter cannot read pg_advisory_xact_lock's void result.
@@ -67,7 +69,14 @@ export async function withSyncLock<T>(db: PrismaLike, projectId: string, fn: () 
       if (isLockTimeout(e)) throw new Error("linear-sync-lock-busy");
       throw e;
     }
-    return fn();
+    // Pre-review r2 (fencing, as the sync's LockGuard): the write starts only while the lock is held and will still be
+    // held when the write's own timeout ends; otherwise it is "busy" (retryable) and nothing is written.
+    const guard = async () => {
+      if (deadline - now() < WRITE_MARGIN_MS) throw new Error("linear-sync-lock-busy");
+      try { await tx.$queryRawUnsafe("SELECT 1"); } catch { throw new Error("linear-sync-lock-busy"); }
+      if (deadline - now() < WRITE_MARGIN_MS) throw new Error("linear-sync-lock-busy");
+    };
+    return fn(guard);
   }, { timeout: txMs, maxWait: 10_000 });
 }
 
@@ -92,7 +101,12 @@ export function linearTeardownOps(db: PrismaLike, api: LinearTeardownApi, projec
   const call = async <T>(what: string, fn: () => Promise<T>): Promise<T> => {
     try { return await fn(); } catch (e) { throw toProviderError(e, makeError, what); }
   };
-  const locked = (what: string, fn: () => Promise<void>) => call(what, () => withSyncLock(db, projectId, fn));
+  // One Linear write inside the lock, right after the guard; any read it needs (the status id) runs before the lock.
+  const locked = (what: string, write: () => Promise<void>) => call(what, () => withSyncLock(db, projectId, async (guard) => { await guard(); await write(); }));
+  const setStatus = async (what: string, id: string, type: "completed" | "started") => {
+    const statusId = await call(what, () => api.projectStatusId(type));
+    await locked(what, () => api.updateProjectStatus(id, statusId));
+  };
   const project: LinearResourceOps = {
     provider: "linear",
     kind: "project",
@@ -101,8 +115,8 @@ export function linearTeardownOps(db: PrismaLike, api: LinearTeardownApi, projec
       if (!p || p.archivedAt) return null;
       return { owned: item.name === projectId && readMarker(p.description, "project") === projectId };
     },
-    archive: (item) => locked("project complete", () => api.setProjectStatus(item.externalId, "completed")),
-    unarchive: (item) => locked("project restart", () => api.setProjectStatus(item.externalId, "started")),
+    archive: (item) => setStatus("project complete", item.externalId, "completed"),
+    unarchive: (item) => setStatus("project restart", item.externalId, "started"),
     remove: (item) => locked("project archive", () => api.archiveProject(item.externalId)),
   };
   const milestone: LinearResourceOps = {
