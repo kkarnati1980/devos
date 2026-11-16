@@ -100,6 +100,8 @@ test("DEVOS-97 (Codex PR185-r1): a key callback reporting no key set is no-key, 
   await assert.rejects(c.query("query { x }"), (e) => e instanceof LinearError && e.code === "no-key" && /not set/.test(e.message));
   await assert.rejects(c.mutate("mutation { x }"), (e) => e instanceof LinearError && e.code === "no-key");
   assert.equal(calls.length, 0, "no request without a key");
+  // Pre-review (low): the runtime key callbacks in apps/api throw this literal; pin it so a rename cannot drift.
+  assert.equal(LINEAR_KEY_NOT_SET, "linear-key-not-set");
 });
 
 test("a stalled vault read fails the call before any request starts (Codex PR35-r3: write after lock expiry)", async () => {
