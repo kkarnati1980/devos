@@ -11,6 +11,7 @@
 import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
+import { probeLiveAsserts, readProbeSteps, type AssertModule } from "./provision-probe-asserts.js";
 import { findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
@@ -73,7 +74,7 @@ export async function probeCli(argv: string[], deps: { log(): Promise<Pick<Probe
   }
 }
 
-/** d3c-1: the live asserts are wired in d3c-2b. Until then they throw a fixed code (see the contract). */
+/** The effects of a probe that is off: never called (probeStep stops at `offReason`), so they throw a fixed code. */
 const notWired = async (): Promise<never> => { throw new Error("probe-not-wired"); };
 
 // The production wiring; its pieces are tested on their own (probeCli, the parts, offReasonFor, stepWiring, buildProvisioner).
@@ -115,7 +116,8 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           record: (r) => log.record(r),
           provisionOnce: () => probeProvisionOnce(pv, p),
           inventory: () => readProbeInventory(db, p.id, timeoutMs),
-          liveAsserts: notWired,
+          // d3c-2b: AT13's live asserts over the recorded ids, on the purge kit's clients (decision 1).
+          liveAsserts: () => probeLiveAsserts({ mod: w.purge.provisionMod as unknown as AssertModule, gh: w.purge.gh, cf: w.purge.cf, projectId: p.id, steps: () => readProbeSteps(db, p.id, timeoutMs) }),
           // d3c-2a: the purge through M2.5 under the KK grant (decisions 1–5), found read-only on each use.
           purge: async () => {
             const k = w.purge;
@@ -146,7 +148,9 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main(process.env).then(
-    (r) => { process.stdout.write(`${JSON.stringify(r.out)}\n`); process.exitCode = r.code; },
-    (e) => { process.stdout.write(`${JSON.stringify({ error: errorCode(e) })}\n`); process.exitCode = 1; },
+    // Codex PR167-r2: exit once the line is written, so a provider read cut off by a budget (still retrying in the
+    // background) never keeps the process past the agent's check limit.
+    (r) => { process.stdout.write(`${JSON.stringify(r.out)}\n`, () => process.exit(r.code)); },
+    (e) => { process.stdout.write(`${JSON.stringify({ error: errorCode(e) })}\n`, () => process.exit(1)); },
   );
 }
