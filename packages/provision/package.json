@@ -24,6 +24,7 @@
   },
   "devDependencies": {
     "@devos/db": "workspace:*",
+    "@devos/isolation": "workspace:*",
     "@types/node": "^22.7.0",
     "@types/pg": "8.15.6",
     "typescript": "^5.6.3"

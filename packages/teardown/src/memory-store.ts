@@ -7,6 +7,7 @@ interface Row extends ResourceRecord {
   projectId: string;
   id: string;
   deletedAt?: Date;
+  deleteStartedAt?: Date;
 }
 
 export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
@@ -57,7 +58,12 @@ export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
   async activeResources(projectId: string): Promise<ActiveResource[]> {
     return (this.resources as Row[])
       .filter((r) => r.projectId === projectId && !r.deletedAt)
-      .map((r) => ({ id: r.id, provider: r.provider, kind: r.kind, externalId: r.externalId, name: r.name }));
+      .map((r) => ({ id: r.id, provider: r.provider, kind: r.kind, externalId: r.externalId, name: r.name, deleteStartedAt: r.deleteStartedAt ?? null }));
+  }
+
+  async markDeleteStarted(resourceId: string, at: Date): Promise<void> {
+    const r = (this.resources as Row[]).find((x) => x.id === resourceId);
+    if (r && !r.deletedAt && !r.deleteStartedAt) r.deleteStartedAt = at;
   }
 
   /** Tests set this to throw once before the row update (AT4: crash after the provider delete). */

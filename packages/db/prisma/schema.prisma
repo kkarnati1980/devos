@@ -902,16 +902,18 @@ model ApprovalComment {
 }
 
 model Resource {
-  id         String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  projectId  String           @map("project_id") @db.Uuid
-  provider   ResourceProvider
-  kind       String
-  externalId String           @map("external_id")
-  name       String
-  status     ResourceStatus   @default(active)
-  deletedAt  DateTime?        @map("deleted_at") @db.Timestamptz(6)
-  createdAt  DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+  id              String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId       String           @map("project_id") @db.Uuid
+  provider        ResourceProvider
+  kind            String
+  externalId      String           @map("external_id")
+  name            String
+  status          ResourceStatus   @default(active)
+  deletedAt       DateTime?        @map("deleted_at") @db.Timestamptz(6)
+  /// DEVOS-235 (Codex PR160-r1): set just before a purge sends this row's provider delete.
+  deleteStartedAt DateTime?        @map("delete_started_at") @db.Timestamptz(6)
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   project Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
 

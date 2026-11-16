@@ -228,6 +228,28 @@ export function prFromEvent(path) {
   }
 }
 
+/** DEVOS-239 part b: the file the "Read KK's floor-guard answers" step writes (scripts/release/kk-source.mjs). */
+export const KK_ANSWERS_FILE = "kk-answers.json";
+
+const KK_RECORD_OK = (r) => r !== null && typeof r === "object" && /^fg-[0-9a-f]{10}$/.test(r.hit) && typeof r.file === "string" && r.file.length > 0
+  && Number.isInteger(r.line) && r.line >= 0 && /^[0-9a-f]{40}$/.test(r.sha) && (r.decision === "keep" || r.decision === "restore")
+  && typeof r.link === "string" && /^https:\/\/\S+$/.test(r.link);
+
+/**
+ * DEVOS-239 part b: KK's answer records from the answers file. A missing, unreadable or malformed file, or one with
+ * any malformed record, gives no records (a KK-only hit then stays refused), never a pass.
+ * @returns {{ records: object[], note: string }}
+ */
+export function loadKkAnswers(path, read = readFileSync) {
+  if (!path) return { records: [], note: "no answers file (RUNNER_TEMP is not set)" };
+  let j;
+  try { j = JSON.parse(read(path, "utf8")); } catch { return { records: [], note: "no readable KK answers file" }; }
+  const recs = j?.records;
+  if (!Array.isArray(recs)) return { records: [], note: "the KK answers file has no records list" };
+  if (!recs.every(KK_RECORD_OK)) return { records: [], note: "the KK answers file has a malformed record; none used" };
+  return { records: recs, note: `${recs.length} KK answer(s)${j?.error ? `; source: ${String(j.error).slice(0, 200)}` : ""}` };
+}
+
 /**
  * GI-1d: the checkout is shallow and keeps no credentials, so the floor guard re-run first fetches the full history
  * of base and head with the job token, passed through git's environment config (never on the command line or in
@@ -255,7 +277,8 @@ async function loadRelease() {
 /**
  * GI-1d (DEVOS-179): when the only failed check is the floor guard, ci-gate passes only if the Release path's own
  * rules (GI-1b, `judgeFloorGuard`) dispose of it: the watcher's Codex PASS for this SHA and PR holds a valid
- * Keep for every hit of the floor guard re-run (base copy, on base...head), no hit is KK-only, and every guard
+ * Keep for every hit of the floor guard re-run (base copy, on base...head), every KK-only hit has exactly one KK
+ * "keep" record for this SHA (`kkAnswers`, DEVOS-239; read from KK's Linear comment by kk-source.mjs, part b), and every guard
  * path the PR changes is named by a CHANGE line with a decision note. It never waits for the PASS: the watcher
  * reviews only green heads, so ci-gate is re-run after the PASS lands. Anything else stays a failure.
  * @returns {Promise<{ disposed: boolean, reasons: string[] }>}
@@ -265,7 +288,7 @@ export function floorGuardOnly(v, check = "floor-guard") {
   return v.state === "failure" && v.pending.length === 0 && v.failed.length === 1 && v.failed[0] === `${check}=failure`;
 }
 
-export async function floorGuardDisposition(v, { gh, repo, pr, sha, baseSha, config, guardReport, release = loadRelease }) {
+export async function floorGuardDisposition(v, { gh, repo, pr, sha, baseSha, config, guardReport, release = loadRelease, kkAnswers = [] }) {
   // Shape first, so any other failure never loads the Release module and fails exactly as before (pre-review L1).
   if (!floorGuardOnly(v, config?.floorGuard?.check)) return { disposed: false, reasons: [] };
   const rel = await release();
@@ -280,7 +303,7 @@ export async function floorGuardDisposition(v, { gh, repo, pr, sha, baseSha, con
   if (!passLabel) return { disposed: false, reasons };
   const p = await gh.get(`/repos/${repo}/pulls/${pr}`);
   if (p?.head?.sha !== sha) return { disposed: false, reasons: [`PR #${pr}'s head is ${String(p?.head?.sha).slice(0, 7)}, not ${sha.slice(0, 7)}`] };
-  const judged = await rel.judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles: p.changed_files, floorGuardFailed: true, otherFloorGuardRed: false, mainSha: baseSha, guardReport: guardReport ?? ((a) => rel.localGuardReport({ ...a, fetch: false })), config });
+  const judged = await rel.judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFiles: p.changed_files, floorGuardFailed: true, otherFloorGuardRed: false, mainSha: baseSha, guardReport: guardReport ?? ((a) => rel.localGuardReport({ ...a, fetch: false })), config, kkAnswers });
   return { disposed: judged.disposed && judged.reasons.length === 0, reasons: judged.reasons };
 }
 
@@ -315,7 +338,10 @@ async function main() {
   }
   const { pr, baseSha } = prFromEvent(process.env.GITHUB_EVENT_PATH ?? "");
   const rel = await loadRelease();
+  const kk = loadKkAnswers(process.env.RUNNER_TEMP ? join(process.env.RUNNER_TEMP, KK_ANSWERS_FILE) : "");
+  console.log(`ci-gate: ${kk.note}`);
   const d = await floorGuardDisposition(v, {
+    kkAnswers: kk.records,
     gh: rel.githubClient({ token: GITHUB_TOKEN }),
     repo: GITHUB_REPOSITORY,
     pr,

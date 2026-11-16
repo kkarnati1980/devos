@@ -1,12 +1,32 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.0.0
+# Version: 1.4.0
+# v1.4.0 (DEVOS-127, S4-b2c): the IPv6 defence-in-depth drop. Chain DEVOS-ISO6 (`-i devos-p+ -j DROP`: every IPv6
+# packet from a project bridge, which S4 names devos-p<idx>) is jumped to first from the ip6tables DOCKER-USER,
+# FORWARD and INPUT on every apply run, and kept in /etc/ufw/after6.rules for boot. A failure there does not stop
+# the IPv4 block; the run exits 1. --remove deletes it too. IPv6 tailnet entries stay refused (S4.md S4-b2c 6).
+# v1.3.0 (DEVOS-127, S4-b2d): after a successful apply, the conntrack entries of every stack whose rights shrank
+# (a rule with its /24 as source is gone: stack removed, egress or a tailnet entry revoked; on the first apply,
+# the whole pool) are deleted, so a connection opened before the change cannot outlive it. A clean-up that cannot
+# run now is kept in isolation/conntrack.pending and retried on every tick (exit 1 until done). One overall
+# deadline: no change starts after ISOLATION_DEADLINE_S (default 25 s) of the run, so a rollback always fits in the
+# agent's 60 s timeout.
+# v1.2.0 (DEVOS-127, S4-b2b): boot persistence. Every successful run keeps a marker block in /etc/ufw/after.rules
+# (BEGIN/END DEVOS S4 ISOLATION, placed after M0.1's DEVOS UFW AND DOCKER block) that rebuilds the installed
+# chains and puts the three jumps first, so the block is back at boot and after `ufw reload`, before the agent's
+# first tick (the FORWARD jump can drop below tailscaled's ts-forward when tailscaled starts; S4.md S4-b2b 1). A rollback rewrites it to the restored block; --remove deletes it. Written only when it differs,
+# atomically, ASCII only, and only while M0.1's block is in the file (else exit 1, block itself still applied).
+# v1.1.0 (DEVOS-127, S4-b2a): --remove also writes $DEVOS_DIR/isolation/disabled, and an apply run refuses with
+# exit 4 while that file exists, so KK's console rollback is not undone by the agent's next tick. To turn the
+# block back on: rm /root/.devos/isolation/disabled (the next agent tick applies it again).
+# v1.0.1 (DEVOS-237): the token minimum is 32 characters (was 16), the same as the API.
 # Contract: docs/modules/S4.md (decisions 1-5, S4-b). Run as root by the server agent (allow-list, D1-passed
 # SHA only) or by KK for --remove. Never run with arguments taken from GitHub content.
 #
 #   isolation-apply.sh            fetch the approved state, apply the block if it changed, self-test, roll back
 #   isolation-apply.sh --dry-run  fetch the state and print the generated block; changes nothing
-#   isolation-apply.sh --remove   delete the S4 jumps and chains; M0.1/M0.2 rules stay as they are
+#   isolation-apply.sh --remove   delete the S4 jumps and chains and keep them off (isolation/disabled);
+#                                 M0.1/M0.2 rules stay as they are
 #
 # The block is two chains, DEVOS-ISO-FWD (jumped to first from DOCKER-USER and from FORWARD, so tailscaled's
 # own `ts-forward` jump at FORWARD 1 cannot accept tailnet-bound pool traffic before it) and DEVOS-ISO-IN (jumped to first
@@ -26,17 +46,26 @@
 # DevOS API) runs before and after: if it passed before and fails after, the previous block is restored (or
 # the block removed if there was none); if it already failed before, the block is kept and the failure
 # reported. One run at a time ($DEVOS_DIR/isolation/.lock). Worst case stays under the agent's 60 s timeout.
-# Exit 0 applied or unchanged, 1 failed (previous block kept or restored), 3 skipped (not set up yet).
-# Prints no token and no secret.
+# Exit 0 applied or unchanged, 1 failed (previous block kept or restored), 3 skipped (not set up yet),
+# 4 disabled by --remove (nothing changed).
+# Prints no token and no secret. S4-b2c: the IPv6 step before the fetch has its own budget (V6_BUDGET 8 s, about
+# 18 s worst case) that is not counted against the IPv4 deadline; S4-b decision 11 still holds if the agent's 60 s
+# timeout kills a run: the new IPv4 block is kept, never no block.
 set -uo pipefail
 DIR="${DEVOS_DIR:-/root/.devos}"
 ISO="$DIR/isolation"
 CONF="$DIR/server-agent.conf"
 TOKEN_FILE="$DIR/secrets/isolation_state_token"
+BOOT_BEGIN="# BEGIN DEVOS S4 ISOLATION"
+BOOT_END="# END DEVOS S4 ISOLATION"
+M01_END="# END DEVOS UFW AND DOCKER"
 POOL="10.208.0.0/14"
 FWD=DEVOS-ISO-FWD
 IN=DEVOS-ISO-IN
+ISO6=DEVOS-ISO6
 conf() { sed -n "s/^$1=\\([A-Za-z0-9._:\\/ -]\\{1,300\\}\\)\$/\\1/p" "$CONF" 2>/dev/null | head -n1; }
+UFW_AFTER="$(conf ISOLATION_UFW_AFTER_RULES)"; UFW_AFTER="${UFW_AFTER:-/etc/ufw/after.rules}"
+UFW_AFTER6="$(conf ISOLATION_UFW_AFTER6_RULES)"; UFW_AFTER6="${UFW_AFTER6:-/etc/ufw/after6.rules}"
 
 MODE=apply
 case "${1:-}" in
@@ -60,17 +89,200 @@ remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if n
   return $rc
 }
 
+# --- boot persistence (S4-b2b) ------------------------------------------------------------------------------
+# ufw loads after.rules in one `iptables-restore -n` at boot and on `ufw reload`. M0.1's block declares
+# `:DOCKER-USER - [0:0]` (which flushes it), so ours must come after it in the file: it re-creates the S4 chains
+# and inserts each jump at position 1. If ufw does not flush INPUT/FORWARD on a reload, a second copy of those
+# jumps can appear; it is harmless (the second pass gives the same verdict) and the next agent tick collapses it
+# (jump_ops). Without M0.1's block DOCKER-USER might not exist at boot and the whole ufw load would fail, so the
+# block is then not written.
+boot_text() {  # installed block in $1 -> the after.rules marker block
+  echo "$BOOT_BEGIN (isolation-apply.sh; generated, do not edit; removed by --remove)"
+  grep -vx 'COMMIT' <<<"$1"
+  echo "-I DOCKER-USER 1 -j $FWD"
+  echo "-I FORWARD 1 -j $FWD"
+  echo "-I INPUT 1 -j $IN"
+  echo "COMMIT"
+  echo "$BOOT_END"
+}
+boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when after.rules holds what it should
+  # S4-b2c: $2/$3/$4/$5 = file, text function, BEGIN and END markers (default: the IPv4 after.rules block)
+  local f="${2:-$UFW_AFTER}" textfn="${3:-boot_text}" BOOT_BEGIN="${4:-$BOOT_BEGIN}" BOOT_END="${5:-$BOOT_END}" rest want tmp mode
+  [[ -f "$f" ]] || { [[ -z "$1" ]] && return 0; echo "boot persistence: $f missing (ufw not set up?)"; return 1; }
+  # Pre-review: an orphan BEGIN (hand edit) would make the sed range delete to the end of the file, so the
+  # markers must be absent, or exactly one BEGIN followed by exactly one END.
+  local nb ne lb le
+  nb="$(grep -c "^$BOOT_BEGIN" "$f")"; ne="$(grep -cx "$BOOT_END" "$f")"
+  if [[ "$nb$ne" != 00 ]]; then
+    lb="$(grep -n "^$BOOT_BEGIN" "$f" | head -n1 | cut -d: -f1)"; le="$(grep -nx "$BOOT_END" "$f" | head -n1 | cut -d: -f1)"
+    [[ "$nb$ne" == 11 ]] && (( lb < le )) || { echo "boot persistence: the DEVOS S4 ISOLATION markers in $f are broken (hand edit?); not written"; return 1; }
+  fi
+  rest="$(sed "/^$BOOT_BEGIN/,/^$BOOT_END\$/d" "$f")" || { echo "boot persistence: cannot read $f"; return 1; }
+  if [[ -n "$1" ]]; then
+    grep -qxF -- "$M01_END" <<<"$rest" || { echo "boot persistence: M0.1's DEVOS UFW AND DOCKER block is not in $f; not written"; return 1; }
+    want="$rest"$'\n'"$("$textfn" "$1")"
+    LC_ALL=C grep -q '[^ -~]' <<<"$want" && { echo "boot persistence: non-ASCII text; not written"; return 1; }
+  else
+    want="$rest"
+  fi
+  [[ "$want" == "$(cat "$f")" ]] && return 0
+  mode="$(stat -c %a "$f" 2>/dev/null)"; mode="${mode:-640}"
+  tmp="$(mktemp "$f.devos-s4.XXXXXX")" || { echo "boot persistence: cannot write next to $f"; return 1; }
+  BOOT_TMP="$tmp"; trap 'rm -f "${BOOT_TMP:-}"' EXIT; trap 'exit 143' TERM  # a timeout kill between mktemp and mv leaves no temp file
+  if printf '%s\n' "$want" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$f"; then BOOT_TMP=""; return 0; fi
+  rm -f "$tmp"; BOOT_TMP=""; echo "boot persistence: could not replace $f"; return 1
+}
+
+# --- S4-b2c: the IPv6 defence-in-depth drop ------------------------------------------------------------------
+# Project networks have no IPv6 and a fixed bridge name devos-p<idx> (S4-b2c decision 1), so one static rule drops
+# every IPv6 packet that enters from a project bridge, forwarded or to the host. It does not depend on the state.
+BOOT6_BEGIN="# BEGIN DEVOS S4 ISOLATION6"
+BOOT6_END="# END DEVOS S4 ISOLATION6"
+ip6t() { timeout 5 ip6tables -w 3 "$@"; }
+# Pre-review (low): the IPv6 step has its own small budget, so a hanging ip6tables cannot use up the IPv4 run:
+# no query or restore starts after V6_BUDGET s of the step (worst case about 8 + 10 s), and the time the step
+# took is not counted against the IPv4 change deadline (T0 moves forward by it).
+V6_BUDGET=8
+v6_time() { (( SECONDS - V6_T0 <= V6_BUDGET )) || { echo "IPv6 drop: time budget (${V6_BUDGET} s) used up; retried next tick"; return 1; }; }
+V6_RULE="-A $ISO6 -i devos-p+ -j DROP"
+v6_block() { printf '*filter\n:%s - [0:0]\n%s\nCOMMIT\n' "$ISO6" "$V6_RULE"; }
+boot6_text() {  # the after6.rules marker block ($1 unused: the block is static)
+  echo "$BOOT6_BEGIN (isolation-apply.sh; generated, do not edit; removed by --remove)"
+  v6_block | grep -vx 'COMMIT'
+  echo "-I DOCKER-USER 1 -j $ISO6"
+  echo "-I FORWARD 1 -j $ISO6"
+  echo "-I INPUT 1 -j $ISO6"
+  echo "COMMIT"
+  echo "$BOOT6_END"
+}
+v6_jump_ops() {  # -> restore lines that leave exactly one jump to DEVOS-ISO6, first, in each built-in chain
+  local chain n first rules
+  for chain in DOCKER-USER FORWARD INPUT; do
+    v6_time || return 1
+    rules="$(ip6t -S "$chain" 2>/dev/null)" || { echo "IPv6 drop: cannot read the IPv6 $chain chain"; return 1; }
+    n="$(grep -cxF -- "-A $chain -j $ISO6" <<<"$rules")"
+    first="$(grep '^-A ' <<<"$rules" | sed -n 1p)"
+    [[ "$n" == 1 && "$first" == "-A $chain -j $ISO6" ]] && continue
+    while (( n-- > 0 )); do echo "-D $chain -j $ISO6"; done
+    echo "-I $chain 1 -j $ISO6"
+  done
+}
+v6_sync() {  # 0 when the IPv6 drop is live (one rule, every jump first, once) and in after6.rules
+  command -v ip6tables >/dev/null 2>&1 && command -v ip6tables-restore >/dev/null 2>&1 || { echo "IPv6 drop: ip6tables not installed"; return 1; }
+  ip6t -S DOCKER-USER >/dev/null 2>&1 || { echo "IPv6 drop: the IPv6 DOCKER-USER chain is missing (M0.1 not applied?)"; return 1; }
+  local ops tx have
+  v6_time || return 1
+  have="$(ip6t -S "$ISO6" 2>/dev/null | grep '^-A ')"
+  ops="$(v6_jump_ops)" || { tail -n1 <<<"$ops"; return 1; }  # on failure the cause is its last line
+  if [[ "$have" != "$V6_RULE" || -n "$ops" ]]; then
+    tx="$(v6_block | grep -vx 'COMMIT')"$'\n'"${ops:+$ops$'\n'}COMMIT"
+    v6_time || return 1
+    printf '%s\n' "$tx" | timeout 10 ip6tables-restore -w 3 --noflush || { echo "IPv6 drop: ip6tables-restore refused the transaction"; return 1; }
+  fi
+  boot_sync x "$UFW_AFTER6" boot6_text "$BOOT6_BEGIN" "$BOOT6_END" || { echo "IPv6 drop: not persisted for boot"; return 1; }
+}
+v6_remove() {  # deletes the IPv6 jumps, the chain and the after6.rules block; 0 if nothing of it is left
+  local chain rc=0
+  if command -v ip6tables >/dev/null 2>&1; then
+    # Pre-review (low): a failed query must not read as "nothing left", so ip6tables must answer first.
+    if ip6t -S INPUT >/dev/null 2>&1; then
+      for chain in DOCKER-USER FORWARD INPUT; do
+        while ip6t -C "$chain" -j "$ISO6" 2>/dev/null; do ip6t -D "$chain" -j "$ISO6" || { rc=1; break; }; done
+      done
+      if ip6t -S "$ISO6" >/dev/null 2>&1; then ip6t -F "$ISO6" && ip6t -X "$ISO6" || rc=1; fi
+    else
+      echo "remove: ip6tables does not answer; the IPv6 drop may still be in place (ip6tables -S DEVOS-ISO6)"; rc=1
+    fi
+  fi
+  boot_sync "" "$UFW_AFTER6" boot6_text "$BOOT6_BEGIN" "$BOOT6_END" || rc=1
+  return $rc
+}
+
+# --- S4-b2d: conntrack clean-up and the run deadline ---------------------------------------------------------
+T0=$SECONDS
+DEADLINE="$(conf ISOLATION_DEADLINE_S)"; [[ "$DEADLINE" =~ ^[0-9]{1,2}$ ]] && (( DEADLINE <= 25 )) || DEADLINE=25  # pre-review: never above 25
+shrunk() {  # $1 = previous block, $2 = new block -> the /24 sources (or the pool) whose rules shrank, one per line
+  [[ -z "$1" ]] && { echo "$POOL"; return; }
+  # Pre-review r2: a change to the pool-wide rules (no /24 source: the private-range DROPs, the final DROP, their
+  # order) can shrink every stack at once, so it cuts the whole pool.
+  local re=' -s 10\.[0-9]+\.[0-9]+\.0/24 '
+  [[ "$(grep -vE -- "$re" <<<"$1")" == "$(grep -vE -- "$re" <<<"$2")" ]] || { echo "$POOL"; return; }
+  # One pass (pre-review: per-rule greps were O(n^2)): previous rules with a /24 source that the new block lacks.
+  comm -23 <(grep -E -- "$re" <<<"$1" | LC_ALL=C sort -u) <(LC_ALL=C sort -u <<<"$2") \
+    | grep -oE -- '-s 10\.[0-9]+\.[0-9]+\.0/24' | cut -d' ' -f2 | LC_ALL=C sort -u
+}
+ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack; 0 when nothing is left pending
+  local f="$ISO/conntrack.pending" src out rc left=""
+  [[ -s "$f" ]] || return 0
+  if ! command -v conntrack >/dev/null 2>&1; then
+    echo "conntrack not installed: connections opened before the change are kept until they close ($(paste -sd' ' "$f"))"; return 1
+  fi
+  while IFS= read -r src; do
+    [[ "$src" =~ ^10\.(20[89]|21[01])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.0/(24|14)$ ]] || continue
+    # Pre-review: no call may run past the agent's 60 s, so the last one starts by 49 s and gets what is left.
+    if (( SECONDS - T0 >= 49 )); then left+="$src"$'\n'; continue; fi
+    # conntrack exits 1 when no entry matched ("0 flow entries have been deleted"); that is a success here.
+    out="$(timeout 10 conntrack -D -s "$src" 2>&1)"; rc=$?
+    (( rc == 0 )) || { (( rc == 1 )) && [[ "$out" == *": 0 flow entries have been deleted"* ]]; } || left+="$src"$'\n'
+  done < "$f"
+  if [[ -n "$left" ]]; then printf '%s' "$left" > "$f.tmp" && mv -f "$f.tmp" "$f"; echo "conntrack clean-up incomplete, retried next tick: $(paste -sd' ' "$f")"; return 1; fi
+  rm -f "$f"; return 0
+}
+ct_queue() {  # $1 = previous block, $2 = new block, $3 = 1 when the live chains drifted -> pending list
+  local new
+  new="$(shrunk "$1" "$2")"
+  # Pre-review: a drift repair (a flushed chain or a lost jump, judged from the live state, whatever the new
+  # block is) cuts the whole pool: flows opened while the block was missing would survive it through the
+  # ESTABLISHED return.
+  [[ "${3:-0}" == 1 ]] && new="$POOL"
+  [[ -n "$new" ]] || return 0
+  { [[ -s "$ISO/conntrack.pending" ]] && cat "$ISO/conntrack.pending"; echo "$new"; } | sort -u > "$ISO/conntrack.pending.tmp" \
+    && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
+}
+
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
-  if remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"; echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched)"; exit 0; fi
-  echo "remove failed: some S4 rules are still in place (see iptables -S DOCKER-USER / INPUT)"; exit 1
+  # Codex PR165-r1: each step runs whatever the others did, so a failure in one family cannot leave the other's
+  # boot block in place or the agent free to re-apply. The marker comes first (the next tick sees it even if a
+  # later step fails); every failure is named and the run still exits 1.
+  RM_RC=0
+  date -u +%FT%TZ > "$ISO/disabled" || { echo "remove: could not write $ISO/disabled: the agent will apply the block again"; RM_RC=1; }
+  if remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"
+  else echo "remove: some IPv4 S4 rules are still in place (iptables -S DOCKER-USER, FORWARD, INPUT)"; RM_RC=1; fi
+  boot_sync "" || { echo "remove: the boot block is still in $UFW_AFTER: delete the DEVOS S4 ISOLATION lines there"; RM_RC=1; }
+  v6_remove || { echo "remove: the IPv6 drop or its block in $UFW_AFTER6 is still in place (ip6tables -S DEVOS-ISO6)"; RM_RC=1; }
+  if (( RM_RC == 0 )); then
+    echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched); kept off until $ISO/disabled is deleted"; exit 0
+  fi
+  echo "remove failed: some S4 rules are still in place (see above); kept off until $ISO/disabled is deleted"; exit 1
 fi
+[[ "$MODE" == apply && -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 
 for c in jq curl flock iptables iptables-restore; do
   command -v "$c" >/dev/null 2>&1 || { echo "skipped: $c not installed"; exit 3; }
 done
 [[ -s "$TOKEN_FILE" ]] || { echo "skipped: no isolation state token yet ($TOKEN_FILE)"; exit 3; }
+
+# Codex PR163-r4: cuts already queued are retried on every tick BEFORE the state fetch (under the lock, unless
+# --remove turned the block off), so a fetch failure or a refused document cannot hold them back. The run itself
+# goes on; a cut still pending makes it exit 1 on every path below (the fetch and validation exits are 1 anyway).
+if [[ "$MODE" == apply && -s "$ISO/conntrack.pending" ]]; then
+  ( exec 9>"$ISO/.lock" && flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; ct_flush ) || true
+fi
+# S4-b2c decision 3: the IPv6 drop is static, so it is kept in place on every apply run before the state fetch
+# (under the lock, unless --remove turned the block off): a fetch failure or a refused document cannot hold it
+# back. A failure does not stop the IPv4 block; the run carries on and then exits 1 on every path.
+V6_RC=0
+if [[ "$MODE" == apply ]]; then
+  V6_T0=$SECONDS
+  # Pre-review (low): only a held lock skips the step; a lock file that cannot be opened is a failure.
+  V6_MSG="$(mkdir -p "$ISO" && chmod 700 "$ISO" && exec 9>"$ISO/.lock" || { echo "IPv6 drop: cannot open $ISO/.lock"; exit 1; }
+    flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; v6_sync)"; V6_RC=$?
+  T0=$(( T0 + SECONDS - V6_T0 ))
+  (( V6_RC == 0 )) || echo "IPv6 drop not in place: $V6_MSG"
+fi
+done_ok() { (( V6_RC == 0 )) || exit 1; exit 0; }  # $1 names the path, for the reader
 
 # --- 1. fetch and validate the approved state -------------------------------------------------------------
 PORT="$(conf API_INTERNAL_PORT)"; PORT="${PORT:-3002}"
@@ -79,7 +291,7 @@ URL="$(conf ISOLATION_STATE_URL)"; URL="${URL:-http://127.0.0.1:$PORT/internal/i
 [[ "$URL" =~ ^http://(127\.0\.0\.1|\[::1\]|localhost):[0-9]{1,5}/[A-Za-z0-9/_-]*$ ]] \
   || { echo "refused: ISOLATION_STATE_URL must be a loopback http URL"; exit 1; }
 tok="$(head -c 512 "$TOKEN_FILE" | tr -d '\r\n')"
-[[ "$tok" =~ ^[A-Za-z0-9._~+/=-]{16,512}$ ]] || { echo "refused: the isolation state token file is malformed"; exit 1; }
+[[ "$tok" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "refused: the isolation state token file is malformed"; exit 1; }
 state="$(curl -sS --fail --connect-timeout 3 --max-time 10 --max-filesize 1048576 --proto =http \
   -H @<(printf 'Authorization: Bearer %s\n' "$tok") "$URL" 2>/dev/null)"; crc=$?
 unset tok
@@ -125,7 +337,7 @@ while IFS=$'\t' read -r idx slug env egress tailnet; do
   if [[ -n "$tailnet" ]]; then
     read -r -a cidrs <<<"$tailnet"
     for c in "${cidrs[@]}"; do
-      v4_in_tailnet "$c" || { echo "refused: tailnet entry for $slug/$env is not an IPv4 CIDR inside 100.64.0.0/10 (IPv6 entries wait for S4-b2); nothing changed"; exit 1; }
+      v4_in_tailnet "$c" || { echo "refused: tailnet entry for $slug/$env is not an IPv4 CIDR inside 100.64.0.0/10 (IPv6 entries are refused: project networks have no IPv6, S4-b2c decision 6); nothing changed"; exit 1; }
       v4+="$c "
     done
   fi
@@ -169,7 +381,7 @@ generate() {
 }
 BLOCK="$(generate)"
 
-if [[ "$MODE" == dry ]]; then printf '%s\n' "$BLOCK"; echo "# dry run: nothing changed (${#STACKS[@]} stacks)"; exit 0; fi
+if [[ "$MODE" == dry ]]; then printf '%s\n' "$BLOCK"; echo "# dry run: nothing changed (${#STACKS[@]} stacks)"; echo "# IPv6 block (ip6tables, static; S4-b2c):"; v6_block; exit 0; fi
 
 # --- 3. apply when changed ---------------------------------------------------------------------------------
 # One iptables-restore transaction carries the chain rebuild AND the jump changes, so DOCKER-USER/INPUT never
@@ -203,13 +415,19 @@ record() {  # block -> installed.rules + live fingerprint
   printf '%s\n' "$1" > "$ISO/installed.rules.tmp" && mv -f "$ISO/installed.rules.tmp" "$ISO/installed.rules" \
     && live_fp > "$ISO/live.sha256.tmp" && mv -f "$ISO/live.sha256.tmp" "$ISO/live.sha256"
 }
-install_block() {  # block text in $1 -> live, in one transaction with the jump changes
+install_block() {  # block text in $1 -> live, in one transaction with the jump changes; $2=deadline: check it last
   ipt -S DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (M0.1 not applied?)"; return 1; }
   # The whole transaction is built BEFORE iptables-restore starts (Codex PR54-r1): on the legacy backend restore
   # holds the xtables lock from *filter to COMMIT, so jump_ops' `iptables -S` queries must not run inside it.
   local tx ops
   ops="$(jump_ops)" || return 1
   tx="$(grep -vx 'COMMIT' <<<"$1")"$'\n'"${ops:+$ops$'\n'}COMMIT"
+  # Codex PR163-r1: the drift check and jump_ops above are timeout-bound iptables queries that can use up the rest
+  # of the deadline, so the forward change checks it once more right before iptables-restore (exit 2: deferred,
+  # nothing changed). A rollback never passes `deadline`: it must always run.
+  if [[ "${2:-}" == deadline ]] && (( SECONDS - T0 > DEADLINE )); then
+    echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; return 2
+  fi
   printf '%s\n' "$tx" | timeout 15 iptables-restore -w 5 --noflush
 }
 selftest() {  # every target host:port must accept a TCP connection within 3 s
@@ -231,30 +449,58 @@ selftest() {  # every target host:port must accept a TCP connection within 3 s
 mkdir -p "$ISO" && chmod 700 "$ISO" || { echo "cannot create $ISO"; exit 1; }
 # One run at a time (the agent tick and KK's --remove must not interleave).
 exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply run holds $ISO/.lock"; exit 3; }
+# Codex PR158-r1: --remove may have run (and released the lock) while this run fetched the state, so the marker
+# is checked again under the lock, before anything is applied.
+[[ -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
-  echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
+  # Pre-review: the clean-up runs whatever the boot step says, so a broken after.rules cannot hold it back.
+  rc=0; ct_flush || rc=1
+  boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; exit 1; }
+  (( rc == 0 )) || exit 1
+  echo "unchanged: ${#STACKS[@]} stacks, block already in place"; done_ok "unchanged"
 fi
 
 # Probe before the change: the S4 chains match only pool sources, so they cannot break a host probe. If the
 # host already fails before the change, the cause is elsewhere; the block is applied and kept (isolation is
 # the floor) and the failure is reported. Roll back only when the probe passed before and fails after.
 pre_ok=1; pre_msg="$(selftest)" || pre_ok=0
-if ! install_block "$BLOCK"; then
+# S4-b decision 11 / S4-b2d: start no change late in the run, so the post-change self-test and a rollback
+# (iptables-restore 15 s + the self-test) still fit inside the agent's 60 s.
+(( SECONDS - T0 <= DEADLINE )) || { echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; exit 1; }
+# Pre-review: the cut is queued BEFORE the change, so a kill, a failed record or a failed boot step after it can
+# never lose it. A cut queued for a change that then fails or rolls back is harmless (decision 2).
+# Pre-review r2: a cut resets NATed connections (the mapping goes with the entry), so it must not happen for a
+# change that is rolled back: the list is snapshotted here and restored after a successful rollback.
+drift=0; [[ -n "$PREV" ]] && { [[ -n "$(jump_ops)" ]] || ! live_matches "$PREV"; } && drift=1
+CT_SNAP=""; [[ -s "$ISO/conntrack.pending" ]] && CT_SNAP="$(cat "$ISO/conntrack.pending")"
+ct_restore() {  # the pending list as it was before this run's ct_queue
+  if [[ -n "$CT_SNAP" ]]; then printf '%s\n' "$CT_SNAP" > "$ISO/conntrack.pending.tmp" && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
+  else rm -f "$ISO/conntrack.pending"; fi
+}
+ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; exit 1; }
+install_block "$BLOCK" deadline; irc=$?
+if (( irc == 2 )); then ct_restore; exit 1; fi
+if (( irc != 0 )); then
+  ct_restore
   echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
 fi
 if ! post_msg="$(selftest)"; then
   if (( pre_ok == 0 )); then
-    record "$BLOCK"
+    record "$BLOCK"; ct_flush; boot_sync "$BLOCK"
     echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
   if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && record "$PREV" && echo "rolled back to the previous block" || echo "rollback failed: run $0 --remove from the console"
+    install_block "$PREV" && record "$PREV" && { ct_restore; boot_sync "$PREV"; echo "rolled back to the previous block"; } || echo "rollback failed: run $0 --remove from the console"
   else
-    remove_block && rm -f "$ISO/live.sha256" && echo "rolled back: S4 block removed" || echo "rollback failed: run $0 --remove from the console"
+    remove_block && rm -f "$ISO/live.sha256" && { ct_restore; boot_sync ""; echo "rolled back: S4 block removed"; } || echo "rollback failed: run $0 --remove from the console"
   fi
   exit 1
 fi
 record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
+ct_ok=0; ct_flush || ct_ok=1
+boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; exit 1; }
+(( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; exit 1; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"
+done_ok "applied"

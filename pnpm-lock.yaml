@@ -48,6 +48,9 @@ importers:
       '@devos/run-engine':
         specifier: workspace:*
         version: link:../../packages/run-engine
+      '@devos/teardown':
+        specifier: workspace:*
+        version: link:../../packages/teardown
       '@nestjs/common':
         specifier: 11.2.8
         version: 11.2.8(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -213,6 +216,9 @@ importers:
       '@devos/db':
         specifier: workspace:*
         version: link:../db
+      '@devos/isolation':
+        specifier: workspace:*
+        version: link:../isolation
       '@types/node':
         specifier: ^22.7.0
         version: 22.20.5

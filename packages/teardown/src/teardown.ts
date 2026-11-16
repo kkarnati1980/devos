@@ -41,6 +41,11 @@ export interface TeardownStore {
   markRestored(projectId: string): Promise<void>;
   /** The project's active inventory rows, oldest first. */
   activeResources(projectId: string): Promise<ActiveResource[]>;
+  /**
+   * DEVOS-235 (Codex PR160-r1): records that this run is about to send the row's provider delete, before the call,
+   * so a later run knows a 404 for it may be its own earlier delete. Returned as `deleteStartedAt` by `activeResources`.
+   */
+  markDeleteStarted(resourceId: string, at: Date): Promise<void>;
   markResourceDeleted(resourceId: string, at: Date): Promise<void>;
   /** Removes the project's `provision_step` rows (M2.4 hand-off: no stale `done` rows after a purge). */
   resetSteps(projectId: string): Promise<void>;
@@ -185,7 +190,13 @@ export async function archiveProject(projectId: string, opts: ArchiveOptions): P
     // Pre-review finding 3: prove ownership of every resource before the first write, so a mismatch never
     // leaves the project half archived.
     const todo: { r: ActiveResource; ops: ResourceOps }[] = [];
-    for (const r of await opts.store.activeResources(projectId)) {
+    // M2.5-a3b pre-review 2: the purge's order (Coolify first, the GitHub repo last), so the stacks are stopped
+    // before the repo turns read-only, as the Archive row orders it; a failed stop leaves the repo writable.
+    const ordered = (await opts.store.activeResources(projectId))
+      .map((r, i) => ({ r, i }))
+      .sort((a, b) => rank(a.r) - rank(b.r) || b.i - a.i)
+      .map((x) => x.r);
+    for (const r of ordered) {
       const ops = map.get(opsKey(r.provider, r.kind));
       if (!ops?.archive) continue;
       const got = await inspect(ops, r);
@@ -218,7 +229,12 @@ export async function restoreProject(projectId: string, opts: TeardownOptions): 
     // Pre-review finding 3: prove ownership of every resource before the first write, so a mismatch never
     // leaves the project half restored.
     const todo: { r: ActiveResource; ops: ResourceOps }[] = [];
-    for (const r of await opts.store.activeResources(projectId)) {
+    // Same order as Archive and Purge (M2.5-a3b); only the GitHub repo has an unarchive op today.
+    const ordered = (await opts.store.activeResources(projectId))
+      .map((r, i) => ({ r, i }))
+      .sort((a, b) => rank(a.r) - rank(b.r) || b.i - a.i)
+      .map((x) => x.r);
+    for (const r of ordered) {
       const ops = map.get(opsKey(r.provider, r.kind));
       if (!ops?.unarchive) continue;
       const got = await inspect(ops, r);
@@ -301,6 +317,7 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
       if (before) {
         if (!before.owned) throw new TeardownError("ownership_mismatch", false, `${describe(r)} no longer carries this project's marker; not deleted`, pick(r));
         await opts.store.assertLockHeld(projectId);
+        await opts.store.markDeleteStarted(r.id, new Date(now()));
         try {
           await ops.remove(r);
         } catch (e) {

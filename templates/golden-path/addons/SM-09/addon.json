@@ -1,0 +1,13 @@
+{
+  "id": "SM-09",
+  "name": "Ops and observability",
+  "files": [
+    "src/ops.mjs",
+    "test/sm-09-ops.test.mjs"
+  ],
+  "checks": {
+    "SM-09-L1": "test/sm-09-ops.test.mjs",
+    "SM-09-L2": "test/sm-09-ops.test.mjs"
+  },
+  "usage": "The core already serves /health (liveness, never checks dependencies) and /ready, and logs each request as a JSON line with its request ID. Pass createApp({ readyChecks: [dbReady(query), queueReady(queue), dependencyReady(\"payments\", \"https://…/health\")] }): each check has a timeout (readyCheck(name, fn, { timeoutMs })), so a hung dependency answers 503 instead of hanging /ready. Log with logger().child({ requestId }) or .child({ jobId }) instead of console.log: every line is JSON, and values under secret-like or personal-data keys, tokens, JWTs, e-mail addresses and URL passwords are redacted. Wire errors to monitoring with const monitor = errorMonitor({ report: webhookReporter(process.env.ERROR_WEBHOOK_URL) }) (an HTTPS intake URL kept in the vault; it goes through safeFetch), call monitor.capture(err, { requestId }) in route and job error paths, and watchProcess(monitor) at start-up. Never pass a whole request, user record or payload to a log call; pick the fields."
+}

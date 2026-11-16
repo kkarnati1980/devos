@@ -6,6 +6,8 @@ import { ProviderError } from "./http.js";
 import type { GitHubClient } from "./github.js";
 import type { CoolifyClient } from "./coolify.js";
 import { ownershipMarker, type ProviderName } from "./runner.js";
+import { applicationName, listApplications } from "./application.js";
+import { STACK_ENVS } from "./stack.js";
 
 /** One inventory row as teardown sees it. */
 export interface InventoryItem {
@@ -13,6 +15,11 @@ export interface InventoryItem {
   kind: string;
   externalId: string;
   name: string;
+  /**
+   * DEVOS-235 (Codex PR160-r1): set when an earlier purge run began this row's provider delete and did not mark the
+   * row deleted (a crash between the DELETE and the inventory update). Absent or null otherwise.
+   */
+  deleteStartedAt?: Date | null;
 }
 
 /** What teardown can do to one kind of resource. `inspect` returns null when the resource is gone. */
@@ -123,6 +130,95 @@ export function coolifyProjectOps(cf: CoolifyClient, projectId: string): Resourc
   };
 }
 
+const APP_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
+/** Coolify v4 application states that mean "no container running" (`exited`, `exited:unhealthy`, `stopped`). */
+const STOPPED_RE = /^(exited|stopped)(:[a-z]+)?$/;
+
+/**
+ * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos:<project id>` (M2.4-c2's
+ * marker). Archive stops the app; there is no un-archive (Restore leaves stacks stopped; the next deploy starts
+ * them). Remove deletes the app with its volumes, configuration and connected networks in one call.
+ */
+export interface AppTeardownOptions {
+  /** How long a queued stop or delete may take to show (default 60 s), and the wait between reads (default 2 s). */
+  confirmMs?: number;
+  pollMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: AppTeardownOptions = {}): ResourceOps {
+  const confirmMs = o.confirmMs ?? 60_000;
+  const pollMs = o.pollMs ?? 2_000;
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = o.now ?? Date.now;
+  const uuid = (item: InventoryItem): string => {
+    if (!APP_UUID_RE.test(item.externalId)) throw new Error("coolify-uuid-invalid");
+    return item.externalId;
+  };
+  const inspect = async (id: string): Promise<{ owned: boolean; status: unknown } | null> => {
+    const r = await cf.http.get<{ uuid?: unknown; description?: unknown; status?: unknown }>(`/api/v1/applications/${id}`);
+    // Only a 404 proves absence; a 200 must carry this application (same uuid, a string or null description).
+    if (r.status === 404) return null;
+    const b = r.body;
+    if (r.status !== 200 || !b || typeof b !== "object" || b.uuid !== id || !(b.description == null || typeof b.description === "string")) {
+      throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/applications/{uuid} returned an inconclusive response (${r.status})`, r.status);
+    }
+    return { owned: ((b.description as string | null | undefined) ?? "").includes(ownershipMarker(projectId)), status: b.status };
+  };
+  return {
+    provider: "coolify",
+    kind: "application",
+    inspect: async (item) => {
+      const a = await inspect(uuid(item));
+      return a && { owned: a.owned };
+    },
+    archive: async (item) => {
+      const id = uuid(item);
+      // Stop is idempotent: stopping a stopped app is a no-op at Coolify (a GET, so the transport may retry it).
+      const r = await cf.http.get<unknown>(`/api/v1/applications/${id}/stop`);
+      // Pre-review 3: an app deleted since Archive's inspect has nothing to stop; confirm with a fresh read.
+      if (r.status === 404 && (await inspect(id)) === null) return;
+      if (r.status !== 200) {
+        throw new ProviderError("coolify", r.status === 404 ? "http" : "bad-response", `coolify stop of an application returned ${r.status}`, r.status);
+      }
+      // Codex PR154-r3: Coolify only queues the stop ("Stopping request queued."). Archive succeeds (and the repo
+      // turns read-only after it) only once a read shows the app stopped (`exited` or `stopped`, with or without a
+      // `:health` suffix) or gone; still running when the bound ends, or a status that is not a string, fails
+      // the step, so the repo stays writable and Archive can be run again.
+      const until = now() + confirmMs;
+      for (;;) {
+        const a = await inspect(id);
+        if (a === null) return;
+        if (typeof a.status !== "string") {
+          throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/applications/{uuid} returned no status after a stop", 200);
+        }
+        if (STOPPED_RE.test(a.status)) return;
+        if (now() >= until) throw new ProviderError("coolify", "timeout", "coolify has not finished stopping the application yet");
+        await sleep(pollMs);
+      }
+    },
+    remove: async (item) => {
+      const id = uuid(item);
+      const q = "delete_configurations=true&delete_volumes=true&docker_cleanup=true&delete_connected_networks=true";
+      try {
+        await cf.http.write("DELETE", `/api/v1/applications/${id}?${q}`);
+      } catch (e) {
+        if (!gone(e)) throw e;
+      }
+      // Pre-review 1: Coolify only queues the delete. The row is marked deleted (and the environment after it is
+      // touched) only once a read shows the app gone; otherwise a transient error makes the purge stop as
+      // `delete_unconfirmed` (retryable, no second delete in this run).
+      const until = now() + confirmMs;
+      for (;;) {
+        if ((await inspect(id)) === null) return;
+        if (now() >= until) throw new ProviderError("coolify", "timeout", "coolify has not finished deleting the application yet");
+        await sleep(pollMs);
+      }
+    },
+  };
+}
+
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
@@ -180,6 +276,19 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
           hits.push({ provider: "coolify", kind: "project", externalId: x.uuid, name: x.name });
         }
       }
+      // M2.5-a3b: applications too (M2.4-c2 names them `devos-<slug>-preview|live` and marks the description).
+      const appNames = new Set(STACK_ENVS.map((env) => applicationName(p.slug, env)));
+      for (const a of await listApplications(cf)) {
+        // Codex PR154-r1 (as PR48-r5 for repos): ownership needs the description field present, a string or null.
+        // An omitted one is inconclusive, so the scan fails rather than report a renamed application as clean.
+        const d = (a as { description?: unknown }).description;
+        if (!(d === null || typeof d === "string")) {
+          throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/applications returned an application without a description field", 200);
+        }
+        if (appNames.has(a.name) || (a.description ?? "").includes(marker)) {
+          hits.push({ provider: "coolify", kind: "application", externalId: a.uuid, name: a.name });
+        }
+      }
       return hits;
     },
   };
@@ -226,6 +335,50 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
 export async function pinnedGitHub(gh: GitHubClient): Promise<GitHubClient> {
   const http = await gh.http.pinned();
   const c = Object.create(Object.getPrototypeOf(gh)) as GitHubClient;
+  Object.defineProperty(c, "http", { value: http, enumerable: true });
+  return c;
+}
+
+const COOLIFY_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * DEVOS-235 purge preflight: Coolify answers 404 for a uuid outside the token's team, so a token for the wrong team
+ * would make every Coolify project, environment and application look gone and blind the leftover scan. Before any
+ * delete, the token must read each of the project's still-active Coolify project rows: a 200 that carries the same
+ * uuid. A 404 (or any other answer) throws `coolify-token-scope`, so the purge stops with `provider_forbidden` and
+ * deletes nothing. A 5xx or timeout stays a transient ProviderError (the purge stops retryable). With no active
+ * Coolify project row there is nothing recorded to prove (docs/modules/M2.5.md, "DEVOS-235 decisions" 2).
+ * Build it, and the purge's Coolify ops and scanner, on one `pinnedCoolify` client, so the proof holds for every call.
+ */
+export function coolifyTokenScopeCheck(cf: CoolifyClient, recorded: () => Promise<readonly InventoryItem[]>): () => Promise<void> {
+  if (typeof recorded !== "function") throw new Error("coolify-recorded-invalid");
+  return async () => {
+    const rows = (await recorded()).filter((r) => r.provider === "coolify" && r.kind === "project");
+    for (const r of rows) {
+      if (!COOLIFY_UUID_RE.test(r.externalId)) throw new Error("coolify-token-scope: a recorded Coolify project id is not a uuid");
+      const res = await cf.http.get<{ uuid?: string }>(`/api/v1/projects/${r.externalId}`);
+      if (res.status === 404) {
+        // Codex PR160-r1: an earlier purge run began deleting this project and crashed before marking the row deleted.
+        // Its 404 then most likely means "gone", so it proves nothing either way: skip it, as decision 2 does for no
+        // row at all. Every other 404 is still read as a wrong-team token.
+        if (r.deleteStartedAt) continue;
+        throw new Error("coolify-token-scope: the Coolify token cannot see this project's Coolify project; use the token of the team that owns it");
+      }
+      if (res.status !== 200 || !res.body || typeof res.body !== "object" || res.body.uuid !== r.externalId) {
+        throw new Error(`coolify-token-scope: Coolify returned an inconclusive answer for the recorded project (${res.status})`);
+      }
+    }
+  };
+}
+
+/**
+ * DEVOS-235 pre-review: one Coolify token snapshot for a whole purge, as `pinnedGitHub` does for GitHub. A token
+ * swapped in the vault after the preflight (another team's) would answer 404 for every uuid and make the stacks look
+ * gone. Build the purge's Coolify ops, scanner and `coolifyTokenScopeCheck` from this one client.
+ */
+export async function pinnedCoolify(cf: CoolifyClient): Promise<CoolifyClient> {
+  const http = await cf.http.pinned();
+  const c = Object.create(Object.getPrototypeOf(cf)) as CoolifyClient;
   Object.defineProperty(c, "http", { value: http, enumerable: true });
   return c;
 }

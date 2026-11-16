@@ -2,7 +2,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -46,12 +46,17 @@ function commit(files, msg = "c") {
   return sha;
 }
 
+// S4-b2a: a stand-in for isolation-apply.sh (its own tests are isolation-apply.test.mjs): counts runs, prints a
+// secret-shaped value (must be redacted) and exits with FAKE_ISO_RC (default 0); FAKE_ISO_SLEEP makes it hang.
+const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + ' Bearer abcDEF+ghi/jkl012345678901234567890="; [[ -n "${FAKE_ISO_MSG:-}" ]] && echo "$FAKE_ISO_MSG"; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
 const real = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
 const baseFiles = () => ({
   "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
   "scripts/review/review-commit.sh": real("scripts/review/review-commit.sh"),
   "scripts/server/server-agent.sh": real("scripts/server/server-agent.sh"),
   "scripts/server/cert-renew.sh": real("scripts/server/cert-renew.sh"),
+  "scripts/server/isolation-apply.sh": fakeIso,
+  "scripts/server/checks/project-isolation-apply.sh": null,   // only AT-b2a-1c installs the real check
   "scripts/server/install-server-agent.sh": real("scripts/server/install-server-agent.sh"),
   "scripts/server/checks/ok.sh": "#!/usr/bin/env bash\necho fine\n",
   "scripts/server/checks/leaky.sh": `#!/usr/bin/env bash\necho "key ${SK} token ${GH_TOKEN} cf ${CF_TOKEN}"\nexit 1\n`,
@@ -167,7 +172,7 @@ test("AT1/AT9: passing SHA installs the allow-list only; a second tick makes no 
   M.main = sha; green(sha); pass(sha);
   const r = await runAgent();
   assert.equal(r.code, 0, r.out);
-  for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "cert-renew.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
+  for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "cert-renew.sh", "isolation-apply.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
   assert.ok(!fs.existsSync(path.join(D(), "bin/install-server-agent.sh")), "installer is not on the allow-list");
   assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), sha);
   assert.ok(fs.existsSync(path.join(D(), `agent/done.${sha}`)), "SHA reaches done");
@@ -609,6 +614,14 @@ test("DEVOS-82 AT13: a read-only token fails the read or write check; a token th
   assert.equal(writes().length, 0, "no write is attempted without read");
 });
 
+test("DEVOS-238: an unreachable Coolify API reads as \"not reachable\", not a six-digit HTTP code", async () => {
+  resetMock();
+  const r = await runTokenCheck({ COOLIFY_API: "http://127.0.0.1:1/cf" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /Coolify API not reachable at http:\/\/127\.0\.0\.1:1\/cf/);
+  assert.doesNotMatch(r.out, /000000/);
+});
+
 test("DEVOS-82 AT14: a read + write + deploy token passes with an idempotent no-op PATCH (same git_commit_sha)", async () => {
   resetMock(); M.appSha = "fedcba9876543210fedcba9876543210fedcba98";
   const r = await runTokenCheck();
@@ -710,6 +723,135 @@ test("DEVOS-87 AT13: an allow-listed file missing from bin/ is installed again f
   fs.rmSync(path.join(D(), "bin/cert-renew.sh")); fs.rmSync(path.join(D(), `agent/installed.${sha}`));
   const r2 = await runAgent();
   assert.ok(!fs.existsSync(path.join(D(), "bin/cert-renew.sh")), r2.out);
+});
+
+// ---- S4-b2a (DEVOS-127): isolation-apply.sh every tick, reported by checks/project-isolation-apply.sh ----
+const isoCount = () => (fs.existsSync(path.join(D(), "iso.count")) ? fs.readFileSync(path.join(D(), "iso.count"), "utf8").split("\n").filter(Boolean).length : 0);
+const isoState = () => fs.readFileSync(path.join(D(), "agent/isolation.state"), "utf8");
+
+test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and runs every tick; output redacted; result kept", async () => {
+  resetMock(); freshState();
+  const sha = commit({ ...baseFiles(), "xb2a1": "1" }, "s4-b2a every tick");
+  M.main = sha; green(sha); pass(sha);
+  const r1 = await runAgent();
+  assert.equal(r1.code, 0, r1.out);
+  assert.match(r1.out, /isolation: not installed yet/);
+  assert.ok(fs.existsSync(path.join(D(), "bin/isolation-apply.sh")), "installed from the allow-list");
+  assert.equal(isoCount(), 1, "run once, after the install and before the new SHA's server checks");
+  const r2 = await runAgent();
+  assert.equal(isoCount(), 2, r2.out);
+  assert.match(r2.out, /isolation: ok/);
+  assert.doesNotMatch(r2.out, /abcdefghijklmnop1234/, "isolation output is redacted");
+  assert.doesNotMatch(r2.out, /ghi\/jkl012345/, "a base64 Bearer value is redacted whole");
+  assert.match(isoState(), /^\d{1,12} ok\n$/);
+  assert.ok(fs.existsSync(path.join(D(), "agent/isolation.enforced")), "the first ok marks isolation as enforced");
+  await runAgent();
+  assert.equal(isoCount(), 3, "runs again on the next tick (not daily)");
+  // Once enforced, "not set up" and a missing listener are failures, never a silent skip (pre-review 1/2).
+  await runAgent({ FAKE_ISO_RC: "3" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 3\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "1" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "4" });
+  assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
+  const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
+  assert.equal(r6.code, 0, r6.out);
+  assert.match(isoState(), /^\d{1,12} fail \(timeout\)\n$/, "the agent's timeout bounds the run");
+  const before = isoCount();
+  const r7 = await runAgent({}, ["--dry-run"]);
+  assert.match(r7.out, /WOULD run isolation-apply\.sh/);
+  assert.equal(isoCount(), before, "--dry-run never runs it");
+});
+
+test("S4-b2a AT-b2a-1b: before the first ok, no token (exit 3) or no listener yet (curl exit 7) is skipped; other failures fail", async () => {
+  resetMock(); freshState();
+  const sha = commit({ ...baseFiles(), "xb2a1b": "1" }, "s4-b2a not set up");
+  M.main = sha; green(sha); pass(sha);
+  await runAgent({ FAKE_ISO_RC: "3" });
+  await runAgent({ FAKE_ISO_RC: "3" });
+  assert.match(isoState(), /^\d{1,12} skipped\n$/, "no token yet");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
+  assert.match(isoState(), /^\d{1,12} skipped\n$/, "token present, listener not deployed yet (S4-t2)");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/, "a listener that answers with an error is a failure");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "self-test failed after the change; previous block restored" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "4" });
+  assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "disabled is a failure even before the first ok");
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.enforced")));
+});
+
+test("S4-b2a AT-b2a-1c: a new SHA's server-check reports isolation-apply.sh as installed by that SHA (pre-review r2)", async () => {
+  resetMock(); freshState();
+  const sha1 = commit({ ...baseFiles(), "xb2a1c": "1" }, "s4-b2a working script");
+  M.main = sha1; green(sha1); pass(sha1);
+  await runAgent(); await runAgent();
+  assert.match(isoState(), /ok\n$/);
+  const broken = '#!/usr/bin/env bash\necho x >> "$DEVOS_DIR/iso.count"; exit 1\n';
+  const sha2 = commit({ ...baseFiles(), "scripts/server/isolation-apply.sh": broken,
+    "scripts/server/checks/project-isolation-apply.sh": real("scripts/server/checks/project-isolation-apply.sh"), "xb2a1c": "2" }, "s4-b2a broken script");
+  M.main = sha2; green(sha2); pass(sha2);
+  reqs.length = 0;
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  const sc = statusPosts("server-check").find(() => true);
+  assert.ok(sc, r.out);
+  assert.equal(sc.state, "failure", "the broken script's result is in this SHA's server-check");
+  assert.match(isoState(), /fail \(exit 1\)\n$/);
+});
+
+test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed copy missing from bin/ is repaired", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ ...baseFiles(), "xb2a2": "1" }, "s4-b2a inflight");
+  M.main = sha; green(sha); pass(sha);
+  M.deployStatus = "in_progress";
+  await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.ok(fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)));
+  const r2 = await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.match(r2.out, /isolation deferred: a deployment is in flight/);
+  assert.equal(isoCount(), 0);
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state")), "a deferral writes no result");
+  // A marker older than ISOLATION_DEFER_MAX (a stuck deploy, or GitHub down) no longer defers (pre-review 3).
+  const old = new Date(Date.now() - 1801 * 1000);
+  fs.utimesSync(path.join(D(), `agent/deploy-started.${sha}`), old, old);
+  const r3 = await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.match(r3.out, /is older than 1800s; not deferring/);
+  assert.equal(isoCount(), 1, r3.out);
+  M.deployStatus = "finished";
+  await runAgent();
+  fs.rmSync(path.join(D(), "bin/isolation-apply.sh"));   // as after an older agent with the shorter allow-list
+  const n = isoCount();
+  const r4 = await runAgent();
+  assert.match(r4.out, /isolation-apply\.sh missing from bin\/; installing again from/);
+  assert.equal(isoCount(), n + 1, "runs in the same tick, once");
+});
+
+const ISO_CHECK = path.join(ROOT, "scripts/server/checks/project-isolation-apply.sh");
+function isoCheck(state, extra = {}) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "iso-check-"));
+  fs.mkdirSync(path.join(d, "agent"));
+  if (state !== null) fs.writeFileSync(path.join(d, "agent/isolation.state"), state);
+  const r = spawnSync("bash", [ISO_CHECK], { env: { ...process.env, DEVOS_DIR: d, ...extra }, encoding: "utf8" });
+  fs.rmSync(d, { recursive: true, force: true });
+  return { code: r.status, out: r.stdout + r.stderr };
+}
+const ago = (s) => Math.floor(Date.now() / 1000) - s;
+
+test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips until set up, fails otherwise", () => {
+  assert.equal(isoCheck(`${ago(60)} ok\n`).code, 0);
+  assert.equal(isoCheck(null).code, 3, "never run yet");
+  assert.equal(isoCheck(`${ago(60)} skipped\n`).code, 3, "not set up yet");
+  assert.equal(isoCheck(`${ago(60)} fail (exit 1)\n`).code, 1);
+  assert.equal(isoCheck(`${ago(60)} fail (timeout)\n`).code, 1);
+  const stale = isoCheck(`${ago(2701)} ok\n`);
+  assert.equal(stale.code, 1, "an old ok is a failure");
+  assert.match(stale.out, /more than 2700s/);
+  assert.equal(isoCheck(`${ago(-600)} ok\n`).code, 1, "a future date fails");
+  assert.equal(isoCheck("garbage\n").code, 1, "unreadable fails, never passes");
+  assert.equal(isoCheck(`${ago(60)} ok extra\n`).code, 1);
+  assert.equal(isoCheck(`${ago(100)} ok\n`, { ISOLATION_MAX_AGE: "50" }).code, 1);
 });
 
 // ---- DEVOS-90: re-checks on request and every 6 hours ----
@@ -946,4 +1088,148 @@ if out="$(gh_all_runs abc)"; then echo "ok \${#out}"; else echo "fail $(ls "$TMP
   const out = execFileSync("bash", [f], { cwd: ROOT, encoding: "utf8" }).trim();
   fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(out, "fail 0\nfail 0", "a failed or non-JSON page must fail the call and leave no temp files");
+});
+
+// ---- DEVOS-234 d3c-3: checks/provision-probe.sh steps the AT13 probe detached in the API container ----
+// Fakes on PATH: `docker` (ps → one API id; `exec` runs the command here, `exec -d` runs it in the background) and
+// `node` (the probe CLI: `step` replays FAKE_DIR/steps line by line as "exit|sleep|json", `report` prints
+// FAKE_DIR/report as "exit|json"). PROBE_STATE_DIR stands in for /tmp/devos-probe inside the container.
+const PCHECK = path.join(ROOT, "scripts/server/checks/provision-probe.sh");
+function probeFakes({ steps = [], report = "3|{}", api = true } = {}) {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-pcheck-"));
+  const w = (n, body) => { fs.writeFileSync(path.join(bin, n), `#!/usr/bin/env bash\n${body}\n`); fs.chmodSync(path.join(bin, n), 0o755); };
+  fs.writeFileSync(path.join(bin, "steps"), steps.join("\n") + "\n");
+  fs.writeFileSync(path.join(bin, "report"), report + "\n");
+  w("docker", `echo "$*" >> "$FAKE_DIR/docker.args"
+case "$1" in
+  ps) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit 0;;
+  exec) shift; if [[ "$1" == -d ]]; then shift 2; shift; ( sleep "\${FAKE_DSLEEP:-0}"; sh -c "$2" ) >/dev/null 2>&1 & exit 0; fi
+        shift; shift; exec sh -c "$2";;
+esac
+exit 1`);
+  w("node", `[[ "$1 $2 $3" == "deploy/with-db-url.mjs node apps/api/dist/provision-probe-cli.js" ]] || exit 99
+case "$4" in
+  step) n=$(cat "$FAKE_DIR/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/n"
+        l="$(sed -n "\${n}p" "$FAKE_DIR/steps")"; [[ -n "$l" ]] || exit 98
+        IFS='|' read -r rc sl js <<<"$l"; sleep "$sl"; echo "$js"; exit "$rc";;
+  report) IFS='|' read -r rc js < "$FAKE_DIR/report"; echo "$js"; exit "$rc";;
+esac
+exit 97`);
+  return { bin, state: path.join(bin, "state"), api };
+}
+function runProbeCheck(f, { finishBy = "20", dsleep = "0" } = {}) {
+  const r = spawnSync("bash", [PCHECK], {
+    env: { PATH: `${f.bin}:${process.env.PATH}`, FAKE_DIR: f.bin, FAKE_API: f.api ? "1" : "0", PROBE_STATE_DIR: f.state,
+           PROBE_POLL_SECONDS: "0.2", PROBE_FINISH_BY_SECONDS: finishBy, PROBE_EXEC_SECONDS: "10", FAKE_DSLEEP: dsleep },
+    encoding: "utf8",
+  });
+  const args = fs.existsSync(path.join(f.bin, "docker.args")) ? fs.readFileSync(path.join(f.bin, "docker.args"), "utf8") : "";
+  fs.rmSync(path.join(f.bin, "docker.args"), { force: true }); // each run's calls only
+  const steps = Number(fs.existsSync(path.join(f.bin, "n")) ? fs.readFileSync(path.join(f.bin, "n"), "utf8") : 0);
+  return { code: r.status, out: r.stdout + r.stderr, args, steps };
+}
+const pj = (o) => JSON.stringify({ command: "step", ...o });
+const inProg = (phase) => `3|0|${pj({ exit: 3, phase, cycle: 1, code: "in_progress" })}`;
+
+test("DEVOS-234 d3c-3 provision-probe: steps detached until the cycle ends; a passed cycle passes", () => {
+  const f = probeFakes({ steps: [inProg("run1"), inProg("inventory1"), inProg("run2"), `0|0|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const r = runProbeCheck(f);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.steps, 4);
+  assert.match(r.out, /probe cycle passed/);
+  // every step was started detached (docker exec -d), never as a blocking exec
+  assert.equal((r.args.match(/^exec -d abcdef123456 sh -c .*provision-probe-cli\.js step/gm) ?? []).length, 4, r.args);
+  assert.doesNotMatch(r.args.split("\n").filter((l) => !l.startsWith("exec -d")).join("\n"), /cli\.js step/);
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a failed cycle fails; the probe off (no grant) is skipped", () => {
+  const fail = probeFakes({ steps: [inProg("purge"), `1|0|${pj({ exit: 1, phase: "done", cycle: 1, code: "inventory-differs" })}`] });
+  const r1 = runProbeCheck(fail);
+  assert.equal(r1.code, 1, r1.out);
+  assert.match(r1.out, /failed \(code inventory-differs\)/);
+  const off = probeFakes({ steps: [`3|0|${pj({ exit: 3, phase: "idle", cycle: 0, code: "skipped", detail: "probe-purge-not-approved" })}`] });
+  const r2 = runProbeCheck(off);
+  assert.equal(r2.code, 3, r2.out);
+  assert.equal(r2.steps, 1);
+  for (const f of [fail, off]) fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: between cycles it reports the newest finished cycle (read-only report)", () => {
+  const probed = `3|0|${pj({ exit: 3, phase: "done", cycle: 2, code: "probed", detail: "pass" })}`;
+  for (const [report, want] of [["0|{\"command\":\"report\",\"code\":\"pass\"}", 0], ["1|{\"command\":\"report\",\"code\":\"purge-failed\"}", 1], ["3|{\"command\":\"report\",\"code\":\"no-cycle\"}", 3]]) {
+    const f = probeFakes({ steps: [probed], report });
+    const r = runProbeCheck(f);
+    assert.equal(r.code, want, r.out);
+    assert.equal(r.steps, 1);
+    assert.match(r.out, /report: \{"command":"report"/);
+    fs.rmSync(f.bin, { recursive: true, force: true });
+  }
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a step longer than the time box is left running and picked up by the next run", () => {
+  const f = probeFakes({ steps: [`0|5|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const first = runProbeCheck(f, { finishBy: "2" });
+  assert.equal(first.code, 3, first.out);
+  assert.match(first.out, /still in progress/);
+  assert.equal((first.args.match(/^exec -d /gm) ?? []).length, 1, "the first run started the step");
+  // a second run while the step still runs starts nothing new and leaves it running
+  const during = runProbeCheck(f, { finishBy: "1" });
+  assert.equal(during.code, 3, during.out);
+  assert.doesNotMatch(during.args, /^exec -d /m, "nothing started while the step runs");
+  // once it ends, the next run reads its result exactly once
+  const after = runProbeCheck(f);
+  assert.equal(after.code, 0, after.out);
+  assert.equal(after.steps, 1, "the step was run once in all");
+  assert.ok(fs.existsSync(path.join(f.state, "rc.last")) && !fs.existsSync(path.join(f.state, "rc")));
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a step that does not move the phase waits for the next run; a hung step fails", () => {
+  const f = probeFakes({ steps: [inProg("purge"), inProg("purge"), inProg("purge")] });
+  const r = runProbeCheck(f);
+  assert.equal(r.code, 3, r.out);
+  assert.equal(r.steps, 2, "stops after the second step left the phase where it was");
+  assert.match(r.out, /phase purge is still in progress/);
+  fs.rmSync(f.bin, { recursive: true, force: true });
+  const h = probeFakes({ steps: [`0|30|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const first = runProbeCheck(h, { finishBy: "1" });
+  assert.equal(first.code, 3, first.out);
+  const pidAge = path.join(h.state, "pid");
+  const old = new Date(Date.now() - 3 * 3600 * 1000);
+  fs.utimesSync(pidAge, old, old);
+  const hung = runProbeCheck(h, { finishBy: "1" });
+  assert.equal(hung.code, 1, hung.out);
+  assert.match(hung.out, /hung/);
+  spawnSync("bash", ["-c", `kill $(cat "${pidAge}") 2>/dev/null; pkill -f "${h.bin}" 2>/dev/null; true`]);
+  fs.rmSync(h.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a detached start that is slow to run is never started twice", () => {
+  const f = probeFakes({ steps: [inProg("run1"), `0|0|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const r = runProbeCheck(f, { dsleep: "1" });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.steps, 2, "one step per start, none doubled");
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a step whose process is gone without an exit code is started again", () => {
+  const f = probeFakes({ steps: [`0|0|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  fs.mkdirSync(f.state);
+  fs.writeFileSync(path.join(f.state, "pid"), "999999\n"); // no such process
+  const r = runProbeCheck(f);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.steps, 1);
+  fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: skipped without docker's API container; a CLI usage exit fails", () => {
+  const none = probeFakes({ api: false });
+  const r1 = runProbeCheck(none);
+  assert.equal(r1.code, 3, r1.out);
+  assert.match(r1.out, /no running DevOS API container/);
+  assert.equal(r1.steps, 0);
+  const usage = probeFakes({ steps: [`2|0|{"error":"usage"}`] });
+  assert.equal(runProbeCheck(usage).code, 1);
+  for (const f of [none, usage]) fs.rmSync(f.bin, { recursive: true, force: true });
 });
