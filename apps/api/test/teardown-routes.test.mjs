@@ -327,11 +327,29 @@ test("Codex PR179-r2: a sweep run from a stale snapshot writes nothing to a prov
   const rows = { isArchived: async (id) => (await store.project(id))?.stage === "archived" };
   const asked = [];
   const authorize = notArchived(rows, P.id, async (a) => (asked.push(a), "allow"));
-  await assert.rejects(runProvision(P.id, [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P)], { store, authorize }), (e) => /policy_denied|denied/.test(String(e.code ?? e.message)));
+  await assert.rejects(runProvision(P.id, [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P)], { store, authorize }), (e) => e.message === "provision-project-archived" && e.name !== "StepError");
   assert.equal(fake.calls.filter((c) => c.method !== "GET").length, 0, "no provider write after Archive");
   assert.deepEqual(asked, [], "M1.7 is not even asked for an archived project");
   // Not archived: the inner authorizer decides; a failing stage read is a deny.
   assert.equal(await notArchived({ isArchived: async () => false }, P.id, async () => "allow")("x", "y"), "allow");
-  assert.equal(await notArchived({ isArchived: async () => { throw new Error("db"); } }, P.id, async () => "allow")("x", "y"), "deny");
+  await assert.rejects(notArchived({ isArchived: async () => { throw new Error("db password=x"); } }, P.id, async () => "allow")("x", "y"), (e) => e.message === "provision-stage-unreadable");
+
+  // Codex PR179-r3: sweep → Archive → Restore. The stale run's failure is retryable (not parked), the archived project
+  // drops out of the listing, and after Restore it is provisioned again.
+  const { ProvisionSweepJob } = await import("../dist/provision-sweep.js");
+  let stage = "archived";
+  const runs = [];
+  const job = new ProvisionSweepJob({
+    listProvisioning: async (exclude) => (stage === "provisioning" && !exclude.includes(P.id) ? [{ id: P.id, slug: P.slug, name: P.name }] : []),
+    provision: async (p) => { runs.push(stage); return notArchived({ isArchived: async () => stage === "archived" }, p.id, async () => "allow")("a", "r"); },
+    markBuilding: async () => {},
+    raiseNameConflict: async () => {},
+    log: () => {},
+  });
+  await job["onFailure"]({ id: P.id, slug: P.slug, name: P.name }, new Error("provision-project-archived"));
+  assert.equal(job.isParked(P.id), false, "a lifecycle skip never parks the project");
+  stage = "provisioning"; // Restore
+  await job.tick();
+  assert.deepEqual(runs, ["provisioning"], "the restored project is provisioned again on the next tick");
   assert.equal(await notArchived({}, P.id, async () => "require_approval")("x", "y"), "require_approval");
 });

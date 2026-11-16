@@ -104,12 +104,21 @@ export function provisionConfig(env: NodeJS.ProcessEnv): ProvisionConfig | { off
 /**
  * DEVOS-244 (Codex PR179-r2): the sweep snapshots its projects before running them one by one, and Archive can run in
  * between under the same project lock. Each create therefore re-reads the stage first: an archived or purged project
- * (or a read that fails) is a deny, so runProvision stops before any provider write.
+ * (or a read that fails) throws, so runProvision stops before any provider write without parking the project.
  */
 export function notArchived(rows: Pick<ProvisioningRows, "isArchived">, projectId: string, inner: Authorize): Authorize {
   if (!rows.isArchived) return inner;
   const check = rows.isArchived.bind(rows);
-  return async (action, resource) => ((await check(projectId).catch(() => true)) ? "deny" : inner(action, resource));
+  // Codex PR179-r3: a plain throw, not "deny". The runner stops before the write either way, but a deny would be a
+  // non-retryable policy_denied that parks the project in the sweep, so a later Restore (or a transient read error)
+  // would leave it parked. A plain error is retryable: an archived project simply drops out of the next listing
+  // (`archivedAt: null` filter), and a restored or recovered one is provisioned again.
+  return async (action, resource) => {
+    let archived: boolean;
+    try { archived = await check(projectId); } catch { throw new Error("provision-stage-unreadable"); }
+    if (archived) throw new Error("provision-project-archived");
+    return inner(action, resource);
+  };
 }
 
 /** M1.7 on every create: `provision.<provider>.<kind>` on `project:<id>/…`; anything but allow stops the step. */
