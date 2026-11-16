@@ -15,7 +15,7 @@ const PR_SHA = "d".repeat(40);
 
 let srv, port, dir;
 let M;
-const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false, manyComments: false, runs: null, reruns: [], failRerun: false, runState: null });
+const reset = () => (M = { statuses: [], failStatus: false, failMain: false, hangMain: false, prs: [], green: false, comments: [], runsDelayMs: 0, hangComment: false, failCommentsGet: false, manyComments: false, runs: null, reruns: [], failedOnlyReruns: [], failRerun: false, runState: null });
 
 before(async () => {
   reset();
@@ -37,7 +37,10 @@ before(async () => {
           ? { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "completed", conclusion: "success" }
           : { workflow_id: 1, created_at: "2026-11-11T00:00:00Z", status: "in_progress", conclusion: null }] });
       }
-      const rr = p.match(/^\/repos\/kkarnati1980\/devos\/actions\/runs\/(\d+)\/rerun-failed-jobs$/);
+      const rr = p.match(/^\/repos\/kkarnati1980\/devos\/actions\/runs\/(\d+)\/rerun$/);
+      const rf = p.match(/^\/repos\/kkarnati1980\/devos\/actions\/runs\/(\d+)\/rerun-failed-jobs$/);
+      // DEVOS-243: a failed-jobs-only re-run would reuse kk-answers' old output; record it so a test can refuse it.
+      if (rf && req.method === "POST") { M.failedOnlyReruns.push(Number(rf[1])); return send(201, {}); }
       const rg = p.match(/^\/repos\/kkarnati1980\/devos\/actions\/runs\/(\d+)$/);
       if (rg && req.method === "GET") {
         const id = Number(rg[1]);
@@ -544,6 +547,8 @@ test("AT22: a PASS with FLOOR-GUARD KEEP re-runs the failed ci-gate run once; a 
   assert.deepEqual(M.reruns, [777], "the failed ci-gate run, by id");
   await tick([], { REVIEW_RUNNER: keep });
   assert.deepEqual(M.reruns, [777], "only once");
+  // DEVOS-243: the whole run is re-run (/rerun), never only its failed jobs.
+  assert.deepEqual(M.failedOnlyReruns, [], "never rerun-failed-jobs");
   // Pre-review L1: a ci-gate run already re-run by hand (now green) is not POSTed, and the watcher stops trying.
   reset();
   const sha4 = "5b".repeat(20);
