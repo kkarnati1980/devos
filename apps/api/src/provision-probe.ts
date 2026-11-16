@@ -72,6 +72,19 @@ export function inventoryDiff(a: InventoryRow[], b: InventoryRow[]): string | nu
   return null;
 }
 
+/**
+ * Codex PR164-r2: the first incomplete row of one read, or null. A done step without an external id, or without an
+ * active resource row behind it (an empty name), is a gap; the same gap in both reads would compare equal, so each
+ * read is checked on its own before the compare. Checked in key order, so the row named is stable.
+ */
+export function inventoryIncomplete(rows: InventoryRow[]): string | null {
+  for (const r of [...rows].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))) {
+    if (r.externalId === "") return `no-external-id:${r.key}`;
+    if (r.name === "") return `no-active-resource:${r.key}`;
+  }
+  return null;
+}
+
 function nextPhase(p: Phase): Phase {
   return PHASES[Math.min(PHASES.indexOf(p) + 1, PHASES.length - 1)] ?? "done";
 }
@@ -141,11 +154,15 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     }
     case "inventory1": {
       const r = await attempt(() => d.inventory());
-      return r.ok ? advance({ inventory1: r.value }) : toPurge(failed("inventory1-failed", "error"));
+      if (!r.ok) return toPurge(failed("inventory1-failed", "error"));
+      const gap = inventoryIncomplete(r.value);
+      return gap ? toPurge(failed("inventory-incomplete", `run1:${gap}`)) : advance({ inventory1: r.value });
     }
     case "inventory2": {
       const r = await attempt(() => d.inventory());
       if (!r.ok) return toPurge(failed("inventory2-failed", "error"));
+      const gap = inventoryIncomplete(r.value);
+      if (gap) return toPurge(failed("inventory-incomplete", `run2:${gap}`));
       const diff = inventoryDiff(last.inventory1 ?? [], r.value);
       // A failed compare still purges the probe's resources: the failure is kept in the record.
       return diff ? toPurge(failed("inventory-differs", diff)) : advance();
