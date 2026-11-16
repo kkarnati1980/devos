@@ -29,15 +29,17 @@ function fixHeaderObject(h) {
 
 function fixHeaderList(list) {   // writeHead's flat [name, value, name, value…] form
   if (list.length % 2) throw new TypeError("mybrain-link: a header list needs a value for every name");
-  const out = []; let csp = false;
+  // Node applies a list through setHeader once a header is set (protectResponse sets them first), so a name
+  // listed twice keeps only its last value: every CSP value of the list goes into one entry.
+  const out = []; let csp = null;
   for (let i = 0; i < list.length; i += 2) {
     const name = String(list[i]); let value = list[i + 1];
     if (CORS.test(name)) continue;
     if (name.toLowerCase() === "x-frame-options") value = "DENY";
-    if (name.toLowerCase() === "content-security-policy") csp = true;
+    if (name.toLowerCase() === "content-security-policy") { (csp ??= []).push(...(Array.isArray(value) ? value : [value])); continue; }
     out.push(name, value);
   }
-  if (csp) out.push("content-security-policy", NONE);
+  if (csp) out.push("content-security-policy", withFrameAncestorsNone(csp));
   return out;
 }
 

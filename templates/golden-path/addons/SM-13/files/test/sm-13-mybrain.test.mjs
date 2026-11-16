@@ -17,10 +17,11 @@ const routes = {
   "GET /obj": (_q, res) => { res.writeHead(200, { "Access-Control-Allow-Origin": "https://evil.example", "Content-Security-Policy": "default-src 'self'; frame-ancestors *" }); res.end("x"); },
   "GET /list": (_q, res) => { res.writeHead(200, "OK", ["access-control-allow-origin", "*", "x-frame-options", "ALLOWALL", "content-type", "text/plain"]); res.end("y"); },
   "GET /csp": (_q, res) => { res.setHeader("content-security-policy", ["script-src 'self'", "frame-ancestors https://mybrain.example"]); res.end("z"); },
+  "GET /list-csp": (_q, res) => { res.writeHead(200, ["Content-Security-Policy", "default-src 'self'", "content-security-policy", "img-src 'self'", "content-type", "text/plain"]); res.end("l"); },
   "GET /comma": (_q, res) => { res.setHeader("content-security-policy", "default-src 'self', frame-ancestors https://evil.example"); res.end("c"); },
   "OPTIONS /": (_q, res) => { res.writeHead(204, { "access-control-allow-methods": "POST" }); res.end(); },
 };
-const paths = ["/", "/obj", "/list", "/csp", "/comma", "/health", "/ready", "/missing"];
+const paths = ["/", "/obj", "/list", "/list-csp", "/csp", "/comma", "/health", "/ready", "/missing"];
 const tmp = { dir: "" };
 const listen = (server) => new Promise((r) => server.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${server.address().port}`)));
 const silent = { write() {} };
@@ -45,6 +46,12 @@ test("SM-13-L1 every response carries frame-ancestors 'none' and no Access-Contr
     return res;
   } });
   assert.equal(r.ok, true);
+  // A flat header list keeps every CSP value the route gave, plus the 'none' policy.
+  const { safeFetch } = await import("../src/safe-fetch.mjs");
+  const seen = [];
+  const r2 = await scanApp({ baseUrl: openUrl, paths: ["/list-csp"], fetcher: async (url, opts) => { const res = await safeFetch(url, opts); seen.push(res.headers["content-security-policy"]); return res; } });
+  assert.equal(r2.ok, true);
+  assert.equal(seen[0], "default-src 'self', img-src 'self', frame-ancestors 'none'");
 });
 
 test("SM-13-L1 the scan catches an app without the profile (negative control)", async () => {
