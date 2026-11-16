@@ -126,36 +126,37 @@ boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when 
 
 # --- S4-b2d: conntrack clean-up and the run deadline ---------------------------------------------------------
 T0=$SECONDS
-DEADLINE="$(conf ISOLATION_DEADLINE_S)"; [[ "$DEADLINE" =~ ^[0-9]{1,2}$ ]] || DEADLINE=25
+DEADLINE="$(conf ISOLATION_DEADLINE_S)"; [[ "$DEADLINE" =~ ^[0-9]{1,2}$ ]] && (( DEADLINE <= 25 )) || DEADLINE=25  # pre-review: never above 25
 shrunk() {  # $1 = previous block, $2 = new block -> the /24 sources (or the pool) whose rules shrank, one per line
   [[ -z "$1" ]] && { echo "$POOL"; return; }
-  local src
-  for src in $(grep -oE -- '-s 10\.[0-9]+\.[0-9]+\.0/24' <<<"$1" | cut -d' ' -f2 | sort -u); do
-    # Every previous rule with this source must still be there, else the stack lost a right.
-    while IFS= read -r l; do
-      grep -qxF -- "$l" <<<"$2" || { echo "$src"; break; }
-    done < <(grep -F -- "-s $src " <<<"$1")
-  done
+  # One pass (pre-review: per-rule greps were O(n^2)): previous rules with a /24 source that the new block lacks.
+  comm -23 <(grep -E -- ' -s 10\.[0-9]+\.[0-9]+\.0/24 ' <<<"$1" | LC_ALL=C sort -u) <(LC_ALL=C sort -u <<<"$2") \
+    | grep -oE -- '-s 10\.[0-9]+\.[0-9]+\.0/24' | cut -d' ' -f2 | LC_ALL=C sort -u
 }
 ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack; 0 when nothing is left pending
-  local f="$ISO/conntrack.pending" src out left=""
+  local f="$ISO/conntrack.pending" src out rc left=""
   [[ -s "$f" ]] || return 0
   if ! command -v conntrack >/dev/null 2>&1; then
     echo "conntrack not installed: connections opened before the change are kept until they close ($(paste -sd' ' "$f"))"; return 1
   fi
   while IFS= read -r src; do
     [[ "$src" =~ ^10\.(20[89]|21[01])\.[0-9]{1,3}\.0/(24|14)$ ]] || continue
-    if (( SECONDS - T0 >= 55 )); then left+="$src"$'\n'; continue; fi
+    # Pre-review: no call may run past the agent's 60 s, so the last one starts by 49 s and gets what is left.
+    if (( SECONDS - T0 >= 49 )); then left+="$src"$'\n'; continue; fi
     # conntrack exits 1 when no entry matched ("0 flow entries have been deleted"); that is a success here.
-    out="$(timeout 10 conntrack -D -s "$src" 2>&1)"
-    [[ $? == 0 || "$out" == *"flow entries have been deleted"* ]] || left+="$src"$'\n'
+    out="$(timeout $(( 59 - (SECONDS - T0) < 10 ? 59 - (SECONDS - T0) : 10 )) conntrack -D -s "$src" 2>&1)"; rc=$?
+    (( rc == 0 )) || { (( rc == 1 )) && [[ "$out" == *": 0 flow entries have been deleted"* ]]; } || left+="$src"$'\n'
   done < "$f"
   if [[ -n "$left" ]]; then printf '%s' "$left" > "$f.tmp" && mv -f "$f.tmp" "$f"; echo "conntrack clean-up incomplete, retried next tick: $(paste -sd' ' "$f")"; return 1; fi
   rm -f "$f"; return 0
 }
 ct_queue() {  # $1 = previous block, $2 = new block -> add the shrunk sources to the pending list
   local new
-  new="$(shrunk "$1" "$2")"; [[ -n "$new" ]] || return 0
+  new="$(shrunk "$1" "$2")"
+  # Pre-review: a re-install of the same block is a drift repair (a flushed chain or a lost jump); flows opened
+  # while it was missing would survive it through the ESTABLISHED return, so the whole pool is cut.
+  [[ -n "$1" && "$1" == "$2" ]] && new="$POOL"
+  [[ -n "$new" ]] || return 0
   { [[ -s "$ISO/conntrack.pending" ]] && cat "$ISO/conntrack.pending"; echo "$new"; } | sort -u > "$ISO/conntrack.pending.tmp" \
     && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
 }
@@ -342,8 +343,10 @@ exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply ru
 [[ -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
+  # Pre-review: the clean-up runs whatever the boot step says, so a broken after.rules cannot hold it back.
+  rc=0; ct_flush || rc=1
   boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; exit 1; }
-  ct_flush || exit 1
+  (( rc == 0 )) || exit 1
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
 fi
 
@@ -354,12 +357,15 @@ pre_ok=1; pre_msg="$(selftest)" || pre_ok=0
 # S4-b decision 11 / S4-b2d: start no change late in the run, so the post-change self-test and a rollback
 # (iptables-restore 15 s + the self-test) still fit inside the agent's 60 s.
 (( SECONDS - T0 <= DEADLINE )) || { echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; exit 1; }
+# Pre-review: the cut is queued BEFORE the change, so a kill, a failed record or a failed boot step after it can
+# never lose it. A cut queued for a change that then fails or rolls back is harmless (decision 2).
+ct_queue "$PREV" "$BLOCK" || { echo "could not write $ISO/conntrack.pending: nothing changed"; exit 1; }
 if ! install_block "$BLOCK"; then
   echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
 fi
 if ! post_msg="$(selftest)"; then
   if (( pre_ok == 0 )); then
-    record "$BLOCK"; boot_sync "$BLOCK"; ct_queue "$PREV" "$BLOCK"; ct_flush
+    record "$BLOCK"; ct_flush; boot_sync "$BLOCK"
     echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
@@ -371,7 +377,7 @@ if ! post_msg="$(selftest)"; then
   exit 1
 fi
 record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
+ct_ok=0; ct_flush || ct_ok=1
 boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; exit 1; }
-ct_queue "$PREV" "$BLOCK" || { echo "applied, but could not write $ISO/conntrack.pending"; exit 1; }
-ct_flush || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; exit 1; }
+(( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; exit 1; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"

@@ -593,3 +593,58 @@ test("S4-b2d: no change starts after the run deadline; nothing changes and the n
   const ok = host(STATE);
   assert.equal(run(ok, [], { FAKE_CURL_SLEEP: "1.2" }).code, 0, "the default 25 s deadline allows a slow fetch");
 });
+
+test("S4-b2d (pre-review): a failed boot step after a revoke still cuts the revoked stack, now and on later ticks", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD); // M0.1's block gone: boot persistence fails from now on
+  const n0 = ctLog(h).length;
+  setState(h, { stacks: [STATE.stacks[1]] });
+  let r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24", "queued before the change");
+  r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /not persisted for boot/);
+  assert.equal(ctLog(h).at(-1), "-D -s 10.209.1.0/24", "the unchanged tick still runs the clean-up");
+  assert.equal(fs.existsSync(pending(h)), false);
+  assert.ok(ctLog(h).length > n0);
+});
+
+test("S4-b2d (pre-review): a drift repair (same block re-installed) cuts the whole pool", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "nf/DEVOS-ISO-FWD"), ""); // hand flush
+  const n0 = ctLog(h).length;
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n0), ["-D -s 10.208.0.0/14"]);
+});
+
+test("S4-b2d (pre-review): the block kept after an already-failing probe is cut too", () => {
+  const h = host(STATE);
+  targets(h, downPort);
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /block kept/);
+  assert.deepEqual(ctLog(h), ["-D -s 10.208.0.0/14"]);
+});
+
+test("S4-b2d (pre-review): without the conntrack tool the run says so, exits 1 and keeps the cut pending", () => {
+  const h = host(STATE);
+  const nob = path.join(h, "bin");
+  fs.mkdirSync(nob);
+  for (const f of fs.readdirSync(bin)) if (f !== "conntrack") fs.symlinkSync(path.join(bin, f), path.join(nob, f));
+  // Only the core tools the script needs, so a real conntrack in /usr/bin cannot be found.
+  const core = path.join(h, "core");
+  fs.mkdirSync(core);
+  for (const t of ["bash", "jq", "flock", "sed", "grep", "cat", "cut", "sort", "comm", "head", "tr", "mv", "rm", "mkdir", "chmod",
+    "date", "sha256sum", "timeout", "awk", "ls", "paste", "mktemp", "stat", "sleep", "kill", "printf", "env"]) {
+    const w = spawnSync("bash", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
+    if (w.startsWith("/")) fs.symlinkSync(w, path.join(core, t));
+  }
+  const r = run(h, [], { PATH: `${nob}:${core}` });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /conntrack not installed/);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.0.0/14");
+  assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/, "the block itself does not need conntrack");
+});
