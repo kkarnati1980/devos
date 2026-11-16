@@ -382,7 +382,7 @@ test("M2.5-b3: POST purge-request needs the session and CSRF, returns the card i
     const ok = await call(port, "POST", `/projects/${P.id}/purge-request`, { headers: h });
     assert.deepEqual([ok.status, ok.json], [200, { approvalId: CARD, raised: true }]);
     assert.deepEqual(asks, [P.id]);
-    for (const [code, status] of [["not_archived", 409], ["purge-already-approved", 409], ["project-not-found", 404], ["something-else", 503]]) {
+    for (const [code, status] of [["not_archived", 409], ["purge-already-approved", 409], ["purge-waits-for-daily-run", 409], ["project-not-found", 404], ["something-else", 503]]) {
       answer = { ok: false, code };
       const r = await call(port, "POST", `/projects/${P.id}/purge-request`, { headers: h });
       assert.deepEqual([r.status, r.json.code], [status, status === 503 ? "teardown-failed" : code]);
