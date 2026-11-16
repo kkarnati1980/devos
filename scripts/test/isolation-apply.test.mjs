@@ -26,6 +26,7 @@ before(async () => {
 [[ "$1" == -w ]] && shift 2
 echo "$*" >> "$FAKE_LOG/iptables.log"
 op="$1" ch="$2"; shift 2; f="$FAKE_NF/$ch"
+[[ "$op" == -S && -n "\${FAKE_IPT_S_SLEEP:-}" ]] && sleep "$FAKE_IPT_S_SLEEP"
 case "$op" in
   -S) [[ -f "$f" ]] || exit 1; [[ "$ch" == INPUT || "$ch" == FORWARD ]] && echo "-P $ch DROP" || echo "-N $ch"; cat "$f" ;;
   -C) [[ -f "$f" ]] && grep -qxF -- "-A $ch $*" "$f" ;;
@@ -592,6 +593,21 @@ test("S4-b2d: no change starts after the run deadline; nothing changes and the n
   assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
   const ok = host(STATE);
   assert.equal(run(ok, [], { FAKE_CURL_SLEEP: "1.2" }).code, 0, "the default 25 s deadline allows a slow fetch");
+});
+
+test("Codex PR163-r1: a deadline used up by the iptables queries just before the change still defers it; nothing changes", () => {
+  // The first apply makes no iptables query before the early check, so it passes; install_block's queries then
+  // take 2 s each, past the 1 s deadline, and iptables-restore must not start.
+  const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=1\n" });
+  const r = run(h, [], { FAKE_IPT_S_SLEEP: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /deadline: \d+ s spent before the change \(limit 1 s\); nothing changed/);
+  assert.equal(restores(h), 0, "iptables-restore never started");
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+  assert.equal(fs.existsSync(pending(h)), false, "the cut queued for the deferred change is withdrawn");
+  assert.equal(fs.existsSync(installed(h)), false, "nothing recorded");
+  const ok = run(h, [], {});
+  assert.equal(ok.code, 0, ok.out);
 });
 
 test("S4-b2d (pre-review): a failed boot step after a revoke still cuts the revoked stack, now and on later ticks", () => {

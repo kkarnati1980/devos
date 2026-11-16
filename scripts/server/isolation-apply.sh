@@ -315,13 +315,19 @@ record() {  # block -> installed.rules + live fingerprint
   printf '%s\n' "$1" > "$ISO/installed.rules.tmp" && mv -f "$ISO/installed.rules.tmp" "$ISO/installed.rules" \
     && live_fp > "$ISO/live.sha256.tmp" && mv -f "$ISO/live.sha256.tmp" "$ISO/live.sha256"
 }
-install_block() {  # block text in $1 -> live, in one transaction with the jump changes
+install_block() {  # block text in $1 -> live, in one transaction with the jump changes; $2=deadline: check it last
   ipt -S DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (M0.1 not applied?)"; return 1; }
   # The whole transaction is built BEFORE iptables-restore starts (Codex PR54-r1): on the legacy backend restore
   # holds the xtables lock from *filter to COMMIT, so jump_ops' `iptables -S` queries must not run inside it.
   local tx ops
   ops="$(jump_ops)" || return 1
   tx="$(grep -vx 'COMMIT' <<<"$1")"$'\n'"${ops:+$ops$'\n'}COMMIT"
+  # Codex PR163-r1: the drift check and jump_ops above are timeout-bound iptables queries that can use up the rest
+  # of the deadline, so the forward change checks it once more right before iptables-restore (exit 2: deferred,
+  # nothing changed). A rollback never passes `deadline`: it must always run.
+  if [[ "${2:-}" == deadline ]] && (( SECONDS - T0 > DEADLINE )); then
+    echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; return 2
+  fi
   printf '%s\n' "$tx" | timeout 15 iptables-restore -w 5 --noflush
 }
 selftest() {  # every target host:port must accept a TCP connection within 3 s
@@ -373,7 +379,9 @@ ct_restore() {  # the pending list as it was before this run's ct_queue
   else rm -f "$ISO/conntrack.pending"; fi
 }
 ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; exit 1; }
-if ! install_block "$BLOCK"; then
+install_block "$BLOCK" deadline; irc=$?
+if (( irc == 2 )); then ct_restore; exit 1; fi
+if (( irc != 0 )); then
   ct_restore
   echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
 fi
