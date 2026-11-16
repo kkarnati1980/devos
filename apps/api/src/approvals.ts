@@ -1,6 +1,7 @@
 // M2.3 decision cards (docs/modules/M2.3.md): ACTION / TARGET / REASON cards, KK-only decisions that issue one
 // scoped, expiring, limited-use M1.7 grant, and blocked tasks that wait only on the cards they depend on.
 import { createHash } from "node:crypto";
+import { probeGrantCard } from "./provision-probe-purge.js";
 import { looksSecret, type NoticeInput } from "./notify.js";
 import type { KkSession } from "./auth.js";
 
@@ -391,7 +392,13 @@ export class Approvals {
   private async grantScope(card: Card, options: ApproveOptions, at: Date): Promise<Parameters<GrantIssuer["issueGrant"]>[1]> {
     if (card.action === PROBE_GRANT_CARD_ACTION) {
       const pid = card.projectId;
-      if (!pid || card.target !== `project:${pid}` || !this.deps.isProbeProject) throw new ApprovalError("invalid-input");
+      // Pre-review 1: only the fixed card the probe raises (its gate and every word of its text), so a policy card for
+      // the same action, carrying a rule's reason, can never issue this grant.
+      const fixed = pid ? probeGrantCard(pid) : null;
+      if (
+        !pid || !fixed || card.target !== fixed.target || card.gate !== fixed.gate || card.reason !== fixed.reason ||
+        card.consequence !== fixed.consequence || !this.deps.isProbeProject
+      ) throw new ApprovalError("invalid-input");
       let probe: boolean;
       try {
         probe = await this.deps.isProbeProject(pid);

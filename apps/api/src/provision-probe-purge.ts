@@ -199,7 +199,7 @@ export async function probeStage(db: any, projectId: string, timeoutMs: number):
   return String(p.stage);
 }
 
-/** DEVOS-110 decision 2: a rejected grant card is not raised again for one probe cycle. */
+/** DEVOS-110 decision 2: a rejected (or approved, then revoked) grant card is not raised again for one probe cycle. */
 export const PROBE_CARD_REASK_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
@@ -240,7 +240,8 @@ export async function raiseProbeGrantCard(projectId: string, now: Date, d: Probe
   const cards = await d.list({ action: card.action, target: card.target, limit: 50 });
   if (cards.some((c) => c.status === "pending")) return false;
   const since = now.getTime() - PROBE_CARD_REASK_MS;
-  if (cards.some((c) => c.status === "rejected" && (c.decidedAt ?? c.createdAt).getTime() > since)) return false;
+  // Pre-review 3: a card approved in the last 7 days whose grant is gone (KK revoked it) is a "no" too, like a rejection.
+  if (cards.some((c) => (c.status === "rejected" || c.status === "approved") && (c.decidedAt ?? c.createdAt).getTime() > since)) return false;
   await d.raise(card);
   return true;
 }

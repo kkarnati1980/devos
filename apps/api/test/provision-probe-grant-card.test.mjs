@@ -70,6 +70,15 @@ test("a: a blocked cycle raises exactly one fixed card; a second blocked tick ra
   assert.equal(await raise(), true, "asked again after 7 days");
   assert.equal((await s.store.list({ status: "pending", limit: 10 })).length, 1);
 
+  // Pre-review 3: an approval KK later revokes holds re-asking for 7 days, like a rejection.
+  const [p2] = await s.store.list({ status: "pending", limit: 1 });
+  const { grantId } = await s.approvals.approve(s.session, p2.id);
+  await s.engine.revokeGrant(s.session, grantId);
+  s.advance(PROBE_CARD_REASK_MS - 60_000);
+  assert.equal(await raise(), false, "a revoked approval is not re-asked within 7 days");
+  s.advance(2 * 60_000);
+  assert.equal(await raise(), true);
+
   // A cycle that is not blocked for the grant raises nothing; a card that cannot be raised keeps the cycle blocked.
   let called = 0;
   assert.equal(await cycleStartWithCard(async () => "ready", async () => { called++; return true; }), "ready");
@@ -115,6 +124,13 @@ test("c: the same action on a non-probe project, or with a mismatched target, is
   await assert.rejects(s.approvals.approve(s.session, other.id), (e) => e instanceof ApprovalError && e.code === "invalid-input");
   const skew = await s.approvals.raiseCard({ ...probeGrantCard(PROBE), target: `project:${OTHER}` });
   await assert.rejects(s.approvals.approve(s.session, skew.id), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  // Pre-review 1: a policy card for the same action (a rule's reason or gate) is not the fixed card.
+  const policyCard = await s.approvals.raiseCard({ ...probeGrantCard(PROBE), reason: "Policy requires approval", consequence: null });
+  await assert.rejects(s.approvals.approve(s.session, policyCard.id), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  await s.approvals.reject(s.session, policyCard.id);
+  const otherGate = await s.approvals.raiseCard({ ...probeGrantCard(PROBE), gate: "decision" });
+  await assert.rejects(s.approvals.approve(s.session, otherGate.id), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  await s.approvals.reject(s.session, otherGate.id);
   const noProject = await s.approvals.raiseCard({ ...probeGrantCard(PROBE), projectId: null });
   await assert.rejects(s.approvals.approve(s.session, noProject.id), (e) => e instanceof ApprovalError && e.code === "invalid-input");
   assert.equal([...s.policyStore.grants].length, 0);
