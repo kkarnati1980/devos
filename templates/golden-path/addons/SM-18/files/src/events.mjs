@@ -8,8 +8,9 @@ const ID = /^[\w.:-]{1,200}$/;
 // One process only. An app with more than one instance gives the ledger a database store with the same three
 // calls plus transaction(fn): fn(tx) runs inside one database transaction, and the ledger passes tx to the
 // three calls and to the handler, so the handler's write and the record of the event commit together or not
-// at all. lastOrder(objectId, tx) should lock the object's row (SELECT … FOR UPDATE) so two instances cannot
-// apply events for one object at once; a duplicate event id then fails the unique key and rolls back.
+// at all. lastOrder(objectId, tx) should first upsert the object's row (INSERT … ON CONFLICT DO NOTHING) and then
+// lock it (SELECT … FOR UPDATE), so two instances cannot apply events for one object at once, even its first
+// two events; a duplicate event id then fails the unique key and rolls back.
 export function memoryEventStore({ now = Date.now, keepMs = 7 * 24 * 3600 * 1000 } = {}) {
   const events = new Map();   // event id → time seen (kept at least as long as providers retry, 3 days for most)
   const objects = new Map();  // object id → { version, rank }
