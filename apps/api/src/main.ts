@@ -19,7 +19,7 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision, teardown, teardownSweep, linearSync } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision, teardown, teardownSweep, linearSync, linearLinks } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadLinear: async (apiKey) => {
@@ -96,6 +96,7 @@ async function main(): Promise<void> {
     requirements,
     provision,
     teardown,
+    linearLinks,
     tls,
   });
   app.enableShutdownHooks();

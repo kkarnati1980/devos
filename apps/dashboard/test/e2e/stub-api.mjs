@@ -154,6 +154,23 @@ export async function startStubApi(allowedOrigin) {
       t.purgeCardId = "00000000-0000-4000-8000-0000000000a3";
       return json(200, { approvalId: t.purgeCardId, raised: true });
     }
+    // M2.6-b2b3 (DEVOS-248): Open in Linear. xss-probe is mirrored, with one link that is not on linear.app and a
+    // module key carrying markup; every other project has the mirror off (the API's answer while the sync is off).
+    const llSlug = url.match(/^\/projects\/by-slug\/([a-z0-9-]+)\/linear-links$/);
+    if (req.method === "GET" && llSlug) {
+      state.linearLinksAsked = (state.linearLinksAsked ?? 0) + 1;
+      if (llSlug[1] !== "xss-probe") return json(200, { enabled: false, project: null, modules: [] });
+      return json(200, {
+        enabled: true,
+        project: "https://linear.app/kishoremb/project/xss-probe-0f1e2d3c4b5a",
+        modules: [
+          { key: "M1.1", url: "https://linear.app/kishoremb/issue/DEVOS-301/m11" },
+          { key: "M1.2<img src=x onerror=window.__xss8=1>", url: "https://linear.app/kishoremb/issue/DEVOS-302/m12" },
+          { key: "M1.3", url: "javascript:window.__xss9=1" },
+          { key: "M1.4", url: "https://linear.app.evil.example/x" },
+        ],
+      });
+    }
     if (req.method === "GET" && url.startsWith("/projects/by-slug/")) return json(404, { statusCode: 404, code: "project-not-found" });
     if (req.method === "GET" && url === "/setup") {
       return json(200, { capsConfirmed: state.settings.capsConfirmedAt !== null, vaultConfigured: true, secrets: NAMES.map((n) => ({ name: n, set: state.secrets.has(n) })), complete: false });

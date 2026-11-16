@@ -389,6 +389,21 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: "`project-not-found`" }
         "503": { description: "`teardown-not-configured` or `teardown-store-failed`" }
+  /projects/by-slug/{slug}/linear-links:
+    get:
+      operationId: getLinearLinksBySlug
+      summary: "M2.6-b2b3: the project page's Open in Linear links, read from Linear by the stored ids (read-only, no Linear write)"
+      x-devos-access: session
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9-]{2,40}$" } }
+      responses:
+        "200": { description: "`{ enabled, project: null | url, modules: [{ key, url }] }`; `enabled: false` while the Linear sync is off (no Linear call); every url is https on linear.app, and a module without a stored Linear id has no entry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "502": { description: "`linear-unreachable` (Linear failed or took longer than 15 s; never Linear's text)" }
+        "503": { description: "`linear-links-store-failed`" }
   /projects/{id}/teardown:
     get:
       operationId: getTeardownState
