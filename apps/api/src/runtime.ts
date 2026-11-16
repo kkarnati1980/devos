@@ -29,6 +29,8 @@ import { ANTHROPIC_KEY_NAME } from "./analyst-adapter.js";
 import { buildProvisionSweep, PrismaProvisioningRows, type ProvisionModule, type ProvisionWiring } from "./provision-runtime.js";
 import type { ProvisionSweepJob } from "./provision-sweep.js";
 import { PrismaProvisionReader, type ProvisionServices } from "./provision-routes.js";
+import type { TeardownServices } from "./teardown-routes.js";
+import { buildTeardownServices, type TeardownRuntimeModule } from "./teardown-runtime.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -93,6 +95,8 @@ export interface Runtime {
   provisionSweep: ProvisionSweepJob | null;
   /** DEVOS-225 (M2.4-d2): the status and retry routes; null parts → 503 `provision-not-configured`. */
   provision: ProvisionServices;
+  /** DEVOS-244 (M2.5-b1): archive/restore routes; null parts → 503 `teardown-not-configured`. */
+  teardown: TeardownServices;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -125,6 +129,8 @@ export async function buildRuntime(
      * @devos/db, so the API typechecks on its own. Absent or failing → the provisioning sweep is off (logged).
      */
     loadProvision?: () => Promise<{ mod: ProvisionModule; apply: ProvisionWiring["apply"]; isolationHook: (o: { store: PrismaIsolationStore }) => ProvisionWiring["afterStack"] }>;
+    /** DEVOS-244: @devos/teardown, imported at runtime like @devos/provision. Absent or failing → the archive/restore routes answer 503. */
+    loadTeardown?: () => Promise<TeardownRuntimeModule>;
   },
 ): Promise<Runtime> {
   const databaseUrl = env.DATABASE_URL;
@@ -141,7 +147,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null } };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null }, teardown: { reader: null, actions: null } as TeardownServices };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -258,8 +264,13 @@ export async function buildRuntime(
     : { off: opts.loadProvision ? "provision-load-failed" : "provision-not-loaded" };
   const provisionSweep = "off" in sweep ? null : sweep;
   if ("off" in sweep) log({ level: "warn", msg: "provision-sweep-off", code: sweep.off });
+  // DEVOS-244 (M2.5-b1): archive/restore for KK, on the same provider modules and vault as the sweep.
+  const td = opts.loadTeardown ? await opts.loadTeardown().catch(() => null) : null;
+  const tw = buildTeardownServices({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownServices>[0]["policy"], env, timeoutMs: t });
+  if ("off" in tw) log({ level: "warn", msg: "teardown-routes-off", code: tw.off });
+  const teardown: TeardownServices = "off" in tw ? { reader: null, actions: null } : { ...tw, log };
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
-    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep } };
+    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown };
 }
 
 /**

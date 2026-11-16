@@ -19,7 +19,7 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision, teardown } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadLinear: async (apiKey) => {
@@ -37,6 +37,11 @@ async function main(): Promise<void> {
       const applyUrl = new URL("../../../scripts/template/apply.mjs", import.meta.url).href;
       const [mod, iso, tpl] = await Promise.all([import(provisionModuleName), import(isolationModuleName), import(applyUrl)]);
       return { mod, apply: tpl.apply, isolationHook: iso.isolationHook };
+    },
+    loadTeardown: async () => {
+      // DEVOS-244: @devos/teardown, imported at runtime like @devos/provision.
+      const teardownModuleName = "@devos/teardown";
+      return import(teardownModuleName);
     },
     loadDb: async (url) => {
       // @devos/db is a declared dependency of @devos/api (PR14-r1); it is imported at runtime so the
@@ -85,6 +90,7 @@ async function main(): Promise<void> {
     approvals,
     requirements,
     provision,
+    teardown,
     tls,
   });
   app.enableShutdownHooks();
