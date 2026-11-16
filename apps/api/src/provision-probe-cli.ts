@@ -20,21 +20,47 @@ export function errorCode(e: unknown): string {
   return /^(probe|provision)-[a-z0-9-]{1,60}$/.test(m) ? m : "probe-error";
 }
 
-const summary = (r: PhaseRecord) => ({ cycle: r.cycle, phase: r.phase, at: r.at, ...(r.result ? { result: { ok: r.result.ok, code: r.result.code, ...(r.result.detail ? { detail: r.result.detail } : {}) } } : {}) });
+/**
+ * Pre-review 2: a `detail` is printed only in the shape of our codes and step keys (it can be a runner StepError code
+ * read structurally, or come back from a DB row); anything else is replaced, never printed.
+ */
+export function safeDetail(d: unknown): string | undefined {
+  if (d === undefined || d === null || d === "") return undefined;
+  return typeof d === "string" && /^[A-Za-z0-9_:.,\/-]{1,120}$/.test(d) ? d : "probe-detail-hidden";
+}
+const withDetail = (d: unknown) => { const x = safeDetail(d); return x ? { detail: x } : {}; };
+const summary = (r: PhaseRecord) => ({ cycle: r.cycle, phase: r.phase, at: r.at, ...(r.result ? { result: { ok: r.result.ok, code: r.result.code, ...withDetail(r.result.detail) } } : {}) });
+
+export const USAGE = "provision-probe-cli.js status|report|step";
+/** The command, or null for wrong arguments (exit 2, checked before anything is built or read). */
+export function parseCommand(argv: string[]): "status" | "report" | "step" | null {
+  return argv.length === 1 && (argv[0] === "status" || argv[0] === "report" || argv[0] === "step") ? argv[0] : null;
+}
+
+/**
+ * Pre-review 1: the probe is skipped exactly when the sweep would not run: the wiring is off, or a provider token is
+ * not in the vault yet (`ready()`, as ProvisionSweepJob checks it). Checked before the probe project is touched.
+ */
+export async function offReasonFor(w: { off: string } | { provisioner: { ready(): Promise<string | null> } }): Promise<string | null> {
+  if ("off" in w) return w.off;
+  try {
+    return await w.provisioner.ready();
+  } catch {
+    return "provision-ready-check-failed";
+  }
+}
 
 /**
  * The CLI's core over injected effects, so it is tested without a database or providers. `deps` is built lazily:
  * `status` and `report` need only the phase log; `step` builds everything (and may report the probe as skipped).
  */
 export async function probeCli(argv: string[], deps: { log(): Promise<Pick<ProbeDeps, "last">>; step(): Promise<ProbeDeps> }): Promise<CliResult> {
-  const cmd = argv[0];
-  if (argv.length !== 1 || !["status", "report", "step"].includes(cmd ?? "")) {
-    return { code: 2, out: { error: "usage", usage: "provision-probe-cli.js status|report|step" } };
-  }
+  const cmd = parseCommand(argv);
+  if (!cmd) return { code: 2, out: { error: "usage", usage: USAGE } };
   try {
     if (cmd === "step") {
       const t = await probeStep(await deps.step());
-      return { code: t.exit, out: { command: "step", ...t } };
+      return { code: t.exit, out: { command: "step", exit: t.exit, phase: t.phase, cycle: t.cycle, code: t.code, ...withDetail(t.detail) } };
     }
     const last = await (await deps.log()).last();
     if (cmd === "status") return { code: 0, out: { command: "status", ...(last ? summary(last) : { phase: "idle", cycle: 0 }) } };
@@ -52,25 +78,31 @@ const notWired = async (): Promise<never> => { throw new Error("probe-not-wired"
 /* c8 ignore start -- the production wiring; its pieces are tested on their own (probeCli, the parts, buildProvisioner). */
 async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
   const timeoutMs = 10_000;
+  const argv = process.argv.slice(2);
+  const cmd = parseCommand(argv);
+  if (!cmd) return { code: 2, out: { error: "usage", usage: USAGE } };
   const databaseUrl = env.DATABASE_URL;
-  if (!databaseUrl) return { code: 3, out: { code: "skipped", detail: "database-not-configured" } };
+  // DevOS not deployed with a database here: every command reports skipped (exit 3), with its name.
+  if (!databaseUrl) return { code: 3, out: { command: cmd, code: "skipped", detail: "database-not-configured" } };
   const dbModuleName = "@devos/db";
   const { createDb } = (await import(dbModuleName)) as { createDb: (u: string) => any };
   const db = createDb(databaseUrl);
   try {
     const project = async () => ensureProbeProject(db, new Date(), timeoutMs);
-    return await probeCli(process.argv.slice(2), {
+    return await probeCli(argv, {
       log: async () => {
-        const found = await db.project.findUnique({ where: { slug: PROBE_SLUG }, select: { id: true } });
+        const found = await db.$transaction((tx: any) => tx.project.findUnique({ where: { slug: PROBE_SLUG }, select: { id: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
         return found ? new PrismaProbeLog(db, found.id, timeoutMs) : { last: async () => null };
       },
       step: async () => {
         const { stepWiring } = await import("./provision-probe-wiring.js");
         const w = await stepWiring(db, databaseUrl, env, timeoutMs);
-        // Off (no policy key, vault or provisioning settings): skipped before the probe project is created or read.
-        if ("off" in w) {
-          const off = w.off;
-          return { offReason: async () => off, last: async () => null, record: notWired, provisionOnce: notWired, inventory: notWired, liveAsserts: notWired, purge: notWired, fingerprint: "", now: () => new Date() };
+        // Off (no policy key, vault, provisioning settings or provider token): skipped before the probe project is
+        // created or read.
+        const off = await offReasonFor(w);
+        if (off || "off" in w) {
+          const reason = off ?? "provision-off";
+          return { offReason: async () => reason, last: async () => null, record: notWired, provisionOnce: notWired, inventory: notWired, liveAsserts: notWired, purge: notWired, fingerprint: "", now: () => new Date() };
         }
         const pv = w.provisioner;
         const p = await project();
@@ -81,7 +113,7 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           last: () => log.last(),
           record: (r) => log.record(r),
           provisionOnce: () => probeProvisionOnce(pv, p),
-          inventory: () => readProbeInventory(db, p.id),
+          inventory: () => readProbeInventory(db, p.id, timeoutMs),
           liveAsserts: notWired,
           purge: notWired,
           fingerprint: await probeFingerprint(fileURLToPath(root)),

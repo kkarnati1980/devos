@@ -61,11 +61,12 @@ export async function probeFingerprint(root: string): Promise<string> {
  * by provider, kind and external id. A done step whose resource row is missing, or a step done without an external id,
  * is kept with an empty name so the compare names it (a silent drop could hide a lost row).
  */
-export async function readProbeInventory(db: any, projectId: string): Promise<InventoryRow[]> {
-  const [steps, resources] = await Promise.all([
-    db.provisionStep.findMany({ where: { projectId, status: "done" }, orderBy: [{ key: "asc" }], select: { key: true, provider: true, kind: true, externalId: true } }),
-    db.resource.findMany({ where: { projectId, status: "active" }, select: { provider: true, kind: true, externalId: true, name: true } }),
-  ]) as [any[], any[]];
+export async function readProbeInventory(db: any, projectId: string, timeoutMs: number): Promise<InventoryRow[]> {
+  // Pre-review 3: bounded like PrismaProbeLog (ADR-0011: a timeout on every outbound call), one consistent read.
+  const [steps, resources] = await db.$transaction(async (tx: any) => [
+    await tx.provisionStep.findMany({ where: { projectId, status: "done" }, orderBy: [{ key: "asc" }], select: { key: true, provider: true, kind: true, externalId: true } }),
+    await tx.resource.findMany({ where: { projectId, status: "active" }, select: { provider: true, kind: true, externalId: true, name: true } }),
+  ], { timeout: timeoutMs, maxWait: timeoutMs }) as [any[], any[]];
   const byId = new Map<string, string>();
   for (const r of resources) byId.set(`${r.provider}\u0000${r.kind}\u0000${r.externalId}`, String(r.name));
   return steps.map((s) => ({
