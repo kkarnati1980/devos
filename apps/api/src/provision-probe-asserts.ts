@@ -225,3 +225,17 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
   }
   return capCodes(codes);
 }
+
+/**
+ * DEVOS-110 follow-up (from DEVOS-234): the CLI's production wiring of AT13's live asserts, kept here so a test can
+ * run it. It uses the purge kit's provisioning module and its GitHub and Coolify clients, and reads this project's
+ * own journal on every call.
+ */
+export function liveAssertsFor(
+  kit: { provisionMod: unknown; gh: unknown; cf: unknown },
+  db: any,
+  projectId: string,
+  timeoutMs: number,
+): () => Promise<string[]> {
+  return () => probeLiveAsserts({ mod: kit.provisionMod as AssertModule, gh: kit.gh, cf: kit.cf, projectId, steps: () => readProbeSteps(db, projectId, timeoutMs) });
+}
