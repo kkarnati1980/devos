@@ -375,6 +375,72 @@ paths:
         "404": { description: "`project-not-found`" }
         "409": { description: "`project-not-provisioning`, or `project-not-parked` (the project is not parked)" }
         "503": { description: "`provision-not-configured` or `provision-store-failed`" }
+  /projects/by-slug/{slug}/teardown:
+    get:
+      operationId: getTeardownStateBySlug
+      summary: "M2.5-b1: the same teardown state by slug, for the project page's Remove project panel (read-only)"
+      x-devos-access: session
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9-]{2,40}$" } }
+      responses:
+        "200": { description: "`{ projectId, slug, stage, archivedAt, purgeAfter, active, lastScan }`, as GET /projects/{id}/teardown" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "503": { description: "`teardown-not-configured` or `teardown-store-failed`" }
+  /projects/{id}/teardown:
+    get:
+      operationId: getTeardownState
+      summary: "M2.5-b1: stage, archive dates, active resources per provider and the last leftover scan (read-only)"
+      x-devos-access: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ projectId, slug, stage, archivedAt, purgeAfter, active: { <provider>: <count> }, lastScan: null | { scannedAt, hits: [{ provider, kind, externalId, name }], errors: [{ scanner, code }] } }`; hit fields are text, a scanner error is its fixed code only" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`project-not-found`" }
+        "503": { description: "`teardown-not-configured` or `teardown-store-failed`" }
+  /projects/{id}/archive:
+    post:
+      operationId: archiveProject
+      summary: "M2.5-b1: Archive (stop the stacks, archive the repo; nothing deleted). purge_after = now + archive_days. Reversible with Restore"
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ stage: \"archived\", archivedAt, purgeAfter }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "Forbidden (session, Origin, CSRF), or `policy_denied` / `approval_required` from M1.7" }
+        "404": { description: "`project_not_found` or `project-not-found`" }
+        "409": { description: "`already_archived`, `ownership_mismatch` or `project-busy` (provisioning or a purge holds the project lock)" }
+        "500": { description: "`unsupported_resource`" }
+        "502": { description: "`provider_error`, `provider_forbidden` or `delete_unconfirmed`" }
+        "503": { description: "`teardown-not-configured`, `teardown-store-failed`, `archive-days-invalid` or `teardown-failed`" }
+        "504": { description: "`teardown-timeout` (120 s; the run continues under the project lock, GET shows the result)" }
+  /projects/{id}/restore:
+    post:
+      operationId: restoreProject
+      summary: "M2.5-b1: Restore an archived project (repo un-archived, stage back to its previous value; stacks stay stopped)"
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ stage }`" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "Forbidden (session, Origin, CSRF), or `policy_denied` / `approval_required` from M1.7" }
+        "404": { description: "`project_not_found` or `project-not-found`" }
+        "409": { description: "`not_archived`, `ownership_mismatch` or `project-busy`" }
+        "500": { description: "`unsupported_resource`" }
+        "502": { description: "`provider_error`, `provider_forbidden` or `delete_unconfirmed`" }
+        "503": { description: "`teardown-not-configured`, `teardown-store-failed` or `teardown-failed`" }
+        "504": { description: "`teardown-timeout`" }
   /vault/secrets:
     get:
       operationId: listSecrets
