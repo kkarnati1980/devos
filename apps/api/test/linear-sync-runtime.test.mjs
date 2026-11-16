@@ -115,6 +115,14 @@ test("decision 4: a failing project is logged by fixed code and id only; a missi
   const skips = logs2.filter((l) => l.msg === "linear-sync-skipped");
   assert.ok(skips.length >= 2, "one warning per tick; the schedule goes on");
   assert.deepEqual(skips[0], { level: "warn", msg: "linear-sync-skipped", code: "linear-key-not-set" });
+  const broken = fakeModule();
+  const logs3 = [];
+  const job3 = buildLinearSync({ mod: broken.mod, db: { tag: "db" }, vault: { reveal: async () => { throw new Error("vault-key-version-mismatch"); } }, env: ON, log: (e) => logs3.push(e), intervalMs: 20 });
+  job3.start();
+  await sleep(50);
+  await job3.stop();
+  assert.deepEqual(logs3.find((l) => l.msg === "linear-sync-skipped"), { level: "warn", msg: "linear-sync-skipped", code: "linear-key-unreadable" });
+  assert.equal(broken.seen.lists, 0);
 });
 
 test("decision 2–3: off, with a fixed code, unless switched on and fully configured", () => {
@@ -126,7 +134,9 @@ test("decision 2–3: off, with a fixed code, unless switched on and fully confi
   assert.deepEqual(buildLinearSync({ ...base, vault: null, env: ON }), { off: "linear-sync-vault-not-configured" });
   assert.deepEqual(buildLinearSync({ ...base, mod: null, env: ON }), { off: "linear-sync-not-loaded" });
   assert.deepEqual(buildLinearSync({ ...base, env: { ...ON, DEVOS_LINEAR_TEAM_KEY: "DEVOS; drop" } }), { off: "linear-team-key-invalid" });
-  assert.deepEqual(buildLinearSync({ ...base, mod: { ...mod, LinearClient: undefined }, env: ON }), { off: "linear-sync-not-loaded" }, "a module without its exports never stops the API");
+  for (const k of ["LinearClient", "graphqlApi", "listActiveProjects", "syncActiveProjects", "lockedSyncOne", "startSchedule"]) {
+    assert.deepEqual(buildLinearSync({ ...base, mod: { ...mod, [k]: undefined }, env: ON }), { off: "linear-sync-not-loaded" }, `a module without ${k} never stops the API`);
+  }
 });
 
 test("buildRuntime: the Linear sync is null when switched off, and with no loader; a loader that throws never stops the API", async () => {

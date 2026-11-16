@@ -43,6 +43,9 @@ export function buildLinearSync(w: {
   if (!w.db) return { off: "linear-sync-no-database" };
   if (!w.vault) return { off: "linear-sync-vault-not-configured" };
   if (!w.mod) return { off: "linear-sync-not-loaded" };
+  // Pre-review r2: every export this wiring calls must be a function, or the sync is off (the API still starts).
+  const EXPORTS = ["LinearClient", "graphqlApi", "listActiveProjects", "syncActiveProjects", "lockedSyncOne", "startSchedule"] as const;
+  if (EXPORTS.some((k) => typeof (w.mod as unknown as Record<string, unknown>)[k] !== "function")) return { off: "linear-sync-not-loaded" };
   const teamKey = w.env.DEVOS_LINEAR_TEAM_KEY ?? "DEVOS";
   if (!TEAM_KEY.test(teamKey)) return { off: "linear-team-key-invalid" };
   const mod = w.mod;
@@ -71,8 +74,10 @@ export function buildLinearSync(w: {
   }
   const tick = async () => {
     // Pre-review 4: no key → one warning per tick, not one per project (and no lock or transaction is opened).
-    if (!(await vault.reveal("linear_api_key").catch(() => null))) {
-      w.log({ level: "warn", msg: "linear-sync-skipped", code: "linear-key-not-set" });
+    // Pre-review r2: a vault that cannot read the key is named as such, not as a missing key.
+    const key = await vault.reveal("linear_api_key").then((k) => (k ? "set" : "not-set"), () => "unreadable");
+    if (key !== "set") {
+      w.log({ level: "warn", msg: "linear-sync-skipped", code: key === "unreadable" ? "linear-key-unreadable" : "linear-key-not-set" });
       return;
     }
     const r = await mod.syncActiveProjects({ list: () => mod.listActiveProjects(db), syncOne });
