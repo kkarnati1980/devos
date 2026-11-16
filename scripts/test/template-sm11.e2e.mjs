@@ -25,7 +25,7 @@ test("SM-11-L1: the generated app's main journey passes in Chromium at 1440×900
   fs.symlinkSync(fs.realpathSync(path.dirname(pkg)), path.join(out, "node_modules/playwright"), "dir");
   const report = path.join(tmp, "e2e-report");
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT"));
-  const run = spawnSync(process.execPath, ["--test", "test/e2e/main-journey.e2e.mjs"], { cwd: out, encoding: "utf8", timeout: 180_000, env: { ...env, E2E_REPORT_DIR: report } });
+  const run = spawnSync(process.execPath, ["--test", "test/e2e/main-journey.e2e.mjs"], { cwd: out, encoding: "utf8", timeout: 120_000, env: { ...env, E2E_REPORT_DIR: report } });
   assert.equal(run.status, 0, `${run.stdout.slice(-3000)}${run.stderr.slice(-1500)}`);
   const rep = JSON.parse(fs.readFileSync(path.join(report, "main-journey-report.json"), "utf8"));
   assert.equal(rep.check, "SM-11-L1");
