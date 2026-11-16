@@ -223,3 +223,42 @@ test("d3c-2b: in probeStep, failing asserts purge and end live-assert-failed wit
   assert.equal(recs.at(-1).phase, "purge");
   assert.equal(recs.at(-1).result, undefined);
 });
+
+test("d3c-2b pre-review 1: past the time budget no new read starts, and each check left is unreadable", async () => {
+  const w = world();
+  let t = 0;
+  // The clock moves 10 units per call; the budget lets the first few checks start, then none.
+  const out = await probeLiveAsserts({ mod: w.mod, gh: "GH", cf: "CF", projectId: PID, steps: async () => steps(), budgetMs: 25, now: () => (t += 10) });
+  assert.ok(out.length > 0);
+  for (const c of out) assert.match(c, /-unreadable(:|$)/);
+  const before = w.reads.length;
+  assert.ok(before < 9, `reads ${before}`);
+  // A budget of 0 reads nothing at a provider.
+  const w2 = world();
+  const none = await probeLiveAsserts({ mod: w2.mod, gh: "GH", cf: "CF", projectId: PID, steps: async () => steps(), budgetMs: 0 });
+  assert.deepEqual(w2.reads, []);
+  assert.deepEqual(none, ["app-unreadable:preview", "app-unreadable:production", "default-branch-unreadable", "env-unreadable:preview", "more-1"]);
+});
+
+test("d3c-2b pre-review 2: a throw from pinning or the journal read ends the cycle live-assert-failed:error and purges", async () => {
+  for (const which of ["pin", "journal"]) {
+    const w = world();
+    if (which === "pin") w.mod.pinnedCoolify = async () => { throw new Error("vault read failed with a body"); };
+    const recs = [];
+    const deps = {
+      offReason: async () => null,
+      last: async () => recs.at(-1) ?? { cycle: 1, phase: "assert", at: new Date().toISOString(), fingerprint: "f" },
+      record: async (r) => { recs.push(r); },
+      provisionOnce: async () => "done",
+      inventory: async () => [],
+      liveAsserts: () => probeLiveAsserts({ mod: w.mod, gh: "GH", cf: "CF", projectId: PID, steps: async () => { if (which === "journal") throw new Error("db down"); return steps(); } }),
+      purge: async () => "done",
+      fingerprint: "f",
+      now: () => new Date(),
+    };
+    await probeStep(deps);
+    assert.equal(recs.at(-1).phase, "purge", which);
+    assert.equal(recs.at(-1).result.code, "live-assert-failed");
+    assert.equal(recs.at(-1).result.detail, "error");
+  }
+});

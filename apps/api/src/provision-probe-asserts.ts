@@ -28,6 +28,11 @@ export interface AssertModule {
 export const COOLIFY_DESCRIPTION_MAX = 255;
 /** Decision 5: the CLI prints a detail of at most 120 characters (`safeDetail`), so the list is capped to fit. */
 export const ASSERT_DETAIL_MAX = 120;
+/**
+ * Decision 6 (pre-review 1): one tick must end inside the server agent's 120 s check limit, so no new read starts after
+ * this budget; each check not started is reported as its `*-unreadable` code and the cycle purges.
+ */
+export const ASSERT_BUDGET_MS = 75_000;
 
 const UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
@@ -102,6 +107,9 @@ export interface AssertDeps {
   cf: unknown;
   projectId: string;
   steps(): Promise<Map<string, string>>;
+  /** Tests only: the budget and the clock. */
+  budgetMs?: number;
+  now?: () => number;
 }
 
 /**
@@ -110,6 +118,9 @@ export interface AssertDeps {
  * `journal-missing:<key>`. Only the reads that build the inputs (pinning, the journal) may throw.
  */
 export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
+  const now = d.now ?? Date.now;
+  const deadline = now() + (d.budgetMs ?? ASSERT_BUDGET_MS);
+  const late = () => now() >= deadline;
   const steps = await d.steps();
   const gh = (await d.mod.pinnedGitHub(d.gh)).http;
   const cf = (await d.mod.pinnedCoolify(d.cf)).http;
@@ -127,7 +138,8 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
   const [owner, repoName] = full ? (full.split("/") as [string, string]) : ["", ""];
   const repoOk = !!full && NAME_RE.test(owner) && NAME_RE.test(repoName) && !dotsOnly(owner) && !dotsOnly(repoName);
   if (full && !repoOk) codes.push("journal-missing:github/repo");
-  if (repoOk) {
+  if (repoOk && late()) codes.push("default-branch-unreadable");
+  else if (repoOk) {
     try {
       const r = await gh.get<{ default_branch?: unknown }>(`/repos/${owner}/${repoName}`);
       if (r.status !== 200 || !r.body) codes.push("default-branch-unreadable");
@@ -146,7 +158,7 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
     if (!uuid) continue;
     // The stored application: description and Compose.
     let app: { description?: unknown; docker_compose_raw?: unknown } | null = null;
-    try {
+    if (!late()) try {
       const r = await cf.get<{ description?: unknown; docker_compose_raw?: unknown }>(`/api/v1/applications/${uuid}`);
       app = r.status === 200 && r.body && typeof r.body === "object" ? r.body : null;
     } catch {
@@ -157,7 +169,8 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
       const desc = app.description;
       if (typeof desc !== "string" || !desc.includes(marker)) codes.push(`app-description-marker:${env}`);
       if (typeof desc === "string" && desc.length > COOLIFY_DESCRIPTION_MAX) codes.push(`app-description-length:${env}`);
-      if (repo && commit) {
+      if (repo && commit && late()) codes.push(`compose-unreadable:${env}`);
+      else if (repo && commit) {
         try {
           tree ??= repo.treeOf(commit);
           const entry = (await tree).get(`deploy/compose.${env}.devos.yaml`);
@@ -170,7 +183,7 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
     }
     // The app secrets' env vars: listed, readable, runtime-only.
     let envs: Record<string, unknown>[] | null = null;
-    try {
+    if (!late()) try {
       const r = await cf.get<unknown>(`/api/v1/applications/${uuid}/envs`);
       envs = r.status === 200 && Array.isArray(r.body) ? (r.body as unknown[]).filter((x): x is Record<string, unknown> => !!x && typeof x === "object") : null;
     } catch {
