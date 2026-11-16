@@ -2,7 +2,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { grantProblem } from "@devos/policy";
-import { teardownWiring, purgeStop, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
+import { teardownWiring, purgeStop, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, teardownResource, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
+import * as realProvision from "@devos/provision";
+import * as realTeardown from "@devos/teardown";
 import { probeStep } from "../dist/provision-probe.js";
 
 const PID = "11111111-1111-4111-8111-111111111111";
@@ -41,7 +43,7 @@ test("d3c-2a decision 2: the wiring covers every recorded kind, the required sca
   assert.deepEqual(w.ops.map((o) => `${o.provider}/${o.kind}`).sort(), [
     "backup_schedule/nightly", "coolify/application", "coolify/environment", "coolify/port", "coolify/private_key", "coolify/project", "github/deploy_key", "github/repo",
   ]);
-  assert.deepEqual(w.scanners.map((s) => s.name), ["inventory", "vault", "github", "coolify"]);
+  assert.deepEqual(w.scanners.map((s) => s.name), ["inventory", "vault", "github", "coolify", "backup_schedule"]);
   assert.equal(w.preflight.length, 2);
   // DEVOS-235 decision 4: every provider op, scanner and check gets the one pinned client of its provider.
   for (const c of calls) {
@@ -134,11 +136,18 @@ test("d3c-2a decision 3: a KK grant for teardown.* on the probe project is found
     ["one use left", grant({ uses: 29 })],
     ["expired", grant({ expiresAt: new Date("2026-11-01T00:00:00Z") })],
     ["another project", grant({ projectId: "22222222-2222-4222-8222-222222222222" })],
-    ["pinned to a resource", grant({ scopeResource: "other" })],
+    ["pinned to another resource", grant({ scopeResource: "other" })],
+    ["pinned to the bare id (teardown asks about project:<id>)", grant({ scopeResource: PID })],
   ]) {
     assert.equal(await findProbeGrant(grantDb([g]).db, PID, NOW, 1234, grantProblem), null, why);
   }
   assert.equal(await findProbeGrant(grantDb([grant({ id: "bad", uses: 30 }), grant({ id: "good" })]).db, PID, NOW, 1234, grantProblem), "good", "the next usable grant");
+  // Pre-review 2: a grant pinned to the resource teardown authorizes is accepted.
+  assert.equal(teardownResource(PID), `project:${PID}`);
+  assert.equal(await findProbeGrant(grantDb([grant({ scopeResource: `project:${PID}` })]).db, PID, NOW, 1234, grantProblem), "g-1");
+  // Pre-review 4: an archived row needs only the purge's use.
+  assert.equal(await findProbeGrant(grantDb([grant({ uses: 29 })]).db, PID, NOW, 1234, grantProblem, ["teardown.purge"]), "g-1");
+  assert.equal(await findProbeGrant(grantDb([grant({ scopeAction: "teardown.purge" })]).db, PID, NOW, 1234, grantProblem, ["teardown.purge"]), "g-1");
 });
 
 test("d3c-2a decision 3: the authorizer presents the grant to the M1.7 engine as the system provisioner", async () => {
@@ -151,10 +160,11 @@ test("d3c-2a decision 3: the authorizer presents the grant to the M1.7 engine as
   assert.deepEqual(seen[0], { identity: { id: "system:provisioner", type: "system" }, action: { type: "teardown.purge", resource: PID, projectId: PID }, approvalGrantId: "g-1" });
 });
 
-function projectDb(stage) {
+function projectDb(stage, activeRows = 0) {
   const writes = [];
   const db = {
     writes,
+    resource: { count: async (q) => { writes.push(["count", q.where]); return activeRows; } },
     project: {
       findUnique: async () => (stage === null ? null : { stage }),
       updateMany: async (q) => { writes.push(["update", q]); return { count: 1 }; },
@@ -171,7 +181,9 @@ test("d3c-2a decisions 4 and 5: no grant blocks the cycle; purged resets only th
   assert.deepEqual(none.writes, [], "nothing read or written without a grant");
   const live = projectDb("live");
   assert.equal(await probeCycleStart(live, PID, 1234, async () => true), "ready");
-  assert.deepEqual(live.writes, [["tx", { timeout: 1234, maxWait: 1234 }]]);
+  assert.deepEqual(live.writes, [["tx", { timeout: 1234, maxWait: 1234 }], ["count", { projectId: PID, status: "active" }]]);
+  // Pre-review 5: rows left behind by a cycle whose archive was refused are purged first.
+  assert.equal(await probeCycleStart(projectDb("live", 3), PID, 1234, async () => true), "purge-pending");
   const purged = projectDb("purged");
   assert.equal(await probeCycleStart(purged, PID, 1234, async () => true), "ready");
   assert.deepEqual(purged.writes.slice(1), [
@@ -216,4 +228,32 @@ test("d3c-2a decision 4: a cycle that starts with a pending purge purges first a
   const b = await probeStep(d);
   assert.deepEqual([b.exit, b.phase, b.code], [1, "done", "previous-purge-pending"]);
   assert.equal(purges, 1);
+});
+
+test("d3c-2a pre-review 1: the real teardown accepts the wiring built from the real provision ops and reaches purged", async () => {
+  // Real @devos/provision op factories (so the provider set is the real one) and the real purgeProject's
+  // scanner rule. Only the network pieces are stubbed: pinned clients, the two provider scans and the preflights.
+  const pm = {
+    ...realProvision,
+    pinnedGitHub: async () => ({}),
+    pinnedCoolify: async () => ({}),
+    githubScanner: () => ({ name: "github", scan: async () => [] }),
+    coolifyScanner: () => ({ name: "coolify", scan: async () => [] }),
+  };
+  const store = new realTeardown.MemoryTeardownStore();
+  store.addProject({ id: PID, slug: "devos-probe-m24", stage: "archived" });
+  // A backup schedule row: its ops never call a provider, so the whole purge runs offline.
+  await store.recordResource(PID, { provider: "backup_schedule", kind: "nightly", externalId: `${PID}/live`, name: "devos-probe-m24/live" });
+  const db = { vaultSecret: { findMany: async () => [] } };
+  const w = await teardownWiring(pm, realTeardown, { gh: {}, cf: {}, store, db, projectId: PID, owner: "kkarnati1980", timeoutMs: 1000 });
+  const needed = new Set(w.ops.map((o) => o.provider));
+  for (const p of needed) assert.ok(w.scanners.some((x) => x.name === p), `a scanner for ${p}`);
+  const out = await probePurge(PID, {
+    teardown: realTeardown,
+    store,
+    authorize: async () => "allow",
+    stage: async () => "archived",
+    wiring: async () => ({ ...w, preflight: [] }),
+  });
+  assert.equal(out, "done");
 });

@@ -62,10 +62,17 @@ export async function teardownWiring(
       pm.coolifyPortOps(),
       pm.backupScheduleOps(),
     ],
-    scanners: [tm.inventoryScanner(w.store), tm.vaultScanner(w.db, w.timeoutMs), pm.githubScanner(gh), pm.coolifyScanner(cf)],
+    // Pre-review 1 (high): purgeProject needs a scanner per provider with ops. A backup schedule exists only as an
+    // inventory row (nothing at a provider), which the inventory scanner already sees, so its own scan is empty.
+    scanners: [tm.inventoryScanner(w.store), tm.vaultScanner(w.db, w.timeoutMs), pm.githubScanner(gh), pm.coolifyScanner(cf), BACKUP_SCHEDULE_SCANNER],
     preflight: [pm.githubTokenScopeCheck(gh, { owner: w.owner }), pm.coolifyTokenScopeCheck(cf, () => w.store.activeResources(id))],
   };
 }
+
+const BACKUP_SCHEDULE_SCANNER = { name: "backup_schedule", scan: async (): Promise<never[]> => [] };
+
+/** The resource string `@devos/teardown` authorizes (its `check`), shared so the grant pre-check asks the same question. */
+export const teardownResource = (projectId: string): string => `project:${projectId}`;
 
 /** Decision 3: the actions the probe's KK grant must cover; one cycle uses one of each (more on a retried purge). */
 export const PROBE_GRANT_ACTIONS = ["teardown.archive", "teardown.purge"] as const;
@@ -78,15 +85,19 @@ type GrantProblem = (grant: any, request: { identity: { id: string; type: "syste
  * grant on the probe project that `grantProblem` accepts for every action in PROBE_GRANT_ACTIONS, with at least
  * one use left per action. Null when there is none.
  */
-export async function findProbeGrant(db: any, projectId: string, now: Date, timeoutMs: number, grantProblem: GrantProblem): Promise<string | null> {
+export async function findProbeGrant(
+  db: any, projectId: string, now: Date, timeoutMs: number, grantProblem: GrantProblem,
+  actions: readonly string[] = PROBE_GRANT_ACTIONS,
+): Promise<string | null> {
   const rows: GrantRow[] = await db.$transaction((tx: any) => tx.approvalGrant.findMany({
     where: { projectId, revokedAt: null, expiresAt: { gt: now } },
     orderBy: [{ expiresAt: "desc" }, { id: "asc" }],
     take: 20,
   }), { timeout: timeoutMs, maxWait: timeoutMs });
   for (const g of rows) {
-    if (g.maxUses - g.uses < PROBE_GRANT_ACTIONS.length) continue;
-    const ok = PROBE_GRANT_ACTIONS.every((type) => grantProblem(g, { identity: PROVISIONER_IDENTITY, action: { type, resource: projectId, projectId } }, now.getTime()) === null);
+    if (g.maxUses - g.uses < actions.length) continue;
+    // Pre-review 2: the same resource string the engine is asked about (`project:<id>`).
+    const ok = actions.every((type) => grantProblem(g, { identity: PROVISIONER_IDENTITY, action: { type, resource: teardownResource(projectId), projectId } }, now.getTime()) === null);
     if (ok) return g.id;
   }
   return null;
@@ -170,6 +181,9 @@ export async function probeCycleStart(db: any, projectId: string, timeoutMs: num
     const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true } });
     if (!p) throw new Error("probe-project-missing");
     if (p.stage === "archived") return "purge-pending";
+    // Pre-review 5: rows left by a cycle whose archive was refused (the stage never reached `archived`) are purged
+    // first too, instead of a new cycle provisioning on top of them.
+    if (p.stage !== "purged" && (await tx.resource.count({ where: { projectId, status: "active" } })) > 0) return "purge-pending";
     if (p.stage === "purged") {
       await tx.project.updateMany({ where: { id: projectId, stage: "purged" }, data: { stage: "intake", archivedAt: null, purgeAfter: null } });
       await tx.auditEvent.create({ data: { actor: "system", action: "provision.probe_reset", summary: "AT13 probe project back to intake for a new cycle", projectId } });

@@ -11,7 +11,7 @@
 import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
-import { findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, teardownWiring } from "./provision-probe-purge.js";
+import { findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -119,7 +119,10 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           // d3c-2a: the purge through M2.5 under the KK grant (decisions 1–5), found read-only on each use.
           purge: async () => {
             const k = w.purge;
-            const grant = await findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem);
+            // Pre-review 4: an archived row needs only the purge's use.
+            const stage = await probeStage(db, p.id, timeoutMs);
+            if (stage === "purged") return "done";
+            const grant = await findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, stage === "archived" ? ["teardown.purge"] : PROBE_GRANT_ACTIONS);
             // Decision 4: a grant that expired or ran out mid-cycle ends the cycle as purge-permission.
             if (!grant) return { error: "purge-permission:approval_required" };
             return probePurge(p.id, {
