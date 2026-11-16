@@ -31,7 +31,7 @@ test("AT2/AT4/AT5: the generated core's own tests pass (F2-2 corpus, caps, /heal
   const out = fresh("core-tests");
   const r = spawnSync(process.execPath, ["--test", "test/safe-fetch.test.mjs", "test/server.test.mjs"], { cwd: out, encoding: "utf8", timeout: 60_000, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT")) });
   assert.equal(r.status, 0, r.stdout.slice(-3000) + r.stderr.slice(-2000));
-  assert.match(r.stdout, /# pass 22/);
+  assert.match(r.stdout, /# pass 24/);
   assert.match(r.stdout, /# fail 0/);
 });
 

@@ -3,7 +3,8 @@
 // - http: and https: only; at most 5 redirects, each hop checked again;
 // - the host is resolved once, every address is checked, and the socket is pinned to a checked address
 //   (no second lookup, so DNS rebinding cannot swap it);
-// - a timeout on the whole request and a cap on the response size.
+// - a timeout on the whole request and a cap on the response size;
+// - optionally, allowPorts limits the port of every hop (the URL passed in and each redirect target).
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
@@ -51,6 +52,7 @@ export function isBlockedAddress(ip) {
   if ((w[0] & 0xffc0) === 0xfe80) return true;    // fe80::/10 link-local
   if ((w[0] & 0xff00) === 0xff00) return true;    // ff00::/8 multicast
   if (w[0] === 0x2001 && w[1] === 0x0db8) return true;  // documentation
+  if (w[0] === 0x2001 && w[1] === 0x0000) return true;  // Teredo 2001::/32 (tunnels to an IPv4 endpoint; never a plain server)
   return false;
 }
 
@@ -74,6 +76,16 @@ const CROSS_ORIGIN_SAFE = new Set(["accept", "accept-language", "accept-encoding
 export function redirectHeaders(headers, fromOrigin, toOrigin) {
   return fromOrigin === toOrigin ? headers : Object.fromEntries(Object.entries(headers).filter(([k]) => CROSS_ORIGIN_SAFE.has(k.toLowerCase())));
 }
+/** allowPorts: undefined = any port; otherwise a non-empty list of integer ports 1-65535. */
+function checkAllowPorts(list) {
+  if (list === undefined) return null;
+  if (!Array.isArray(list) || list.length === 0 || !list.every((p) => Number.isInteger(p) && p >= 1 && p <= 65535)) {
+    throw new SafeFetchError("allow-ports", "allowPorts must be a non-empty list of integer ports 1-65535");
+  }
+  return new Set(list);
+}
+const effectivePort = (url) => (url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80);
+
 function checkAllowHosts(list) {
   return (list || []).map((h) => {
     const n = String(h).toLowerCase();
@@ -86,15 +98,18 @@ function checkAllowHosts(list) {
 
 /**
  * safeFetch(url, { method, headers, body, timeoutMs = 10000, maxBytes = 5_000_000, maxRedirects = 5,
- *                  allowHosts = [], lookup }) -> { status, headers, url, body: Buffer, text() }
+ *                  allowHosts = [], allowPorts, lookup }) -> { status, headers, url, body: Buffer, text() }
  * allowHosts names exact hostnames that may be internal (declared services only). It applies to the URL the
  * caller passed and to redirects that never left that origin, so a public URL cannot bounce into a declared
  * service, and a declared service cannot be re-entered through a detour.
+ * allowPorts (optional) names the only ports any hop may use; a URL or redirect to another port is refused with
+ * code "port" after its address check and before any connection. Leave it out for declared services on their own ports.
  * lookup is for tests. Every failure is a SafeFetchError with a code.
  */
 export async function safeFetch(input, opts = {}) {
   const { method = "GET", headers = {}, body, timeoutMs = 10_000, maxBytes = 5_000_000, maxRedirects = 5 } = opts;
   const allowHosts = checkAllowHosts(opts.allowHosts);
+  const allowPorts = checkAllowPorts(opts.allowPorts);
   const lookup = opts.lookup || defaultLookup;
   const deadline = Date.now() + timeoutMs;
   let url;
@@ -109,6 +124,8 @@ export async function safeFetch(input, opts = {}) {
     if (url.origin !== origin0) left0 = true;   // once a hop leaves the first origin, allowHosts never applies again
     const allowed = !left0 && allowHosts.includes(url.hostname.replace(/^\[|\]$/g, "").toLowerCase());
     const addr = await withTimeout(resolveChecked(url.hostname, { lookup, allowed }), left);
+    // After the address check, so an internal target is always reported as blocked-address; still before any connection.
+    if (allowPorts && !allowPorts.has(effectivePort(url))) throw new SafeFetchError("port", `refused port ${effectivePort(url)}`);
     const res = await request(url, addr, { method: m, headers: h, body: b, deadline, maxBytes });
     if ([301, 302, 303, 307, 308].includes(res.status) && res.headers.location) {
       if (hop >= maxRedirects) throw new SafeFetchError("redirects", "too many redirects");
