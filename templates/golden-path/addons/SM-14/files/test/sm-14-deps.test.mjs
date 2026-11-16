@@ -89,7 +89,9 @@ test("SM-14-L1: an audit that did not run or cannot be read fails closed", () =>
   assert.deepEqual(readAudit({ error: { code: "ENOTFOUND", summary: "registry unreachable" } }).findings, ["audit-failed"]);
   for (const bad of [null, "", [], {}, { auditReportVersion: 1, advisories: {} }, { ...clean(), metadata: { vulnerabilities: { high: "0" } } },
     { ...clean(), metadata: { vulnerabilities: { ...clean().metadata.vulnerabilities, high: -1 } } },
-    { ...clean(), metadata: { vulnerabilities: { ...clean().metadata.vulnerabilities, critical: 0.5 } } }]) {
+    { ...clean(), metadata: { vulnerabilities: { ...clean().metadata.vulnerabilities, critical: 0.5 } } },
+    // Codex PR187-r2: a missing or malformed per-package list.
+    { ...clean(), vulnerabilities: [{ severity: "critical" }] }, { ...clean(), vulnerabilities: undefined }, { ...clean(), vulnerabilities: null }]) {
     assert.deepEqual(readAudit(bad).findings, ["audit-unreadable"], JSON.stringify(bad));
   }
   const odd = clean();

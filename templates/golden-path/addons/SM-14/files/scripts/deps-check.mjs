@@ -65,13 +65,14 @@ export function checkLockfile(pkg, lock) {
  * per-package list; the larger of the two is used, so a report cannot hide a finding in either place.
  */
 export function readAudit(audit) {
-  if (!isObj(audit) || audit.auditReportVersion !== 2 || !isObj(audit.metadata) || !isObj(audit.metadata.vulnerabilities)) {
+  // Codex PR187-r2: the per-package list must be an object too (npm always writes one, `{}` when clean).
+  if (!isObj(audit) || audit.auditReportVersion !== 2 || !isObj(audit.vulnerabilities) || !isObj(audit.metadata) || !isObj(audit.metadata.vulnerabilities)) {
     return { findings: [isObj(audit) && isObj(audit.error) ? "audit-failed" : "audit-unreadable"], vulnerabilities: null };
   }
   const meta = audit.metadata.vulnerabilities;
   if (!SEVERITIES.every((s) => count(meta[s]))) return { findings: ["audit-unreadable"], vulnerabilities: null };
   const listed = Object.fromEntries(SEVERITIES.map((s) => [s, 0]));
-  for (const v of Object.values(isObj(audit.vulnerabilities) ? audit.vulnerabilities : {})) {
+  for (const v of Object.values(audit.vulnerabilities)) {
     if (!isObj(v) || !SEVERITIES.includes(v.severity)) return { findings: ["audit-unreadable"], vulnerabilities: null };
     listed[v.severity] += 1;
   }
