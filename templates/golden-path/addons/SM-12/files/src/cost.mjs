@@ -71,7 +71,7 @@ export function memoryStore() {
       spent.set(key(service, month), Math.max(0, (spent.get(key(service, month)) ?? 0) + delta));
     },
     async read(month) {
-      const out = {};
+      const out = Object.create(null); // no inherited keys: a service may be named "constructor" (Codex PR176-r1)
       for (const [k, v] of spent) { const [s, m] = k.split(" "); if (m === month) out[s] = v; }
       return out;
     },
@@ -112,7 +112,7 @@ export function pgStore(query) {
       rowsOf(await query("UPDATE paid_usage SET spent = GREATEST(0, spent + $3), updated_at = now() WHERE service = $1 AND month = $2 RETURNING spent", [service, month, delta]));
     },
     async read(month) {
-      const out = {};
+      const out = Object.create(null); // no inherited keys: a service may be named "constructor" (Codex PR176-r1)
       for (const r of rowsOf(await query("SELECT service, spent FROM paid_usage WHERE month = $1", [month]))) out[r.service] = Number(r.spent);
       return out;
     },
@@ -168,11 +168,14 @@ export function costMeter({ services, store = memoryStore(), now = Date.now, tim
     async report() {
       const m = month();
       const spent = await store.read(m);
+      // Own keys only, so an app store returning a plain object cannot hand back an inherited member
+      // (e.g. `constructor`) as a service's spend (Codex PR176-r1).
+      const used = (name) => (spent && Object.hasOwn(spent, name) && Number.isFinite(spent[name]) ? spent[name] : 0);
       return {
         month: m,
         services: services.map((s) => ({
-          service: s.name, unit: s.unit, monthlyCap: s.monthlyCap, spent: spent[s.name] ?? 0,
-          remaining: Math.max(0, s.monthlyCap - (spent[s.name] ?? 0)),
+          service: s.name, unit: s.unit, monthlyCap: s.monthlyCap, spent: used(s.name),
+          remaining: Math.max(0, s.monthlyCap - used(s.name)),
         })),
       };
     },

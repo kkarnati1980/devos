@@ -154,3 +154,15 @@ test("SM-12-L1: pgStore keeps the spend in paid_usage, so every instance counts 
   assert.throws(() => pgStore(null), /query function/);
   assert.throws(() => costMeter({ services: services(), store: {} }), /store.reserve/);
 });
+
+test("SM-12-L1: a service named like an Object member reports 0 spent before its first charge (Codex PR176-r1)", async () => {
+  const svc = paidServices([{ name: "constructor", unit: "calls", monthlyCap: 5 }, { name: "tostring", unit: "calls", monthlyCap: 5 }, { name: "hasownproperty", unit: "calls", monthlyCap: 5 }]);
+  const plain = { async reserve() { return { ok: true, spent: 0 }; }, async adjust() {}, async read() { return {}; } };
+  for (const store of [memoryStore(), plain]) {
+    const r = await costMeter({ services: svc, store, now: () => NOV }).report();
+    assert.deepEqual(r.services.map((x) => [x.service, x.spent, x.remaining]), [["constructor", 0, 5], ["tostring", 0, 5], ["hasownproperty", 0, 5]]);
+  }
+  const meter = costMeter({ services: svc, now: () => NOV });
+  await meter.charge("constructor", 2, async () => ({ cost: 2 }));
+  assert.deepEqual((await meter.report()).services[0], { service: "constructor", unit: "calls", monthlyCap: 5, spent: 2, remaining: 3 });
+});
