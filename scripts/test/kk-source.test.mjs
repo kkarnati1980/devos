@@ -25,7 +25,7 @@ const noSleep = async () => {};
 function fake(responses) {
   const calls = [];
   const fetchImpl = async (url, init) => {
-    calls.push({ url, headers: init.headers, vars: JSON.parse(init.body).variables, hasSignal: !!init.signal });
+    calls.push({ url, headers: init.headers, vars: JSON.parse(init.body).variables, hasSignal: !!init.signal, redirect: init.redirect });
     const r = responses.shift();
     if (r instanceof Error) throw r;
     if (!r) throw new Error("no more responses");
@@ -72,6 +72,12 @@ test("K7 a read is retried on 5xx, 429 and network errors only; other failures t
   const notJson = fake([{ status: 200, text: async () => "<html>" }, res(200, page([node(KEEP)]))]);
   await assert.rejects(readKkComments({ ids: ["DEVOS-200"], key: KEY, fetchImpl: notJson.fetchImpl, sleep: noSleep }), /not JSON/);
   assert.equal(notJson.calls.length, 1, "a whole body that is not JSON is not retried");
+  for (const status of [301, 307, 308, 0]) {
+    const r = fake([{ status, text: async () => "" }, res(200, page([node(KEEP)]))]);
+    await assert.rejects(readKkComments({ ids: ["DEVOS-200"], key: KEY, fetchImpl: r.fetchImpl, sleep: noSleep }), /redirected/, `HTTP ${status}`);
+    assert.equal(r.calls.length, 1, `HTTP ${status}: refused without a second request (Codex PR162-r3)`);
+    assert.equal(r.calls[0].redirect, "manual", "fetch never follows a redirect");
+  }
   for (const [name, responses] of [
     ["401", [res(401, {})]],
     ["graphql errors", [res(200, { errors: [{ message: `bad key ${KEY}` }] })]],

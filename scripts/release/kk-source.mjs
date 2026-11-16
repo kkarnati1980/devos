@@ -67,11 +67,13 @@ async function linearQuery(variables, { key, fetchImpl, timeoutMs, attempts, sle
         headers: { authorization: key, "content-type": "application/json" },
         body: JSON.stringify({ query: QUERY, variables }),
         signal: AbortSignal.timeout(Math.min(timeoutMs, left)),
+        redirect: "manual", // never follow a redirect: the key goes to LINEAR_ENDPOINT only (F2, Codex PR162-r3)
       });
     } catch (err) {
       last = new KkSourceError(`Linear ${err?.name === "TimeoutError" ? "timed out" : "request failed"}`);
       continue;
     }
+    if (res.status === 0 || (res.status >= 300 && res.status < 400)) throw new KkSourceError(`Linear redirected (HTTP ${res.status}); refused`);
     if (res.status === 429 || res.status >= 500) { last = new KkSourceError(`Linear HTTP ${res.status}`); continue; }
     if (res.status !== 200) throw new KkSourceError(`Linear HTTP ${res.status}`);
     // The body is read inside the attempt: a timeout or network failure while it streams is retried like one before
