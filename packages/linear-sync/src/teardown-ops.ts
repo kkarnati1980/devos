@@ -3,7 +3,7 @@
 // Linear (never deletes it); the purge then marks its `resource` rows deleted (G2 evidence). Every Linear write runs
 // under the same per-project advisory lock as the sync (`devos:linear-sync`), so a sync that is mid-run never
 // interleaves with it. Shaped as `@devos/provision` ResourceOps / LeftoverScanner (structurally; no dependency).
-import { LinearError } from "./client.js";
+import { LINEAR_KEY_NOT_SET, LinearError } from "./client.js";
 import { readMarker } from "./markers.js";
 import { WRITE_MARGIN_MS, type PrismaLike } from "./prisma-store.js";
 import type { LinearTeardownApi } from "./types.js";
@@ -39,10 +39,11 @@ export function toProviderError(e: unknown, makeError: MakeError, what: string):
       case "timeout": return makeError("timeout", `linear ${what}: timed out`);
       case "rate-limited": return makeError("http", `linear ${what}: rate limited`, 429);
       case "http": return makeError("http", `linear ${what}: HTTP ${e.status ?? "error"}`, e.status);
+      case "no-key": return makeError("no-token", `linear ${what}: the Linear key is not set`);
       default: return makeError("bad-response", `linear ${what}: refused or unexpected response`);
     }
   }
-  if (e instanceof Error && e.message === "linear-key-not-set") return makeError("no-token", `linear ${what}: the Linear key is not set`);
+  if (e instanceof Error && e.message === LINEAR_KEY_NOT_SET) return makeError("no-token", `linear ${what}: the Linear key is not set`);
   if (e instanceof Error && e.message === "linear-sync-lock-busy") return makeError("timeout", `linear ${what}: a Linear sync still holds the project's lock`);
   return makeError("bad-response", `linear ${what}: unexpected error`);
 }

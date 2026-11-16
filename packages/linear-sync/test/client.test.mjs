@@ -1,7 +1,7 @@
 // M2.6-a AT4/AT5 (client part): timeouts, retries for reads only, rate-limit pause, no key in errors.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { LinearClient, LinearError, withMarker, readMarker, stripMarkers } from "../dist/index.js";
+import { LinearClient, LinearError, LINEAR_KEY_NOT_SET, withMarker, readMarker, stripMarkers } from "../dist/index.js";
 
 const KEY = "lin_api_" + "Zq9fake0000000000000000000000000000000";
 const res = (status, body, headers = {}) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -91,6 +91,17 @@ test("a rate-limit error on a 4xx is retried as 429; Retry-After is capped; a va
   assert.equal(calls.length, 2); assert.ok(sleeps[0] <= 60_000);
   const v = new LinearClient({ apiKey: () => { throw new Error(KEY); }, fetchImpl: async () => res(200, { data: {} }), sleep: async () => {} });
   await assert.rejects(v.query("query { x }"), (e) => e.code === "bad-response" && !e.message.includes(KEY));
+});
+
+test("DEVOS-97 (Codex PR185-r1): a key callback reporting no key set is no-key, not retried, nothing sent", async () => {
+  const calls = [];
+  const c = new LinearClient({ apiKey: async () => { throw new Error(LINEAR_KEY_NOT_SET); },
+    fetchImpl: async (...a) => { calls.push(a); return res(200, { data: {} }); }, sleep: async () => {} });
+  await assert.rejects(c.query("query { x }"), (e) => e instanceof LinearError && e.code === "no-key" && /not set/.test(e.message));
+  await assert.rejects(c.mutate("mutation { x }"), (e) => e instanceof LinearError && e.code === "no-key");
+  assert.equal(calls.length, 0, "no request without a key");
+  // Pre-review (low): the runtime key callbacks in apps/api throw this literal; pin it so a rename cannot drift.
+  assert.equal(LINEAR_KEY_NOT_SET, "linear-key-not-set");
 });
 
 test("a stalled vault read fails the call before any request starts (Codex PR35-r3: write after lock expiry)", async () => {
