@@ -97,8 +97,8 @@ test("SM-11-L1: a hung step or layout check times out, a failed screenshot fails
     steps: (_p, { viewport }) => (viewport === "desktop" ? new Promise(() => {}) : undefined) });
   assert.ok(Date.now() - t0 < 2000, "bounded by the timeouts");
   assert.match(report.results[0].problems[0], /^step: journey timed out after 100 ms/);
-  assert.match(report.results[0].problems[1], /^screenshot: layout check timed out/);
-  assert.equal(report.results[0].screenshot, null);
+  assert.match(report.results[0].problems[1], /^layout: layout check timed out/);
+  assert.equal(report.results[0].screenshot, "main-journey-desktop.png", "the screenshot is still taken after a hung layout check");
   assert.match(report.results[1].problems[0], /^screenshot: target closed/);
   assert.equal(report.results[1].screenshot, null);
   assert.equal(report.ok, false);
@@ -114,6 +114,16 @@ test("SM-11-L1: a browser that cannot open a context fails both widths and still
     [false, ["browser: browser has been closed"]],
   ]);
   assert.ok(fs.existsSync(path.join(out, "main-journey-report.json")));
+});
+
+test("SM-11-L1: a context that opens only after its timeout is closed when it arrives", async () => {
+  const out = tmp();
+  let closed = 0;
+  const browser = { newContext: () => new Promise((r) => setTimeout(() => r({ async newPage() {}, async close() { closed++; } }), 150)) };
+  const report = await runJourney({ browser, baseURL: "http://127.0.0.1:3000", outDir: out, timeoutMs: 50, steps: () => {} });
+  assert.match(report.results[0].problems[0], /^browser: new context timed out after 50 ms/);
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(closed, 2, "both late contexts are closed");
 });
 
 test("SM-11-L1: bad arguments are refused before anything runs", async () => {

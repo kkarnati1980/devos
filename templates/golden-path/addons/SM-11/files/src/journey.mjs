@@ -43,7 +43,12 @@ export async function runJourney({ browser, baseURL, name = "main-journey", step
     let screenshot = null;
     const started = Date.now();
     try {
-      context = await within(timeoutMs, browser.newContext({ viewport: { ...viewport }, baseURL: base.href }), "new context");
+      const opening = Promise.resolve().then(() => browser.newContext({ viewport: { ...viewport }, baseURL: base.href }));
+      // A context that opens after its timeout is closed when it arrives, so a slow browser leaks none.
+      context = await within(timeoutMs, opening, "new context").catch((e) => {
+        opening.then((late) => late?.close?.()).catch(() => {});
+        throw e;
+      });
       const page = await within(timeoutMs, context.newPage(), "new page");
       page.on("pageerror", (e) => problems.push(`pageerror: ${String(e && e.message).slice(0, 300)}`));
       page.on("console", (m) => { if (m.type() === "error") problems.push(`console: ${String(m.text()).slice(0, 300)}`); });
@@ -55,6 +60,10 @@ export async function runJourney({ browser, baseURL, name = "main-journey", step
       try {
         const overflow = await within(timeoutMs, page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), "layout check");
         if (overflow > 0) problems.push(`layout: page is ${overflow}px wider than the ${viewport.width}px viewport`);
+      } catch (e) {
+        problems.push(`layout: ${String(e && e.message).slice(0, 300)}`);
+      }
+      try {
         const file = path.join(outDir, `${name}-${viewportName}.png`);
         await within(timeoutMs, page.screenshot({ path: file, fullPage: true }), "screenshot");
         screenshot = path.basename(file);
@@ -70,7 +79,7 @@ export async function runJourney({ browser, baseURL, name = "main-journey", step
   }
 
   const report = { check: "SM-11-L1", journey: name, sha, at: now().toISOString(), ok: results.every((r) => r.ok), results };
-  const tmp = path.join(outDir, `.${name}-report.json.tmp`);
+  const tmp = path.join(outDir, `.${name}-report.json.${process.pid}.${Date.now()}.tmp`);
   await fs.writeFile(tmp, JSON.stringify(report, null, 2) + "\n");
   await fs.rename(tmp, path.join(outDir, `${name}-report.json`));
   return report;
