@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.1.0
+# Version: 1.2.0
+# v1.2.0 (DEVOS-127, S4-b2b): boot persistence. Every successful run keeps a marker block in /etc/ufw/after.rules
+# (BEGIN/END DEVOS S4 ISOLATION, placed after M0.1's DEVOS UFW AND DOCKER block) that rebuilds the installed
+# chains and puts the three jumps first, so the block is back at boot and after `ufw reload`, before the agent's
+# first tick (the FORWARD jump can drop below tailscaled's ts-forward when tailscaled starts; S4.md S4-b2b 1). A rollback rewrites it to the restored block; --remove deletes it. Written only when it differs,
+# atomically, ASCII only, and only while M0.1's block is in the file (else exit 1, block itself still applied).
 # v1.1.0 (DEVOS-127, S4-b2a): --remove also writes $DEVOS_DIR/isolation/disabled, and an apply run refuses with
 # exit 4 while that file exists, so KK's console rollback is not undone by the agent's next tick. To turn the
 # block back on: rm /root/.devos/isolation/disabled (the next agent tick applies it again).
@@ -39,10 +44,14 @@ DIR="${DEVOS_DIR:-/root/.devos}"
 ISO="$DIR/isolation"
 CONF="$DIR/server-agent.conf"
 TOKEN_FILE="$DIR/secrets/isolation_state_token"
+BOOT_BEGIN="# BEGIN DEVOS S4 ISOLATION"
+BOOT_END="# END DEVOS S4 ISOLATION"
+M01_END="# END DEVOS UFW AND DOCKER"
 POOL="10.208.0.0/14"
 FWD=DEVOS-ISO-FWD
 IN=DEVOS-ISO-IN
 conf() { sed -n "s/^$1=\\([A-Za-z0-9._:\\/ -]\\{1,300\\}\\)\$/\\1/p" "$CONF" 2>/dev/null | head -n1; }
+UFW_AFTER="$(conf ISOLATION_UFW_AFTER_RULES)"; UFW_AFTER="${UFW_AFTER:-/etc/ufw/after.rules}"
 
 MODE=apply
 case "${1:-}" in
@@ -66,11 +75,55 @@ remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if n
   return $rc
 }
 
+# --- boot persistence (S4-b2b) ------------------------------------------------------------------------------
+# ufw loads after.rules in one `iptables-restore -n` at boot and on `ufw reload`. M0.1's block declares
+# `:DOCKER-USER - [0:0]` (which flushes it), so ours must come after it in the file: it re-creates the S4 chains
+# and inserts each jump at position 1. If ufw does not flush INPUT/FORWARD on a reload, a second copy of those
+# jumps can appear; it is harmless (the second pass gives the same verdict) and the next agent tick collapses it
+# (jump_ops). Without M0.1's block DOCKER-USER might not exist at boot and the whole ufw load would fail, so the
+# block is then not written.
+boot_text() {  # installed block in $1 -> the after.rules marker block
+  echo "$BOOT_BEGIN (isolation-apply.sh; generated, do not edit; removed by --remove)"
+  grep -vx 'COMMIT' <<<"$1"
+  echo "-I DOCKER-USER 1 -j $FWD"
+  echo "-I FORWARD 1 -j $FWD"
+  echo "-I INPUT 1 -j $IN"
+  echo "COMMIT"
+  echo "$BOOT_END"
+}
+boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when after.rules holds what it should
+  local f="$UFW_AFTER" rest want tmp mode
+  [[ -f "$f" ]] || { [[ -z "$1" ]] && return 0; echo "boot persistence: $f missing (ufw not set up?)"; return 1; }
+  # Pre-review: an orphan BEGIN (hand edit) would make the sed range delete to the end of the file, so the
+  # markers must be absent, or exactly one BEGIN followed by exactly one END.
+  local nb ne lb le
+  nb="$(grep -c "^$BOOT_BEGIN" "$f")"; ne="$(grep -cx "$BOOT_END" "$f")"
+  if [[ "$nb$ne" != 00 ]]; then
+    lb="$(grep -n "^$BOOT_BEGIN" "$f" | head -n1 | cut -d: -f1)"; le="$(grep -nx "$BOOT_END" "$f" | head -n1 | cut -d: -f1)"
+    [[ "$nb$ne" == 11 ]] && (( lb < le )) || { echo "boot persistence: the DEVOS S4 ISOLATION markers in $f are broken (hand edit?); not written"; return 1; }
+  fi
+  rest="$(sed "/^$BOOT_BEGIN/,/^$BOOT_END\$/d" "$f")" || { echo "boot persistence: cannot read $f"; return 1; }
+  if [[ -n "$1" ]]; then
+    grep -qxF -- "$M01_END" <<<"$rest" || { echo "boot persistence: M0.1's DEVOS UFW AND DOCKER block is not in $f; not written"; return 1; }
+    want="$rest"$'\n'"$(boot_text "$1")"
+    LC_ALL=C grep -q '[^ -~]' <<<"$want" && { echo "boot persistence: non-ASCII text; not written"; return 1; }
+  else
+    want="$rest"
+  fi
+  [[ "$want" == "$(cat "$f")" ]] && return 0
+  mode="$(stat -c %a "$f" 2>/dev/null)"; mode="${mode:-640}"
+  tmp="$(mktemp "$f.devos-s4.XXXXXX")" || { echo "boot persistence: cannot write next to $f"; return 1; }
+  BOOT_TMP="$tmp"; trap 'rm -f "${BOOT_TMP:-}"' EXIT; trap 'exit 143' TERM  # a timeout kill between mktemp and mv leaves no temp file
+  if printf '%s\n' "$want" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$f"; then BOOT_TMP=""; return 0; fi
+  rm -f "$tmp"; BOOT_TMP=""; echo "boot persistence: could not replace $f"; return 1
+}
+
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
   if remove_block; then
     rm -f "$ISO/installed.rules" "$ISO/live.sha256"
+    boot_sync "" || { echo "removed, but the boot block is still in $UFW_AFTER: delete the DEVOS S4 ISOLATION lines there"; date -u +%FT%TZ > "$ISO/disabled"; exit 1; }
     date -u +%FT%TZ > "$ISO/disabled" || { echo "removed, but could not write $ISO/disabled: the agent will apply the block again"; exit 1; }
     echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched); kept off until $ISO/disabled is deleted"; exit 0
   fi
@@ -247,6 +300,7 @@ exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply ru
 [[ -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
+  boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; exit 1; }
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
 fi
 
@@ -259,16 +313,17 @@ if ! install_block "$BLOCK"; then
 fi
 if ! post_msg="$(selftest)"; then
   if (( pre_ok == 0 )); then
-    record "$BLOCK"
+    record "$BLOCK"; boot_sync "$BLOCK"
     echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
   if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && record "$PREV" && echo "rolled back to the previous block" || echo "rollback failed: run $0 --remove from the console"
+    install_block "$PREV" && record "$PREV" && { boot_sync "$PREV"; echo "rolled back to the previous block"; } || echo "rollback failed: run $0 --remove from the console"
   else
-    remove_block && rm -f "$ISO/live.sha256" && echo "rolled back: S4 block removed" || echo "rollback failed: run $0 --remove from the console"
+    remove_block && rm -f "$ISO/live.sha256" && { boot_sync ""; echo "rolled back: S4 block removed"; } || echo "rollback failed: run $0 --remove from the console"
   fi
   exit 1
 fi
 record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
+boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; exit 1; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"
