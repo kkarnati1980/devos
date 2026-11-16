@@ -75,7 +75,7 @@ export async function probeCli(argv: string[], deps: { log(): Promise<Pick<Probe
 /** d3c-1: the live asserts and the purge are wired in d3c-2. Until then they throw a fixed code (see the contract). */
 const notWired = async (): Promise<never> => { throw new Error("probe-not-wired"); };
 
-/* c8 ignore start -- the production wiring; its pieces are tested on their own (probeCli, the parts, buildProvisioner). */
+// The production wiring; its pieces are tested on their own (probeCli, the parts, offReasonFor, stepWiring, buildProvisioner).
 async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
   const timeoutMs = 10_000;
   const argv = process.argv.slice(2);
@@ -132,4 +132,3 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     (e) => { process.stdout.write(`${JSON.stringify({ error: errorCode(e) })}\n`); process.exitCode = 1; },
   );
 }
-/* c8 ignore stop */
