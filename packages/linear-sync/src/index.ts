@@ -13,3 +13,5 @@ export { listActiveProjects, syncActiveProjects, lockedSyncOne, startSchedule, S
 export type { SweepResult, SweepDeps, Schedule, ProjectOutcome } from "./schedule.js";
 export { linearTeardownOps, linearScanner, withSyncLock, isLockTimeout, toProviderError, TEARDOWN_LOCK_WAIT_MS, TEARDOWN_LOCK_TX_MS } from "./teardown-ops.js";
 export type { LinearResourceOps, MakeError, TeardownErrorCode } from "./teardown-ops.js";
+export { linearLinks, linearUrl, LINK_MAX_ISSUES } from "./links.js";
+export type { LinearLinks, LinkReader } from "./links.js";

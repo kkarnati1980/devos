@@ -27,6 +27,7 @@ import { DEAD_LETTERS, DeadLettersController, type DeadLetterServices } from "./
 import { REQUIREMENTS, RequirementsController, type RequirementsServices } from "./requirements.js";
 import { PROVISION, ProvisionController, type ProvisionServices } from "./provision-routes.js";
 import { TEARDOWN, TeardownController, type TeardownServices } from "./teardown-routes.js";
+import { LINEAR_LINKS, LinearLinksController, type LinearLinksService } from "./linear-links.js";
 import { APPROVALS, ApprovalsController, type ApprovalRouteServices } from "./approvals-routes.js";
 
 export interface AppDeps {
@@ -53,6 +54,8 @@ export interface AppDeps {
   provision?: ProvisionServices;
   /** DEVOS-244 (M2.5-b1): archive, restore and the teardown state (null parts → 503 `teardown-not-configured`). */
   teardown?: TeardownServices;
+  /** DEVOS-248 (M2.6-b2b3): the "Open in Linear" links (null → `enabled: false`, no Linear call). */
+  linearLinks?: LinearLinksService | null;
   /** R3-a: certificate + key → the API listens on HTTPS (TLS 1.2+); null/absent → plain HTTP (tests, CI). */
   tls?: ApiTls | null;
 }
@@ -62,7 +65,7 @@ class ApiModule {
   static register(deps: Required<Omit<AppDeps, "now" | "log" | "tls">> & { sessions: SessionService }): DynamicModule {
     return {
       module: ApiModule,
-      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController, DeadLettersController, RequirementsController, ApprovalsController, ProvisionController, TeardownController],
+      controllers: [HealthController, AuthController, GrantsController, SetupController, SettingsController, ProjectSettingsController, VaultController, NotificationsController, DeadLettersController, RequirementsController, ApprovalsController, ProvisionController, TeardownController, LinearLinksController],
       providers: [
         { provide: CONFIG, useValue: deps.config },
         { provide: IDENTITY, useValue: deps.identity },
@@ -77,6 +80,7 @@ class ApiModule {
         { provide: APPROVALS, useValue: deps.approvals },
         { provide: PROVISION, useValue: deps.provision },
         { provide: TEARDOWN, useValue: deps.teardown },
+        { provide: LINEAR_LINKS, useValue: deps.linearLinks },
         { provide: APP_GUARD, useClass: AccessGuard },
       ],
     };
@@ -100,6 +104,7 @@ export async function createApp(deps: AppDeps): Promise<NestExpressApplication> 
       approvals: deps.approvals ?? { approvals: null, grantsFor: null, revokeGrant: null },
       provision: deps.provision ?? { reader: null, sweep: null },
       teardown: deps.teardown ?? { reader: null, actions: null },
+      linearLinks: deps.linearLinks ?? null,
       sessions,
     }),
     {

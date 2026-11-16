@@ -8,6 +8,7 @@ import { PreflightPanel } from "./preflight-panel";
 import { ProvisioningPanel } from "./provisioning/provisioning-panel";
 import { BatchesPanel } from "./batches-panel";
 import { RemovePanel } from "./remove/remove-panel";
+import { LinearPanel } from "./linear-panel";
 
 export default async function ProjectPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -56,6 +57,9 @@ export default async function ProjectPage({ params }: { params: Promise<{ slug: 
           })}
         </div>
       </section>
+
+      {/* M2.6-b2b3 (DEVOS-248): Open in Linear, read from the API with KK's session (the board is still M1.3's mock). */}
+      {apiOrigin ? <LinearPanel apiOrigin={apiOrigin} slug={project.slug} /> : null}
 
       <section aria-labelledby="spec-h">
         <h2 id="spec-h">Spec</h2>
