@@ -76,7 +76,8 @@ export class LinearClient {
       try {
         return await this.once<T>(query, variables, signal);
       } catch (e) {
-        if (signal?.aborted) throw budgetEnded();
+        // A real non-transient answer (refused, no key, bad response) keeps its code; only the abort itself is the budget.
+        if (signal?.aborted) throw e instanceof LinearError && e.code !== "timeout" && e.code !== "network" ? e : budgetEnded();
         last = e instanceof LinearError ? e : new LinearError("network", "request failed");
         const transient = last.code === "network" || last.code === "timeout" || (last.code === "http" && (last.status === 429 || (last.status ?? 0) >= 500));
         if (!retry || !transient || i === attempts - 1) throw last;

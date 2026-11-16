@@ -152,16 +152,18 @@ test("Linear failing or slow → 502 linear-unreachable with no Linear text; sto
   } finally { await app.close(); }
 
   // DEVOS-97: the bound also aborts the signal handed to the service, so the client's retries stop too.
-  let given;
-  const slow = { ids: async () => ROWS.acme, links: (_ids, signal) => { given = signal; return new Promise(() => {}); } };
+  let given, abortedAt = null;
+  const slow = { ids: async () => ROWS.acme, links: (_ids, signal) => { given = signal; signal.addEventListener("abort", () => { abortedAt = Date.now(); }); return new Promise(() => {}); } };
   const s = await start(slow);
   const saved = LinearLinksController.timeoutMs;
   LinearLinksController.timeoutMs = 50;
   try {
     const c = await cookie(s.port);
     const r = await request(s.port, "GET", "/projects/by-slug/acme/linear-links", { cookie: c });
+    const answeredAt = Date.now();
     assert.equal(r.status, 502);
     assert.equal(r.json.code, "linear-unreachable");
+    assert.ok(abortedAt !== null && abortedAt <= answeredAt, "the timer aborted the signal before the answer arrived");
     assert.ok(given instanceof AbortSignal, "the service gets a signal");
     assert.equal(given.aborted, true, "the signal is aborted when the bound ends");
   } finally { LinearLinksController.timeoutMs = saved; await s.app.close(); }

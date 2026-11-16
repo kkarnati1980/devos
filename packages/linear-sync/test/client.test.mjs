@@ -173,6 +173,16 @@ test("DEVOS-97 budget: an aborted signal ends the call: no request, no further a
   ctl2.abort();
   await assert.rejects(p2, (e) => e.code === "timeout" && /budget/.test(e.message));
   assert.equal(seen.length, 1); assert.equal(seen[0].aborted, true, "the request in flight is cancelled");
+  // The same for a read, which would otherwise be retried after an AbortError (pre-review, medium).
+  const ctl3 = new AbortController();
+  const seen3 = [];
+  const c3 = new LinearClient({ apiKey: () => KEY, sleep: async () => {},
+    fetchImpl: (u, init) => new Promise((_, rej) => { seen3.push(init.signal); init.signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))); }) });
+  const p3 = c3.query("query { ok }", {}, { signal: ctl3.signal });
+  await new Promise((r) => setTimeout(r, 20));
+  ctl3.abort();
+  await assert.rejects(p3, (e) => e.code === "timeout" && /budget/.test(e.message));
+  assert.equal(seen3.length, 1, "a read aborted in flight is not retried");
   // Without a signal nothing changes: retries still run.
   const d = client([res(503, {}), res(200, { data: { ok: 2 } })]);
   assert.deepEqual(await d.c.query("query { ok }"), { ok: 2 });
