@@ -69,11 +69,27 @@ const STATE = { stacks: [
   { slug: "alpha", env: "preview", idx: 0, egress: false, tailnet: ["100.101.102.103/32"] },
 ] };
 
+// /etc/ufw/after.rules as M0.1 v1.3.1 leaves it: ufw's own head, then the DEVOS UFW AND DOCKER block at the end.
+const UFW_HEAD = "# rules.input-after\n*filter\n:ufw-after-input - [0:0]\nCOMMIT\n";
+const M01 = `# BEGIN DEVOS UFW AND DOCKER (M0.1 v1.3.1) - default-deny
+*filter
+:ufw-user-forward - [0:0]
+:ufw-docker-logging-deny - [0:0]
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -j ufw-user-forward
+-A DOCKER-USER -j ufw-docker-logging-deny
+COMMIT
+# END DEVOS UFW AND DOCKER
+`;
+const afterRules = (h) => fs.readFileSync(path.join(h, "after.rules"), "utf8");
+const bootBlock = (h) => { const m = afterRules(h).match(/# BEGIN DEVOS S4 ISOLATION[^\n]*\n([\s\S]*?)# END DEVOS S4 ISOLATION\n/); return m && m[1]; };
+
 function host(state, { conf = "", token = "t0ken-" + "a".repeat(30) } = {}) {
   const h = fs.mkdtempSync(path.join(tmp, "h-"));
   for (const d of ["devos/secrets", "nf", "log"]) fs.mkdirSync(path.join(h, d), { recursive: true });
   if (token !== null) fs.writeFileSync(path.join(h, "devos/secrets/isolation_state_token"), token + "\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=127.0.0.1:${upPort}\n${conf}`);
+  fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=127.0.0.1:${upPort}\n${conf}ISOLATION_UFW_AFTER_RULES=${path.join(h, "after.rules")}\n`);
+  fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD + M01, { mode: 0o640 });
   fs.writeFileSync(path.join(h, "nf/DOCKER-USER"), "-A DOCKER-USER -j ufw-user-forward\n-A DOCKER-USER -j ufw-docker-logging-deny\n");
   fs.writeFileSync(path.join(h, "nf/INPUT"), "-A INPUT -j ufw-before-logging-input\n");
   fs.writeFileSync(path.join(h, "nf/FORWARD"), "-A FORWARD -j ts-forward\n-A FORWARD -j DOCKER-USER\n");
@@ -244,7 +260,9 @@ async function listener() {  // a self-test target in its own process, so the fa
   const port = await new Promise((r) => c.stdout.once("data", (d) => r(Number(String(d).trim()))));
   return { pid: c.pid, port, stop: () => { try { c.kill("SIGKILL"); } catch {} } };
 }
-const targets = (h, ...ports) => fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=${ports.map((p) => "127.0.0.1:" + p).join(" ")}\n`);
+// Keeps the after.rules line, so no test ever falls back to the real /etc/ufw/after.rules.
+const targets = (h, ...ports) => fs.writeFileSync(path.join(h, "devos/server-agent.conf"),
+  `ISOLATION_SELFTEST_TARGETS=${ports.map((p) => "127.0.0.1:" + p).join(" ")}\nISOLATION_UFW_AFTER_RULES=${path.join(h, "after.rules")}\n`);
 
 test("AT8 self-test that passed before and fails after rolls back to the previous block", async () => {
   const h = host(STATE);
@@ -378,4 +396,105 @@ test("unknown arguments are refused", () => {
   const h = host(STATE);
   assert.equal(run(h, ["--force"]).code, 2);
   assert.equal(run(h, ["--dry-run", "x"]).code, 2);
+});
+
+// --- S4-b2b: boot persistence through /etc/ufw/after.rules --------------------------------------------------
+test("S4-b2b: apply writes the boot block after M0.1's block, and an unchanged run does not rewrite it", () => {
+  const h = host(STATE);
+  const r = run(h);
+  assert.equal(r.code, 0, r.out);
+  const txt = afterRules(h);
+  assert.ok(txt.startsWith(UFW_HEAD + M01), "ufw's own rules and M0.1's block are kept, in front");
+  assert.ok(txt.indexOf("# BEGIN DEVOS S4 ISOLATION") > txt.indexOf("# END DEVOS UFW AND DOCKER"), "ours comes after M0.1's");
+  const golden = fs.readFileSync(GOLDEN, "utf8");
+  assert.equal(bootBlock(h), golden.replace(/^COMMIT\n$/m, "")
+    + "-I DOCKER-USER 1 -j DEVOS-ISO-FWD\n-I FORWARD 1 -j DEVOS-ISO-FWD\n-I INPUT 1 -j DEVOS-ISO-IN\nCOMMIT\n");
+  assert.equal(fs.statSync(path.join(h, "after.rules")).mode & 0o777, 0o640, "file mode kept");
+  assert.doesNotMatch(txt, /[^\x09\x0a\x20-\x7e]/, "ASCII only (ufw crashes on anything else)");
+  const ino = fs.statSync(path.join(h, "after.rules")).ino;
+  assert.equal(run(h).code, 0);
+  assert.equal(fs.statSync(path.join(h, "after.rules")).ino, ino, "unchanged run leaves the file alone");
+  assert.equal(fs.readdirSync(h).filter((f) => f.includes(".devos-s4.")).length, 0, "no temp file left");
+});
+
+test("S4-b2b: loading after.rules on a fresh boot (and after M0.1's DOCKER-USER flush) restores the live block", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const live = { fwd: nf(h, "DEVOS-ISO-FWD"), in: nf(h, "DEVOS-ISO-IN") };
+  // Reboot: no S4 chains, INPUT/FORWARD hold only ufw's/tailscaled's jumps; ufw then loads after.rules in one restore.
+  for (const c of ["DEVOS-ISO-FWD", "DEVOS-ISO-IN"]) fs.rmSync(path.join(h, "nf", c));
+  fs.writeFileSync(path.join(h, "nf/INPUT"), "-A INPUT -j ufw-before-logging-input\n");
+  fs.writeFileSync(path.join(h, "nf/FORWARD"), "-A FORWARD -j ts-forward\n-A FORWARD -j DOCKER-USER\n");
+  fs.writeFileSync(path.join(h, "nf/DOCKER-USER"), "-A DOCKER-USER -j stale\n");
+  const env = { ...process.env, PATH: `${bin}:/usr/bin:/bin`, FAKE_NF: path.join(h, "nf"), FAKE_LOG: path.join(h, "log") };
+  const r = spawnSync("iptables-restore", ["--noflush"], { input: afterRules(h), env, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), live.fwd);
+  assert.equal(nf(h, "DEVOS-ISO-IN"), live.in);
+  assert.equal(nf(h, "DOCKER-USER"), "-A DOCKER-USER -j DEVOS-ISO-FWD\n-A DOCKER-USER -j ufw-user-forward\n-A DOCKER-USER -j ufw-docker-logging-deny\n",
+    "M0.1 flushed DOCKER-USER, then our jump went in first");
+  assert.equal(nf(h, "FORWARD").split("\n")[0], "-A FORWARD -j DEVOS-ISO-FWD", "first, above ts-forward");
+  assert.equal(nf(h, "INPUT").split("\n")[0], "-A INPUT -j DEVOS-ISO-IN");
+  // The agent's next tick finds everything in place (same block, jumps first, same fingerprint).
+  const after = run(h);
+  assert.equal(after.code, 0, after.out);
+  assert.match(after.out, /unchanged/);
+});
+
+test("S4-b2b: a re-run of M0.1 (its block moves to the end) puts ours back after it on the next tick", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const ours = bootBlock(h);
+  // M0.1's replace_block: delete its block, append it again at the end.
+  const t = afterRules(h).replace(M01, "") + M01;
+  fs.writeFileSync(path.join(h, "after.rules"), t);
+  const r = run(h);
+  assert.equal(r.code, 0, r.out);
+  const txt = afterRules(h);
+  assert.ok(txt.indexOf("# BEGIN DEVOS S4 ISOLATION") > txt.indexOf("# END DEVOS UFW AND DOCKER"));
+  assert.equal(bootBlock(h), ours);
+  assert.equal(txt.match(/# BEGIN DEVOS S4 ISOLATION/g).length, 1, "exactly one copy");
+});
+
+test("S4-b2b: without M0.1's block the boot block is not written (exit 1), the live block still applies", () => {
+  const h = host(STATE);
+  fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD);
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /M0\.1's DEVOS UFW AND DOCKER block is not in .*; not written/);
+  assert.match(r.out, /self-test passed, but not persisted for boot/);
+  assert.equal(afterRules(h), UFW_HEAD, "after.rules untouched");
+  assert.equal(nf(h, "DOCKER-USER").split("\n")[0], "-A DOCKER-USER -j DEVOS-ISO-FWD");
+});
+
+test("S4-b2b: a rollback rewrites the boot block to the restored block; a first-apply rollback deletes it", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const good = bootBlock(h);
+  let l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.equal(r.code, 1, r.out);
+    assert.equal(bootBlock(h), good);
+  } finally { l.stop(); }
+  const h2 = host(STATE);
+  l = await listener();
+  try {
+    targets(h2, l.port);
+    const r = run(h2, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.match(r.out, /rolled back: S4 block removed/);
+    assert.equal(afterRules(h2), UFW_HEAD + M01, "no boot block after the first apply was rolled back");
+  } finally { l.stop(); }
+});
+
+test("S4-b2b: --remove deletes the boot block too, so a reboot does not bring the block back", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  assert.ok(bootBlock(h));
+  const r = run(h, ["--remove"]);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(afterRules(h), UFW_HEAD + M01);
+  assert.equal(run(h, ["--remove"]).code, 0, "still idempotent");
 });
