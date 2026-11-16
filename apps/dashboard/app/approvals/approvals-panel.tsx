@@ -147,7 +147,7 @@ function Detail({ d, busy, act, api }: {
   const purge = c.gate === "purge";
   // DEVOS-110 (#173 pre-review 2): the probe's grant card always issues a fixed grant (90 days, 30 uses), so its form
   // shows that instead of inputs the server would ignore.
-  const fixedGrant = c.action === PROBE_GRANT_CARD_ACTION;
+  const fixedGrant = c.action === PROBE_GRANT_CARD_ACTION && c.gate === "destructive_or_spend";
   return (
     <section className="panel" data-testid="approval-detail">
       <h2>{c.action}</h2>
