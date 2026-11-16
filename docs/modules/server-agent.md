@@ -85,6 +85,10 @@ Any GitHub read error (runs, statuses, PRs, trees) means **wait** for the next t
 
 AT1–AT9 and AT11–AT22 run in CI (39 tests in total, including the PR11-r1 regressions: unreadable tree, paged runs, drain after main moves, dry run with a stored refusal, deploy resume and no resubmit) (`scripts/test/server-agent.test.mjs`) against a mock GitHub API, a mock Coolify API and a local git repo standing in for the deploy-key remote.
 
+## Pass rule
+- `node --test scripts/test/server-agent.test.mjs` exits 0 on the merged SHA (the acceptance tests above, including DEVOS-82 AT13–AT16 for `coolify-token-check.sh`).
+- DEVOS-238: `coolify-token-check.sh` against a closed port exits 1 and prints "Coolify API not reachable" (the "DEVOS-238" case in `scripts/test/server-agent.test.mjs`).
+
 ## Example check
 `scripts/server/checks/dashboard-tailnet-only.sh` (v1.1.0, DEVOS-83): the dashboard completes a **verified HTTPS handshake** on its MagicDNS name (`tailscale status --json` → `Self.DNSName`), with `curl --resolve <name>:<port>:<tailnet IP>` so the probe stays on the tailnet and curl's normal certificate check applies (never `-k`). Plain HTTP or an invalid certificate fails the check. It does **not** accept TCP connections on any public IPv4 address of the host (a plain TCP connect probe, so the result does not depend on the protocol). Port from `DASHBOARD_PORT` in `/root/.devos/server-agent.conf` (default 3000). It reports skipped (exit 3) while nothing accepts a connection on the tailnet port, i.e. before the dashboard is deployed (M1.3). A skipped check is never counted as passed. **Limit:** probing the host's own public IP from the host tests the listener binding, not the cloud firewall; the firewall half of the G1 check still needs an outside probe.
 
