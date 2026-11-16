@@ -1,0 +1,13 @@
+{
+  "id": "SM-11",
+  "name": "UI quality",
+  "files": [
+    "src/journey.mjs",
+    "test/sm-11-journey.test.mjs",
+    "test/e2e/main-journey.e2e.mjs"
+  ],
+  "checks": {
+    "SM-11-L1": "test/e2e/main-journey.e2e.mjs"
+  },
+  "usage": "Add the devDependency \"playwright\" (pin an exact version) and the script \"test:e2e\": \"node --test test/e2e/*.e2e.mjs\"; CI runs npx playwright install chromium, then npm run test:e2e, and keeps e2e-report/ (a screenshot per width and main-journey-report.json, evidence e2e_report for SM-11-L1). Replace the demo page and steps in test/e2e/main-journey.e2e.mjs with the app's real main journey from its requirements file, using getByRole/getByLabel locators. runJourney fails a width on a step error, an uncaught page error, a console error, a page wider than the viewport, or a hang past timeoutMs, and always writes the report. Add e2e-report/ to .gitignore. Full tier (SM-11-F1/F2: every journey, axe, keyboard-only) is the app's own work."
+}
