@@ -5,8 +5,14 @@
 
 export const LINEAR_ENDPOINT = "https://api.linear.app/graphql";
 
+/**
+ * The message an `apiKey` callback throws when no Linear key is stored (DEVOS-97, Codex PR185-r1). The client turns it
+ * into `LinearError("no-key")`, so callers can tell "no key set" apart from a broken vault.
+ */
+export const LINEAR_KEY_NOT_SET = "linear-key-not-set";
+
 export class LinearError extends Error {
-  constructor(public readonly code: "network" | "timeout" | "http" | "graphql" | "rate-limited" | "bad-response", message: string,
+  constructor(public readonly code: "network" | "timeout" | "http" | "graphql" | "rate-limited" | "bad-response" | "no-key", message: string,
               public readonly status?: number, public readonly retryAfterMs?: number) {
     super(message);
     this.name = "LinearError";
@@ -82,9 +88,12 @@ export class LinearClient {
         new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("key-timeout")), this.o.keyTimeoutMs); }),
       ]);
     } catch (e) {
-      throw (e as Error)?.message === "key-timeout"
+      const m = (e as Error)?.message;
+      throw m === "key-timeout"
         ? new LinearError("timeout", "Linear API key read from the vault timed out")
-        : new LinearError("bad-response", "Linear API key is not available from the vault");
+        : m === LINEAR_KEY_NOT_SET
+          ? new LinearError("no-key", "Linear API key is not set")
+          : new LinearError("bad-response", "Linear API key is not available from the vault");
     } finally { if (timer) clearTimeout(timer); }
     let res: Response;
     try {

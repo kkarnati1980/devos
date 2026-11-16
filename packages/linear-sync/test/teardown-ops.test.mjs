@@ -2,7 +2,7 @@
 // archives it (never deletes it); every write runs under the sync's per-project advisory lock; errors carry fixed text.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { LinearClient, LinearError, graphqlApi, linearTeardownOps, linearScanner, withSyncLock, TEARDOWN_LOCK_WAIT_MS } from "../dist/index.js";
+import { LinearClient, LinearError, LINEAR_KEY_NOT_SET, graphqlApi, linearTeardownOps, linearScanner, withSyncLock, TEARDOWN_LOCK_WAIT_MS } from "../dist/index.js";
 
 const PID = "11111111-2222-4333-8444-555555555555";
 const OTHER = "99999999-2222-4333-8444-555555555555";
@@ -114,6 +114,26 @@ test("errors: Linear failures map to provider errors with fixed text; transient 
   const [p3] = linearTeardownOps(broken, K.api, PID, makeError);
   await assert.rejects(p3.archive(row), (e) => e.code === "bad-response" && !/lock/.test(e.message));
   assert.deepEqual(K.writes, []);
+});
+
+test("DEVOS-97 (Codex PR185-r1): a missing Linear key is no-token through the real LinearClient, for every op and the scan", async () => {
+  const calls = [];
+  const client = new LinearClient({ apiKey: async () => { throw new Error(LINEAR_KEY_NOT_SET); },
+    fetchImpl: async (...a) => { calls.push(a); return new Response("{}", { status: 200 }); }, sleep: async () => {} });
+  const api = graphqlApi(client);
+  const db = fakeDb();
+  const [project] = linearTeardownOps(db, api, PID, makeError);
+  const noToken = (e) => e instanceof FakeProviderError && e.code === "no-token" && /key is not set/.test(e.message);
+  await assert.rejects(project.inspect(row), noToken);
+  await assert.rejects(project.archive(row), noToken);
+  await assert.rejects(project.unarchive(row), noToken);
+  await assert.rejects(project.remove(row), noToken);
+  await assert.rejects(linearScanner(api, "DEVOS", makeError).scan({ id: PID, slug: "demo" }), noToken);
+  assert.equal(calls.length, 0, "nothing is sent to Linear without a key");
+  // A vault that fails for another reason is still bad-response (not no-token).
+  const broken = graphqlApi(new LinearClient({ apiKey: async () => { throw new Error("vault down"); }, fetchImpl: async () => new Response("{}"), sleep: async () => {} }));
+  const [p2] = linearTeardownOps(db, broken, PID, makeError);
+  await assert.rejects(p2.inspect(row), (e) => e.code === "bad-response");
 });
 
 test("pre-review r2: the write is fenced: refused (busy, retryable, nothing written) once less than the write margin is left", async () => {
