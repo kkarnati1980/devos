@@ -11,6 +11,7 @@
 import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
+import { findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, teardownWiring } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -72,7 +73,7 @@ export async function probeCli(argv: string[], deps: { log(): Promise<Pick<Probe
   }
 }
 
-/** d3c-1: the live asserts and the purge are wired in d3c-2. Until then they throw a fixed code (see the contract). */
+/** d3c-1: the live asserts are wired in d3c-2b. Until then they throw a fixed code (see the contract). */
 const notWired = async (): Promise<never> => { throw new Error("probe-not-wired"); };
 
 // The production wiring; its pieces are tested on their own (probeCli, the parts, offReasonFor, stepWiring, buildProvisioner).
@@ -115,7 +116,21 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           provisionOnce: () => probeProvisionOnce(pv, p),
           inventory: () => readProbeInventory(db, p.id, timeoutMs),
           liveAsserts: notWired,
-          purge: notWired,
+          // d3c-2a: the purge through M2.5 under the KK grant (decisions 1–5), found read-only on each use.
+          purge: async () => {
+            const k = w.purge;
+            const grant = await findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem);
+            // Decision 4: a grant that expired or ran out mid-cycle ends the cycle as purge-permission.
+            if (!grant) return { error: "purge-permission:approval_required" };
+            return probePurge(p.id, {
+              teardown: k.teardownMod,
+              store: k.store,
+              authorize: grantAuthorizer(k.policy, p.id, grant),
+              stage: () => probeStage(db, p.id, timeoutMs),
+              wiring: () => teardownWiring(k.provisionMod, k.teardownMod, { gh: k.gh, cf: k.cf, store: k.store, db, projectId: p.id, owner: k.owner, timeoutMs }),
+            });
+          },
+          cycleStart: () => probeCycleStart(db, p.id, timeoutMs, async () => (await findProbeGrant(db, p.id, new Date(), timeoutMs, w.purge.grantProblem)) !== null),
           fingerprint: await probeFingerprint(fileURLToPath(root)),
           now: () => new Date(),
         };

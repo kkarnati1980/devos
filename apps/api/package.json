@@ -21,6 +21,7 @@
     "@devos/policy": "workspace:*",
     "@devos/provision": "workspace:*",
     "@devos/run-engine": "workspace:*",
+    "@devos/teardown": "workspace:*",
     "@nestjs/common": "11.2.8",
     "@nestjs/core": "11.2.8",
     "@nestjs/platform-express": "11.2.8",

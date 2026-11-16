@@ -103,7 +103,7 @@ export function policyAuthorizer(policy: ProvisionPolicy, projectId: string): Au
   };
 }
 
-const vaultToken = (vault: ProvisionVault, name: "github_token" | "coolify_api_token") => async (): Promise<string> => {
+export const vaultToken = (vault: ProvisionVault, name: "github_token" | "coolify_api_token") => async (): Promise<string> => {
   const v = await vault.reveal(name);
   if (!v) throw new Error(`${name}-not-set`);
   return v;
