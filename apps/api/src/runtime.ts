@@ -33,7 +33,7 @@ import type { TeardownServices } from "./teardown-routes.js";
 import { buildTeardownServices, buildTeardownSweep, type TeardownRuntimeModule, type TeardownSweepCards } from "./teardown-runtime.js";
 import type { TeardownSweepJob } from "./teardown-sweep.js";
 import { buildLinearLinks, type LinearLinksModule, type LinearLinksService } from "./linear-links.js";
-import { buildLinearSync, buildLinearTeardown, sharedLinearClient, type LinearSyncJob, type LinearSyncModule, type LinearTeardownModule } from "./linear-sync-runtime.js";
+import { buildLinearSync, buildLinearTeardown, linearKeyReader, sharedLinearClient, type LinearSyncJob, type LinearSyncModule, type LinearTeardownModule } from "./linear-sync-runtime.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -239,11 +239,7 @@ export async function buildRuntime(
   // through M1.6. It only reads Linear. Without a vault or a Linear loader it is off.
   // A Linear client that cannot be loaded turns the watchdog off (logged) and never stops the API (pre-review L2).
   const linear = vault && opts.loadLinear
-    ? await opts.loadLinear(async () => {
-        const key = await vault.reveal("linear_api_key");
-        if (!key) throw new Error("linear-key-not-set");
-        return key;
-      }).catch(() => { stdoutSink({ ts: new Date().toISOString(), level: "warn", msg: "runner-watchdog-linear-load-failed" }); return null; })
+    ? await opts.loadLinear(linearKeyReader(vault)).catch(() => { stdoutSink({ ts: new Date().toISOString(), level: "warn", msg: "runner-watchdog-linear-load-failed" }); return null; })
     : null;
   const runnerWatchdog = linear
     ? new RunnerWatchdogJob({

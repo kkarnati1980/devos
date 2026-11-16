@@ -87,6 +87,7 @@ test("buildRuntime passes the Linear teardown parts into the teardown routes (ar
   await rt.teardown.actions.archive({}, PID, 30);
   await rt.teardown.actions.restore({}, PID);
   // The purge job's purge step (what an approved card runs), called directly: its card rules are teardown-sweep.test.mjs's.
+  // `d` is TeardownSweepJob's injected deps (TS `private`, erased at run time): a test seam, renamed only with this test.
   await rt.teardownSweep.d.purge(PID, "grant-1", new Date(1));
   assert.deepEqual(T.calls.map((c) => c.what), ["archive", "restore", "purge"]);
   for (const c of T.calls) {
