@@ -2,7 +2,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -46,12 +46,16 @@ function commit(files, msg = "c") {
   return sha;
 }
 
+// S4-b2a: a stand-in for isolation-apply.sh (its own tests are isolation-apply.test.mjs): counts runs, prints a
+// secret-shaped value (must be redacted) and exits with FAKE_ISO_RC (default 0); FAKE_ISO_SLEEP makes it hang.
+const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + '"; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
 const real = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
 const baseFiles = () => ({
   "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
   "scripts/review/review-commit.sh": real("scripts/review/review-commit.sh"),
   "scripts/server/server-agent.sh": real("scripts/server/server-agent.sh"),
   "scripts/server/cert-renew.sh": real("scripts/server/cert-renew.sh"),
+  "scripts/server/isolation-apply.sh": fakeIso,
   "scripts/server/install-server-agent.sh": real("scripts/server/install-server-agent.sh"),
   "scripts/server/checks/ok.sh": "#!/usr/bin/env bash\necho fine\n",
   "scripts/server/checks/leaky.sh": `#!/usr/bin/env bash\necho "key ${SK} token ${GH_TOKEN} cf ${CF_TOKEN}"\nexit 1\n`,
@@ -167,7 +171,7 @@ test("AT1/AT9: passing SHA installs the allow-list only; a second tick makes no 
   M.main = sha; green(sha); pass(sha);
   const r = await runAgent();
   assert.equal(r.code, 0, r.out);
-  for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "cert-renew.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
+  for (const f of ["review-watch.sh", "review-commit.sh", "server-agent.sh", "cert-renew.sh", "isolation-apply.sh", "checks/ok.sh", "checks/leaky.sh"]) assert.ok(fs.existsSync(path.join(D(), "bin", f)), f);
   assert.ok(!fs.existsSync(path.join(D(), "bin/install-server-agent.sh")), "installer is not on the allow-list");
   assert.equal(fs.readFileSync(path.join(D(), "agent/installed.sha"), "utf8").trim(), sha);
   assert.ok(fs.existsSync(path.join(D(), `agent/done.${sha}`)), "SHA reaches done");
@@ -710,6 +714,83 @@ test("DEVOS-87 AT13: an allow-listed file missing from bin/ is installed again f
   fs.rmSync(path.join(D(), "bin/cert-renew.sh")); fs.rmSync(path.join(D(), `agent/installed.${sha}`));
   const r2 = await runAgent();
   assert.ok(!fs.existsSync(path.join(D(), "bin/cert-renew.sh")), r2.out);
+});
+
+// ---- S4-b2a (DEVOS-127): isolation-apply.sh every tick, reported by checks/project-isolation-apply.sh ----
+const isoCount = () => (fs.existsSync(path.join(D(), "iso.count")) ? fs.readFileSync(path.join(D(), "iso.count"), "utf8").split("\n").filter(Boolean).length : 0);
+const isoState = () => fs.readFileSync(path.join(D(), "agent/isolation.state"), "utf8");
+
+test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and runs every tick; output redacted; result kept", async () => {
+  resetMock(); freshState();
+  const sha = commit({ ...baseFiles(), "xb2a1": "1" }, "s4-b2a every tick");
+  M.main = sha; green(sha); pass(sha);
+  const r1 = await runAgent();
+  assert.equal(r1.code, 0, r1.out);
+  assert.match(r1.out, /isolation: not installed yet/);
+  assert.equal(isoCount(), 0);
+  assert.ok(fs.existsSync(path.join(D(), "bin/isolation-apply.sh")), "installed from the allow-list");
+  const r2 = await runAgent();
+  assert.equal(isoCount(), 1, r2.out);
+  assert.match(r2.out, /isolation: ok/);
+  assert.doesNotMatch(r2.out, /abcdefghijklmnop1234/, "isolation output is redacted");
+  assert.match(isoState(), /^\d{1,12} ok\n$/);
+  await runAgent();
+  assert.equal(isoCount(), 2, "runs again on the next tick (not daily)");
+  await runAgent({ FAKE_ISO_RC: "3" });
+  assert.match(isoState(), /^\d{1,12} skipped\n$/);
+  await runAgent({ FAKE_ISO_RC: "1" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
+  assert.equal(r6.code, 0, r6.out);
+  assert.match(isoState(), /^\d{1,12} fail \(timeout\)\n$/, "the agent's timeout bounds the run");
+  const before = isoCount();
+  const r7 = await runAgent({}, ["--dry-run"]);
+  assert.match(r7.out, /WOULD run isolation-apply\.sh/);
+  assert.equal(isoCount(), before, "--dry-run never runs it");
+});
+
+test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed copy missing from bin/ is repaired", async () => {
+  resetMock(); freshState({ deploy: true });
+  const sha = commit({ ...baseFiles(), "xb2a2": "1" }, "s4-b2a inflight");
+  M.main = sha; green(sha); pass(sha);
+  M.deployStatus = "in_progress";
+  await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.ok(fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)));
+  const r2 = await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.match(r2.out, /isolation deferred: a deployment is in flight/);
+  assert.equal(isoCount(), 0);
+  M.deployStatus = "finished";
+  await runAgent();
+  fs.rmSync(path.join(D(), "bin/isolation-apply.sh"));   // as after an older agent with the shorter allow-list
+  const r4 = await runAgent();
+  assert.match(r4.out, /isolation-apply\.sh missing from bin\/; installing again from/);
+  assert.equal(isoCount(), 1, r4.out);
+});
+
+const ISO_CHECK = path.join(ROOT, "scripts/server/checks/project-isolation-apply.sh");
+function isoCheck(state, extra = {}) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "iso-check-"));
+  fs.mkdirSync(path.join(d, "agent"));
+  if (state !== null) fs.writeFileSync(path.join(d, "agent/isolation.state"), state);
+  const r = spawnSync("bash", [ISO_CHECK], { env: { ...process.env, DEVOS_DIR: d, ...extra }, encoding: "utf8" });
+  fs.rmSync(d, { recursive: true, force: true });
+  return { code: r.status, out: r.stdout + r.stderr };
+}
+const ago = (s) => Math.floor(Date.now() / 1000) - s;
+
+test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips until set up, fails otherwise", () => {
+  assert.equal(isoCheck(`${ago(60)} ok\n`).code, 0);
+  assert.equal(isoCheck(null).code, 3, "never run yet");
+  assert.equal(isoCheck(`${ago(60)} skipped\n`).code, 3, "not set up yet");
+  assert.equal(isoCheck(`${ago(60)} fail (exit 1)\n`).code, 1);
+  assert.equal(isoCheck(`${ago(60)} fail (timeout)\n`).code, 1);
+  const stale = isoCheck(`${ago(2701)} ok\n`);
+  assert.equal(stale.code, 1, "an old ok is a failure");
+  assert.match(stale.out, /more than 2700s/);
+  assert.equal(isoCheck(`${ago(-600)} ok\n`).code, 1, "a future date fails");
+  assert.equal(isoCheck("garbage\n").code, 1, "unreadable fails, never passes");
+  assert.equal(isoCheck(`${ago(60)} ok extra\n`).code, 1);
+  assert.equal(isoCheck(`${ago(100)} ok\n`, { ISOLATION_MAX_AGE: "50" }).code, 1);
 });
 
 // ---- DEVOS-90: re-checks on request and every 6 hours ----

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.4.0
+# Version: 1.5.0
+# v1.5.0 (DEVOS-127, S4-b2a): the allow-list gains scripts/server/isolation-apply.sh (S4-b). Every tick, after the
+# cert renewal and before anything that needs GitHub, the agent runs it under `timeout 60` (deferred while a
+# deployment is in flight: its self-test would see the DevOS API restarting). The redacted output goes to the
+# agent log; the result is kept in agent/isolation.state, which the project-isolation-apply check reports.
 # v1.4.0 (DEVOS-90): server re-checks without a new main SHA. Every 6 hours, and within a tick (about 3 minutes)
 # of a "/recheck" comment by an allowed author on the open draft tracking PR (head branch devos-recheck), the
 # agent runs the installed checks again on the currently deployed SHA and posts a fresh server-check status.
@@ -43,9 +47,11 @@ CHECK_TIMEOUT="${CHECK_TIMEOUT:-120}"
 GH_ENV="$DIR/github-review.env"
 CF_ENV="$DIR/coolify-deploy.env"
 # The allow-list: the only files ever installed (checks are added from scripts/server/checks/*.sh).
-ALLOW=(scripts/review/review-watch.sh scripts/review/review-commit.sh scripts/server/server-agent.sh scripts/server/cert-renew.sh)
+ALLOW=(scripts/review/review-watch.sh scripts/review/review-commit.sh scripts/server/server-agent.sh scripts/server/cert-renew.sh
+       scripts/server/isolation-apply.sh)
 CERT_EVERY="${CERT_EVERY:-86400}"       # R3-d: renew once a day
 CERT_RETRY="${CERT_RETRY:-3600}"        # after a failed renewal, try again after an hour
+ISOLATION_TIMEOUT="${ISOLATION_TIMEOUT:-60}"  # S4-b2a: one isolation-apply.sh run per tick (S4-b decision 9)
 RECHECK_EVERY="${RECHECK_EVERY:-21600}" # DEVOS-90: re-run the server checks every 6 hours
 RECHECK_BRANCH="${RECHECK_BRANCH:-devos-recheck}"            # head branch of the draft tracking PR
 RECHECK_AUTHORS="${RECHECK_AUTHORS:-${REPO%%/*}}"            # logins allowed to request; default the repo owner
@@ -352,6 +358,25 @@ cert_renewal() {
 
 # The allow-list grew (v1.3.0): the SHA that installed it ran an older agent with the shorter list, so a new
 # allow-listed file is missing from bin/. Install again from the recorded SHA (it already passed D1).
+# S4-b2a (DEVOS-127): the host firewall block for project isolation (S4-b), applied every tick. It reads the
+# approved state from the DevOS API on loopback and changes only the S4 chains; exit 0 applied or unchanged,
+# 1 failed (previous block kept or restored), 3 not set up yet. The result line in isolation.state is
+# "<epoch> <ok|skipped|fail (exit n)|fail (timeout)>"; checks/project-isolation-apply.sh reports it.
+isolation_tick() {
+  local f rc st
+  [[ -f "$BIN/isolation-apply.sh" ]] || { log "isolation: not installed yet"; return 0; }
+  for f in "$ST"/deploy-started.*; do
+    [[ -e "$f" ]] || continue
+    [[ -s "$ST/deployed.${f##*/deploy-started.}" ]] || { log "isolation deferred: a deployment is in flight"; return 0; }
+  done
+  if [[ $DRY -eq 1 ]]; then log "WOULD run isolation-apply.sh"; return 0; fi
+  set +e; DEVOS_DIR="$DIR" timeout "$ISOLATION_TIMEOUT" bash "$BIN/isolation-apply.sh" > "$TMP/iso.out" 2>&1 </dev/null; rc=$?; set -e
+  redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done
+  case "$rc" in 0) st=ok;; 3) st=skipped;; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
+  printf '%s %s\n' "$(date +%s)" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"
+  log "isolation: $st"
+}
+
 repair_allowlist() {
   local f sha
   [[ $DRY -eq 0 && -s "$ST/installed.sha" ]] || return 0
@@ -498,6 +523,7 @@ recheck_tick() {
 # ---- tick ----
 repair_allowlist
 cert_renewal
+isolation_tick
 sha="$(gh GET "/repos/$REPO/commits/main" | jq -r '.sha')" || die "cannot read main"
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "bad main sha"
 deploy_on=0; [[ -e "$ST/deploy.enabled" ]] && deploy_on=1
