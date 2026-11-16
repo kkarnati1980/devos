@@ -15,6 +15,11 @@ export interface InventoryItem {
   kind: string;
   externalId: string;
   name: string;
+  /**
+   * DEVOS-235 (Codex PR160-r1): set when an earlier purge run began this row's provider delete and did not mark the
+   * row deleted (a crash between the DELETE and the inventory update). Absent or null otherwise.
+   */
+  deleteStartedAt?: Date | null;
 }
 
 /** What teardown can do to one kind of resource. `inspect` returns null when the resource is gone. */
@@ -353,6 +358,10 @@ export function coolifyTokenScopeCheck(cf: CoolifyClient, recorded: () => Promis
       if (!COOLIFY_UUID_RE.test(r.externalId)) throw new Error("coolify-token-scope: a recorded Coolify project id is not a uuid");
       const res = await cf.http.get<{ uuid?: string }>(`/api/v1/projects/${r.externalId}`);
       if (res.status === 404) {
+        // Codex PR160-r1: an earlier purge run began deleting this project and crashed before marking the row deleted.
+        // Its 404 then most likely means "gone", so it proves nothing either way: skip it, as decision 2 does for no
+        // row at all. Every other 404 is still read as a wrong-team token.
+        if (r.deleteStartedAt) continue;
         throw new Error("coolify-token-scope: the Coolify token cannot see this project's Coolify project; use the token of the team that owns it");
       }
       if (res.status !== 200 || !res.body || typeof res.body !== "object" || res.body.uuid !== r.externalId) {

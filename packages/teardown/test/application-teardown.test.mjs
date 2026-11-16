@@ -324,3 +324,43 @@ test("DEVOS-235 pre-review: a purge built on pinnedCoolify keeps the preflight's
   );
   assert.equal(u.fake.deletes().length, 0);
 });
+
+test("Codex PR160-r1 (AT4): a purge that crashed after deleting the Coolify project resumes; the preflight does not block it", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  // Crash between the Coolify project's DELETE and its inventory update (the window Codex found).
+  const orig = s.store.markResourceDeleted.bind(s.store);
+  s.store.markResourceDeleted = async (id, at) => {
+    const row = s.store.resources.find((r) => r.id === id);
+    if (row.provider === "coolify" && row.kind === "project") throw new Error("simulated crash before the inventory update");
+    return orig(id, at);
+  };
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] }), /simulated crash/);
+  s.store.markResourceDeleted = orig;
+  const row = s.store.resources.find((r) => r.provider === "coolify" && r.kind === "project");
+  assert.equal(s.fake.projects.has(row.externalId), false, "the Coolify project is gone at Coolify");
+  assert.ok(!row.deletedAt && row.deleteStartedAt instanceof Date, "its row is still active, with the delete recorded as started");
+  // Restart: the 404 for that row is its own earlier delete, so the preflight skips it and the purge finishes.
+  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] });
+  assert.equal(out.purged, true, JSON.stringify(out.report));
+  assert.equal(s.store.projects.get(P.id).stage, "purged");
+});
+
+test("Codex PR160-r1: the delete is recorded as started before its DELETE is sent; a never-started row still needs its 200", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const order = [];
+  const origStart = s.store.markDeleteStarted.bind(s.store);
+  s.store.markDeleteStarted = async (id, at) => { order.push({ id, deletesBefore: s.fake.deletes().length }); return origStart(id, at); };
+  await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] });
+  assert.ok(order.length > 0);
+  order.forEach((o, i) => assert.equal(o.deletesBefore, i, `start ${i} recorded before its own DELETE`));
+
+  // A recorded project row without a started delete: a 404 is still a wrong-team token.
+  const u = await setup();
+  const rows = (await u.store.activeResources(P.id)).filter((r) => r.provider === "coolify" && r.kind === "project");
+  assert.ok(rows.length === 1 && rows[0].deleteStartedAt === null);
+  u.fake.coolify.wrongTeam = true;
+  await assert.rejects(coolifyTokenScopeCheck(u.cf, async () => rows)(), /coolify-token-scope/);
+  await coolifyTokenScopeCheck(u.cf, async () => [{ ...rows[0], deleteStartedAt: new Date() }])();
+});

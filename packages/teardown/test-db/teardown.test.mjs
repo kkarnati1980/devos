@@ -88,6 +88,9 @@ test("AT4 on Postgres: a crash after each provider delete and before the row upd
     s.store.markResourceDeleted = async (id, at) => { if (n++ === k) throw new Error("simulated crash"); return orig(id, at); };
     await assert.rejects(purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: s.scanners, authorize: allowAll }), /simulated crash/);
     s.store.markResourceDeleted = orig;
+    // Codex PR160-r1: the crashed row is still active and carries the start of its delete.
+    const started = (await s.store.activeResources(s.p.id)).filter((r) => r.deleteStartedAt instanceof Date);
+    assert.equal(started.length, 1, "the crashed row records its delete start");
     const out = await purgeProject(s.p.id, { store: s.store, ops: s.ops, scanners: s.scanners, authorize: allowAll });
     assert.equal(out.purged, true);
     assert.equal(s.deletes.length, 2, "each resource deleted once");
@@ -102,6 +105,8 @@ test("AT7 on Postgres: after a purge the same project provisions fresh; its own 
   const out = await s.provision();
   assert.deepEqual(out.map((o) => o.outcome), ["created", "created"]);
   assert.equal(await db.resource.count({ where: { projectId: s.p.id, status: "active" } }), 2);
+  // Codex PR160-r1: a revived row starts with no recorded delete.
+  assert.equal(await db.resource.count({ where: { projectId: s.p.id, status: "active", deleteStartedAt: { not: null } } }), 0);
 });
 
 test("DEVOS-131 on Postgres: purge deletes the project's vault secrets (only this project's) and ends purged", async () => {
