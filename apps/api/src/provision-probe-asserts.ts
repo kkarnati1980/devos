@@ -122,8 +122,16 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
   const deadline = now() + (d.budgetMs ?? ASSERT_BUDGET_MS);
   const late = () => now() >= deadline;
   const steps = await d.steps();
-  const gh = (await d.mod.pinnedGitHub(d.gh)).http;
-  const cf = (await d.mod.pinnedCoolify(d.cf)).http;
+  // Codex PR167-r1: the budget is checked at every GET, including the ones inside `CoreRepo` (tree, blob), so no read
+  // starts after the deadline; a refused read throws, and its check reports `*-unreadable`.
+  const budgeted = (h: ReadHttp): ReadHttp => ({
+    get: async <T>(path: string) => {
+      if (late()) throw new Error("probe-assert-budget");
+      return h.get<T>(path);
+    },
+  });
+  const gh = budgeted((await d.mod.pinnedGitHub(d.gh)).http);
+  const cf = budgeted((await d.mod.pinnedCoolify(d.cf)).http);
   const marker = d.mod.ownershipMarker(d.projectId);
   const codes: string[] = [];
   const need = (key: string, re: RegExp): string | null => {

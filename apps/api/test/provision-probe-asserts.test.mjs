@@ -262,3 +262,22 @@ test("d3c-2b pre-review 2: a throw from pinning or the journal read ends the cyc
     assert.equal(recs.at(-1).result.detail, "error");
   }
 });
+
+test("Codex PR167-r1: a Compose read that crosses the deadline starts no later GET (tree, blob)", async () => {
+  const w = world();
+  // The clock is the number of provider reads so far: the deadline falls right after the commit read of CoreRepo.
+  const n = () => w.reads.length;
+  let deadlineAt = null;
+  const probe = probeLiveAsserts({
+    mod: w.mod, gh: "GH", cf: "CF", projectId: PID, steps: async () => steps(),
+    // reads: 1 repo, 2 app(preview), 3 commit; the deadline is 3 so the tree read (4th) must not start.
+    budgetMs: 3, now: () => n(),
+  });
+  const out = await probe;
+  deadlineAt = 3;
+  assert.equal(w.reads.length, deadlineAt);
+  assert.ok(w.reads[2].includes("/git/commits/"));
+  assert.ok(!w.reads.some((r) => r.includes("/git/trees/") || r.includes("/git/blobs/")));
+  assert.ok(out.includes("compose-unreadable:preview"));
+  for (const c of out) assert.match(c, /-unreadable(:|$)|^more-\d+$/);
+});
