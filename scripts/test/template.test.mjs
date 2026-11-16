@@ -190,7 +190,13 @@ test("AT6: apply refuses unknown, floor or opt-in IDs and a non-empty output, wr
   assert.equal(r.code, 2); assert.match(r.error, /not empty/);
   assert.deepEqual(fs.readdirSync(busy), ["keep.txt"]);
   assert.ok(!fs.readdirSync(tmp).some((n) => n.includes(".partial-")), "no staging left behind");
-  const out = fresh("pending", ["SM-13"]);
+  // Every add-on is built, so `pending` is exercised on a copy of the template with SM-13's add-on removed.
+  const copy = path.join(tmp, "template-copy");
+  fs.cpSync(path.join(ROOT, "templates/golden-path"), copy, { recursive: true });
+  fs.rmSync(path.join(copy, "addons", "SM-13"), { recursive: true });
+  const out = path.join(tmp, "pending");
+  const pr = apply({ out, select: ["SM-13"], sha: "a".repeat(40), template: copy });
+  assert.equal(pr.code, 0, pr.error);
   const m = JSON.parse(fs.readFileSync(path.join(out, ".devos/template.json"), "utf8"));
   assert.deepEqual(m.selected, ["SM-13"]); assert.deepEqual(m.pending, ["SM-13"]); assert.deepEqual(m.applied, []);
   const cli = spawnSync(process.execPath, [path.join(ROOT, "scripts/template/apply.mjs"), "--out", path.join(tmp, "cli"), "--select", "SM-99"], { encoding: "utf8" });

@@ -32,7 +32,8 @@ function devosSha() {
   try { return execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return "unknown"; }
 }
 
-export function apply({ out, select = [], sha = devosSha() }) {
+// `template` is for tests only (a copy of the template, e.g. with an add-on removed to exercise `pending`).
+export function apply({ out, select = [], sha = devosSha(), template = TEMPLATE }) {
   if (!out) return { code: 2, error: "--out is required" };
   out = path.resolve(out);   // so "dir/" stages beside dir, never inside it
   const ids = [...new Set(select.map((s) => s.trim()).filter(Boolean))];
@@ -41,11 +42,11 @@ export function apply({ out, select = [], sha = devosSha() }) {
   if (bad.length) return { code: 2, error: `not a selectable module: ${bad.join(", ")}` };
   if (fs.existsSync(out) && fs.readdirSync(out).length) return { code: 2, error: `output directory is not empty: ${out}` };
   const applied = [], pending = [];
-  for (const id of ids) (fs.existsSync(path.join(TEMPLATE, "addons", id, "addon.json")) ? applied : pending).push(id);
+  for (const id of ids) (fs.existsSync(path.join(template, "addons", id, "addon.json")) ? applied : pending).push(id);
   const stage = `${out}.partial-${process.pid}`;
   try {
-    copyDir(path.join(TEMPLATE, "core"), stage);
-    for (const id of applied) copyDir(path.join(TEMPLATE, "addons", id, "files"), stage);
+    copyDir(path.join(template, "core"), stage);
+    for (const id of applied) copyDir(path.join(template, "addons", id, "files"), stage);
     fs.mkdirSync(path.join(stage, ".devos"), { recursive: true });
     fs.writeFileSync(path.join(stage, ".devos/template.json"), JSON.stringify({ template: "golden-path", version: TEMPLATE_VERSION, devosSha: sha, selected: ids, applied, pending }, null, 2) + "\n");
     if (fs.existsSync(out)) fs.rmdirSync(out);
