@@ -69,6 +69,13 @@ test("fail: a pool route that is not a stack /24 (wider prefix, host route)", ()
   assert.match(r.out, /^fail: 2 pool route\(s\) not on their devos-p bridge: 10\.208\.0\.0\/16 on br-x \(not a stack \/24\) 10\.210\.3\.9 on devos-p515 \(not a stack \/24\)$/);
 });
 
+test("fail: a route wider than the pool that contains it; a wide route elsewhere and 10.207/10.212 are ignored", () => {
+  const r = run("cover", { routes: ["10.0.0.0/8 dev br-wide scope link", "10.192.0.0/11 dev eth1 scope link", "192.168.0.0/13 dev eth2 scope link",
+    "10.207.255.0/24 dev br-low scope link", "10.212.0.0/24 dev br-high scope link", "10.208.1.0/24 dev devos-p1 scope link"].join("\n") + "\n" });
+  assert.equal(r.code, 1);
+  assert.equal(r.out, "fail: 2 pool route(s) not on their devos-p bridge: 10.0.0.0/8 on br-wide (contains the pool) 10.192.0.0/11 on eth1 (contains the pool)");
+});
+
 test("fail: an interface name with odd characters is not echoed", () => {
   const r = run("odd", { routes: "10.208.2.0/24 dev $(touch${IFS}x) scope link\n" });
   assert.equal(r.code, 1);
