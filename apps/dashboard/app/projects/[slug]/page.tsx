@@ -7,6 +7,7 @@ import { parseApiOrigin } from "../../../lib/headers.mjs";
 import { PreflightPanel } from "./preflight-panel";
 import { ProvisioningPanel } from "./provisioning/provisioning-panel";
 import { BatchesPanel } from "./batches-panel";
+import { RemovePanel } from "./remove/remove-panel";
 
 export default async function ProjectPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -84,6 +85,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ slug: 
       {apiOrigin ? <BatchesPanel apiOrigin={apiOrigin} slug={project.slug} /> : null}
 
       {apiOrigin ? <ProvisioningPanel apiOrigin={apiOrigin} slug={project.slug} /> : null}
+      {apiOrigin ? <RemovePanel apiOrigin={apiOrigin} slug={project.slug} /> : null}
 
       <ReadinessPanel scope={project.slug} />
     </>

@@ -40,7 +40,7 @@ function fakes() {
   return { ...base, fetchImpl, calls };
 }
 
-async function start({ policy = "allow", actions: override, configured = true, login = KK, days = 30, log, readerOverride = {} } = {}) {
+async function start({ policy = "allow", actions: override, configured = true, login = KK, days = 30, log, readerOverride = {}, purge } = {}) {
   const fake = fakes();
   const sleep = async () => {};
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep });
@@ -73,7 +73,7 @@ async function start({ policy = "allow", actions: override, configured = true, l
     grants: null,
     log: () => {},
     kkSessions: new KkSessionRegistry(),
-    teardown: configured ? { reader, actions, log } : undefined,
+    teardown: configured ? { reader, actions, log, ...(purge !== undefined ? { purge } : {}) } : undefined,
   });
   await app.listen(0, "127.0.0.1");
   return { app, port: app.getHttpServer().address().port, fake, store, decisions };
@@ -360,4 +360,54 @@ test("Codex PR179-r2: a sweep run from a stale snapshot writes nothing to a prov
   await job.tick();
   assert.deepEqual(runs, ["provisioning"], "the restored project is provisioned again on the next tick");
   assert.equal(await notArchived({}, P.id, async () => "require_approval")("x", "y"), "require_approval");
+});
+
+// DEVOS-246 (M2.5-b3, decision 2): KK's early ask through the route; the panel's card link in GET.
+test("M2.5-b3: POST purge-request needs the session and CSRF, returns the card id, and maps refusals to fixed codes", async () => {
+  const CARD = "33333333-2222-4333-8444-555555555555";
+  const asks = [];
+  let answer = { ok: true, approvalId: CARD, raised: true };
+  const purge = {
+    pendingCard: async (p) => (p.stage === "archived" ? CARD : null),
+    askPurge: async (id) => { asks.push(id); if (answer === "throw") throw new Error("db down secret-ish text"); return answer; },
+  };
+  const { app, port } = await start({ purge });
+  try {
+    const h = await session(port);
+    const noCsrf = await call(port, "POST", `/projects/${P.id}/purge-request`, { headers: { origin: ORIGIN, cookie: h.cookie } });
+    assert.equal(noCsrf.status, 403);
+    assert.equal(asks.length, 0, "no card without the CSRF token");
+    const bad = await call(port, "POST", `/projects/not-a-uuid/purge-request`, { headers: h });
+    assert.deepEqual([bad.status, bad.json.code], [400, "invalid:id"]);
+    const ok = await call(port, "POST", `/projects/${P.id}/purge-request`, { headers: h });
+    assert.deepEqual([ok.status, ok.json], [200, { approvalId: CARD, raised: true }]);
+    assert.deepEqual(asks, [P.id]);
+    for (const [code, status] of [["not_archived", 409], ["purge-already-approved", 409], ["purge-waits-for-daily-run", 409], ["project-not-found", 404], ["something-else", 503]]) {
+      answer = { ok: false, code };
+      const r = await call(port, "POST", `/projects/${P.id}/purge-request`, { headers: h });
+      assert.deepEqual([r.status, r.json.code], [status, status === 503 ? "teardown-failed" : code]);
+    }
+    answer = "throw";
+    const failed = await call(port, "POST", `/projects/${P.id}/purge-request`, { headers: h });
+    assert.deepEqual([failed.status, failed.json.code], [503, "teardown-store-failed"]);
+    assert.ok(!failed.text.includes("secret-ish"));
+    // GET links the pending card only while archived, and says the ask is available.
+    const live = await call(port, "GET", `/projects/${P.id}/teardown`, { headers: { cookie: h.cookie } });
+    assert.deepEqual([live.json.purgeCardId, live.json.purgeAskAvailable], [null, true]);
+    const ar = await call(port, "POST", `/projects/${P.id}/archive`, { headers: h });
+    assert.equal(ar.status, 200);
+    const g = await call(port, "GET", `/projects/by-slug/${P.slug}/teardown`, { headers: { cookie: h.cookie } });
+    assert.deepEqual([g.json.purgeCardId, g.json.purgeAskAvailable], [CARD, true]);
+  } finally { await app.close(); }
+});
+
+test("M2.5-b3: without the teardown job, GET shows no card link and the ask answers 503 teardown-not-configured", async () => {
+  const { app, port } = await start();
+  try {
+    const h = await session(port);
+    const g = await call(port, "GET", `/projects/${P.id}/teardown`, { headers: { cookie: h.cookie } });
+    assert.deepEqual([g.status, g.json.purgeCardId, g.json.purgeAskAvailable], [200, null, false]);
+    const r = await call(port, "POST", `/projects/${P.id}/purge-request`, { headers: h });
+    assert.deepEqual([r.status, r.json.code], [503, "teardown-not-configured"]);
+  } finally { await app.close(); }
 });

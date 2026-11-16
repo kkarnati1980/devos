@@ -398,3 +398,79 @@ test("AT8a/AT11 page part (CR-b2c, DEVOS-216): the project page lists every batc
   assert.match(await other.page.getByTestId("batches-error").innerText(), /^No build questions for this project yet\. \(project-not-found\)$/);
   await other.context.close();
 });
+
+test("M2.5-b3 (DEVOS-246, AT9 panel half): the Remove project panel shows the state in IST and the leftover check as text; Archive, Restore and Ask to delete now post with CSRF; no delete button", async () => {
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  // Laptop width: the archived project.
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const problems = [];
+  page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+  let probe401 = 0;
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    if (/^Failed to load resource: the server responded with a status of 401/.test(m.text()) && probe401++ === 0) return;
+    problems.push(`console: ${m.text()}`);
+  });
+  page.on("dialog", async (d) => { problems.push(`dialog: ${d.message()}`); await d.dismiss(); });
+  await page.addInitScript(() => {
+    window.__cspViolations = [];
+    document.addEventListener("securitypolicyviolation", (e) => window.__cspViolations.push(`${e.violatedDirective} ${e.blockedURI}`));
+  });
+  await page.goto(dash.base + "/projects/xss-probe", { waitUntil: "load" });
+  const panel = page.getByTestId("remove-panel");
+  await panel.getByTestId("remove-state").waitFor();
+  assert.match(await panel.getByTestId("remove-state").innerText(), /^Archived since 10 Nov 2026, 10:00 IST: .* after 10 Dec 2026, 10:00 IST\.$/);
+  assert.equal(await panel.getByTestId("remove-counts").innerText(), "Coolify: 2, GitHub: 1");
+  assert.match(await panel.getByTestId("remove-scan-hit").innerText(), /^still there: Coolify application “<img src=x onerror=window\.__xss6=1>” \(app-<b>1<\/b>\)$/);
+  assert.match(await panel.getByTestId("remove-scan-error").innerText(), /^could not check github<script>window\.__xss7=1<\/script> \(provider_error\)$/);
+  assert.equal(await panel.locator("img, b, script").count(), 0, "scan texts are shown as text");
+  assert.equal(await page.evaluate(() => [window.__xss6, window.__xss7].every((x) => x === undefined)), true, "no payload ran");
+  // No direct delete button anywhere in the panel.
+  const labels = await panel.locator("button").allInnerTexts();
+  assert.deepEqual(labels, ["Restore", "Ask to delete now"]);
+  assert.ok(!labels.some((l) => /^(delete|purge)/i.test(l)));
+
+  await panel.getByTestId("remove-ask-purge").click();
+  await panel.getByTestId("remove-note").filter({ hasText: "The delete card is in Approvals" }).waitFor();
+  assert.equal(api.state.received.at(-1).url, "/projects/11111111-1111-4111-8111-111111111111/purge-request");
+  const link = panel.getByTestId("remove-card-link");
+  await link.waitFor();
+  assert.equal(await link.getAttribute("href"), "/approvals?id=00000000-0000-4000-8000-0000000000a3");
+  assert.equal(await panel.getByTestId("remove-ask-purge").count(), 0, "one card at a time");
+
+  await panel.getByTestId("remove-restore").click();
+  await panel.getByTestId("remove-note").filter({ hasText: "Restored." }).waitFor();
+  assert.equal(api.state.received.at(-1).url, "/projects/11111111-1111-4111-8111-111111111111/restore");
+  await panel.getByTestId("remove-archive").waitFor();
+  assert.match(await panel.getByTestId("remove-state").innerText(), /^Active\./);
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems, []);
+  await context.close();
+
+  // Phone width: the active project; Archive needs a second, in-page confirmation (no browser dialog).
+  const { page: phone, context: pc, problems: pp } = await open("/projects/social-content-extraction");
+  const pp2 = phone.getByTestId("remove-panel");
+  await pp2.getByTestId("remove-archive").waitFor();
+  assert.equal(await pp2.getByTestId("remove-scan").innerText(), "none yet");
+  const posts = api.state.received.length;
+  await pp2.getByTestId("remove-archive").click();
+  assert.match(await pp2.getByTestId("remove-confirm").innerText(), /^Archive social-content-extraction\? .*Nothing is deleted\./);
+  await pp2.getByTestId("remove-archive-cancel").click();
+  assert.equal(api.state.received.length, posts, "Cancel posts nothing");
+  await pp2.getByTestId("remove-archive").click();
+  await pp2.getByTestId("remove-archive-confirm").click();
+  await pp2.getByTestId("remove-note").filter({ hasText: "Archived. Nothing was deleted" }).waitFor();
+  assert.equal(api.state.received.at(-1).url, "/projects/22222222-2222-4222-8222-222222222222/archive");
+  await pp2.getByTestId("remove-restore").waitFor();
+  assert.match(await pp2.getByTestId("remove-state").innerText(), /^Archived since 16 Nov 2026, 23:30 IST/);
+  const m = await phone.evaluate(() => ({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }));
+  assert.ok(m.sw <= m.cw, `scrollWidth ${m.sw} > ${m.cw}`);
+  const box = await pp2.boundingBox();
+  assert.ok(box && box.x >= 0 && box.x + box.width <= 390, "the panel fits the phone width");
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "every POST carried the session's CSRF token");
+  assert.deepEqual(await phone.evaluate(() => window.__cspViolations), []);
+  // The other panels on this page get the API's expected 404 project-not-found (no pre-flight, provisioning or batches).
+  assert.deepEqual(pp.filter((p) => !/status of 404 \(Not Found\)$/.test(p)), []);
+  await pc.close();
+});
