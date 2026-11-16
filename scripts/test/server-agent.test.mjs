@@ -614,6 +614,14 @@ test("DEVOS-82 AT13: a read-only token fails the read or write check; a token th
   assert.equal(writes().length, 0, "no write is attempted without read");
 });
 
+test("DEVOS-238: an unreachable Coolify API reads as \"not reachable\", not a six-digit HTTP code", async () => {
+  resetMock();
+  const r = await runTokenCheck({ COOLIFY_API: "http://127.0.0.1:1/cf" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /Coolify API not reachable at http:\/\/127\.0\.0\.1:1\/cf/);
+  assert.doesNotMatch(r.out, /000000/);
+});
+
 test("DEVOS-82 AT14: a read + write + deploy token passes with an idempotent no-op PATCH (same git_commit_sha)", async () => {
   resetMock(); M.appSha = "fedcba9876543210fedcba9876543210fedcba98";
   const r = await runTokenCheck();

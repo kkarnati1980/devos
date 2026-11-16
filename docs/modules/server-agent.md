@@ -85,6 +85,10 @@ Any GitHub read error (runs, statuses, PRs, trees) means **wait** for the next t
 
 AT1–AT9 and AT11–AT22 run in CI (39 tests in total, including the PR11-r1 regressions: unreadable tree, paged runs, drain after main moves, dry run with a stored refusal, deploy resume and no resubmit) (`scripts/test/server-agent.test.mjs`) against a mock GitHub API, a mock Coolify API and a local git repo standing in for the deploy-key remote.
 
+## Pass rule
+- `node --test scripts/test/server-agent.test.mjs` exits 0 on the merged SHA (the acceptance tests above, including DEVOS-82 AT13–AT16 for `coolify-token-check.sh`).
+- DEVOS-238: `coolify-token-check.sh` against a closed port exits 1 and prints "Coolify API not reachable" (the "DEVOS-238" case in `scripts/test/server-agent.test.mjs`).
+
 ## Example check
 `scripts/server/checks/dashboard-tailnet-only.sh` (v1.1.0, DEVOS-83): the dashboard completes a **verified HTTPS handshake** on its MagicDNS name (`tailscale status --json` → `Self.DNSName`), with `curl --resolve <name>:<port>:<tailnet IP>` so the probe stays on the tailnet and curl's normal certificate check applies (never `-k`). Plain HTTP or an invalid certificate fails the check. It does **not** accept TCP connections on any public IPv4 address of the host (a plain TCP connect probe, so the result does not depend on the protocol). Port from `DASHBOARD_PORT` in `/root/.devos/server-agent.conf` (default 3000). It reports skipped (exit 3) while nothing accepts a connection on the tailnet port, i.e. before the dashboard is deployed (M1.3). A skipped check is never counted as passed. **Limit:** probing the host's own public IP from the host tests the listener binding, not the cloud firewall; the firewall half of the G1 check still needs an outside probe.
 
@@ -122,3 +126,7 @@ AT1–AT9 and AT11–AT22 run in CI (39 tests in total, including the PR11-r1 re
 **Codex PR31-r1 (12 Nov 2026, 1 medium, fixed):** `scan_requests` passed each comment page, bodies included, to `jq --argjson`; a page over 128 KiB would abort every tick before re-checks ran. Pages now go through temp files, each comment body is reduced at once to a `recheck` flag, and every read or merge failure is logged and non-fatal (AT22, 39 tests).
 
 **Pre-review (11 Nov 2026, 8 findings: 1 medium, 7 low; 6 fixed):** the AT19 draft and opener filters had no test that could fail (medium, fixed: a test where only a non-draft and a foreign-opened PR exist); a stored result that can never post now gives up after about a day (480 attempts) and an unreadable one is dropped; the 6-hour clock restarts after normal checks; comments are read with `since=`; AT9's text names the re-check exception; dry run with a pending request is tested. Not changed: re-checks after a failed newer deploy use the newer installed checks (documented above), and a result comment can repeat if a POST succeeds but its response times out (the same as the per-SHA comment; a duplicate comment is harmless, and no deploy or Coolify action is ever retried).
+
+## DEVOS-238 (16 Nov 2026, runner B): `coolify-token-check.sh` v1.0.2
+
+On a connection error curl prints `%{http_code}` as `000` itself, and the old `|| echo 000` fallback appended another, so `why` reported "Coolify API answered HTTP 000000" instead of "not reachable". `req()` now keeps curl's output only when it is a three-digit HTTP code and otherwise returns `000`. The exit code was already right (1); only the message changes. Test: `server-agent.test.mjs` "DEVOS-238" runs the check against a closed port and expects "Coolify API not reachable at …" (it fails on v1.0.1).

@@ -213,6 +213,9 @@ importers:
       '@devos/db':
         specifier: workspace:*
         version: link:../db
+      '@devos/isolation':
+        specifier: workspace:*
+        version: link:../isolation
       '@types/node':
         specifier: ^22.7.0
         version: 22.20.5
