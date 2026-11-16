@@ -1,0 +1,12 @@
+{
+  "id": "SM-12",
+  "name": "Cost and rate",
+  "files": [
+    "src/cost.mjs",
+    "test/sm-12-cost.test.mjs"
+  ],
+  "checks": {
+    "SM-12-L1": "test/sm-12-cost.test.mjs"
+  },
+  "usage": "Declare every paid service once with its monthly cap: const services = paidServices([{ name: \"openai\", unit: \"usd-cents\", monthlyCap: 5000 }]) (amounts are whole numbers in the service's unit; there is no default cap, because how much may be spent is the app owner's decision). Create one meter: const meter = costMeter({ services, store: pgStore((text, params) => pool.query(text, params)) }) (pass a bound function; the paid_usage table, PAID_USAGE_SQL, in a migration, so every instance counts against the same cap; memoryStore() is for one process and tests), with timeZone set to the month the budget counts in (default UTC). Make every paid call through it: await meter.charge(\"openai\", estimate, async () => { const r = await callProvider(); return { cost: realCost, ...r }; }). The estimate is a whole number >= 1 and must be an upper bound of the real cost (e.g. max tokens × price): concurrent calls are held under the cap by their estimates, so an underestimate lets spend pass the cap by its difference. A call that would pass the cap throws CapExceededError (code cap-exceeded, status 429) before it runs, so it spends nothing; answer the user with the status and code only, never err.message (it holds the budget figures). If recording the real cost fails, the estimate stays, onError is told and the paid result is still returned. Run one concurrency test of pgStore on the app's real database. A failed call keeps its estimate (it may have been billed). Serve await meter.report() (month, and per service unit, monthlyCap, spent, remaining) to the project budget. The review (SM-12-L1) checks that no paid SDK is called outside meter.charge."
+}
