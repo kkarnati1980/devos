@@ -3,7 +3,7 @@
 // @devos/provision, @devos/isolation and S3's apply() are loaded at run time by main.ts (like @devos/db), so the API
 // typechecks without their `dist` and its typecheck/test/test:db scripts stay unchanged (floor guard, #117 ci-gate).
 // The shapes below mirror the package's exports structurally. Nothing here logs a value: only fixed codes.
-import { ProvisionSweepJob, nameConflictCard, type ProvisioningProject } from "./provision-sweep.js";
+import { ProvisionSkip, ProvisionSweepJob, nameConflictCard, type ProvisioningProject } from "./provision-sweep.js";
 
 type Step = { key: string };
 type Decision = "allow" | "deny" | "require_approval";
@@ -111,12 +111,12 @@ export function notArchived(rows: Pick<ProvisioningRows, "isArchived">, projectI
   const check = rows.isArchived.bind(rows);
   // Codex PR179-r3: a plain throw, not "deny". The runner stops before the write either way, but a deny would be a
   // non-retryable policy_denied that parks the project in the sweep, so a later Restore (or a transient read error)
-  // would leave it parked. A plain error is retryable: an archived project simply drops out of the next listing
-  // (`archivedAt: null` filter), and a restored or recovered one is provisioned again.
+  // would leave it parked. An archived project is a ProvisionSkip (PR179-r4): the sweep neither counts nor parks it, and
+  // it drops out of the next listing (`archivedAt: null`); a failed read is an ordinary retryable failure.
   return async (action, resource) => {
     let archived: boolean;
     try { archived = await check(projectId); } catch { throw new Error("provision-stage-unreadable"); }
-    if (archived) throw new Error("provision-project-archived");
+    if (archived) throw new ProvisionSkip("provision-project-archived");
     return inner(action, resource);
   };
 }

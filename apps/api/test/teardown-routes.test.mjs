@@ -327,7 +327,7 @@ test("Codex PR179-r2: a sweep run from a stale snapshot writes nothing to a prov
   const rows = { isArchived: async (id) => (await store.project(id))?.stage === "archived" };
   const asked = [];
   const authorize = notArchived(rows, P.id, async (a) => (asked.push(a), "allow"));
-  await assert.rejects(runProvision(P.id, [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P)], { store, authorize }), (e) => e.message === "provision-project-archived" && e.name !== "StepError");
+  await assert.rejects(runProvision(P.id, [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P)], { store, authorize }), (e) => e.name === "ProvisionSkip" && e.code === "provision-project-archived");
   assert.equal(fake.calls.filter((c) => c.method !== "GET").length, 0, "no provider write after Archive");
   assert.deepEqual(asked, [], "M1.7 is not even asked for an archived project");
   // Not archived: the inner authorizer decides; a failing stage read is a deny.
@@ -346,8 +346,16 @@ test("Codex PR179-r2: a sweep run from a stale snapshot writes nothing to a prov
     raiseNameConflict: async () => {},
     log: () => {},
   });
-  await job["onFailure"]({ id: P.id, slug: P.slug, name: P.name }, new Error("provision-project-archived"));
-  assert.equal(job.isParked(P.id), false, "a lifecycle skip never parks the project");
+  // Codex PR179-r4: four real failures first, then the stale run's skip: still not parked, and the count is cleared.
+  const pp = { id: P.id, slug: P.slug, name: P.name };
+  for (let i = 0; i < 4; i++) await job["onFailure"](pp, new Error("transient"));
+  assert.equal(job.isParked(P.id), false);
+  const { ProvisionSkip } = await import("../dist/provision-sweep.js");
+  await job["onFailure"](pp, new ProvisionSkip("provision-project-archived"));
+  assert.equal(job.isParked(P.id), false, "a lifecycle skip is never failure five");
+  assert.equal(job["failures"].has(P.id), false, "the skip clears the failure count");
+  await job["onFailure"](pp, new Error("transient"));
+  assert.equal(job.isParked(P.id), false, "after the skip the count starts again from zero");
   stage = "provisioning"; // Restore
   await job.tick();
   assert.deepEqual(runs, ["provisioning"], "the restored project is provisioned again on the next tick");
