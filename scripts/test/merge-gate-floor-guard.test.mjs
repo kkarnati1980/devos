@@ -8,6 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { githubClient, localGuardReport, namesChange, notKeepable, passVerdictText, release } from "../release/merge.mjs";
 import { applyDispositions, run as guardRun } from "../floor-guard/floor-guard.mjs";
+import { floorGuardDisposition } from "../ci/ci-gate.mjs";
+import { parseKkAnswers } from "../release/kk-answers.mjs";
 
 const REPO = "kkarnati1980/devos";
 const HEAD = "a".repeat(40);
@@ -298,4 +300,85 @@ test("B12 (DEVOS-181) a ci-step hit with a plain stored body is cleared by a Kee
   assert.equal(r3.code, 1);
   assert.ok(r3.reasons.some((x) => x.includes(script.id) && x.includes("escalate to KK")), r3.reasons.join("; "));
   assert.equal(merges(unknown), 0);
+});
+
+// DEVOS-239 (GI-1e): KK's recorded answer for a KK-only hit. The record shape is the gate evaluator's kkResolutions.
+const KKH = { id: "fg-9a5389ff38", rule: "ci-step-changed", file: ".github/workflows/release-images.yml", line: 0, text: "job scan: step gitleaks changed" };
+const kkRec = (over = {}) => ({ hit: KKH.id, file: KKH.file, line: KKH.line, sha: HEAD, decision: "keep", link: "https://linear.app/kishoremb/issue/DEVOS-200#comment-1", ...over });
+
+test("B13 (DEVOS-239) a KK-only hit merges with exactly one KK keep for that occurrence and SHA; any other answer refuses", async () => {
+  assert.equal(notKeepable(KKH), true);
+  const ok = redGuard({ comments: [passComment()] });
+  const r = await release(ok.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [KKH] }), kkAnswers: [kkRec()] });
+  assert.equal(r.code, 0, r.reasons.join("; "));
+  assert.equal(r.disposed, true);
+  assert.equal(merges(ok), 1);
+  // The same answer as KK writes it (line 0, as every ci-step hit), through the parser.
+  const parsed = parseKkAnswers([{ body: `Keep it.\nFLOOR-GUARD KK KEEP ${KKH.id} ${KKH.file}:${KKH.line} ${HEAD}`, link: "https://linear.app/kishoremb/issue/DEVOS-200#comment-2" }]).records;
+  const viaText = redGuard({ comments: [passComment()] });
+  const rp = await release(viaText.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [KKH] }), kkAnswers: parsed });
+  assert.equal(rp.code, 0, rp.reasons.join("; "));
+  assert.equal(merges(viaText), 1);
+  const refused = [
+    [[], /no KK answer/],
+    [[kkRec({ sha: OTHER })], /no KK answer/],
+    [[kkRec({ line: 1 })], /no KK answer/],
+    [[kkRec({ file: ".github/workflows/ci.yml" })], /no KK answer/],
+    [[kkRec({ hit: "fg-0000000000" })], /no KK answer/],
+    [[kkRec({ decision: "restore" })], /answer is restore, not keep/],
+    [[kkRec({ decision: "escalated" })], /answer is escalated, not keep/],
+    [[kkRec(), kkRec({ decision: "restore" })], /2 answers .*keep, restore.*exactly one keep/],
+    [[kkRec(), kkRec()], /2 answers .*exactly one keep/],
+    [[kkRec({ link: "http://x" })], /no link/],
+    [[kkRec({ link: undefined })], /no link/],
+  ];
+  for (const [answers, re] of refused) {
+    const f = redGuard({ comments: [passComment()] });
+    const v = await release(f.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [KKH] }), kkAnswers: answers });
+    assert.equal(v.code, 1, JSON.stringify(answers));
+    assert.ok(v.reasons.some((x) => x.includes(KKH.id) && re.test(x) && x.includes("escalate to KK")), `${re}: ${v.reasons.join("; ")}`);
+    assert.equal(merges(f), 0);
+  }
+  // A Codex Keep for a KK-only hit is still void, with or without a KK record for another SHA.
+  const codex = redGuard({ comments: [passComment(keeps([KKH]))] });
+  const c = await release(codex.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [KKH] }), kkAnswers: [kkRec({ sha: OTHER })] });
+  assert.equal(c.code, 1);
+  assert.equal(merges(codex), 0);
+});
+
+test("B14 (DEVOS-239) KK answers never stand in for other gate conditions: a mixed report needs a Codex Keep for each ordinary hit, a KK restore overrides one, and no PASS still refuses", async () => {
+  const [ordinary] = HITS;
+  const both = redGuard({ comments: [passComment(keeps([ordinary]))] });
+  const r1 = await release(both.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [ordinary, KKH] }), kkAnswers: [kkRec()] });
+  assert.equal(r1.code, 0, r1.reasons.join("; "));
+  assert.equal(merges(both), 1);
+  const noCodex = redGuard({ comments: [passComment()] });
+  const r2 = await release(noCodex.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [ordinary, KKH] }), kkAnswers: [kkRec()] });
+  assert.equal(r2.code, 1);
+  assert.ok(r2.reasons.some((x) => x.includes(ordinary.id) && x.includes("has no \"FLOOR-GUARD KEEP")), r2.reasons.join("; "));
+  // A KK keep does not clear an ordinary hit (only Codex does, as in the gate evaluator); a KK restore voids a Codex Keep.
+  const kkOnly = redGuard({ comments: [passComment()] });
+  const r3 = await release(kkOnly.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [ordinary] }), kkAnswers: [kkRec({ hit: ordinary.id, file: ordinary.file, line: ordinary.line })] });
+  assert.equal(r3.code, 1);
+  const restore = redGuard({ comments: [passComment(keeps([ordinary]))] });
+  const r4 = await release(restore.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [ordinary] }), kkAnswers: [kkRec({ hit: ordinary.id, file: ordinary.file, line: ordinary.line, decision: "restore" })] });
+  assert.equal(r4.code, 1);
+  assert.ok(r4.reasons.some((x) => x.includes(ordinary.id) && x.includes("overrides a Codex Keep")), r4.reasons.join("; "));
+  // No Codex PASS comment at all: a KK keep alone never merges (the PASS is still required, D1).
+  const noPass = redGuard({ comments: [] });
+  const r5 = await release(noPass.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [KKH] }), kkAnswers: [kkRec()] });
+  assert.equal(r5.code, 1);
+  assert.equal(merges(noPass), 0);
+});
+
+test("B15 (DEVOS-239) ci-gate judges KK answers with the same rule: one keep for this SHA passes, another SHA or none fails", async () => {
+  const v = { state: "failure", pending: [], failed: ["floor-guard=failure"] };
+  const run = async (kkAnswers) => {
+    const f = redGuard({ comments: [passComment()] });
+    return floorGuardDisposition(v, { gh: f.gh, repo: REPO, pr: 7, sha: HEAD, baseSha: MAIN, guardReport: stubGuard({ hits: [KKH] }), kkAnswers });
+  };
+  assert.equal((await run([kkRec()])).disposed, true);
+  assert.equal((await run([kkRec({ sha: OTHER })])).disposed, false);
+  assert.equal((await run([])).disposed, false);
+  assert.equal((await run(undefined)).disposed, false);
 });
