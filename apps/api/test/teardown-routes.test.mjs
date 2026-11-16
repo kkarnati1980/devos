@@ -314,3 +314,24 @@ test("pre-review 4: production wiring is off with a code; the reader bounds ever
   assert.equal(await auth("teardown.restore", `project:${P.id}`), "require_approval");
   assert.deepEqual(d, { identity: { id: "kk:a@b", type: "kk" }, action: { type: "teardown.restore", resource: `project:${P.id}`, projectId: P.id } });
 });
+
+test("Codex PR179-r2: a sweep run from a stale snapshot writes nothing to a provider once the project is archived", async () => {
+  const { notArchived } = await import("../dist/provision-runtime.js");
+  const fake = fakes();
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: async () => {} });
+  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl: fake.fetchImpl, sleep: async () => {} });
+  const store = new MemoryTeardownStore();
+  store.addProject({ id: P.id, slug: P.slug, stage: "provisioning" });
+  // The sweep listed the project while it was provisioning; KK's Archive then ran under the lock and set archived.
+  await store.withProjectLock(P.id, async () => { await store.markArchived(P.id, new Date(), new Date(Date.now() + DAY)); });
+  const rows = { isArchived: async (id) => (await store.project(id))?.stage === "archived" };
+  const asked = [];
+  const authorize = notArchived(rows, P.id, async (a) => (asked.push(a), "allow"));
+  await assert.rejects(runProvision(P.id, [githubRepoStep(gh, P, "kkarnati1980"), coolifyProjectStep(cf, P)], { store, authorize }), (e) => /policy_denied|denied/.test(String(e.code ?? e.message)));
+  assert.equal(fake.calls.filter((c) => c.method !== "GET").length, 0, "no provider write after Archive");
+  assert.deepEqual(asked, [], "M1.7 is not even asked for an archived project");
+  // Not archived: the inner authorizer decides; a failing stage read is a deny.
+  assert.equal(await notArchived({ isArchived: async () => false }, P.id, async () => "allow")("x", "y"), "allow");
+  assert.equal(await notArchived({ isArchived: async () => { throw new Error("db"); } }, P.id, async () => "allow")("x", "y"), "deny");
+  assert.equal(await notArchived({}, P.id, async () => "require_approval")("x", "y"), "require_approval");
+});
