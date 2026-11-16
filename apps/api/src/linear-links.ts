@@ -6,6 +6,7 @@
 // session check like every other route (GET never writes).
 import { Controller, Get, Inject, Param } from "@nestjs/common";
 import { httpError } from "./auth.js";
+import { linearKeyReader } from "./linear-sync-runtime.js";
 
 export const LINEAR_LINKS = Symbol("devos:linear-links");
 const SLUG = /^[a-z0-9-]{2,40}$/;
@@ -106,6 +107,8 @@ export function buildLinearLinks(w: {
   db: unknown;
   vault: { reveal(name: string): Promise<string | null> } | null;
   env: NodeJS.ProcessEnv;
+  /** The shared client (`sharedLinearClient`); absent → the service builds its own. */
+  client?: unknown;
 }): LinearLinksService | { off: string } {
   if (w.env.DEVOS_LINEAR_SYNC !== "on") return { off: TEAM_OFF };
   if (!w.db) return { off: "linear-sync-no-database" };
@@ -116,13 +119,7 @@ export function buildLinearLinks(w: {
   const db = w.db as Db;
   let client: unknown;
   try {
-    client = new mod.LinearClient({
-      apiKey: async () => {
-        const key = await vault.reveal("linear_api_key");
-        if (!key) throw new Error("linear-key-not-set");
-        return key;
-      },
-    });
+    client = w.client ?? new mod.LinearClient({ apiKey: linearKeyReader(vault) });
   } catch {
     return { off: "linear-sync-not-loaded" };
   }

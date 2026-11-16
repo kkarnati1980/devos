@@ -33,7 +33,7 @@ import type { TeardownServices } from "./teardown-routes.js";
 import { buildTeardownServices, buildTeardownSweep, type TeardownRuntimeModule, type TeardownSweepCards } from "./teardown-runtime.js";
 import type { TeardownSweepJob } from "./teardown-sweep.js";
 import { buildLinearLinks, type LinearLinksModule, type LinearLinksService } from "./linear-links.js";
-import { buildLinearSync, buildLinearTeardown, type LinearSyncJob, type LinearSyncModule, type LinearTeardownModule } from "./linear-sync-runtime.js";
+import { buildLinearSync, buildLinearTeardown, sharedLinearClient, type LinearSyncJob, type LinearSyncModule, type LinearTeardownModule } from "./linear-sync-runtime.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -277,8 +277,10 @@ export async function buildRuntime(
   if ("off" in sweep) log({ level: "warn", msg: "provision-sweep-off", code: sweep.off });
   // DEVOS-163/247 (M2.6-b2b): @devos/linear-sync, used by the sync job and by every teardown (AT7).
   const lsMod = opts.loadLinearSync ? await opts.loadLinearSync().catch(() => null) : null;
+  // DEVOS-97 follow-up: one LinearClient for the sync, the teardown parts and the links, so a rate-limit pause is shared.
+  const linearClient = sharedLinearClient({ mod: lsMod as { LinearClient?: unknown } | null, vault, env }) ?? undefined;
   const pe = (loaded?.mod as { ProviderError?: unknown } | undefined)?.ProviderError;
-  const lt = buildLinearTeardown({ mod: lsMod as Partial<LinearTeardownModule> | null, db, vault, env,
+  const lt = buildLinearTeardown({ mod: lsMod as Partial<LinearTeardownModule> | null, db, vault, env, client: linearClient,
     providerError: typeof pe === "function" ? (p, c, m, st) => new (pe as new (...a: unknown[]) => Error)(p, c, m, st) : null });
   if ("off" in lt && lt.off !== "linear-sync-disabled") log({ level: "warn", msg: "linear-teardown-off", code: lt.off });
   const linearTeardown = typeof lt === "function" ? lt : null;
@@ -299,11 +301,11 @@ export async function buildRuntime(
   // DEVOS-246 (M2.5-b3): the panel's purge card link and KK's early ask go through the same job's card rules.
   const teardownRoutes: TeardownServices = { ...teardown, purge: teardownSweep };
   // DEVOS-163 (M2.6-b2b1): the 10-minute Linear sync over active projects; off unless DEVOS_LINEAR_SYNC=on.
-  const ls = buildLinearSync({ mod: lsMod, db, vault, env, log });
+  const ls = buildLinearSync({ mod: lsMod, db, vault, env, log, client: linearClient });
   if ("off" in ls) log({ level: ls.off === "linear-sync-disabled" ? "info" : "warn", msg: "linear-sync-off", code: ls.off });
   const linearSync = "off" in ls ? null : ls;
   // DEVOS-248 (M2.6-b2b3): the project page's "Open in Linear" links, read from Linear by stored id; on with the sync.
-  const ll = buildLinearLinks({ mod: lsMod as Partial<LinearLinksModule> | null, db, vault, env });
+  const ll = buildLinearLinks({ mod: lsMod as Partial<LinearLinksModule> | null, db, vault, env, client: linearClient });
   if ("off" in ll && ll.off !== "linear-sync-disabled") log({ level: "warn", msg: "linear-links-off", code: ll.off });
   const linearLinks = "off" in ll ? null : ll;
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
