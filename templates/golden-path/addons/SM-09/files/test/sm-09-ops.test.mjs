@@ -87,6 +87,15 @@ test("SM-09-L2: logs are JSON with a request or job ID, and secrets and personal
     stripe: FAKE_STRIPE, time: "1999-01-01T00:00:00Z" });
   const [a, b, c] = out.lines;
   assert.equal(c.url, "redis://:[redacted]@cache:6379");
+  // Codex PR152-r1: a URL password is masked whole even when its host looks like an e-mail domain.
+  for (const [inp, want] of [
+    ["postgres://app:super!secret@db.example.com/app", "postgres://app:[redacted]@db.example.com/app"],
+    ["connect failed: postgres://app:pw2@db.example.org:5432/x", "connect failed: postgres://app:[redacted]@db.example.org:5432/x"],
+  ]) {
+    const got = redact(inp);
+    assert.equal(got, want);
+    assert.doesNotMatch(got, /super|secret|pw2/);
+  }
   assert.deepEqual(c.counts, { "[redacted-email]": 3 });
   assert.equal(c.username, "[redacted]");
   assert.equal(c.raw, "[binary 7 bytes]");

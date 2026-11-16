@@ -67,11 +67,13 @@ export const dependencyReady = (name, url, { timeoutMs = 2000, allowHosts = [], 
 const SECRET_KEY = /pass(word|phrase)?|secret|token|auth|cookie|session|api[-_]?key|private|credential|signature|otp|pin$/i;
 const PERSONAL_KEY = /e-?mail|phone|mobile|address|^name$|full[-_]?name|first[-_]?name|last[-_]?name|user[-_]?name|display[-_]?name|^login$|birth|dob|ssn|aadhaar|pan$|ip$|ip[-_]?addr/i;
 const VALUE_PATTERNS = [
+  // URL credentials first (Codex PR152-r1): the e-mail pattern would otherwise eat "secret@host" and leave the rest
+  // of the password ("super!") with no "@" for this pattern to anchor on.
+  [/(\/\/[^/\s:@]{0,256}:)[^@\s/]{1,256}@/g, "$1[redacted]@"], // also redis://:password@host
   [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]"],
   [/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}/g, "[redacted-jwt]"],
   [/[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}/g, "[redacted-email]"],
   [/\b(gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|[sr]k_(live|test)_[A-Za-z0-9]{10,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b/g, "[redacted-key]"],
-  [/(\/\/[^/\s:@]{0,256}:)[^@\s/]{1,256}@/g, "$1[redacted]@"], // also redis://:password@host
 ];
 const KEEP = new Set(["requestId", "jobId", "level", "time", "msg", "method", "path", "status", "ms", "code", "type", "attempt"]);
 
