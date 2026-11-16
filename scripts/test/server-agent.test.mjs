@@ -1124,6 +1124,7 @@ function runProbeCheck(f, { finishBy = "20", dsleep = "0" } = {}) {
     encoding: "utf8",
   });
   const args = fs.existsSync(path.join(f.bin, "docker.args")) ? fs.readFileSync(path.join(f.bin, "docker.args"), "utf8") : "";
+  fs.rmSync(path.join(f.bin, "docker.args"), { force: true }); // each run's calls only
   const steps = Number(fs.existsSync(path.join(f.bin, "n")) ? fs.readFileSync(path.join(f.bin, "n"), "utf8") : 0);
   return { code: r.status, out: r.stdout + r.stderr, args, steps };
 }
@@ -1167,17 +1168,41 @@ test("DEVOS-234 d3c-3 provision-probe: between cycles it reports the newest fini
 });
 
 test("DEVOS-234 d3c-3 provision-probe: a step longer than the time box is left running and picked up by the next run", () => {
-  const f = probeFakes({ steps: [`0|3|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
-  const first = runProbeCheck(f, { finishBy: "1" });
+  const f = probeFakes({ steps: [`0|5|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const first = runProbeCheck(f, { finishBy: "2" });
   assert.equal(first.code, 3, first.out);
   assert.match(first.out, /still in progress/);
-  // a second run while it still runs starts nothing new; once it ends, its result is read exactly once
-  spawnSync("sleep", ["3.5"]);
-  const second = runProbeCheck(f);
-  assert.equal(second.code, 0, second.out);
-  assert.equal(second.steps, 1, "the step was run once in all");
+  assert.equal((first.args.match(/^exec -d /gm) ?? []).length, 1, "the first run started the step");
+  // a second run while the step still runs starts nothing new and leaves it running
+  const during = runProbeCheck(f, { finishBy: "1" });
+  assert.equal(during.code, 3, during.out);
+  assert.doesNotMatch(during.args, /^exec -d /m, "nothing started while the step runs");
+  // once it ends, the next run reads its result exactly once
+  const after = runProbeCheck(f);
+  assert.equal(after.code, 0, after.out);
+  assert.equal(after.steps, 1, "the step was run once in all");
   assert.ok(fs.existsSync(path.join(f.state, "rc.last")) && !fs.existsSync(path.join(f.state, "rc")));
   fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+test("DEVOS-234 d3c-3 provision-probe: a step that does not move the phase waits for the next run; a hung step fails", () => {
+  const f = probeFakes({ steps: [inProg("purge"), inProg("purge"), inProg("purge")] });
+  const r = runProbeCheck(f);
+  assert.equal(r.code, 3, r.out);
+  assert.equal(r.steps, 2, "stops after the second step left the phase where it was");
+  assert.match(r.out, /phase purge is still in progress/);
+  fs.rmSync(f.bin, { recursive: true, force: true });
+  const h = probeFakes({ steps: [`0|30|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const first = runProbeCheck(h, { finishBy: "1" });
+  assert.equal(first.code, 3, first.out);
+  const pidAge = path.join(h.state, "pid");
+  const old = new Date(Date.now() - 3 * 3600 * 1000);
+  fs.utimesSync(pidAge, old, old);
+  const hung = runProbeCheck(h, { finishBy: "1" });
+  assert.equal(hung.code, 1, hung.out);
+  assert.match(hung.out, /hung/);
+  spawnSync("bash", ["-c", `kill $(cat "${pidAge}") 2>/dev/null; pkill -f "${h.bin}" 2>/dev/null; true`]);
+  fs.rmSync(h.bin, { recursive: true, force: true });
 });
 
 test("DEVOS-234 d3c-3 provision-probe: a detached start that is slow to run is never started twice", () => {

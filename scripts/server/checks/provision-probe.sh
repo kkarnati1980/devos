@@ -26,11 +26,12 @@ field() { printf '%s' "$1" | sed -n "s/.*\"$2\":\\(\"[^\"]*\"\\|[0-9.]*\\|true\\
 # or "idle" (no step, or one whose process is gone without an exit code, e.g. after a container restart).
 POLL_SH="if [ -f $D/rc ]; then printf 'done %s\n' \"\$(head -c 4 $D/rc)\"; grep -m1 '^{' $D/out 2>/dev/null | head -c 2000; echo;"\
 " mv -f $D/rc $D/rc.last; mv -f $D/out $D/out.last 2>/dev/null; "\
-"elif [ -f $D/pid ] && kill -0 \"\$(cat $D/pid)\" 2>/dev/null; then echo running; else echo idle; fi"
+"elif [ -f $D/pid ] && kill -0 \"\$(cat $D/pid)\" 2>/dev/null; then echo \"running \$(( \$(date +%s) - \$(stat -c %Y $D/pid) ))\"; else echo idle; fi"
 # start -> one `step` in the background; its exit code is written only after it ends.
 # The shell writes its own pid first and stays alive until the step ends, so "running" holds for the whole step.
 START_SH="mkdir -p $D && rm -f $D/rc $D/out && echo \$\$ > $D/pid && { $CLI step > $D/out 2>/dev/null; echo \$? > $D/rc.tmp; mv -f $D/rc.tmp $D/rc; }"
 START_GRACE="${PROBE_START_GRACE_SECONDS:-10}" # a step just started may not have written its pid yet
+HUNG_AFTER="${PROBE_HUNG_SECONDS:-7200}"       # PROBE_PHASE_MAX_MS: a step still running after this is a failure
 
 # report -> the newest finished cycle's JSON line, then `rc=<exit>` of the read-only `report` command.
 REPORT_SH="o=\$($CLI report 2>/dev/null); r=\$?; printf '%s\\n' \"\$o\" | grep -m1 '^{' | head -c 2000; echo; echo rc=\$r"
@@ -48,13 +49,13 @@ finish() { # step rc, step JSON line -> exit of this check
   fi
   case "$rc" in
     0) echo "probe cycle passed"; exit 0;;
-    1) echo "probe cycle failed (code ${code:-unknown})"; exit 1;;
+    1) if [[ -n "$code" ]]; then echo "probe cycle failed (code $code)"; else echo "probe step failed (error $(field "$line" error))"; fi; exit 1;;
     3) echo "skipped: ${code:-unknown}"; exit 3;;
     *) echo "probe CLI exit ${rc:-none}"; exit 1;;
   esac
 }
 
-started=0 pend=""
+started=0 pend="" lastphase=""
 while (( SECONDS < FINISH_BY )); do
   p="$(ex "$POLL_SH")" || { echo "cannot read the probe state in the API container"; exit 1; }
   case "$p" in
@@ -65,11 +66,20 @@ while (( SECONDS < FINISH_BY )); do
       # One phase advanced and the cycle is still running: take the next step while the time box allows.
       if [[ "$rc" == 3 && "$(field "$line" code)" == in_progress ]]; then
         (( SECONDS < FINISH_BY )) || break
+        # Pre-review 1: a step that did not move the phase (a provider retry) waits for the next check run, so a
+        # retryable stop is not hammered every few seconds.
+        phase="$(field "$line" phase)"
+        if [[ -n "$lastphase" && "$phase" == "$lastphase" ]]; then echo "skipped: phase $phase is still in progress; the next check run retries"; exit 3; fi
+        lastphase="$phase"
         timeout "$EXEC_S" docker exec -d "$ID" sh -c "$START_SH" >/dev/null 2>&1 || { echo "cannot start a probe step"; exit 1; }
         started=$((started + 1)); pend=$SECONDS; sleep "$POLL"; continue
       fi
       finish "$rc" "$line";;
-    running) pend=""; sleep "$POLL";;
+    running\ *)
+      pend=""; age="${p#running }"
+      # Pre-review 2: a step that never ends would otherwise read as "in progress" for ever.
+      if [[ "$age" =~ ^[0-9]+$ ]] && (( age > HUNG_AFTER )); then echo "a probe step has been running for ${age}s (over ${HUNG_AFTER}s): hung"; exit 1; fi
+      sleep "$POLL";;
     idle)
       # `docker exec -d` returns before the step's shell runs: never start a second step inside the grace window.
       if [[ -n "$pend" ]] && (( SECONDS - pend < START_GRACE )); then sleep "$POLL"; continue; fi
