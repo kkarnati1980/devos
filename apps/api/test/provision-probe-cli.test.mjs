@@ -71,3 +71,60 @@ test("d3c: the inventory joins done steps to active resources; a lost row stays 
   ]);
   assert.deepEqual(seen, [{ projectId: "proj-1", status: "done" }, { projectId: "proj-1", status: "active" }]);
 });
+
+import { probeCli, errorCode } from "../dist/provision-probe-cli.js";
+
+const rec = (over = {}) => ({ cycle: 2, phase: "inventory1", at: "2026-11-16T00:00:00.000Z", fingerprint: "fp", ...over });
+const logOf = (last) => ({ log: async () => ({ last: async () => last }), step: async () => { throw new Error("step deps must not be built"); } });
+
+test("d3c-1: usage errors exit 2 and build nothing", async () => {
+  for (const argv of [[], ["nope"], ["step", "extra"]]) {
+    const r = await probeCli(argv, { log: async () => { throw new Error("built"); }, step: async () => { throw new Error("built"); } });
+    assert.equal(r.code, 2);
+    assert.equal(r.out.error, "usage");
+  }
+});
+
+test("d3c-1: status is read-only and shows the newest phase, or idle", async () => {
+  assert.deepEqual(await probeCli(["status"], logOf(null)), { code: 0, out: { command: "status", phase: "idle", cycle: 0 } });
+  const r = await probeCli(["status"], logOf(rec()));
+  assert.deepEqual(r, { code: 0, out: { command: "status", cycle: 2, phase: "inventory1", at: "2026-11-16T00:00:00.000Z" } });
+  assert.ok(!("fingerprint" in r.out));
+});
+
+test("d3c-1: report is 3 with no cycle or a running one, 0 or 1 with the finished cycle's code", async () => {
+  assert.equal((await probeCli(["report"], logOf(null))).out.code, "no-cycle");
+  assert.equal((await probeCli(["report"], logOf(null))).code, 3);
+  const running = await probeCli(["report"], logOf(rec({ phase: "purge", result: { ok: false, code: "inventory-differs" } })));
+  assert.equal(running.code, 3);
+  assert.equal(running.out.code, "in_progress");
+  const ok = await probeCli(["report"], logOf(rec({ phase: "done", result: { ok: true, code: "pass" } })));
+  assert.deepEqual([ok.code, ok.out.code], [0, "pass"]);
+  const bad = await probeCli(["report"], logOf(rec({ phase: "done", result: { ok: false, code: "purge-permission", detail: "github_repo", cause: "x" } })));
+  assert.deepEqual([bad.code, bad.out.code, bad.out.result.detail], [1, "purge-permission", "github_repo"]);
+  assert.ok(!JSON.stringify(bad.out).includes("cause"), "the stored cause stays in the DB row");
+});
+
+test("d3c-1: step runs one probeStep with the built deps and returns its exit", async () => {
+  const records = [];
+  const deps = {
+    offReason: async () => null, last: async () => records.at(-1) ?? null, record: async (r) => { records.push(r); },
+    provisionOnce: async () => "done", inventory: async () => [], liveAsserts: async () => [], purge: async () => "done",
+    fingerprint: "fp", now: () => new Date("2026-11-16T00:00:00Z"),
+  };
+  const r = await probeCli(["step"], { log: async () => { throw new Error("not needed"); }, step: async () => deps });
+  assert.deepEqual([r.code, r.out.phase, r.out.code], [3, "run1", "in_progress"]);
+  assert.equal(records.length, 1);
+  const off = await probeCli(["step"], { log: async () => ({}), step: async () => ({ ...deps, offReason: async () => "provision-sweep-off" }) });
+  assert.deepEqual([off.code, off.out.code, off.out.detail], [3, "skipped", "provision-sweep-off"]);
+});
+
+test("d3c-1: a thrown error becomes exit 1 with a fixed code; provider or DB text is never printed", async () => {
+  const boom = (m) => ({ log: async () => ({ last: async () => { throw new Error(m); } }), step: async () => { throw new Error(m); } });
+  const a = await probeCli(["status"], boom("probe-phase-unreadable"));
+  assert.deepEqual(a, { code: 1, out: { command: "status", error: "probe-phase-unreadable" } });
+  const b = await probeCli(["step"], boom("connect ECONNREFUSED postgres://user:pw@db/devos"));
+  assert.deepEqual(b, { code: 1, out: { command: "step", error: "probe-error" } });
+  assert.equal(errorCode(new Error("probe-slug-taken")), "probe-slug-taken");
+  assert.equal(errorCode("probe-x"), "probe-error");
+});
