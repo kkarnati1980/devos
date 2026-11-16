@@ -59,7 +59,7 @@ test("AT2/AT3: hardening adds no-new-privileges, cap_drop ALL and only the proje
   assert.deepEqual(s.cap_add, ["NET_BIND_SERVICE"]);
   assert.deepEqual(s.security_opt, ["no-new-privileges:true"]);
   assert.deepEqual(s.networks, ["devos-p-shop-live"]);
-  assert.deepEqual(out.networks, { "devos-p-shop-live": { name: "devos-p-shop-live", driver: "bridge", enable_ipv6: false, ipam: { config: [{ subnet: "10.208.3.0/24", gateway: "10.208.3.1" }] } } });
+  assert.deepEqual(out.networks, { "devos-p-shop-live": { name: "devos-p-shop-live", driver: "bridge", enable_ipv6: false, driver_opts: { "com.docker.network.bridge.name": "devos-p3" }, ipam: { config: [{ subnet: "10.208.3.0/24", gateway: "10.208.3.1" }] } } });
 });
 
 test("AT3: unsafe Compose options are refused with compose_unsafe", () => {
@@ -294,4 +294,15 @@ test("S4-a1 PR69-r1: a service without limits gets its default clamped to the pe
       assert.ok(svc.mem_limit > 0 && svc.mem_limit <= caps.memBytes, `${env} memory ${svc.mem_limit}`);
     }
   }
+});
+
+test("S4-b2c: the bridge name is devos-p<idx>, fits the kernel's 15 characters, and a project cannot set its own", () => {
+  const top = stackNetwork("shop", "live", 1023);
+  const out = hardenCompose({ services: { app: { image: "a" } },
+    networks: { evil: { driver_opts: { "com.docker.network.bridge.name": "docker0" } } } }, "live", top);
+  assert.deepEqual(Object.keys(out.networks), ["devos-p-shop-live"]);
+  const name = out.networks["devos-p-shop-live"].driver_opts["com.docker.network.bridge.name"];
+  assert.equal(name, "devos-p1023");
+  assert.ok(name.length <= 15);
+  assert.match(name, /^devos-p[0-9]{1,4}$/);
 });

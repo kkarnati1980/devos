@@ -55,6 +55,10 @@ if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sl
   // curl: logs argv (to prove the token is not on it) and prints FAKE_STATE; FAKE_CURL_RC fails the fetch.
   w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ -z "\${FAKE_CURL_SLEEP:-}" ]] || sleep "$FAKE_CURL_SLEEP"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
   w("tailscale", `exit 1`);
+  // ip6tables / ip6tables-restore (S4-b2c): the same fakes over $FAKE_NF/v6 and $FAKE_LOG/v6, so the IPv4
+  // restore count and logs are not mixed with IPv6. FAKE_V6_RC fails every ip6tables call; FAKE_V6_RESTORE_RC the restore.
+  w("ip6tables", `[[ "\${FAKE_V6_RC:-0}" == 0 ]] || exit "$FAKE_V6_RC"; FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_IPT_S_SLEEP= exec "\${0%/*}/iptables" "$@"`);
+  w("ip6tables-restore", `FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_RESTORE_RC="\${FAKE_V6_RESTORE_RC:-0}" FAKE_KILL_PID= exec "\${0%/*}/iptables-restore" "$@"`);
   // conntrack (S4-b2d): logs argv; FAKE_CT_RC fails it with another message; with no match the real one exits 1.
   w("conntrack", `echo "$*" >> "$FAKE_LOG/conntrack.log"; [[ "\${FAKE_CT_RC:-0}" == 0 ]] || { echo "conntrack v1.4.7 (conntrack-tools): Operation failed: injected" >&2; exit "$FAKE_CT_RC"; }
 [[ -n "\${FAKE_CT_NOMATCH:-}" ]] && { echo "conntrack v1.4.7 (conntrack-tools): 0 flow entries have been deleted." >&2; exit 1; }
@@ -86,15 +90,33 @@ const M01 = `# BEGIN DEVOS UFW AND DOCKER (M0.1 v1.3.1) - default-deny
 COMMIT
 # END DEVOS UFW AND DOCKER
 `;
+// after6.rules as M0.1 v1.3.1 leaves it (S4-b2c).
+const UFW_HEAD6 = "# rules.input-after\n*filter\n:ufw6-after-input - [0:0]\nCOMMIT\n";
+const M01_6 = `# BEGIN DEVOS UFW AND DOCKER (M0.1 v1.3.1, IPv6) - same policy; containers use ULA fd00::/8.
+*filter
+:ufw6-user-forward - [0:0]
+:ufw6-docker-logging-deny - [0:0]
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -j ufw6-user-forward
+-A DOCKER-USER -j ufw6-docker-logging-deny
+COMMIT
+# END DEVOS UFW AND DOCKER
+`;
+// Both ufw paths, so no test ever falls back to the real /etc/ufw files.
+const AFTER_CONF = (h) => `ISOLATION_UFW_AFTER_RULES=${path.join(h, "after.rules")}\nISOLATION_UFW_AFTER6_RULES=${path.join(h, "after6.rules")}\n`;
 const afterRules = (h) => fs.readFileSync(path.join(h, "after.rules"), "utf8");
 const bootBlock = (h) => { const m = afterRules(h).match(/# BEGIN DEVOS S4 ISOLATION[^\n]*\n([\s\S]*?)# END DEVOS S4 ISOLATION\n/); return m && m[1]; };
 
 function host(state, { conf = "", token = "t0ken-" + "a".repeat(30) } = {}) {
   const h = fs.mkdtempSync(path.join(tmp, "h-"));
-  for (const d of ["devos/secrets", "nf", "log"]) fs.mkdirSync(path.join(h, d), { recursive: true });
+  for (const d of ["devos/secrets", "nf/v6", "log/v6"]) fs.mkdirSync(path.join(h, d), { recursive: true });
   if (token !== null) fs.writeFileSync(path.join(h, "devos/secrets/isolation_state_token"), token + "\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=127.0.0.1:${upPort}\n${conf}ISOLATION_UFW_AFTER_RULES=${path.join(h, "after.rules")}\n`);
+  fs.writeFileSync(path.join(h, "devos/server-agent.conf"), `ISOLATION_SELFTEST_TARGETS=127.0.0.1:${upPort}\n${conf}${AFTER_CONF(h)}`);
   fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD + M01, { mode: 0o640 });
+  fs.writeFileSync(path.join(h, "after6.rules"), UFW_HEAD6 + M01_6, { mode: 0o640 });
+  fs.writeFileSync(path.join(h, "nf/v6/DOCKER-USER"), "-A DOCKER-USER -j ufw6-user-forward\n-A DOCKER-USER -j ufw6-docker-logging-deny\n");
+  fs.writeFileSync(path.join(h, "nf/v6/INPUT"), "-A INPUT -j ufw6-before-logging-input\n");
+  fs.writeFileSync(path.join(h, "nf/v6/FORWARD"), "-A FORWARD -j ufw6-before-logging-forward\n");
   fs.writeFileSync(path.join(h, "nf/DOCKER-USER"), "-A DOCKER-USER -j ufw-user-forward\n-A DOCKER-USER -j ufw-docker-logging-deny\n");
   fs.writeFileSync(path.join(h, "nf/INPUT"), "-A INPUT -j ufw-before-logging-input\n");
   fs.writeFileSync(path.join(h, "nf/FORWARD"), "-A FORWARD -j ts-forward\n-A FORWARD -j DOCKER-USER\n");
@@ -267,7 +289,7 @@ async function listener() {  // a self-test target in its own process, so the fa
 }
 // Keeps the after.rules line, so no test ever falls back to the real /etc/ufw/after.rules.
 const targets = (h, ...ports) => fs.writeFileSync(path.join(h, "devos/server-agent.conf"),
-  `ISOLATION_SELFTEST_TARGETS=${ports.map((p) => "127.0.0.1:" + p).join(" ")}\nISOLATION_UFW_AFTER_RULES=${path.join(h, "after.rules")}\n`);
+  `ISOLATION_SELFTEST_TARGETS=${ports.map((p) => "127.0.0.1:" + p).join(" ")}\n${AFTER_CONF(h)}`);
 
 test("AT8 self-test that passed before and fails after rolls back to the previous block", async () => {
   const h = host(STATE);
@@ -740,4 +762,119 @@ test("S4-b2d (pre-review r2): a pending entry with an octet above 255 is dropped
   fs.writeFileSync(pending(h), "10.208.999.0/24\n");
   assert.equal(run(h).code, 0);
   assert.equal(ctLog(h).length, 1, "only the first apply's pool cut");
+});
+
+// --- S4-b2c: the IPv6 defence-in-depth drop ---------------------------------------------------------------
+const nf6 = (h, c) => nf(h, `v6/${c}`);
+const restores6 = (h) => fs.readdirSync(path.join(h, "log/v6")).filter((f) => f.startsWith("restore.")).length;
+const after6 = (h) => fs.readFileSync(path.join(h, "after6.rules"), "utf8");
+const RULE6 = "-A DEVOS-ISO6 -i devos-p+ -j DROP\n";
+const firstRule = (h, c) => nf6(h, c).split("\n")[0];
+
+test("S4-b2c: an apply run installs the IPv6 drop with every jump first, once, and persists it in after6.rules", () => {
+  const h = host(STATE);
+  const r = run(h);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(nf6(h, "DEVOS-ISO6"), RULE6);
+  for (const c of ["DOCKER-USER", "FORWARD", "INPUT"]) {
+    assert.equal(firstRule(h, c), `-A ${c} -j DEVOS-ISO6`, c);
+    assert.equal(nf6(h, c).split("\n").filter((l) => l === `-A ${c} -j DEVOS-ISO6`).length, 1, c);
+  }
+  const t = after6(h);
+  assert.ok(t.startsWith(UFW_HEAD6 + M01_6), "M0.1's IPv6 block kept, ours after it");
+  assert.match(t, /# BEGIN DEVOS S4 ISOLATION6[^\n]*\n\*filter\n:DEVOS-ISO6 - \[0:0\]\n-A DEVOS-ISO6 -i devos-p\+ -j DROP\n-I DOCKER-USER 1 -j DEVOS-ISO6\n-I FORWARD 1 -j DEVOS-ISO6\n-I INPUT 1 -j DEVOS-ISO6\nCOMMIT\n# END DEVOS S4 ISOLATION6\n$/);
+  assert.doesNotMatch(afterRules(h), /ISOLATION6/, "the IPv4 after.rules carries no IPv6 block");
+  assert.equal(fs.statSync(path.join(h, "after6.rules")).mode & 0o777, 0o640, "file mode kept");
+  // An unchanged run issues no IPv6 restore and leaves after6.rules alone.
+  const n = restores6(h), ino = fs.statSync(path.join(h, "after6.rules")).ino;
+  assert.equal(run(h).code, 0);
+  assert.equal(restores6(h), n, "no second ip6tables-restore");
+  assert.equal(fs.statSync(path.join(h, "after6.rules")).ino, ino);
+  assert.deepEqual(fs.readdirSync(h).filter((f) => f.includes("devos-s4")), [], "no temp file left");
+});
+
+test("S4-b2c: a flushed IPv6 chain or a lost jump is repaired on the next tick, even when the state fetch fails", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "nf/v6/DEVOS-ISO6"), "");
+  fs.writeFileSync(path.join(h, "nf/v6/FORWARD"), "-A FORWARD -j ufw6-before-logging-forward\n-A FORWARD -j DEVOS-ISO6\n");
+  const r = run(h, [], { FAKE_CURL_RC: "7" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /state fetch failed/);
+  assert.equal(nf6(h, "DEVOS-ISO6"), RULE6);
+  assert.equal(firstRule(h, "FORWARD"), "-A FORWARD -j DEVOS-ISO6");
+  assert.equal(nf6(h, "FORWARD").split("\n").filter((l) => l.endsWith("-j DEVOS-ISO6")).length, 1, "the moved jump is not duplicated");
+  assert.equal(run(h).code, 0, "unchanged afterwards");
+});
+
+test("S4-b2c: an IPv6 failure does not stop the IPv4 block; the run exits 1 and says why", () => {
+  const h = host(STATE);
+  let r = run(h, [], { FAKE_V6_RC: "3" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /IPv6 drop not in place: IPv6 drop: the IPv6 DOCKER-USER chain is missing/);
+  assert.match(r.out, /applied: 2 stacks, self-test passed/);
+  assert.match(nf(h, "DEVOS-ISO-FWD"), /beta\/live egress/, "IPv4 block applied");
+  r = run(h, [], { FAKE_V6_RESTORE_RC: "1" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /IPv6 drop not in place: IPv6 drop: ip6tables-restore refused the transaction/);
+  assert.match(r.out, /unchanged: 2 stacks/);
+  assert.equal(nf6(h, "DEVOS-ISO6"), null, "nothing half-applied");
+  assert.equal(run(h).code, 0, "applied on the next good tick");
+  assert.equal(nf6(h, "DEVOS-ISO6"), RULE6);
+});
+
+test("S4-b2c: without M0.1's IPv6 block the drop is applied live but not written to after6.rules (exit 1)", () => {
+  const h = host(STATE);
+  fs.writeFileSync(path.join(h, "after6.rules"), UFW_HEAD6);
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /M0\.1's DEVOS UFW AND DOCKER block is not in .*after6\.rules; not written/);
+  assert.equal(after6(h), UFW_HEAD6, "after6.rules untouched");
+  assert.equal(nf6(h, "DEVOS-ISO6"), RULE6, "live drop in place");
+});
+
+test("S4-b2c: loading after6.rules on a fresh boot restores the IPv6 drop with its jumps first", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  for (const c of ["DEVOS-ISO6"]) fs.rmSync(path.join(h, "nf/v6", c));
+  fs.writeFileSync(path.join(h, "nf/v6/INPUT"), "-A INPUT -j ufw6-before-logging-input\n");
+  fs.writeFileSync(path.join(h, "nf/v6/FORWARD"), "-A FORWARD -j ufw6-before-logging-forward\n");
+  const env = { ...process.env, PATH: `${bin}:/usr/bin:/bin`, FAKE_NF: path.join(h, "nf"), FAKE_LOG: path.join(h, "log") };
+  const r = spawnSync("ip6tables-restore", ["--noflush"], { input: after6(h), env, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(nf6(h, "DEVOS-ISO6"), RULE6);
+  for (const c of ["DOCKER-USER", "FORWARD", "INPUT"]) assert.equal(firstRule(h, c), `-A ${c} -j DEVOS-ISO6`, c);
+  const n = restores6(h);
+  assert.equal(run(h).code, 0);
+  assert.equal(restores6(h), n, "the next tick finds it in place");
+});
+
+test("S4-b2c: --remove deletes the IPv6 drop and its after6.rules block; a disabled run does not re-apply it", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const r = run(h, ["--remove"]);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(nf6(h, "DEVOS-ISO6"), null);
+  for (const c of ["DOCKER-USER", "FORWARD", "INPUT"]) assert.doesNotMatch(nf6(h, c), /DEVOS-ISO6/, c);
+  assert.equal(after6(h), UFW_HEAD6 + M01_6, "after6.rules back to M0.1's");
+  assert.equal(run(h).code, 4);
+  assert.equal(nf6(h, "DEVOS-ISO6"), null, "kept off while disabled");
+  assert.equal(run(h, ["--remove"]).code, 0, "idempotent");
+});
+
+test("S4-b2c: --dry-run prints the IPv6 block after the IPv4 one and changes nothing", () => {
+  const h = host(STATE);
+  const r = run(h, ["--dry-run"]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /# dry run: nothing changed \(2 stacks\)\n# IPv6 block \(ip6tables, static; S4-b2c\):\n\*filter\n:DEVOS-ISO6 - \[0:0\]\n-A DEVOS-ISO6 -i devos-p\+ -j DROP\nCOMMIT\n$/);
+  assert.equal(nf6(h, "DEVOS-ISO6"), null);
+  assert.equal(restores6(h), 0);
+});
+
+test("S4-b2c: IPv6 tailnet entries are still refused, whole document (decision 6)", () => {
+  const h = host({ stacks: [{ slug: "alpha", env: "preview", idx: 0, egress: false, tailnet: ["fd7a:115c:a1e0::1/128"] }] });
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /IPv6 entries are refused: project networks have no IPv6/);
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
 });
