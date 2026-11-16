@@ -175,9 +175,10 @@ export function fileSource(path) {
 /** A source that reads the kill_switch table (KILL_SWITCH_SQL) through any `query(text, params) → { rows }`. */
 export function dbSource(query) {
   if (typeof query !== "function") throw new TypeError("flags: dbSource needs a query function");
-  // The signal is passed on for drivers that can cancel a query; killSwitches() never starts a second read while one hangs.
-  return async ({ signal } = {}) => {
-    const res = await query("SELECT phase, enabled FROM kill_switch", [], { signal });
+  // Exactly two arguments: in node-postgres a third one is the callback slot. A hung query is contained by
+  // killSwitches(), which never starts a second read while one hangs; set statement_timeout so it ends.
+  return async () => {
+    const res = await query("SELECT phase, enabled FROM kill_switch", []);
     if (!Array.isArray(res?.rows)) throw new TypeError("flags: query() must return { rows }");
     const out = {};
     for (const r of res.rows) out[r.phase] = r.enabled;

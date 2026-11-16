@@ -119,7 +119,8 @@ test("SM-10-L1: a hung kill_switch query is never stacked, and requests do not w
   let calls = 0;
   let finish;
   const seen = [];
-  const hung = async (text, params, opts) => { calls += 1; seen.push(opts); if (calls === 1) return { rows: [] }; return new Promise((r) => { finish = () => r({ rows: [{ phase: "phase-2", enabled: false }] }); }); };
+  // Called the node-postgres way: a third argument would be taken as a callback, so it must never be passed.
+  const hung = async (...args) => { assert.equal(args.length, 2, "query(text, params) only"); calls += 1; if (calls === 1) return { rows: [] }; return new Promise((r) => { finish = () => r({ rows: [{ phase: "phase-2", enabled: false }] }); }); };
   const errors = [];
   let t = 0;
   const switches = killSwitches({ phases: ["phase-2"], source: dbSource(hung), refreshMs: 10, timeoutMs: 500, now: () => t, onError: (e) => errors.push(e.message) });
@@ -134,7 +135,6 @@ test("SM-10-L1: a hung kill_switch query is never stacked, and requests do not w
       await switches.settled();
     }
     assert.equal(calls, 2, "one hung query, never a second one beside it");
-    assert.ok(seen[1].signal.aborted, "the hung query's signal is aborted");
     assert.ok(errors.some((m) => /did not answer within 500 ms/.test(m)));
     assert.ok(errors.some((m) => /previous source read still pending/.test(m)));
     finish(); // the query finally returns; its late result is ignored, and the next read runs again
