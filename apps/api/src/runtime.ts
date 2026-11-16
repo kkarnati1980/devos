@@ -281,8 +281,10 @@ export async function buildRuntime(
   const ts = buildTeardownSweep({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownSweep>[0]["policy"], cards: purgeCards, env, timeoutMs: t, log });
   if ("off" in ts) log({ level: "warn", msg: "teardown-sweep-off", code: ts.off });
   const teardownSweep = "off" in ts ? null : ts;
+  // DEVOS-246 (M2.5-b3): the panel's purge card link and KK's early ask go through the same job's card rules.
+  const teardownRoutes: TeardownServices = { ...teardown, purge: teardownSweep };
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
-    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown, teardownSweep };
+    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown: teardownRoutes, teardownSweep };
 }
 
 /**

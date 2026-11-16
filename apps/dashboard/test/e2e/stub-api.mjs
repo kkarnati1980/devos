@@ -115,6 +115,45 @@ export async function startStubApi(allowedOrigin) {
         },
       });
     }
+    // M2.5-b3 (DEVOS-246): the Remove project panel. xss-probe is archived with a leftover check whose texts carry
+    // seeded markup; social-content-extraction is active. Archive/Restore/purge-request change this state.
+    state.teardown ??= {
+      "xss-probe": {
+        projectId: "11111111-1111-4111-8111-111111111111", slug: "xss-probe", stage: "archived",
+        archivedAt: "2026-11-10T04:30:00.000Z", purgeAfter: "2026-12-10T04:30:00.000Z",
+        active: { github: 1, coolify: 2 },
+        lastScan: {
+          scannedAt: "2026-11-10T05:00:00.000Z",
+          hits: [{ provider: "coolify", kind: "application", externalId: "app-<b>1</b>", name: "<img src=x onerror=window.__xss6=1>" }],
+          errors: [{ scanner: "github<script>window.__xss7=1</script>", code: "provider_error" }],
+        },
+        purgeCardId: null, purgeAskAvailable: true,
+      },
+      "social-content-extraction": {
+        projectId: "22222222-2222-4222-8222-222222222222", slug: "social-content-extraction", stage: "building",
+        archivedAt: null, purgeAfter: null, active: { github: 1 }, lastScan: null, purgeCardId: null, purgeAskAvailable: true,
+      },
+    };
+    const tdSlug = url.match(/^\/projects\/by-slug\/([a-z0-9-]+)\/teardown$/);
+    if (req.method === "GET" && tdSlug && state.teardown[tdSlug[1]]) return json(200, state.teardown[tdSlug[1]]);
+    const tdPost = url.match(/^\/projects\/([0-9a-f-]{36})\/(archive|restore|purge-request)$/);
+    if (req.method === "POST" && tdPost) {
+      const t = Object.values(state.teardown).find((x) => x.projectId === tdPost[1]);
+      if (!t) return json(404, { statusCode: 404, code: "project-not-found" });
+      state.received.push({ url, body });
+      if (tdPost[2] === "archive") {
+        if (t.stage === "archived") return json(409, { statusCode: 409, code: "already_archived" });
+        Object.assign(t, { stage: "archived", archivedAt: "2026-11-16T18:00:00.000Z", purgeAfter: "2026-12-16T18:00:00.000Z" });
+        return json(200, { stage: "archived", archivedAt: t.archivedAt, purgeAfter: t.purgeAfter });
+      }
+      if (t.stage !== "archived") return json(409, { statusCode: 409, code: "not_archived" });
+      if (tdPost[2] === "restore") {
+        Object.assign(t, { stage: "building", archivedAt: null, purgeAfter: null, purgeCardId: null });
+        return json(200, { stage: "building" });
+      }
+      t.purgeCardId = "00000000-0000-4000-8000-0000000000a3";
+      return json(200, { approvalId: t.purgeCardId, raised: true });
+    }
     if (req.method === "GET" && url.startsWith("/projects/by-slug/")) return json(404, { statusCode: 404, code: "project-not-found" });
     if (req.method === "GET" && url === "/setup") {
       return json(200, { capsConfirmed: state.settings.capsConfirmedAt !== null, vaultConfigured: true, secrets: NAMES.map((n) => ({ name: n, set: state.secrets.has(n) })), complete: false });

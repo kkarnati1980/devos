@@ -383,7 +383,7 @@ paths:
       parameters:
         - { name: slug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9-]{2,40}$" } }
       responses:
-        "200": { description: "`{ projectId, slug, stage, archivedAt, purgeAfter, active, lastScan }`, as GET /projects/{id}/teardown" }
+        "200": { description: "`{ projectId, slug, stage, archivedAt, purgeAfter, active, lastScan, purgeCardId, purgeAskAvailable }`, as GET /projects/{id}/teardown" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -397,7 +397,7 @@ paths:
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
-        "200": { description: "`{ projectId, slug, stage, archivedAt, purgeAfter, active: { <provider>: <count> }, lastScan: null | { scannedAt, hits: [{ provider, kind, externalId, name }], errors: [{ scanner, code }] } }`; hit fields are text, a scanner error is its fixed code only" }
+        "200": { description: "`{ projectId, slug, stage, archivedAt, purgeAfter, active: { <provider>: <count> }, lastScan: null | { scannedAt, hits: [{ provider, kind, externalId, name }], errors: [{ scanner, code }] }, purgeCardId: null | uuid, purgeAskAvailable: boolean }`; hit fields are text, a scanner error is its fixed code only; `purgeCardId` is the pending purge card of the current archive (M2.5-b3)" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -441,6 +441,22 @@ paths:
         "502": { description: "`provider_error`, `provider_forbidden` or `delete_unconfirmed`" }
         "503": { description: "`teardown-not-configured`, `teardown-store-failed` or `teardown-failed`" }
         "504": { description: "`teardown-timeout`" }
+  /projects/{id}/purge-request:
+    post:
+      operationId: requestProjectPurge
+      summary: "M2.5-b3: KK asks for the purge card now (early purge). Raises or returns the gate-5 card only; nothing is deleted until KK approves it with the typed confirmation"
+      x-devos-access: session
+      x-devos-state-changing: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ approvalId, raised }` (raised false: the pending card of this archive is returned)" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "Forbidden (session, Origin, CSRF)" }
+        "404": { description: "`project-not-found`" }
+        "409": { description: "`not_archived` or `purge-already-approved` (an approved card's purge has not run yet)" }
+        "503": { description: "`teardown-not-configured`, `teardown-store-failed` or `teardown-failed`" }
   /vault/secrets:
     get:
       operationId: listSecrets

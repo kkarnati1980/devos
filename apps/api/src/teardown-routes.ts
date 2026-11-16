@@ -31,9 +31,24 @@ export interface TeardownActions {
   restore(session: KkSession, projectId: string): Promise<void>;
 }
 
+/** M2.5-b3 (DEVOS-246): the purge card link and KK's early ask, served by the teardown job (absent → 503). */
+export interface TeardownPurgeAsk {
+  pendingCard(p: TeardownProjectRow): Promise<string | null>;
+  askPurge(projectId: string): Promise<{ ok: true; approvalId: string; raised: boolean } | { ok: false; code: string }>;
+}
+
+/** The fixed codes askPurge may return, and their statuses. */
+export const PURGE_ASK_STATUS: Readonly<Record<string, number>> = Object.freeze({
+  "project-not-found": 404,
+  not_archived: 409,
+  "purge-already-approved": 409,
+});
+
 export interface TeardownServices {
   reader: TeardownReader | null;
   actions: TeardownActions | null;
+  /** M2.5-b3: null or absent while the teardown job is off; GET then shows no card link and the ask answers 503. */
+  purge?: TeardownPurgeAsk | null;
   /** Pre-review 1: the outcome of a run that ended after its 504 is logged by fixed code (absent → not logged). */
   log?: (e: Record<string, unknown>) => void;
 }
@@ -138,7 +153,12 @@ export class TeardownController {
   private async view(p: TeardownProjectRow | null) {
     if (!p) throw httpError(404, "project-not-found");
     const reader = this.reader();
-    const [rows, scan] = await Promise.all([this.read(reader.activeResources(p.id)), this.read(reader.lastScan(p.id))]);
+    const purge = this.svc.purge ?? null;
+    const [rows, scan, card] = await Promise.all([
+      this.read(reader.activeResources(p.id)),
+      this.read(reader.lastScan(p.id)),
+      purge ? this.read(purge.pendingCard(p)) : Promise.resolve(null),
+    ]);
     return {
       projectId: p.id,
       slug: p.slug,
@@ -147,6 +167,10 @@ export class TeardownController {
       purgeAfter: p.purgeAfter ? p.purgeAfter.toISOString() : null,
       active: activeCounts(rows),
       lastScan: scanView(scan),
+      // M2.5-b3: the pending purge card of this archive (the panel links to it), or null.
+      purgeCardId: typeof card === "string" && UUID.test(card) ? card : null,
+      // False while the teardown job is off, so the panel does not offer "Ask to delete now".
+      purgeAskAvailable: purge !== null,
     };
   }
 
@@ -192,5 +216,24 @@ export class TeardownController {
     // Pre-review 3: the restore succeeded; a failed re-read must not turn that into an error KK would retry.
     const p = await this.reader().project(id).catch(() => null);
     return { stage: p?.stage ?? null };
+  }
+
+  /**
+   * M2.5-b3 decision 2 (DEVOS-246): KK asks for the purge card now instead of waiting for `purge_after`. Behind the
+   * global session, Origin and CSRF checks like every POST. It raises (or returns) the gate-5 card only; the purge
+   * itself still waits for KK's approval with the typed confirmation, and runs in the teardown job, never here.
+   */
+  @Post(":id/purge-request")
+  @HttpCode(200)
+  async purgeRequest(@Param("id") id: string) {
+    if (!UUID.test(id)) throw httpError(400, "invalid:id");
+    const purge = this.svc.purge;
+    if (!this.svc.reader || !purge) throw httpError(503, "teardown-not-configured");
+    const r = await this.read(purge.askPurge(id));
+    if (!r.ok) {
+      const status = Object.hasOwn(PURGE_ASK_STATUS, r.code) ? PURGE_ASK_STATUS[r.code]! : 503;
+      throw httpError(status, status === 503 ? "teardown-failed" : r.code);
+    }
+    return { approvalId: r.approvalId, raised: r.raised };
   }
 }

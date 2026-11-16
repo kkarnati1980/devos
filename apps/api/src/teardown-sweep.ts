@@ -402,6 +402,42 @@ export class TeardownSweepJob {
     return period.filter((c) => c.status === "expired").length < MAX_UNANSWERED;
   }
 
+  /**
+   * M2.5-b3 (DEVOS-246): the pending purge card of the project's current archive, for the panel's link to the inbox.
+   * A card from an earlier archive is not shown (approving it would never purge, pre-review 1 of M2.5-b2).
+   */
+  async pendingCard(p: TeardownProject): Promise<string | null> {
+    if (p.stage !== "archived") return null;
+    const pending = await this.d.cards({ status: "pending", action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE });
+    return pending.find((c) => c.projectId === p.id && raisedThisArchive(c, p))?.id ?? null;
+  }
+
+  /**
+   * M2.5-b3 decision 2 (DEVOS-246): KK's early ask ("Ask to delete now"). It only raises the same purge card as the
+   * daily run; nothing is deleted until KK approves that card with its typed confirmation. A pending card of this
+   * archive is returned as is; one from an earlier archive is closed first; an approved card whose grant is still
+   * unspent means a purge is already queued. Raised before `purge_after`, a rejected card leaves `purge_after` alone
+   * (keepArchivedPass), and the daily run counts only cards raised in its own period, so an early ask never uses up
+   * the daily run's raises.
+   */
+  async askPurge(projectId: string): Promise<{ ok: true; approvalId: string; raised: boolean } | { ok: false; code: string }> {
+    const p = await this.d.project(projectId);
+    if (!p) return { ok: false, code: "project-not-found" };
+    if (p.stage !== "archived" || !p.archivedAt) return { ok: false, code: "not_archived" };
+    const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
+    const pending = cards.filter((c) => c.status === "pending");
+    const current = pending.find((c) => raisedThisArchive(c, p));
+    if (current) return { ok: true, approvalId: current.id, raised: false };
+    for (const c of cards.filter((x) => x.status === "approved" && raisedThisArchive(x, p))) {
+      if (await this.d.unspentGrant(c.id, new Date(this.now()))) return { ok: false, code: "purge-already-approved" };
+    }
+    if (pending.length) await this.d.expire(pending.map((c) => c.id), "purge-card-older-archive");
+    const card = (await this.d.raise(purgeCard(p, await this.d.activeCounts(p.id)))) as { id?: unknown } | null;
+    if (!card || typeof card.id !== "string") throw new Error("purge-card-not-raised");
+    this.d.log({ level: "info", msg: "teardown-purge-asked", projectId: p.id, approvalId: card.id });
+    return { ok: true, approvalId: card.id, raised: true };
+  }
+
   start(): this {
     if (!this.timer) {
       void this.tick();

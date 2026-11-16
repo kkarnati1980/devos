@@ -35,6 +35,8 @@ export interface SetupStatus {
 }
 
 const TIMEOUT_MS = 10_000; // ADR-0011 §9: every outbound call has a timeout
+/** M2.5-b3: Archive and Restore run in the request, bounded at 120 s by the API (TEARDOWN_ROUTE_TIMEOUT_MS); a margin on top. */
+export const TEARDOWN_TIMEOUT_MS = 130_000;
 
 /**
  * M2.3-b2 (DEVOS-135): page-wide signals for the nav's pending-approvals count. The nav never signs in
@@ -75,6 +77,19 @@ export interface PreflightView {
 export interface ProvisionStepView { key: string; provider: string; kind: string; status: "pending" | "done" | "failed"; attempts: number; code: string | null; updatedAt: string }
 export interface ProvisionView { projectId: string; stage: string; parked: boolean; steps: ProvisionStepView[] }
 /** ADR-0012 CR-b2c (DEVOS-216): the project page's batch cards (apps/api card-batch-view.ts). */
+/** M2.5-b1/b3 (DEVOS-244, DEVOS-246): the teardown state behind the "Remove project" panel; scan fields are text. */
+export interface TeardownView {
+  projectId: string;
+  slug: string;
+  stage: string;
+  archivedAt: string | null;
+  purgeAfter: string | null;
+  active: Record<string, number>;
+  lastScan: { scannedAt: string; hits: { provider: string; kind: string; externalId: string; name: string }[]; errors: { scanner: string; code: string }[] } | null;
+  purgeCardId: string | null;
+  purgeAskAvailable: boolean;
+}
+
 export interface BatchQuestionView {
   ref: string;
   text: string;
@@ -136,8 +151,8 @@ export class DevosApi {
    * CSRF token is stale) or the 12-hour session ended is retried once after recovering the token
    * (PR17-r1). Both refusals happen in the API guard, before any change, so the retry is safe.
    */
-  private async call<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
-    const first = await this.once<T>(method, path, body);
+  private async call<T>(method: string, path: string, body?: unknown, timeoutMs = TIMEOUT_MS): Promise<ApiResult<T>> {
+    const first = await this.once<T>(method, path, body, timeoutMs);
     if (first.ok || method === "GET" || path === "/auth/session") return first;
     if (first.code === "csrf-token-invalid") {
       const r = await this.refresh();
@@ -146,12 +161,12 @@ export class DevosApi {
       const r = await this.signIn();
       if (!r.ok) return first;
     } else return first;
-    return this.once<T>(method, path, body);
+    return this.once<T>(method, path, body, timeoutMs);
   }
 
-  private async once<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
+  private async once<T>(method: string, path: string, body?: unknown, timeoutMs = TIMEOUT_MS): Promise<ApiResult<T>> {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
       const headers: Record<string, string> = {};
       if (body !== undefined) headers["content-type"] = "application/json";
@@ -265,6 +280,19 @@ export class DevosApi {
   }
   retryProvision(projectId: string) {
     return this.call<{ queued: boolean }>("POST", `/projects/${encodeURIComponent(projectId)}/provision`);
+  }
+  /** M2.5-b3 (DEVOS-246): the "Remove project" panel. Archive and Restore never delete; a purge needs KK's card. */
+  teardown(slug: string) {
+    return this.call<TeardownView>("GET", `/projects/by-slug/${encodeURIComponent(slug)}/teardown`);
+  }
+  archiveProject(projectId: string) {
+    return this.call<{ stage: string; archivedAt: string; purgeAfter: string }>("POST", `/projects/${encodeURIComponent(projectId)}/archive`, undefined, TEARDOWN_TIMEOUT_MS);
+  }
+  restoreProject(projectId: string) {
+    return this.call<{ stage: string | null }>("POST", `/projects/${encodeURIComponent(projectId)}/restore`, undefined, TEARDOWN_TIMEOUT_MS);
+  }
+  askPurge(projectId: string) {
+    return this.call<{ approvalId: string; raised: boolean }>("POST", `/projects/${encodeURIComponent(projectId)}/purge-request`);
   }
   /** ADR-0012 CR-b2c (DEVOS-216). */
   batches(slug: string) {
