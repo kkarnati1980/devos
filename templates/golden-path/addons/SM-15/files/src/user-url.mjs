@@ -28,6 +28,8 @@ export function parseUserUrl(input) {
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new SafeFetchError("scheme", `refused scheme ${url.protocol}`);
   if (url.username || url.password) throw new SafeFetchError("credentials", "refused: credentials in URL");
   if (!url.hostname) throw new SafeFetchError("url", "no host");
+  // The parsed form can be much longer than what was typed (non-ASCII is percent-encoded); the cap holds for both.
+  if (url.href.length > USER_URL_LIMITS.maxUrlLength) throw new SafeFetchError("url", `URL longer than ${USER_URL_LIMITS.maxUrlLength} characters once encoded`);
   return url;
 }
 

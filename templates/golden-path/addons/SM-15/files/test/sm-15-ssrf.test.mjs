@@ -35,14 +35,15 @@ before(async () => {
 });
 after(() => { for (const t of timers) clearInterval(t); srv.closeAllConnections(); srv.close(); });
 
-// Names the resolver answers in these tests. Any name not listed would resolve to a public address, so no refused
-// case below depends on one.
+// Names the resolver answers in these tests. Any other name fails to resolve, so no case here can open a socket
+// to a real address even if a check regressed (the case would then fail with "dns").
 const NAMES = {
   "localhost": ["127.0.0.1"], "localhost.": ["127.0.0.1"], "internal.test": ["10.1.2.3"], "metadata.google.internal": ["169.254.169.254"],
   "mixed.test": ["93.184.216.34", "192.168.1.5"], "v6ula.test": ["fd00::1"], "v6mapped.test": ["::ffff:127.0.0.1"],
   "nip.test": ["127.0.0.1"], "aws6.test": ["fd00:ec2::254"],
 };
-const lookup = async (h) => (NAMES[h] || ["93.184.216.34"]).map((address) => ({ address, family: address.includes(":") ? 6 : 4 }));
+const lookup = async (h) => { if (!NAMES[h]) { const e = new Error("not found"); e.code = "ENOTFOUND"; throw e; }
+  return NAMES[h].map((address) => ({ address, family: address.includes(":") ? 6 : 4 })); };
 
 // The stub stands in for a public server: "public.test" reaches it only through this test wrapper, the one bypass.
 const viaStub = (url, o) => safeFetch(url, { ...o, allowHosts: ["public.test"], lookup: async (h) => (h === "public.test" ? [{ address: "127.0.0.1", family: 4 }] : lookup(h)) });
@@ -102,7 +103,7 @@ test("SM-15-L1 corpus: a redirect from a public page to any internal target or o
   assert.equal(ok.status, 200); assert.equal(ok.text(), "hello");
 });
 
-test("SM-15-L1 corpus: DNS rebinding cannot swap the address (one lookup per hop, the socket goes to the checked one)", async () => {
+test("SM-15-L1 corpus: DNS rebinding: one lookup per request and per hop, and a name with any internal answer is refused", async () => {
   // The resolver answers the stub's address once, then an internal one: a second lookup for the connection would
   // have gone to 10.9.9.9 and failed.
   let seen = 0;
@@ -159,6 +160,7 @@ test("SM-15-L1: a user URL never uses allowHosts, a body or a method other than 
     await assert.rejects(fetchUserUrl(input), (e) => e instanceof SafeFetchError && e.code === "url");
   }
   await refused(`http://example.com/${"a".repeat(USER_URL_LIMITS.maxUrlLength)}`, "url");
+  await refused(`http://example.com/${"\u00e9".repeat(1000)}`, "url");   // 1019 characters typed, over 6000 once encoded
   assert.equal(parseUserUrl("  https://Example.COM/x  ").href, "https://example.com/x");
   assert.throws(() => makeUserUrlFetcher({ transport: "safeFetch" }), TypeError);
 });
