@@ -4,7 +4,7 @@
 # v1.2.0 (DEVOS-127, S4-b2b): boot persistence. Every successful run keeps a marker block in /etc/ufw/after.rules
 # (BEGIN/END DEVOS S4 ISOLATION, placed after M0.1's DEVOS UFW AND DOCKER block) that rebuilds the installed
 # chains and puts the three jumps first, so the block is back at boot and after `ufw reload`, before the agent's
-# first tick. A rollback rewrites it to the restored block; --remove deletes it. Written only when it differs,
+# first tick (the FORWARD jump can drop below tailscaled's ts-forward when tailscaled starts; S4.md S4-b2b 1). A rollback rewrites it to the restored block; --remove deletes it. Written only when it differs,
 # atomically, ASCII only, and only while M0.1's block is in the file (else exit 1, block itself still applied).
 # v1.1.0 (DEVOS-127, S4-b2a): --remove also writes $DEVOS_DIR/isolation/disabled, and an apply run refuses with
 # exit 4 while that file exists, so KK's console rollback is not undone by the agent's next tick. To turn the
@@ -94,6 +94,14 @@ boot_text() {  # installed block in $1 -> the after.rules marker block
 boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when after.rules holds what it should
   local f="$UFW_AFTER" rest want tmp mode
   [[ -f "$f" ]] || { [[ -z "$1" ]] && return 0; echo "boot persistence: $f missing (ufw not set up?)"; return 1; }
+  # Pre-review: an orphan BEGIN (hand edit) would make the sed range delete to the end of the file, so the
+  # markers must be absent, or exactly one BEGIN followed by exactly one END.
+  local nb ne lb le
+  nb="$(grep -c "^$BOOT_BEGIN" "$f")"; ne="$(grep -cx "$BOOT_END" "$f")"
+  if [[ "$nb$ne" != 00 ]]; then
+    lb="$(grep -n "^$BOOT_BEGIN" "$f" | head -n1 | cut -d: -f1)"; le="$(grep -nx "$BOOT_END" "$f" | head -n1 | cut -d: -f1)"
+    [[ "$nb$ne" == 11 ]] && (( lb < le )) || { echo "boot persistence: the DEVOS S4 ISOLATION markers in $f are broken (hand edit?); not written"; return 1; }
+  fi
   rest="$(sed "/^$BOOT_BEGIN/,/^$BOOT_END\$/d" "$f")" || { echo "boot persistence: cannot read $f"; return 1; }
   if [[ -n "$1" ]]; then
     grep -qxF -- "$M01_END" <<<"$rest" || { echo "boot persistence: M0.1's DEVOS UFW AND DOCKER block is not in $f; not written"; return 1; }
@@ -105,8 +113,9 @@ boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when 
   [[ "$want" == "$(cat "$f")" ]] && return 0
   mode="$(stat -c %a "$f" 2>/dev/null)"; mode="${mode:-640}"
   tmp="$(mktemp "$f.devos-s4.XXXXXX")" || { echo "boot persistence: cannot write next to $f"; return 1; }
-  if printf '%s\n' "$want" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$f"; then return 0; fi
-  rm -f "$tmp"; echo "boot persistence: could not replace $f"; return 1
+  BOOT_TMP="$tmp"; trap 'rm -f "${BOOT_TMP:-}"' EXIT; trap 'exit 143' TERM  # a timeout kill between mktemp and mv leaves no temp file
+  if printf '%s\n' "$want" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$f"; then BOOT_TMP=""; return 0; fi
+  rm -f "$tmp"; BOOT_TMP=""; echo "boot persistence: could not replace $f"; return 1
 }
 
 if [[ "$MODE" == remove ]]; then

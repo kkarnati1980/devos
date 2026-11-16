@@ -427,6 +427,18 @@ test("S4-b2b: loading after.rules on a fresh boot (and after M0.1's DOCKER-USER 
   fs.writeFileSync(path.join(h, "nf/FORWARD"), "-A FORWARD -j ts-forward\n-A FORWARD -j DOCKER-USER\n");
   fs.writeFileSync(path.join(h, "nf/DOCKER-USER"), "-A DOCKER-USER -j stale\n");
   const env = { ...process.env, PATH: `${bin}:/usr/bin:/bin`, FAKE_NF: path.join(h, "nf"), FAKE_LOG: path.join(h, "log") };
+  // Pre-review: the fake restore would create a missing chain, so check statically what the real one refuses:
+  // every chain the whole file appends to, inserts into or jumps to is builtin or declared earlier in the file.
+  const known = new Set(["INPUT", "FORWARD", "OUTPUT", "ACCEPT", "DROP", "RETURN", "LOG"]);
+  for (const l of afterRules(h).split("\n")) {
+    const decl = l.match(/^:(\S+) /);
+    if (decl) { known.add(decl[1]); continue; }
+    const rule = l.match(/^-[AI] (\S+) /);
+    if (!rule) continue;
+    assert.ok(known.has(rule[1]), `chain ${rule[1]} used before it exists: ${l}`);
+    const tgt = l.match(/ -j (\S+)$/);
+    if (tgt) assert.ok(known.has(tgt[1]), `target ${tgt[1]} not declared before: ${l}`);
+  }
   const r = spawnSync("iptables-restore", ["--noflush"], { input: afterRules(h), env, encoding: "utf8" });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(nf(h, "DEVOS-ISO-FWD"), live.fwd);
@@ -497,4 +509,14 @@ test("S4-b2b: --remove deletes the boot block too, so a reboot does not bring th
   assert.equal(r.code, 0, r.out);
   assert.equal(afterRules(h), UFW_HEAD + M01);
   assert.equal(run(h, ["--remove"]).code, 0, "still idempotent");
+});
+
+test("S4-b2b (pre-review): broken markers (an orphan BEGIN) are refused and the file is left alone", () => {
+  const h = host(STATE);
+  const broken = UFW_HEAD + M01 + "# BEGIN DEVOS S4 ISOLATION (hand edit)\n# KK's own line\n";
+  fs.writeFileSync(path.join(h, "after.rules"), broken);
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /markers in .* are broken \(hand edit\?\); not written/);
+  assert.equal(afterRules(h), broken, "nothing after the orphan BEGIN is dropped");
 });
