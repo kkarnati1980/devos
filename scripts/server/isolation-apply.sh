@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.2.0
+# Version: 1.3.0
+# v1.3.0 (DEVOS-127, S4-b2d): after a successful apply, the conntrack entries of every stack whose rights shrank
+# (a rule with its /24 as source is gone: stack removed, egress or a tailnet entry revoked; on the first apply,
+# the whole pool) are deleted, so a connection opened before the change cannot outlive it. A clean-up that cannot
+# run now is kept in isolation/conntrack.pending and retried on every tick (exit 1 until done). One overall
+# deadline: no change starts after ISOLATION_DEADLINE_S (default 25 s) of the run, so a rollback always fits in the
+# agent's 60 s timeout.
 # v1.2.0 (DEVOS-127, S4-b2b): boot persistence. Every successful run keeps a marker block in /etc/ufw/after.rules
 # (BEGIN/END DEVOS S4 ISOLATION, placed after M0.1's DEVOS UFW AND DOCKER block) that rebuilds the installed
 # chains and puts the three jumps first, so the block is back at boot and after `ufw reload`, before the agent's
@@ -116,6 +122,42 @@ boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when 
   BOOT_TMP="$tmp"; trap 'rm -f "${BOOT_TMP:-}"' EXIT; trap 'exit 143' TERM  # a timeout kill between mktemp and mv leaves no temp file
   if printf '%s\n' "$want" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$f"; then BOOT_TMP=""; return 0; fi
   rm -f "$tmp"; BOOT_TMP=""; echo "boot persistence: could not replace $f"; return 1
+}
+
+# --- S4-b2d: conntrack clean-up and the run deadline ---------------------------------------------------------
+T0=$SECONDS
+DEADLINE="$(conf ISOLATION_DEADLINE_S)"; [[ "$DEADLINE" =~ ^[0-9]{1,2}$ ]] || DEADLINE=25
+shrunk() {  # $1 = previous block, $2 = new block -> the /24 sources (or the pool) whose rules shrank, one per line
+  [[ -z "$1" ]] && { echo "$POOL"; return; }
+  local src
+  for src in $(grep -oE -- '-s 10\.[0-9]+\.[0-9]+\.0/24' <<<"$1" | cut -d' ' -f2 | sort -u); do
+    # Every previous rule with this source must still be there, else the stack lost a right.
+    while IFS= read -r l; do
+      grep -qxF -- "$l" <<<"$2" || { echo "$src"; break; }
+    done < <(grep -F -- "-s $src " <<<"$1")
+  done
+}
+ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack; 0 when nothing is left pending
+  local f="$ISO/conntrack.pending" src out left=""
+  [[ -s "$f" ]] || return 0
+  if ! command -v conntrack >/dev/null 2>&1; then
+    echo "conntrack not installed: connections opened before the change are kept until they close ($(paste -sd' ' "$f"))"; return 1
+  fi
+  while IFS= read -r src; do
+    [[ "$src" =~ ^10\.(20[89]|21[01])\.[0-9]{1,3}\.0/(24|14)$ ]] || continue
+    if (( SECONDS - T0 >= 55 )); then left+="$src"$'\n'; continue; fi
+    # conntrack exits 1 when no entry matched ("0 flow entries have been deleted"); that is a success here.
+    out="$(timeout 10 conntrack -D -s "$src" 2>&1)"
+    [[ $? == 0 || "$out" == *"flow entries have been deleted"* ]] || left+="$src"$'\n'
+  done < "$f"
+  if [[ -n "$left" ]]; then printf '%s' "$left" > "$f.tmp" && mv -f "$f.tmp" "$f"; echo "conntrack clean-up incomplete, retried next tick: $(paste -sd' ' "$f")"; return 1; fi
+  rm -f "$f"; return 0
+}
+ct_queue() {  # $1 = previous block, $2 = new block -> add the shrunk sources to the pending list
+  local new
+  new="$(shrunk "$1" "$2")"; [[ -n "$new" ]] || return 0
+  { [[ -s "$ISO/conntrack.pending" ]] && cat "$ISO/conntrack.pending"; echo "$new"; } | sort -u > "$ISO/conntrack.pending.tmp" \
+    && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
 }
 
 if [[ "$MODE" == remove ]]; then
@@ -301,6 +343,7 @@ exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply ru
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
   boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; exit 1; }
+  ct_flush || exit 1
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
 fi
 
@@ -308,12 +351,15 @@ fi
 # host already fails before the change, the cause is elsewhere; the block is applied and kept (isolation is
 # the floor) and the failure is reported. Roll back only when the probe passed before and fails after.
 pre_ok=1; pre_msg="$(selftest)" || pre_ok=0
+# S4-b decision 11 / S4-b2d: start no change late in the run, so the post-change self-test and a rollback
+# (iptables-restore 15 s + the self-test) still fit inside the agent's 60 s.
+(( SECONDS - T0 <= DEADLINE )) || { echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; exit 1; }
 if ! install_block "$BLOCK"; then
   echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
 fi
 if ! post_msg="$(selftest)"; then
   if (( pre_ok == 0 )); then
-    record "$BLOCK"; boot_sync "$BLOCK"
+    record "$BLOCK"; boot_sync "$BLOCK"; ct_queue "$PREV" "$BLOCK"; ct_flush
     echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
@@ -326,4 +372,6 @@ if ! post_msg="$(selftest)"; then
 fi
 record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
 boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; exit 1; }
+ct_queue "$PREV" "$BLOCK" || { echo "applied, but could not write $ISO/conntrack.pending"; exit 1; }
+ct_flush || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; exit 1; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"

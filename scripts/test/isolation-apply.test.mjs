@@ -52,8 +52,12 @@ while IFS= read -r l; do
 done <<<"$in"
 if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sleep 0.3; fi`);
   // curl: logs argv (to prove the token is not on it) and prints FAKE_STATE; FAKE_CURL_RC fails the fetch.
-  w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
+  w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ -z "\${FAKE_CURL_SLEEP:-}" ]] || sleep "$FAKE_CURL_SLEEP"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
   w("tailscale", `exit 1`);
+  // conntrack (S4-b2d): logs argv; FAKE_CT_RC fails it with another message; with no match the real one exits 1.
+  w("conntrack", `echo "$*" >> "$FAKE_LOG/conntrack.log"; [[ "\${FAKE_CT_RC:-0}" == 0 ]] || { echo "conntrack v1.4.7 (conntrack-tools): Operation failed: injected" >&2; exit "$FAKE_CT_RC"; }
+[[ -n "\${FAKE_CT_NOMATCH:-}" ]] && { echo "conntrack v1.4.7 (conntrack-tools): 0 flow entries have been deleted." >&2; exit 1; }
+echo "conntrack v1.4.7 (conntrack-tools): 3 flow entries have been deleted." >&2`);
   up = net.createServer((s) => s.end()).listen(0, "127.0.0.1");
   await new Promise((r) => up.once("listening", r));
   upPort = up.address().port;
@@ -519,4 +523,73 @@ test("S4-b2b (pre-review): broken markers (an orphan BEGIN) are refused and the 
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /markers in .* are broken \(hand edit\?\); not written/);
   assert.equal(afterRules(h), broken, "nothing after the orphan BEGIN is dropped");
+});
+
+// --- S4-b2d: conntrack clean-up for stacks whose rights shrank, and the run deadline -------------------------
+const ctLog = (h) => { const f = path.join(h, "log/conntrack.log"); return fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim().split("\n").filter(Boolean) : []; };
+const pending = (h) => path.join(h, "devos/isolation/conntrack.pending");
+
+test("S4-b2d: the first apply cuts the pool's old connections once; an unchanged run cuts nothing", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h), ["-D -s 10.208.0.0/14"]);
+  assert.equal(fs.existsSync(pending(h)), false);
+  assert.equal(run(h).code, 0);
+  assert.equal(ctLog(h).length, 1, "no clean-up on an unchanged run");
+});
+
+test("S4-b2d: only stacks that lost a right are cut (egress revoked, tailnet removed, stack gone); a grant cuts nothing", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const n0 = ctLog(h).length;
+  // Grant: alpha gains egress -> nothing cut.
+  setState(h, { stacks: [STATE.stacks[0], { ...STATE.stacks[1], egress: true }] });
+  assert.equal(run(h).code, 0);
+  assert.equal(ctLog(h).length, n0, "a grant cuts nothing");
+  // Revoke beta's egress (idx 257 -> 10.209.1.0/24) and alpha's tailnet entry (idx 0 -> 10.208.0.0/24).
+  setState(h, { stacks: [{ ...STATE.stacks[0], egress: false }, { ...STATE.stacks[1], egress: true, tailnet: [] }] });
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n0).sort(), ["-D -s 10.208.0.0/24", "-D -s 10.209.1.0/24"]);
+  // Remove beta entirely.
+  const n1 = ctLog(h).length;
+  setState(h, { stacks: [{ ...STATE.stacks[1], egress: true, tailnet: [] }] });
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n1), ["-D -s 10.209.1.0/24"]);
+});
+
+test("S4-b2d: 'no entry matched' counts as done; a failed clean-up is kept pending and retried next tick", () => {
+  const h = host(STATE);
+  assert.equal(run(h, [], { FAKE_CT_NOMATCH: "1" }).code, 0, "0 flow entries deleted is a success");
+  assert.equal(fs.existsSync(pending(h)), false);
+  setState(h, { stacks: [STATE.stacks[1]] });
+  let r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /conntrack clean-up incomplete, retried next tick: 10\.209\.1\.0\/24/);
+  assert.match(r.out, /self-test passed; old connections not yet cut/);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24");
+  assert.match(nf(h, "DEVOS-ISO-FWD"), /alpha\/preview/, "the new block is in place regardless");
+  r = run(h);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /unchanged/);
+  assert.equal(ctLog(h).at(-1), "-D -s 10.209.1.0/24", "retried on the unchanged tick");
+  assert.equal(fs.existsSync(pending(h)), false);
+});
+
+test("S4-b2d: a pending list entry that is not a pool source is never passed to conntrack", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(pending(h), "0.0.0.0/0\n-F\n10.209.1.0/24\n");
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(1), ["-D -s 10.209.1.0/24"]);
+});
+
+test("S4-b2d: no change starts after the run deadline; nothing changes and the next tick retries", () => {
+  const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=0\n" });
+  const r = run(h, [], { FAKE_CURL_SLEEP: "1.2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /deadline: \d+ s spent before the change \(limit 0 s\); nothing changed/);
+  assert.equal(restores(h), 0);
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+  const ok = host(STATE);
+  assert.equal(run(ok, [], { FAKE_CURL_SLEEP: "1.2" }).code, 0, "the default 25 s deadline allows a slow fetch");
 });
