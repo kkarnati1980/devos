@@ -23,6 +23,7 @@ before(() => {
   // is_buildtime:true whatever was sent). Headers given as @file are copied to $FAKE_LOG/headers.
   fs.writeFileSync(path.join(bin, "curl"), `#!/usr/bin/env bash
 echo "$*" >> "$FAKE_LOG/curl.args"
+[[ "\${FAKE_CURL_RC:-0}" == 0 ]] || { printf 000; exit "$FAKE_CURL_RC"; }
 out= m=GET url= body=
 while (( $# )); do case "$1" in
   -o) out="$2"; shift 2 ;; -X) m="$2"; shift 2 ;; -w) shift 2 ;;
@@ -35,7 +36,8 @@ case "$m $url" in
     if [[ "\${FAKE_HIDE_VALUES:-0}" == 1 ]]; then jq 'map(del(.value))' "$FAKE_ENVS" > "$out"; else cat "$FAKE_ENVS" > "$out"; fi ;;
   "PATCH "*/envs/bulk) code="\${FAKE_PATCH_CODE:-201}"; n=$(ls "$FAKE_LOG" | grep -c '^patch\\.'); cp "$body" "$FAKE_LOG/patch.$n.json"
     if [[ "$code" == 201 ]]; then
-      jq -s --arg f "\${FAKE_FLIP_BUILD:-0}" '.[1].data[0] as $e | ($e | if $f == "1" then (if has("is_buildtime") then .is_buildtime = true else .is_build_time = true end) else . end) as $e
+      jq -s --arg f "\${FAKE_FLIP_BUILD:-0}" --arg o "\${FAKE_ALTER:-}" '.[1].data[0] as $e | ($e | if $f == "1" then (if has("is_buildtime") then .is_buildtime = true else .is_build_time = true end) else . end
+          | if $o == "value" then .value = "other" elif $o == "preview" then .is_preview = true else . end) as $e
         | [.[0][] | select(.key != $e.key)] + [$e]' "$FAKE_ENVS" "$body" > "$FAKE_ENVS.n" && mv "$FAKE_ENVS.n" "$FAKE_ENVS"
     fi; echo '{}' > "$out" ;;
   *) code=404; echo '{}' > "$out" ;;
@@ -109,6 +111,14 @@ test("keeps an existing valid token (re-run is idempotent) and replaces it only 
   assert.equal(envs(h).filter((x) => x.key === "DEVOS_ISOLATION_STATE_TOKEN").length, 1);
 });
 
+test("a token of exactly 32 characters is kept", () => {
+  const keep = "Q".repeat(32) + "\n";
+  const h = host({ token: keep });
+  const r = run(h);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(tok(h), keep);
+});
+
 test("a malformed or short host token is replaced", () => {
   for (const bad of ["short-token\n", "x".repeat(31), "bad token with spaces and more than thirty two chars\n", ""]) {
     const h = host({ token: bad });
@@ -144,7 +154,9 @@ test("no Coolify token yet: host token written, Coolify skipped, exit 3", () => 
 
 test("Coolify errors exit 1 and keep the host token; a read-back with build-time on fails", () => {
   for (const [env, re] of [[{ FAKE_GET_CODE: "403" }, /reading the app's env: HTTP 403/], [{ FAKE_PATCH_CODE: "401" }, /writing the app's env: HTTP 401/],
-    [{ FAKE_PATCH_CODE: "500" }, /writing the app's env: Coolify API answered HTTP 500/], [{ FAKE_FLIP_BUILD: "1" }, /did not read back as a runtime-only env/]]) {
+    [{ FAKE_PATCH_CODE: "500" }, /writing the app's env: Coolify API answered HTTP 500/], [{ FAKE_FLIP_BUILD: "1" }, /did not read back as a runtime-only env/],
+    [{ FAKE_ALTER: "value" }, /did not read back as a runtime-only env with the host's value/], [{ FAKE_ALTER: "preview" }, /did not read back/],
+    [{ FAKE_CURL_RC: "7" }, /reading the app's env: Coolify API not reachable/]]) {
     const keep = "Z".repeat(48) + "\n";
     const h = host({ token: keep });
     const r = run(h, [], env);

@@ -338,6 +338,12 @@ test("DEVOS-237: a token shorter than 32 characters is refused before any reques
   assert.equal(restores(h), 0);
 });
 
+test("DEVOS-237: a token of exactly 32 characters is accepted", () => {
+  const h = host(STATE, { token: "t0ken-" + "a".repeat(26) }); // 32 characters
+  const r = run(h, ["--dry-run"]);
+  assert.equal(r.code, 0, r.out);
+});
+
 test("unknown arguments are refused", () => {
   const h = host(STATE);
   assert.equal(run(h, ["--force"]).code, 2);

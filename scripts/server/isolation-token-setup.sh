@@ -36,7 +36,8 @@ for c in jq curl flock base64 head; do
 done
 
 TMP="$(mktemp -d)" || { echo "failed: no temp dir"; exit 1; }
-chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
+new=
+chmod 700 "$TMP"; trap 'rm -rf "$TMP"; [[ -n "$new" ]] && rm -f "$new"' EXIT
 
 valid_file() {  # path -> 0 if it holds one valid token line
   local t
@@ -60,9 +61,9 @@ else
     rm -f "$new"; echo "failed: could not generate a token (the existing host token, if any, is kept)"; exit 1
   fi
   mv -f "$new" "$TOKEN_FILE" || { rm -f "$new"; echo "failed: could not install the token file"; exit 1; }
+  new=
   echo "host token: created ($TOKEN_FILE, mode $(stat -c %a "$TOKEN_FILE"))"
 fi
-tr -d '\r\n' < <(head -c 600 "$TOKEN_FILE") > "$TMP/tok" || { echo "failed: cannot read the token file"; exit 1; }
 
 # --- 2. API copy (Coolify env) ----------------------------------------------------------------------------
 if [[ ! -s "$CF_ENV" ]]; then
@@ -76,7 +77,8 @@ U="$(sed -n 's/^COOLIFY_APP_UUID=//p' "$CF_ENV" | head -n1 | tr -d '\r\n')"
 req() {  # method path [body-file] -> HTTP code (body in $TMP/r); 000 on a connection error
   local a=(-sS --connect-timeout 10 --max-time 30 -o "$TMP/r" -w '%{http_code}' -H @"$TMP/auth" -H 'Accept: application/json' -X "$1")
   [[ -n "${3:-}" ]] && a+=(-H 'Content-Type: application/json' --data-binary @"$3")
-  curl "${a[@]}" "$COOLIFY_API$2" 2>/dev/null || echo 000
+  local c; c="$(curl "${a[@]}" "$COOLIFY_API$2" 2>/dev/null)" || true
+  [[ "$c" =~ ^[1-5][0-9][0-9]$ ]] && echo "$c" || echo 000   # curl prints 000 itself on a connection error
 }
 why() { case "$1" in 401|403) echo "HTTP $1: the Coolify token lacks read + write";; 404) echo "HTTP 404: no app with that UUID";;
   000) echo "Coolify API not reachable at $COOLIFY_API";; *) echo "Coolify API answered HTTP $1";; esac; }
@@ -84,7 +86,14 @@ why() { case "$1" in 401|403) echo "HTTP $1: the Coolify token lacks read + writ
 # The agent PATCHes the same app's envs (GIT_SHA) inside its tick: hold its lock so the two never interleave.
 install -d -m 700 "$(dirname "$AGENT_LOCK")"
 exec 9>>"$AGENT_LOCK"
-flock -w "${LOCK_WAIT:-1600}" 9 || { echo "failed: the agent tick did not finish; nothing sent to Coolify (host token kept)"; exit 1; }
+if ! flock -n 9; then
+  echo "waiting for the running agent tick to finish (up to $(( ${LOCK_WAIT:-1600} / 60 )) minutes)..."
+  flock -w "${LOCK_WAIT:-1600}" 9 || { echo "failed: the agent tick did not finish; nothing sent to Coolify (host token kept)"; exit 1; }
+fi
+# Read the host token only now, under the lock: a concurrent --rotate that renamed a new token in while this
+# run waited is the value sent, so the host copy and the Coolify copy cannot end up different (pre-review).
+valid_file "$TOKEN_FILE" || { echo "failed: the host token changed and is no longer valid; rerun"; exit 1; }
+tr -d '\r\n' < <(head -c 600 "$TOKEN_FILE") > "$TMP/tok" || { echo "failed: cannot read the token file"; exit 1; }
 
 c="$(req GET "/applications/$U/envs")"
 [[ "$c" == 200 ]] && jq -e 'type == "array"' "$TMP/r" >/dev/null 2>&1 \
