@@ -37,6 +37,11 @@ export interface ProbeDeps {
   inventory(): Promise<InventoryRow[]>;
   /** AT13's live asserts; each failure is a fixed code. */
   liveAsserts(): Promise<string[]>;
+  /**
+   * d3c-2a decisions 4 and 5: checked only when a new cycle would start. `{ blocked }` skips (exit 3, nothing created);
+   * `purge-pending` starts the cycle with the purge (an earlier purge did not finish). Absent means "ready".
+   */
+  cycleStart?(): Promise<"ready" | "purge-pending" | { blocked: string }>;
   /** M2.5 purge over the recorded ids only. */
   purge(): Promise<PurgeOutcome>;
   fingerprint: string;
@@ -112,7 +117,14 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
   const at = () => d.now().toISOString();
 
   if (!last || (last.phase === "done" && due(last, d))) {
+    const start = d.cycleStart ? await d.cycleStart() : "ready";
+    if (typeof start === "object") return { exit: 3, phase: "idle", cycle: last?.cycle ?? 0, code: "skipped", detail: start.blocked };
     const cycle = (last?.cycle ?? 0) + 1;
+    if (start === "purge-pending") {
+      // d3c-2a decision 4: the earlier cycle's resources are purged first; the cycle reports that, never a pass.
+      await d.record({ cycle, phase: "purge", at: at(), fingerprint: d.fingerprint, result: { ok: false, code: "previous-purge-pending" } });
+      return { exit: 3, phase: "purge", cycle, code: "in_progress" };
+    }
     await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint });
     return { exit: 3, phase: "run1", cycle, code: "in_progress" };
   }
