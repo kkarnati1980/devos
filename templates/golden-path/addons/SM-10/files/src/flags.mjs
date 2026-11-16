@@ -61,7 +61,8 @@ export function killSwitches({ phases, source, defaults = {}, refreshMs = 5000, 
       if (r && typeof r.then === "function") r.then(undefined, () => {});
     } catch { /* swallowed */ }
   };
-  const base = Object.fromEntries(phases.map((p) => [p, defaults[p] ?? true]));
+  // Own properties only: a phase named like an Object.prototype member (`constructor`) must not read the inherited one.
+  const base = Object.fromEntries(phases.map((p) => [p, Object.hasOwn(defaults, p) ? defaults[p] : true]));
   let state = Object.freeze({ ...base });
   let readAt = -Infinity;
   let inFlight = null;

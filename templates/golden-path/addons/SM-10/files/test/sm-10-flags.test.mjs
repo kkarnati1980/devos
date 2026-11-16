@@ -248,3 +248,13 @@ test("SM-10-L1: reads are shared and rate-limited; declarations are checked", as
   assert.throws(() => fileSource(""), /needs a path/);
   assert.throws(() => dbSource(null), /query function/);
 });
+
+test("SM-10: a phase named like an Object.prototype member gets its own default, never the inherited property (Codex PR175-r3)", async () => {
+  const sw = killSwitches({ phases: ["constructor", "tostring"], source: async () => ({}), defaults: {} });
+  const flags = await sw.clientFlags();
+  assert.deepEqual(flags, { constructor: true, tostring: true });
+  assert.equal(typeof flags.constructor, "boolean");
+  const off = killSwitches({ phases: ["constructor"], source: async () => ({}), defaults: { constructor: false } });
+  assert.deepEqual(await off.clientFlags(), { constructor: false });
+});
+
