@@ -289,6 +289,26 @@ test("M2.3 AT12 (DEVOS-135): a deep-linked purge card shows the phrase to type a
   await context.close();
 });
 
+test("DEVOS-110: the probe's grant card shows its fixed grant, has no hours/uses inputs and approves with an empty body", async () => {
+  const P = "00000000-0000-4000-8000-0000000000a6";
+  api.state.approvals.push({ id: P, gate: "destructive_or_spend", action: "teardown.probe-grant", target: "project:00000000-0000-4000-8000-0000000000b1", reason: "DevOS runs a weekly self-test.", consequence: "Nothing is deleted except the probe's own test resources.", costUsd: null, projectId: null, status: "pending", createdAt: "2026-11-13T10:00:00.000Z", decidedAt: null, decidedBy: null, blockedTasks: 0, grant: null });
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  const { page, context, problems } = await open(`/approvals?id=${P}`);
+  await page.getByTestId("approval-detail").waitFor();
+  assert.match(await page.getByTestId("approve-fixed").innerText(), /90 days, at most 30 uses/);
+  assert.equal(await page.getByTestId("approve-hours").count(), 0, "no hours input for the fixed grant");
+  assert.equal(await page.getByTestId("approve-uses").count(), 0, "no uses input for the fixed grant");
+  await page.getByTestId("approve").click();
+  await page.getByTestId("detail-status").filter({ hasText: "approved" }).waitFor();
+  const last = api.state.received.at(-1);
+  assert.equal(last.url, `/approvals/${P}/approve`);
+  assert.deepEqual(JSON.parse(last.body), {});
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "the approve carried the session's CSRF token");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems, []);
+  await context.close();
+});
+
 test("AT-CA3b (CR-a3, DEVOS-199): the project page shows the pre-flight read-only — waiting for secrets, answers and defaults, escaped", async () => {
   const { page, context, problems } = await open("/projects/xss-probe");
   await page.getByTestId("preflight-state").waitFor();
