@@ -16,7 +16,45 @@ permissions:
   pull-requests: read # GI-1d: the PR's changed files and the watcher's PASS comment
   # GI-1d: PR number and base SHA come from the event file; history is fetched only when a disposition is judged.
 jobs:
+  # DEVOS-239 part b (GI-1e, note 0028): KK's answers to KK-only floor-guard hits, read from his own Linear comment on
+  # the PR's issue by the BASE commit's kk-source.mjs with a read-only key. A job of its own that checks out only the
+  # base and installs nothing, so no code from the head runs where the key is. Any failure (no key on a fork PR,
+  # Linear down, a base with no kk-source.mjs yet) gives no answers and every KK-only hit stays refused.
+  kk-answers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      answers: ${{ steps.read.outputs.answers }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: scripts/release
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Read KK's floor-guard answers from Linear
+        id: read
+        env:
+          LINEAR_READ_KEY: ${{ secrets.LINEAR_READ_KEY }}
+        run: |
+          out="$RUNNER_TEMP/kk-answers.json"
+          if [[ -f scripts/release/kk-source.mjs ]]; then
+            node scripts/release/kk-source.mjs --event "$GITHUB_EVENT_PATH" --out "$out"
+          else
+            echo "ci-gate: the base commit has no kk-source.mjs; no KK answers are read"
+            printf '%s' '{"records":[],"unreadable":0,"issues":[],"error":"the base commit has no kk-source.mjs"}' > "$out"
+          fi
+          echo "answers=$(cat "$out")" >> "$GITHUB_OUTPUT"
   ci-gate:
+    needs: kk-answers
+    # A failed kk-answers job must never skip the required gate (a skipped required check counts as passing): the
+    # gate always runs, and the hand-over step then gives it no answers (pre-review r2, finding 2).
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -50,6 +88,20 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           path: .gate-src
           persist-credentials: false
+      # DEVOS-239 part b (GI-1e, note 0028): KK's answers come from the kk-answers job, which never sees the head's
+      # code; this step only writes them to a file for the gate step. Before the swap, so nothing runs between the
+      # swap and the gate (AT13).
+      - name: Hand KK's floor-guard answers to the gate (DEVOS-239)
+        env:
+          KK_ANSWERS: ${{ needs.kk-answers.outputs.answers }}
+          KK_RESULT: ${{ needs.kk-answers.result }}
+        run: |
+          if [[ "$KK_RESULT" == "success" ]]; then
+            printf '%s' "$KK_ANSWERS" > "$RUNNER_TEMP/kk-answers.json"
+          else
+            echo "ci-gate: the kk-answers job did not succeed ($KK_RESULT); no KK answers are used"
+            printf '%s' '{"records":[],"error":"the kk-answers job did not succeed"}' > "$RUNNER_TEMP/kk-answers.json"
+          fi
       - name: Use the base commit's copy of the gate's code and its yaml (DEVOS-202)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
