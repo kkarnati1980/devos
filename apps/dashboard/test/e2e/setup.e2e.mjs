@@ -513,11 +513,11 @@ test("M2.6-b2b3 (DEVOS-248): Open in Linear links for the project and modules wi
     await context.close();
   }
 
-  // A project with the mirror off (or no stored Linear id): no link at all.
+  // A project with the mirror off: no link at all (a module without a stored id is dropped by the API, linear-links.test.mjs).
   const { page, context, problems } = await open("/projects/social-content-extraction");
   const panel = page.getByTestId("linear-panel");
   await panel.getByTestId("linear-off").waitFor();
-  assert.equal(await panel.locator("a").count(), 0, "no link without a stored Linear id");
+  assert.equal(await panel.locator("a").count(), 0, "no link while the mirror is off");
   assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
   assert.deepEqual(problems.filter((p) => !/status of 404 \(Not Found\)$/.test(p)), []);
   await context.close();
