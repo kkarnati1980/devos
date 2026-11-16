@@ -1,0 +1,16 @@
+{
+  "id": "SM-18",
+  "name": "Integrations",
+  "files": [
+    "src/integration-error.mjs",
+    "src/webhook.mjs",
+    "src/events.mjs",
+    "src/cache.mjs",
+    "src/token-vault.mjs",
+    "test/sm-18-integrations.test.mjs"
+  ],
+  "checks": {
+    "SM-18-L1": "test/sm-18-integrations.test.mjs"
+  },
+  "usage": "Use only the parts that apply; delete the others with their tests. Webhooks (src/webhook.mjs): read the raw body with readRawBody(req) (1 MB cap; answer too-large with 413 and Connection: close), take the bare hex HMAC and the timestamp out of the provider's headers (strip a prefix such as 'sha256=' or split 't=…,v1=…' first), then const { release } = await verifyWebhook({ secrets, body, signature, timestamp, replay }) with the shared secret from config (WEBHOOK_SECRET, never in the repo; list two while rotating) and one memoryReplayStore() per process, or a shared store with the same claim(key, expiresAtMs) and release(key) contract (a unique-key insert and a delete) when the app runs more than one instance. It checks an HMAC-SHA256 over '<timestamp>.<raw body>' in constant time, a 5-minute window and replays. Answer 400 for signature-missing, signature-invalid, timestamp-invalid, stale and replayed, and 503 for replay-store-full (the sender retries). Parse JSON only after it passes. If processing then fails and you answer 5xx, call release() first so the provider's resend is accepted. A provider with its own signing scheme (Stripe, Razorpay) uses its official verifier instead, plus the window where the provider signs a timestamp, and the event ledger for dedupe. Payment events (src/events.mjs): createEventLedger({ rank, store }) and apply({ id, objectId, type, version }, handler): version is the provider's event time or sequence per object, rank orders event types that share a version (later states higher); duplicates and events older than the object's last applied one are not applied, and a failing handler records nothing so the provider's retry is applied. With more than one instance, give it a database store: transaction(fn) plus hasEvent/lastOrder/commit taking the transaction (applied event ids under a unique key, the object's row upserted first and then read with SELECT … FOR UPDATE, so even its first two events cannot race), and write in the handler through the transaction it is given, so the effect and the record commit together. Cache (src/cache.mjs): createCache({ ttlMs }) — every entry expires; read with get(key, loader) and change data only through write(keys, writer), which drops the keys before and after the write so no read returns the old value afterwards. Third-party tokens (src/token-vault.mjs): createTokenVault({ keys: loadTokenKeys(TOKEN_KEYS), scopes }) with TOKEN_KEYS='<id>:<32-byte base64 key>' from the server's secret store (openssl rand -base64 32; put the new key first to rotate, then rewrap() stored records before removing the old key; rewrap needs the record's scopes still declared and the token not expired) and scopes = the least scopes the app needs per provider; ask the provider for scopesFor(provider, need) only, seal() what it returns (a broader grant is refused), store the record, and open(record, { provider, owner, need }) only for the signed-in owner. Never log a token, a key or a signature."
+}
