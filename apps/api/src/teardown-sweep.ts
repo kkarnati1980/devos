@@ -73,8 +73,12 @@ export interface TeardownSweepDeps {
    * per approval: the purge's single policy check, before any provider call, spends a use.
    */
   unspentGrant(approvalId: string, now: Date): Promise<string | null>;
-  /** Purge under the card's grant (teardownWiring + purgeProject); throws `TeardownError` on a stop. */
-  purge(projectId: string, grantId: string): Promise<PurgeResultLike>;
+  /**
+   * Purge under the card's grant (teardownWiring + purgeProject); throws `TeardownError` on a stop. Its authorizer
+   * allows only when M1.7 actually used this grant (so the attempt spends it, whatever the policy mode or rules) and,
+   * re-read under the project lock, the card is not older than the project's `archived_at`.
+   */
+  purge(projectId: string, grantId: string, cardCreatedAt: Date): Promise<PurgeResultLike>;
   /** `purge_after` from `from` to `to`, only while the project is archived and `purge_after` is still `from`. */
   keepArchived(projectId: string, from: Date, to: Date, approvalId: string): Promise<boolean>;
   log(e: { level: "info" | "warn"; msg: string; projectId?: string; code?: string; approvalId?: string }): void;
@@ -181,6 +185,12 @@ export class TeardownSweepJob {
    * is harmless for the same reason.
    */
   private readonly waitForDaily = new Set<string>();
+  /**
+   * Approvals whose purge stopped for good (pre-review r2 3): never run again by this process. A stop that spent the
+   * grant is already final through rule 4; one that did not (refused at the policy check, or `not_archived`) wrote
+   * nothing at a provider, so a single repeat after a restart is harmless.
+   */
+  private readonly stopped = new Set<string>();
   private readonly now: () => number;
 
   constructor(private readonly d: TeardownSweepDeps) {
@@ -253,7 +263,7 @@ export class TeardownSweepJob {
     const seen = new Set<string>();
     for (const c of approved) {
       const pid = c.projectId;
-      if (!pid || c.target !== target(pid) || seen.has(pid) || this.waitForDaily.has(c.id)) continue;
+      if (!pid || c.target !== target(pid) || seen.has(pid) || this.waitForDaily.has(c.id) || this.stopped.has(c.id)) continue;
       const grant = await this.d.unspentGrant(c.id, new Date(this.now()));
       if (!grant) continue;
       const p = await this.d.project(pid);
@@ -263,12 +273,12 @@ export class TeardownSweepJob {
         continue;
       }
       seen.add(pid);
-      await this.runPurge(p, c.id, grant);
+      await this.runPurge(p, c.id, grant, c.createdAt);
     }
   }
 
-  private async runPurge(p: TeardownProject, approvalId: string, grantId: string): Promise<void> {
-    const run = this.d.purge(p.id, grantId);
+  private async runPurge(p: TeardownProject, approvalId: string, grantId: string, cardCreatedAt: Date): Promise<void> {
+    const run = this.d.purge(p.id, grantId, cardCreatedAt);
     let result: PurgeResultLike;
     try {
       result = await withLimit(run, this.d.purgeTimeoutMs ?? PURGE_TIME_LIMIT_MS);
@@ -289,7 +299,14 @@ export class TeardownSweepJob {
     const stop = teardownStop(e);
     const code = stop ? stop.code : "teardown-purge-failed";
     // Only a fixed code is logged, never an error's text (it may quote a provider body).
+    if (stop && stop.code === "not_archived") {
+      // Restored while the purge waited for the project lock: KK's newer word, not a stop (pre-review r2 3).
+      this.stopped.add(approvalId);
+      this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, approvalId, code: "not-archived" });
+      return;
+    }
     if (stop && !stop.retryable) {
+      this.stopped.add(approvalId);
       this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
       await this.raiseStopped(p, code);
       return;
@@ -306,6 +323,7 @@ export class TeardownSweepJob {
       this.d.log({ level: "info", msg: "teardown-purged", projectId: p.id, approvalId });
       return;
     }
+    this.stopped.add(approvalId);
     const code = r.report.errors.length ? "scan-error" : r.report.hits.length ? "leftover" : "incomplete";
     this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
     await this.raiseStopped(p, code);

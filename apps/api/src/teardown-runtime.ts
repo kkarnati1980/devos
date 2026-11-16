@@ -5,7 +5,8 @@
 import type { KkSession } from "./auth.js";
 import { provisionConfig, vaultToken, type ProvisionModule } from "./provision-runtime.js";
 import { teardownWiring, type ProvisionTeardownModule, type TeardownModule, type TeardownStoreLike } from "./teardown-wiring.js";
-import { grantAuthorizer } from "./provision-probe-purge.js";
+import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
+import { teardownResource } from "./teardown-wiring.js";
 import { TeardownSweepJob, type PurgeCardLike, type TeardownSweepDeps } from "./teardown-sweep.js";
 import type { ScanReportLike, TeardownActions, TeardownProjectRow, TeardownReader, TeardownServices } from "./teardown-routes.js";
 
@@ -108,6 +109,29 @@ export function buildTeardownServices(w: {
 // runs only under the grant of an approved purge card (grantAuthorizer: the provisioner identity presenting KK's
 // grant to M1.7), on teardownWiring's pinned clients, scanners and preflight list. Every read is bounded.
 
+/**
+ * M2.5-b2 rule 4 (pre-review r2 1 and 2): the purge's authorizer. Only `teardown.purge`; refused when the card is older
+ * than the project's `archived_at` (re-read when purgeProject asks, which is under the project lock, so a Restore and a
+ * new Archive in between are seen); and "allow" only when M1.7 allowed **by using this grant**, so every attempt spends
+ * a use whatever the policy mode or rules (an un-gated allow, e.g. observe mode, is "require_approval", never a purge).
+ */
+export function purgeCardAuthorizer(
+  policy: { decide(r: unknown): Promise<{ enforcedOutcome: string; approvalGrantId?: string | null }> },
+  projectId: string,
+  grantId: string,
+  cardCreatedAt: Date,
+  archivedAt: () => Promise<Date | null>,
+): Authorize {
+  return async (action, resource) => {
+    if (action !== "teardown.purge" || resource !== teardownResource(projectId)) return "deny";
+    const since = await archivedAt();
+    if (!since || cardCreatedAt.getTime() < since.getTime()) return "deny";
+    const d = await policy.decide({ identity: PROVISIONER_IDENTITY, action: { type: action, resource, projectId }, approvalGrantId: grantId });
+    if (d.enforcedOutcome === "allow") return d.approvalGrantId === grantId ? "allow" : "require_approval";
+    return d.enforcedOutcome === "require_approval" ? "require_approval" : "deny";
+  };
+}
+
 /** The job waits up to 60 s for the project lock (a provisioning tick or a route may hold it). */
 export const PURGE_LOCK_WAIT_MS = 60_000;
 
@@ -170,9 +194,10 @@ export function buildTeardownSweep(w: {
       }));
       return rows.find((g) => g.uses === 0 && g.maxUses >= 1)?.id ?? null;
     },
-    purge: async (projectId, grantId) => {
+    purge: async (projectId, grantId, cardCreatedAt) => {
       const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs });
-      return td.purgeProject(projectId, { store, authorize: grantAuthorizer(w.policy, projectId, grantId), ops: wiring.ops, scanners: wiring.scanners, preflight: wiring.preflight });
+      const authorize = purgeCardAuthorizer(w.policy, projectId, grantId, cardCreatedAt, async () => (await store.project(projectId))?.archivedAt ?? null);
+      return td.purgeProject(projectId, { store, authorize, ops: wiring.ops, scanners: wiring.scanners, preflight: wiring.preflight });
     },
     keepArchived: (projectId, from, to, approvalId) =>
       tx(async (t) => {

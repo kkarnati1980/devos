@@ -7,12 +7,11 @@ import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { TeardownError } from "@devos/teardown";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { Approvals, MemoryApprovalStore, parseCard } from "../dist/approvals.js";
-import { grantAuthorizer } from "../dist/provision-probe-purge.js";
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
 } from "../dist/teardown-sweep.js";
-import { buildTeardownSweep } from "../dist/teardown-runtime.js";
+import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
 const KEY = Buffer.alloc(32, 7);
 const P = "11111111-2222-4333-8444-555555555555";
@@ -27,11 +26,11 @@ const purgeRule = {
   roles: [], environments: [], effect: "require_approval", constraints: {}, enabled: true,
 };
 
-function setup({ purgeImpl, purgeTimeoutMs } = {}) {
+function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule] } = {}) {
     const failDue = { n: 0 };
   let now = T0;
   const kk = new KkSessionRegistry();
-  const policyStore = new MemoryPolicyStore({ mode: "enforce", rules: [purgeRule] });
+  const policyStore = new MemoryPolicyStore({ mode, rules });
   const engine = new PolicyEngine({ store: policyStore, hmacKey: KEY, now: () => now, verifyKkSession: kk.verify });
   const store = new MemoryApprovalStore();
   const approvals = new Approvals({ store, grants: engine, notifier: null, verifyKkSession: kk.verify, now: () => now });
@@ -39,10 +38,10 @@ function setup({ purgeImpl, purgeTimeoutMs } = {}) {
   const counts = { [P]: { github: 2, coolify: 5 } };
   const calls = { purge: [], providerCalls: 0, keep: [] };
   const logs = [];
-  const purge = async (projectId, grantId) => {
+  const purge = async (projectId, grantId, cardCreatedAt) => {
     calls.purge.push({ projectId, grantId });
-    // The real purge checks `teardown.purge` once before any provider call (M2.5-a1); the same check here.
-    const d = await grantAuthorizer(engine, projectId, grantId)("teardown.purge", `project:${projectId}`);
+    // The real purge checks `teardown.purge` once before any provider call (M2.5-a1), with the production authorizer.
+    const d = await purgeCardAuthorizer(engine, projectId, grantId, cardCreatedAt, async () => projects.get(projectId)?.archivedAt ?? null)("teardown.purge", `project:${projectId}`);
     if (d !== "allow") throw new TeardownError("approval_required", false, "approval needed");
     calls.providerCalls++;
     if (purgeImpl) return purgeImpl(projectId);
@@ -382,4 +381,45 @@ test("pre-review 6: the production queries: an unspent grant only, and Keep arch
   assert.equal(audit.action, "teardown.keep_archived");
   assert.equal(audit.details.approvalId, "a1");
   assert.ok(seen.filter((x) => x[0] === "tx").every((x) => x[1].timeout === 1000 && x[1].maxWait === 1000), "every read bounded");
+});
+
+test("pre-review r2 1: observe mode or an allow rule never purges un-gated; one approval = at most one attempt", async () => {
+  const allowRule = { ...purgeRule, id: "r-allow", effect: "allow" };
+  for (const opts of [{ mode: "observe", rules: [] }, { mode: "enforce", rules: [allowRule] }]) {
+    const s = setup(opts);
+    await s.job.tick();
+    const [c] = await s.purgeCards("pending");
+    await approve(s, c.id);
+    await s.job.tick();
+    s.advance(10 * 60_000);
+    await s.job.tick();
+    s.advance(DAY);
+    await s.job.tick();
+    assert.equal(s.calls.providerCalls, 0, `${opts.mode}: refused at the check, nothing deleted`);
+    assert.equal(s.calls.purge.length, 1, `${opts.mode}: one attempt only`);
+    assert.equal(s.projects.get(P).stage, "archived");
+  }
+});
+
+test("pre-review r2 2: the authorizer refuses a card older than archived_at, re-read when the purge asks", async () => {
+  const s = setup();
+  let archivedAt = new Date(T0);
+  const auth = purgeCardAuthorizer(s.engine, P, "00000000-0000-4000-8000-0000000000ff", new Date(T0 - 1), async () => archivedAt);
+  assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
+  assert.equal(await auth("teardown.archive", `project:${P}`), "deny");
+  archivedAt = null;
+  assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
+});
+
+test("pre-review r2 3: not_archived (Restore while waiting for the lock) is a skip, never a stop card, and not re-run", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("not_archived", false, "x"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await s.approvals.approve(s.session, c.id, { confirmation: `PURGE project:${P}`, maxUses: 3, expiresInHours: 72 });
+  await s.job.tick();
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 1);
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "not-archived"));
 });
