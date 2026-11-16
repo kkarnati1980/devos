@@ -41,6 +41,11 @@ export interface TeardownStore {
   markRestored(projectId: string): Promise<void>;
   /** The project's active inventory rows, oldest first. */
   activeResources(projectId: string): Promise<ActiveResource[]>;
+  /**
+   * DEVOS-235 (Codex PR160-r1): records that this run is about to send the row's provider delete, before the call,
+   * so a later run knows a 404 for it may be its own earlier delete. Returned as `deleteStartedAt` by `activeResources`.
+   */
+  markDeleteStarted(resourceId: string, at: Date): Promise<void>;
   markResourceDeleted(resourceId: string, at: Date): Promise<void>;
   /** Removes the project's `provision_step` rows (M2.4 hand-off: no stale `done` rows after a purge). */
   resetSteps(projectId: string): Promise<void>;
@@ -312,6 +317,7 @@ export async function purgeProject(projectId: string, opts: PurgeOptions): Promi
       if (before) {
         if (!before.owned) throw new TeardownError("ownership_mismatch", false, `${describe(r)} no longer carries this project's marker; not deleted`, pick(r));
         await opts.store.assertLockHeld(projectId);
+        await opts.store.markDeleteStarted(r.id, new Date(now()));
         try {
           await ops.remove(r);
         } catch (e) {

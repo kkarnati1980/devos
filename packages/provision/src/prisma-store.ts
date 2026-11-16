@@ -152,7 +152,7 @@ export class PrismaStore implements ProvisionStore {
     const hit = await q(this.db.resource.findUnique({ where })) as any;
     if (hit) {
       if (hit.projectId !== projectId) throw new Error("resource_owned_elsewhere");
-      if (hit.status !== "active") await q(this.db.resource.update({ where, data: { status: "active", deletedAt: null, name: r.name } }));
+      if (hit.status !== "active") await q(this.db.resource.update({ where, data: { status: "active", deletedAt: null, deleteStartedAt: null, name: r.name } }));
       return;
     }
     try {
