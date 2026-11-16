@@ -648,3 +648,50 @@ test("S4-b2d (pre-review): without the conntrack tool the run says so, exits 1 a
   assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.0.0/14");
   assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/, "the block itself does not need conntrack");
 });
+
+test("S4-b2d (pre-review r2): the cut is queued before the change, so a failed record cannot lose it", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  setState(h, { stacks: [STATE.stacks[1]] });
+  fs.mkdirSync(path.join(h, "devos/isolation/installed.rules.tmp")); // record() cannot write its temp file
+  const r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /could not record/);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24", "queued before iptables-restore ran");
+});
+
+test("S4-b2d (pre-review r2): a rolled-back change leaves the pending list as it was (no NAT reset for nothing)", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(pending(h), "10.208.3.0/24\n"); // an older cut still due
+  const l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [STATE.stacks[1]] }); // would cut beta's /24
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.match(r.out, /rolled back to the previous block/);
+    assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.3.0/24", "beta's cut was dropped with the rollback");
+  } finally { l.stop(); }
+  const f = host(STATE);
+  setState(f, { stacks: [STATE.stacks[1]] });
+  assert.equal(run(f, [], { FAKE_RESTORE_RC: "1" }).code, 1);
+  assert.equal(fs.existsSync(pending(f)), false, "a refused restore queues nothing");
+});
+
+test("S4-b2d (pre-review r2): drift plus a state change in one tick still cuts the whole pool", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "nf/DEVOS-ISO-FWD"), "");
+  setState(h, { stacks: [...STATE.stacks, { slug: "gamma", env: "live", idx: 9, egress: false, tailnet: [] }] });
+  const n0 = ctLog(h).length;
+  assert.equal(run(h).code, 0);
+  assert.deepEqual(ctLog(h).slice(n0), ["-D -s 10.208.0.0/14"]);
+});
+
+test("S4-b2d (pre-review r2): a pending entry with an octet above 255 is dropped, not retried forever", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(pending(h), "10.208.999.0/24\n");
+  assert.equal(run(h).code, 0);
+  assert.equal(ctLog(h).length, 1, "only the first apply's pool cut");
+});

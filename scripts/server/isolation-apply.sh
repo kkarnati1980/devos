@@ -129,8 +129,12 @@ T0=$SECONDS
 DEADLINE="$(conf ISOLATION_DEADLINE_S)"; [[ "$DEADLINE" =~ ^[0-9]{1,2}$ ]] && (( DEADLINE <= 25 )) || DEADLINE=25  # pre-review: never above 25
 shrunk() {  # $1 = previous block, $2 = new block -> the /24 sources (or the pool) whose rules shrank, one per line
   [[ -z "$1" ]] && { echo "$POOL"; return; }
+  # Pre-review r2: a change to the pool-wide rules (no /24 source: the private-range DROPs, the final DROP, their
+  # order) can shrink every stack at once, so it cuts the whole pool.
+  local re=' -s 10\.[0-9]+\.[0-9]+\.0/24 '
+  [[ "$(grep -vE -- "$re" <<<"$1")" == "$(grep -vE -- "$re" <<<"$2")" ]] || { echo "$POOL"; return; }
   # One pass (pre-review: per-rule greps were O(n^2)): previous rules with a /24 source that the new block lacks.
-  comm -23 <(grep -E -- ' -s 10\.[0-9]+\.[0-9]+\.0/24 ' <<<"$1" | LC_ALL=C sort -u) <(LC_ALL=C sort -u <<<"$2") \
+  comm -23 <(grep -E -- "$re" <<<"$1" | LC_ALL=C sort -u) <(LC_ALL=C sort -u <<<"$2") \
     | grep -oE -- '-s 10\.[0-9]+\.[0-9]+\.0/24' | cut -d' ' -f2 | LC_ALL=C sort -u
 }
 ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack; 0 when nothing is left pending
@@ -140,22 +144,23 @@ ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack;
     echo "conntrack not installed: connections opened before the change are kept until they close ($(paste -sd' ' "$f"))"; return 1
   fi
   while IFS= read -r src; do
-    [[ "$src" =~ ^10\.(20[89]|21[01])\.[0-9]{1,3}\.0/(24|14)$ ]] || continue
+    [[ "$src" =~ ^10\.(20[89]|21[01])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.0/(24|14)$ ]] || continue
     # Pre-review: no call may run past the agent's 60 s, so the last one starts by 49 s and gets what is left.
     if (( SECONDS - T0 >= 49 )); then left+="$src"$'\n'; continue; fi
     # conntrack exits 1 when no entry matched ("0 flow entries have been deleted"); that is a success here.
-    out="$(timeout $(( 59 - (SECONDS - T0) < 10 ? 59 - (SECONDS - T0) : 10 )) conntrack -D -s "$src" 2>&1)"; rc=$?
+    out="$(timeout 10 conntrack -D -s "$src" 2>&1)"; rc=$?
     (( rc == 0 )) || { (( rc == 1 )) && [[ "$out" == *": 0 flow entries have been deleted"* ]]; } || left+="$src"$'\n'
   done < "$f"
   if [[ -n "$left" ]]; then printf '%s' "$left" > "$f.tmp" && mv -f "$f.tmp" "$f"; echo "conntrack clean-up incomplete, retried next tick: $(paste -sd' ' "$f")"; return 1; fi
   rm -f "$f"; return 0
 }
-ct_queue() {  # $1 = previous block, $2 = new block -> add the shrunk sources to the pending list
+ct_queue() {  # $1 = previous block, $2 = new block, $3 = 1 when the live chains drifted -> pending list
   local new
   new="$(shrunk "$1" "$2")"
-  # Pre-review: a re-install of the same block is a drift repair (a flushed chain or a lost jump); flows opened
-  # while it was missing would survive it through the ESTABLISHED return, so the whole pool is cut.
-  [[ -n "$1" && "$1" == "$2" ]] && new="$POOL"
+  # Pre-review: a drift repair (a flushed chain or a lost jump, judged from the live state, whatever the new
+  # block is) cuts the whole pool: flows opened while the block was missing would survive it through the
+  # ESTABLISHED return.
+  [[ "${3:-0}" == 1 ]] && new="$POOL"
   [[ -n "$new" ]] || return 0
   { [[ -s "$ISO/conntrack.pending" ]] && cat "$ISO/conntrack.pending"; echo "$new"; } | sort -u > "$ISO/conntrack.pending.tmp" \
     && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
@@ -359,8 +364,17 @@ pre_ok=1; pre_msg="$(selftest)" || pre_ok=0
 (( SECONDS - T0 <= DEADLINE )) || { echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; exit 1; }
 # Pre-review: the cut is queued BEFORE the change, so a kill, a failed record or a failed boot step after it can
 # never lose it. A cut queued for a change that then fails or rolls back is harmless (decision 2).
-ct_queue "$PREV" "$BLOCK" || { echo "could not write $ISO/conntrack.pending: nothing changed"; exit 1; }
+# Pre-review r2: a cut resets NATed connections (the mapping goes with the entry), so it must not happen for a
+# change that is rolled back: the list is snapshotted here and restored after a successful rollback.
+drift=0; [[ -n "$PREV" ]] && { [[ -n "$(jump_ops)" ]] || ! live_matches "$PREV"; } && drift=1
+CT_SNAP=""; [[ -s "$ISO/conntrack.pending" ]] && CT_SNAP="$(cat "$ISO/conntrack.pending")"
+ct_restore() {  # the pending list as it was before this run's ct_queue
+  if [[ -n "$CT_SNAP" ]]; then printf '%s\n' "$CT_SNAP" > "$ISO/conntrack.pending.tmp" && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
+  else rm -f "$ISO/conntrack.pending"; fi
+}
+ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; exit 1; }
 if ! install_block "$BLOCK"; then
+  ct_restore
   echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
 fi
 if ! post_msg="$(selftest)"; then
@@ -370,9 +384,9 @@ if ! post_msg="$(selftest)"; then
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
   if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && record "$PREV" && { boot_sync "$PREV"; echo "rolled back to the previous block"; } || echo "rollback failed: run $0 --remove from the console"
+    install_block "$PREV" && record "$PREV" && { ct_restore; boot_sync "$PREV"; echo "rolled back to the previous block"; } || echo "rollback failed: run $0 --remove from the console"
   else
-    remove_block && rm -f "$ISO/live.sha256" && { boot_sync ""; echo "rolled back: S4 block removed"; } || echo "rollback failed: run $0 --remove from the console"
+    remove_block && rm -f "$ISO/live.sha256" && { ct_restore; boot_sync ""; echo "rolled back: S4 block removed"; } || echo "rollback failed: run $0 --remove from the console"
   fi
   exit 1
 fi
