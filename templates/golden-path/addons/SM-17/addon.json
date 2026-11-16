@@ -1,0 +1,12 @@
+{
+  "id": "SM-17",
+  "name": "Files and uploads",
+  "files": [
+    "src/uploads.mjs",
+    "test/sm-17-uploads.test.mjs"
+  ],
+  "checks": {
+    "SM-17-L1": "test/sm-17-uploads.test.mjs"
+  },
+  "usage": "Read an upload with readBody(req, maxBytes) from src/uploads.mjs (it refuses a declared length over the cap before reading and cuts a body that grows past it), then checkUpload({ name, bytes, allow, maxBytes }): the file's first bytes decide its type (png, jpeg, gif, webp, pdf; narrow allow to what the app needs), a file whose bytes are not an allowed type is refused, and so is a file whose name says another type (a renamed file). Answer too-large with 413. Keep files with createStore({ dir, webRoot }).save(bytes, checked): dir is an absolute folder outside the folder the app serves (webRoot, default ./public), set from config (for example UPLOAD_DIR=/data/uploads on a mounted volume); each file gets a random 32-hex name and the sniffed extension, never the user's name, written once with owner-only permissions. Serve a stored file only through your own route that checks the caller may see it, with the stored type as Content-Type, X-Content-Type-Options: nosniff and Content-Disposition: attachment for anything that is not an image. SVG and HTML are not accepted: they can carry script."
+}
