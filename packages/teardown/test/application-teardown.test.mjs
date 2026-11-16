@@ -6,12 +6,13 @@ import assert from "node:assert/strict";
 import {
   allowAll, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, stackSteps, parsePortRange, runProvision,
   githubRepoOps, coolifyProjectOps, coolifyEnvironmentOps, coolifyPortOps, coolifyApplicationOps, githubScanner, coolifyScanner,
-  ownershipMarker, applicationName,
+  ownershipMarker, applicationName, coolifyTokenScopeCheck, pinnedCoolify,
 } from "@devos/provision";
 import { archiveProject, restoreProject, purgeProject, inventoryScanner, MemoryTeardownStore, TeardownError } from "../dist/index.js";
 import { fakeProviders } from "../../provision/test/fakes.mjs";
 
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
+const OTHER_TEAM = "TESTONLY_coolify_token_of_another_team_0000";
 const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme", name: "Acme app" };
 const RANGE = parsePortRange("20000-20999");
 const json = (status, body) => new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -21,12 +22,14 @@ function fakes() {
   const calls = [];
   const lingering = new Map(); // uuid -> reads left before a queued delete finishes (Coolify queues it)
   const stopStatus = { value: 200 };
+  const coolify = { wrongTeam: false, projectStatus: 0 }; // DEVOS-235: a token for another team sees no uuid
   const stopReads = new Map(); // uuid -> reads that still show "running:healthy" after a stop was queued
   async function fetchImpl(url, init = {}) {
     const u = new URL(url);
     const method = init.method ?? "GET";
     const path = u.pathname;
-    calls.push({ method, path, query: u.search });
+    const auth = new Headers(init.headers ?? {}).get("authorization");
+    calls.push({ method, path, query: u.search, auth });
     let m;
     if (u.origin === "https://api.github.com") {
       if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)$/)) && (method === "PATCH" || method === "DELETE")) {
@@ -40,6 +43,10 @@ function fakes() {
       if (method === "GET" && path === "/user/repos") return json(200, Number(u.searchParams.get("page") ?? 1) === 1 ? [...base.repos.values()] : []);
     }
     if (u.origin === "http://coolify.test:8000") {
+      const wrongTeam = coolify.wrongTeam || auth === `Bearer ${OTHER_TEAM}`;
+      if (wrongTeam && /^\/api\/v1\/(projects|applications)\/[^/]+/.test(path)) return json(404, { message: "Not found." });
+      if (wrongTeam && method === "GET" && /^\/api\/v1\/(projects|applications)$/.test(path)) return json(200, []);
+      if (coolify.projectStatus && method === "GET" && /^\/api\/v1\/projects\/[^/]+$/.test(path)) return json(coolify.projectStatus, { message: "injected" });
       if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)\/stop$/)) && method === "GET") {
         const a = base.apps.get(m[1]);
         if (!a) return json(404, { message: "Application not found." });
@@ -82,7 +89,7 @@ function fakes() {
     }
     return base.fetchImpl(url, init);
   }
-  return { ...base, fetchImpl, calls, lingering, stopStatus, stopReads, deletes: () => calls.filter((c) => c.method === "DELETE") };
+  return { ...base, fetchImpl, calls, lingering, stopStatus, coolify, stopReads, deletes: () => calls.filter((c) => c.method === "DELETE") };
 }
 
 async function setup(appOpts = { sleep: async () => {} }) {
@@ -102,7 +109,7 @@ async function setup(appOpts = { sleep: async () => {} }) {
   const ops = [githubRepoOps(gh, P.id), coolifyProjectOps(cf, P.id), coolifyEnvironmentOps(cf, P.id), coolifyPortOps(), coolifyApplicationOps(cf, P.id, appOpts)];
   const scanners = [githubScanner(gh), coolifyScanner(cf), inventoryScanner(store), store.vaultScanner()];
   const base = { store, ops, now: () => Date.UTC(2026, 10, 16, 0, 0, 0) };
-  return { fake, store, scanners, base };
+  return { fake, store, scanners, base, cf };
 }
 
 test("M2.5-a3b: Archive stops both applications and deletes nothing", async () => {
@@ -211,4 +218,149 @@ test("pre-review 6: Restore makes no application call; the apps stay stopped and
   assert.ok(!s.fake.calls.slice(before).some((c) => c.path.startsWith("/api/v1/applications/")));
   assert.ok([...s.fake.apps.values()].every((a) => a.stopped));
   assert.equal(s.store.projects.get(P.id).stage, "live");
+});
+
+// DEVOS-235: the Coolify token-scope preflight.
+const coolifyCheck = (s) => coolifyTokenScopeCheck(s.cf, () => s.store.activeResources(P.id));
+
+test("DEVOS-235: a Coolify token for another team stops the purge (provider_forbidden) with zero deletes", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.fake.coolify.wrongTeam = true;
+  // Without the preflight, this token would make every Coolify row look gone (the gap the check closes).
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] }),
+    (e) => e instanceof TeardownError && e.code === "provider_forbidden" && e.retryable === false && /coolify-token-scope/.test(e.message),
+  );
+  assert.equal(s.fake.deletes().length, 0, "nothing deleted");
+  assert.ok(s.store.resources.every((r) => !r.deletedAt), "every row stays active");
+  assert.equal(s.fake.apps.size, 2);
+  assert.equal(s.store.projects.get(P.id).stage, "archived");
+});
+
+test("DEVOS-235: the right team's token passes the preflight and the purge reaches 0", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] });
+  assert.equal(out.purged, true, JSON.stringify(out.report));
+});
+
+test("DEVOS-235: a 5xx on the preflight read stops the purge retryable, never as a scope problem; nothing deleted", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.fake.coolify.projectStatus = 503;
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] }),
+    (e) => e instanceof TeardownError && e.code === "provider_error" && e.retryable === true,
+  );
+  assert.equal(s.fake.deletes().length, 0);
+});
+
+test("DEVOS-235: an inconclusive 200 (another uuid) or a non-uuid recorded id stops the purge with zero deletes", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const rows = await s.store.activeResources(P.id);
+  const swapped = async () => rows.map((r) => (r.provider === "coolify" && r.kind === "project" ? { ...r, externalId: "not/a uuid" } : r));
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyTokenScopeCheck(s.cf, swapped)] }),
+    (e) => e instanceof TeardownError && e.code === "provider_forbidden",
+  );
+  const proj = rows.find((r) => r.provider === "coolify" && r.kind === "project");
+  const real = s.fake.projects.get(proj.externalId);
+  const other = async () => rows.map((r) => (r === proj ? { ...r, externalId: "aaaaaaaa-0000-4000-8000-000000000000" } : r));
+  s.fake.projects.set("aaaaaaaa-0000-4000-8000-000000000000", { ...real, uuid: "bbbbbbbb-0000-4000-8000-000000000000" });
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyTokenScopeCheck(s.cf, other)] }),
+    (e) => e instanceof TeardownError && e.code === "provider_forbidden" && /inconclusive/.test(e.message),
+  );
+  assert.equal(s.fake.deletes().length, 0);
+  assert.throws(() => coolifyTokenScopeCheck(s.cf, null), /coolify-recorded-invalid/);
+});
+
+test("DEVOS-235: with no active Coolify project row there is nothing to prove; the check makes no call", async () => {
+  const s = await setup();
+  const before = s.fake.calls.length;
+  await coolifyTokenScopeCheck(s.cf, async () => [])();
+  assert.equal(s.fake.calls.length, before);
+});
+
+test("DEVOS-235 pre-review: a 403 on the preflight read stops the purge as provider_forbidden, not retryable, zero deletes", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  s.fake.coolify.projectStatus = 403;
+  await assert.rejects(
+    purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] }),
+    (e) => e instanceof TeardownError && e.code === "provider_forbidden" && e.retryable === false,
+  );
+  assert.equal(s.fake.deletes().length, 0);
+});
+
+test("DEVOS-235 pre-review: a purge built on pinnedCoolify keeps the preflight's token even if the vault token changes", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  let token = TOKEN;
+  const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => token, fetchImpl: s.fake.fetchImpl, sleep: async () => {} });
+  const pinned = await pinnedCoolify(cf);
+  token = OTHER_TEAM; // swapped in the vault after the pin: unpinned calls would see every uuid as gone
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: s.fake.fetchImpl, sleep: async () => {} });
+  const ops = [githubRepoOps(gh, P.id), coolifyProjectOps(pinned, P.id), coolifyEnvironmentOps(pinned, P.id), coolifyPortOps(), coolifyApplicationOps(pinned, P.id, { sleep: async () => {} })];
+  const scanners = [githubScanner(gh), coolifyScanner(pinned), inventoryScanner(s.store), s.store.vaultScanner()];
+  const before = s.fake.calls.length;
+  const out = await purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners, preflight: [coolifyTokenScopeCheck(pinned, () => s.store.activeResources(P.id))] });
+  assert.equal(out.purged, true, JSON.stringify(out.report));
+  const cfCalls = s.fake.calls.slice(before).filter((c) => c.path.startsWith("/api/v1/"));
+  assert.ok(cfCalls.length > 0 && cfCalls.every((c) => c.auth === `Bearer ${TOKEN}`), "every Coolify call used the pinned token");
+  assert.equal(s.fake.apps.size, 0, "the applications were really deleted");
+
+  // Control: the same swap without the pin makes the preflight fail closed, nothing deleted.
+  const u = await setup();
+  await archiveProject(P.id, { ...u.base, authorize: allowAll });
+  let t2 = TOKEN;
+  const cf2 = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => t2, fetchImpl: u.fake.fetchImpl, sleep: async () => {} });
+  t2 = OTHER_TEAM;
+  await assert.rejects(
+    purgeProject(P.id, { ...u.base, authorize: allowAll, scanners: u.scanners, preflight: [coolifyTokenScopeCheck(cf2, () => u.store.activeResources(P.id))] }),
+    (e) => e.code === "provider_forbidden",
+  );
+  assert.equal(u.fake.deletes().length, 0);
+});
+
+test("Codex PR160-r1 (AT4): a purge that crashed after deleting the Coolify project resumes; the preflight does not block it", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  // Crash between the Coolify project's DELETE and its inventory update (the window Codex found).
+  const orig = s.store.markResourceDeleted.bind(s.store);
+  s.store.markResourceDeleted = async (id, at) => {
+    const row = s.store.resources.find((r) => r.id === id);
+    if (row.provider === "coolify" && row.kind === "project") throw new Error("simulated crash before the inventory update");
+    return orig(id, at);
+  };
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] }), /simulated crash/);
+  s.store.markResourceDeleted = orig;
+  const row = s.store.resources.find((r) => r.provider === "coolify" && r.kind === "project");
+  assert.equal(s.fake.projects.has(row.externalId), false, "the Coolify project is gone at Coolify");
+  assert.ok(!row.deletedAt && row.deleteStartedAt instanceof Date, "its row is still active, with the delete recorded as started");
+  // Restart: the 404 for that row is its own earlier delete, so the preflight skips it and the purge finishes.
+  const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] });
+  assert.equal(out.purged, true, JSON.stringify(out.report));
+  assert.equal(s.store.projects.get(P.id).stage, "purged");
+});
+
+test("Codex PR160-r1: the delete is recorded as started before its DELETE is sent; a never-started row still needs its 200", async () => {
+  const s = await setup();
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const order = [];
+  const origStart = s.store.markDeleteStarted.bind(s.store);
+  s.store.markDeleteStarted = async (id, at) => { order.push({ id, deletesBefore: s.fake.deletes().length }); return origStart(id, at); };
+  await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [coolifyCheck(s)] });
+  assert.ok(order.length > 0);
+  order.forEach((o, i) => assert.equal(o.deletesBefore, i, `start ${i} recorded before its own DELETE`));
+
+  // A recorded project row without a started delete: a 404 is still a wrong-team token.
+  const u = await setup();
+  const rows = (await u.store.activeResources(P.id)).filter((r) => r.provider === "coolify" && r.kind === "project");
+  assert.ok(rows.length === 1 && rows[0].deleteStartedAt === null);
+  u.fake.coolify.wrongTeam = true;
+  await assert.rejects(coolifyTokenScopeCheck(u.cf, async () => rows)(), /coolify-token-scope/);
+  await coolifyTokenScopeCheck(u.cf, async () => [{ ...rows[0], deleteStartedAt: new Date() }])();
 });

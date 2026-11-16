@@ -15,6 +15,11 @@ export interface InventoryItem {
   kind: string;
   externalId: string;
   name: string;
+  /**
+   * DEVOS-235 (Codex PR160-r1): set when an earlier purge run began this row's provider delete and did not mark the
+   * row deleted (a crash between the DELETE and the inventory update). Absent or null otherwise.
+   */
+  deleteStartedAt?: Date | null;
 }
 
 /** What teardown can do to one kind of resource. `inspect` returns null when the resource is gone. */
@@ -330,6 +335,50 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
 export async function pinnedGitHub(gh: GitHubClient): Promise<GitHubClient> {
   const http = await gh.http.pinned();
   const c = Object.create(Object.getPrototypeOf(gh)) as GitHubClient;
+  Object.defineProperty(c, "http", { value: http, enumerable: true });
+  return c;
+}
+
+const COOLIFY_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * DEVOS-235 purge preflight: Coolify answers 404 for a uuid outside the token's team, so a token for the wrong team
+ * would make every Coolify project, environment and application look gone and blind the leftover scan. Before any
+ * delete, the token must read each of the project's still-active Coolify project rows: a 200 that carries the same
+ * uuid. A 404 (or any other answer) throws `coolify-token-scope`, so the purge stops with `provider_forbidden` and
+ * deletes nothing. A 5xx or timeout stays a transient ProviderError (the purge stops retryable). With no active
+ * Coolify project row there is nothing recorded to prove (docs/modules/M2.5.md, "DEVOS-235 decisions" 2).
+ * Build it, and the purge's Coolify ops and scanner, on one `pinnedCoolify` client, so the proof holds for every call.
+ */
+export function coolifyTokenScopeCheck(cf: CoolifyClient, recorded: () => Promise<readonly InventoryItem[]>): () => Promise<void> {
+  if (typeof recorded !== "function") throw new Error("coolify-recorded-invalid");
+  return async () => {
+    const rows = (await recorded()).filter((r) => r.provider === "coolify" && r.kind === "project");
+    for (const r of rows) {
+      if (!COOLIFY_UUID_RE.test(r.externalId)) throw new Error("coolify-token-scope: a recorded Coolify project id is not a uuid");
+      const res = await cf.http.get<{ uuid?: string }>(`/api/v1/projects/${r.externalId}`);
+      if (res.status === 404) {
+        // Codex PR160-r1: an earlier purge run began deleting this project and crashed before marking the row deleted.
+        // Its 404 then most likely means "gone", so it proves nothing either way: skip it, as decision 2 does for no
+        // row at all. Every other 404 is still read as a wrong-team token.
+        if (r.deleteStartedAt) continue;
+        throw new Error("coolify-token-scope: the Coolify token cannot see this project's Coolify project; use the token of the team that owns it");
+      }
+      if (res.status !== 200 || !res.body || typeof res.body !== "object" || res.body.uuid !== r.externalId) {
+        throw new Error(`coolify-token-scope: Coolify returned an inconclusive answer for the recorded project (${res.status})`);
+      }
+    }
+  };
+}
+
+/**
+ * DEVOS-235 pre-review: one Coolify token snapshot for a whole purge, as `pinnedGitHub` does for GitHub. A token
+ * swapped in the vault after the preflight (another team's) would answer 404 for every uuid and make the stacks look
+ * gone. Build the purge's Coolify ops, scanner and `coolifyTokenScopeCheck` from this one client.
+ */
+export async function pinnedCoolify(cf: CoolifyClient): Promise<CoolifyClient> {
+  const http = await cf.http.pinned();
+  const c = Object.create(Object.getPrototypeOf(cf)) as CoolifyClient;
   Object.defineProperty(c, "http", { value: http, enumerable: true });
   return c;
 }
