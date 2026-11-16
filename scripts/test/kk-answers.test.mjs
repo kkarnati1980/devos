@@ -11,13 +11,15 @@ const H = { id: "fg-9a5389ff38", rule: "ci-step-changed", file: ".github/workflo
 const H2 = { id: "fg-0123456789", rule: "gitleaksignore-added", file: ".gitleaksignore", line: 3, text: "abc:rule:1" };
 
 test("K1 parses one record per marker line, bound to id, file:line (spaces allowed) and the full SHA", () => {
-  const body = `Keep both, they are fine.\nFLOOR-GUARD KK KEEP ${H2.id} ${H2.file}:${H2.line} ${SHA}\r\n  FLOOR-GUARD KK RESTORE fg-1111111111 src/a b.ts:12 ${SHA}  `;
+  const body = `Keep both, they are fine.\nFLOOR-GUARD KK KEEP ${H2.id} ${H2.file}:${H2.line} ${SHA}\r\n  FLOOR-GUARD KK RESTORE fg-1111111111 src/a b.ts:12 ${SHA}  \nFLOOR-GUARD KK KEEP ${H.id} ${H.file}:0 ${SHA}`;
   const { records, unreadable } = parseKkAnswers([{ body, link: LINK }]);
   assert.deepEqual(unreadable, []);
   assert.deepEqual(records, [
     { hit: H2.id, file: ".gitleaksignore", line: 3, sha: SHA, decision: "keep", link: LINK },
     { hit: "fg-1111111111", file: "src/a b.ts", line: 12, sha: SHA, decision: "restore", link: LINK },
+    { hit: H.id, file: H.file, line: 0, sha: SHA, decision: "keep", link: LINK },
   ]);
+  assert.equal(parseKkAnswers([{ body: `FLOOR-GUARD KK KEEP ${H.id} ${H.file}:01 ${SHA}`, link: LINK }]).records.length, 0, "no leading zero");
 });
 
 test("K2 never from a runner, never without an https link, never from a malformed line", () => {

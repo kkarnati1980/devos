@@ -9,6 +9,7 @@ import path from "node:path";
 import { githubClient, localGuardReport, namesChange, notKeepable, passVerdictText, release } from "../release/merge.mjs";
 import { applyDispositions, run as guardRun } from "../floor-guard/floor-guard.mjs";
 import { floorGuardDisposition } from "../ci/ci-gate.mjs";
+import { parseKkAnswers } from "../release/kk-answers.mjs";
 
 const REPO = "kkarnati1980/devos";
 const HEAD = "a".repeat(40);
@@ -312,6 +313,12 @@ test("B13 (DEVOS-239) a KK-only hit merges with exactly one KK keep for that occ
   assert.equal(r.code, 0, r.reasons.join("; "));
   assert.equal(r.disposed, true);
   assert.equal(merges(ok), 1);
+  // The same answer as KK writes it (line 0, as every ci-step hit), through the parser.
+  const parsed = parseKkAnswers([{ body: `Keep it.\nFLOOR-GUARD KK KEEP ${KKH.id} ${KKH.file}:${KKH.line} ${HEAD}`, link: "https://linear.app/kishoremb/issue/DEVOS-200#comment-2" }]).records;
+  const viaText = redGuard({ comments: [passComment()] });
+  const rp = await release(viaText.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [KKH] }), kkAnswers: parsed });
+  assert.equal(rp.code, 0, rp.reasons.join("; "));
+  assert.equal(merges(viaText), 1);
   const refused = [
     [[], /no KK answer/],
     [[kkRec({ sha: OTHER })], /no KK answer/],
@@ -344,6 +351,7 @@ test("B14 (DEVOS-239) KK answers never stand in for other gate conditions: a mix
   const both = redGuard({ comments: [passComment(keeps([ordinary]))] });
   const r1 = await release(both.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [ordinary, KKH] }), kkAnswers: [kkRec()] });
   assert.equal(r1.code, 0, r1.reasons.join("; "));
+  assert.equal(merges(both), 1);
   const noCodex = redGuard({ comments: [passComment()] });
   const r2 = await release(noCodex.gh, { repo: REPO, pr: 7, guardReport: stubGuard({ hits: [ordinary, KKH] }), kkAnswers: [kkRec()] });
   assert.equal(r2.code, 1);

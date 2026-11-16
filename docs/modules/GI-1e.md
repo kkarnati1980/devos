@@ -13,7 +13,7 @@ Today "escalate to KK" ends in a permanent refusal: the Release path and ci-gate
 1. **Record.** `{ hit, file, line, sha, decision, link }`: hit id, file and line of one occurrence (GI-1 ids repeat for identical lines), the full 40-character head SHA, `decision` `keep` or `restore`, and an https link to where KK wrote it. This is exactly the evaluator's `kkResolutions` entry (K4 proves a parsed record clears the same hit there).
 2. **Text form.** KK's answer is one line per hit: `FLOOR-GUARD KK KEEP|RESTORE <id> <file>:<line> <full head sha>`. `parseKkAnswers(comments)` reads `{ body, link }` comments and:
    - skips a comment whose body starts with `[runner` (a runner's, never KK's) or that has no https link;
-   - yields a record only for a line that parses exactly (upper-case decision, `fg-` + 10 hex id, a positive line, a full SHA, nothing after it); any other `FLOOR-GUARD KK` line is returned as `unreadable` and yields nothing, so a typo never reads as a keep.
+   - yields a record only for a line that parses exactly (upper-case decision, `fg-` + 10 hex id, a line of 0 or more (CI step hits carry line 0), a full SHA, nothing after it); any other `FLOOR-GUARD KK` line is returned as `unreadable` and yields nothing, so a typo never reads as a keep.
 3. **Acceptance rule** (`kkKeepProblem`). A KK-only hit is cleared only by exactly one record matching its id, file, line and the head SHA, with decision `keep` and an https link. None, a record for another SHA or occurrence, two records (even two keeps), `restore`, any other decision, or no link refuses, with the reason and "escalate to KK".
 4. **Release path.** `judgeFloorGuard`, `evaluate` and `release` take `kkAnswers` (default `[]`). Per hit of the re-run:
    - KK-only → step 3;
@@ -32,13 +32,16 @@ Today "escalate to KK" ends in a permanent refusal: the Release path and ci-gate
 ## Acceptance tests
 | # | Pass when |
 |---|---|
-| K1 | (`kk-answers.test.mjs`) A comment with KEEP and RESTORE lines yields one record each, with id, file (spaces allowed), line, full SHA, decision and the comment's link |
+| K1 | (`kk-answers.test.mjs`) A comment with KEEP and RESTORE lines yields one record each, with id, file (spaces allowed), line (0 included), full SHA, decision and the comment's link |
 | K2 | A `[runner`-prefixed comment, one without an https link, a non-object, and each malformed line (short SHA, no line, text after the SHA, lower-case or unknown decision, bad id) yield no record; malformed lines are listed as unreadable |
 | K3 | `kkKeepProblem`: one keep → null; none, another SHA, another line, a string line, two records, restore, no link → a reason |
 | K4 | A parsed keep record clears the KK-only hit in the gate evaluator's `floorGuardProblems`; none pauses; a parsed restore pauses |
-| B13 | (`merge-gate-floor-guard.test.mjs`) The PR #157 hit shape with one KK keep merges (one merge call); no answer, another SHA, line, file or id, restore, escalated, keep+restore, two keeps, an http or missing link each refuse with "escalate to KK" and no merge; a Codex Keep for it still refuses |
+| B13 | (`merge-gate-floor-guard.test.mjs`) The PR #157 hit shape (line 0) with one KK keep, also as parsed from KK's comment text, merges (one merge call); no answer, another SHA, line, file or id, restore, escalated, keep+restore, two keeps, an http or missing link each refuse with "escalate to KK" and no merge; a Codex Keep for it still refuses |
 | B14 | A mixed report needs a Codex Keep for the ordinary hit and a KK keep for the KK-only one; a KK keep never clears an ordinary hit; a KK restore overrides a Codex Keep; with no PASS comment, a KK keep alone refuses |
 | B15 | ci-gate's `floorGuardDisposition` disposes with one KK keep for this SHA, and not with another SHA's, none or `undefined` |
 
+## Pre-review (16 Nov 2026)
+Round 1: CHANGES_REQUESTED, 4 findings (1 medium, 3 low), all fixed: the parser refused line 0, which every `ci-step-*` hit carries, including PR #157's (K1 and B13 now parse a line-0 answer); open hits are matched by id, file and line, not object identity, and an exit other than 0/1 refuses; the pass-rule count; B14 checks the merge call.
+
 ## Pass rule
-`node --test scripts/test/kk-answers.test.mjs` exits 0 with 4 tests passing; `node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 15 tests passing (B1–B15); `node --test scripts/test/merge-gate.test.mjs scripts/test/ci-gate-dispositions.test.mjs scripts/test/gate-evaluator.test.mjs` exits 0.
+`node --test scripts/test/kk-answers.test.mjs` exits 0 with 4 tests passing; `node --test scripts/test/merge-gate-floor-guard.test.mjs` exits 0 with 16 tests passing (B1–B15 and B7b); `node --test scripts/test/merge-gate.test.mjs scripts/test/ci-gate-dispositions.test.mjs scripts/test/gate-evaluator.test.mjs` exits 0.

@@ -5,7 +5,7 @@
 // This module only parses and matches; reading the source (KK's Linear comment) is GI-1e part b. Zero dependencies.
 
 /** The marker KK's answer carries, one per line: `FLOOR-GUARD KK KEEP|RESTORE <id> <file>:<line> <full head sha>`. */
-const ANSWER_LINE = /^[ \t]*FLOOR-GUARD KK (KEEP|RESTORE) (fg-[0-9a-f]{10}) (.+):([1-9][0-9]*) ([0-9a-f]{40})[ \t]*$/;
+const ANSWER_LINE = /^[ \t]*FLOOR-GUARD KK (KEEP|RESTORE) (fg-[0-9a-f]{10}) (.+):(0|[1-9][0-9]*) ([0-9a-f]{40})[ \t]*$/;
 const ANY_ANSWER = /^[ \t]*FLOOR-GUARD KK\b/;
 
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);

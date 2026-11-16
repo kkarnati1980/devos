@@ -281,7 +281,9 @@ export async function judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFil
         else {
           const d = applyDispositions(report, { sha, source: "codex", text: verdictText });
           const before = reasons.length;
-          if (d.exit === 2) reasons.push(`floor-guard dispositions could not be applied on ${sha.slice(0, 7)}`);
+          if (d.exit !== 0 && d.exit !== 1) reasons.push(`floor-guard dispositions could not be applied on ${sha.slice(0, 7)}`);
+          // Open hits are matched by occurrence, never by object identity, so a copy that returns cloned hits still refuses.
+          const isOpen = (h) => !Array.isArray(d.open) || d.open.some((o) => o?.id === h.id && o?.file === h.file && o?.line === h.line);
           for (const h of report.hits) {
             const where = `floor-guard hit ${h.id} ${h.rule} ${h.file}:${h.line}`;
             if (notKeepable(h)) {
@@ -291,7 +293,7 @@ export async function judgeFloorGuard(gh, { repo, pr, sha, passLabel, changedFil
             } else if (answersFor(kkAnswers, h, sha).length && kkKeepProblem(kkAnswers, h, sha)) {
               // As in the gate evaluator: any KK record other than one keep (restore, conflicting) overrides a Codex Keep.
               reasons.push(`${where}: ${kkKeepProblem(kkAnswers, h, sha)}; KK's answer overrides a Codex Keep`);
-            } else if (d.open.includes(h)) {
+            } else if (isOpen(h)) {
               reasons.push(`${where} has no "FLOOR-GUARD KEEP ${h.id} ${h.file}:${h.line} <reason>" in the PASS for ${sha.slice(0, 7)}`);
             }
           }
