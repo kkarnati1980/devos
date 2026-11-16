@@ -2,11 +2,12 @@
 // the app.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createApp } from "../src/server.mjs";
-import { applyLinkOut, findMyBrainSecrets, headerFindings, lockFrameAncestors, scanApp } from "../src/mybrain-link.mjs";
+import { applyLinkOut, findMyBrainSecrets, headerFindings, scanApp, withFrameAncestorsNone } from "../src/mybrain-link.mjs";
 import { main } from "../scripts/mybrain-scan.mjs";
 
 const config = { server: { port: 0, host: "127.0.0.1", sha: "test" }, clientConfig: () => ({}) };
@@ -16,9 +17,10 @@ const routes = {
   "GET /obj": (_q, res) => { res.writeHead(200, { "Access-Control-Allow-Origin": "https://evil.example", "Content-Security-Policy": "default-src 'self'; frame-ancestors *" }); res.end("x"); },
   "GET /list": (_q, res) => { res.writeHead(200, "OK", ["access-control-allow-origin", "*", "x-frame-options", "ALLOWALL", "content-type", "text/plain"]); res.end("y"); },
   "GET /csp": (_q, res) => { res.setHeader("content-security-policy", ["script-src 'self'", "frame-ancestors https://mybrain.example"]); res.end("z"); },
+  "GET /comma": (_q, res) => { res.setHeader("content-security-policy", "default-src 'self', frame-ancestors https://evil.example"); res.end("c"); },
   "OPTIONS /": (_q, res) => { res.writeHead(204, { "access-control-allow-methods": "POST" }); res.end(); },
 };
-const paths = ["/", "/obj", "/list", "/csp", "/health", "/ready", "/missing"];
+const paths = ["/", "/obj", "/list", "/csp", "/comma", "/health", "/ready", "/missing"];
 const tmp = { dir: "" };
 const listen = (server) => new Promise((r) => server.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${server.address().port}`)));
 const silent = { write() {} };
@@ -39,7 +41,7 @@ test("SM-13-L1 every response carries frame-ancestors 'none' and no Access-Contr
   const r = await scanApp({ baseUrl: openUrl, paths: ["/obj"], fetcher: async (url, opts) => {
     const { safeFetch } = await import("../src/safe-fetch.mjs");
     const res = await safeFetch(url, opts);
-    if (opts.method === "GET") assert.equal(res.headers["content-security-policy"], "default-src 'self'; frame-ancestors 'none'");
+    if (opts.method === "GET") assert.equal(res.headers["content-security-policy"], "default-src 'self'; frame-ancestors *, frame-ancestors 'none'", "the route's policy is kept and a 'none' policy is added");
     return res;
   } });
   assert.equal(r.ok, true);
@@ -58,8 +60,10 @@ test("SM-13-L1 the scan catches an app without the profile (negative control)", 
 });
 
 test("SM-13-L1 header rules", () => {
-  assert.equal(lockFrameAncestors(undefined), "frame-ancestors 'none'");
-  assert.equal(lockFrameAncestors("frame-ancestors 'self' https://a; img-src 'self'"), "img-src 'self'; frame-ancestors 'none'");
+  assert.deepEqual(withFrameAncestorsNone(undefined), ["frame-ancestors 'none'"]);
+  assert.deepEqual(withFrameAncestorsNone(["a", "frame-ancestors 'none'"]), ["a", "frame-ancestors 'none'"]);
+  assert.deepEqual(headerFindings({ "content-security-policy": "default-src 'self', frame-ancestors https://evil.example; frame-ancestors 'none'" }), ["frame-ancestors-not-none"], "a 'none' after another frame-ancestors in the same policy is ignored by browsers");
+  assert.deepEqual(headerFindings({ "content-security-policy": "default-src 'self', frame-ancestors https://evil.example, frame-ancestors 'none'" }), []);
   assert.deepEqual(headerFindings({ "Content-Security-Policy": "frame-ancestors 'none'" }), []);
   assert.deepEqual(headerFindings({ "content-security-policy": "frame-ancestors 'none' https://x" }), ["frame-ancestors-not-none"]);
   assert.deepEqual(headerFindings({ "content-security-policy": "default-src 'self'", "Access-Control-Allow-Origin": "*" }), ["frame-ancestors-not-none", "cors-header:access-control-allow-origin"]);
@@ -70,6 +74,10 @@ test("SM-13-L1 no MyBrain credential in the app; the CLI writes the scan_report 
   writeFileSync(join(app, "src", "ok.mjs"), "// opened from MyBrain as a link; no token here\n");
   writeFileSync(join(app, "test", "fake.mjs"), "const MYBRAIN_API_TOKEN = 'fake';\n");
   assert.deepEqual(findMyBrainSecrets(app), []);
+  symlinkSync(app, join(app, "src", "loop"));   // a link loop is not followed
+  assert.deepEqual(findMyBrainSecrets(app), []);
+  // The applied app itself (this test's own folder's parent) names no MyBrain credential.
+  assert.deepEqual(findMyBrainSecrets(dirname(dirname(fileURLToPath(import.meta.url)))), []);
   writeFileSync(join(app, ".env.example"), "MYBRAIN_API_TOKEN=\n");
   writeFileSync(join(app, "src", "client.mjs"), "const k = process.env.MY_BRAIN_SESSION_COOKIE;\n");
   assert.deepEqual(findMyBrainSecrets(app).map((f) => f.split(":")[0]).sort(), [".env.example", "src/client.mjs"]);
@@ -82,6 +90,9 @@ test("SM-13-L1 no MyBrain credential in the app; the CLI writes the scan_report 
   const rep = JSON.parse(readFileSync(out, "utf8"));
   assert.equal(rep.ok, true); assert.equal(rep.checked.length, 4); assert.match(text, /SM-13-L1: pass/);
   assert.equal(await main(["--url", openUrl, "--paths", "/"], { root: app, print: () => {} }), 1, "a credential fails the scan");
+  const inRoot = join(tmp.dir, "clean", "scan-report.json");
+  writeFileSync(inRoot, JSON.stringify({ findings: ["src/x.mjs: names a MyBrain credential (MYBRAIN_API_TOKEN)"] }));
+  assert.equal(await main(["--url", openUrl, "--paths", "/", "--out", inRoot], { root: join(tmp.dir, "clean"), print: () => {} }), 0, "the scan's own old report is skipped");
   assert.equal(await main(["--url", plainUrl, "--paths", "/"], { root: join(tmp.dir, "clean"), print: () => {} }), 1);
   assert.equal(await main([], { print: () => {} }), 2);
 });

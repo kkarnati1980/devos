@@ -2,40 +2,42 @@
 // never called cross-origin. Every response carries frame-ancestors 'none' (and X-Frame-Options: DENY for old
 // browsers), and no response carries an Access-Control-Allow-* header, whatever a route sets. KK's login is the
 // tailnet identity (SM-02); the app holds no MyBrain token.
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { join, relative, resolve, sep } from "node:path";
 import { safeFetch } from "./safe-fetch.mjs";
 
 export const LINK_OUT_HEADERS = Object.freeze({ "content-security-policy": "frame-ancestors 'none'", "x-frame-options": "DENY" });
 const CORS = /^access-control-/i;
-const FRAME_ANCESTORS = /(^|;)\s*frame-ancestors\b[^;]*/i;
+const NONE = LINK_OUT_HEADERS["content-security-policy"];
 
-// Keeps a route's own CSP and forces its frame-ancestors directive to 'none'.
-export function lockFrameAncestors(csp) {
-  const text = Array.isArray(csp) ? csp.join("; ") : csp === undefined || csp === null ? "" : String(csp);
-  if (!text.trim()) return LINK_OUT_HEADERS["content-security-policy"];
-  const rest = text.replace(new RegExp(FRAME_ANCESTORS.source, "gi"), "$1").split(";").map((d) => d.trim()).filter(Boolean);
-  return [...rest, "frame-ancestors 'none'"].join("; ");
+// A route's own CSP values are kept untouched; `frame-ancestors 'none'` is added as a policy of its own. A browser
+// enforces every policy, and framing needs every policy to allow it, so this one policy blocks it whatever the
+// route's policies say (even a second policy hidden after a comma).
+export function withFrameAncestorsNone(csp) {
+  const values = (Array.isArray(csp) ? csp : csp === undefined || csp === null ? [] : [csp]).map(String).filter((v) => v.trim() && v.trim() !== NONE);
+  return [...values, NONE];
 }
 
 function fixHeaderObject(h) {
   for (const name of Object.keys(h)) {
     if (CORS.test(name)) delete h[name];
-    else if (name.toLowerCase() === "content-security-policy") h[name] = lockFrameAncestors(h[name]);
+    else if (name.toLowerCase() === "content-security-policy") h[name] = withFrameAncestorsNone(h[name]);
     else if (name.toLowerCase() === "x-frame-options") h[name] = "DENY";
   }
   return h;
 }
 
 function fixHeaderList(list) {   // writeHead's flat [name, value, name, value…] form
-  const out = [];
-  for (let i = 0; i + 1 < list.length; i += 2) {
+  if (list.length % 2) throw new TypeError("mybrain-link: a header list needs a value for every name");
+  const out = []; let csp = false;
+  for (let i = 0; i < list.length; i += 2) {
     const name = String(list[i]); let value = list[i + 1];
     if (CORS.test(name)) continue;
-    if (name.toLowerCase() === "content-security-policy") value = lockFrameAncestors(value);
     if (name.toLowerCase() === "x-frame-options") value = "DENY";
+    if (name.toLowerCase() === "content-security-policy") csp = true;
     out.push(name, value);
   }
+  if (csp) out.push("content-security-policy", NONE);
   return out;
 }
 
@@ -50,7 +52,7 @@ export function protectResponse(res) {
     let i = typeof rest[0] === "string" ? 1 : 0;   // writeHead(status, [reason], [headers])
     if (rest[i] && typeof rest[i] === "object") rest[i] = Array.isArray(rest[i]) ? fixHeaderList(rest[i]) : fixHeaderObject({ ...rest[i] });
     for (const name of res.getHeaderNames()) if (CORS.test(name)) res.removeHeader(name);
-    res.setHeader("content-security-policy", lockFrameAncestors(res.getHeader("content-security-policy")));
+    res.setHeader("content-security-policy", withFrameAncestorsNone(res.getHeader("content-security-policy")));
     res.setHeader("x-frame-options", "DENY");
     return writeHead.call(this, status, ...rest);
   };
@@ -68,8 +70,13 @@ export function applyLinkOut(server) {
 export function headerFindings(headers) {
   const h = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v.join(", ") : String(v)]));
   const out = [];
-  const fa = (h["content-security-policy"] || "").match(FRAME_ANCESTORS);
-  if (!fa || fa[0].replace(/^;/, "").trim().replace(/\s+/g, " ").toLowerCase() !== "frame-ancestors 'none'") out.push("frame-ancestors-not-none");
+  // Several CSP headers arrive joined by commas; each comma-separated part is one enforced policy. Framing is
+  // blocked when at least one policy's first frame-ancestors directive is exactly 'none'.
+  const blocks = (h["content-security-policy"] || "").split(",").some((policy) => {
+    const fa = policy.split(";").map((d) => d.trim().replace(/\s+/g, " ").toLowerCase()).find((d) => /^frame-ancestors(\s|$)/.test(d));
+    return fa === "frame-ancestors 'none'";
+  });
+  if (!blocks) out.push("frame-ancestors-not-none");
   for (const k of Object.keys(h)) if (CORS.test(k)) out.push(`cors-header:${k}`);
   return out;
 }
@@ -112,20 +119,25 @@ export async function scanApp({ baseUrl, paths = ["/health", "/ready", "/"], fet
 }
 
 // "No MyBrain tokens in the app": a MyBrain credential named in code or config is a finding.
-const MYBRAIN_SECRET = /\bMY_?BRAIN[\w-]*?(TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|COOKIE|SESSION)\w*/i;
-// node_modules and .git are skipped everywhere, the root test/ folder too (tests name fake credentials).
-export function findMyBrainSecrets(root) {
+// Built from parts so this file does not match its own pattern.
+const CREDENTIAL_NAME = new RegExp(["\\bMY_?BR", "AIN[\\w-]*?(TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|COOKIE|SESSION)\\w*"].join(""), "i");
+// node_modules and .git are skipped everywhere, the root test/ folder too (tests name fake credentials), and the
+// files in `skipFiles` (the scan's own report). Links are not followed.
+export function findMyBrainSecrets(root, { skipFiles = [] } = {}) {
+  const skip = new Set(skipFiles.map((f) => resolve(f)));
   const out = [];
   const walk = (dir) => {
     for (const name of readdirSync(dir)) {
       const full = join(dir, name);
       const rel = relative(root, full).split(sep).join("/");
       if (name === "node_modules" || name === ".git" || rel === "test") continue;
-      const st = statSync(full);
+      if (skip.has(resolve(full))) continue;
+      const st = lstatSync(full);
+      if (st.isSymbolicLink()) continue;
       if (st.isDirectory()) { walk(full); continue; }
       if (!st.isFile() || st.size > 2_000_000) continue;
       const text = readFileSync(full, "utf8");
-      const m = text.match(MYBRAIN_SECRET);
+      const m = text.match(CREDENTIAL_NAME);
       if (m) out.push(`${rel}: names a MyBrain credential (${m[0].slice(0, 40)})`);
     }
   };

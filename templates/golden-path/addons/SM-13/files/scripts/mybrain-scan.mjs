@@ -12,10 +12,10 @@ export async function main(argv, { scan = scanApp, root = process.cwd(), print =
   if (!url) { print("usage: mybrain-scan.mjs --url <app base URL> [--paths /a,/b] [--out report.json]\n"); return 2; }
   const paths = arg("--paths") ? arg("--paths").split(",").map((p) => p.trim()).filter(Boolean) : undefined;
   const report = await scan({ baseUrl: url, ...(paths ? { paths } : {}) });
-  const secrets = findMyBrainSecrets(root);
+  const out = arg("--out");
+  const secrets = findMyBrainSecrets(root, { skipFiles: out ? [resolve(out)] : [] });
   report.findings.push(...secrets);
   report.ok = report.findings.length === 0;
-  const out = arg("--out");
   if (out) { const tmp = `${resolve(out)}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(report, null, 2) + "\n"); renameSync(tmp, resolve(out)); }
   print(`${report.check}: ${report.ok ? "pass" : "FAIL"} (${report.checked.length} responses)\n${report.findings.map((f) => `  ${f}\n`).join("")}`);
   return report.ok ? 0 : 1;
