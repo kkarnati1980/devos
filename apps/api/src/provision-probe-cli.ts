@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -77,6 +77,28 @@ export async function probeCli(argv: string[], deps: { log(): Promise<Pick<Probe
 /** The effects of a probe that is off: never called (probeStep stops at `offReason`), so they throw a fixed code. */
 const notWired = async (): Promise<never> => { throw new Error("probe-not-wired"); };
 
+/**
+ * DEVOS-110: the M2.3 core the probe raises its grant card through, with the M1.6 notice wired as runtime.ts wires it.
+ * It never approves anything: no KK session verifies, and the grant issuer is not wired.
+ */
+async function probeApprovals(db: any, vault: { reveal(n: string): Promise<string | null>; list(): Promise<{ name: string; set: boolean }[]> }, env: NodeJS.ProcessEnv, timeoutMs: number) {
+  const [{ Approvals, PrismaApprovalStore }, { Notifier, PrismaNotificationStore, parseDashboardUrl }, { parseSmtpConfig }] = await Promise.all([
+    import("./approvals.js"), import("./notify.js"), import("./smtp.js"),
+  ]);
+  const notifier = new Notifier(new PrismaNotificationStore(db, timeoutMs), {
+    secrets: { reveal: (name) => vault.reveal(name), isSet: async (name) => (await vault.list()).some((m) => m.name === name && m.set) },
+    smtp: parseSmtpConfig(env),
+    dashboardUrl: parseDashboardUrl(env.DEVOS_DASHBOARD_URL),
+    timeoutMs,
+  });
+  return new Approvals({
+    store: new PrismaApprovalStore(db, timeoutMs),
+    grants: { issueGrant: notWired, revokeGrant: notWired },
+    notifier,
+    verifyKkSession: () => false,
+  });
+}
+
 // The production wiring; its pieces are tested on their own (probeCli, the parts, offReasonFor, stepWiring, buildProvisioner).
 async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
   const timeoutMs = 10_000;
@@ -135,7 +157,14 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               wiring: () => teardownWiring(k.provisionMod, k.teardownMod, { gh: k.gh, cf: k.cf, store: k.store, db, projectId: p.id, owner: k.owner, timeoutMs }),
             });
           },
-          cycleStart: () => probeCycleStart(db, p.id, timeoutMs, async () => (await findProbeGrant(db, p.id, new Date(), timeoutMs, w.purge.grantProblem)) !== null),
+          // DEVOS-110: a cycle blocked for want of the grant raises the fixed grant card for KK (at most one open).
+          cycleStart: () => cycleStartWithCard(
+            () => probeCycleStart(db, p.id, timeoutMs, async () => (await findProbeGrant(db, p.id, new Date(), timeoutMs, w.purge.grantProblem)) !== null),
+            async () => {
+              const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
+              return raiseProbeGrantCard(p.id, new Date(), { list: (f) => approvals.store.list(f), raise: (c) => approvals.raiseCard(c) });
+            },
+          ),
           fingerprint: await probeFingerprint(fileURLToPath(root)),
           now: () => new Date(),
         };

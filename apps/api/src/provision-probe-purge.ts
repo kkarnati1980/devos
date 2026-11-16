@@ -198,3 +198,64 @@ export async function probeStage(db: any, projectId: string, timeoutMs: number):
   if (!p) throw new Error("probe-project-missing");
   return String(p.stage);
 }
+
+/** DEVOS-110 decision 2: a rejected grant card is not raised again for one probe cycle. */
+export const PROBE_CARD_REASK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * DEVOS-110 decision 1: the probe's one grant card. Every word is fixed here; only the probe's own row id goes in,
+ * and nothing read from a provider or the server. The action is not a purge action (gate 5 stays for real purges);
+ * approving it issues the fixed `teardown.*` grant (approvals.ts `PROBE_GRANT_SCOPE`).
+ */
+export function probeGrantCard(projectId: string): {
+  gate: "destructive_or_spend"; action: "teardown.probe-grant"; target: string; reason: string; consequence: string; projectId: string;
+} {
+  return {
+    gate: "destructive_or_spend",
+    action: "teardown.probe-grant",
+    target: teardownResource(projectId),
+    reason:
+      "DevOS runs a weekly self-test (the AT13 provisioning probe). It creates a throwaway test project, checks it was set up correctly, then deletes it again. " +
+      "To delete its own test resources it needs your permission once. Approving lets the probe archive and delete only its own throwaway test project " +
+      "(devos-probe-m24) for 90 days, at most 30 times. It cannot touch any real project.",
+    consequence:
+      "If you approve: the weekly self-test runs and cleans up after itself. If you reject: the self-test stays off and DevOS asks again in 7 days. " +
+      "Nothing is deleted either way except the probe's own test resources.",
+    projectId,
+  };
+}
+
+/** The approvals surface the probe needs (structural; `Approvals` / `ApprovalStore`). */
+export interface ProbeCardDeps {
+  list(f: { action: string; target: string; limit: number }): Promise<{ status: string; decidedAt: Date | null; createdAt: Date }[]>;
+  raise(card: ReturnType<typeof probeGrantCard>): Promise<unknown>;
+}
+
+/**
+ * DEVOS-110 decision 2: raise the grant card when none is pending and none was rejected in the last 7 days.
+ * Returns whether a card was raised. A failure is rethrown; the caller keeps the cycle blocked either way.
+ */
+export async function raiseProbeGrantCard(projectId: string, now: Date, d: ProbeCardDeps): Promise<boolean> {
+  const card = probeGrantCard(projectId);
+  const cards = await d.list({ action: card.action, target: card.target, limit: 50 });
+  if (cards.some((c) => c.status === "pending")) return false;
+  const since = now.getTime() - PROBE_CARD_REASK_MS;
+  if (cards.some((c) => c.status === "rejected" && (c.decidedAt ?? c.createdAt).getTime() > since)) return false;
+  await d.raise(card);
+  return true;
+}
+
+/**
+ * DEVOS-110: a cycle start that, when blocked for want of a grant, raises the grant card. The cycle stays blocked
+ * (nothing is created); a card that could not be raised shows as `probe-purge-not-approved:card-failed`.
+ */
+export async function cycleStartWithCard(start: () => Promise<CycleStart>, raise: () => Promise<boolean>): Promise<CycleStart> {
+  const s = await start();
+  if (typeof s !== "object" || s.blocked !== "probe-purge-not-approved") return s;
+  try {
+    await raise();
+    return s;
+  } catch {
+    return { blocked: "probe-purge-not-approved:card-failed" };
+  }
+}

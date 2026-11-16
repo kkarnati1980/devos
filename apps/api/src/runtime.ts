@@ -20,6 +20,7 @@ import { PrismaRequirementsStore } from "./requirements-store.js";
 import { PrismaBatchViewStore, type PrismaViewTxLike } from "./card-batch-view.js";
 import { reanswerSettleMs, type RequirementsServices } from "./requirements.js";
 import { RequirementsSyncJob, skipDecidedQuestions, syncIntervalMs, type DecidedCardLister } from "./requirements-sync.js";
+import { isProbeProjectRow } from "./provision-probe.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 import { PrismaIsolationStore } from "./isolation-store.js";
 import { PrismaWatchdogStore, RunnerWatchdogJob, type LinearReader } from "./runner-watchdog-runtime.js";
@@ -182,6 +183,8 @@ export async function buildRuntime(
     verifyKkSession: opts.kkSessions.verify,
     // DEVOS-134: a policy card's gate comes from the matched rules' `constraints.gateName`.
     gateForRules: (ids) => gateForRulesFromDb(db, ids, t),
+    // DEVOS-110 decision 3: the probe's fixed grant card is approvable only for the probe's own row.
+    isProbeProject: (id) => isProbeProjectRow(db, id, t),
   });
   const approvals: ApprovalRouteServices = {
     approvals: approvalsCore,
