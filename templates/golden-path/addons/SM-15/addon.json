@@ -1,0 +1,12 @@
+{
+  "id": "SM-15",
+  "name": "User-supplied URL fetching",
+  "files": [
+    "src/user-url.mjs",
+    "test/sm-15-ssrf.test.mjs"
+  ],
+  "checks": {
+    "SM-15-L1": "test/sm-15-ssrf.test.mjs"
+  },
+  "usage": "Fetch every URL that a user typed, pasted or sent with fetchUserUrl(input) from src/user-url.mjs, never with safeFetch directly. It accepts only an absolute http or https URL of at most 2048 characters with no user name or password, fetches it with GET or HEAD only and no body, never uses allowHosts (a user URL can never reach a declared internal service), and caps each fetch at 8 seconds, 2 MB and 3 redirects; a caller may lower a cap (timeoutMs, maxBytes, maxRedirects) but never raise it. safeFetch still checks every address on every hop (F2). Every failure is a SafeFetchError with a code: show the user publicMessage(err), which never says whether an internal name exists, and log the code. test/sm-15-ssrf.test.mjs holds the SSRF corpus (internal and encoded addresses, IPv6 forms, internal names, DNS rebinding, redirects to internal targets, file://, gopher:// and other schemes, credentials) and the size and time caps; keep it passing and add a case for any new bypass you hear of."
+}
