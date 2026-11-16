@@ -200,6 +200,17 @@ test("SM-10-L1: a failing, hanging or malformed source keeps the last good state
     fs.writeFileSync(file, "{ phase-1: off");
     const loud = killSwitches({ phases: ["phase-1"], source: fileSource(file), onError: () => { throw new Error("boom"); } });
     assert.deepEqual(await loud.current(), { "phase-1": true });
+    const rejected = [];
+    const onRejection = (r) => rejected.push(r);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const asyncLoud = killSwitches({ phases: ["phase-1"], source: fileSource(file), onError: async () => { throw new Error("reporter down"); } });
+      assert.deepEqual(await asyncLoud.current(), { "phase-1": true });
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    assert.deepEqual(rejected, [], "a rejecting async onError is swallowed");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

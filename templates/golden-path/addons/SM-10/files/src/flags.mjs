@@ -54,7 +54,13 @@ export function killSwitches({ phases, source, defaults = {}, refreshMs = 5000, 
   for (const [n, v, min, max] of [["refreshMs", refreshMs, 0, 3_600_000], ["timeoutMs", timeoutMs, 1, 60_000]]) {
     if (!Number.isInteger(v) || v < min || v > max) throw new TypeError(`flags: ${n} must be a whole number ${min}-${max}`);
   }
-  const report = (err) => { try { onError(err); } catch { /* reporting must not break the app */ } };
+  // Reporting must not break the app: a throwing onError, or an async one that rejects, is swallowed.
+  const report = (err) => {
+    try {
+      const r = onError(err);
+      if (r && typeof r.then === "function") r.then(undefined, () => {});
+    } catch { /* swallowed */ }
+  };
   const base = Object.fromEntries(phases.map((p) => [p, defaults[p] ?? true]));
   let state = Object.freeze({ ...base });
   let readAt = -Infinity;
