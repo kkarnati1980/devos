@@ -48,7 +48,7 @@ function commit(files, msg = "c") {
 
 // S4-b2a: a stand-in for isolation-apply.sh (its own tests are isolation-apply.test.mjs): counts runs, prints a
 // secret-shaped value (must be redacted) and exits with FAKE_ISO_RC (default 0); FAKE_ISO_SLEEP makes it hang.
-const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + '"; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
+const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + ' Bearer abcDEF+ghi/jkl012345678901234567890="; [[ -n "${FAKE_ISO_MSG:-}" ]] && echo "$FAKE_ISO_MSG"; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
 const real = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
 const baseFiles = () => ({
   "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
@@ -733,11 +733,16 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.equal(isoCount(), 1, r2.out);
   assert.match(r2.out, /isolation: ok/);
   assert.doesNotMatch(r2.out, /abcdefghijklmnop1234/, "isolation output is redacted");
+  assert.doesNotMatch(r2.out, /ghi\/jkl012345/, "a base64 Bearer value is redacted whole");
   assert.match(isoState(), /^\d{1,12} ok\n$/);
+  assert.ok(fs.existsSync(path.join(D(), "agent/isolation.enforced")), "the first ok marks isolation as enforced");
   await runAgent();
   assert.equal(isoCount(), 2, "runs again on the next tick (not daily)");
+  // Once enforced, "not set up" and a missing listener are failures, never a silent skip (pre-review 1/2).
   await runAgent({ FAKE_ISO_RC: "3" });
-  assert.match(isoState(), /^\d{1,12} skipped\n$/);
+  assert.match(isoState(), /^\d{1,12} fail \(exit 3\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
   await runAgent({ FAKE_ISO_RC: "1" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
@@ -747,6 +752,22 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   const r7 = await runAgent({}, ["--dry-run"]);
   assert.match(r7.out, /WOULD run isolation-apply\.sh/);
   assert.equal(isoCount(), before, "--dry-run never runs it");
+});
+
+test("S4-b2a AT-b2a-1b: before the first ok, no token (exit 3) or no listener yet (curl exit 7) is skipped; other failures fail", async () => {
+  resetMock(); freshState();
+  const sha = commit({ ...baseFiles(), "xb2a1b": "1" }, "s4-b2a not set up");
+  M.main = sha; green(sha); pass(sha);
+  await runAgent({ FAKE_ISO_RC: "3" });
+  await runAgent({ FAKE_ISO_RC: "3" });
+  assert.match(isoState(), /^\d{1,12} skipped\n$/, "no token yet");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
+  assert.match(isoState(), /^\d{1,12} skipped\n$/, "token present, listener not deployed yet (S4-t2)");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/, "a listener that answers with an error is a failure");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "self-test failed after the change; previous block restored" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.enforced")));
 });
 
 test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed copy missing from bin/ is repaired", async () => {
@@ -759,12 +780,20 @@ test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed
   const r2 = await runAgent({ DEPLOY_TIMEOUT: "0" });
   assert.match(r2.out, /isolation deferred: a deployment is in flight/);
   assert.equal(isoCount(), 0);
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state")), "a deferral writes no result");
+  // A marker older than ISOLATION_DEFER_MAX (a stuck deploy, or GitHub down) no longer defers (pre-review 3).
+  const old = new Date(Date.now() - 2 * 3600 * 1000);
+  fs.utimesSync(path.join(D(), `agent/deploy-started.${sha}`), old, old);
+  const r3 = await runAgent({ DEPLOY_TIMEOUT: "0" });
+  assert.match(r3.out, /is older than 3600s; not deferring/);
+  assert.equal(isoCount(), 1, r3.out);
   M.deployStatus = "finished";
   await runAgent();
   fs.rmSync(path.join(D(), "bin/isolation-apply.sh"));   // as after an older agent with the shorter allow-list
+  const n = isoCount();
   const r4 = await runAgent();
   assert.match(r4.out, /isolation-apply\.sh missing from bin\/; installing again from/);
-  assert.equal(isoCount(), 1, r4.out);
+  assert.equal(isoCount(), n + 1, "runs in the same tick, once");
 });
 
 const ISO_CHECK = path.join(ROOT, "scripts/server/checks/project-isolation-apply.sh");
