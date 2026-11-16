@@ -1,0 +1,33 @@
+# DEVOS-197 part 2 (KK's decision, 16 Nov 2026 14:42 IST; docs/decisions/0029-closed-pr-branch-cleanup.md):
+# when a PR is closed WITHOUT merging, delete its `kishore/devos-*` head branch so a leftover branch cannot keep
+# `secret-scan` red on every open PR. The logic and every safety check live in scripts/ci/cleanup-closed-pr-branch.mjs.
+#
+# pull_request_target runs with this repo's token, so this workflow NEVER checks out or runs PR code: the checkout
+# below takes no `ref`, so it is GITHUB_SHA, a commit of this repo's own branch (note 0029), sparse to scripts/ci,
+# with no stored credentials. The
+# branch name reaches the script only through the event file, never through `${{ }}` in a shell line.
+name: cleanup-closed-pr-branch
+on:
+  pull_request_target:
+    types: [closed]
+concurrency:
+  group: cleanup-closed-pr-branch-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+permissions: {}
+jobs:
+  delete-branch:
+    if: github.event.pull_request.merged == false && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write # delete the head branch
+      pull-requests: write # post the "Restore branch" comment
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Delete the closed PR's branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/ci/cleanup-closed-pr-branch.mjs
