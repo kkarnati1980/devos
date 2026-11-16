@@ -242,6 +242,9 @@ selftest() {  # every target host:port must accept a TCP connection within 3 s
 mkdir -p "$ISO" && chmod 700 "$ISO" || { echo "cannot create $ISO"; exit 1; }
 # One run at a time (the agent tick and KK's --remove must not interleave).
 exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply run holds $ISO/.lock"; exit 3; }
+# Codex PR158-r1: --remove may have run (and released the lock) while this run fetched the state, so the marker
+# is checked again under the lock, before anything is applied.
+[[ -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
