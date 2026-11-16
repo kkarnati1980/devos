@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.2.0
+# Version: 1.3.0
+# v1.3.0 (DEVOS-127, S4-b2d): after a successful apply, the conntrack entries of every stack whose rights shrank
+# (a rule with its /24 as source is gone: stack removed, egress or a tailnet entry revoked; on the first apply,
+# the whole pool) are deleted, so a connection opened before the change cannot outlive it. A clean-up that cannot
+# run now is kept in isolation/conntrack.pending and retried on every tick (exit 1 until done). One overall
+# deadline: no change starts after ISOLATION_DEADLINE_S (default 25 s) of the run, so a rollback always fits in the
+# agent's 60 s timeout.
 # v1.2.0 (DEVOS-127, S4-b2b): boot persistence. Every successful run keeps a marker block in /etc/ufw/after.rules
 # (BEGIN/END DEVOS S4 ISOLATION, placed after M0.1's DEVOS UFW AND DOCKER block) that rebuilds the installed
 # chains and puts the three jumps first, so the block is back at boot and after `ufw reload`, before the agent's
@@ -118,6 +124,48 @@ boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when 
   rm -f "$tmp"; BOOT_TMP=""; echo "boot persistence: could not replace $f"; return 1
 }
 
+# --- S4-b2d: conntrack clean-up and the run deadline ---------------------------------------------------------
+T0=$SECONDS
+DEADLINE="$(conf ISOLATION_DEADLINE_S)"; [[ "$DEADLINE" =~ ^[0-9]{1,2}$ ]] && (( DEADLINE <= 25 )) || DEADLINE=25  # pre-review: never above 25
+shrunk() {  # $1 = previous block, $2 = new block -> the /24 sources (or the pool) whose rules shrank, one per line
+  [[ -z "$1" ]] && { echo "$POOL"; return; }
+  # Pre-review r2: a change to the pool-wide rules (no /24 source: the private-range DROPs, the final DROP, their
+  # order) can shrink every stack at once, so it cuts the whole pool.
+  local re=' -s 10\.[0-9]+\.[0-9]+\.0/24 '
+  [[ "$(grep -vE -- "$re" <<<"$1")" == "$(grep -vE -- "$re" <<<"$2")" ]] || { echo "$POOL"; return; }
+  # One pass (pre-review: per-rule greps were O(n^2)): previous rules with a /24 source that the new block lacks.
+  comm -23 <(grep -E -- "$re" <<<"$1" | LC_ALL=C sort -u) <(LC_ALL=C sort -u <<<"$2") \
+    | grep -oE -- '-s 10\.[0-9]+\.[0-9]+\.0/24' | cut -d' ' -f2 | LC_ALL=C sort -u
+}
+ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack; 0 when nothing is left pending
+  local f="$ISO/conntrack.pending" src out rc left=""
+  [[ -s "$f" ]] || return 0
+  if ! command -v conntrack >/dev/null 2>&1; then
+    echo "conntrack not installed: connections opened before the change are kept until they close ($(paste -sd' ' "$f"))"; return 1
+  fi
+  while IFS= read -r src; do
+    [[ "$src" =~ ^10\.(20[89]|21[01])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.0/(24|14)$ ]] || continue
+    # Pre-review: no call may run past the agent's 60 s, so the last one starts by 49 s and gets what is left.
+    if (( SECONDS - T0 >= 49 )); then left+="$src"$'\n'; continue; fi
+    # conntrack exits 1 when no entry matched ("0 flow entries have been deleted"); that is a success here.
+    out="$(timeout 10 conntrack -D -s "$src" 2>&1)"; rc=$?
+    (( rc == 0 )) || { (( rc == 1 )) && [[ "$out" == *": 0 flow entries have been deleted"* ]]; } || left+="$src"$'\n'
+  done < "$f"
+  if [[ -n "$left" ]]; then printf '%s' "$left" > "$f.tmp" && mv -f "$f.tmp" "$f"; echo "conntrack clean-up incomplete, retried next tick: $(paste -sd' ' "$f")"; return 1; fi
+  rm -f "$f"; return 0
+}
+ct_queue() {  # $1 = previous block, $2 = new block, $3 = 1 when the live chains drifted -> pending list
+  local new
+  new="$(shrunk "$1" "$2")"
+  # Pre-review: a drift repair (a flushed chain or a lost jump, judged from the live state, whatever the new
+  # block is) cuts the whole pool: flows opened while the block was missing would survive it through the
+  # ESTABLISHED return.
+  [[ "${3:-0}" == 1 ]] && new="$POOL"
+  [[ -n "$new" ]] || return 0
+  { [[ -s "$ISO/conntrack.pending" ]] && cat "$ISO/conntrack.pending"; echo "$new"; } | sort -u > "$ISO/conntrack.pending.tmp" \
+    && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
+}
+
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
@@ -135,6 +183,13 @@ for c in jq curl flock iptables iptables-restore; do
   command -v "$c" >/dev/null 2>&1 || { echo "skipped: $c not installed"; exit 3; }
 done
 [[ -s "$TOKEN_FILE" ]] || { echo "skipped: no isolation state token yet ($TOKEN_FILE)"; exit 3; }
+
+# Codex PR163-r4: cuts already queued are retried on every tick BEFORE the state fetch (under the lock, unless
+# --remove turned the block off), so a fetch failure or a refused document cannot hold them back. The run itself
+# goes on; a cut still pending makes it exit 1 on every path below (the fetch and validation exits are 1 anyway).
+if [[ "$MODE" == apply && -s "$ISO/conntrack.pending" ]]; then
+  ( exec 9>"$ISO/.lock" && flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; ct_flush ) || true
+fi
 
 # --- 1. fetch and validate the approved state -------------------------------------------------------------
 PORT="$(conf API_INTERNAL_PORT)"; PORT="${PORT:-3002}"
@@ -267,13 +322,19 @@ record() {  # block -> installed.rules + live fingerprint
   printf '%s\n' "$1" > "$ISO/installed.rules.tmp" && mv -f "$ISO/installed.rules.tmp" "$ISO/installed.rules" \
     && live_fp > "$ISO/live.sha256.tmp" && mv -f "$ISO/live.sha256.tmp" "$ISO/live.sha256"
 }
-install_block() {  # block text in $1 -> live, in one transaction with the jump changes
+install_block() {  # block text in $1 -> live, in one transaction with the jump changes; $2=deadline: check it last
   ipt -S DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (M0.1 not applied?)"; return 1; }
   # The whole transaction is built BEFORE iptables-restore starts (Codex PR54-r1): on the legacy backend restore
   # holds the xtables lock from *filter to COMMIT, so jump_ops' `iptables -S` queries must not run inside it.
   local tx ops
   ops="$(jump_ops)" || return 1
   tx="$(grep -vx 'COMMIT' <<<"$1")"$'\n'"${ops:+$ops$'\n'}COMMIT"
+  # Codex PR163-r1: the drift check and jump_ops above are timeout-bound iptables queries that can use up the rest
+  # of the deadline, so the forward change checks it once more right before iptables-restore (exit 2: deferred,
+  # nothing changed). A rollback never passes `deadline`: it must always run.
+  if [[ "${2:-}" == deadline ]] && (( SECONDS - T0 > DEADLINE )); then
+    echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; return 2
+  fi
   printf '%s\n' "$tx" | timeout 15 iptables-restore -w 5 --noflush
 }
 selftest() {  # every target host:port must accept a TCP connection within 3 s
@@ -300,7 +361,10 @@ exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply ru
 [[ -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
+  # Pre-review: the clean-up runs whatever the boot step says, so a broken after.rules cannot hold it back.
+  rc=0; ct_flush || rc=1
   boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; exit 1; }
+  (( rc == 0 )) || exit 1
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; exit 0
 fi
 
@@ -308,22 +372,41 @@ fi
 # host already fails before the change, the cause is elsewhere; the block is applied and kept (isolation is
 # the floor) and the failure is reported. Roll back only when the probe passed before and fails after.
 pre_ok=1; pre_msg="$(selftest)" || pre_ok=0
-if ! install_block "$BLOCK"; then
+# S4-b decision 11 / S4-b2d: start no change late in the run, so the post-change self-test and a rollback
+# (iptables-restore 15 s + the self-test) still fit inside the agent's 60 s.
+(( SECONDS - T0 <= DEADLINE )) || { echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; exit 1; }
+# Pre-review: the cut is queued BEFORE the change, so a kill, a failed record or a failed boot step after it can
+# never lose it. A cut queued for a change that then fails or rolls back is harmless (decision 2).
+# Pre-review r2: a cut resets NATed connections (the mapping goes with the entry), so it must not happen for a
+# change that is rolled back: the list is snapshotted here and restored after a successful rollback.
+drift=0; [[ -n "$PREV" ]] && { [[ -n "$(jump_ops)" ]] || ! live_matches "$PREV"; } && drift=1
+CT_SNAP=""; [[ -s "$ISO/conntrack.pending" ]] && CT_SNAP="$(cat "$ISO/conntrack.pending")"
+ct_restore() {  # the pending list as it was before this run's ct_queue
+  if [[ -n "$CT_SNAP" ]]; then printf '%s\n' "$CT_SNAP" > "$ISO/conntrack.pending.tmp" && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
+  else rm -f "$ISO/conntrack.pending"; fi
+}
+ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; exit 1; }
+install_block "$BLOCK" deadline; irc=$?
+if (( irc == 2 )); then ct_restore; exit 1; fi
+if (( irc != 0 )); then
+  ct_restore
   echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
 fi
 if ! post_msg="$(selftest)"; then
   if (( pre_ok == 0 )); then
-    record "$BLOCK"; boot_sync "$BLOCK"
+    record "$BLOCK"; ct_flush; boot_sync "$BLOCK"
     echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
   if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && record "$PREV" && { boot_sync "$PREV"; echo "rolled back to the previous block"; } || echo "rollback failed: run $0 --remove from the console"
+    install_block "$PREV" && record "$PREV" && { ct_restore; boot_sync "$PREV"; echo "rolled back to the previous block"; } || echo "rollback failed: run $0 --remove from the console"
   else
-    remove_block && rm -f "$ISO/live.sha256" && { boot_sync ""; echo "rolled back: S4 block removed"; } || echo "rollback failed: run $0 --remove from the console"
+    remove_block && rm -f "$ISO/live.sha256" && { ct_restore; boot_sync ""; echo "rolled back: S4 block removed"; } || echo "rollback failed: run $0 --remove from the console"
   fi
   exit 1
 fi
 record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
+ct_ok=0; ct_flush || ct_ok=1
 boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; exit 1; }
+(( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; exit 1; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"

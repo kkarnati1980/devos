@@ -80,9 +80,14 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
     const rows = await this.q(this.tdb.resource.findMany({
       where: { projectId, status: "active" },
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-      select: { id: true, provider: true, kind: true, externalId: true, name: true },
+      select: { id: true, provider: true, kind: true, externalId: true, name: true, deleteStartedAt: true },
     })) as any[];
-    return rows.map((r) => ({ id: r.id, provider: r.provider, kind: r.kind, externalId: r.externalId, name: r.name }));
+    return rows.map((r) => ({ id: r.id, provider: r.provider, kind: r.kind, externalId: r.externalId, name: r.name, deleteStartedAt: r.deleteStartedAt ?? null }));
+  }
+
+  async markDeleteStarted(resourceId: string, at: Date): Promise<void> {
+    // First start only: a retried delete keeps the time of the first attempt.
+    await this.q(this.tdb.resource.updateMany({ where: { id: resourceId, status: "active", deleteStartedAt: null }, data: { deleteStartedAt: at } }));
   }
 
   async markResourceDeleted(resourceId: string, at: Date): Promise<void> {

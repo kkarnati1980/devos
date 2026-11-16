@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { GUARD_PATHS } from "../floor-guard/floor-guard.mjs";
+import { kkAnswersForPr, KEY_ENV as KK_KEY_ENV } from "./kk-source.mjs";
 import { KK_ONLY } from "../gates/kk-only.mjs";
 import { answersFor, kkKeepProblem } from "./kk-answers.mjs";
 
@@ -428,7 +429,12 @@ export async function main(argv, { env = process.env, fetchImpl = fetch, log = c
   try {
     const args = parseArgs(argv);
     const gh = githubClient({ token: tokenFromEnv(env), fetchImpl, sleep });
-    return (await release(gh, { ...args, log })).code;
+    // DEVOS-239 part b: KK's answers from his Linear comment on the PR's issue; none (no key, Linear down) keeps
+    // every KK-only hit refused.
+    const p = await gh.get(`/repos/${args.repo}/pulls/${args.pr}`);
+    const kk = await kkAnswersForPr({ branch: p?.head?.ref, body: p?.body, key: env[KK_KEY_ENV], fetchImpl, sleep });
+    log(`KK answers: ${kk.records.length} from ${kk.issues.join(", ") || "no issue"}${kk.error ? ` (none read: ${kk.error})` : ""}`);
+    return (await release(gh, { ...args, log, kkAnswers: kk.records })).code;
   } catch (err) {
     log(`CANNOT RUN: ${err instanceof CannotRun ? err.message : `unexpected error: ${String(err?.message ?? err).slice(0, 200)}`}`);
     return 2;
