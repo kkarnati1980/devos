@@ -48,7 +48,9 @@
 # reported. One run at a time ($DEVOS_DIR/isolation/.lock). Worst case stays under the agent's 60 s timeout.
 # Exit 0 applied or unchanged, 1 failed (previous block kept or restored), 3 skipped (not set up yet),
 # 4 disabled by --remove (nothing changed).
-# Prints no token and no secret.
+# Prints no token and no secret. S4-b2c: the IPv6 step before the fetch has its own budget (V6_BUDGET 8 s, about
+# 18 s worst case) that is not counted against the IPv4 deadline; S4-b decision 11 still holds if the agent's 60 s
+# timeout kills a run: the new IPv4 block is kept, never no block.
 set -uo pipefail
 DIR="${DEVOS_DIR:-/root/.devos}"
 ISO="$DIR/isolation"
@@ -136,7 +138,12 @@ boot_sync() {  # $1 = installed block, or "" to delete the marker block; 0 when 
 # every IPv6 packet that enters from a project bridge, forwarded or to the host. It does not depend on the state.
 BOOT6_BEGIN="# BEGIN DEVOS S4 ISOLATION6"
 BOOT6_END="# END DEVOS S4 ISOLATION6"
-ip6t() { timeout 10 ip6tables -w 5 "$@"; }
+ip6t() { timeout 5 ip6tables -w 3 "$@"; }
+# Pre-review (low): the IPv6 step has its own small budget, so a hanging ip6tables cannot use up the IPv4 run:
+# no query or restore starts after V6_BUDGET s of the step (worst case about 8 + 10 s), and the time the step
+# took is not counted against the IPv4 change deadline (T0 moves forward by it).
+V6_BUDGET=8
+v6_time() { (( SECONDS - V6_T0 <= V6_BUDGET )) || { echo "IPv6 drop: time budget (${V6_BUDGET} s) used up; retried next tick"; return 1; }; }
 V6_RULE="-A $ISO6 -i devos-p+ -j DROP"
 v6_block() { printf '*filter\n:%s - [0:0]\n%s\nCOMMIT\n' "$ISO6" "$V6_RULE"; }
 boot6_text() {  # the after6.rules marker block ($1 unused: the block is static)
@@ -149,10 +156,12 @@ boot6_text() {  # the after6.rules marker block ($1 unused: the block is static)
   echo "$BOOT6_END"
 }
 v6_jump_ops() {  # -> restore lines that leave exactly one jump to DEVOS-ISO6, first, in each built-in chain
-  local chain n first
+  local chain n first rules
   for chain in DOCKER-USER FORWARD INPUT; do
-    n="$(ip6t -S "$chain" 2>/dev/null | grep -cxF -- "-A $chain -j $ISO6")"
-    first="$(ip6t -S "$chain" 2>/dev/null | grep '^-A ' | sed -n 1p)"
+    v6_time || return 1
+    rules="$(ip6t -S "$chain" 2>/dev/null)" || { echo "IPv6 drop: cannot read the IPv6 $chain chain"; return 1; }
+    n="$(grep -cxF -- "-A $chain -j $ISO6" <<<"$rules")"
+    first="$(grep '^-A ' <<<"$rules" | sed -n 1p)"
     [[ "$n" == 1 && "$first" == "-A $chain -j $ISO6" ]] && continue
     while (( n-- > 0 )); do echo "-D $chain -j $ISO6"; done
     echo "-I $chain 1 -j $ISO6"
@@ -162,21 +171,28 @@ v6_sync() {  # 0 when the IPv6 drop is live (one rule, every jump first, once) a
   command -v ip6tables >/dev/null 2>&1 && command -v ip6tables-restore >/dev/null 2>&1 || { echo "IPv6 drop: ip6tables not installed"; return 1; }
   ip6t -S DOCKER-USER >/dev/null 2>&1 || { echo "IPv6 drop: the IPv6 DOCKER-USER chain is missing (M0.1 not applied?)"; return 1; }
   local ops tx have
+  v6_time || return 1
   have="$(ip6t -S "$ISO6" 2>/dev/null | grep '^-A ')"
-  ops="$(v6_jump_ops)" || return 1
+  ops="$(v6_jump_ops)" || { tail -n1 <<<"$ops"; return 1; }  # on failure the cause is its last line
   if [[ "$have" != "$V6_RULE" || -n "$ops" ]]; then
     tx="$(v6_block | grep -vx 'COMMIT')"$'\n'"${ops:+$ops$'\n'}COMMIT"
-    printf '%s\n' "$tx" | timeout 15 ip6tables-restore -w 5 --noflush || { echo "IPv6 drop: ip6tables-restore refused the transaction"; return 1; }
+    v6_time || return 1
+    printf '%s\n' "$tx" | timeout 10 ip6tables-restore -w 3 --noflush || { echo "IPv6 drop: ip6tables-restore refused the transaction"; return 1; }
   fi
   boot_sync x "$UFW_AFTER6" boot6_text "$BOOT6_BEGIN" "$BOOT6_END" || { echo "IPv6 drop: not persisted for boot"; return 1; }
 }
 v6_remove() {  # deletes the IPv6 jumps, the chain and the after6.rules block; 0 if nothing of it is left
   local chain rc=0
   if command -v ip6tables >/dev/null 2>&1; then
-    for chain in DOCKER-USER FORWARD INPUT; do
-      while ip6t -C "$chain" -j "$ISO6" 2>/dev/null; do ip6t -D "$chain" -j "$ISO6" || { rc=1; break; }; done
-    done
-    if ip6t -S "$ISO6" >/dev/null 2>&1; then ip6t -F "$ISO6" && ip6t -X "$ISO6" || rc=1; fi
+    # Pre-review (low): a failed query must not read as "nothing left", so ip6tables must answer first.
+    if ip6t -S INPUT >/dev/null 2>&1; then
+      for chain in DOCKER-USER FORWARD INPUT; do
+        while ip6t -C "$chain" -j "$ISO6" 2>/dev/null; do ip6t -D "$chain" -j "$ISO6" || { rc=1; break; }; done
+      done
+      if ip6t -S "$ISO6" >/dev/null 2>&1; then ip6t -F "$ISO6" && ip6t -X "$ISO6" || rc=1; fi
+    else
+      echo "remove: ip6tables does not answer; the IPv6 drop may still be in place (ip6tables -S DEVOS-ISO6)"; rc=1
+    fi
   fi
   boot_sync "" "$UFW_AFTER6" boot6_text "$BOOT6_BEGIN" "$BOOT6_END" || rc=1
   return $rc
@@ -253,7 +269,11 @@ fi
 # back. A failure does not stop the IPv4 block; the run carries on and then exits 1 on every path.
 V6_RC=0
 if [[ "$MODE" == apply ]]; then
-  V6_MSG="$(mkdir -p "$ISO" && chmod 700 "$ISO" && exec 9>"$ISO/.lock" && flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; v6_sync)"; V6_RC=$?
+  V6_T0=$SECONDS
+  # Pre-review (low): only a held lock skips the step; a lock file that cannot be opened is a failure.
+  V6_MSG="$(mkdir -p "$ISO" && chmod 700 "$ISO" && exec 9>"$ISO/.lock" || { echo "IPv6 drop: cannot open $ISO/.lock"; exit 1; }
+    flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; v6_sync)"; V6_RC=$?
+  T0=$(( T0 + SECONDS - V6_T0 ))
   (( V6_RC == 0 )) || echo "IPv6 drop not in place: $V6_MSG"
 fi
 done_ok() { (( V6_RC == 0 )) || exit 1; exit 0; }  # $1 names the path, for the reader

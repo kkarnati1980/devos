@@ -57,7 +57,7 @@ if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sl
   w("tailscale", `exit 1`);
   // ip6tables / ip6tables-restore (S4-b2c): the same fakes over $FAKE_NF/v6 and $FAKE_LOG/v6, so the IPv4
   // restore count and logs are not mixed with IPv6. FAKE_V6_RC fails every ip6tables call; FAKE_V6_RESTORE_RC the restore.
-  w("ip6tables", `[[ "\${FAKE_V6_RC:-0}" == 0 ]] || exit "$FAKE_V6_RC"; FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_IPT_S_SLEEP= exec "\${0%/*}/iptables" "$@"`);
+  w("ip6tables", `[[ "\${FAKE_V6_RC:-0}" == 0 ]] || exit "$FAKE_V6_RC"; FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_IPT_S_SLEEP="\${FAKE_V6_S_SLEEP:-}" exec "\${0%/*}/iptables" "$@"`);
   w("ip6tables-restore", `FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_RESTORE_RC="\${FAKE_V6_RESTORE_RC:-0}" FAKE_KILL_PID= exec "\${0%/*}/iptables-restore" "$@"`);
   // conntrack (S4-b2d): logs argv; FAKE_CT_RC fails it with another message; with no match the real one exits 1.
   w("conntrack", `echo "$*" >> "$FAKE_LOG/conntrack.log"; [[ "\${FAKE_CT_RC:-0}" == 0 ]] || { echo "conntrack v1.4.7 (conntrack-tools): Operation failed: injected" >&2; exit "$FAKE_CT_RC"; }
@@ -877,4 +877,25 @@ test("S4-b2c: IPv6 tailnet entries are still refused, whole document (decision 6
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /IPv6 entries are refused: project networks have no IPv6/);
   assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+});
+
+test("S4-b2c (pre-review): a hanging ip6tables stops at the IPv6 budget, and the IPv4 change still goes ahead", () => {
+  const h = host(STATE);
+  const t = Date.now();
+  const r = run(h, [], { FAKE_V6_S_SLEEP: "3", FAKE_IPT_S_SLEEP: "0" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /IPv6 drop not in place: IPv6 drop: time budget \(8 s\) used up; retried next tick/);
+  assert.match(r.out, /applied: 2 stacks, self-test passed/, "the IPv6 time is not counted against the IPv4 deadline");
+  assert.doesNotMatch(r.out, /deadline:/);
+  assert.equal(restores6(h), 0, "no IPv6 restore started past the budget");
+  assert.ok(Date.now() - t < 30000, "bounded");
+});
+
+test("S4-b2c (pre-review): --remove does not report success while ip6tables does not answer", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const r = run(h, ["--remove"], { FAKE_V6_RC: "4" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /ip6tables does not answer/);
+  assert.equal(nf6(h, "DEVOS-ISO6"), RULE6, "still there, and said so");
 });
