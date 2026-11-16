@@ -1,6 +1,7 @@
 // M2.3 decision cards (docs/modules/M2.3.md): ACTION / TARGET / REASON cards, KK-only decisions that issue one
 // scoped, expiring, limited-use M1.7 grant, and blocked tasks that wait only on the cards they depend on.
 import { createHash } from "node:crypto";
+import { probeGrantCard } from "./provision-probe-purge.js";
 import { looksSecret, type NoticeInput } from "./notify.js";
 import type { KkSession } from "./auth.js";
 
@@ -227,8 +228,18 @@ export interface ApprovalsDeps {
    * Wired in M2.3-b; without it every policy card is a `decision` card (purge actions excepted, see below).
    */
   gateForRules?: (ruleIds: readonly string[]) => Promise<GateName | null>;
+  /**
+   * DEVOS-110 (M2.4-d follow-up, decision 3): true only for the AT13 probe's own project row. Without it a
+   * `teardown.probe-grant` card can never be approved (no grant is issued).
+   */
+  isProbeProject?: (projectId: string) => Promise<boolean>;
   now?: () => number;
 }
+
+/** DEVOS-110 decision 1: the one card action whose approval issues a fixed grant instead of a card-scoped one. */
+export const PROBE_GRANT_CARD_ACTION = "teardown.probe-grant";
+/** DEVOS-110 decision 3 (the d3c-2 decision 3 grant): what approving that card issues. Code, never read from the card. */
+export const PROBE_GRANT_SCOPE = { scopeAction: "teardown.*", hours: MAX_GRANT_HOURS, maxUses: 30 } as const;
 
 /** The rule fields `gateFromRules` reads (structural; `@devos/policy` PolicyRule). */
 export interface GateRuleLike {
@@ -353,16 +364,8 @@ export class Approvals {
       confirmationHash = expected;
     }
     const at = new Date(this.now());
-    const hours = options.expiresInHours ?? DEFAULT_GRANT_HOURS;
-    const grant = await this.deps.grants.issueGrant(session as KkSession, {
-      approvalId: card.id,
-      scopeAction: card.action,
-      scopeResource: card.target,
-      projectId: card.projectId,
-      sha: options.sha ?? null,
-      expiresAt: new Date(at.getTime() + hours * 3600 * 1000),
-      maxUses: options.maxUses ?? 1,
-    });
+    const scope = await this.grantScope(card, options, at);
+    const grant = await this.deps.grants.issueGrant(session as KkSession, scope);
     const decided = await this.deps.store
       .decide(
         id,
@@ -378,6 +381,51 @@ export class Approvals {
       throw new ApprovalError("card-not-pending", 409);
     }
     return { card: decided, grantId: grant.id };
+  }
+
+  /**
+   * The grant an approval issues: scoped to the card's own action and target, except for the probe's fixed card
+   * (DEVOS-110 decision 3), whose grant is `teardown.*` on the probe project for 90 days and 30 uses, whatever the
+   * approve options say. That card is refused (no grant) unless its project is the probe's row and its target is
+   * that project, so no card text can widen a grant.
+   */
+  private async grantScope(card: Card, options: ApproveOptions, at: Date): Promise<Parameters<GrantIssuer["issueGrant"]>[1]> {
+    if (card.action === PROBE_GRANT_CARD_ACTION) {
+      const pid = card.projectId;
+      // Pre-review 1: only the fixed card the probe raises (its gate and every word of its text), so a policy card for
+      // the same action, carrying a rule's reason, can never issue this grant.
+      const fixed = pid ? probeGrantCard(pid) : null;
+      if (
+        !pid || !fixed || card.target !== fixed.target || card.gate !== fixed.gate || card.reason !== fixed.reason ||
+        card.consequence !== fixed.consequence || !this.deps.isProbeProject
+      ) throw new ApprovalError("invalid-input");
+      let probe: boolean;
+      try {
+        probe = await this.deps.isProbeProject(pid);
+      } catch {
+        throw new ApprovalError("approvals-store-error", 500);
+      }
+      if (!probe) throw new ApprovalError("invalid-input");
+      return {
+        approvalId: card.id,
+        scopeAction: PROBE_GRANT_SCOPE.scopeAction,
+        scopeResource: null,
+        projectId: pid,
+        sha: null,
+        expiresAt: new Date(at.getTime() + PROBE_GRANT_SCOPE.hours * 3600 * 1000),
+        maxUses: PROBE_GRANT_SCOPE.maxUses,
+      };
+    }
+    const hours = options.expiresInHours ?? DEFAULT_GRANT_HOURS;
+    return {
+      approvalId: card.id,
+      scopeAction: card.action,
+      scopeResource: card.target,
+      projectId: card.projectId,
+      sha: options.sha ?? null,
+      expiresAt: new Date(at.getTime() + hours * 3600 * 1000),
+      maxUses: options.maxUses ?? 1,
+    };
   }
 
   /**
