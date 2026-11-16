@@ -1,7 +1,7 @@
 // DEVOS-228 (M2.4-d3b, docs/modules/M2.4.md "Part 2"): the AT13 probe's phase machine, with fakes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { probeStep, inventoryDiff, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, PROBE_EVERY_MS, PROBE_PHASE_MAX_MS } from "../dist/provision-probe.js";
+import { probeStep, inventoryDiff, inventoryIncomplete, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, PROBE_EVERY_MS, PROBE_PHASE_MAX_MS } from "../dist/provision-probe.js";
 
 const ROWS = [
   { key: "github_repo", provider: "github", externalId: "1", name: "devos-probe-m24" },
@@ -121,6 +121,34 @@ test("inventoryDiff ignores row order and names a missing or extra row", () => {
   assert.equal(inventoryDiff(ROWS, [...ROWS].reverse()), null);
   assert.equal(inventoryDiff(ROWS, [ROWS[0]]), "missing-in-run2:coolify_project");
   assert.equal(inventoryDiff([ROWS[0]], ROWS), "extra-in-run2:coolify_project");
+});
+
+test("Codex PR164-r2: the same gap in both reads fails the cycle and names the row, after the purge", async () => {
+  for (const [row, detail] of [
+    [{ ...ROWS[1], name: "" }, "run1:no-active-resource:coolify_project"],
+    [{ ...ROWS[1], externalId: "", name: "" }, "run1:no-external-id:coolify_project"],
+  ]) {
+    const d = fake({ inventory: async () => { d.calls.inventory++; return [ROWS[0], row]; } });
+    const end = (await runToEnd(d)).at(-1);
+    assert.deepEqual([end.exit, end.code, end.detail], [1, "inventory-incomplete", detail]);
+    assert.equal(d.calls.inventory, 1, "the gap is caught on the first read; identical reads cannot pass");
+    assert.equal(d.calls.purge, 1);
+    assert.equal(d.calls.asserts, 0);
+  }
+});
+
+test("Codex PR164-r2: a row lost between the reads is named from the second read", async () => {
+  let n = 0;
+  const d = fake({ inventory: async () => (++n === 1 ? ROWS : [ROWS[0], { ...ROWS[1], name: "" }]) });
+  const end = (await runToEnd(d)).at(-1);
+  assert.deepEqual([end.exit, end.code, end.detail], [1, "inventory-incomplete", "run2:no-active-resource:coolify_project"]);
+  assert.equal(d.calls.purge, 1);
+});
+
+test("inventoryIncomplete passes complete rows and names the first gap in key order", () => {
+  assert.equal(inventoryIncomplete(ROWS), null);
+  assert.equal(inventoryIncomplete([]), null);
+  assert.equal(inventoryIncomplete([{ ...ROWS[0], externalId: "" }, { ...ROWS[1], name: "" }]), "no-active-resource:coolify_project");
 });
 
 test("inventoryDiff flags a key recorded twice in one run", () => {
