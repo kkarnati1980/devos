@@ -191,6 +191,12 @@ export class TeardownSweepJob {
    * nothing at a provider, so a single repeat after a restart is harmless.
    */
   private readonly stopped = new Set<string>();
+  /**
+   * Stop-report cards not yet delivered (Codex PR181-r1): retried at the start of every tick until raised (raiseCard
+   * dedupes a pending twin). In memory: after a restart the daily run raises a fresh purge card instead, which still
+   * needs KK's approval before anything more is deleted.
+   */
+  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string }>();
   private readonly now: () => number;
 
   constructor(private readonly d: TeardownSweepDeps) {
@@ -204,10 +210,11 @@ export class TeardownSweepJob {
       const { day, minute } = istClock(this.now());
       const daily = minute >= PURGE_DUE_MINUTE_IST && this.lastDailyDay !== day;
       if (daily) this.waitForDaily.clear();
+      await this.deliverStops();
       await this.step("teardown-restored-pass-failed", () => this.closeRestored());
       await this.step("teardown-keep-pass-failed", () => this.keepArchivedPass());
       await this.step("teardown-approved-pass-failed", () => this.approvedPass());
-      // Pre-review 5: a failed daily run is tried again on the next tick, not a day later.
+      // Pre-review 5: a failed (or partly failed) daily run is tried again on the next tick, not a day later.
       if (daily && (await this.step("teardown-due-pass-failed", () => this.duePass()))) this.lastDailyDay = day;
     } finally {
       this.running = false;
@@ -330,16 +337,25 @@ export class TeardownSweepJob {
   }
 
   private async raiseStopped(p: TeardownProject, code: string): Promise<void> {
-    try {
-      await this.d.raise(purgeStoppedCard(p, code, await this.d.activeCounts(p.id)));
-    } catch {
-      this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: p.id, code });
+    this.stopsOwed.set(p.id, { p, code });
+    await this.deliverStops();
+  }
+
+  private async deliverStops(): Promise<void> {
+    for (const [id, o] of this.stopsOwed) {
+      try {
+        await this.d.raise(purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id)));
+        this.stopsOwed.delete(id);
+      } catch {
+        this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: o.p.id, code: o.code });
+      }
     }
   }
 
   /** 4. Decision (b): the daily purge-due run raises a card; it never deletes. */
   private async duePass(): Promise<void> {
     const due = await this.d.listDue(new Date(this.now()), DUE_PAGE);
+    let failed = false;
     for (const p of due) {
       try {
         if (await this.shouldRaise(p)) {
@@ -347,9 +363,13 @@ export class TeardownSweepJob {
           this.d.log({ level: "info", msg: "teardown-purge-card", projectId: p.id });
         }
       } catch {
+        failed = true;
         this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: p.id, code: "purge-due" });
       }
     }
+    // Codex PR181-r1: any project whose card could not be raised keeps the daily run open, so the next tick tries again
+    // (projects already served are not raised twice: a pending card blocks a second one).
+    if (failed) throw new Error("teardown-due-partial");
   }
 
   /**
@@ -358,7 +378,7 @@ export class TeardownSweepJob {
    * one, then nothing.
    */
   private async shouldRaise(p: TeardownProject): Promise<boolean> {
-    if (p.stage !== "archived" || !p.purgeAfter) return false;
+    if (p.stage !== "archived" || !p.purgeAfter || this.stopsOwed.has(p.id)) return false;
     const since = p.purgeAfter.getTime();
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
     if (cards.some((c) => c.status === "pending")) return false;

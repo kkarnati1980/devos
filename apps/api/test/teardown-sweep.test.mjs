@@ -28,6 +28,7 @@ const purgeRule = {
 
 function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule] } = {}) {
     const failDue = { n: 0 };
+  const failRaise = { n: 0 };
   let now = T0;
   const kk = new KkSessionRegistry();
   const policyStore = new MemoryPolicyStore({ mode, rules });
@@ -56,7 +57,10 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
     project: async (id) => (projects.has(id) ? { ...projects.get(id) } : null),
     activeCounts: async (id) => ({ ...(counts[id] ?? {}) }),
     cards: (f) => approvals.store.list(f),
-    raise: (c) => approvals.raiseCard(c),
+    raise: (c) => {
+      if (failRaise.n > 0) { failRaise.n--; return Promise.reject(new Error("db blip")); }
+      return approvals.raiseCard(c);
+    },
     expire: (ids, reason) => approvals.expireCardsById(ids, reason),
     unspentGrant: async (approvalId, at) => {
       return [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses === 0)?.id ?? null;
@@ -75,7 +79,7 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
   });
   const session = kk.mint("kk@example.com");
   const purgeCards = (status) => approvals.store.list({ action: PURGE_ACTION, limit: 50, ...(status ? { status } : {}) });
-  return { failDue, job, approvals, store, engine, policyStore, projects, counts, calls, logs, session, purgeCards, advance: (ms) => (now += ms), now: () => now };
+  return { failDue, failRaise, job, approvals, store, engine, policyStore, projects, counts, calls, logs, session, purgeCards, advance: (ms) => (now += ms), now: () => now };
 }
 
 const approve = (s, id) => s.approvals.approve(s.session, id, { confirmation: `PURGE project:${P}` });
@@ -423,3 +427,34 @@ test("pre-review r2 3: not_archived (Restore while waiting for the lock) is a sk
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
   assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "not-archived"));
 });
+
+test("Codex PR181-r1: a stop card that could not be raised is retried on the next tick", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("ownership_mismatch", false, "x"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  s.failRaise.n = 1;
+  await s.job.tick();
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
+  assert.equal(s.calls.purge.length, 1);
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0, "the open stop card holds back a new purge card");
+});
+
+test("Codex PR181-r1: a due project whose card could not be raised is retried on the next tick, the same day", async () => {
+  const s = setup();
+  s.failRaise.n = 1;
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0);
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 1);
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 1, "no second card");
+});
+
