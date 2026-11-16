@@ -95,4 +95,5 @@ test("SM-13-L1 no MyBrain credential in the app; the CLI writes the scan_report 
   assert.equal(await main(["--url", openUrl, "--paths", "/", "--out", inRoot], { root: join(tmp.dir, "clean"), print: () => {} }), 0, "the scan's own old report is skipped");
   assert.equal(await main(["--url", plainUrl, "--paths", "/"], { root: join(tmp.dir, "clean"), print: () => {} }), 1);
   assert.equal(await main([], { print: () => {} }), 2);
+  assert.equal(await main(["--url", openUrl, "--out", join(tmp.dir, "clean", "x.mjs")], { root: join(tmp.dir, "clean"), print: () => {} }), 2, "the report is a .json file");
 });

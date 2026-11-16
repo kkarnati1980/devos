@@ -13,6 +13,7 @@ export async function main(argv, { scan = scanApp, root = process.cwd(), print =
   const paths = arg("--paths") ? arg("--paths").split(",").map((p) => p.trim()).filter(Boolean) : undefined;
   const report = await scan({ baseUrl: url, ...(paths ? { paths } : {}) });
   const out = arg("--out");
+  if (out !== undefined && !/\.json$/i.test(out)) { print("mybrain-scan: --out must name a .json report file\n"); return 2; }
   const secrets = findMyBrainSecrets(root, { skipFiles: out ? [resolve(out)] : [] });
   report.findings.push(...secrets);
   report.ok = report.findings.length === 0;
