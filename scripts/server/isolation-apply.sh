@@ -243,13 +243,19 @@ ct_queue() {  # $1 = previous block, $2 = new block, $3 = 1 when the live chains
 if [[ "$MODE" == remove ]]; then
   command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
-  if remove_block && v6_remove; then
-    rm -f "$ISO/installed.rules" "$ISO/live.sha256"
-    boot_sync "" || { echo "removed, but the boot block is still in $UFW_AFTER: delete the DEVOS S4 ISOLATION lines there"; date -u +%FT%TZ > "$ISO/disabled"; exit 1; }
-    date -u +%FT%TZ > "$ISO/disabled" || { echo "removed, but could not write $ISO/disabled: the agent will apply the block again"; exit 1; }
+  # Codex PR165-r1: each step runs whatever the others did, so a failure in one family cannot leave the other's
+  # boot block in place or the agent free to re-apply. The marker comes first (the next tick sees it even if a
+  # later step fails); every failure is named and the run still exits 1.
+  RM_RC=0
+  date -u +%FT%TZ > "$ISO/disabled" || { echo "remove: could not write $ISO/disabled: the agent will apply the block again"; RM_RC=1; }
+  if remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"
+  else echo "remove: some IPv4 S4 rules are still in place (iptables -S DOCKER-USER, FORWARD, INPUT)"; RM_RC=1; fi
+  boot_sync "" || { echo "remove: the boot block is still in $UFW_AFTER: delete the DEVOS S4 ISOLATION lines there"; RM_RC=1; }
+  v6_remove || { echo "remove: the IPv6 drop or its block in $UFW_AFTER6 is still in place (ip6tables -S DEVOS-ISO6)"; RM_RC=1; }
+  if (( RM_RC == 0 )); then
     echo "removed: S4 isolation jumps and chains (M0.1/M0.2 rules untouched); kept off until $ISO/disabled is deleted"; exit 0
   fi
-  echo "remove failed: some S4 rules are still in place (see iptables -S / ip6tables -S DOCKER-USER, FORWARD, INPUT, and the ufw after.rules / after6.rules files)"; exit 1
+  echo "remove failed: some S4 rules are still in place (see above); kept off until $ISO/disabled is deleted"; exit 1
 fi
 [[ "$MODE" == apply && -e "$ISO/disabled" ]] && { echo "disabled: --remove was run; delete $ISO/disabled to turn the block back on"; exit 4; }
 

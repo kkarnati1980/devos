@@ -27,6 +27,7 @@ before(async () => {
 echo "$*" >> "$FAKE_LOG/iptables.log"
 op="$1" ch="$2"; shift 2; f="$FAKE_NF/$ch"
 [[ "$op" == -S && -n "\${FAKE_IPT_S_SLEEP:-}" ]] && sleep "$FAKE_IPT_S_SLEEP"
+[[ "$op" == -D && -n "\${FAKE_IPT_D_RC:-}" ]] && exit "$FAKE_IPT_D_RC"  # Codex PR165-r1: a failed rule delete
 case "$op" in
   -S) [[ -f "$f" ]] || exit 1; [[ "$ch" == INPUT || "$ch" == FORWARD ]] && echo "-P $ch DROP" || echo "-N $ch"; cat "$f" ;;
   -C) [[ -f "$f" ]] && grep -qxF -- "-A $ch $*" "$f" ;;
@@ -57,7 +58,7 @@ if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sl
   w("tailscale", `exit 1`);
   // ip6tables / ip6tables-restore (S4-b2c): the same fakes over $FAKE_NF/v6 and $FAKE_LOG/v6, so the IPv4
   // restore count and logs are not mixed with IPv6. FAKE_V6_RC fails every ip6tables call; FAKE_V6_RESTORE_RC the restore.
-  w("ip6tables", `[[ "\${FAKE_V6_RC:-0}" == 0 ]] || exit "$FAKE_V6_RC"; FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_IPT_S_SLEEP="\${FAKE_V6_S_SLEEP:-}" exec "\${0%/*}/iptables" "$@"`);
+  w("ip6tables", `[[ "\${FAKE_V6_RC:-0}" == 0 ]] || exit "$FAKE_V6_RC"; FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_IPT_S_SLEEP="\${FAKE_V6_S_SLEEP:-}" FAKE_IPT_D_RC= exec "\${0%/*}/iptables" "$@"`);
   w("ip6tables-restore", `FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_RESTORE_RC="\${FAKE_V6_RESTORE_RC:-0}" FAKE_KILL_PID= exec "\${0%/*}/iptables-restore" "$@"`);
   // conntrack (S4-b2d): logs argv; FAKE_CT_RC fails it with another message; with no match the real one exits 1.
   w("conntrack", `echo "$*" >> "$FAKE_LOG/conntrack.log"; [[ "\${FAKE_CT_RC:-0}" == 0 ]] || { echo "conntrack v1.4.7 (conntrack-tools): Operation failed: injected" >&2; exit "$FAKE_CT_RC"; }
@@ -898,4 +899,30 @@ test("S4-b2c (pre-review): --remove does not report success while ip6tables does
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /ip6tables does not answer/);
   assert.equal(nf6(h, "DEVOS-ISO6"), RULE6, "still there, and said so");
+  // Codex PR165-r1: the IPv6 failure must not stop the IPv4 rollback or the marker (AT8).
+  assert.ok(fs.existsSync(path.join(h, "devos/isolation/disabled")), "the disable marker is written anyway");
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null, "the IPv4 block is gone");
+  assert.equal(afterRules(h), UFW_HEAD + M01, "the IPv4 boot block is gone too");
+  const before = restores(h);
+  const next = run(h);
+  assert.equal(next.code, 4, next.out);
+  assert.equal(restores(h), before, "the next tick does not re-apply the IPv4 block");
+  assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
+  // Once ip6tables answers again, a second --remove finishes the IPv6 part.
+  assert.equal(run(h, ["--remove"]).code, 0);
+  assert.equal(nf6(h, "DEVOS-ISO6"), null);
+  assert.equal(after6(h), UFW_HEAD6 + M01_6);
+});
+
+test("S4-b2c (Codex PR165-r1): an IPv4 removal failure still removes the IPv6 drop and both boot blocks", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const r = run(h, ["--remove"], { FAKE_IPT_D_RC: "4" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /some IPv4 S4 rules are still in place/);
+  assert.ok(fs.existsSync(path.join(h, "devos/isolation/disabled")));
+  assert.equal(afterRules(h), UFW_HEAD + M01, "the IPv4 boot block is removed anyway");
+  assert.equal(nf6(h, "DEVOS-ISO6"), null, "the IPv6 drop is removed anyway");
+  assert.equal(after6(h), UFW_HEAD6 + M01_6);
+  assert.equal(run(h).code, 4, "kept off");
 });
