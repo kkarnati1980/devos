@@ -19,7 +19,7 @@ async function main(): Promise<void> {
   // R3-a: read the certificate files before anything else starts, so a missing file stops start-up early.
   const tls = loadTls(process.env, config.secureCookies);
   const kkSessions = new KkSessionRegistry();
-  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision, teardown } = await buildRuntime(process.env, {
+  const { grants, readiness, setup, notify, deadLetters, approvals, requirements, requirementsSync, analystSweep, isolation, cardBatch, runnerWatchdog, provisionSweep, provision, teardown, teardownSweep } = await buildRuntime(process.env, {
     outboundTimeoutMs: config.outboundTimeoutMs,
     kkSessions,
     loadLinear: async (apiKey) => {
@@ -113,9 +113,10 @@ async function main(): Promise<void> {
   runnerWatchdog?.start();
   // DEVOS-224: provisions approved projects, at start-up and every 60 s.
   provisionSweep?.start();
-  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); isolationServer?.close(); });
-  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); isolationServer?.close(); });
-  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null, cardBatch: cardBatch !== null, runnerWatchdog: runnerWatchdog !== null, provisionSweep: provisionSweep !== null });
+  teardownSweep?.start();
+  process.once("SIGTERM", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); teardownSweep?.stop(); isolationServer?.close(); });
+  process.once("SIGINT", () => { requirementsSync?.stop(); analystSweep?.stop(); cardBatch?.stop(); runnerWatchdog?.stop(); provisionSweep?.stop(); teardownSweep?.stop(); isolationServer?.close(); });
+  stdoutSink({ ts: new Date().toISOString(), level: "info", msg: "api-started", port: config.port, tls: tls !== null, policyEngine: grants !== null, vault: setup.vault !== null, notifications: notify.notifier !== null, deadLetters: deadLetters.queue !== null, approvals: approvals.approvals !== null, requirements: requirements.pipeline !== null, requirementsSync: requirementsSync !== null, analystModelPass: analystModelPass(process.env) && requirements.pipeline !== null, analystSweep: analystSweep !== null, isolationState: isolationServer !== null, cardBatch: cardBatch !== null, runnerWatchdog: runnerWatchdog !== null, provisionSweep: provisionSweep !== null, teardownSweep: teardownSweep !== null });
 }
 
 main().catch((e: unknown) => {
