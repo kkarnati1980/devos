@@ -126,6 +126,8 @@ export function coolifyProjectOps(cf: CoolifyClient, projectId: string): Resourc
 }
 
 const APP_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
+/** Coolify v4 application states that mean "no container running" (`exited`, `exited:unhealthy`, `stopped`). */
+const STOPPED_RE = /^(exited|stopped)(:[a-z]+)?$/;
 
 /**
  * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos:<project id>` (M2.4-c2's
@@ -133,7 +135,7 @@ const APP_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
  * them). Remove deletes the app with its volumes, configuration and connected networks in one call.
  */
 export interface AppTeardownOptions {
-  /** How long a queued delete may take to show as gone (default 60 s), and the wait between reads (default 2 s). */
+  /** How long a queued stop or delete may take to show (default 60 s), and the wait between reads (default 2 s). */
   confirmMs?: number;
   pollMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -149,20 +151,23 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
     if (!APP_UUID_RE.test(item.externalId)) throw new Error("coolify-uuid-invalid");
     return item.externalId;
   };
-  const inspect = async (id: string): Promise<{ owned: boolean } | null> => {
-    const r = await cf.http.get<{ uuid?: unknown; description?: unknown }>(`/api/v1/applications/${id}`);
+  const inspect = async (id: string): Promise<{ owned: boolean; status: unknown } | null> => {
+    const r = await cf.http.get<{ uuid?: unknown; description?: unknown; status?: unknown }>(`/api/v1/applications/${id}`);
     // Only a 404 proves absence; a 200 must carry this application (same uuid, a string or null description).
     if (r.status === 404) return null;
     const b = r.body;
     if (r.status !== 200 || !b || typeof b !== "object" || b.uuid !== id || !(b.description == null || typeof b.description === "string")) {
       throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/applications/{uuid} returned an inconclusive response (${r.status})`, r.status);
     }
-    return { owned: ((b.description as string | null | undefined) ?? "").includes(ownershipMarker(projectId)) };
+    return { owned: ((b.description as string | null | undefined) ?? "").includes(ownershipMarker(projectId)), status: b.status };
   };
   return {
     provider: "coolify",
     kind: "application",
-    inspect: async (item) => inspect(uuid(item)),
+    inspect: async (item) => {
+      const a = await inspect(uuid(item));
+      return a && { owned: a.owned };
+    },
     archive: async (item) => {
       const id = uuid(item);
       // Stop is idempotent: stopping a stopped app is a no-op at Coolify (a GET, so the transport may retry it).
@@ -171,6 +176,21 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
       if (r.status === 404 && (await inspect(id)) === null) return;
       if (r.status !== 200) {
         throw new ProviderError("coolify", r.status === 404 ? "http" : "bad-response", `coolify stop of an application returned ${r.status}`, r.status);
+      }
+      // Codex PR154-r3: Coolify only queues the stop ("Stopping request queued."). Archive succeeds (and the repo
+      // turns read-only after it) only once a read shows the app stopped (`exited` or `stopped`, with or without a
+      // `:health` suffix) or gone; still running when the bound ends, or a status that is not a string, fails
+      // the step, so the repo stays writable and Archive can be run again.
+      const until = now() + confirmMs;
+      for (;;) {
+        const a = await inspect(id);
+        if (a === null) return;
+        if (typeof a.status !== "string") {
+          throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/applications/{uuid} returned no status after a stop", 200);
+        }
+        if (STOPPED_RE.test(a.status)) return;
+        if (now() >= until) throw new ProviderError("coolify", "timeout", "coolify has not finished stopping the application yet");
+        await sleep(pollMs);
       }
     },
     remove: async (item) => {

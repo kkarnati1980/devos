@@ -21,6 +21,7 @@ function fakes() {
   const calls = [];
   const lingering = new Map(); // uuid -> reads left before a queued delete finishes (Coolify queues it)
   const stopStatus = { value: 200 };
+  const stopReads = new Map(); // uuid -> reads that still show "running:healthy" after a stop was queued
   async function fetchImpl(url, init = {}) {
     const u = new URL(url);
     const method = init.method ?? "GET";
@@ -43,7 +44,8 @@ function fakes() {
         const a = base.apps.get(m[1]);
         if (!a) return json(404, { message: "Application not found." });
         if (stopStatus.value !== 200) return json(stopStatus.value, { message: "injected" });
-        a.stopped = true;
+        // Like Coolify, the stop is queued: the app reads as running for `stopReads` more reads (default 1).
+        a.stopping = stopReads.get(a.uuid) ?? 1;
         return json(200, { message: "Stopping request queued." });
       }
       if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)$/))) {
@@ -55,7 +57,8 @@ function fakes() {
             lingering.set(a.uuid, left);
             if (left < 0) { base.apps.delete(a.uuid); return json(404, { message: "Application not found." }); }
           }
-          return json(200, { uuid: a.uuid, name: a.name, description: a.description });
+          if (a.stopping !== undefined && !a.stopped) { if (a.stopping-- <= 0) a.stopped = true; }
+          return json(200, { uuid: a.uuid, name: a.name, description: a.description, status: a.stopped ? "exited:unhealthy" : "running:healthy" });
         }
         if (method === "DELETE") {
           if (lingering.has(a.uuid)) { a.deleting = true; return json(200, { message: "Application deletion request queued." }); }
@@ -79,7 +82,7 @@ function fakes() {
     }
     return base.fetchImpl(url, init);
   }
-  return { ...base, fetchImpl, calls, lingering, stopStatus, deletes: () => calls.filter((c) => c.method === "DELETE") };
+  return { ...base, fetchImpl, calls, lingering, stopStatus, stopReads, deletes: () => calls.filter((c) => c.method === "DELETE") };
 }
 
 async function setup(appOpts = { sleep: async () => {} }) {
@@ -178,6 +181,26 @@ test("pre-review 2: Archive stops the stacks before the repo turns read-only; a 
   await assert.rejects(archiveProject(P.id, { ...f.base, authorize: allowAll }), TeardownError);
   assert.ok(!f.fake.calls.some((c) => c.method === "PATCH" && c.path.startsWith("/repos/")), "the repo was not archived");
   assert.equal(f.store.projects.get(P.id).stage, "live");
+});
+
+test("Codex PR154-r3: Archive waits until a queued stop shows the app stopped; still running in time fails, repo writable", async () => {
+  const s = await setup();
+  s.fake.stopReads.set("app-preview-1", 3);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  assert.ok([...s.fake.apps.values()].every((a) => a.stopped));
+  const reads = s.fake.calls.filter((c) => c.method === "GET" && c.path === "/api/v1/applications/app-preview-1");
+  assert.ok(reads.length >= 4, "read until it showed exited");
+  const repoPatch = s.fake.calls.findIndex((c) => c.method === "PATCH" && c.path.startsWith("/repos/"));
+  const lastRead = s.fake.calls.findLastIndex((c) => c.method === "GET" && c.path.startsWith("/api/v1/applications/"));
+  assert.ok(lastRead < repoPatch, "the repo turns read-only only after both stops are confirmed");
+
+  let t = 0;
+  const u = await setup({ sleep: async (ms) => { t += ms; }, now: () => t, confirmMs: 10000, pollMs: 2000 });
+  u.fake.stopReads.set("app-preview-1", 1000);
+  u.fake.stopReads.set("app-live-1", 1000);
+  await assert.rejects(archiveProject(P.id, { ...u.base, authorize: allowAll }), TeardownError);
+  assert.ok(!u.fake.calls.some((c) => c.method === "PATCH" && c.path.startsWith("/repos/")), "the repo was not archived");
+  assert.equal(u.store.projects.get(P.id).stage, "live");
 });
 
 test("pre-review 6: Restore makes no application call; the apps stay stopped and the stage moves back", async () => {

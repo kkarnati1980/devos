@@ -38,14 +38,36 @@ test("inspect: anything but a 404 or a well-formed 200 for this uuid is inconclu
   }
 });
 
-test("archive stops the app (one call); there is no un-archive", async () => {
-  const s = stub({ [`GET /api/v1/applications/${UUID}/stop`]: { status: 200, body: { message: "Stopping request queued." } } });
+test("archive stops the app (one call, then a read that shows it stopped); there is no un-archive", async () => {
+  const s = stub({
+    [`GET /api/v1/applications/${UUID}/stop`]: { status: 200, body: { message: "Stopping request queued." } },
+    [`GET /api/v1/applications/${UUID}`]: { status: 200, body: { uuid: UUID, description: "", status: "exited:unhealthy" } },
+  });
   const ops = coolifyApplicationOps(s.cf, PID);
   await ops.archive(ITEM);
-  assert.deepEqual(s.calls, [["GET", `/api/v1/applications/${UUID}/stop`]]);
+  assert.deepEqual(s.calls, [["GET", `/api/v1/applications/${UUID}/stop`], ["GET", `/api/v1/applications/${UUID}`]]);
   assert.equal(ops.unarchive, undefined);
   const bad = coolifyApplicationOps(stub({ [`GET /api/v1/applications/${UUID}/stop`]: { status: 500, body: null } }).cf, PID);
   await assert.rejects(bad.archive(ITEM), ProviderError);
+});
+
+test("Codex PR154-r3: a queued stop that still shows running when the bound ends fails; a missing status is inconclusive", async () => {
+  let t = 0;
+  const o = { sleep: async (ms) => { t += ms; }, now: () => t, confirmMs: 6000, pollMs: 2000 };
+  const stop = { [`GET /api/v1/applications/${UUID}/stop`]: { status: 200, body: { message: "Stopping request queued." } } };
+  const running = stub({ ...stop, [`GET /api/v1/applications/${UUID}`]: { status: 200, body: { uuid: UUID, description: "", status: "running:healthy" } } });
+  await assert.rejects(coolifyApplicationOps(running.cf, PID, o).archive(ITEM), (e) => e instanceof ProviderError && e.code === "timeout");
+  assert.equal(running.calls.filter(([, p]) => p === `/api/v1/applications/${UUID}`).length, 4, "bounded: reads at 0, 2, 4 and 6 s");
+  for (const status of [undefined, 7, null]) {
+    const s = stub({ ...stop, [`GET /api/v1/applications/${UUID}`]: { status: 200, body: { uuid: UUID, description: "", status } } });
+    await assert.rejects(coolifyApplicationOps(s.cf, PID, o).archive(ITEM), (e) => e instanceof ProviderError && e.code === "bad-response");
+  }
+  for (const status of ["exited", "stopped", "exited:unhealthy"]) {
+    const s = stub({ ...stop, [`GET /api/v1/applications/${UUID}`]: { status: 200, body: { uuid: UUID, description: "", status } } });
+    await coolifyApplicationOps(s.cf, PID, o).archive(ITEM);
+  }
+  const gone = stub(stop); // stopped, then deleted by hand before the read: nothing left running
+  await coolifyApplicationOps(gone.cf, PID, o).archive(ITEM);
 });
 
 test("remove is one DELETE with volumes, configuration and networks; 404/410 is already gone; other errors throw", async () => {
