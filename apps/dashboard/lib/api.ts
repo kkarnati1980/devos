@@ -76,6 +76,13 @@ export interface PreflightView {
 /** M2.4-d2 (DEVOS-225): provisioning status; `code` is a fixed error code only. */
 export interface ProvisionStepView { key: string; provider: string; kind: string; status: "pending" | "done" | "failed"; attempts: number; code: string | null; updatedAt: string }
 export interface ProvisionView { projectId: string; stage: string; parked: boolean; steps: ProvisionStepView[] }
+/** M2.6-b2b3 (DEVOS-248): Linear URLs for the project and its modules (the API sends only https://linear.app ones). */
+export interface LinearLinksView {
+  enabled: boolean;
+  project: string | null;
+  modules: { key: string; url: string }[];
+}
+
 /** ADR-0012 CR-b2c (DEVOS-216): the project page's batch cards (apps/api card-batch-view.ts). */
 /** M2.5-b1/b3 (DEVOS-244, DEVOS-246): the teardown state behind the "Remove project" panel; scan fields are text. */
 export interface TeardownView {
@@ -280,6 +287,10 @@ export class DevosApi {
   }
   retryProvision(projectId: string) {
     return this.call<{ queued: boolean }>("POST", `/projects/${encodeURIComponent(projectId)}/provision`);
+  }
+  /** M2.6-b2b3 (DEVOS-248): the "Open in Linear" links; `enabled: false` while the Linear sync is off. */
+  linearLinks(slug: string) {
+    return this.call<LinearLinksView>("GET", `/projects/by-slug/${encodeURIComponent(slug)}/linear-links`);
   }
   /** M2.5-b3 (DEVOS-246): the "Remove project" panel. Archive and Restore never delete; a purge needs KK's card. */
   teardown(slug: string) {

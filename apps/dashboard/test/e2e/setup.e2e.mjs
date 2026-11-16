@@ -474,3 +474,51 @@ test("M2.5-b3 (DEVOS-246, AT9 panel half): the Remove project panel shows the st
   assert.deepEqual(pp.filter((p) => !/status of 404 \(Not Found\)$/.test(p)), []);
   await pc.close();
 });
+
+test("M2.6-b2b3 (DEVOS-248): Open in Linear links for the project and modules with a stored id, linear.app only, escaped, at phone and laptop width", async () => {
+  for (const width of [390, 1280]) {
+    const context = await browser.newContext({ viewport: { width, height: 844 } });
+    const page = await context.newPage();
+    const problems = [];
+    page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+    let probe401 = 0;
+    page.on("console", (m) => {
+      if (m.type() !== "error") return;
+      if (/^Failed to load resource: the server responded with a status of 401/.test(m.text()) && probe401++ === 0) return;
+      problems.push(`console: ${m.text()}`);
+    });
+    await page.addInitScript(() => {
+      window.__cspViolations = [];
+      document.addEventListener("securitypolicyviolation", (e) => window.__cspViolations.push(`${e.violatedDirective} ${e.blockedURI}`));
+    });
+    await page.goto(dash.base + "/projects/xss-probe", { waitUntil: "load" });
+    const panel = page.getByTestId("linear-panel");
+    const project = panel.getByTestId("linear-project-link");
+    await project.waitFor();
+    assert.equal(await project.getAttribute("href"), "https://linear.app/kishoremb/project/xss-probe-0f1e2d3c4b5a");
+    assert.equal(await project.getAttribute("rel"), "noreferrer noopener");
+    const links = panel.getByTestId("linear-module-link");
+    assert.equal(await links.count(), 2, "the javascript: and look-alike host links are dropped");
+    assert.deepEqual(await links.evaluateAll((as) => as.map((a) => a.getAttribute("href"))),
+      ["https://linear.app/kishoremb/issue/DEVOS-301/m11", "https://linear.app/kishoremb/issue/DEVOS-302/m12"]);
+    assert.equal(await links.nth(1).innerText(), "Open M1.2<img src=x onerror=window.__xss8=1> in Linear", "module key shown as text");
+    assert.equal(await panel.locator("img, script").count(), 0);
+    assert.equal(await page.evaluate(() => [window.__xss8, window.__xss9].every((x) => x === undefined)), true, "no payload ran");
+    const m = await page.evaluate(() => ({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }));
+    assert.ok(m.sw <= m.cw, `${width}: scrollWidth ${m.sw} > ${m.cw}`);
+    const box = await panel.boundingBox();
+    assert.ok(box && box.x >= 0 && box.x + box.width <= width, `${width}: the panel fits`);
+    assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+    assert.deepEqual(problems, []);
+    await context.close();
+  }
+
+  // A project with the mirror off: no link at all (a module without a stored id is dropped by the API, linear-links.test.mjs).
+  const { page, context, problems } = await open("/projects/social-content-extraction");
+  const panel = page.getByTestId("linear-panel");
+  await panel.getByTestId("linear-off").waitFor();
+  assert.equal(await panel.locator("a").count(), 0, "no link while the mirror is off");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems.filter((p) => !/status of 404 \(Not Found\)$/.test(p)), []);
+  await context.close();
+});

@@ -32,6 +32,7 @@ import { PrismaProvisionReader, type ProvisionServices } from "./provision-route
 import type { TeardownServices } from "./teardown-routes.js";
 import { buildTeardownServices, buildTeardownSweep, type TeardownRuntimeModule, type TeardownSweepCards } from "./teardown-runtime.js";
 import type { TeardownSweepJob } from "./teardown-sweep.js";
+import { buildLinearLinks, type LinearLinksModule, type LinearLinksService } from "./linear-links.js";
 import { buildLinearSync, buildLinearTeardown, type LinearSyncJob, type LinearSyncModule, type LinearTeardownModule } from "./linear-sync-runtime.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
@@ -103,6 +104,8 @@ export interface Runtime {
   teardownSweep: TeardownSweepJob | null;
   /** DEVOS-163 (M2.6-b2b1): the scheduled Linear sync; null when off (logged `linear-sync-off`). main.ts starts it. */
   linearSync: LinearSyncJob | null;
+  /** DEVOS-248 (M2.6-b2b3): the "Open in Linear" links; null when the sync is off (the route answers `enabled: false`). */
+  linearLinks: LinearLinksService | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -155,7 +158,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null }, teardown: { reader: null, actions: null } as TeardownServices, teardownSweep: null, linearSync: null };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null }, teardown: { reader: null, actions: null } as TeardownServices, teardownSweep: null, linearSync: null, linearLinks: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -299,8 +302,12 @@ export async function buildRuntime(
   const ls = buildLinearSync({ mod: lsMod, db, vault, env, log });
   if ("off" in ls) log({ level: ls.off === "linear-sync-disabled" ? "info" : "warn", msg: "linear-sync-off", code: ls.off });
   const linearSync = "off" in ls ? null : ls;
+  // DEVOS-248 (M2.6-b2b3): the project page's "Open in Linear" links, read from Linear by stored id; on with the sync.
+  const ll = buildLinearLinks({ mod: lsMod as Partial<LinearLinksModule> | null, db, vault, env });
+  if ("off" in ll && ll.off !== "linear-sync-disabled") log({ level: "warn", msg: "linear-links-off", code: ll.off });
+  const linearLinks = "off" in ll ? null : ll;
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
-    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown: teardownRoutes, teardownSweep, linearSync };
+    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown: teardownRoutes, teardownSweep, linearSync, linearLinks };
 }
 
 /**
