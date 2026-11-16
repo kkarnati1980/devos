@@ -17,7 +17,10 @@ export interface LinearSyncModule {
   startSchedule(tick: () => Promise<unknown>, opts?: { intervalMs?: number; log?: (line: string) => void }): { stop: () => Promise<void> };
 }
 
-export type LinearSyncLog = (e: { level: "info" | "warn"; msg: string; code?: string; projectId?: string; synced?: number; skipped?: number; inactive?: number; failed?: number }) => void;
+export type LinearSyncLog = (e: { level: "info" | "warn"; msg: string; code?: string; projectId?: string; detail?: string; synced?: number; skipped?: number; inactive?: number; failed?: number }) => void;
+
+/** A sync line's length cap (pre-review 1: a line carries ids and at most 40 characters of a DevOS task title). */
+export const SYNC_LINE_MAX = 300;
 
 export interface LinearSyncJob {
   start(): void;
@@ -45,17 +48,33 @@ export function buildLinearSync(w: {
   const mod = w.mod;
   const vault = w.vault;
   const db = w.db;
-  const client = new mod.LinearClient({
-    apiKey: async () => {
-      const key = await vault.reveal("linear_api_key");
-      if (!key) throw new Error("linear-key-not-set");
-      return key;
-    },
-  });
-  const api = mod.graphqlApi(client);
-  // The package's sync log lines are fixed text plus ids; they are not forwarded verbatim (decision 4).
-  const syncOne = mod.lockedSyncOne(db, api, { teamKey });
+  // Pre-review 1: the sync's divergence and inbound lines (fixed text, ids and at most 40 characters of a DevOS task
+  // title, never Linear or provider error text) are logged as structured events, capped in length (AT6 "and logged").
+  const LINE = /^linear-sync: project ([0-9a-f-]{36})(?: inbound)?: /i;
+  const syncLog = (line: string) => {
+    const m = LINE.exec(line);
+    w.log({ level: "info", msg: /^linear-sync: project [0-9a-f-]{36} inbound: /i.test(line) ? "linear-sync-inbound" : "linear-sync-divergence", projectId: m && UUID.test(m[1]!) ? m[1] : undefined, detail: (m ? line.slice(m[0].length) : line).slice(0, SYNC_LINE_MAX) });
+  };
+  let syncOne: ReturnType<LinearSyncModule["lockedSyncOne"]>;
+  try {
+    const client = new mod.LinearClient({
+      apiKey: async () => {
+        const key = await vault.reveal("linear_api_key");
+        if (!key) throw new Error("linear-key-not-set");
+        return key;
+      },
+    });
+    syncOne = mod.lockedSyncOne(db, mod.graphqlApi(client), { teamKey, log: syncLog });
+  } catch {
+    // Pre-review: a module that loaded without the expected exports turns the sync off; the API still starts.
+    return { off: "linear-sync-not-loaded" };
+  }
   const tick = async () => {
+    // Pre-review 4: no key → one warning per tick, not one per project (and no lock or transaction is opened).
+    if (!(await vault.reveal("linear_api_key").catch(() => null))) {
+      w.log({ level: "warn", msg: "linear-sync-skipped", code: "linear-key-not-set" });
+      return;
+    }
     const r = await mod.syncActiveProjects({ list: () => mod.listActiveProjects(db), syncOne });
     for (const f of r.failed) w.log({ level: "warn", msg: "linear-sync-project-failed", code: "linear-sync-failed", projectId: UUID.test(f.projectId) ? f.projectId : undefined });
     w.log({ level: "info", msg: "linear-sync-swept", synced: r.synced.length, skipped: r.skipped.length, inactive: r.inactive.length, failed: r.failed.length });

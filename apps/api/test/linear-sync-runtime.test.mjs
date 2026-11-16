@@ -47,6 +47,8 @@ function fakeModule({ projects = [P1, P2], failFor = null } = {}) {
       return async (id) => {
         seen.keys.push(await api.client.o.apiKey());
         if (id === failFor) throw new Error(`Linear said: token ${KEY} refused`);
+        opts.log?.(`linear-sync: project ${id}: task t-1 "${"Build the search page ".repeat(30)}": state started -> unstarted (reverted)`);
+        opts.log?.(`linear-sync: project ${id} inbound: task t-2 completed in Linear`);
         seen.synced.push(id);
         return "synced";
       };
@@ -78,6 +80,10 @@ test("AT (wiring): switched on, the schedule ticks every interval over active pr
   assert.ok(seen.keys.every((k) => k === KEY), "the key is read from the vault by name at call time");
   assert.ok(logs.some((l) => l.msg === "linear-sync-started"));
   assert.ok(logs.some((l) => l.msg === "linear-sync-swept" && l.synced === 2 && l.failed === 0));
+  // Pre-review 1 (AT6 "and logged"): the sync's divergence and inbound lines reach the log, structured and capped.
+  const div = logs.find((l) => l.msg === "linear-sync-divergence" && l.projectId === P1);
+  assert.ok(div && div.detail.startsWith('task t-1 "Build the search page') && div.detail.length <= 300);
+  assert.deepEqual(logs.find((l) => l.msg === "linear-sync-inbound" && l.projectId === P2), { level: "info", msg: "linear-sync-inbound", projectId: P2, detail: "task t-2 completed in Linear" });
   await sleep(80);
   assert.equal(seen.lists, ticks, "no tick after stop");
   await job.stop();
@@ -105,8 +111,10 @@ test("decision 4: a failing project is logged by fixed code and id only; a missi
   await sleep(70);
   await job2.stop();
   assert.equal(noKey.seen.synced.length, 0);
-  assert.ok(logs2.some((l) => l.msg === "linear-sync-project-failed"), "each project fails on the missing key; the schedule goes on");
-  assert.ok(noKey.seen.lists >= 2);
+  assert.equal(noKey.seen.lists, 0, "no key: no project is listed, locked or synced");
+  const skips = logs2.filter((l) => l.msg === "linear-sync-skipped");
+  assert.ok(skips.length >= 2, "one warning per tick; the schedule goes on");
+  assert.deepEqual(skips[0], { level: "warn", msg: "linear-sync-skipped", code: "linear-key-not-set" });
 });
 
 test("decision 2–3: off, with a fixed code, unless switched on and fully configured", () => {
@@ -118,6 +126,7 @@ test("decision 2–3: off, with a fixed code, unless switched on and fully confi
   assert.deepEqual(buildLinearSync({ ...base, vault: null, env: ON }), { off: "linear-sync-vault-not-configured" });
   assert.deepEqual(buildLinearSync({ ...base, mod: null, env: ON }), { off: "linear-sync-not-loaded" });
   assert.deepEqual(buildLinearSync({ ...base, env: { ...ON, DEVOS_LINEAR_TEAM_KEY: "DEVOS; drop" } }), { off: "linear-team-key-invalid" });
+  assert.deepEqual(buildLinearSync({ ...base, mod: { ...mod, LinearClient: undefined }, env: ON }), { off: "linear-sync-not-loaded" }, "a module without its exports never stops the API");
 });
 
 test("buildRuntime: the Linear sync is null when switched off, and with no loader; a loader that throws never stops the API", async () => {
