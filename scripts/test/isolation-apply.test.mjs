@@ -576,6 +576,35 @@ test("S4-b2d: 'no entry matched' counts as done; a failed clean-up is kept pendi
   assert.equal(fs.existsSync(pending(h)), false);
 });
 
+test("S4-b2d (Codex PR163-r4): a pending cut is retried on a tick whose state fetch fails or whose document is refused", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  setState(h, { stacks: [STATE.stacks[1]] });
+  assert.equal(run(h, [], { FAKE_CT_RC: "2" }).code, 1);
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24");
+  // The state endpoint is down: the fetch fails, but the queued cut still runs and the list is cleared.
+  let r = run(h, [], { FAKE_CURL_RC: "7" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /state fetch failed \(curl exit 7\): nothing changed/);
+  assert.equal(ctLog(h).at(-1), "-D -s 10.209.1.0/24", "retried before the fetch");
+  assert.equal(fs.existsSync(pending(h)), false);
+  // A refused document: same, and a cut that fails again stays pending.
+  setState(h, { stacks: [STATE.stacks[0]] });
+  assert.equal(run(h, [], { FAKE_CT_RC: "2" }).code, 1);
+  const n = ctLog(h).length;
+  setState(h, "{\"stacks\":[{\"slug\":\"BAD\"}]}");
+  r = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /refused/);
+  assert.ok(ctLog(h).length > n, "retried before validation");
+  assert.ok(fs.existsSync(pending(h)), "still pending after another failure");
+  // Disabled by --remove: no cut is attempted (the block is off on purpose).
+  fs.writeFileSync(path.join(h, "devos/isolation/disabled"), "x\n");
+  const m = ctLog(h).length;
+  assert.equal(run(h).code, 4);
+  assert.equal(ctLog(h).length, m);
+});
+
 test("S4-b2d: a pending list entry that is not a pool source is never passed to conntrack", () => {
   const h = host(STATE);
   assert.equal(run(h).code, 0);
@@ -684,7 +713,8 @@ test("S4-b2d (pre-review r2): a rolled-back change leaves the pending list as it
   try {
     targets(h, upPort, l.port);
     setState(h, { stacks: [STATE.stacks[1]] }); // would cut beta's /24
-    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    // Codex PR163-r4: a due cut is now retried before the fetch, so conntrack keeps failing here to keep it due.
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid), FAKE_CT_RC: "2" });
     assert.match(r.out, /rolled back to the previous block/);
     assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.3.0/24", "beta's cut was dropped with the rollback");
   } finally { l.stop(); }

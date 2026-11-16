@@ -184,6 +184,13 @@ for c in jq curl flock iptables iptables-restore; do
 done
 [[ -s "$TOKEN_FILE" ]] || { echo "skipped: no isolation state token yet ($TOKEN_FILE)"; exit 3; }
 
+# Codex PR163-r4: cuts already queued are retried on every tick BEFORE the state fetch (under the lock, unless
+# --remove turned the block off), so a fetch failure or a refused document cannot hold them back. The run itself
+# goes on; a cut still pending makes it exit 1 on every path below (the fetch and validation exits are 1 anyway).
+if [[ "$MODE" == apply && -s "$ISO/conntrack.pending" ]]; then
+  ( exec 9>"$ISO/.lock" && flock -n 9 || exit 0; [[ -e "$ISO/disabled" ]] && exit 0; ct_flush ) || true
+fi
+
 # --- 1. fetch and validate the approved state -------------------------------------------------------------
 PORT="$(conf API_INTERNAL_PORT)"; PORT="${PORT:-3002}"
 [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || { echo "bad API_INTERNAL_PORT in $CONF"; exit 1; }
