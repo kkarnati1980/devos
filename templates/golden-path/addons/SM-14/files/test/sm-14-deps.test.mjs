@@ -49,6 +49,16 @@ test("SM-14-L1: a missing, unreadable, old-format or stale lockfile fails", () =
   const unresolved = structuredClone(lock);
   delete unresolved.packages["node_modules/yaml"];
   assert.deepEqual(checkLockfile(pkg, unresolved), ["lockfile-out-of-sync"]);
+  // Lockfile version 2 is accepted too.
+  assert.deepEqual(checkLockfile(pkg, { ...lock, lockfileVersion: 2 }), []);
+  // A local package (file:, link:, workspace) is resolved as a link, without a version (as npm writes it).
+  const local = { name: "a", dependencies: { loc: "file:local" } };
+  assert.deepEqual(checkLockfile(local, { lockfileVersion: 3, packages: { "": { name: "a", dependencies: { loc: "file:local" } }, "node_modules/loc": { resolved: "local", link: true }, local: { version: "1.0.0" } } }), []);
+  assert.deepEqual(checkLockfile(local, { lockfileVersion: 3, packages: { "": { name: "a", dependencies: { loc: "file:local" } }, "node_modules/loc": { link: true } } }), ["lockfile-out-of-sync"]);
+  // A name in both dependencies and optionalDependencies is listed by npm under the optional ones only.
+  const both = { name: "a", dependencies: { ms: "2.1.3" }, optionalDependencies: { ms: "2.1.3" } };
+  assert.deepEqual(checkLockfile(both, { lockfileVersion: 3, packages: { "": { name: "a", optionalDependencies: { ms: "2.1.3" } }, "node_modules/ms": { version: "2.1.3", optional: true } } }), []);
+  assert.deepEqual(checkLockfile(both, { lockfileVersion: 3, packages: { "": { name: "a" }, "node_modules/ms": { version: "2.1.3" } } }), ["lockfile-out-of-sync"]);
   // A name like an Object member is not mistaken for a resolved entry.
   const proto = { name: "a", dependencies: { constructor: "1.0.0" } };
   assert.deepEqual(checkLockfile(proto, { lockfileVersion: 3, packages: { "": { dependencies: { constructor: "1.0.0" } } } }), ["lockfile-out-of-sync"]);
@@ -70,7 +80,9 @@ test("SM-14-L1: a high or critical vulnerability fails the scan; lower ones are 
 
 test("SM-14-L1: an audit that did not run or cannot be read fails closed", () => {
   assert.deepEqual(readAudit({ error: { code: "ENOTFOUND", summary: "registry unreachable" } }).findings, ["audit-failed"]);
-  for (const bad of [null, "", [], {}, { auditReportVersion: 1, advisories: {} }, { ...clean(), metadata: { vulnerabilities: { high: "0" } } }]) {
+  for (const bad of [null, "", [], {}, { auditReportVersion: 1, advisories: {} }, { ...clean(), metadata: { vulnerabilities: { high: "0" } } },
+    { ...clean(), metadata: { vulnerabilities: { ...clean().metadata.vulnerabilities, high: -1 } } },
+    { ...clean(), metadata: { vulnerabilities: { ...clean().metadata.vulnerabilities, critical: 0.5 } } }]) {
     assert.deepEqual(readAudit(bad).findings, ["audit-unreadable"], JSON.stringify(bad));
   }
   const odd = clean();
@@ -98,6 +110,9 @@ test("SM-14-L1: the CLI stores the scan_report evidence and exits 0 only when th
   assert.equal(lines.at(-1), "SM-14-L1 FAIL (high-vulnerabilities)");
   // No audit file given, or no lockfile: fail.
   assert.equal(main([], { dir, log: () => {} }), 1);
+  assert.deepEqual(depsCheck({ dir }).findings, ["audit-missing"]);
+  assert.equal(main(["--audit", "--out", "x.json"], { dir, log: () => {} }), 1, "a flag is never taken as the audit file");
+  assert.ok(!fs.existsSync(path.join(dir, "--out")));
   assert.deepEqual(depsCheck({ dir, auditFile: path.join(dir, "missing.json") }).findings, ["audit-missing"]);
   fs.rmSync(path.join(dir, "package-lock.json"));
   fs.writeFileSync(path.join(dir, "audit.json"), JSON.stringify(clean()));

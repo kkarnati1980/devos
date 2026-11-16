@@ -40,11 +40,16 @@ export function checkLockfile(pkg, lock) {
   const root = isObj(lock.packages) ? lock.packages[""] : undefined;
   if (!isObj(root)) return ["lockfile-unreadable"];
   const out = [];
-  if (DEP_FIELDS.some((f) => !sameDeps(pkg[f], root[f]))) out.push("lockfile-out-of-sync");
+  // npm lists a name that is in both `dependencies` and `optionalDependencies` under the optional ones only.
+  const optional = isObj(pkg.optionalDependencies) ? pkg.optionalDependencies : {};
+  const declared = { ...pkg, dependencies: isObj(pkg.dependencies) ? Object.fromEntries(Object.entries(pkg.dependencies).filter(([k]) => !Object.hasOwn(optional, k))) : pkg.dependencies };
+  if (DEP_FIELDS.some((f) => !sameDeps(declared[f], root[f]))) out.push("lockfile-out-of-sync");
   for (const f of DEP_FIELDS.slice(0, 3)) {
     for (const name of Object.keys(isObj(pkg[f]) ? pkg[f] : {})) {
       const entry = Object.hasOwn(lock.packages, `node_modules/${name}`) ? lock.packages[`node_modules/${name}`] : undefined;
-      if (!isObj(entry) || typeof entry.version !== "string") { out.push("lockfile-out-of-sync"); break; }
+      // A registry package has a version; a local (file:, link:, workspace) package is a link with its resolved path.
+      const resolved = isObj(entry) && (typeof entry.version === "string" || (entry.link === true && typeof entry.resolved === "string"));
+      if (!resolved) { out.push("lockfile-out-of-sync"); break; }
     }
   }
   return [...new Set(out)];
@@ -104,7 +109,7 @@ export function writeReport(file, report) {
 
 /** CLI: `node scripts/deps-check.mjs --audit audit.json [--out evidence/sm-14-scan.json]`; exit 0 only when ok. */
 export function main(argv, { dir = process.cwd(), log = console.log } = {}) {
-  const arg = (name) => { const i = argv.indexOf(name); return i >= 0 && typeof argv[i + 1] === "string" ? argv[i + 1] : undefined; };
+  const arg = (name) => { const i = argv.indexOf(name); const v = i >= 0 ? argv[i + 1] : undefined; return typeof v === "string" && !v.startsWith("--") ? v : undefined; };
   const report = depsCheck({ dir, auditFile: arg("--audit") ? path.resolve(dir, arg("--audit")) : undefined });
   const out = arg("--out");
   if (out) writeReport(path.resolve(dir, out), report);
