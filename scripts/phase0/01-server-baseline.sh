@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS M0.1 — Server baseline hardening (Hostinger KVM 4, Ubuntu 24.04 + Coolify)
-# Version: 1.3.2
+# Version: 1.3.3
 # Run as root on the DevOS server, e.g. in Hostinger's browser terminal:
 #     sudo bash 01-server-baseline.sh
 #
@@ -39,6 +39,11 @@
 #   80 and 443 (contract AT3). Step 2 prints the SSH-tunnel route (AT4) until M0.2 is applied
 #   (tailscale0 up), then says the server is tailnet-only (PR37-r1). Text only;
 #   no firewall change, so a re-run is not needed.
+#
+# v1.3.3 (DEVOS-128): installs `conntrack`, which S4's isolation-apply.sh (S4-b2d) needs to cut the open
+#   connections of a stack whose rights shrank. Package only; no firewall change. The live server
+#   gets it from the next re-run (or `apt-get install -y conntrack`); until then isolation-apply.sh keeps the
+#   cut pending and reports it.
 set -euo pipefail
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -49,7 +54,7 @@ say "1/6 System update + automatic security updates"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get full-upgrade -y
-apt-get install -y unattended-upgrades fail2ban ufw curl iproute2
+apt-get install -y unattended-upgrades fail2ban ufw curl iproute2 conntrack
 dpkg-reconfigure -f noninteractive unattended-upgrades || true
 systemctl enable --now unattended-upgrades
 
