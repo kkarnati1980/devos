@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.0.0
+# Version: 1.0.1
+# v1.0.1 (DEVOS-237): the token minimum is 32 characters (was 16), the same as the API.
 # Contract: docs/modules/S4.md (decisions 1-5, S4-b). Run as root by the server agent (allow-list, D1-passed
 # SHA only) or by KK for --remove. Never run with arguments taken from GitHub content.
 #
@@ -79,7 +80,7 @@ URL="$(conf ISOLATION_STATE_URL)"; URL="${URL:-http://127.0.0.1:$PORT/internal/i
 [[ "$URL" =~ ^http://(127\.0\.0\.1|\[::1\]|localhost):[0-9]{1,5}/[A-Za-z0-9/_-]*$ ]] \
   || { echo "refused: ISOLATION_STATE_URL must be a loopback http URL"; exit 1; }
 tok="$(head -c 512 "$TOKEN_FILE" | tr -d '\r\n')"
-[[ "$tok" =~ ^[A-Za-z0-9._~+/=-]{16,512}$ ]] || { echo "refused: the isolation state token file is malformed"; exit 1; }
+[[ "$tok" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "refused: the isolation state token file is malformed"; exit 1; }
 state="$(curl -sS --fail --connect-timeout 3 --max-time 10 --max-filesize 1048576 --proto =http \
   -H @<(printf 'Authorization: Bearer %s\n' "$tok") "$URL" 2>/dev/null)"; crc=$?
 unset tok

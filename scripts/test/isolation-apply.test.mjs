@@ -69,7 +69,7 @@ const STATE = { stacks: [
   { slug: "alpha", env: "preview", idx: 0, egress: false, tailnet: ["100.101.102.103/32"] },
 ] };
 
-function host(state, { conf = "", token = "t0ken-abcdefghijklmnop" } = {}) {
+function host(state, { conf = "", token = "t0ken-" + "a".repeat(30) } = {}) {
   const h = fs.mkdtempSync(path.join(tmp, "h-"));
   for (const d of ["devos/secrets", "nf", "log"]) fs.mkdirSync(path.join(h, d), { recursive: true });
   if (token !== null) fs.writeFileSync(path.join(h, "devos/secrets/isolation_state_token"), token + "\n", { mode: 0o600 });
@@ -327,6 +327,15 @@ test("skipped (exit 3) without a token; refuses a non-loopback state URL", () =>
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /loopback/);
   assert.equal(fs.existsSync(path.join(h, "log/curl.args")), false, "no request made");
+});
+
+test("DEVOS-237: a token shorter than 32 characters is refused before any request", () => {
+  const h = host(STATE, { token: "t0ken-" + "a".repeat(25) }); // 31 characters
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /token file is malformed/);
+  assert.equal(fs.existsSync(path.join(h, "log/curl.args")), false, "no request made");
+  assert.equal(restores(h), 0);
 });
 
 test("unknown arguments are refused", () => {
