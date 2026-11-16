@@ -190,9 +190,9 @@ test("AT6: apply refuses unknown, floor or opt-in IDs and a non-empty output, wr
   assert.equal(r.code, 2); assert.match(r.error, /not empty/);
   assert.deepEqual(fs.readdirSync(busy), ["keep.txt"]);
   assert.ok(!fs.readdirSync(tmp).some((n) => n.includes(".partial-")), "no staging left behind");
-  const out = fresh("pending", ["SM-09", "SM-15"]);
+  const out = fresh("pending", ["SM-15", "SM-17"]);
   const m = JSON.parse(fs.readFileSync(path.join(out, ".devos/template.json"), "utf8"));
-  assert.deepEqual(m.selected, ["SM-09", "SM-15"]); assert.deepEqual(m.pending, ["SM-09", "SM-15"]); assert.deepEqual(m.applied, []);
+  assert.deepEqual(m.selected, ["SM-15", "SM-17"]); assert.deepEqual(m.pending, ["SM-15", "SM-17"]); assert.deepEqual(m.applied, []);
   const cli = spawnSync(process.execPath, [path.join(ROOT, "scripts/template/apply.mjs"), "--out", path.join(tmp, "cli"), "--select", "SM-99"], { encoding: "utf8" });
   assert.equal(cli.status, 2); assert.match(cli.stderr, /refused/); assert.ok(!fs.existsSync(path.join(tmp, "cli")));
 });
