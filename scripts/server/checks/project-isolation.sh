@@ -72,11 +72,17 @@ let e="blocked";try{const r=await fetch(url,{signal:AbortSignal.timeout(5000)});
     dbn=0
     for o in "${probe_nets[@]}"; do
       [[ "$o" == "$n" ]] && continue
-      for ip in $(d network inspect --format '{{range .Containers}}{{.IPv4Address}} {{end}}' "$o" | tr ' ' '\n' | sed 's#/.*##' | head -n 5); do
-        [[ "$ip" =~ $IPV4 ]] && { targets+=("$ip:5432"); dbn=$((dbn + 1)); }
+      # Codex PR180-r1: every container of the other env (at most 20) on every TCP port it exposes, so the database
+      # endpoint is probed whatever its image and port; a container exposing nothing adds no target.
+      for pair in $(d network inspect --format '{{range $id, $c := .Containers}}{{$id}}={{$c.IPv4Address}} {{end}}' "$o" | tr ' ' '\n' | head -n 20); do
+        cid="${pair%%=*}" ip="${pair#*=}"; ip="${ip%%/*}"
+        [[ "$cid" =~ ^[0-9a-f]{12,64}$ && "$ip" =~ $IPV4 ]] || continue
+        for port in $(d inspect --format '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "$cid" | tr ' ' '\n' | sed -n 's#^\([0-9]\{1,5\}\)/tcp$#\1#p' | head -n 10); do
+          targets+=("$ip:$port"); dbn=$((dbn + 1))
+        done
       done
     done
-    (( dbn > 0 )) || incomplete+=("$n: no other probe env container to try")
+    (( dbn > 0 )) || incomplete+=("$n: no exposed TCP port in the other probe env to try")
     declared=false
     grep -q -- "--comment \"${PROBE_SLUG}/${env} egress\"" "$DIR/isolation/installed.rules" 2>/dev/null && declared=true
     [[ "$declared" == true ]] || targets+=("$PUBLIC_IP:443")
