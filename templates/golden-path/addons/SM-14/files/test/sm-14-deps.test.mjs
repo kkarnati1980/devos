@@ -59,6 +59,13 @@ test("SM-14-L1: a missing, unreadable, old-format or stale lockfile fails", () =
   const both = { name: "a", dependencies: { ms: "2.1.3" }, optionalDependencies: { ms: "2.1.3" } };
   assert.deepEqual(checkLockfile(both, { lockfileVersion: 3, packages: { "": { name: "a", optionalDependencies: { ms: "2.1.3" } }, "node_modules/ms": { version: "2.1.3", optional: true } } }), []);
   assert.deepEqual(checkLockfile(both, { lockfileVersion: 3, packages: { "": { name: "a" }, "node_modules/ms": { version: "2.1.3" } } }), ["lockfile-out-of-sync"]);
+  // Codex PR187-r1: a required peer dependency must be resolved; an optional peer need not be.
+  const peer = { name: "a", peerDependencies: { foo: "1.0.0" } };
+  const peerRoot = { "": { name: "a", peerDependencies: { foo: "1.0.0" } } };
+  assert.deepEqual(checkLockfile(peer, { lockfileVersion: 3, packages: peerRoot }), ["lockfile-out-of-sync"]);
+  assert.deepEqual(checkLockfile(peer, { lockfileVersion: 3, packages: { ...peerRoot, "node_modules/foo": { version: "1.0.0", peer: true } } }), []);
+  const optPeer = { ...peer, peerDependenciesMeta: { foo: { optional: true } } };
+  assert.deepEqual(checkLockfile(optPeer, { lockfileVersion: 3, packages: peerRoot }), []);
   // A name like an Object member is not mistaken for a resolved entry.
   const proto = { name: "a", dependencies: { constructor: "1.0.0" } };
   assert.deepEqual(checkLockfile(proto, { lockfileVersion: 3, packages: { "": { dependencies: { constructor: "1.0.0" } } } }), ["lockfile-out-of-sync"]);

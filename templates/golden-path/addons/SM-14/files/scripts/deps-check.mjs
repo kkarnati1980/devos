@@ -44,8 +44,13 @@ export function checkLockfile(pkg, lock) {
   const optional = isObj(pkg.optionalDependencies) ? pkg.optionalDependencies : {};
   const declared = { ...pkg, dependencies: isObj(pkg.dependencies) ? Object.fromEntries(Object.entries(pkg.dependencies).filter(([k]) => !Object.hasOwn(optional, k))) : pkg.dependencies };
   if (DEP_FIELDS.some((f) => !sameDeps(declared[f], root[f]))) out.push("lockfile-out-of-sync");
-  for (const f of DEP_FIELDS.slice(0, 3)) {
+  // Codex PR187-r1: a required peer dependency is installed (npm 7+), so it must be resolved too; a peer marked
+  // optional in peerDependenciesMeta is not installed and needs no entry.
+  const peerMeta = isObj(pkg.peerDependenciesMeta) ? pkg.peerDependenciesMeta : {};
+  const optionalPeer = (name) => Object.hasOwn(peerMeta, name) && isObj(peerMeta[name]) && peerMeta[name].optional === true;
+  for (const f of DEP_FIELDS) {
     for (const name of Object.keys(isObj(pkg[f]) ? pkg[f] : {})) {
+      if (f === "peerDependencies" && optionalPeer(name)) continue;
       const entry = Object.hasOwn(lock.packages, `node_modules/${name}`) ? lock.packages[`node_modules/${name}`] : undefined;
       // A registry package has a version; a local (file:, link:, workspace) package is a link with its resolved path.
       const resolved = isObj(entry) && (typeof entry.version === "string" || (entry.link === true && typeof entry.resolved === "string"));
