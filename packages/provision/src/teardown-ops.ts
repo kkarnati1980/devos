@@ -254,6 +254,12 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
       // M2.5-a3b: applications too (M2.4-c2 names them `devos-<slug>-preview|live` and marks the description).
       const appNames = new Set(STACK_ENVS.map((env) => applicationName(p.slug, env)));
       for (const a of await listApplications(cf)) {
+        // Codex PR154-r1 (as PR48-r5 for repos): ownership needs the description field present, a string or null.
+        // An omitted one is inconclusive, so the scan fails rather than report a renamed application as clean.
+        const d = (a as { description?: unknown }).description;
+        if (!(d === null || typeof d === "string")) {
+          throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/applications returned an application without a description field", 200);
+        }
         if (appNames.has(a.name) || (a.description ?? "").includes(marker)) {
           hits.push({ provider: "coolify", kind: "application", externalId: a.uuid, name: a.name });
         }

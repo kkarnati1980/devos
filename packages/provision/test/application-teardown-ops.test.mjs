@@ -91,6 +91,15 @@ test("the Coolify leftover scan finds the project's applications by name or mark
   await assert.rejects(coolifyScanner(bad.cf).scan({ id: PID, slug: "acme" }), ProviderError, "an unreadable application list is never a clean scan");
 });
 
+test("Codex PR154-r1: an application without a description field makes the scan inconclusive, never clean", async () => {
+  for (const app of [{ uuid: "app-stray-1", name: "renamed" }, { uuid: "app-stray-2", name: "renamed", description: 7 }]) {
+    const s = stub({ "GET /api/v1/projects": { status: 200, body: [] }, "GET /api/v1/applications": { status: 200, body: [app] } });
+    await assert.rejects(coolifyScanner(s.cf).scan({ id: PID, slug: "acme" }), (e) => e instanceof ProviderError && e.code === "bad-response", JSON.stringify(app));
+  }
+  const ok = stub({ "GET /api/v1/projects": { status: 200, body: [] }, "GET /api/v1/applications": { status: 200, body: [{ uuid: "a-9", name: "unrelated", description: null }] } });
+  assert.deepEqual(await coolifyScanner(ok.cf).scan({ id: PID, slug: "acme" }), [], "null is an explicit empty description");
+});
+
 test("pre-review 1: remove waits for a queued delete to show as gone, and gives up with a transient error", async () => {
   let reads = 0;
   const present = { status: 200, body: { uuid: UUID, description: "" } };
