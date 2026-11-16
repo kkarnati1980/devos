@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — install the server agent on the DevOS server (DEVOS-74). Contract: docs/modules/server-agent.md
-# Version: 1.3.0
+# Version: 1.4.0
+# v1.4.0 (DEVOS-237, S4-t1): installs and runs isolation-token-setup.sh (the isolation state token, host + Coolify env).
 # v1.3.0 (DEVOS-82): the Coolify token needs read + write + deploy (write: the agent PATCHes git_commit_sha and the
 # GIT_SHA env). coolify-token-check.sh tests read and write with an idempotent no-op PATCH; a new token is stored
 # only after it passes (a rejected token never replaces the stored one).
@@ -64,6 +65,8 @@ if [[ "${1:-}" != --deploy-on ]]; then
     bash -n "$SRC/server-agent.sh"; bash -n "$SRC/coolify-token-check.sh"
     install -m 700 "$SRC/server-agent.sh" "$DIR/bin/server-agent.sh"
     install -m 700 "$SRC/coolify-token-check.sh" "$DIR/bin/coolify-token-check.sh"
+    bash -n "$SRC/isolation-token-setup.sh"
+    install -m 700 "$SRC/isolation-token-setup.sh" "$DIR/bin/isolation-token-setup.sh"
     install -m 700 "$SRC/install-server-agent.sh" "$DIR/bin/install-server-agent.sh"
     for f in "$SRC"/checks/*.sh; do [[ -e "$f" ]] && bash -n "$f" && install -m 700 "$f" "$DIR/bin/checks/"; done
     pass "installed to $DIR/bin ($(ls "$DIR"/bin/checks/*.sh 2>/dev/null | wc -l) checks)"
@@ -100,6 +103,14 @@ if [[ "${1:-}" != --deploy-on ]]; then
   else
     pass "no Coolify token stored: deploy-on-PASS cannot be turned on yet"
   fi
+
+  # S4-t1 (DEVOS-237): the isolation state token, kept if present. Exit 3 = host copy ready, no Coolify token
+  # yet (rerun after ROTATE_COOLIFY=1); a failure here does not stop the install (the listener stays off).
+  echo "==> 2b/4 isolation state token (never printed)"
+  set +e; bash "$SRC/isolation-token-setup.sh" 2>&1 | sed 's/^/  /'; rc=${PIPESTATUS[0]}; set -e
+  case "$rc" in 0) pass "isolation state token ready (host and Coolify env)";;
+    3) pass "isolation state token on the host; the Coolify env is set once a Coolify token is stored";;
+    *) printf '  \033[1;33mWARN\033[0m isolation state token not delivered (exit %s); rerun %s\n' "$rc" "$DIR/bin/isolation-token-setup.sh";; esac
 
   echo "==> 3/4 dry run"
   "$DIR/bin/server-agent.sh" --dry-run 2>&1 | sed 's/^/  /'
