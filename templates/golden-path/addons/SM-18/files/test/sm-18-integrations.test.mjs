@@ -22,8 +22,12 @@ test("SM-18-L1 webhook: signature over timestamp and raw body, time window, repl
   const replay = memoryReplayStore({ now });
   const v = (o) => verifyWebhook({ secrets: secret, body, signature: sig, timestamp: String(ts), replay, now, ...o });
 
-  assert.deepEqual(await v(), { timestamp: ts });
+  const first = await v();
+  assert.equal(first.timestamp, ts);
   await assert.rejects(v(), code("replayed"), "the same delivery twice");
+  await first.release();   // processing failed and the app answered 5xx: the provider's resend is accepted once
+  const resend = await v(); assert.equal(resend.timestamp, ts);
+  await assert.rejects(v(), code("replayed"));
   await assert.rejects(v({ signature: undefined }), code("signature-missing"));
   await assert.rejects(v({ signature: "zz" }), code("signature-invalid"));
   await assert.rejects(v({ signature: signWebhook({ secret: other, body, timestamp: ts }) }), code("signature-invalid"), "wrong secret");
@@ -40,9 +44,10 @@ test("SM-18-L1 webhook: signature over timestamp and raw body, time window, repl
 
   // Secret rotation: either secret verifies.
   const t2 = ts + 5; const s2 = signWebhook({ secret: other, body, timestamp: t2 });
-  assert.deepEqual(await v({ secrets: [secret, other], signature: s2.toUpperCase(), timestamp: t2 }), { timestamp: t2 });
+  assert.equal((await v({ secrets: [secret, other], signature: s2.toUpperCase(), timestamp: t2 })).timestamp, t2);
   assert.throws(() => signWebhook({ secret: "short", body, timestamp: ts }), TypeError);
   await assert.rejects(verifyWebhook({ secrets: secret, body, signature: sig, timestamp: ts }), TypeError, "no replay store");
+  await assert.rejects(verifyWebhook({ secrets: secret, body, signature: sig, timestamp: ts, replay: { claim: () => true } }), TypeError, "a store without release");
 
   // The replay store forgets an entry only after it could no longer pass the window, and refuses when full.
   clock += 302_000;
@@ -89,6 +94,33 @@ test("SM-18-L1 payment events: duplicates applied once, an older event never und
     await assert.rejects(ledger.apply(bad, handler), code("event-invalid"));
   }
   assert.throws(() => createEventLedger({ store: {} }), TypeError);
+
+  // A database store: check, handler and record run in one transaction; a failed record rolls the handler back.
+  const db = { ids: new Set(), orders: new Map(), rows: new Map() };
+  let failCommit = true;
+  const txStore = {
+    async transaction(fn) {
+      const tx = { ids: new Set(db.ids), orders: new Map(db.orders), rows: new Map(db.rows) };
+      const r = await fn(tx);
+      Object.assign(db, tx);   // commit only when fn returned
+      return r;
+    },
+    hasEvent: (id, tx) => tx.ids.has(id),
+    lastOrder: (o, tx) => tx.orders.get(o) ?? null,
+    commit({ id, objectId, order, applied }, tx) {
+      if (failCommit) throw new Error("commit failed");
+      tx.ids.add(id); if (applied) tx.orders.set(objectId, order);
+    },
+  };
+  const dbLedger = createEventLedger({ store: txStore });
+  const write = (e, tx) => { tx.rows.set(e.objectId, e.type); };
+  await assert.rejects(dbLedger.apply(ev("t1", "payment.succeeded", 1, "pay_9"), write), /commit failed/);
+  assert.equal(db.rows.size, 0, "the handler's write rolled back with the failed record");
+  failCommit = false;
+  assert.deepEqual(await dbLedger.apply(ev("t1", "payment.succeeded", 1, "pay_9"), write), { status: "applied" });
+  assert.equal(db.rows.get("pay_9"), "payment.succeeded");
+  assert.deepEqual(await dbLedger.apply(ev("t1", "payment.succeeded", 1, "pay_9"), write), { status: "duplicate" });
+  assert.throws(() => createEventLedger({ store: { ...txStore, transaction: 1 } }), TypeError);
 });
 
 test("SM-18-L1 cache: TTL, invalidation on write, no stale value after a write", async () => {
@@ -120,6 +152,9 @@ test("SM-18-L1 cache: TTL, invalidation on write, no stale value after a write",
   await Promise.all([cache.get("k", loader), cache.get("k", loader)]); assert.equal(loads, 1);
   await assert.rejects(cache.get("e", async () => { throw new Error("nope"); }), /nope/);
   assert.equal(await cache.get("e", async () => "ok"), "ok");
+  await assert.rejects(cache.get("s", () => { throw new Error("sync"); }), /sync/);
+  assert.equal(await cache.get("s", async () => "ok"), "ok", "a loader that throws at once is not kept");
+  cache.invalidate("s");
   await cache.get("z", async () => "z");
   assert.equal(cache.size, 2);
   assert.throws(() => createCache({}), TypeError, "a TTL is required");
@@ -162,5 +197,6 @@ test("SM-18-L1 tokens: encrypted at rest, bound to owner and provider, least sco
   assert.throws(() => onlyNew.open(rec, { provider: "google", owner: "user-1", need: ["calendar.readonly"] }), code("token-key-unknown"));
 
   for (const bad of ["", "k1", `K1:${k1}`, `k1:${randomBytes(16).toString("base64")}`, `k1:${k1},k1:${k2}`]) assert.throws(() => loadTokenKeys(bad), TypeError, bad);
-  try { loadTokenKeys(`k1:${k1.slice(0, -4)}`); } catch (e) { assert.ok(!e.message.includes(k1.slice(0, 20)), "errors never repeat a key"); }
+  assert.throws(() => loadTokenKeys(`k1:${k1.slice(0, -4)}`), (e) => e instanceof TypeError && !e.message.includes(k1.slice(0, 20)), "errors never repeat a key");
+  assert.throws(() => vault.scopesFor("google", "calendar.readonly"), TypeError, "need is a list, not a string");
 });

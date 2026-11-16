@@ -4,16 +4,13 @@ export function createCache({ ttlMs, max = 1000, now = Date.now } = {}) {
   if (!Number.isInteger(ttlMs) || ttlMs < 1) throw new TypeError("cache: ttlMs (a positive whole number of ms) is required");
   if (!Number.isInteger(max) || max < 1) throw new TypeError("cache: max must be a positive integer");
   const entries = new Map();   // key → { value, expires }; Map order doubles as least-recently-used order
-  const gens = new Map();      // key → generation, bumped by every invalidation
-  const loading = new Map();   // key → { gen, promise } for one shared load per key and generation
+  const loading = new Map();   // key → promise of the one shared load; an invalidation drops it
 
   const key = (k) => { if (typeof k !== "string" || !k) throw new TypeError("cache: keys are non-empty strings"); return k; };
-  const gen = (k) => gens.get(k) ?? 0;
 
   function invalidate(k) {
     key(k);
-    entries.delete(k); loading.delete(k);
-    gens.set(k, gen(k) + 1);
+    entries.delete(k); loading.delete(k);   // a load still running can no longer store its value
   }
 
   // Read-through. Errors are never cached.
@@ -23,22 +20,23 @@ export function createCache({ ttlMs, max = 1000, now = Date.now } = {}) {
     const hit = entries.get(k);
     if (hit && hit.expires > now()) { entries.delete(k); entries.set(k, hit); return hit.value; }
     if (hit) entries.delete(k);
-    const g = gen(k);
     const pending = loading.get(k);
-    if (pending && pending.gen === g) return pending.promise;
+    if (pending) return pending;
+    let started;
+    try { started = Promise.resolve(loader(k)); } catch (e) { return Promise.reject(e); }   // the loader reads now
     const promise = (async () => {
       try {
-        const value = await loader(k);
-        if (gen(k) === g) {   // still current: no write happened while loading
+        const value = await started;   // suspends here, so `loading` holds this promise before the checks below
+        if (loading.get(k) === promise) {   // still current: no invalidation happened while loading
           entries.delete(k); entries.set(k, { value, expires: now() + ttlMs });
           while (entries.size > max) entries.delete(entries.keys().next().value);
         }
         return value;
       } finally {
-        if (loading.get(k)?.promise === promise) loading.delete(k);
+        if (loading.get(k) === promise) loading.delete(k);
       }
     })();
-    loading.set(k, { gen: g, promise });
+    loading.set(k, promise);
     return promise;
   }
 

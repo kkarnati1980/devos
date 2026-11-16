@@ -45,6 +45,7 @@ export function createTokenVault({ keys, scopes, now = Date.now }) {
   function scopesFor(provider, need) {
     const allowed = declared.get(name("provider", provider));
     if (!allowed) throw new IntegrationError("provider-not-declared", "provider not declared");
+    if (!Array.isArray(need)) throw new TypeError("token-vault: need is a list of scope names");
     const list = [...new Set(need)];
     if (!list.length) throw new TypeError("token-vault: name the scopes this feature needs");
     for (const s of list) if (!allowed.has(s)) throw new IntegrationError("scope-not-declared", `scope not declared for ${provider}: ${s}`);

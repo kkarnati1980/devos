@@ -5,8 +5,11 @@ import { IntegrationError } from "./integration-error.mjs";
 
 const ID = /^[\w.:-]{1,200}$/;
 
-// One process only. An app with more than one instance keeps the same three calls in its database, inside one
-// transaction: a table of applied event ids (unique) and a table of the last applied order per object.
+// One process only. An app with more than one instance gives the ledger a database store with the same three
+// calls plus transaction(fn): fn(tx) runs inside one database transaction, and the ledger passes tx to the
+// three calls and to the handler, so the handler's write and the record of the event commit together or not
+// at all. lastOrder(objectId, tx) should lock the object's row (SELECT … FOR UPDATE) so two instances cannot
+// apply events for one object at once; a duplicate event id then fails the unique key and rolls back.
 export function memoryEventStore({ now = Date.now, keepMs = 7 * 24 * 3600 * 1000 } = {}) {
   const events = new Map();   // event id → time seen (kept at least as long as providers retry, 3 days for most)
   const objects = new Map();  // object id → { version, rank }
@@ -30,6 +33,8 @@ export function createEventLedger({ store = memoryEventStore(), rank = {} } = {}
   for (const k of ["hasEvent", "lastOrder", "commit"]) if (typeof store[k] !== "function") throw new TypeError(`events: store.${k} is required`);
   const ranks = new Map(Object.entries(rank));
   for (const v of ranks.values()) if (!Number.isInteger(v)) throw new TypeError("events: ranks must be integers");
+  if (store.transaction !== undefined && typeof store.transaction !== "function") throw new TypeError("events: store.transaction must be a function");
+  const run = store.transaction ? (fn) => store.transaction(fn) : (fn) => fn(undefined);
   const chains = new Map();   // object id → tail promise, so one object's events run one at a time
 
   function check(event) {
@@ -56,15 +61,17 @@ export function createEventLedger({ store = memoryEventStore(), rank = {} } = {}
     chains.set(event.objectId, tail);
     await prev;
     try {
-      if (await store.hasEvent(event.id)) return { status: "duplicate" };
-      const last = await store.lastOrder(event.objectId);
-      if (last && older(order, last)) {
-        await store.commit({ id: event.id, objectId: event.objectId, order, applied: false });
-        return { status: "stale" };
-      }
-      await handler(event);
-      await store.commit({ id: event.id, objectId: event.objectId, order, applied: true });
-      return { status: "applied" };
+      return await run(async (tx) => {
+        if (await store.hasEvent(event.id, tx)) return { status: "duplicate" };
+        const last = await store.lastOrder(event.objectId, tx);
+        if (last && older(order, last)) {
+          await store.commit({ id: event.id, objectId: event.objectId, order, applied: false }, tx);
+          return { status: "stale" };
+        }
+        await handler(event, tx);
+        await store.commit({ id: event.id, objectId: event.objectId, order, applied: true }, tx);
+        return { status: "applied" };
+      });
     } finally {
       release();
       if (chains.get(event.objectId) === tail) chains.delete(event.objectId);

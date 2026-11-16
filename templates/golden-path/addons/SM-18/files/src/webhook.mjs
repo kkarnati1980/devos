@@ -26,8 +26,8 @@ export function signWebhook({ secret, body, timestamp }) {
 }
 
 // Remembers accepted signatures until they could no longer pass the time window. One process only: an app
-// with more than one instance passes a shared store with the same claim(key, expiresAtMs) → boolean contract,
-// e.g. an INSERT into a table with a unique key that returns false on conflict.
+// with more than one instance passes a shared store with the same claim(key, expiresAtMs) → boolean and
+// release(key) contract, e.g. an INSERT into a table with a unique key that returns false on conflict.
 export function memoryReplayStore({ now = Date.now, max = 100_000 } = {}) {
   const seen = new Map();
   return {
@@ -42,6 +42,7 @@ export function memoryReplayStore({ now = Date.now, max = 100_000 } = {}) {
       seen.set(key, expiresAtMs);
       return true;
     },
+    release(key) { seen.delete(key); },
     get size() { return seen.size; },
   };
 }
@@ -51,7 +52,7 @@ export function memoryReplayStore({ now = Date.now, max = 100_000 } = {}) {
 export async function verifyWebhook({ secrets, body, signature, timestamp, replay, now = Date.now, toleranceSec = WEBHOOK_DEFAULTS.toleranceSec }) {
   const keys = (Array.isArray(secrets) ? secrets : [secrets]).map(checkSecret);
   if (!keys.length) throw new TypeError("webhook: at least one secret is required");
-  if (!replay || typeof replay.claim !== "function") throw new TypeError("webhook: a replay store is required");
+  if (!replay || typeof replay.claim !== "function" || typeof replay.release !== "function") throw new TypeError("webhook: a replay store is required");
   if (!Number.isInteger(toleranceSec) || toleranceSec < 1 || toleranceSec > 900) throw new TypeError("webhook: toleranceSec must be 1–900");
   const bytes = asBytes(body);
   if (typeof signature !== "string" || !signature) throw new IntegrationError("signature-missing", "webhook signature missing");
@@ -72,7 +73,9 @@ export async function verifyWebhook({ secrets, body, signature, timestamp, repla
   if (Math.abs(nowSec - ts) > toleranceSec) throw new IntegrationError("stale", "webhook timestamp outside the allowed window");
   const fresh = await replay.claim(`${ts}.${sig}`, (ts + toleranceSec + 1) * 1000);
   if (fresh !== true) throw new IntegrationError("replayed", "webhook already received");
-  return { timestamp: ts };
+  // Call release() when processing fails and the app answers 5xx, so the provider's resend is accepted.
+  const key = `${ts}.${sig}`;
+  return { timestamp: ts, release: async () => { await replay.release(key); } };
 }
 
 // Reads the raw body for signing, refusing a declared length over the cap before reading and cutting a body
@@ -86,7 +89,7 @@ export function readRawBody(req, maxBytes = WEBHOOK_DEFAULTS.maxBytes) {
     req.on("data", (c) => {
       if (done) return;
       size += c.length;
-      if (size > maxBytes) { done = true; req.pause(); reject(new IntegrationError("too-large", "webhook body too large")); return; }
+      if (size > maxBytes) { done = true; parts.length = 0; req.resume(); reject(new IntegrationError("too-large", "webhook body too large")); return; }
       parts.push(c);
     });
     req.on("end", () => { if (!done) { done = true; resolve(Buffer.concat(parts)); } });
