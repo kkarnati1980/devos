@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import * as realProvision from "@devos/provision";
-import { probeLiveAsserts, composeMatches, envPhase, capCodes, readProbeSteps, COOLIFY_DESCRIPTION_MAX, ASSERT_DETAIL_MAX } from "../dist/provision-probe-asserts.js";
+import { probeLiveAsserts, liveAssertsFor, composeMatches, envPhase, capCodes, readProbeSteps, COOLIFY_DESCRIPTION_MAX, ASSERT_DETAIL_MAX } from "../dist/provision-probe-asserts.js";
 import { probeStep } from "../dist/provision-probe.js";
 import { safeDetail } from "../dist/provision-probe-cli.js";
 
@@ -292,4 +292,34 @@ test("Codex PR167-r2: a read that never answers (a transport still retrying) is 
   assert.ok(took < 1000, `took ${took} ms`);
   // GitHub answered at once; every Coolify read was cut off or refused.
   assert.deepEqual(out, ["app-unreadable:preview", "app-unreadable:production", "env-unreadable:preview", "env-unreadable:production"]);
+});
+
+test("DEVOS-110: the CLI's live-assert wiring uses the purge kit's module and clients and this project's journal", async () => {
+  const w = world();
+  const queries = [];
+  const db = {
+    $transaction: async (fn, opts) => {
+      queries.push(opts);
+      return fn({ provisionStep: { findMany: async (q) => {
+        queries.push(q);
+        return q.where.projectId === PID ? [...steps()].map(([key, externalId]) => ({ key, externalId })) : [];
+      } } });
+    },
+  };
+  const live = liveAssertsFor({ provisionMod: w.mod, gh: "GH", cf: "CF" }, db, PID, 4321);
+  assert.deepEqual(queries, [], "nothing is read until the probe runs the asserts");
+  assert.deepEqual(await live(), []);
+  assert.deepEqual(w.pins, [["gh", "GH"], ["cf", "CF"]]);
+  assert.deepEqual(queries[0], { timeout: 4321, maxWait: 4321 });
+  assert.deepEqual(queries[1].where, { projectId: PID, status: "done" });
+  assert.ok(w.reads.includes(`cf:/api/v1/applications/${APP.production}/envs`));
+  // Each call reads the journal again, so a later cycle sees its own ids.
+  await live();
+  assert.equal(queries.filter((q) => q.where).length, 2);
+  // Another project's journal gives this probe no ids: every check reports its missing row, nothing is read.
+  const other = world();
+  const codes = await liveAssertsFor({ provisionMod: other.mod, gh: "GH", cf: "CF" }, db, "22222222-2222-4222-8222-222222222222", 4321)();
+  // (capCodes may fold the tail into one "more-<n>" code.)
+  assert.ok(codes.length > 0 && codes.every((c) => c.startsWith("journal-missing:") || /^more-\d+$/.test(c)), codes.join(","));
+  assert.deepEqual(other.reads, [], "no provider read without a journalled id");
 });
