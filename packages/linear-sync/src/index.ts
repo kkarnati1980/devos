@@ -11,5 +11,5 @@ export type { LockGuard } from "./prisma-store.js";
 export type { PrismaLike } from "./prisma-store.js";
 export { listActiveProjects, syncActiveProjects, lockedSyncOne, startSchedule, SYNC_INTERVAL_MS, INACTIVE_STAGES } from "./schedule.js";
 export type { SweepResult, SweepDeps, Schedule, ProjectOutcome } from "./schedule.js";
-export { linearTeardownOps, linearScanner, withSyncLock, toProviderError, TEARDOWN_LOCK_WAIT_MS, TEARDOWN_LOCK_TX_MS } from "./teardown-ops.js";
+export { linearTeardownOps, linearScanner, withSyncLock, isLockTimeout, toProviderError, TEARDOWN_LOCK_WAIT_MS, TEARDOWN_LOCK_TX_MS } from "./teardown-ops.js";
 export type { LinearResourceOps, MakeError, TeardownErrorCode } from "./teardown-ops.js";

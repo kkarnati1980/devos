@@ -60,8 +60,8 @@ export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi 
     async findProject(teamId, devosProjectId) {
       let after: string | null = null;
       for (let p = 0; p < MAX_PAGES; p++) {
-        const d: { team: { projects: Conn<{ id: string; name: string; description: string; archivedAt: string | null }> } } = await client.query(
-          `query($id: String!, $after: String) { team(id: $id) { projects(first: ${PAGE}, after: $after, includeArchived: true) { nodes { id name description archivedAt } pageInfo { hasNextPage endCursor } } } }`,
+        const d: { team: { projects: Conn<{ id: string; name: string; description: string }> } } = await client.query(
+          `query($id: String!, $after: String) { team(id: $id) { projects(first: ${PAGE}, after: $after, includeArchived: true) { nodes { id name description } pageInfo { hasNextPage endCursor } } } }`,
           { id: teamId, after });
         const hit = d.team.projects.nodes.find((x) => readMarker(x.description, "project") === devosProjectId);
         if (hit) return hit;
@@ -181,6 +181,21 @@ export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi 
       const t = d.teams.nodes[0];
       if (!t) throw new LinearError("bad-response", `no Linear team with key ${key}`);
       return t.id;
+    },
+    async findProjects(teamId, devosProjectId) {
+      // Pre-review 2: all matches over every page; an exhausted search fails closed, like findProject.
+      const out: { id: string; archivedAt: string | null }[] = [];
+      let after: string | null = null;
+      for (let p = 0; p < MAX_PAGES; p++) {
+        const d: { team: { projects: Conn<{ id: string; description: string | null; archivedAt: string | null }> } } = await client.query(
+          `query($id: String!, $after: String) { team(id: $id) { projects(first: ${PAGE}, after: $after, includeArchived: true) { nodes { id description archivedAt } pageInfo { hasNextPage endCursor } } } }`,
+          { id: teamId, after });
+        for (const x of d.team.projects.nodes) if (readMarker(x.description, "project") === devosProjectId) out.push({ id: x.id, archivedAt: x.archivedAt ?? null });
+        if (!d.team.projects.pageInfo?.hasNextPage) return out;
+        if (!d.team.projects.pageInfo.endCursor) throw new LinearError("bad-response", "Linear project page without a cursor");
+        after = d.team.projects.pageInfo.endCursor;
+      }
+      throw new LinearError("bad-response", "too many projects in this Linear team to search for the marker");
     },
     async projectState(id) {
       const d = await client.query<{ projects: Conn<{ id: string; description: string | null; archivedAt: string | null }> }>(

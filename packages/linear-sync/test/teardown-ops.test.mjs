@@ -19,7 +19,7 @@ function fakeDb({ lockFails = false } = {}) {
     db.log.push(["tx", opts]);
     const tx = {
       $executeRawUnsafe: async (sql) => { db.log.push(["exec", sql]); },
-      $queryRawUnsafe: async (sql, ...args) => { db.log.push(["query", sql, ...args]); if (lockFails) throw new Error("canceling statement due to lock timeout"); return [{ ok: "" }]; },
+      $queryRawUnsafe: async (sql, ...args) => { db.log.push(["query", sql, ...args]); if (lockFails === "timeout") throw Object.assign(new Error("db error"), { cause: { code: "55P03" } }); if (lockFails) throw new Error("connection lost"); return [{ locked: 1 }]; },
     };
     db.inTx = true;
     try { return await fn(tx); } finally { db.inTx = false; }
@@ -31,7 +31,7 @@ function fakeApi(db, project = { id: "lp1", description: `Mirror\n\ndevos-ref: p
   const L = { writes: [], project };
   L.api = {
     teamId: async () => "team-1",
-    findProject: async (_t, pid) => (L.project && L.project.description.includes(`project/${pid}`) ? { ...L.project, name: "x" } : null),
+    findProjects: async (_t, pid) => [L.project, ...(L.extra ?? [])].filter((p) => p && p.description.includes(`project/${pid}`)).map((p) => ({ id: p.id, archivedAt: p.archivedAt })),
     projectState: async (id) => (L.project && L.project.id === id ? { ...L.project } : null),
     setProjectStatus: async (id, type) => { L.writes.push(["status", id, type, db.inTx]); },
     archiveProject: async (id) => { L.writes.push(["archive", id, db.inTx]); L.project.archivedAt = "2026-11-17T00:00:00Z"; },
@@ -49,6 +49,7 @@ test("AT7: archive marks the Linear project completed, inside the sync's advisor
   assert.deepEqual(L.writes, [["status", "lp1", "completed", true]]);
   const q = db.log.find((x) => x[0] === "query");
   assert.match(q[1], /pg_advisory_xact_lock\(hashtext\('devos:linear-sync'\), hashtext\(\$1\)\)/);
+  assert.match(q[1], /^SELECT 1 AS locked FROM \(SELECT pg_advisory_xact_lock/);
   assert.equal(q[2], PID);
   assert.ok(db.log.some((x) => x[0] === "exec" && x[1] === `SET LOCAL lock_timeout = ${TEARDOWN_LOCK_WAIT_MS}`));
 });
@@ -102,10 +103,15 @@ test("errors: Linear failures map to provider errors with fixed text; transient 
   await assert.rejects(project.inspect(row), (e) => e.code === "http" && e.status === 429);
   L.api.projectState = async () => { throw new Error("linear-key-not-set"); };
   await assert.rejects(project.inspect(row), (e) => e.code === "no-token");
-  const busy = fakeDb({ lockFails: true }); const B = fakeApi(busy);
+  const busy = fakeDb({ lockFails: "timeout" }); const B = fakeApi(busy);
   const [p2] = linearTeardownOps(busy, B.api, PID, makeError);
   await assert.rejects(p2.archive(row), (e) => e.code === "timeout" && /lock/.test(e.message));
   assert.deepEqual(B.writes, []);
+  // Pre-review 1: any other lock-query failure is not read as "busy" (not transient, no lock wording).
+  const broken = fakeDb({ lockFails: "other" }); const K = fakeApi(broken);
+  const [p3] = linearTeardownOps(broken, K.api, PID, makeError);
+  await assert.rejects(p3.archive(row), (e) => e.code === "bad-response" && !/lock/.test(e.message));
+  assert.deepEqual(K.writes, []);
 });
 
 test("withSyncLock refuses bounds where the transaction cannot outlive the wait", async () => {
@@ -120,6 +126,9 @@ test("leftover scan: an unarchived Linear project with this project's marker is 
   assert.deepEqual(await s.scan({ id: OTHER, slug: "other" }), []);
   L.project.archivedAt = "2026-11-17T00:00:00Z";
   assert.deepEqual(await s.scan({ id: PID, slug: "demo" }), []);
+  // Pre-review 2: a second, unarchived project with the same marker is still a hit.
+  L.extra = [{ id: "lp2", description: `devos-ref: project/${PID}`, archivedAt: null }];
+  assert.deepEqual(await s.scan({ id: PID, slug: "demo" }), [{ provider: "linear", kind: "project", externalId: "lp2", name: PID }]);
   L.api.teamId = async () => { throw new LinearError("graphql", "Linear text"); };
   await assert.rejects(s.scan({ id: PID, slug: "demo" }), (e) => e.code === "bad-response" && !/Linear text/.test(e.message));
 });
@@ -147,12 +156,14 @@ test("GraphQL: no status of the type, or a refused archive, fails closed", async
   await assert.rejects(a.archiveProject("lp1"), /refused/);
 });
 
-test("GraphQL: projectState reads archivedAt (archived included); teamId fails without a team; findProject returns archivedAt", async () => {
+test("GraphQL: projectState reads archivedAt (archived included); teamId fails without a team; findProjects returns every marked project", async () => {
   const { a, calls } = gql((b) => (/teams\(/.test(b.query) ? { teams: { nodes: [] } }
-    : /team\(id/.test(b.query) ? { team: { projects: { nodes: [{ id: "lp1", name: "n", description: `devos-ref: project/${PID}`, archivedAt: "2026-11-17T00:00:00Z" }], pageInfo: { hasNextPage: false } } } }
+    : /team\(id/.test(b.query) ? (b.variables.after
+      ? { team: { projects: { nodes: [{ id: "lp3", description: `devos-ref: project/${PID}`, archivedAt: null }], pageInfo: { hasNextPage: false } } } }
+      : { team: { projects: { nodes: [{ id: "lp1", description: `devos-ref: project/${PID}`, archivedAt: "2026-11-17T00:00:00Z" }, { id: "lp2", description: `devos-ref: project/${OTHER}`, archivedAt: null }], pageInfo: { hasNextPage: true, endCursor: "c1" } } } })
     : { projects: { nodes: [{ id: "lp1", description: null, archivedAt: "2026-11-17T00:00:00Z" }] } }));
   assert.deepEqual(await a.projectState("lp1"), { id: "lp1", description: null, archivedAt: "2026-11-17T00:00:00Z" });
   assert.match(calls[0].query, /includeArchived: true/);
   await assert.rejects(a.teamId("DEVOS"), /no Linear team/);
-  assert.equal((await a.findProject("team-1", PID)).archivedAt, "2026-11-17T00:00:00Z");
+  assert.deepEqual(await a.findProjects("team-1", PID), [{ id: "lp1", archivedAt: "2026-11-17T00:00:00Z" }, { id: "lp3", archivedAt: null }]);
 });

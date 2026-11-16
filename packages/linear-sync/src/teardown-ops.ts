@@ -60,13 +60,24 @@ export async function withSyncLock<T>(db: PrismaLike, projectId: string, fn: () 
   return db.$transaction(async (tx: any) => {
     await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = ${waitMs}`);
     try {
-      // `::text`: pg_advisory_xact_lock returns void, which the raw query cannot read back.
-      await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('devos:linear-sync'), hashtext($1))::text AS ok`, projectId);
-    } catch {
-      throw new Error("linear-sync-lock-busy");
+      // Wrapped so the row has a typed column: the pg adapter cannot read pg_advisory_xact_lock's void result.
+      await tx.$queryRawUnsafe(`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:linear-sync'), hashtext($1))) AS l`, projectId);
+    } catch (e) {
+      // Pre-review 1: only a lock timeout (SQLSTATE 55P03) means "a sync still holds it"; anything else is a real error.
+      if (isLockTimeout(e)) throw new Error("linear-sync-lock-busy");
+      throw e;
     }
     return fn();
   }, { timeout: txMs, maxWait: 10_000 });
+}
+
+/** Postgres `lock_not_available` (55P03), however the driver or Prisma wraps it. */
+export function isLockTimeout(e: unknown): boolean {
+  for (let x: any = e, i = 0; x && i < 4; x = x.cause, i++) {
+    if (x.code === "55P03" || x.meta?.code === "55P03" || x.originalCode === "55P03") return true;
+    if (typeof x.message === "string" && /canceling statement due to lock timeout/i.test(x.message)) return true;
+  }
+  return false;
 }
 
 /**
@@ -104,20 +115,21 @@ export function linearTeardownOps(db: PrismaLike, api: LinearTeardownApi, projec
 }
 
 /**
- * The independent leftover check for Linear (M2.5 decision 6): the project's Linear project, found by its marker in
- * the team (archived ones included), is a hit unless it is archived. A failed read is an error (fixed text), never "clean".
+ * The independent leftover check for Linear (M2.5 decision 6): every Linear project in the team that carries this
+ * project's marker (archived ones included, every page) is a hit unless it is archived. A failed read is an error (fixed text), never "clean".
  */
 export function linearScanner(api: LinearTeardownApi, teamKey: string, makeError: MakeError): { name: "linear"; scan(p: { id: string; slug: string }): Promise<{ provider: string; kind: string; externalId: string; name: string }[]> } {
   return {
     name: "linear",
     async scan(p) {
-      let hit: Awaited<ReturnType<LinearTeardownApi["findProject"]>>;
+      let found: Awaited<ReturnType<LinearTeardownApi["findProjects"]>>;
       try {
-        hit = await api.findProject(await api.teamId(teamKey), p.id);
+        found = await api.findProjects(await api.teamId(teamKey), p.id);
       } catch (e) {
         throw toProviderError(e, makeError, "leftover scan");
       }
-      return hit && !hit.archivedAt ? [{ provider: "linear", kind: "project", externalId: hit.id, name: p.id }] : [];
+      // Pre-review 2: every project carrying the marker counts, not only the first one.
+      return found.filter((x) => !x.archivedAt).map((x) => ({ provider: "linear", kind: "project", externalId: x.id, name: p.id }));
     },
   };
 }

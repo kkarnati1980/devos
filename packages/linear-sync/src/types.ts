@@ -52,8 +52,8 @@ export interface SyncStore {
 export interface LinearTeardownApi {
   /** The id of the team with this key; fails when there is none. */
   teamId(key: string): Promise<string>;
-  /** As LinearApi.findProject, with `archivedAt` (null when the project is not archived). */
-  findProject(teamId: string, devosProjectId: string): Promise<{ id: string; name: string; description: string; archivedAt?: string | null } | null>;
+  /** Every project in the team carrying this DevOS project's marker, archived included, with `archivedAt`. */
+  findProjects(teamId: string, devosProjectId: string): Promise<{ id: string; archivedAt: string | null }[]>;
   /** The project by id, archived included, or null when it no longer exists. */
   projectState(id: string): Promise<{ id: string; description: string | null; archivedAt: string | null } | null>;
   /** Moves the project to the workspace's first project status of this type. */
