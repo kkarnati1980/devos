@@ -158,7 +158,8 @@ export function costMeter({ services, store = memoryStore(), now = Date.now, tim
           whole(`${name}: reported cost`, result.cost, 0);
           if (result.cost !== estimate) await store.adjust(s.name, m, result.cost - estimate);
         } catch (err) {
-          try { onError(err); } catch { /* reporting must not break the app */ }
+          // Reporting must not break the app: a throwing or a rejecting (async) onError is swallowed.
+          Promise.resolve().then(() => onError(err)).catch(() => {});
         }
       }
       return result;

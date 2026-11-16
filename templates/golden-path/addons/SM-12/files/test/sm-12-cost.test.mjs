@@ -61,12 +61,24 @@ test("SM-12-L1: a paid result is never thrown away after the call; underestimate
   const meter = costMeter({ services: services(), store: broken, now: () => NOV, onError: (e) => errors.push(e.message) });
   assert.deepEqual(await meter.charge("openai", 100, async () => ({ cost: 40, text: "paid" })), { cost: 40, text: "paid" });
   assert.deepEqual(await meter.charge("openai", 100, async () => ({ cost: -3, text: "paid" })), { cost: -3, text: "paid" });
+  await new Promise((r) => setImmediate(r)); // onError runs on the next tick
   assert.deepEqual(errors.length, 2);
   assert.match(errors[0], /db down/);
   assert.match(errors[1], /reported cost/);
   assert.equal((await meter.report()).services[0].spent, 200, "the estimates stay recorded");
   const loud = costMeter({ services: services(), now: () => NOV, onError: () => { throw new Error("boom"); } });
   assert.deepEqual(await loud.charge("openai", 5, async () => ({ cost: "x" })), { cost: "x" });
+  const rejected = [];
+  const onRejection = (r) => rejected.push(r);
+  process.on("unhandledRejection", onRejection);
+  try {
+    const asyncLoud = costMeter({ services: services(), now: () => NOV, onError: async () => { throw new Error("reporter down"); } });
+    assert.deepEqual(await asyncLoud.charge("openai", 5, async () => ({ cost: "x" })), { cost: "x" });
+    await new Promise((r) => setTimeout(r, 20));
+  } finally {
+    process.off("unhandledRejection", onRejection);
+  }
+  assert.deepEqual(rejected, [], "a rejecting async onError is swallowed");
 
   // 20 concurrent calls estimated at 2 that really cost 3 (cap 60): the estimates admit 30, so spend ends at most
   // 30 × 3 = 90, i.e. each admitted underestimate adds its own difference. Upper-bound estimates keep it under the cap.
