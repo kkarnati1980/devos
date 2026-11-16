@@ -6,6 +6,8 @@ import { ProviderError } from "./http.js";
 import type { GitHubClient } from "./github.js";
 import type { CoolifyClient } from "./coolify.js";
 import { ownershipMarker, type ProviderName } from "./runner.js";
+import { applicationName, listApplications } from "./application.js";
+import { STACK_ENVS } from "./stack.js";
 
 /** One inventory row as teardown sees it. */
 export interface InventoryItem {
@@ -123,6 +125,95 @@ export function coolifyProjectOps(cf: CoolifyClient, projectId: string): Resourc
   };
 }
 
+const APP_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
+/** Coolify v4 application states that mean "no container running" (`exited`, `exited:unhealthy`, `stopped`). */
+const STOPPED_RE = /^(exited|stopped)(:[a-z]+)?$/;
+
+/**
+ * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos:<project id>` (M2.4-c2's
+ * marker). Archive stops the app; there is no un-archive (Restore leaves stacks stopped; the next deploy starts
+ * them). Remove deletes the app with its volumes, configuration and connected networks in one call.
+ */
+export interface AppTeardownOptions {
+  /** How long a queued stop or delete may take to show (default 60 s), and the wait between reads (default 2 s). */
+  confirmMs?: number;
+  pollMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: AppTeardownOptions = {}): ResourceOps {
+  const confirmMs = o.confirmMs ?? 60_000;
+  const pollMs = o.pollMs ?? 2_000;
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = o.now ?? Date.now;
+  const uuid = (item: InventoryItem): string => {
+    if (!APP_UUID_RE.test(item.externalId)) throw new Error("coolify-uuid-invalid");
+    return item.externalId;
+  };
+  const inspect = async (id: string): Promise<{ owned: boolean; status: unknown } | null> => {
+    const r = await cf.http.get<{ uuid?: unknown; description?: unknown; status?: unknown }>(`/api/v1/applications/${id}`);
+    // Only a 404 proves absence; a 200 must carry this application (same uuid, a string or null description).
+    if (r.status === 404) return null;
+    const b = r.body;
+    if (r.status !== 200 || !b || typeof b !== "object" || b.uuid !== id || !(b.description == null || typeof b.description === "string")) {
+      throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/applications/{uuid} returned an inconclusive response (${r.status})`, r.status);
+    }
+    return { owned: ((b.description as string | null | undefined) ?? "").includes(ownershipMarker(projectId)), status: b.status };
+  };
+  return {
+    provider: "coolify",
+    kind: "application",
+    inspect: async (item) => {
+      const a = await inspect(uuid(item));
+      return a && { owned: a.owned };
+    },
+    archive: async (item) => {
+      const id = uuid(item);
+      // Stop is idempotent: stopping a stopped app is a no-op at Coolify (a GET, so the transport may retry it).
+      const r = await cf.http.get<unknown>(`/api/v1/applications/${id}/stop`);
+      // Pre-review 3: an app deleted since Archive's inspect has nothing to stop; confirm with a fresh read.
+      if (r.status === 404 && (await inspect(id)) === null) return;
+      if (r.status !== 200) {
+        throw new ProviderError("coolify", r.status === 404 ? "http" : "bad-response", `coolify stop of an application returned ${r.status}`, r.status);
+      }
+      // Codex PR154-r3: Coolify only queues the stop ("Stopping request queued."). Archive succeeds (and the repo
+      // turns read-only after it) only once a read shows the app stopped (`exited` or `stopped`, with or without a
+      // `:health` suffix) or gone; still running when the bound ends, or a status that is not a string, fails
+      // the step, so the repo stays writable and Archive can be run again.
+      const until = now() + confirmMs;
+      for (;;) {
+        const a = await inspect(id);
+        if (a === null) return;
+        if (typeof a.status !== "string") {
+          throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/applications/{uuid} returned no status after a stop", 200);
+        }
+        if (STOPPED_RE.test(a.status)) return;
+        if (now() >= until) throw new ProviderError("coolify", "timeout", "coolify has not finished stopping the application yet");
+        await sleep(pollMs);
+      }
+    },
+    remove: async (item) => {
+      const id = uuid(item);
+      const q = "delete_configurations=true&delete_volumes=true&docker_cleanup=true&delete_connected_networks=true";
+      try {
+        await cf.http.write("DELETE", `/api/v1/applications/${id}?${q}`);
+      } catch (e) {
+        if (!gone(e)) throw e;
+      }
+      // Pre-review 1: Coolify only queues the delete. The row is marked deleted (and the environment after it is
+      // touched) only once a read shows the app gone; otherwise a transient error makes the purge stop as
+      // `delete_unconfirmed` (retryable, no second delete in this run).
+      const until = now() + confirmMs;
+      for (;;) {
+        if ((await inspect(id)) === null) return;
+        if (now() >= until) throw new ProviderError("coolify", "timeout", "coolify has not finished deleting the application yet");
+        await sleep(pollMs);
+      }
+    },
+  };
+}
+
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
@@ -178,6 +269,19 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
         }
         if (x.name === `devos-${p.slug}` || (x.description ?? "").includes(marker)) {
           hits.push({ provider: "coolify", kind: "project", externalId: x.uuid, name: x.name });
+        }
+      }
+      // M2.5-a3b: applications too (M2.4-c2 names them `devos-<slug>-preview|live` and marks the description).
+      const appNames = new Set(STACK_ENVS.map((env) => applicationName(p.slug, env)));
+      for (const a of await listApplications(cf)) {
+        // Codex PR154-r1 (as PR48-r5 for repos): ownership needs the description field present, a string or null.
+        // An omitted one is inconclusive, so the scan fails rather than report a renamed application as clean.
+        const d = (a as { description?: unknown }).description;
+        if (!(d === null || typeof d === "string")) {
+          throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/applications returned an application without a description field", 200);
+        }
+        if (appNames.has(a.name) || (a.description ?? "").includes(marker)) {
+          hits.push({ provider: "coolify", kind: "application", externalId: a.uuid, name: a.name });
         }
       }
       return hits;
