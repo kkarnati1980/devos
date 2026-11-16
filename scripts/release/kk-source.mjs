@@ -74,8 +74,17 @@ async function linearQuery(variables, { key, fetchImpl, timeoutMs, attempts, sle
     }
     if (res.status === 429 || res.status >= 500) { last = new KkSourceError(`Linear HTTP ${res.status}`); continue; }
     if (res.status !== 200) throw new KkSourceError(`Linear HTTP ${res.status}`);
+    // The body is read inside the attempt: a timeout or network failure while it streams is retried like one before
+    // the headers (Codex PR162-r1); only a body that arrived whole and is not JSON is refused at once.
+    let text;
+    try {
+      text = await res.text();
+    } catch (err) {
+      last = new KkSourceError(`Linear ${err?.name === "TimeoutError" ? "timed out" : "request failed"} while sending its answer`);
+      continue;
+    }
     let json;
-    try { json = await res.json(); } catch { throw new KkSourceError("Linear sent a response that is not JSON"); }
+    try { json = JSON.parse(text); } catch { throw new KkSourceError("Linear sent a response that is not JSON"); }
     if (Array.isArray(json?.errors) && json.errors.length) throw new KkSourceError("Linear refused the query");
     return json?.data;
   }

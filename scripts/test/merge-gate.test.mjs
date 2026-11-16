@@ -323,7 +323,7 @@ test("K11 (DEVOS-239 part b) the CLI reads KK's answers from Linear with LINEAR_
     if (url === "https://api.linear.app/graphql") {
       linear.push({ auth: init.headers.authorization, vars: JSON.parse(init.body).variables });
       const nodes = [{ body: `FLOOR-GUARD KK KEEP fg-9a5389ff38 a.yml:0 ${SHA40}`, url: "https://linear.app/kishoremb/issue/DEVOS-7#c", botActor: null, user: { id: "b9a2ca4d-b88b-4c7b-8526-fde8045b98f7" } }];
-      return { status: 200, json: async () => ({ data: { issue: { comments: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } } }) };
+      return { status: 200, text: async () => JSON.stringify({ data: { issue: { comments: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } } }) };
     }
     return g.fetchImpl(url, init);
   };

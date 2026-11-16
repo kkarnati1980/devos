@@ -16,7 +16,9 @@ const KEEP = `FLOOR-GUARD KK KEEP ${HIT.id} ${HIT.file}:0 ${SHA}`;
 const URL1 = "https://linear.app/kishoremb/issue/DEVOS-200#comment-1";
 const node = (body, extra = {}) => ({ body, url: URL1, botActor: null, user: { id: KK_LINEAR_USER_ID }, ...extra });
 const page = (nodes, next = null) => ({ data: { issue: { identifier: "DEVOS-200", comments: { nodes, pageInfo: { hasNextPage: !!next, endCursor: next } } } } });
-const res = (status, json) => ({ status, json: async () => json });
+const res = (status, json) => ({ status, text: async () => JSON.stringify(json) });
+/** A response whose headers arrive but whose body read fails (a timeout or a dropped connection mid-body). */
+const cut = (name = "TimeoutError") => ({ status: 200, text: async () => { throw Object.assign(new Error("body"), { name }); } });
 const noSleep = async () => {};
 
 /** A fake fetch that serves `responses` in order and records each call (url, headers, variables). */
@@ -64,6 +66,12 @@ test("K7 a read is retried on 5xx, 429 and network errors only; other failures t
   const to = fake([timedOut, res(200, page([node(KEEP)]))]);
   assert.equal((await readKkComments({ ids: ["DEVOS-200"], key: KEY, fetchImpl: to.fetchImpl, sleep: noSleep })).length, 1, "a timed-out read is retried");
   await assert.rejects(readKkComments({ ids: ["DEVOS-200"], key: KEY, fetchImpl: fake([timedOut, timedOut, timedOut]).fetchImpl, sleep: noSleep }), /timed out/);
+  const body = fake([cut(), cut("TypeError"), res(200, page([node(KEEP)]))]);
+  assert.equal((await readKkComments({ ids: ["DEVOS-200"], key: KEY, fetchImpl: body.fetchImpl, sleep: noSleep })).length, 1, "a body read that times out or drops is retried (Codex PR162-r1)");
+  await assert.rejects(readKkComments({ ids: ["DEVOS-200"], key: KEY, fetchImpl: fake([cut(), cut(), cut()]).fetchImpl, sleep: noSleep }), /timed out while sending/);
+  const notJson = fake([{ status: 200, text: async () => "<html>" }, res(200, page([node(KEEP)]))]);
+  await assert.rejects(readKkComments({ ids: ["DEVOS-200"], key: KEY, fetchImpl: notJson.fetchImpl, sleep: noSleep }), /not JSON/);
+  assert.equal(notJson.calls.length, 1, "a whole body that is not JSON is not retried");
   for (const [name, responses] of [
     ["401", [res(401, {})]],
     ["graphql errors", [res(200, { errors: [{ message: `bad key ${KEY}` }] })]],
