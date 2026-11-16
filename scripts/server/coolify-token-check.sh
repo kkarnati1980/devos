@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DevOS — check that a Coolify API token can do what the server agent needs (DEVOS-82).
-# Contract: docs/modules/server-agent.md · Version: 1.0.1
+# Contract: docs/modules/server-agent.md · Version: 1.0.2
+# v1.0.2 (DEVOS-238): a connection error reads as "not reachable" (curl printed 000 and the fallback added another).
 # v1.0.1 (Codex PR26-r1): the whole read / PATCH / read-back runs under the server agent's lock, so a running tick
 # cannot set a new git_commit_sha between our read and our write-back (which would deploy the older revision).
 # Usage: coolify-token-check.sh <env-file with COOLIFY_TOKEN= and COOLIFY_APP_UUID=>
@@ -36,7 +37,8 @@ U="$(sed -n 's/^COOLIFY_APP_UUID=//p' "$ENVF" | head -n1 | tr -d '\r\n')"
 req() {  # method path [body-file] -> HTTP code (body in $TMP/r); 000 on a connection error
   local a=(-sS --connect-timeout 10 --max-time 30 -o "$TMP/r" -w '%{http_code}' -H @"$TMP/auth" -H 'Accept: application/json' -X "$1")
   [[ -n "${3:-}" ]] && a+=(-H 'Content-Type: application/json' --data-binary @"$3")
-  curl "${a[@]}" "$COOLIFY_API$2" 2>/dev/null || echo 000
+  local c; c="$(curl "${a[@]}" "$COOLIFY_API$2" 2>/dev/null)" || true
+  [[ "$c" =~ ^[1-5][0-9][0-9]$ ]] && echo "$c" || echo 000   # curl prints 000 itself on a connection error
 }
 why() { case "$1" in 401|403) echo "HTTP $1: missing $2 permission";; 404) echo "HTTP 404: no app with that UUID";;
   000) echo "Coolify API not reachable at $COOLIFY_API";; *) echo "Coolify API answered HTTP $1";; esac; }
