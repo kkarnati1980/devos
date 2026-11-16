@@ -56,6 +56,10 @@ test("SM-10-L1: turning a phase off in the switch file hides its routes and UI f
     t = 999;
     assert.equal((await fetch(`${s.base}/reports`)).status, 200);
     t = 1000;
+    // Requests never wait for the source: the first request after refreshMs still gets the old state and starts a
+    // background re-read; once it lands, phase 2 is hidden.
+    assert.equal((await fetch(`${s.base}/reports`)).status, 200);
+    await switches.settled();
     const hidden = await fetch(`${s.base}/reports`);
     assert.equal(hidden.status, 404);
     assert.deepEqual(await hidden.json(), { error: "not-found" }, "the same answer as a route that does not exist");
@@ -67,12 +71,16 @@ test("SM-10-L1: turning a phase off in the switch file hides its routes and UI f
     // Back on: the same running server shows it again.
     fs.writeFileSync(file, JSON.stringify({ "phase-2": true }));
     t = 2000;
+    await switches.current();
     assert.equal((await fetch(`${s.base}/reports`)).status, 200);
 
-    // Deleting the line returns the phase to its default.
-    fs.writeFileSync(file, JSON.stringify({ "phase-1": false }));
+    // Deleting a line returns that phase to its default (on), even after it was turned off.
+    fs.writeFileSync(file, JSON.stringify({ "phase-1": false, "phase-2": false }));
     t = 3000;
-    assert.deepEqual(await switches.current(), { "phase-1": false, "phase-2": true });
+    assert.deepEqual(await switches.current(), { "phase-1": false, "phase-2": false });
+    fs.writeFileSync(file, JSON.stringify({ "phase-2": false }));
+    t = 4000;
+    assert.deepEqual(await switches.current(), { "phase-1": true, "phase-2": false });
   } finally {
     await s.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -89,9 +97,12 @@ test("SM-10-L1: the kill_switch table turns a phase off and on through setKillSw
     await setKillSwitch(db.query, "phase-2", false, "ops@example.com");
     assert.deepEqual(db.rows.get("phase-2"), { phase: "phase-2", enabled: false, updated_by: "ops@example.com" });
     t = 500;
+    await switches.current();
     assert.equal((await fetch(`${s.base}/reports`, { method: "POST" })).status, 404);
     await setKillSwitch(db.query, "phase-2", true, "ops@example.com");
     t = 1000;
+    await fetch(`${s.base}/reports`, { method: "POST" }); // starts the background re-read
+    await switches.settled();
     assert.equal((await fetch(`${s.base}/reports`, { method: "POST" })).status, 200);
   } finally {
     await s.close();
@@ -102,6 +113,38 @@ test("SM-10-L1: the kill_switch table turns a phase off and on through setKillSw
     await assert.rejects(setKillSwitch(db.query, phase, enabled, by), TypeError, JSON.stringify([phase, enabled, by]));
   }
   await assert.rejects(dbSource(async () => ({}))(), /must return \{ rows \}/);
+});
+
+test("SM-10-L1: a hung kill_switch query is never stacked, and requests do not wait for it", async () => {
+  let calls = 0;
+  let finish;
+  const seen = [];
+  const hung = async (text, params, opts) => { calls += 1; seen.push(opts); if (calls === 1) return { rows: [] }; return new Promise((r) => { finish = () => r({ rows: [{ phase: "phase-2", enabled: false }] }); }); };
+  const errors = [];
+  let t = 0;
+  const switches = killSwitches({ phases: ["phase-2"], source: dbSource(hung), refreshMs: 10, timeoutMs: 500, now: () => t, onError: (e) => errors.push(e.message) });
+  const s = await serve({ "GET /reports": switches.guard("phase-2", ok({ reports: [] })) });
+  try {
+    assert.equal((await fetch(`${s.base}/reports`)).status, 200); // first read, awaited
+    for (let i = 1; i <= 4; i += 1) {
+      t = i * 10;
+      const started = Date.now();
+      assert.equal((await fetch(`${s.base}/reports`)).status, 200);
+      assert.ok(Date.now() - started < 250, "a request does not wait for the hung read (timeoutMs is 500)");
+      await switches.settled();
+    }
+    assert.equal(calls, 2, "one hung query, never a second one beside it");
+    assert.ok(seen[1].signal.aborted, "the hung query's signal is aborted");
+    assert.ok(errors.some((m) => /did not answer within 500 ms/.test(m)));
+    assert.ok(errors.some((m) => /previous source read still pending/.test(m)));
+    finish(); // the query finally returns; its late result is ignored, and the next read runs again
+    await new Promise((r) => setImmediate(r));
+    t = 100;
+    await switches.current();
+    assert.equal(calls, 3);
+  } finally {
+    await s.close();
+  }
 });
 
 test("SM-10-L1: a failing, hanging or malformed source keeps the last good state and is reported", async () => {
@@ -125,7 +168,8 @@ test("SM-10-L1: a failing, hanging or malformed source keeps the last good state
   let aborted = false;
   for (const bad of [
     () => { throw new Error("db down again"); },
-    (signal) => new Promise(() => { signal.addEventListener("abort", () => { aborted = true; }); }),
+    // A hang that honours its signal (a driver that cancels): it settles once aborted, so the next read may run.
+    (signal) => new Promise((_, reject) => { signal.addEventListener("abort", () => { aborted = true; reject(new Error("cancelled")); }); }),
     () => "phase-1=false",
     () => [false, true],
     () => null,
@@ -143,6 +187,11 @@ test("SM-10-L1: a failing, hanging or malformed source keeps the last good state
   assert.deepEqual(await switches.current(), { "phase-1": false, "phase-2": false });
   assert.ok(errors.some((m) => /"phase-1" is not true or false; kept false/.test(m)));
   assert.ok(errors.some((m) => /unknown phase in source: "phase-3"/.test(m)));
+  const before = errors.length;
+  t += 10;
+  await switches.current();
+  assert.equal(errors.filter((m) => /unknown phase/.test(m)).length, 1, "an unknown name is reported once, not on every read");
+  assert.equal(errors.length, before + 1, "only the non-boolean value is reported again");
 
   // A file that is not JSON is an error too, and a throwing onError never breaks the app.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sm10-"));

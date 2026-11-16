@@ -4,6 +4,7 @@
 //   operator can change while the app runs: fileSource(path) (a JSON file on a mounted volume) or dbSource(query)
 //   (the kill_switch table). The state is re-read at most every `refreshMs`.
 // - switches.guard(phase, handler): a route that answers 404 (the core's deny-by-default answer) while its phase is off.
+//   After the first read, requests never wait for the source: a stale state is re-read in the background.
 // - switches.clientFlags(): { [phase]: boolean } for the UI, so it hides the phase's screens and links.
 // - setKillSwitch(query, phase, enabled, by): turns a phase on or off in the kill_switch table (an operator action).
 import { readFile } from "node:fs/promises";
@@ -58,6 +59,8 @@ export function killSwitches({ phases, source, defaults = {}, refreshMs = 5000, 
   let state = Object.freeze({ ...base });
   let readAt = -Infinity;
   let inFlight = null;
+  let pendingSource = null; // a source() call that timed out and has not settled yet
+  let lastUnknown = "";
 
   const apply = (value) => {
     if (!isPlainObject(value)) throw new TypeError("flags: source() must return an object of phase: true|false");
@@ -67,21 +70,36 @@ export function killSwitches({ phases, source, defaults = {}, refreshMs = 5000, 
       if (typeof value[p] === "boolean") next[p] = value[p];
       else { next[p] = state[p]; report(new TypeError(`flags: value for ${JSON.stringify(p)} is not true or false; kept ${state[p]}`)); }
     }
-    const unknown = Object.keys(value).filter((k) => !known.has(k));
-    if (unknown.length) report(new TypeError(`flags: unknown phase in source: ${unknown.map((k) => JSON.stringify(k)).join(", ")}`));
+    const unknown = Object.keys(value).filter((k) => !known.has(k)).map((k) => JSON.stringify(k)).join(", ");
+    // Reported once per change of the set, not on every read (a stale row would otherwise be reported every refreshMs).
+    if (unknown && unknown !== lastUnknown) report(new TypeError(`flags: unknown phase in source: ${unknown}`));
+    lastUnknown = unknown;
     state = Object.freeze(next);
   };
 
   const readOnce = async () => {
+    if (pendingSource) {
+      // The last read timed out and is still running (a hung query holding a pool connection): never stack another.
+      report(new Error("flags: previous source read still pending; kept the last good state"));
+      readAt = now();
+      return;
+    }
     const ac = new AbortController();
     let timer;
+    let timedOut = false;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => { ac.abort(); reject(new Error(`flags: source did not answer within ${timeoutMs} ms`)); }, timeoutMs);
+      timer = setTimeout(() => { timedOut = true; ac.abort(); reject(new Error(`flags: source did not answer within ${timeoutMs} ms`)); }, timeoutMs);
     });
+    const call = Promise.resolve().then(() => source({ signal: ac.signal }));
+    call.catch(() => {}); // a late failure of a timed-out read is not unhandled
     try {
-      apply(await Promise.race([Promise.resolve().then(() => source({ signal: ac.signal })), timeout]));
+      apply(await Promise.race([call, timeout]));
     } catch (err) {
       report(err); // keep the last good state
+      if (timedOut) {
+        pendingSource = call;
+        call.then(() => {}, () => {}).finally(() => { if (pendingSource === call) pendingSource = null; });
+      }
     } finally {
       clearTimeout(timer);
       readAt = now();
@@ -93,9 +111,18 @@ export function killSwitches({ phases, source, defaults = {}, refreshMs = 5000, 
     if (!inFlight) inFlight = readOnce().finally(() => { inFlight = null; });
     return inFlight;
   };
-  /** Re-reads the source if the state is older than refreshMs, then returns the state. Never throws. */
+  /** Re-reads the source if the state is older than refreshMs, waits for it, and returns the state. Never throws. */
   const current = async () => {
     if (now() - readAt >= refreshMs) await refresh();
+    return state;
+  };
+  /**
+   * The request path: the first read is awaited; after that the current state is returned at once and a stale one
+   * is re-read in the background (stale-while-revalidate), so a slow source never delays a request.
+   */
+  const fresh = async () => {
+    if (readAt === -Infinity) return current();
+    if (now() - readAt >= refreshMs) refresh();
     return state;
   };
   const isOn = (phase) => {
@@ -107,15 +134,17 @@ export function killSwitches({ phases, source, defaults = {}, refreshMs = 5000, 
     phases: Object.freeze([...phases]),
     refresh,
     current,
+    /** Resolves when no read is in flight (for tests and graceful shutdown). */
+    settled: () => (inFlight ? inFlight.then(() => {}) : Promise.resolve()),
     isOn,
     /** The phase state for the UI: { [phase]: boolean }. Hiding in the UI is not enough; guard the routes too. */
-    clientFlags: async () => ({ ...(await current()) }),
+    clientFlags: async () => ({ ...(await fresh()) }),
     /** A route handler that answers 404 while `phase` is off, exactly as the core does for a route that does not exist. */
     guard(phase, handler) {
       if (!known.has(phase)) throw new TypeError(`flags: unknown phase ${JSON.stringify(phase)}`);
       if (typeof handler !== "function") throw new TypeError("flags: guard() needs a handler");
       return async (req, res, ctx) => {
-        if (!(await current())[phase]) {
+        if (!(await fresh())[phase]) {
           res.writeHead(404, { "content-type": "application/json", "cache-control": "no-store" });
           return res.end(JSON.stringify({ error: "not-found" }));
         }
@@ -146,8 +175,9 @@ export function fileSource(path) {
 /** A source that reads the kill_switch table (KILL_SWITCH_SQL) through any `query(text, params) → { rows }`. */
 export function dbSource(query) {
   if (typeof query !== "function") throw new TypeError("flags: dbSource needs a query function");
-  return async () => {
-    const res = await query("SELECT phase, enabled FROM kill_switch", []);
+  // The signal is passed on for drivers that can cancel a query; killSwitches() never starts a second read while one hangs.
+  return async ({ signal } = {}) => {
+    const res = await query("SELECT phase, enabled FROM kill_switch", [], { signal });
     if (!Array.isArray(res?.rows)) throw new TypeError("flags: query() must return { rows }");
     const out = {};
     for (const r of res.rows) out[r.phase] = r.enabled;
