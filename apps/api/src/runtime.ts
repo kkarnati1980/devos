@@ -30,7 +30,8 @@ import { buildProvisionSweep, PrismaProvisioningRows, type ProvisionModule, type
 import type { ProvisionSweepJob } from "./provision-sweep.js";
 import { PrismaProvisionReader, type ProvisionServices } from "./provision-routes.js";
 import type { TeardownServices } from "./teardown-routes.js";
-import { buildTeardownServices, type TeardownRuntimeModule } from "./teardown-runtime.js";
+import { buildTeardownServices, buildTeardownSweep, type TeardownRuntimeModule, type TeardownSweepCards } from "./teardown-runtime.js";
+import type { TeardownSweepJob } from "./teardown-sweep.js";
 import { AnalystRunSweepJob, PrismaAnalystRunRows, PrismaAnalystRunSweeper, runEngineModelRunner, type AnalystRowsDb, type RunExecutor } from "./analyst-runner.js";
 
 /** The subset of the Prisma client the API needs. */
@@ -97,6 +98,8 @@ export interface Runtime {
   provision: ProvisionServices;
   /** DEVOS-244 (M2.5-b1): archive/restore routes; null parts → 503 `teardown-not-configured`. */
   teardown: TeardownServices;
+  /** DEVOS-245 (M2.5-b2): the purge card and the teardown jobs; null when off (logged `teardown-sweep-off`). */
+  teardownSweep: TeardownSweepJob | null;
 }
 
 const notReady = (code: string): ReadinessProbe => async () => {
@@ -147,7 +150,7 @@ export async function buildRuntime(
   const noDead: DeadLetterServices = { queue: null, audit: null };
   const noApprovals: ApprovalRouteServices = { approvals: null, grantsFor: null, revokeGrant: null };
   const noRequirements: RequirementsServices = { pipeline: null, store: null, cards: null };
-  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null }, teardown: { reader: null, actions: null } as TeardownServices };
+  const off = { setup: noSetup, notify: noNotify, deadLetters: noDead, approvals: noApprovals, requirements: noRequirements, requirementsSync: null, analystSweep: null, cardBatch: null, cardBatchQueue: null, isolation: null, runnerWatchdog: null, provisionSweep: null, provision: { reader: null, sweep: null }, teardown: { reader: null, actions: null } as TeardownServices, teardownSweep: null };
   if (!databaseUrl) return { grants: null, readiness: notReady("database-not-configured"), ...off };
   if (!hmac) return { grants: null, readiness: notReady("policy-not-configured"), ...off };
   const db = await opts.loadDb(databaseUrl);
@@ -269,8 +272,17 @@ export async function buildRuntime(
   const tw = buildTeardownServices({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownServices>[0]["policy"], env, timeoutMs: t });
   if ("off" in tw) log({ level: "warn", msg: "teardown-routes-off", code: tw.off });
   const teardown: TeardownServices = "off" in tw ? { reader: null, actions: null } : { ...tw, log };
+  // DEVOS-245 (M2.5-b2): purge cards and purges under their grants, on the same modules, vault and approvals core.
+  const purgeCards: TeardownSweepCards = {
+    list: (f) => approvalsCore.store.list(f as Parameters<typeof approvalsCore.store.list>[0]),
+    raise: (card) => approvalsCore.raiseCard(card),
+    expire: (ids, reason) => approvalsCore.expireCardsById(ids, reason),
+  };
+  const ts = buildTeardownSweep({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownSweep>[0]["policy"], cards: purgeCards, env, timeoutMs: t, log });
+  if ("off" in ts) log({ level: "warn", msg: "teardown-sweep-off", code: ts.off });
+  const teardownSweep = "off" in ts ? null : ts;
   return { grants, readiness: dbReadiness(db, opts.outboundTimeoutMs), setup, notify: { notifier }, deadLetters, approvals, requirements, requirementsSync, analystSweep, cardBatch, cardBatchQueue, isolation, runnerWatchdog, provisionSweep,
-    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown };
+    provision: { reader: provisionSweep ? new PrismaProvisionReader(db, t) : null, sweep: provisionSweep }, teardown, teardownSweep };
 }
 
 /**
