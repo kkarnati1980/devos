@@ -313,3 +313,28 @@ test("DEVOS-212: allStatuses pages the /statuses list and keeps creator; codexPa
   assert.equal((await allStatuses(pager(2000), "o/r", "abc")).length, 2000);
   await assert.rejects(allStatuses(pager(2001), "o/r", "abc"), /more than 2,000/);
 });
+
+test("K11 (DEVOS-239 part b) the CLI reads KK's answers from Linear with LINEAR_READ_KEY for the PR's issue; without the key it reads none and still judges", async () => {
+  const LKEY = "test-linear-key-not-real";
+  const SHA40 = HEAD;
+  const g = fakeGitHub({ pr: { number: 7, state: "open", draft: false, merged: false, changed_files: 1, base: { ref: "main" }, body: "Fixes DEVOS-7", head: { sha: HEAD, ref: "kishore/devos-7-x", repo: { full_name: REPO } } } });
+  const linear = [];
+  const fetchImpl = async (url, init) => {
+    if (url === "https://api.linear.app/graphql") {
+      linear.push({ auth: init.headers.authorization, vars: JSON.parse(init.body).variables });
+      const nodes = [{ body: `FLOOR-GUARD KK KEEP fg-9a5389ff38 a.yml:0 ${SHA40}`, url: "https://linear.app/kishoremb/issue/DEVOS-7#c", botActor: null, user: { id: "b9a2ca4d-b88b-4c7b-8526-fde8045b98f7" } }];
+      return { status: 200, text: async () => JSON.stringify({ data: { issue: { comments: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } } }) };
+    }
+    return g.fetchImpl(url, init);
+  };
+  const out = [];
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN, LINEAR_READ_KEY: LKEY }, fetchImpl, log: (l) => out.push(l) }), 0);
+  assert.deepEqual(linear.map((c) => c.vars.id), ["DEVOS-7"]);
+  assert.equal(linear[0].auth, LKEY);
+  assert.match(out.join("\n"), /KK answers: 1 from DEVOS-7/);
+  assert.ok(!out.join("\n").includes(LKEY), "the key is never logged");
+  const h = fakeGitHub();
+  const out2 = [];
+  assert.equal(await main(["7"], { env: { GH_TOKEN: TOKEN }, fetchImpl: h.fetchImpl, log: (l) => out2.push(l) }), 0);
+  assert.match(out2.join("\n"), /KK answers: 0 from no issue \(none read: the PR names no DEVOS issue/);
+});
