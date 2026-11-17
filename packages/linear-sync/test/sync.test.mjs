@@ -375,4 +375,19 @@ test("DEVOS-97 known gap 7: fencedApi fences the unarchive and the status write;
   const guard = async () => { throw new Error("linear-sync-lock-expiring"); };
   await assert.rejects(syncProject(plan, fencedApi(L.api, guard), memoryStore(plan)), /linear-sync-lock-expiring/);
   assert.equal(L.writes.length, 0); assert.ok(L.projects[0].archivedAt, "still archived");
+  // The status write is fenced too: a guard that allows the unarchive and refuses the next write stops before it.
+  let allow = 1;
+  const second = async () => { if (allow-- <= 0) throw new Error("linear-sync-lock-expiring"); };
+  await assert.rejects(syncProject(plan, fencedApi(L.api, second), memoryStore(plan)), /linear-sync-lock-expiring/);
+  assert.deepEqual(L.writes.map((x) => x.op), ["unarchiveProject"], "the status write was refused by the guard");
+});
+
+test("DEVOS-97 known gap 7: no `started` project status fails the sync before any write; the project stays archived", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  await syncProject(plan, L.api, memoryStore(plan));
+  L.projects[0].archivedAt = "2026-11-17T00:00:00Z";
+  L.writes.length = 0;
+  L.api.projectStatusId = async (type) => { throw new Error(`no Linear project status of type ${type}`); };
+  await assert.rejects(syncProject(plan, L.api, memoryStore(plan)), /no Linear project status of type started/);
+  assert.equal(L.writes.length, 0); assert.ok(L.projects[0].archivedAt, "still archived");
 });
