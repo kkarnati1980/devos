@@ -217,7 +217,7 @@ export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi 
         `mutation($id: String!, $i: ProjectUpdateInput!) { projectUpdate(id: $id, input: $i) { success } }`, { id, i: { statusId } })).projectUpdate, "project status update");
     },
     async unarchiveProject(id) {
-      // DEVOS-97 known gap 7: the reverse of the purge's projectArchive (never a delete or a trash restore).
+      // DEVOS-97 known gap 7: the reverse of the purge's projectArchive; never a delete. It also takes a trashed project out of the trash (M2.6 "DEVOS-97 known gap 7" decision 3).
       ok((await client.mutate<{ projectUnarchive: { success: boolean } }>(
         `mutation($id: String!) { projectUnarchive(id: $id) { success } }`, { id })).projectUnarchive, "project unarchive");
     },
