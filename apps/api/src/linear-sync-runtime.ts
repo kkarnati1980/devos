@@ -30,6 +30,33 @@ export interface LinearSyncJob {
 const TEAM_KEY = /^[A-Za-z0-9]{1,10}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** The key callback every Linear client uses: the vault's `linear_api_key`, by name at call time (never logged). */
+export function linearKeyReader(vault: { reveal(name: string): Promise<string | null> }): () => Promise<string> {
+  return async () => {
+    const key = await vault.reveal("linear_api_key");
+    if (!key) throw new Error("linear-key-not-set");
+    return key;
+  };
+}
+
+/**
+ * DEVOS-97 follow-up ("shared Linear client" decisions): one `LinearClient` for the sync job, the teardown parts and
+ * the links route, so a rate-limit pause one of them sees holds for all three. Null when the sync is off, a piece is
+ * missing or the client cannot be built; each builder then reports its own off code as before.
+ */
+export function sharedLinearClient(w: {
+  mod: { LinearClient?: unknown } | null;
+  vault: { reveal(name: string): Promise<string | null> } | null;
+  env: NodeJS.ProcessEnv;
+}): unknown | null {
+  if (w.env.DEVOS_LINEAR_SYNC !== "on" || !w.vault || !w.mod || typeof w.mod.LinearClient !== "function") return null;
+  try {
+    return new (w.mod.LinearClient as new (o: { apiKey: () => Promise<string> }) => unknown)({ apiKey: linearKeyReader(w.vault) });
+  } catch {
+    return null;
+  }
+}
+
 /** Decision 2–3: the job, or why it is off (a fixed code, logged by the caller). */
 export function buildLinearSync(w: {
   mod: LinearSyncModule | null;
@@ -38,6 +65,8 @@ export function buildLinearSync(w: {
   env: NodeJS.ProcessEnv;
   log: LinearSyncLog;
   intervalMs?: number;
+  /** The shared client (`sharedLinearClient`); absent → the job builds its own. */
+  client?: unknown;
 }): LinearSyncJob | { off: string } {
   if (w.env.DEVOS_LINEAR_SYNC !== "on") return { off: "linear-sync-disabled" };
   if (!w.db) return { off: "linear-sync-no-database" };
@@ -60,13 +89,7 @@ export function buildLinearSync(w: {
   };
   let syncOne: ReturnType<LinearSyncModule["lockedSyncOne"]>;
   try {
-    const client = new mod.LinearClient({
-      apiKey: async () => {
-        const key = await vault.reveal("linear_api_key");
-        if (!key) throw new Error("linear-key-not-set");
-        return key;
-      },
-    });
+    const client = w.client ?? new mod.LinearClient({ apiKey: linearKeyReader(vault) });
     syncOne = mod.lockedSyncOne(db, mod.graphqlApi(client), { teamKey, log: syncLog });
   } catch {
     // Pre-review: a module that loaded without the expected exports turns the sync off; the API still starts.
@@ -126,6 +149,8 @@ export function buildLinearTeardown(w: {
   vault: { reveal(name: string): Promise<string | null> } | null;
   env: NodeJS.ProcessEnv;
   providerError: ((provider: string, code: string, message: string, status?: number) => Error) | null;
+  /** The shared client (`sharedLinearClient`); absent → the parts build their own. */
+  client?: unknown;
 }): LinearTeardownParts | { off: string } {
   if (w.env.DEVOS_LINEAR_SYNC !== "on") return { off: "linear-sync-disabled" };
   if (!w.db) return { off: "linear-sync-no-database" };
@@ -142,13 +167,7 @@ export function buildLinearTeardown(w: {
   const makeError: LinearMakeError = (code, message, status) => pe("linear", code, message, status);
   let api: unknown;
   try {
-    api = m.graphqlApi(new m.LinearClient({
-      apiKey: async () => {
-        const key = await vault.reveal("linear_api_key");
-        if (!key) throw new Error("linear-key-not-set");
-        return key;
-      },
-    }));
+    api = m.graphqlApi(w.client ?? new m.LinearClient({ apiKey: linearKeyReader(vault) }));
   } catch {
     return { off: "linear-sync-not-loaded" };
   }
