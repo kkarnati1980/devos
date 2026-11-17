@@ -183,6 +183,20 @@ test("GraphQL: the status id is the lowest-position workspace status of the type
   assert.deepEqual(calls[2].variables, { id: "lp1" });
 });
 
+test("DEVOS-97 known gap 7: unarchive uses projectUnarchive; project reads return archivedAt; a refused unarchive fails closed", async () => {
+  const { a, calls } = gql((b) => (/projectUnarchive/.test(b.query) ? { projectUnarchive: { success: true } }
+    : /team\(id/.test(b.query) ? { team: { projects: { nodes: [{ id: "lp1", name: "X", description: "Mirrored by DevOS.\n\ndevos-ref: project/00000000-0000-4000-8000-000000000001", archivedAt: "2026-11-17T00:00:00Z" }], pageInfo: { hasNextPage: false, endCursor: null } } } }
+    : { projects: { nodes: [{ id: "lp1", name: "X", description: null, archivedAt: null }] } }));
+  await a.unarchiveProject("lp1");
+  assert.match(calls[0].query, /projectUnarchive\(id: \$id\)/); assert.deepEqual(calls[0].variables, { id: "lp1" });
+  const p = await a.project("lp1");
+  assert.match(calls[1].query, /archivedAt/); assert.equal(p.archivedAt, null);
+  const f = await a.findProject("t1", "00000000-0000-4000-8000-000000000001");
+  assert.match(calls[2].query, /archivedAt/); assert.equal(f.archivedAt, "2026-11-17T00:00:00Z");
+  const { a: refused } = gql(() => ({ projectUnarchive: { success: false } }));
+  await assert.rejects(refused.unarchiveProject("lp1"), /refused/);
+});
+
 test("GraphQL: no status of the type, or a refused archive, fails closed", async () => {
   const { a } = gql((b) => (/projectStatuses/.test(b.query) ? { projectStatuses: { nodes: [{ id: "st-go", type: "started", position: 0 }] } } : { projectArchive: { success: false } }));
   await assert.rejects(a.projectStatusId("completed"), /no Linear project status/);

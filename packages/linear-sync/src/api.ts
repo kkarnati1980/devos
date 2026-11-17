@@ -60,11 +60,11 @@ export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi 
     async findProject(teamId, devosProjectId) {
       let after: string | null = null;
       for (let p = 0; p < MAX_PAGES; p++) {
-        const d: { team: { projects: Conn<{ id: string; name: string; description: string }> } } = await client.query(
-          `query($id: String!, $after: String) { team(id: $id) { projects(first: ${PAGE}, after: $after, includeArchived: true) { nodes { id name description } pageInfo { hasNextPage endCursor } } } }`,
+        const d: { team: { projects: Conn<{ id: string; name: string; description: string; archivedAt: string | null }> } } = await client.query(
+          `query($id: String!, $after: String) { team(id: $id) { projects(first: ${PAGE}, after: $after, includeArchived: true) { nodes { id name description archivedAt } pageInfo { hasNextPage endCursor } } } }`,
           { id: teamId, after });
         const hit = d.team.projects.nodes.find((x) => readMarker(x.description, "project") === devosProjectId);
-        if (hit) return hit;
+        if (hit) return { id: hit.id, name: hit.name, description: hit.description, archivedAt: hit.archivedAt ?? null };
         if (!d.team.projects.pageInfo?.hasNextPage) return null;
         if (!d.team.projects.pageInfo.endCursor) throw new LinearError("bad-response", "Linear project page without a cursor");
         after = d.team.projects.pageInfo.endCursor;
@@ -80,9 +80,10 @@ export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi 
     },
     async project(id) {
       // A filtered list answers "not found" with an empty list instead of an error, whatever status Linear uses.
-      const d = await client.query<{ projects: Conn<{ id: string; name: string; description: string | null }> }>(
-        `query($id: ID!) { projects(filter: { id: { eq: $id } }, includeArchived: true) { nodes { id name description } } }`, { id });
-      return d.projects.nodes.find((p) => p.id === id) ?? null;
+      const d = await client.query<{ projects: Conn<{ id: string; name: string; description: string | null; archivedAt: string | null }> }>(
+        `query($id: ID!) { projects(filter: { id: { eq: $id } }, includeArchived: true) { nodes { id name description archivedAt } } }`, { id });
+      const p = d.projects.nodes.find((x) => x.id === id);
+      return p ? { id: p.id, name: p.name, description: p.description, archivedAt: p.archivedAt ?? null } : null;
     },
     async updateProject(id, input) {
       ok((await client.mutate<{ projectUpdate: { success: boolean } }>(
@@ -214,6 +215,11 @@ export function graphqlApi(client: LinearClient): LinearApi & LinearTeardownApi 
     async updateProjectStatus(id, statusId) {
       ok((await client.mutate<{ projectUpdate: { success: boolean } }>(
         `mutation($id: String!, $i: ProjectUpdateInput!) { projectUpdate(id: $id, input: $i) { success } }`, { id, i: { statusId } })).projectUpdate, "project status update");
+    },
+    async unarchiveProject(id) {
+      // DEVOS-97 known gap 7: the reverse of the purge's projectArchive (never a delete or a trash restore).
+      ok((await client.mutate<{ projectUnarchive: { success: boolean } }>(
+        `mutation($id: String!) { projectUnarchive(id: $id) { success } }`, { id })).projectUnarchive, "project unarchive");
     },
     async archiveProject(id) {
       ok((await client.mutate<{ projectArchive: { success: boolean } }>(

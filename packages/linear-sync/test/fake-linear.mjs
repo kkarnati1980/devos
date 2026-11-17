@@ -19,6 +19,10 @@ export function fakeLinear({ failCreateIssueAfterWrite = null } = {}) {
     project: async (pid) => L.projects.find((p) => p.id === pid) || null,
     createProject: async (i) => { const p = { id: id("p"), ...i }; L.projects.push(p); w("createProject", i); return p.id; },
     updateProject: async (pid, i) => { Object.assign(L.projects.find((p) => p.id === pid), i); w("updateProject", i); },
+    // DEVOS-97 known gap 7: project statuses and unarchive (archivedAt is set by a test to model a purge's projectArchive).
+    projectStatusId: async (type) => ({ started: "ps-started", completed: "ps-completed" })[type],
+    unarchiveProject: async (pid) => { L.projects.find((p) => p.id === pid).archivedAt = null; w("unarchiveProject", pid); },
+    updateProjectStatus: async (pid, sid) => { L.projects.find((p) => p.id === pid).statusId = sid; w("updateProjectStatus", { pid, sid }); },
     milestones: async (pid) => L.milestones.filter((m) => m.projectId === pid).map(({ id, name, description }) => ({ id, name, description })),
     createMilestone: async (i) => { const m = { id: id("m"), ...i }; L.milestones.push(m); w("createMilestone", i); return m.id; },
     updateMilestone: async (mid, i) => { Object.assign(L.milestones.find((m) => m.id === mid), i); w("updateMilestone", i); },
