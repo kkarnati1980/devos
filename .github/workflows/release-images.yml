@@ -136,9 +136,10 @@ jobs:
           printf 'Authorization: Bearer %s\n' "$(openssl rand -hex 24)" > "$RUNNER_TEMP/iso-wrong.h"
           code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H @"$RUNNER_TEMP/iso-wrong.h" "$url")"; echo "wrong token: HTTP $code"; test "$code" = 401
           printf 'Authorization: Bearer %s\n' "$DEVOS_ISOLATION_STATE_TOKEN" > "$RUNNER_TEMP/iso.h"
-          body="$(curl -fsS --max-time 10 -H @"$RUNNER_TEMP/iso.h" "$url")"; rm -f "$RUNNER_TEMP/iso.h" "$RUNNER_TEMP/iso-wrong.h"
-          jq -e 'keys == ["stacks"] and (.stacks | type == "array")' <<<"$body" >/dev/null
-          echo "with token: HTTP 200, state document ok"
+          code="$(curl -sS -o "$RUNNER_TEMP/iso-body.json" -w '%{http_code}' --max-time 10 -H @"$RUNNER_TEMP/iso.h" "$url")"; rm -f "$RUNNER_TEMP/iso.h" "$RUNNER_TEMP/iso-wrong.h"
+          echo "with token: HTTP $code"; test "$code" = 200
+          jq -e 'keys == ["stacks"] and (.stacks | type == "array")' "$RUNNER_TEMP/iso-body.json" >/dev/null
+          echo "with token: state document ok"
       - name: S4-t2 the isolation state token is not baked into any image
         env: { DEVOS_BIND_IP: 127.0.0.1 }
         run: |
