@@ -21,7 +21,7 @@ const mk = async (data) => {
 const card = (projectId) =>
   db.approval.create({ data: { projectId, gate: "purge", action: "teardown.purge", target: `project:${projectId}`, reason: "test purge card" } });
 const grant = (approvalId, projectId, data) =>
-  db.approvalGrant.create({ data: { approvalId, projectId, scopeAction: "teardown.purge", issuedBy: "kk", expiresAt: new Date(Date.now() + DAY), ...data } });
+  db.approvalGrant.create({ data: { approvalId, projectId, scopeAction: "teardown.purge", issuedBy: "kk:test", expiresAt: new Date(Date.now() + DAY), ...data } });
 
 test("listDue: only archived projects whose purge_after has passed, oldest first, with the row shape the sweep reads", async () => {
   // A fixed far-future "now" keeps the rows of other tests on the shared database out of the comparison: only rows
@@ -36,7 +36,9 @@ test("listDue: only archived projects whose purge_after has passed, oldest first
   const notArchived = await mk({ stage: "building", purgeAfter: at(1) });
   const noDate = await mk({ stage: "archived", archivedAt: at(-1) });
 
-  const due = (await q.listDue(now, 1000)).filter((p) => p.purgeAfter && p.purgeAfter.getTime() >= base.getTime());
+  const mine = new Set([older, newer, exact, notYet, notArchived, noDate].map((p) => p.id));
+  const all = await q.listDue(now, 1000);
+  const due = all.filter((p) => mine.has(p.id));
   assert.deepEqual(due.map((p) => p.id), [older.id, newer.id, exact.id], "purge_after <= now (inclusive), ascending");
   for (const p of [notYet, notArchived, noDate]) assert.ok(!due.some((d) => d.id === p.id), p.slug);
   assert.deepEqual(due[0], { id: older.id, slug: older.slug, stage: "archived", purgeAfter: at(2), archivedAt: at(-30) });
@@ -44,10 +46,10 @@ test("listDue: only archived projects whose purge_after has passed, oldest first
   // The page limit is applied in the query, after the ordering.
   const page = await q.listDue(now, 1);
   assert.equal(page.length, 1);
-  assert.ok(page[0].purgeAfter.getTime() <= older.purgeAfter.getTime(), "the first page holds the oldest due row");
+  assert.equal(page[0].id, all[0].id, "the first page holds the oldest due row");
 });
 
-test("unspentGrant: an unrevoked, unexpired, unused grant of that card only; a used, revoked, expired or zero-use grant is not", async () => {
+test("unspentGrant: an unrevoked, unexpired, unused grant of that card only; a used, revoked or expired grant is not", async () => {
   const p = await mk({ stage: "archived", archivedAt: new Date(), purgeAfter: new Date() });
   const now = new Date();
   const none = await card(p.id);
@@ -56,10 +58,12 @@ test("unspentGrant: an unrevoked, unexpired, unused grant of that card only; a u
   const c = await card(p.id);
   await grant(c.id, p.id, { uses: 1, maxUses: 1 });
   await grant(c.id, p.id, { revokedAt: now });
-  await grant(c.id, p.id, { expiresAt: new Date(now.getTime() - 1000) });
-  await grant(c.id, p.id, { expiresAt: now }); // expires_at > now is strict
-  await grant(c.id, p.id, { maxUses: 0 });
-  assert.equal(await q.unspentGrant(c.id, now), null, "used, revoked, expired, expiring now and zero-use grants are all spent");
+  // The database requires expires_at > issued_at (approval_grant_expiry), so past grants get an earlier issued_at.
+  // A zero-use grant cannot exist (approval_grant_uses: max_uses >= 1); the code's maxUses check is defence in depth.
+  const issuedAt = new Date(now.getTime() - DAY);
+  await grant(c.id, p.id, { issuedAt, expiresAt: new Date(now.getTime() - 1000) });
+  await grant(c.id, p.id, { issuedAt, expiresAt: now }); // expires_at > now is strict
+  assert.equal(await q.unspentGrant(c.id, now), null, "used, revoked, expired and expiring-now grants are all spent");
 
   const good = await grant(c.id, p.id, {});
   assert.equal(await q.unspentGrant(c.id, now), good.id);
@@ -105,4 +109,5 @@ test("keepArchived: a failed audit insert rolls the purge_after move back", asyn
   await assert.rejects(qf.keepArchived(p.id, from, new Date(from.getTime() + 30 * DAY), "x"), /audit down/);
   const row = await db.project.findUnique({ where: { id: p.id }, select: { purgeAfter: true } });
   assert.deepEqual(row.purgeAfter, from, "the update is rolled back with the failed audit insert");
+  assert.equal((await db.auditEvent.findMany({ where: { projectId: p.id, action: "teardown.keep_archived" } })).length, 0);
 });
