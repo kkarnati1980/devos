@@ -52,6 +52,11 @@ jobs:
             echo "DEVOS_TLS_DIR=$RUNNER_TEMP/tls"
             echo "DEVOS_TAILSCALE_SOCKET_HOST=$RUNNER_TEMP/tailscaled.sock"
           } >> "$GITHUB_ENV"
+      - name: S4-t2 throwaway isolation state token (masked)
+        run: |
+          set -euo pipefail
+          # Same shape as scripts/server/isolation-token-setup.sh: 48 random bytes, base64 (64 characters).
+          v="$(openssl rand -base64 48 | tr -d '\n')"; echo "::add-mask::$v"; echo "DEVOS_ISOLATION_STATE_TOKEN=$v" >> "$GITHUB_ENV"
       - name: AT3 compose refuses to start without DEVOS_BIND_IP
         run: |
           if docker compose config -q 2>err.txt; then echo "compose accepted a missing DEVOS_BIND_IP"; exit 1; fi
@@ -68,6 +73,16 @@ jobs:
             if env "$v=" docker compose config -q 2>err.txt; then echo "compose accepted an empty $v"; exit 1; fi
             echo "$v: required (ok)"
           done
+      - name: S4-t2 compose refuses to start without DEVOS_ISOLATION_STATE_TOKEN (missing or empty)
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: |
+          set -euo pipefail
+          v=DEVOS_ISOLATION_STATE_TOKEN
+          docker compose config -q
+          if env -u "$v" docker compose config -q 2>err.txt; then echo "compose accepted a missing $v"; exit 1; fi
+          grep -q "$v is required" err.txt || { echo "no '$v is required' message"; exit 1; }
+          if env "$v=" docker compose config -q 2>err.txt; then echo "compose accepted an empty $v"; exit 1; fi
+          echo "$v: required (ok)"
       - uses: ./.github/actions/security-tools
       - name: AT3 gitleaks over the rendered compose configuration (with a seeded negative control)
         run: |
@@ -78,6 +93,7 @@ jobs:
               DEVOS_KK_LOGIN=set-in-coolify DEVOS_SESSION_KEY=set-in-coolify DEVOS_ALLOWED_ORIGINS=https://set.in.coolify \
               DEVOS_POLICY_HMAC_KEY=set-in-coolify DEVOS_VAULT_KEY=set-in-coolify DEVOS_API_ORIGIN=https://set.in.coolify:3001 \
               DEVOS_TLS_CERT_FILE=/certs/set-in-coolify.crt DEVOS_TLS_KEY_FILE=/certs/set-in-coolify.key \
+              DEVOS_ISOLATION_STATE_TOKEN=set-in-coolify \
               "$@" docker compose -f deploy/compose.yaml config > "$out/compose.rendered.yaml"
           }
           scan() { gitleaks dir --no-banner --redact --exit-code 1 "$out" > /dev/null 2>&1; }
@@ -110,6 +126,29 @@ jobs:
           code="$(curl -s --cacert "$CI_CA" -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:3000/)"; echo "dashboard HTTP $code"
           [[ "$code" =~ ^(200|30[1278])$ ]]
           test "$(docker compose ps worker --format '{{.State}}')" = "running"
+      - name: S4-t2 AT12 the isolation state listener answers on host loopback with the token, 401 without
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: |
+          set -euo pipefail
+          url=http://127.0.0.1:3002/internal/isolation-state
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url")"; echo "no token: HTTP $code"; test "$code" = 401
+          # Header lines are written to files (never on argv, and no key-shaped literal in this file).
+          printf 'Authorization: Bearer %s\n' "$(openssl rand -hex 24)" > "$RUNNER_TEMP/iso-wrong.h"
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H @"$RUNNER_TEMP/iso-wrong.h" "$url")"; echo "wrong token: HTTP $code"; test "$code" = 401
+          printf 'Authorization: Bearer %s\n' "$DEVOS_ISOLATION_STATE_TOKEN" > "$RUNNER_TEMP/iso.h"
+          code="$(curl -sS -o "$RUNNER_TEMP/iso-body.json" -w '%{http_code}' --max-time 10 -H @"$RUNNER_TEMP/iso.h" "$url")"; rm -f "$RUNNER_TEMP/iso.h" "$RUNNER_TEMP/iso-wrong.h"
+          echo "with token: HTTP $code"; test "$code" = 200
+          jq -e 'keys == ["stacks"] and (.stacks | type == "array")' "$RUNNER_TEMP/iso-body.json" >/dev/null
+          echo "with token: state document ok"
+      - name: S4-t2 the isolation state token is not baked into any image
+        env: { DEVOS_BIND_IP: 127.0.0.1 }
+        run: |
+          set -euo pipefail
+          for img in $(docker compose images -q | sort -u); do
+            docker history --no-trunc "$img" > layers.txt; docker image inspect "$img" > inspect.txt
+            if grep -qF "$DEVOS_ISOLATION_STATE_TOKEN" layers.txt inspect.txt; then echo "the isolation state token is baked into image $img"; exit 1; fi
+          done
+          echo "no image carries the isolation state token"
       - name: AT3 ports are bound to DEVOS_BIND_IP only; no secret in any image
         env: { DEVOS_BIND_IP: 127.0.0.1 }
         run: |

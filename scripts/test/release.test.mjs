@@ -25,8 +25,12 @@ test("AT3 only api and dashboard publish ports, each on the required DEVOS_BIND_
   for (const [name, svc] of Object.entries(compose.services)) {
     const ports = svc.ports ?? [];
     if (name === "api" || name === "dashboard") {
-      assert.equal(ports.length, 1, `${name} publishes one port`);
+      // S4-t2 (DEVOS-200): the api has exactly one more publish, the isolation state listener, pinned to the
+      // host's loopback and container port 3002 (docs/modules/S4.md, S4-a2b decision 1). Nothing else is admitted.
+      const extra = name === "api" ? ["127.0.0.1:${API_INTERNAL_PORT:-3002}:3002"] : [];
+      assert.equal(ports.length, 1 + extra.length, `${name} publishes ${1 + extra.length} port(s)`);
       assert.match(String(ports[0]), /^\$\{DEVOS_BIND_IP:\?[^}]*\}:/, `${name} binds only to the required DEVOS_BIND_IP`);
+      assert.deepEqual(ports.slice(1).map(String), extra, `${name}: any other publish is on 127.0.0.1:…:3002 only`);
     } else {
       assert.equal(ports.length, 0, `${name} publishes nothing`);
       assert.equal(svc.network_mode, undefined, `${name} is not on the host network`);
@@ -59,7 +63,10 @@ test("AT3 M1.3-a: secure cookies are on by default; migrate gates the api and th
 // DEVOS-81: Coolify dropped the values of optional variables on 9 Nov; every one the server needs is required.
 test("R3 AT3 every server-required variable is required (:?) in compose; the dashboard gets DEVOS_API_ORIGIN", () => {
   const req = (svc, name) => assert.equal(compose.services[svc].environment[name], `\${${name}:?${name} is required}`, `${svc}.${name}`);
-  for (const n of ["DEVOS_POLICY_HMAC_KEY", "DEVOS_VAULT_KEY", "DEVOS_TLS_CERT_FILE", "DEVOS_TLS_KEY_FILE"]) req("api", n);
+  for (const n of ["DEVOS_POLICY_HMAC_KEY", "DEVOS_VAULT_KEY", "DEVOS_TLS_CERT_FILE", "DEVOS_TLS_KEY_FILE", "DEVOS_ISOLATION_STATE_TOKEN"]) req("api", n);
+  // S4-t2: the listener binds 0.0.0.0 inside the container only because the publish above is loopback-only.
+  assert.equal(compose.services.api.environment.API_INTERNAL_BIND, "0.0.0.0");
+  assert.equal(compose.services.api.environment.API_INTERNAL_PORT, "3002");
   for (const n of ["DEVOS_TLS_CERT_FILE", "DEVOS_TLS_KEY_FILE", "DEVOS_API_ORIGIN"]) req("dashboard", n);
   req("worker", "DEVOS_POLICY_HMAC_KEY");
 });

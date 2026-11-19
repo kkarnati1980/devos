@@ -85,10 +85,17 @@ services:
       # refuses to start without both files (config-tls-required).
       DEVOS_TLS_CERT_FILE: ${DEVOS_TLS_CERT_FILE:?DEVOS_TLS_CERT_FILE is required}
       DEVOS_TLS_KEY_FILE: ${DEVOS_TLS_KEY_FILE:?DEVOS_TLS_KEY_FILE is required}
+      # S4-t2 (DEVOS-200): the isolation state listener (S4-a2b decision 1) for the host's isolation-apply.sh.
+      # The token is set by scripts/server/isolation-token-setup.sh (S4-t1); required (:?, DEVOS-81).
+      DEVOS_ISOLATION_STATE_TOKEN: ${DEVOS_ISOLATION_STATE_TOKEN:?DEVOS_ISOLATION_STATE_TOKEN is required}
+      API_INTERNAL_PORT: "3002"
+      API_INTERNAL_BIND: 0.0.0.0
     ports:
       # M1.2 deploy requirement: published on the host directly (no proxy), so the tailnet peer
       # address reaches the whois identity check.
       - "${DEVOS_BIND_IP:?DEVOS_BIND_IP is required}:${DEVOS_API_PORT:-3001}:3001"
+      # S4-t2: the isolation state listener on the host's loopback only (never the tailnet or 0.0.0.0).
+      - "127.0.0.1:${API_INTERNAL_PORT:-3002}:3002"
     volumes:
       - type: bind
         source: ${DEVOS_TAILSCALE_SOCKET_HOST:-/var/run/tailscale/tailscaled.sock}
