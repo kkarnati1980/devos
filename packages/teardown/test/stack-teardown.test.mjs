@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   allowAll, GitHubClient, CoolifyClient, githubRepoStep, coolifyProjectStep, stackSteps, parsePortRange, runProvision,
   githubRepoOps, coolifyProjectOps, coolifyEnvironmentOps, coolifyPortOps, githubScanner, coolifyScanner,
+  backupScheduleStep, backupScheduleOps,
 } from "@devos/provision";
 import { archiveProject, purgeProject, inventoryScanner, MemoryTeardownStore, TeardownError } from "../dist/index.js";
 import { fakeProviders } from "../../provision/test/fakes.mjs";
@@ -170,4 +171,63 @@ test("M2.5-a3: malformed environment and port ids are refused before any call", 
   const port = coolifyPortOps();
   for (const externalId of ["0", "80a", "99999", ""]) await assert.rejects(port.inspect({ provider: "coolify", kind: "port", externalId, name: "acme/preview" }), /coolify-port-invalid/);
   assert.equal(s.fake.calls.length, 0);
+});
+
+// DEVOS-230: a malformed id's fixed reason code reaches the purge error; other plain error text stays hidden.
+test("DEVOS-230: a corrupted port id stops the purge with its reason code (coolify-port-invalid), not a bare 'unexpected error'", async () => {
+  const s = setup();
+  await provision(s);
+  await archiveProject(P.id, { ...s.base, authorize: allowAll });
+  const port = s.store.resources.find((r) => r.kind === "port");
+  port.externalId = "99999";
+  await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners }), (e) => {
+    assert.ok(e instanceof TeardownError);
+    assert.equal(e.code, "provider_error");
+    assert.equal(e.retryable, false);
+    assert.match(e.message, /: coolify-port-invalid$/);
+    assert.equal(e.resource.externalId, "99999");
+    return true;
+  });
+  assert.ok(!port.deletedAt, "the corrupted row stays active");
+});
+
+test("DEVOS-230: a corrupted backup_schedule id stops the purge with backup-schedule-id-invalid", async () => {
+  const s = setup();
+  const steps = s.steps;
+  s.steps = () => [...steps(), backupScheduleStep(s.store, P)];
+  await provision(s);
+  const ops = [...s.base.ops, backupScheduleOps()];
+  await archiveProject(P.id, { ...s.base, ops, authorize: allowAll });
+  const row = s.store.resources.find((r) => r.provider === "backup_schedule");
+  row.externalId = `${P.id}/preview`;
+  // As in apps/api/src/teardown-wiring.ts: the record has nothing at a provider, so its leftover scanner is empty.
+  const scanners = [...s.scanners, { name: "backup_schedule", scan: async () => [] }];
+  await assert.rejects(purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners }), (e) => {
+    assert.ok(e instanceof TeardownError);
+    assert.equal(e.code, "provider_error");
+    assert.match(e.message, /: backup-schedule-id-invalid$/);
+    assert.equal(e.resource.provider, "backup_schedule");
+    return true;
+  });
+  assert.ok(!row.deletedAt, "the corrupted row stays active");
+});
+
+test("DEVOS-230: plain error text that is not a reason code is still hidden as 'unexpected error'", async () => {
+  const s = setup();
+  await provision(s);
+  const leaky = { provider: "coolify", kind: "port", inspect: async () => { throw new Error(`upstream said: ${TOKEN}`); }, remove: async () => {} };
+  const shaped = { ...leaky, inspect: async () => { throw new Error("Port-Invalid"); } };
+  // Codex PR200-r1: text shaped exactly like a code but not a known one stays hidden too.
+  const lookalike = { ...leaky, inspect: async () => { throw new Error("tenant-secret-invalid"); } };
+  for (const bad of [leaky, shaped, lookalike]) {
+    const ops = [...s.base.ops.filter((o) => o.kind !== "port"), bad];
+    await archiveProject(P.id, { ...s.base, ops, authorize: allowAll }).catch(() => {});
+    await assert.rejects(purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners: s.scanners }), (e) => {
+      assert.ok(e instanceof TeardownError);
+      assert.match(e.message, /: unexpected error$/);
+      assert.equal(e.resource.kind, "port", "the error comes from the stubbed port op");
+      assert.ok(!e.message.includes(TOKEN) && !e.message.includes("tenant-secret"));
+      return true;
+    });
+  }
 });

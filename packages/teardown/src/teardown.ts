@@ -148,6 +148,30 @@ async function check(opts: TeardownOptions, action: string, projectId: string): 
     `${action} is ${d === "deny" ? "denied by policy" : "waiting for KK's approval"}`);
 }
 
+/**
+ * DEVOS-230: ops refuse a malformed external id with a plain Error whose message is a fixed reason code. Only the
+ * known codes below are shown in a teardown error; any other plain error text stays hidden ("unexpected error"),
+ * even one shaped like a code, since it could carry a secret or provider output (Codex PR200-r1). An ops function
+ * that adds a new reason code adds it here.
+ */
+const REASON_CODES: ReadonlySet<string> = new Set([
+  "app-secret-name-invalid",
+  "backup-schedule-id-invalid",
+  "coolify-environment-id-invalid",
+  "coolify-port-invalid",
+  "coolify-recorded-invalid",
+  "coolify-server-uuid-invalid",
+  "coolify-uuid-invalid",
+  "deploy-compose-commit-invalid",
+  "github-deploy-key-id-invalid",
+  "github-name-invalid",
+  "github-owner-invalid",
+  "slug-invalid",
+  "tailnet-ip-invalid",
+]);
+const reasonCode = (e: unknown): string | undefined =>
+  e instanceof Error && !(e instanceof ProviderError) && REASON_CODES.has(e.message) ? e.message : undefined;
+
 /** Maps a provider failure on a write to a teardown error (decision 4, decision 9). */
 function writeError(e: unknown, what: string, r: InventoryItem): TeardownError {
   if (e instanceof ProviderError && e.code === "http" && (e.status === 401 || e.status === 403)) {
@@ -156,7 +180,7 @@ function writeError(e: unknown, what: string, r: InventoryItem): TeardownError {
   if (e instanceof ProviderError && e.transient) {
     return new TeardownError("provider_error", true, `${what} of ${describe(r)} failed (${e.code}); safe to retry`, pick(r));
   }
-  const msg = e instanceof ProviderError ? e.message : "unexpected error";
+  const msg = e instanceof ProviderError ? e.message : reasonCode(e) ?? "unexpected error";
   return new TeardownError("provider_error", false, `${what} of ${describe(r)} failed: ${msg}`, pick(r));
 }
 
