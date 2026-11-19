@@ -4,75 +4,13 @@
 import type { PurgeOutcome } from "./provision-probe.js";
 import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
 
-type Ops = { provider: string; kind: string };
-type Scanner = { name: string };
 type Authorize = (action: string, resource: string) => Promise<"allow" | "deny" | "require_approval">;
 
-/** The `@devos/provision` teardown exports the probe uses, read structurally (the package is loaded at run time). */
-export interface ProvisionTeardownModule {
-  pinnedGitHub(gh: unknown): Promise<unknown>;
-  pinnedCoolify(cf: unknown): Promise<unknown>;
-  githubRepoOps(gh: unknown, projectId: string): Ops;
-  githubDeployKeyOps(gh: unknown, projectId: string): Ops;
-  coolifyProjectOps(cf: unknown, projectId: string): Ops;
-  coolifyEnvironmentOps(cf: unknown, projectId: string): Ops;
-  coolifyApplicationOps(cf: unknown, projectId: string): Ops;
-  coolifyPrivateKeyOps(cf: unknown, projectId: string): Ops;
-  coolifyPortOps(): Ops;
-  backupScheduleOps(): Ops;
-  githubScanner(gh: unknown): Scanner;
-  coolifyScanner(cf: unknown): Scanner;
-  githubTokenScopeCheck(gh: unknown, o: { owner: string }): () => Promise<void>;
-  coolifyTokenScopeCheck(cf: unknown, recorded: () => Promise<readonly unknown[]>): () => Promise<void>;
-}
-
-/** The `@devos/teardown` exports the probe uses. */
-export interface TeardownModule {
-  archiveProject(projectId: string, o: Record<string, unknown>): Promise<unknown>;
-  purgeProject(projectId: string, o: Record<string, unknown>): Promise<{ purged: boolean; report: { hits: { provider: string; kind: string }[]; errors: unknown[] } }>;
-  inventoryScanner(store: unknown): Scanner;
-  vaultScanner(db: unknown, timeoutMs?: number): Scanner;
-}
-
-export interface TeardownStoreLike {
-  activeResources(projectId: string): Promise<readonly unknown[]>;
-}
-
-/**
- * Decision 2: the production teardown wiring, built once per purge from one pinned GitHub and one pinned Coolify
- * client (DEVOS-235 decision 4), so every op, scanner and check of that purge uses the same token snapshot.
- * M2.5-b (DEVOS-112) reuses it.
- */
-export async function teardownWiring(
-  pm: ProvisionTeardownModule,
-  tm: TeardownModule,
-  w: { gh: unknown; cf: unknown; store: TeardownStoreLike; db: unknown; projectId: string; owner: string; timeoutMs: number },
-): Promise<{ ops: Ops[]; scanners: Scanner[]; preflight: (() => Promise<void>)[] }> {
-  const gh = await pm.pinnedGitHub(w.gh);
-  const cf = await pm.pinnedCoolify(w.cf);
-  const id = w.projectId;
-  return {
-    ops: [
-      pm.githubRepoOps(gh, id),
-      pm.githubDeployKeyOps(gh, id),
-      pm.coolifyProjectOps(cf, id),
-      pm.coolifyEnvironmentOps(cf, id),
-      pm.coolifyApplicationOps(cf, id),
-      pm.coolifyPrivateKeyOps(cf, id),
-      pm.coolifyPortOps(),
-      pm.backupScheduleOps(),
-    ],
-    // Pre-review 1 (high): purgeProject needs a scanner per provider with ops. A backup schedule exists only as an
-    // inventory row (nothing at a provider), which the inventory scanner already sees, so its own scan is empty.
-    scanners: [tm.inventoryScanner(w.store), tm.vaultScanner(w.db, w.timeoutMs), pm.githubScanner(gh), pm.coolifyScanner(cf), BACKUP_SCHEDULE_SCANNER],
-    preflight: [pm.githubTokenScopeCheck(gh, { owner: w.owner }), pm.coolifyTokenScopeCheck(cf, () => w.store.activeResources(id))],
-  };
-}
-
-const BACKUP_SCHEDULE_SCANNER = { name: "backup_schedule", scan: async (): Promise<never[]> => [] };
-
-/** The resource string `@devos/teardown` authorizes (its `check`), shared so the grant pre-check asks the same question. */
-export const teardownResource = (projectId: string): string => `project:${projectId}`;
+// The wiring itself lives in teardown-wiring.ts (M2.5-b1); re-exported so existing imports keep working.
+export { teardownWiring, teardownResource } from "./teardown-wiring.js";
+export type { ProvisionTeardownModule, TeardownModule, TeardownStoreLike } from "./teardown-wiring.js";
+import { teardownResource } from "./teardown-wiring.js";
+import type { Ops, ProvisionTeardownModule, Scanner, TeardownModule, TeardownStoreLike } from "./teardown-wiring.js";
 
 /** Decision 3: the actions the probe's KK grant must cover; one cycle uses one of each (more on a retried purge). */
 export const PROBE_GRANT_ACTIONS = ["teardown.archive", "teardown.purge"] as const;
@@ -197,4 +135,66 @@ export async function probeStage(db: any, projectId: string, timeoutMs: number):
   const p = await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: projectId }, select: { stage: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
   if (!p) throw new Error("probe-project-missing");
   return String(p.stage);
+}
+
+/** DEVOS-110 decision 2: a rejected (or approved, then revoked) grant card is not raised again for one probe cycle. */
+export const PROBE_CARD_REASK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * DEVOS-110 decision 1: the probe's one grant card. Every word is fixed here; only the probe's own row id goes in,
+ * and nothing read from a provider or the server. The action is not a purge action (gate 5 stays for real purges);
+ * approving it issues the fixed `teardown.*` grant (approvals.ts `PROBE_GRANT_SCOPE`).
+ */
+export function probeGrantCard(projectId: string): {
+  gate: "destructive_or_spend"; action: "teardown.probe-grant"; target: string; reason: string; consequence: string; projectId: string;
+} {
+  return {
+    gate: "destructive_or_spend",
+    action: "teardown.probe-grant",
+    target: teardownResource(projectId),
+    reason:
+      "DevOS runs a weekly self-test (the AT13 provisioning probe). It creates a throwaway test project, checks it was set up correctly, then deletes it again. " +
+      "To delete its own test resources it needs your permission once. Approving lets the probe archive and delete only its own throwaway test project " +
+      "(devos-probe-m24) for 90 days, at most 30 times. It cannot touch any real project.",
+    consequence:
+      "If you approve: the weekly self-test runs and cleans up after itself. If you reject: the self-test stays off and DevOS asks again in 7 days. " +
+      "Nothing is deleted either way except the probe's own test resources.",
+    projectId,
+  };
+}
+
+/** The approvals surface the probe needs (structural; `Approvals` / `ApprovalStore`). */
+export interface ProbeCardDeps {
+  list(f: { action: string; target: string; limit: number }): Promise<{ status: string; decidedAt: Date | null; createdAt: Date }[]>;
+  raise(card: ReturnType<typeof probeGrantCard>): Promise<unknown>;
+}
+
+/**
+ * DEVOS-110 decision 2: raise the grant card when none is pending and none was rejected in the last 7 days.
+ * Returns whether a card was raised. A failure is rethrown; the caller keeps the cycle blocked either way.
+ */
+export async function raiseProbeGrantCard(projectId: string, now: Date, d: ProbeCardDeps): Promise<boolean> {
+  const card = probeGrantCard(projectId);
+  const cards = await d.list({ action: card.action, target: card.target, limit: 50 });
+  if (cards.some((c) => c.status === "pending")) return false;
+  const since = now.getTime() - PROBE_CARD_REASK_MS;
+  // Pre-review 3: a card approved in the last 7 days whose grant is gone (KK revoked it) is a "no" too, like a rejection.
+  if (cards.some((c) => (c.status === "rejected" || c.status === "approved") && (c.decidedAt ?? c.createdAt).getTime() > since)) return false;
+  await d.raise(card);
+  return true;
+}
+
+/**
+ * DEVOS-110: a cycle start that, when blocked for want of a grant, raises the grant card. The cycle stays blocked
+ * (nothing is created); a card that could not be raised shows as `probe-purge-not-approved:card-failed`.
+ */
+export async function cycleStartWithCard(start: () => Promise<CycleStart>, raise: () => Promise<boolean>): Promise<CycleStart> {
+  const s = await start();
+  if (typeof s !== "object" || s.blocked !== "probe-purge-not-approved") return s;
+  try {
+    await raise();
+    return s;
+  } catch {
+    return { blocked: "probe-purge-not-approved:card-failed" };
+  }
 }

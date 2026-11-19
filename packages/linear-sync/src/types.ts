@@ -19,11 +19,20 @@ export interface LinearApi {
   viewerId(): Promise<string>;
   team(key: string): Promise<{ id: string; states: { id: string; type: StateType }[]; labels: { id: string; name: string }[] }>;
   createLabel(teamId: string, name: string): Promise<string>;
-  findProject(teamId: string, devosProjectId: string): Promise<{ id: string; name: string; description: string } | null>;
+  findProject(teamId: string, devosProjectId: string): Promise<{ id: string; name: string; description: string; archivedAt?: string | null } | null>;
   createProject(input: { teamId: string; name: string; description: string }): Promise<string>;
-  /** The project by id, or null when it no longer exists. */
-  project(id: string): Promise<{ id: string; name: string; description: string | null } | null>;
+  /** The project by id, archived included (`archivedAt` set), or null when it no longer exists. */
+  project(id: string): Promise<{ id: string; name: string; description: string | null; archivedAt?: string | null } | null>;
   updateProject(id: string, input: { name?: string; description?: string }): Promise<void>;
+  /**
+   * DEVOS-97 known gap 7: unarchives a Linear project (one write). The sync calls it only for an active DevOS project
+   * whose Linear project is archived (a purge archived it, stopped later, and KK restored the project).
+   */
+  unarchiveProject(id: string): Promise<void>;
+  /** The workspace's first project status of this type (a read); shared with the teardown ops. */
+  projectStatusId(type: "completed" | "started"): Promise<string>;
+  /** Moves the project to that status (one write); the sync uses it only right after `unarchiveProject`. */
+  updateProjectStatus(id: string, statusId: string): Promise<void>;
   milestones(projectId: string): Promise<{ id: string; name: string; description: string | null }[]>;
   createMilestone(input: { projectId: string; name: string; description: string; sortOrder: number }): Promise<string>;
   updateMilestone(id: string, input: { name?: string; description?: string }): Promise<void>;
@@ -46,4 +55,20 @@ export interface SyncStore {
   setTaskIssue(taskId: string, issueId: string): Promise<void>;
   /** M2.6-b (AT6): KK completed or cancelled a human task in Linear; the DevOS task becomes done (audited). */
   completeHumanTask(taskId: string, how: "completed" | "canceled"): Promise<boolean>;   // true when a row changed
+}
+
+/** M2.6-b2b2 (AT7): the Linear calls the teardown ops and the leftover scanner make. */
+export interface LinearTeardownApi {
+  /** The id of the team with this key; fails when there is none. */
+  teamId(key: string): Promise<string>;
+  /** Every project in the team carrying this DevOS project's marker, archived included, with `archivedAt`. */
+  findProjects(teamId: string, devosProjectId: string): Promise<{ id: string; archivedAt: string | null }[]>;
+  /** The project by id, archived included, or null when it no longer exists. */
+  projectState(id: string): Promise<{ id: string; description: string | null; archivedAt: string | null } | null>;
+  /** The workspace's first project status of this type (a read). */
+  projectStatusId(type: "completed" | "started"): Promise<string>;
+  /** Moves the project to that status (one write). */
+  updateProjectStatus(id: string, statusId: string): Promise<void>;
+  /** Archives the project in Linear (not a delete). */
+  archiveProject(id: string): Promise<void>;
 }

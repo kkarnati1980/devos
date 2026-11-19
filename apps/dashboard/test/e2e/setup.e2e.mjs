@@ -289,6 +289,26 @@ test("M2.3 AT12 (DEVOS-135): a deep-linked purge card shows the phrase to type a
   await context.close();
 });
 
+test("DEVOS-110: the probe's grant card shows its fixed grant, has no hours/uses inputs and approves with an empty body", async () => {
+  const P = "00000000-0000-4000-8000-0000000000a6";
+  api.state.approvals.push({ id: P, gate: "destructive_or_spend", action: "teardown.probe-grant", target: "project:00000000-0000-4000-8000-0000000000b1", reason: "DevOS runs a weekly self-test.", consequence: "Nothing is deleted except the probe's own test resources.", costUsd: null, projectId: null, status: "pending", createdAt: "2026-11-13T10:00:00.000Z", decidedAt: null, decidedBy: null, blockedTasks: 0, grant: null });
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  const { page, context, problems } = await open(`/approvals?id=${P}`);
+  await page.getByTestId("approval-detail").waitFor();
+  assert.match(await page.getByTestId("approve-fixed").innerText(), /90 days, at most 30 uses/);
+  assert.equal(await page.getByTestId("approve-hours").count(), 0, "no hours input for the fixed grant");
+  assert.equal(await page.getByTestId("approve-uses").count(), 0, "no uses input for the fixed grant");
+  await page.getByTestId("approve").click();
+  await page.getByTestId("detail-status").filter({ hasText: "approved" }).waitFor();
+  const last = api.state.received.at(-1);
+  assert.equal(last.url, `/approvals/${P}/approve`);
+  assert.deepEqual(JSON.parse(last.body), {});
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "the approve carried the session's CSRF token");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems, []);
+  await context.close();
+});
+
 test("AT-CA3b (CR-a3, DEVOS-199): the project page shows the pre-flight read-only — waiting for secrets, answers and defaults, escaped", async () => {
   const { page, context, problems } = await open("/projects/xss-probe");
   await page.getByTestId("preflight-state").waitFor();
@@ -377,4 +397,128 @@ test("AT8a/AT11 page part (CR-b2c, DEVOS-216): the project page lists every batc
   await other.page.getByTestId("batches-error").waitFor();
   assert.match(await other.page.getByTestId("batches-error").innerText(), /^No build questions for this project yet\. \(project-not-found\)$/);
   await other.context.close();
+});
+
+test("M2.5-b3 (DEVOS-246, AT9 panel half): the Remove project panel shows the state in IST and the leftover check as text; Archive, Restore and Ask to delete now post with CSRF; no delete button", async () => {
+  const refusedBefore = api.state.csrfRefused ?? 0;
+  // Laptop width: the archived project.
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const problems = [];
+  page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+  let probe401 = 0;
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    if (/^Failed to load resource: the server responded with a status of 401/.test(m.text()) && probe401++ === 0) return;
+    problems.push(`console: ${m.text()}`);
+  });
+  page.on("dialog", async (d) => { problems.push(`dialog: ${d.message()}`); await d.dismiss(); });
+  await page.addInitScript(() => {
+    window.__cspViolations = [];
+    document.addEventListener("securitypolicyviolation", (e) => window.__cspViolations.push(`${e.violatedDirective} ${e.blockedURI}`));
+  });
+  await page.goto(dash.base + "/projects/xss-probe", { waitUntil: "load" });
+  const panel = page.getByTestId("remove-panel");
+  await panel.getByTestId("remove-state").waitFor();
+  assert.match(await panel.getByTestId("remove-state").innerText(), /^Archived since 10 Nov 2026, 10:00 IST: .* after 10 Dec 2026, 10:00 IST\.$/);
+  assert.equal(await panel.getByTestId("remove-counts").innerText(), "Coolify: 2, GitHub: 1");
+  assert.match(await panel.getByTestId("remove-scan-hit").innerText(), /^still there: Coolify application “<img src=x onerror=window\.__xss6=1>” \(app-<b>1<\/b>\)$/);
+  assert.match(await panel.getByTestId("remove-scan-error").innerText(), /^could not check github<script>window\.__xss7=1<\/script> \(provider_error\)$/);
+  assert.equal(await panel.locator("img, b, script").count(), 0, "scan texts are shown as text");
+  assert.equal(await page.evaluate(() => [window.__xss6, window.__xss7].every((x) => x === undefined)), true, "no payload ran");
+  // No direct delete button anywhere in the panel.
+  const labels = await panel.locator("button").allInnerTexts();
+  assert.deepEqual(labels, ["Restore", "Ask to delete now"]);
+  assert.ok(!labels.some((l) => /^(delete|purge)/i.test(l)));
+
+  await panel.getByTestId("remove-ask-purge").click();
+  await panel.getByTestId("remove-note").filter({ hasText: "The delete card is in Approvals" }).waitFor();
+  assert.equal(api.state.received.at(-1).url, "/projects/11111111-1111-4111-8111-111111111111/purge-request");
+  const link = panel.getByTestId("remove-card-link");
+  await link.waitFor();
+  assert.equal(await link.getAttribute("href"), "/approvals?id=00000000-0000-4000-8000-0000000000a3");
+  assert.equal(await panel.getByTestId("remove-ask-purge").count(), 0, "one card at a time");
+
+  await panel.getByTestId("remove-restore").click();
+  await panel.getByTestId("remove-note").filter({ hasText: "Restored." }).waitFor();
+  assert.equal(api.state.received.at(-1).url, "/projects/11111111-1111-4111-8111-111111111111/restore");
+  await panel.getByTestId("remove-archive").waitFor();
+  assert.match(await panel.getByTestId("remove-state").innerText(), /^Active\./);
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems, []);
+  await context.close();
+
+  // Phone width: the active project; Archive needs a second, in-page confirmation (no browser dialog).
+  const { page: phone, context: pc, problems: pp } = await open("/projects/social-content-extraction");
+  const pp2 = phone.getByTestId("remove-panel");
+  await pp2.getByTestId("remove-archive").waitFor();
+  assert.equal(await pp2.getByTestId("remove-scan").innerText(), "none yet");
+  const posts = api.state.received.length;
+  await pp2.getByTestId("remove-archive").click();
+  assert.match(await pp2.getByTestId("remove-confirm").innerText(), /^Archive social-content-extraction\? .*Nothing is deleted\./);
+  await pp2.getByTestId("remove-archive-cancel").click();
+  assert.equal(api.state.received.length, posts, "Cancel posts nothing");
+  await pp2.getByTestId("remove-archive").click();
+  await pp2.getByTestId("remove-archive-confirm").click();
+  await pp2.getByTestId("remove-note").filter({ hasText: "Archived. Nothing was deleted" }).waitFor();
+  assert.equal(api.state.received.at(-1).url, "/projects/22222222-2222-4222-8222-222222222222/archive");
+  await pp2.getByTestId("remove-restore").waitFor();
+  assert.match(await pp2.getByTestId("remove-state").innerText(), /^Archived since 16 Nov 2026, 23:30 IST/);
+  const m = await phone.evaluate(() => ({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }));
+  assert.ok(m.sw <= m.cw, `scrollWidth ${m.sw} > ${m.cw}`);
+  const box = await pp2.boundingBox();
+  assert.ok(box && box.x >= 0 && box.x + box.width <= 390, "the panel fits the phone width");
+  assert.equal(api.state.csrfRefused ?? 0, refusedBefore, "every POST carried the session's CSRF token");
+  assert.deepEqual(await phone.evaluate(() => window.__cspViolations), []);
+  // The other panels on this page get the API's expected 404 project-not-found (no pre-flight, provisioning or batches).
+  assert.deepEqual(pp.filter((p) => !/status of 404 \(Not Found\)$/.test(p)), []);
+  await pc.close();
+});
+
+test("M2.6-b2b3 (DEVOS-248): Open in Linear links for the project and modules with a stored id, linear.app only, escaped, at phone and laptop width", async () => {
+  for (const width of [390, 1280]) {
+    const context = await browser.newContext({ viewport: { width, height: 844 } });
+    const page = await context.newPage();
+    const problems = [];
+    page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+    let probe401 = 0;
+    page.on("console", (m) => {
+      if (m.type() !== "error") return;
+      if (/^Failed to load resource: the server responded with a status of 401/.test(m.text()) && probe401++ === 0) return;
+      problems.push(`console: ${m.text()}`);
+    });
+    await page.addInitScript(() => {
+      window.__cspViolations = [];
+      document.addEventListener("securitypolicyviolation", (e) => window.__cspViolations.push(`${e.violatedDirective} ${e.blockedURI}`));
+    });
+    await page.goto(dash.base + "/projects/xss-probe", { waitUntil: "load" });
+    const panel = page.getByTestId("linear-panel");
+    const project = panel.getByTestId("linear-project-link");
+    await project.waitFor();
+    assert.equal(await project.getAttribute("href"), "https://linear.app/kishoremb/project/xss-probe-0f1e2d3c4b5a");
+    assert.equal(await project.getAttribute("rel"), "noreferrer noopener");
+    const links = panel.getByTestId("linear-module-link");
+    assert.equal(await links.count(), 2, "the javascript: and look-alike host links are dropped");
+    assert.deepEqual(await links.evaluateAll((as) => as.map((a) => a.getAttribute("href"))),
+      ["https://linear.app/kishoremb/issue/DEVOS-301/m11", "https://linear.app/kishoremb/issue/DEVOS-302/m12"]);
+    assert.equal(await links.nth(1).innerText(), "Open M1.2<img src=x onerror=window.__xss8=1> in Linear", "module key shown as text");
+    assert.equal(await panel.locator("img, script").count(), 0);
+    assert.equal(await page.evaluate(() => [window.__xss8, window.__xss9].every((x) => x === undefined)), true, "no payload ran");
+    const m = await page.evaluate(() => ({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }));
+    assert.ok(m.sw <= m.cw, `${width}: scrollWidth ${m.sw} > ${m.cw}`);
+    const box = await panel.boundingBox();
+    assert.ok(box && box.x >= 0 && box.x + box.width <= width, `${width}: the panel fits`);
+    assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+    assert.deepEqual(problems, []);
+    await context.close();
+  }
+
+  // A project with the mirror off: no link at all (a module without a stored id is dropped by the API, linear-links.test.mjs).
+  const { page, context, problems } = await open("/projects/social-content-extraction");
+  const panel = page.getByTestId("linear-panel");
+  await panel.getByTestId("linear-off").waitFor();
+  assert.equal(await panel.locator("a").count(), 0, "no link while the mirror is off");
+  assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+  assert.deepEqual(problems.filter((p) => !/status of 404 \(Not Found\)$/.test(p)), []);
+  await context.close();
 });

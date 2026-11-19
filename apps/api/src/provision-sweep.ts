@@ -47,6 +47,20 @@ export interface ProvisionSweepDeps {
 
 export const PROVISION_TICK_MS = 60_000;
 
+/**
+ * DEVOS-244 (Codex PR179-r4): a lifecycle skip, not a failure. A run that started from a stale snapshot and found its
+ * project archived stops before any write; the sweep neither counts it nor parks the project, and clears its failure
+ * count, so after Restore the project is provisioned again from a clean slate.
+ */
+export class ProvisionSkip extends Error {
+  readonly provisionSkip = true;
+  constructor(readonly code: "provision-project-archived") {
+    super(code);
+    this.name = "ProvisionSkip";
+  }
+}
+const isProvisionSkip = (e: unknown): e is ProvisionSkip => e instanceof ProvisionSkip;
+
 export class ProvisionSweepJob {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
@@ -114,6 +128,11 @@ export class ProvisionSweepJob {
   }
 
   private async onFailure(p: ProvisioningProject, e: unknown): Promise<void> {
+    if (isProvisionSkip(e)) {
+      this.failures.delete(p.id);
+      this.d.log({ level: "info", msg: "provision-skipped", projectId: p.id, code: e.code });
+      return;
+    }
     // Only fixed codes are logged, never an error's text (it may quote a provider body).
     const code = isStepError(e) ? e.code : "provision-failed";
     const step = isStepError(e) ? e.step : undefined;

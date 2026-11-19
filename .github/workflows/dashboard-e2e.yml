@@ -61,3 +61,8 @@ jobs:
         run: node -e "import('playwright').then(async ({ chromium }) => { const b = await chromium.launch(); await b.close(); console.log('chromium-launch-ok'); })"
       - name: Browser acceptance tests
         run: pnpm --filter @devos/dashboard run test:e2e
+      # S3-c5 (DEVOS-94, docs/modules/S3.md): the golden-path SM-11 add-on's real-browser main journey, run here
+      # because this is the one job with Chromium. It borrows the dashboard's pinned playwright package.
+      - name: Golden-path SM-11 browser test
+        timeout-minutes: 5
+        run: node --test scripts/test/template-sm11.e2e.mjs

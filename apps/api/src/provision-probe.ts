@@ -229,6 +229,19 @@ export async function ensureProbeProject(db: any, now: Date, timeoutMs: number):
   }, { timeout: timeoutMs, maxWait: timeoutMs });
 }
 
+/**
+ * DEVOS-110 decision 3: true only for the probe's own row (slug PROBE_SLUG and its `provision.probe_started` audit
+ * row, as ensureProbeProject adopts it). One bounded read.
+ */
+export async function isProbeProjectRow(db: any, projectId: string, timeoutMs: number): Promise<boolean> {
+  return db.$transaction(async (tx: any) => {
+    const p = await tx.project.findUnique({ where: { id: projectId }, select: { slug: true } });
+    if (!p || p.slug !== PROBE_SLUG) return false;
+    const mine = await tx.auditEvent.findFirst({ where: { projectId, action: "provision.probe_started" }, select: { id: true } });
+    return mine !== null;
+  }, { timeout: timeoutMs, maxWait: timeoutMs });
+}
+
 const PHASE_ACTION = "provision.probe_phase";
 
 function asRecord(details: unknown): PhaseRecord | null {

@@ -3,7 +3,7 @@
 // @devos/provision, @devos/isolation and S3's apply() are loaded at run time by main.ts (like @devos/db), so the API
 // typechecks without their `dist` and its typecheck/test/test:db scripts stay unchanged (floor guard, #117 ci-gate).
 // The shapes below mirror the package's exports structurally. Nothing here logs a value: only fixed codes.
-import { ProvisionSweepJob, nameConflictCard, type ProvisioningProject } from "./provision-sweep.js";
+import { ProvisionSkip, ProvisionSweepJob, nameConflictCard, type ProvisioningProject } from "./provision-sweep.js";
 
 type Step = { key: string };
 type Decision = "allow" | "deny" | "require_approval";
@@ -55,6 +55,12 @@ export interface ProvisionPolicy {
 export interface ProvisioningRows {
   listProvisioning(exclude: readonly string[]): Promise<ProvisioningProject[]>;
   markBuilding(projectId: string): Promise<void>;
+  /**
+   * DEVOS-244 (Codex PR179-r2): true when the project was archived or purged. Optional; when present, every create
+   * of a sweep run asks it first (under the run's project lock), so a run that started from a stale snapshot never
+   * writes to a provider after Archive.
+   */
+  isArchived?(projectId: string): Promise<boolean>;
 }
 
 export const PROVISIONER_IDENTITY = { id: "system:provisioner", type: "system" as const };
@@ -93,6 +99,26 @@ export function provisionConfig(env: NodeJS.ProcessEnv): ProvisionConfig | { off
   if (o1 !== 100 || o2 < 64 || o2 > 127) return { off: "provision-tailnet-ip-not-tailnet" };
   if (!SHA_RE.test(devosSha)) return { off: "provision-devos-sha-unknown" };
   return { owner, coolifyOrigin: origin.origin, serverUuid, tailnetIp, devosSha, portsRaw: env.DEVOS_PROJECT_PORTS };
+}
+
+/**
+ * DEVOS-244 (Codex PR179-r2): the sweep snapshots its projects before running them one by one, and Archive can run in
+ * between under the same project lock. Each create therefore re-reads the stage first: an archived or purged project
+ * (or a read that fails) throws, so runProvision stops before any provider write without parking the project.
+ */
+export function notArchived(rows: Pick<ProvisioningRows, "isArchived">, projectId: string, inner: Authorize): Authorize {
+  if (!rows.isArchived) return inner;
+  const check = rows.isArchived.bind(rows);
+  // Codex PR179-r3: a plain throw, not "deny". The runner stops before the write either way, but a deny would be a
+  // non-retryable policy_denied that parks the project in the sweep, so a later Restore (or a transient read error)
+  // would leave it parked. An archived project is a ProvisionSkip (PR179-r4): the sweep neither counts nor parks it, and
+  // it drops out of the next listing (`archivedAt: null`); a failed read is an ordinary retryable failure.
+  return async (action, resource) => {
+    let archived: boolean;
+    try { archived = await check(projectId); } catch { throw new Error("provision-stage-unreadable"); }
+    if (archived) throw new ProvisionSkip("provision-project-archived");
+    return inner(action, resource);
+  };
 }
 
 /** M1.7 on every create: `provision.<provider>.<kind>` on `project:<id>/…`; anything but allow stops the step. */
@@ -171,7 +197,7 @@ export function buildProvisioner(w: ProvisionWiring): Provisioner | { off: strin
   return {
     store,
     steps,
-    run: (p) => mod.runProvision(p.id, steps(p), { store, authorize: policyAuthorizer(w.policy, p.id) }),
+    run: (p) => mod.runProvision(p.id, steps(p), { store, authorize: notArchived(w.rows, p.id, policyAuthorizer(w.policy, p.id)) }),
     // Both provider tokens must be in the vault before any project runs: a missing one would otherwise be a
     // non-retryable provider_error and park the project (pre-review M1).
     ready: async () => {
@@ -210,6 +236,12 @@ export class PrismaProvisioningRows implements ProvisioningRows {
       take: 50,
     }), { timeout: t, maxWait: t });
     return rows.map((r) => ({ id: r.id, slug: r.slug, name: r.name }));
+  }
+
+  async isArchived(projectId: string): Promise<boolean> {
+    const t = this.timeoutMs;
+    const p: { stage: unknown; archivedAt: Date | null } | null = await this.db.$transaction((tx: any) => tx.project.findUnique({ where: { id: projectId }, select: { stage: true, archivedAt: true } }), { timeout: t, maxWait: t });
+    return !p || p.archivedAt !== null || ["archived", "purged"].includes(String(p.stage));
   }
 
   async markBuilding(projectId: string): Promise<void> {

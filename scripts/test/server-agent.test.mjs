@@ -1111,7 +1111,10 @@ exit 1`);
 case "$4" in
   step) n=$(cat "$FAKE_DIR/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/n"
         l="$(sed -n "\${n}p" "$FAKE_DIR/steps")"; [[ -n "$l" ]] || exit 98
-        IFS='|' read -r rc sl js <<<"$l"; sleep "$sl"; echo "$js"; exit "$rc";;
+        IFS='|' read -r rc sl js <<<"$l"
+        # "gate": the step runs until the test creates $FAKE_DIR/release (at most 60 s), so its end is not timed.
+        if [[ "$sl" == gate ]]; then for _ in $(seq 1200); do [[ -f "$FAKE_DIR/release" ]] && break; sleep 0.05; done; else sleep "$sl"; fi
+        echo "$js"; exit "$rc";;
   report) IFS='|' read -r rc js < "$FAKE_DIR/report"; echo "$js"; exit "$rc";;
 esac
 exit 97`);
@@ -1127,6 +1130,14 @@ function runProbeCheck(f, { finishBy = "20", dsleep = "0" } = {}) {
   fs.rmSync(path.join(f.bin, "docker.args"), { force: true }); // each run's calls only
   const steps = Number(fs.existsSync(path.join(f.bin, "n")) ? fs.readFileSync(path.join(f.bin, "n"), "utf8") : 0);
   return { code: r.status, out: r.stdout + r.stderr, args, steps };
+}
+// Waits (up to 30 s) until a file exists: a detached step has started (state/pid) or ended (state/rc).
+function waitForFile(file) {
+  const end = Date.now() + 30_000;
+  while (!fs.existsSync(file)) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${file}`);
+    spawnSync("sleep", ["0.05"]);
+  }
 }
 const pj = (o) => JSON.stringify({ command: "step", ...o });
 const inProg = (phase) => `3|0|${pj({ exit: 3, phase, cycle: 1, code: "in_progress" })}`;
@@ -1168,16 +1179,21 @@ test("DEVOS-234 d3c-3 provision-probe: between cycles it reports the newest fini
 });
 
 test("DEVOS-234 d3c-3 provision-probe: a step longer than the time box is left running and picked up by the next run", () => {
-  const f = probeFakes({ steps: [`0|5|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  // The step runs until the test releases it, so no assertion depends on how fast the runner is (DEVOS-110 flaky).
+  const f = probeFakes({ steps: [`0|gate|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
   const first = runProbeCheck(f, { finishBy: "2" });
   assert.equal(first.code, 3, first.out);
   assert.match(first.out, /still in progress/);
   assert.equal((first.args.match(/^exec -d /gm) ?? []).length, 1, "the first run started the step");
+  // the next check run comes minutes later on the server; here, wait until the detached step has written its pid
+  waitForFile(path.join(f.state, "pid"));
   // a second run while the step still runs starts nothing new and leaves it running
   const during = runProbeCheck(f, { finishBy: "1" });
   assert.equal(during.code, 3, during.out);
   assert.doesNotMatch(during.args, /^exec -d /m, "nothing started while the step runs");
   // once it ends, the next run reads its result exactly once
+  fs.writeFileSync(path.join(f.bin, "release"), "");
+  waitForFile(path.join(f.state, "rc"));
   const after = runProbeCheck(f);
   assert.equal(after.code, 0, after.out);
   assert.equal(after.steps, 1, "the step was run once in all");
@@ -1192,16 +1208,18 @@ test("DEVOS-234 d3c-3 provision-probe: a step that does not move the phase waits
   assert.equal(r.steps, 2, "stops after the second step left the phase where it was");
   assert.match(r.out, /phase purge is still in progress/);
   fs.rmSync(f.bin, { recursive: true, force: true });
-  const h = probeFakes({ steps: [`0|30|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
-  const first = runProbeCheck(h, { finishBy: "1" });
+  const h = probeFakes({ steps: [`0|gate|${pj({ exit: 0, phase: "done", cycle: 1, code: "pass" })}`] });
+  const first = runProbeCheck(h, { finishBy: "2" });
   assert.equal(first.code, 3, first.out);
   const pidAge = path.join(h.state, "pid");
+  waitForFile(pidAge);
   const old = new Date(Date.now() - 3 * 3600 * 1000);
   fs.utimesSync(pidAge, old, old);
   const hung = runProbeCheck(h, { finishBy: "1" });
   assert.equal(hung.code, 1, hung.out);
   assert.match(hung.out, /hung/);
-  spawnSync("bash", ["-c", `kill $(cat "${pidAge}") 2>/dev/null; pkill -f "${h.bin}" 2>/dev/null; true`]);
+  fs.writeFileSync(path.join(h.bin, "release"), "");
+  waitForFile(path.join(h.state, "rc"));
   fs.rmSync(h.bin, { recursive: true, force: true });
 });
 

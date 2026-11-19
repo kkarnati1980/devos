@@ -335,3 +335,59 @@ test("DEVOS-162: an analysis task with a stored id and a marked Linear issue is 
   await syncProject(plan, L.api, store);
   assert.deepEqual(L.writes, [], "no write at all: the marked issue is not updated, moved or re-titled");
 });
+
+test("DEVOS-97 known gap 7: an archived Linear project of an active DevOS project is unarchived and moved to started; a second sync writes nothing", async () => {
+  for (const how of ["stored id", "marker"]) {
+    const L = fakeLinear(); const plan = throwaway();
+    await syncProject(plan, L.api, memoryStore(plan));
+    // A purge archived the Linear project, then stopped; Restore did not see the (deleted) row.
+    L.projects[0].archivedAt = "2026-11-17T00:00:00Z"; L.projects[0].statusId = "ps-completed";
+    if (how === "marker") plan.project.linearProjectId = null;   // the purge marked the resource row deleted
+    L.writes.length = 0;
+    const r = await syncProject(plan, L.api, memoryStore(plan));
+    assert.equal(L.projects.length, 1, `${how}: no second project`);
+    assert.equal(L.projects[0].archivedAt, null, `${how}: unarchived`);
+    assert.equal(L.projects[0].statusId, "ps-started", `${how}: moved to started`);
+    assert.deepEqual(L.writes.map((x) => x.op), ["unarchiveProject", "updateProjectStatus"], `${how}: only those two writes`);
+    assert.equal(r.writes, 2);
+    assert.equal(plan.project.linearProjectId, L.projects[0].id, `${how}: the id is stored again`);
+    assert.ok(r.log.some((l) => /unarchived and moved to started/.test(l)), r.log.join("\n"));
+    L.writes.length = 0;
+    const r2 = await syncProject(plan, L.api, memoryStore(plan));
+    assert.equal(r2.writes, 0, `${how}: idempotent`); assert.equal(L.writes.length, 0);
+  }
+});
+
+test("DEVOS-97 known gap 7: a project that is not archived never gets a status write", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  await syncProject(plan, L.api, memoryStore(plan));
+  L.projects[0].archivedAt = null; L.projects[0].statusId = "ps-completed";
+  L.writes.length = 0;
+  await syncProject(plan, L.api, memoryStore(plan));
+  assert.equal(L.writes.length, 0); assert.equal(L.projects[0].statusId, "ps-completed");
+});
+
+test("DEVOS-97 known gap 7: fencedApi fences the unarchive and the status write; a refused guard writes nothing", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  await syncProject(plan, L.api, memoryStore(plan));
+  L.projects[0].archivedAt = "2026-11-17T00:00:00Z";
+  L.writes.length = 0;
+  const guard = async () => { throw new Error("linear-sync-lock-expiring"); };
+  await assert.rejects(syncProject(plan, fencedApi(L.api, guard), memoryStore(plan)), /linear-sync-lock-expiring/);
+  assert.equal(L.writes.length, 0); assert.ok(L.projects[0].archivedAt, "still archived");
+  // The status write is fenced too: a guard that allows the unarchive and refuses the next write stops before it.
+  let allow = 1;
+  const second = async () => { if (allow-- <= 0) throw new Error("linear-sync-lock-expiring"); };
+  await assert.rejects(syncProject(plan, fencedApi(L.api, second), memoryStore(plan)), /linear-sync-lock-expiring/);
+  assert.deepEqual(L.writes.map((x) => x.op), ["unarchiveProject"], "the status write was refused by the guard");
+});
+
+test("DEVOS-97 known gap 7: no `started` project status fails the sync before any write; the project stays archived", async () => {
+  const L = fakeLinear(); const plan = throwaway();
+  await syncProject(plan, L.api, memoryStore(plan));
+  L.projects[0].archivedAt = "2026-11-17T00:00:00Z";
+  L.writes.length = 0;
+  L.api.projectStatusId = async (type) => { throw new Error(`no Linear project status of type ${type}`); };
+  await assert.rejects(syncProject(plan, L.api, memoryStore(plan)), /no Linear project status of type started/);
+  assert.equal(L.writes.length, 0); assert.ok(L.projects[0].archivedAt, "still archived");
+});

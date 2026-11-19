@@ -146,7 +146,9 @@ ci_green() {  # sha -> 0 green; 1 not green; 3 cannot read workflow runs (token 
 }
 
 # DEVOS-195: after a PASS whose Summary has FLOOR-GUARD KEEP lines on a head reviewed with the floor guard red,
-# re-run that head's failed ci-gate jobs once (needs Actions: write). ci-gate passes only if the Keeps are valid
+# re-run that head's whole ci-gate run once (needs Actions: write). DEVOS-243: the whole run (/rerun), never
+# rerun-failed-jobs, so the kk-answers job (DEVOS-239) runs again and reads KK's current answers instead of
+# handing ci-gate its earlier, successful output. ci-gate passes only if the Keeps are valid
 # (GI-1d). A failed POST is retried on later ticks; <sha>.cigate-rerun marks it done.
 rerun_cigate() {  # sha
   local sha="$1" id
@@ -166,7 +168,7 @@ rerun_cigate() {  # sha
   fi
   if [[ $DRY -eq 1 ]]; then log "${sha:0:7}: WOULD re-run ci-gate run $id"; return 0; fi
   printf '{}' > "$TMP/rerun.json"
-  if gh_api POST "/repos/$REPO/actions/runs/$id/rerun-failed-jobs" "$TMP/rerun.json" >/dev/null; then
+  if gh_api POST "/repos/$REPO/actions/runs/$id/rerun" "$TMP/rerun.json" >/dev/null; then
     touch "$STATE/$sha.cigate-rerun"; log "${sha:0:7}: re-ran ci-gate run $id after a PASS with FLOOR-GUARD KEEP"
   else
     log "${sha:0:7}: ci-gate re-run failed (the token needs 'Actions: Read and write'); retry next tick"

@@ -18,7 +18,7 @@ export interface PurgeKit {
   grantProblem: typeof grantProblem;
 }
 
-export async function stepWiring(db: any, databaseUrl: string, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<{ provisioner: Provisioner; purge: PurgeKit } | { off: string }> {
+export async function stepWiring(db: any, databaseUrl: string, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<{ provisioner: Provisioner; purge: PurgeKit; vault: Vault } | { off: string }> {
   const hmac = env.DEVOS_POLICY_HMAC_KEY;
   if (!hmac) return { off: "policy-not-configured" };
   let vaultKey: Buffer | null;
@@ -78,5 +78,6 @@ export async function stepWiring(db: any, databaseUrl: string, env: NodeJS.Proce
     policy: engine as unknown as PurgeKit["policy"],
     grantProblem,
   };
-  return { provisioner: pv, purge };
+  // DEVOS-110: the vault is also what the grant card's notice reads its delivery secrets from (as runtime.ts does).
+  return { provisioner: pv, purge, vault };
 }

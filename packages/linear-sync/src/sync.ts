@@ -59,13 +59,23 @@ export async function syncProject(fullPlan: DevosPlan, api: LinearApi, store: Sy
   // Linear's project description is a short summary field: keep it fixed and short (no project name), ~60 chars.
   const projDesc = withMarker("Mirrored by DevOS.", "project", plan.project.id);
   let projectId = plan.project.linearProjectId;
-  let curProject: { name: string; description: string | null } | null = projectId ? await api.project(projectId) : null;
+  let curProject: { name: string; description: string | null; archivedAt?: string | null } | null = projectId ? await api.project(projectId) : null;
   if (projectId && !curProject) { r.log.push("stored Linear project id not found; searching by marker"); projectId = null; }
   if (!projectId) {
     const found = await api.findProject(team.id, plan.project.id);
     if (found) { projectId = found.id; curProject = found; r.log.push("project adopted by marker"); }
     else { projectId = await api.createProject({ teamId: team.id, name: plan.project.name, description: projDesc }); r.writes++; r.created.push("project"); }
     await store.setProjectId(plan.project.id, projectId);
+  }
+  // DEVOS-97 known gap 7 (M2.6-b2b2 decision 7): the sync runs only for an active project (stage read again under the
+  // lock), so an archived Linear project here was archived by a purge that stopped before the end, after which KK
+  // restored the project (or someone archived it by hand). It is unarchived and moved to the first `started` status,
+  // the state Restore sets; the status id is read before either write. Linear's project status is written only here.
+  if (curProject?.archivedAt) {
+    const started = await api.projectStatusId("started");
+    await api.unarchiveProject(projectId); r.writes++; r.updated.push("project unarchived");
+    await api.updateProjectStatus(projectId, started); r.writes++; r.updated.push("project status started");
+    r.log.push("Linear project was archived while the DevOS project is active; unarchived and moved to started");
   }
   // Codex PR35-r1: DevOS owns the project's name and summary; a rename (or a hand edit in Linear) is synced back.
   if (curProject && (curProject.name !== plan.project.name || !sameText(curProject.description, projDesc))) {

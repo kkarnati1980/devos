@@ -94,7 +94,8 @@ export class PrismaSyncStore implements SyncStore {
 export type LockGuard = () => Promise<void>;
 
 /** The Linear writes; every one is fenced by the lock guard. Reads are not (they change nothing). */
-const WRITES = ["createLabel", "createProject", "updateProject", "createMilestone", "updateMilestone", "createIssue", "updateIssue", "addBlockedBy"] as const;
+const WRITES = ["createLabel", "createProject", "updateProject", "createMilestone", "updateMilestone", "createIssue", "updateIssue", "addBlockedBy",
+  "unarchiveProject", "updateProjectStatus"] as const;
 
 /** Wraps a LinearApi so every write first checks the lock guard. A failed guard stops the sync before the write. */
 export function fencedApi(api: LinearApi, guard: LockGuard): LinearApi {
