@@ -144,6 +144,39 @@ export interface TeardownSweepCards {
   expire(ids: readonly string[], reason: string): Promise<string[]>;
 }
 
+/**
+ * The teardown sweep's three production queries (M2.5-b2), split out of `buildTeardownSweep` so the Postgres test
+ * (`test-db/teardown-sweep-queries.test.mjs`, DEVOS-112 follow-up) runs the exact query code against a real database.
+ */
+export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownSweepDeps, "listDue" | "unspentGrant" | "keepArchived"> {
+  const tx = <T>(fn: (tx: any) => Promise<T>): Promise<T> => db.$transaction(fn, { timeout: timeoutMs, maxWait: timeoutMs });
+  return {
+    listDue: (now: Date, limit: number) =>
+      tx<any[]>((t) => t.project.findMany({
+        where: { stage: "archived", purgeAfter: { lte: now } },
+        orderBy: [{ purgeAfter: "asc" }, { id: "asc" }],
+        take: limit,
+        select: { id: true, slug: true, stage: true, purgeAfter: true, archivedAt: true },
+      })).then((rows: any[]) => rows.map((p) => ({ id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null, archivedAt: p.archivedAt ?? null }))),
+    unspentGrant: async (approvalId: string, now: Date) => {
+      const rows: { id: string; uses: number; maxUses: number }[] = await tx((t: any) => t.approvalGrant.findMany({
+        where: { approvalId, revokedAt: null, expiresAt: { gt: now }, uses: 0 },
+        orderBy: [{ expiresAt: "desc" }, { id: "asc" }],
+        take: 5,
+        select: { id: true, uses: true, maxUses: true },
+      }));
+      return rows.find((g) => g.uses === 0 && g.maxUses >= 1)?.id ?? null;
+    },
+    keepArchived: (projectId: string, from: Date, to: Date, approvalId: string) =>
+      tx(async (t: any) => {
+        const r = await t.project.updateMany({ where: { id: projectId, stage: "archived", purgeAfter: from }, data: { purgeAfter: to } });
+        if (r.count !== 1) return false;
+        await t.auditEvent.create({ data: { actor: "system", action: "teardown.keep_archived", summary: "Kept archived another 30 days (purge card rejected)", projectId, details: { approvalId, purgeAfter: to.toISOString() } } });
+        return true;
+      }),
+  };
+}
+
 export function buildTeardownSweep(w: {
   mod: ProvisionModule | null;
   td: TeardownRuntimeModule | null;
@@ -168,16 +201,10 @@ export function buildTeardownSweep(w: {
   const td = w.td;
   const gh = new w.mod.GitHubClient({ token: vaultToken(w.vault as never, "github_token") });
   const cf = new w.mod.CoolifyClient({ origin: cfg.coolifyOrigin, token: vaultToken(w.vault as never, "coolify_api_token") });
-  const tx = <T>(fn: (tx: any) => Promise<T>): Promise<T> => w.db.$transaction(fn, { timeout: w.timeoutMs, maxWait: w.timeoutMs });
   const cards = w.cards;
+  const q = teardownSweepQueries(w.db, w.timeoutMs);
   return new TeardownSweepJob({
-    listDue: (now, limit) =>
-      tx<any[]>((t) => t.project.findMany({
-        where: { stage: "archived", purgeAfter: { lte: now } },
-        orderBy: [{ purgeAfter: "asc" }, { id: "asc" }],
-        take: limit,
-        select: { id: true, slug: true, stage: true, purgeAfter: true, archivedAt: true },
-      })).then((rows: any[]) => rows.map((p) => ({ id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null, archivedAt: p.archivedAt ?? null }))),
+    listDue: q.listDue,
     project: async (id) => {
       const p = await store.project(id);
       return p ? { id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null, archivedAt: p.archivedAt ?? null } : null;
@@ -190,27 +217,13 @@ export function buildTeardownSweep(w: {
     cards: (f) => cards.list(f),
     raise: (card) => cards.raise(card),
     expire: (ids, reason) => cards.expire(ids, reason),
-    unspentGrant: async (approvalId, now) => {
-      const rows: { id: string; uses: number; maxUses: number }[] = await tx((t) => t.approvalGrant.findMany({
-        where: { approvalId, revokedAt: null, expiresAt: { gt: now }, uses: 0 },
-        orderBy: [{ expiresAt: "desc" }, { id: "asc" }],
-        take: 5,
-        select: { id: true, uses: true, maxUses: true },
-      }));
-      return rows.find((g) => g.uses === 0 && g.maxUses >= 1)?.id ?? null;
-    },
+    unspentGrant: q.unspentGrant,
     purge: async (projectId, grantId, cardCreatedAt) => {
       const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs, linear: w.linear ?? null });
       const authorize = purgeCardAuthorizer(w.policy, projectId, grantId, cardCreatedAt, async () => (await store.project(projectId))?.archivedAt ?? null);
       return td.purgeProject(projectId, { store, authorize, ops: wiring.ops, scanners: wiring.scanners, preflight: wiring.preflight });
     },
-    keepArchived: (projectId, from, to, approvalId) =>
-      tx(async (t) => {
-        const r = await t.project.updateMany({ where: { id: projectId, stage: "archived", purgeAfter: from }, data: { purgeAfter: to } });
-        if (r.count !== 1) return false;
-        await t.auditEvent.create({ data: { actor: "system", action: "teardown.keep_archived", summary: "Kept archived another 30 days (purge card rejected)", projectId, details: { approvalId, purgeAfter: to.toISOString() } } });
-        return true;
-      }),
+    keepArchived: q.keepArchived,
     log: w.log,
   });
 }
