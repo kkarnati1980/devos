@@ -149,13 +149,28 @@ async function check(opts: TeardownOptions, action: string, projectId: string): 
 }
 
 /**
- * DEVOS-230: ops refuse a malformed external id with a fixed reason code in a plain Error (e.g.
- * `coolify-port-invalid`, `backup-schedule-id-invalid`). Only a message of exactly that shape is shown in the purge
- * error; any other plain error text stays hidden ("unexpected error"), since it could carry provider output.
+ * DEVOS-230: ops refuse a malformed external id with a plain Error whose message is a fixed reason code. Only the
+ * known codes below are shown in a teardown error; any other plain error text stays hidden ("unexpected error"),
+ * even one shaped like a code, since it could carry a secret or provider output (Codex PR200-r1). An ops function
+ * that adds a new reason code adds it here.
  */
-const REASON_CODE_RE = /^[a-z][a-z0-9-]{0,62}-invalid$/;
+const REASON_CODES: ReadonlySet<string> = new Set([
+  "app-secret-name-invalid",
+  "backup-schedule-id-invalid",
+  "coolify-environment-id-invalid",
+  "coolify-port-invalid",
+  "coolify-recorded-invalid",
+  "coolify-server-uuid-invalid",
+  "coolify-uuid-invalid",
+  "deploy-compose-commit-invalid",
+  "github-deploy-key-id-invalid",
+  "github-name-invalid",
+  "github-owner-invalid",
+  "slug-invalid",
+  "tailnet-ip-invalid",
+]);
 const reasonCode = (e: unknown): string | undefined =>
-  e instanceof Error && !(e instanceof ProviderError) && REASON_CODE_RE.test(e.message) ? e.message : undefined;
+  e instanceof Error && !(e instanceof ProviderError) && REASON_CODES.has(e.message) ? e.message : undefined;
 
 /** Maps a provider failure on a write to a teardown error (decision 4, decision 9). */
 function writeError(e: unknown, what: string, r: InventoryItem): TeardownError {

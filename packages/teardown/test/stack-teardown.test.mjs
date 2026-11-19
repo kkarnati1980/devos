@@ -217,14 +217,16 @@ test("DEVOS-230: plain error text that is not a reason code is still hidden as '
   await provision(s);
   const leaky = { provider: "coolify", kind: "port", inspect: async () => { throw new Error(`upstream said: ${TOKEN}`); }, remove: async () => {} };
   const shaped = { ...leaky, inspect: async () => { throw new Error("Port-Invalid"); } };
-  for (const bad of [leaky, shaped]) {
+  // Codex PR200-r1: text shaped exactly like a code but not a known one stays hidden too.
+  const lookalike = { ...leaky, inspect: async () => { throw new Error("tenant-secret-invalid"); } };
+  for (const bad of [leaky, shaped, lookalike]) {
     const ops = [...s.base.ops.filter((o) => o.kind !== "port"), bad];
     await archiveProject(P.id, { ...s.base, ops, authorize: allowAll }).catch(() => {});
     await assert.rejects(purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners: s.scanners }), (e) => {
       assert.ok(e instanceof TeardownError);
       assert.match(e.message, /: unexpected error$/);
       assert.equal(e.resource.kind, "port", "the error comes from the stubbed port op");
-      assert.ok(!e.message.includes(TOKEN));
+      assert.ok(!e.message.includes(TOKEN) && !e.message.includes("tenant-secret"));
       return true;
     });
   }
