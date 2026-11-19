@@ -206,8 +206,10 @@ test("DEVOS-230: a corrupted backup_schedule id stops the purge with backup-sche
     assert.ok(e instanceof TeardownError);
     assert.equal(e.code, "provider_error");
     assert.match(e.message, /: backup-schedule-id-invalid$/);
+    assert.equal(e.resource.provider, "backup_schedule");
     return true;
   });
+  assert.ok(!row.deletedAt, "the corrupted row stays active");
 });
 
 test("DEVOS-230: plain error text that is not a reason code is still hidden as 'unexpected error'", async () => {
@@ -221,6 +223,7 @@ test("DEVOS-230: plain error text that is not a reason code is still hidden as '
     await assert.rejects(purgeProject(P.id, { ...s.base, ops, authorize: allowAll, scanners: s.scanners }), (e) => {
       assert.ok(e instanceof TeardownError);
       assert.match(e.message, /: unexpected error$/);
+      assert.equal(e.resource.kind, "port", "the error comes from the stubbed port op");
       assert.ok(!e.message.includes(TOKEN));
       return true;
     });
