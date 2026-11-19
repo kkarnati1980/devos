@@ -148,6 +148,15 @@ async function check(opts: TeardownOptions, action: string, projectId: string): 
     `${action} is ${d === "deny" ? "denied by policy" : "waiting for KK's approval"}`);
 }
 
+/**
+ * DEVOS-230: ops refuse a malformed external id with a fixed reason code in a plain Error (e.g.
+ * `coolify-port-invalid`, `backup-schedule-id-invalid`). Only a message of exactly that shape is shown in the purge
+ * error; any other plain error text stays hidden ("unexpected error"), since it could carry provider output.
+ */
+const REASON_CODE_RE = /^[a-z][a-z0-9-]{0,62}-invalid$/;
+const reasonCode = (e: unknown): string | undefined =>
+  e instanceof Error && !(e instanceof ProviderError) && REASON_CODE_RE.test(e.message) ? e.message : undefined;
+
 /** Maps a provider failure on a write to a teardown error (decision 4, decision 9). */
 function writeError(e: unknown, what: string, r: InventoryItem): TeardownError {
   if (e instanceof ProviderError && e.code === "http" && (e.status === 401 || e.status === 403)) {
@@ -156,7 +165,7 @@ function writeError(e: unknown, what: string, r: InventoryItem): TeardownError {
   if (e instanceof ProviderError && e.transient) {
     return new TeardownError("provider_error", true, `${what} of ${describe(r)} failed (${e.code}); safe to retry`, pick(r));
   }
-  const msg = e instanceof ProviderError ? e.message : "unexpected error";
+  const msg = e instanceof ProviderError ? e.message : reasonCode(e) ?? "unexpected error";
   return new TeardownError("provider_error", false, `${what} of ${describe(r)} failed: ${msg}`, pick(r));
 }
 
