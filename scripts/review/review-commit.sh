@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DevOS — Codex review of one change (D1 Reviewer; bootstrap tool for Phases 0–4, superseded by M3.4)
-# Version: 1.0.3
+# Version: 1.0.4
 # v1.0.1 (Codex review 55ee78d): pristine checkout — reset + clean the work tree, verify
 # HEAD == head SHA and an empty `git status` before AND after the review, else no verdict
 # is stored; strict schema validation; diff is base...head (merge-base), so a stacked
@@ -11,6 +11,8 @@
 # v1.0.3 (DEVOS-180): main's copy of the floor guard runs on main...head in the review clone before
 # the review, and its HIT lines reach the prompt as an enveloped data block, so Codex can judge each
 # hit and write FLOOR-GUARD KEEP / CHANGE markers (GI-1b) on its Summary line.
+# v1.0.4 (DEVOS-249): the prompt says a KK-only hit gets no Codex KEEP and is not a finding only because KK's
+# SHA-bound Linear answer is absent (the merge gate checks that answer, GI-1e); the change itself is still judged.
 # Usage (as root on the DevOS server):
 #   review-commit.sh <base-ref> <head-ref> <contract-path> [label]
 #   e.g. review-commit.sh main kishore/devos-33-m01-server-baseline docs/modules/M0.1.md M0.1
@@ -68,6 +70,25 @@ floor_guard_block() {
     *) echo "Floor guard: could not run (exit ${rc}), so there is no hit list for this change." ;;
   esac
 }
+# floor_guard_rules: the prompt's floor-guard paragraph (rules.md 'Floor guard markers', GI-1b; v1.0.4 KK-only hits).
+# A hit in a KK-only area is disposed of by KK's Linear answer for the exact head SHA, which the kk-answers job and
+# the merge gate read (GI-1e) and Codex cannot see; the head cannot hold its own SHA. Without this paragraph Codex
+# asks for that answer on every head and no PR with such a hit can PASS (DEVOS-249). No gate rule changes.
+floor_guard_rules() {
+  cat <<'RULES'
+Floor guard (rules.md 'Floor guard markers', GI-1b): for each hit below that you judge justified (and not in money,
+data deletion, security scanning, legal, D11 or D13), you may write FLOOR-GUARD KEEP <id> <file>:<line> <reason>.
+If you PASS a change to a guard path (scripts/floor-guard/**, scripts/test/floor-guard.test.mjs,
+.github/workflows/floor-guard.yml, scripts/gates/kk-only.mjs, scripts/test/kk-only.test.mjs), write FLOOR-GUARD CHANGE <path> once per changed path. Write markers only in
+"summary", plain: no backticks, quotes or trailing punctuation after the path or file:line. An unjustified hit is a
+finding, not a Keep.
+A hit in money, data deletion, security scanning, legal, D11 or D13 is KK's to dispose of, never yours: write no
+FLOOR-GUARD KEEP for it. KK answers on Linear for the exact head SHA, which you cannot see, and the merge gate refuses
+the merge without that answer (GI-1e). So KK's answer being absent from what you were given is not a finding.
+Still judge the change itself: if it weakens a scan, a check or a control, or does more than its contract records,
+that is a finding.
+RULES
+}
 # Sourced (tests): define the helpers only.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 [[ "${EUID}" -eq 0 ]] || fail "run as root"
@@ -100,6 +121,7 @@ pristine "$H"
 [[ -f "$contract" ]] || fail "contract $contract not present at $H"
 MB="$(git merge-base "$B" "$H")"
 fgblock="$(floor_guard_block "$B" "$H")"
+fgrules="$(floor_guard_rules)"
 pristine "$H"   # the guard only reads; prove it
 
 prompt="You are the independent Reviewer (Codex, read-only) for the DevOS repository.
@@ -113,12 +135,7 @@ Return PASS only if the change meets its contract, has no logic error, unsafe de
 commits no secret, and stays within the module's owned files (plus cited ADRs).
 Otherwise CHANGES_REQUESTED with one finding per concrete defect: severity (high/medium/low), file,
 line (in the head version), evidence, consequence. Low-severity notes alone must not block PASS.
-Floor guard (rules.md 'Floor guard markers', GI-1b): for each hit below that you judge justified (and not in money,
-data deletion, security scanning, legal, D11 or D13), you may write FLOOR-GUARD KEEP <id> <file>:<line> <reason>.
-If you PASS a change to a guard path (scripts/floor-guard/**, scripts/test/floor-guard.test.mjs,
-.github/workflows/floor-guard.yml), write FLOOR-GUARD CHANGE <path> once per changed path. Write markers only in
-\"summary\", plain: no backticks, quotes or trailing punctuation after the path or file:line. An unjustified hit is a
-finding, not a Keep.
+${fgrules}
 ${fgblock}
 Set \"sha\" to ${H}. Respond only with the JSON object."
 
