@@ -79,7 +79,7 @@ floor_guard_rules() {
 Floor guard (rules.md 'Floor guard markers', GI-1b): for each hit below that you judge justified (and not in money,
 data deletion, security scanning, legal, D11 or D13), you may write FLOOR-GUARD KEEP <id> <file>:<line> <reason>.
 If you PASS a change to a guard path (scripts/floor-guard/**, scripts/test/floor-guard.test.mjs,
-.github/workflows/floor-guard.yml), write FLOOR-GUARD CHANGE <path> once per changed path. Write markers only in
+.github/workflows/floor-guard.yml, scripts/gates/kk-only.mjs, scripts/test/kk-only.test.mjs), write FLOOR-GUARD CHANGE <path> once per changed path. Write markers only in
 "summary", plain: no backticks, quotes or trailing punctuation after the path or file:line. An unjustified hit is a
 finding, not a Keep.
 A hit in money, data deletion, security scanning, legal, D11 or D13 is KK's to dispose of, never yours: write no
