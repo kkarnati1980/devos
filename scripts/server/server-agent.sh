@@ -358,9 +358,7 @@ cert_renewal() {
   done
   if [[ $DRY -eq 1 ]]; then log "WOULD run the daily cert renewal"; return 0; fi
   set +e; DEVOS_DIR="$DIR" timeout 300 bash "$BIN/cert-renew.sh" > "$TMP/cert.out" 2>&1 </dev/null; rc=$?; set -e
-  if ! redact < "$TMP/cert.out" | tail -n 20 | while IFS= read -r l; do log "cert-renew: $l"; done; then  # Codex PR204-r12
-    log "cert-renew: could not redact the run's output for the agent log"
-  fi
+  redact < "$TMP/cert.out" | tail -n 20 | while IFS= read -r l; do log "cert-renew: $l"; done
   case "$rc" in 0) st=ok;; 3) st=skipped;; *) st="fail (exit $rc)";; esac
   printf '%s %s\n' "$now" "$st" > "$ST/cert-renew.state.new" && mv -f "$ST/cert-renew.state.new" "$ST/cert-renew.state"
   log "cert renewal: $st"
