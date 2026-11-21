@@ -25,6 +25,12 @@ before(async () => {
   w("iptables", `exec 8>"$FAKE_LOG/xtables.lock"; flock -w 1 8 || { echo "xtables lock held" >&2; exit 4; }
 [[ "$1" == -w ]] && shift 2
 echo "$*" >> "$FAKE_LOG/iptables.log"
+# Codex PR210-r3: after a restore with FAKE_QFAIL set, every query fails like a held xtables lock (exit 4).
+[[ -f "$FAKE_LOG/qfail" && ( "$1" == -S || "$1" == -C ) ]] && { echo "xtables lock held" >&2; exit 4; }
+if [[ "$*" == -S ]]; then  # whole-table listing: every chain, its policy or -N line, then its rules
+  for f in "$FAKE_NF"/*; do [[ -f "$f" ]] || continue; ch="\${f##*/}"
+    [[ "$ch" == INPUT || "$ch" == FORWARD ]] && echo "-P $ch DROP" || echo "-N $ch"; cat "$f"; done; exit 0
+fi
 op="$1" ch="$2"; shift 2; f="$FAKE_NF/$ch"
 [[ "$op" == -S && -n "\${FAKE_IPT_S_SLEEP:-}" ]] && sleep "$FAKE_IPT_S_SLEEP"
 [[ "$op" == -D && -n "\${FAKE_IPT_D_RC:-}" ]] && exit "$FAKE_IPT_D_RC"  # Codex PR165-r1: a failed rule delete
@@ -52,6 +58,7 @@ while IFS= read -r l; do
     -I\\ *) r="\${l#-I $c 1 }"; { echo "-A $c $r"; cat "$f"; } > "$f.n" && mv "$f.n" "$f" ;;
   esac
 done <<<"$in"
+[[ -z "\${FAKE_QFAIL:-}" ]] || : > "$FAKE_LOG/qfail"
 if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sleep 0.3; fi`);
   // curl: logs argv (to prove the token is not on it) and prints FAKE_STATE; FAKE_CURL_RC fails the fetch.
   w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ -z "\${FAKE_CURL_SLEEP:-}" ]] || sleep "$FAKE_CURL_SLEEP"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
@@ -59,7 +66,7 @@ if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sl
   // ip6tables / ip6tables-restore (S4-b2c): the same fakes over $FAKE_NF/v6 and $FAKE_LOG/v6, so the IPv4
   // restore count and logs are not mixed with IPv6. FAKE_V6_RC fails every ip6tables call; FAKE_V6_RESTORE_RC the restore.
   w("ip6tables", `[[ "\${FAKE_V6_RC:-0}" == 0 ]] || exit "$FAKE_V6_RC"; FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_IPT_S_SLEEP="\${FAKE_V6_S_SLEEP:-}" FAKE_IPT_D_RC= exec "\${0%/*}/iptables" "$@"`);
-  w("ip6tables-restore", `FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_RESTORE_RC="\${FAKE_V6_RESTORE_RC:-0}" FAKE_KILL_PID= exec "\${0%/*}/iptables-restore" "$@"`);
+  w("ip6tables-restore", `FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_RESTORE_RC="\${FAKE_V6_RESTORE_RC:-0}" FAKE_KILL_PID= FAKE_QFAIL= exec "\${0%/*}/iptables-restore" "$@"`);
   // conntrack (S4-b2d): logs argv; FAKE_CT_RC fails it with another message; with no match the real one exits 1.
   w("conntrack", `echo "$*" >> "$FAKE_LOG/conntrack.log"; [[ "\${FAKE_CT_RC:-0}" == 0 ]] || { echo "conntrack v1.4.7 (conntrack-tools): Operation failed: injected" >&2; exit "$FAKE_CT_RC"; }
 [[ -n "\${FAKE_CT_NOMATCH:-}" ]] && { echo "conntrack v1.4.7 (conntrack-tools): 0 flow entries have been deleted." >&2; exit 1; }
@@ -128,8 +135,18 @@ const setState = (h, s) => fs.writeFileSync(path.join(h, "state.json"), typeof s
 function run(h, args = [], env = {}) {
   const r = spawnSync("bash", [SCRIPT, ...args], { encoding: "utf8", env: { PATH: `${bin}:/usr/bin:/bin`, DEVOS_DIR: path.join(h, "devos"),
     FAKE_NF: path.join(h, "nf"), FAKE_LOG: path.join(h, "log"), FAKE_STATE: path.join(h, "state.json"), ...env } });
-  return { code: r.status, out: r.stdout + r.stderr };
+  const out = r.stdout + r.stderr;
+  // DEVOS-128 (v1.5.0): every failed apply run (exit 1) ends with exactly one fixed reason line; the agent keeps
+  // only that code. Checked on every exit-1 run in this file, so no failure path can be missed.
+  if (r.status === 1 && !args.includes("--remove")) {
+    // stdout's last line (stderr, e.g. from an EXIT trap, can land after it; the agent reads the last reason line)
+    assert.match(r.stdout.trimEnd().split("\n").at(-1), REASON_LINE, `exit 1 without a reason line:\n${out}`);
+    assert.equal(out.split("\n").filter((l) => l.startsWith("reason: ")).length, 1, `one reason line only:\n${out}`);
+  }
+  return { code: r.status, out, stdout: r.stdout };
 }
+const REASON_LINE = /^reason: (config|token|state-fetch|refused|lock|deadline|conntrack|apply|self-test|rollback|record|boot-persistence|ipv6)$/;
+const reason = (r) => (r.stdout.trimEnd().split("\n").at(-1).match(REASON_LINE) || [])[1];
 const nf = (h, c) => (fs.existsSync(path.join(h, "nf", c)) ? fs.readFileSync(path.join(h, "nf", c), "utf8") : null);
 const restores = (h) => fs.readdirSync(path.join(h, "log")).filter((f) => f.startsWith("restore.")).length;
 const installed = (h) => path.join(h, "devos/isolation/installed.rules");
@@ -204,6 +221,7 @@ for (const [name, bad] of [
     const r = run(h);
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /refused: .*nothing changed/);
+    assert.equal(reason(r), "refused", "DEVOS-128 reason code");
     assert.equal(restores(h), 1, "nothing applied");
     assert.equal(fs.readFileSync(installed(h), "utf8"), before);
   });
@@ -213,6 +231,7 @@ test("AT6 a failed state fetch changes nothing", () => {
   const h = host(STATE);
   const r = run(h, [], { FAKE_CURL_RC: "7" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "state-fetch", "DEVOS-128 reason code");
   assert.match(r.out, /state fetch failed \(curl exit 7\): nothing changed/);
   assert.equal(restores(h), 0);
 });
@@ -225,6 +244,7 @@ test("AT7 a failed iptables-restore leaves the previous chains, jumps and record
   setState(h, { stacks: [] });
   const r = run(h, [], { FAKE_RESTORE_RC: "1" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "apply", "DEVOS-128 reason code");
   assert.match(r.out, /apply failed .*previous block is still in place/);
   assert.deepEqual(["DOCKER-USER", "INPUT", "DEVOS-ISO-FWD", "DEVOS-ISO-IN"].map((c) => nf(h, c)), snap);
   assert.equal(fs.readFileSync(installed(h), "utf8"), before);
@@ -302,11 +322,58 @@ test("AT8 self-test that passed before and fails after rolls back to the previou
     setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
     const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
     assert.equal(r.code, 1, r.out);
+    assert.equal(reason(r), "self-test", "DEVOS-128 reason code");
     assert.match(r.out, /self-test failed after apply \(self-test: 127\.0\.0\.1:\d+ did not answer\)/);
     assert.match(r.out, /rolled back to the previous block/);
     assert.equal(nf(h, "DEVOS-ISO-FWD"), good);
     assert.equal(nf(h, "DOCKER-USER").match(/DEVOS-ISO-FWD/g).length, 1);
     assert.doesNotMatch(fs.readFileSync(installed(h), "utf8"), /gamma/);
+  } finally { l.stop(); }
+});
+
+test("DEVOS-128: an isolation directory that cannot be created says lock", () => {
+  const h = host(STATE);
+  fs.rmSync(path.join(h, "devos/isolation"), { recursive: true, force: true });
+  fs.writeFileSync(path.join(h, "devos/isolation"), "not a directory\n");
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /cannot create .*isolation/);
+  assert.equal(reason(r), "lock");
+  assert.equal(restores(h), 0, "nothing applied");
+});
+
+test("DEVOS-128: a rollback whose record fails says rollback, names the step, and still restores the rest", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const good = nf(h, "DEVOS-ISO-FWD");
+  const l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
+    fs.mkdirSync(path.join(h, "devos/isolation/installed.rules.tmp")); // the rollback's record() cannot write
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /rolled back to the previous block, but .*installed\.rules could not be recorded/);
+    assert.doesNotMatch(r.out, /--remove/, "a restored live block is never followed by a --remove instruction (PR210-r2)");
+    assert.equal(reason(r), "rollback");
+    assert.equal(nf(h, "DEVOS-ISO-FWD"), good, "the live rollback happened");
+  } finally { l.stop(); }
+});
+
+test("DEVOS-128 (Codex PR210-r1): a rollback whose boot block cannot be restored says rollback; the live block is restored", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const good = nf(h, "DEVOS-ISO-FWD");
+  const l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
+    fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD);   // M0.1's block gone: boot_sync cannot write
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /rolled back to the previous block, but the boot block in .* could not be restored/);
+    assert.equal(reason(r), "rollback");
+    assert.equal(nf(h, "DEVOS-ISO-FWD"), good, "the live rollback itself still happened");
   } finally { l.stop(); }
 });
 
@@ -325,11 +392,66 @@ test("AT8 self-test failure on the first apply removes the block entirely", asyn
   } finally { l.stop(); }
 });
 
+test("DEVOS-128 (Codex PR210-r3): a first-apply rollback whose firewall queries fail says rollback and asks for --remove", async () => {
+  const h = host(STATE);
+  const l = await listener();
+  try {
+    targets(h, l.port);
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid), FAKE_QFAIL: "1" });  // every query fails after the restore
+    assert.equal(r.code, 1, r.out);
+    assert.doesNotMatch(r.out, /rolled back: S4 block removed/, "a failed query never reads as removed");
+    assert.match(r.out, /the firewall did not answer \(ipt -S\)/);
+    assert.match(r.out, /rollback failed: run .* --remove from the console/);
+    assert.equal(reason(r), "rollback");
+    assert.match(nf(h, "DOCKER-USER"), /DEVOS-ISO-FWD/, "the rules really are still in place");
+  } finally { l.stop(); }
+});
+
+test("DEVOS-128 (Codex PR210-r3): --remove does not report success while iptables queries fail", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "log/qfail"), "");
+  const r = run(h, ["--remove"]);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /some IPv4 S4 rules are still in place/);
+  assert.doesNotMatch(r.out, /^removed:/m);
+});
+
+test("DEVOS-128 (Codex PR210-r4): --remove without iptables or ip6tables fails, says why, and still turns the block off", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const bin2 = fs.mkdtempSync(path.join(tmp, "bin-noipt-"));
+  // Codex PR210-r5: PATH is only bin2, so no real firewall command can be found: the fakes (minus the two
+  // firewall ones) plus every system tool except any iptables/ip6tables variant.
+  const link = (dir, n) => { const t = path.join(bin2, n); if (!fs.existsSync(t)) try { fs.symlinkSync(path.join(dir, n), t); } catch {} };
+  for (const n of fs.readdirSync(bin)) if (!/^ip6?tables/.test(n)) link(bin, n);
+  for (const d of ["/usr/bin", "/bin"]) if (fs.existsSync(d)) for (const n of fs.readdirSync(d)) if (!/^ip6?tables/.test(n)) link(d, n);
+  assert.equal(spawnSync("bash", ["-c", "command -v iptables ip6tables"], { env: { PATH: bin2 } }).status, 1, "no firewall command on PATH");
+  const r = run(h, ["--remove"], { PATH: bin2 });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /iptables is not installed, so the IPv4 S4 rules cannot be checked/);
+  assert.match(r.out, /ip6tables is not installed, so the IPv6 drop cannot be checked/);
+  assert.doesNotMatch(r.out, /^removed:/m);
+  assert.equal(fs.existsSync(path.join(h, "devos/isolation/disabled")), true, "the agent is still kept from re-applying");
+  assert.doesNotMatch(fs.readFileSync(path.join(h, "after.rules"), "utf8"), /DEVOS S4 ISOLATION/, "the boot block is still removed");
+});
+
+test("DEVOS-128 (Codex PR210-r4): a rule whose comment only mentions an S4 chain does not block a completed removal", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.appendFileSync(path.join(h, "nf/INPUT"), '-A INPUT -m comment --comment "old -j DEVOS-ISO-IN rule" -j ACCEPT\n');
+  const r = run(h, ["--remove"]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /^removed:/m);
+  assert.match(nf(h, "INPUT"), /old -j DEVOS-ISO-IN rule/, "the unrelated rule is untouched");
+});
+
 test("a host self-test already failing before the change keeps the block (isolation is the floor) and reports it", () => {
   const h = host(STATE);
   targets(h, downPort);
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "self-test", "DEVOS-128 reason code");
   assert.match(r.out, /block kept; the host self-test was already failing before the change/);
   assert.equal(nf(h, "DOCKER-USER").split("\n")[0], "-A DOCKER-USER -j DEVOS-ISO-FWD");
   assert.equal(fs.readFileSync(installed(h), "utf8"), fs.readFileSync(GOLDEN, "utf8"));
@@ -401,6 +523,7 @@ test("skipped (exit 3) without a token; refuses a non-loopback state URL", () =>
   h = host(STATE, { conf: "ISOLATION_STATE_URL=http://example.com:80/internal/isolation-state\n" });
   r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "config", "DEVOS-128 reason code");
   assert.match(r.out, /loopback/);
   assert.equal(fs.existsSync(path.join(h, "log/curl.args")), false, "no request made");
 });
@@ -409,6 +532,7 @@ test("DEVOS-237: a token shorter than 32 characters is refused before any reques
   const h = host(STATE, { token: "t0ken-" + "a".repeat(25) }); // 31 characters
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "token", "DEVOS-128 reason code");
   assert.match(r.out, /token file is malformed/);
   assert.equal(fs.existsSync(path.join(h, "log/curl.args")), false, "no request made");
   assert.equal(restores(h), 0);
@@ -501,6 +625,7 @@ test("S4-b2b: without M0.1's block the boot block is not written (exit 1), the l
   fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD);
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "boot-persistence", "DEVOS-128 reason code");
   assert.match(r.out, /M0\.1's DEVOS UFW AND DOCKER block is not in .*; not written/);
   assert.match(r.out, /self-test passed, but not persisted for boot/);
   assert.equal(afterRules(h), UFW_HEAD, "after.rules untouched");
@@ -640,6 +765,7 @@ test("S4-b2d: no change starts after the run deadline; nothing changes and the n
   const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=0\n" });
   const r = run(h, [], { FAKE_CURL_SLEEP: "1.2" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "deadline", "DEVOS-128 reason code");
   assert.match(r.out, /deadline: \d+ s spent before the change \(limit 0 s\); nothing changed/);
   assert.equal(restores(h), 0);
   assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
@@ -653,6 +779,7 @@ test("Codex PR163-r1: a deadline used up by the iptables queries just before the
   const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=1\n" });
   const r = run(h, [], { FAKE_IPT_S_SLEEP: "2" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "deadline", "DEVOS-128 reason code");
   assert.match(r.out, /deadline: \d+ s spent before the change \(limit 1 s\); nothing changed/);
   assert.equal(restores(h), 0, "iptables-restore never started");
   assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
@@ -712,6 +839,7 @@ test("S4-b2d (pre-review): without the conntrack tool the run says so, exits 1 a
   }
   const r = run(h, [], { PATH: `${nob}:${core}` });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "conntrack", "DEVOS-128 reason code");
   assert.match(r.out, /conntrack not installed/);
   assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.0.0/14");
   assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/, "the block itself does not need conntrack");
@@ -724,6 +852,7 @@ test("S4-b2d (pre-review r2): the cut is queued before the change, so a failed r
   fs.mkdirSync(path.join(h, "devos/isolation/installed.rules.tmp")); // record() cannot write its temp file
   const r = run(h, [], { FAKE_CT_RC: "2" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "record", "DEVOS-128 reason code");
   assert.match(r.out, /could not record/);
   assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24", "queued before iptables-restore ran");
 });
@@ -829,6 +958,7 @@ test("S4-b2c: without M0.1's IPv6 block the drop is applied live but not written
   fs.writeFileSync(path.join(h, "after6.rules"), UFW_HEAD6);
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "ipv6", "DEVOS-128 reason code");
   assert.match(r.out, /M0\.1's DEVOS UFW AND DOCKER block is not in .*after6\.rules; not written/);
   assert.equal(after6(h), UFW_HEAD6, "after6.rules untouched");
   assert.equal(nf6(h, "DEVOS-ISO6"), RULE6, "live drop in place");
