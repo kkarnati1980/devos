@@ -1,6 +1,7 @@
 // DEVOS-236 (docs/modules/M2.5.md "DEVOS-236 decisions"): the read-only orphan-volume server check, on a fake `docker`.
 // Fakes on PATH: `docker` (ps → one API id unless FAKE_API=0; exec → prints FAKE_DIR/cli and exits FAKE_CLI_RC;
-// volume ls → prints FAKE_DIR/vols and exits FAKE_VOL_RC; anything else, e.g. `volume rm`, exits 99 and is recorded).
+// volume ls -q → the names in FAKE_DIR/vols.json, exit FAKE_VOL_RC; volume inspect → that JSON (or FAKE_DIR/inspect
+// when present), exit FAKE_INS_RC; anything else, e.g. `volume rm`, exits 99 and is recorded).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -12,22 +13,25 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const CHECK = path.join(ROOT, "scripts/server/checks/teardown-orphan-volumes.sh");
 
-function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = "", volRc = 0, api = true } = {}) {
+// vols: [{ Name, Labels }], as `docker volume inspect` returns them.
+function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0, insRc = 0, inspect = null, api = true } = {}) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-orphan-"));
   fs.writeFileSync(path.join(bin, "cli"), cli + "\n");
-  fs.writeFileSync(path.join(bin, "vols"), vols);
+  fs.writeFileSync(path.join(bin, "vols.json"), JSON.stringify(vols));
+  if (inspect !== null) fs.writeFileSync(path.join(bin, "inspect"), inspect);
   fs.writeFileSync(path.join(bin, "docker"), `#!/usr/bin/env bash
 echo "$*" >> "$FAKE_DIR/docker.args"
 case "$1 \${2:-}" in
   "ps "*) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit 0;;
   "exec "*) cat "$FAKE_DIR/cli"; exit "$FAKE_CLI_RC";;
-  "volume ls") cat "$FAKE_DIR/vols"; exit "$FAKE_VOL_RC";;
+  "volume ls") [[ "\${3:-}" == -q ]] || exit 98; jq -r '.[].Name' "$FAKE_DIR/vols.json"; exit "$FAKE_VOL_RC";;
+  "volume inspect") if [[ -f "$FAKE_DIR/inspect" ]]; then cat "$FAKE_DIR/inspect"; else cat "$FAKE_DIR/vols.json"; fi; exit "$FAKE_INS_RC";;
 esac
 exit 99
 `);
   fs.chmodSync(path.join(bin, "docker"), 0o755);
   const r = spawnSync("bash", [CHECK], {
-    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc) },
+    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc), FAKE_INS_RC: String(insRc) },
     encoding: "utf8",
   });
   const args = fs.existsSync(path.join(bin, "docker.args")) ? fs.readFileSync(path.join(bin, "docker.args"), "utf8") : "";
@@ -45,7 +49,7 @@ test("DEVOS-236: no purged application and no volume → pass", () => {
 });
 
 test("DEVOS-236: a volume named after a purged application (Coolify naming) is a leftover hit → fail", () => {
-  const vols = [`${U1}-postgres-data\tcoolify.managed=true`, `${U1}_uploads\t`, `${U1}\t`, `other-volume\tx=y`].join("\n") + "\n";
+  const vols = [{ Name: `${U1}-postgres-data`, Labels: { "coolify.managed": "true" } }, { Name: `${U1}_uploads`, Labels: null }, { Name: U1, Labels: {} }, { Name: "other-volume", Labels: { x: "y" } }];
   const r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols });
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, new RegExp(`leftover volume: ${U1}-postgres-data \\(purged application ${U1}\\)`));
@@ -56,24 +60,26 @@ test("DEVOS-236: a volume named after a purged application (Coolify naming) is a
 
 test("DEVOS-236: a volume whose label value is exactly a purged uuid is a hit; a partial or prefix match is not", () => {
   const vols = [
-    `data_abc\tcom.docker.compose.project=${U2},coolify.managed=true`,
-    `near1\tcom.docker.compose.project=${U2}x`,
-    `near2\tnote=x${U2}`,
-    `${U2}x-data\t`,
-  ].join("\n") + "\n";
+    { Name: "data_abc", Labels: { "com.docker.compose.project": U2, "coolify.managed": "true" } },
+    { Name: "near1", Labels: { "com.docker.compose.project": `${U2}x` } },
+    { Name: "near2", Labels: { note: `x${U2}` } },
+    { Name: "near3", Labels: { "traefik.rule": `Host(a),${U2}` } }, // pre-review 1: a comma in a value is not a split
+    { Name: "near4", Labels: { note: `line\n${U2}` } },
+    { Name: `${U2}x-data`, Labels: {} },
+  ];
   const r = run({ cli: JSON.stringify({ uuids: [U2], invalid: 0 }), vols });
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /leftover volume: data_abc/);
-  assert.doesNotMatch(r.out, /near1|near2|abc123-def456x-data/);
+  assert.doesNotMatch(r.out, /near1|near2|near3|near4|abc123-def456x-data/);
   assert.match(r.out, /fail: 1 leftover volume/);
 });
 
 test("DEVOS-236: volumes of live applications only → pass, and the check never removes anything", () => {
-  const r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: "liveapp0001-data\tcoolify.managed=true\n" });
+  const r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "liveapp0001-data", Labels: { "coolify.managed": "true" } }] });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /ok: no leftover volume \(1 purged applications checked\)/);
   assert.doesNotMatch(r.args, /volume rm|volume prune|\brm\b/);
-  assert.deepEqual(r.args.trim().split("\n").map((l) => l.split(" ").slice(0, 2).join(" ")), ["ps --filter", "exec abcdef123456", "volume ls"]);
+  assert.deepEqual(r.args.trim().split("\n").map((l) => l.split(" ").slice(0, 2).join(" ")), ["ps --filter", "exec abcdef123456", "volume ls", "volume inspect"]);
 });
 
 test("DEVOS-236: rows the scan cannot match make it incomplete → fail, never clean", () => {
@@ -100,6 +106,14 @@ test("DEVOS-236: the CLI failing or timing out fails with its fixed code; a dock
   r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), volRc: 1 });
   assert.equal(r.code, 1);
   assert.match(r.out, /fail: docker volume ls failed \(exit 1\)/);
+  r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "v1", Labels: {} }], insRc: 1 });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /fail: docker volume inspect failed \(exit 1\)/);
+  for (const inspect of ["not json", '{"Name":"v1"}', '[{"Name":5}]', '[{"Name":"v1","Labels":"x"}]']) {
+    r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "v1", Labels: {} }], inspect });
+    assert.equal(r.code, 1, `${inspect}: ${r.out}`);
+    assert.match(r.out, /fail: unreadable docker volume inspect output/);
+  }
 });
 
 test("DEVOS-236: skipped when DevOS is not deployed or has no database", () => {
@@ -112,11 +126,21 @@ test("DEVOS-236: skipped when DevOS is not deployed or has no database", () => {
 });
 
 test("DEVOS-236: names are printed in a fixed character set and the list stops at 15", () => {
-  const vols = Array.from({ length: 18 }, (_, i) => `${U1}-v${i}$(id)\t`).join("\n") + "\n";
-  const r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols });
+  const vols = Array.from({ length: 18 }, (_, i) => ({ Name: `${U1}-v${i}`, Labels: {} }));
+  const inspect = JSON.stringify(vols.map((v) => ({ ...v, Name: `${v.Name}$(id)\n` })));
+  const r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols, inspect });
   assert.equal(r.code, 1);
   assert.doesNotMatch(r.out, /\$\(id/);
   assert.equal((r.out.match(/leftover volume:/g) || []).length, 15);
   assert.match(r.out, /\.\.\. 3 more/);
   assert.match(r.out, /fail: 18 leftover volume/);
+});
+
+test("DEVOS-236: several purged applications, each with its own leftover, are all reported (pre-review 8)", () => {
+  const vols = [{ Name: `${U1}-db`, Labels: {} }, { Name: "x-cache", Labels: { "com.docker.compose.project": U2 } }, { Name: "keep", Labels: {} }];
+  const r = run({ cli: JSON.stringify({ uuids: [U1, U2], invalid: 0 }), vols });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, new RegExp(`leftover volume: ${U1}-db \\(purged application ${U1}\\)`));
+  assert.match(r.out, new RegExp(`leftover volume: x-cache \\(purged application ${U2}\\)`));
+  assert.match(r.out, /fail: 2 leftover volume\(s\) of purged applications \(2 purged applications checked\)/);
 });

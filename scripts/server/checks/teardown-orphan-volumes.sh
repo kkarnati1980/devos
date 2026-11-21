@@ -35,32 +35,32 @@ while IFS= read -r u; do
   [[ -z "$u" ]] && continue
   [[ "$u" =~ ^[A-Za-z0-9-]{8,64}$ ]] || { echo "fail: unreadable purged-application list"; exit 1; }
 done <<<"$uuids"
-vols="$(timeout "$EXEC_S" docker volume ls --format '{{.Name}}	{{.Labels}}' 2>/dev/null)"; vrc=$?
+# Pre-review 1/2: labels are read as JSON (`docker volume inspect`), never split from text, so a label
+# value holding a comma or a newline can neither hide a uuid nor fake one.
+names="$(timeout "$EXEC_S" docker volume ls -q 2>/dev/null)"; vrc=$?
 [[ $vrc -eq 0 ]] || { echo "fail: docker volume ls failed (exit $vrc)"; exit 1; }
 n_apps=0; [[ -n "$uuids" ]] && n_apps="$(printf '%s\n' "$uuids" | grep -c .)"
-hits=0
-if [[ -n "$uuids" ]]; then
-  declare -A purged=()
-  while IFS= read -r u; do [[ -n "$u" ]] && purged["$u"]=1; done <<<"$uuids"
-  while IFS=$'\t' read -r name labels; do
-    [[ -z "$name" ]] && continue
-    hit=""
-    for u in "${!purged[@]}"; do
-      if [[ "$name" == "$u" || "$name" == "$u-"* || "$name" == "$u"_* ]]; then hit="$u"; break; fi
-    done
-    if [[ -z "$hit" && -n "$labels" ]]; then
-      IFS=',' read -r -a pairs <<<"$labels"
-      for p in "${pairs[@]}"; do
-        v="${p#*=}"
-        [[ -n "${purged[$v]:-}" ]] && { hit="$v"; break; }
-      done
-    fi
-    if [[ -n "$hit" ]]; then
-      hits=$((hits + 1))
-      [[ $hits -le 15 ]] && echo "  leftover volume: $(clean "$name") (purged application $(clean "$hit"))"
-    fi
-  done <<<"$vols"
+hitlist=""
+if [[ -n "$uuids" && -n "$names" ]]; then
+  mapfile -t vlist <<<"$names"
+  json="$(timeout "$EXEC_S" docker volume inspect -- "${vlist[@]}" 2>/dev/null)"; irc=$?
+  [[ $irc -eq 0 ]] || { echo "fail: docker volume inspect failed (exit $irc)"; exit 1; }
+  ujson="$(printf '%s\n' "$uuids" | jq -R . | jq -s .)"
+  # One "<uuid>\t<name>" line per hit: the name is a purged uuid or starts with one and `-` or `_`, or a label value
+  # is exactly one. Volume names are reduced to the fixed set before they leave jq, so no newline gets through.
+  hitlist="$(printf '%s' "$json" | jq -r --argjson u "$ujson" '
+    if type != "array" then error("bad") else .[] end
+    | (.Name | if type == "string" then . else error("bad") end) as $n
+    | ((.Labels // {}) | if type == "object" then [.[] | tostring] else error("bad") end) as $vals
+    | first($u[] as $x | select($n == $x or ($n | startswith($x + "-")) or ($n | startswith($x + "_")) or ($vals | index([$x]) != null)) | $x) as $hit
+    | "\($hit)\t\($n | gsub("[^A-Za-z0-9._:/=,+-]"; ""))"' 2>/dev/null)" || { echo "fail: unreadable docker volume inspect output"; exit 1; }
 fi
+hits=0
+while IFS=$'\t' read -r hit name; do
+  [[ -z "$hit" ]] && continue
+  hits=$((hits + 1))
+  [[ $hits -le 15 ]] && echo "  leftover volume: $(clean "$name") (purged application $(clean "$hit"))"
+done <<<"$hitlist"
 [[ $hits -gt 15 ]] && echo "  ... $((hits - 15)) more"
 if [[ $hits -gt 0 ]]; then echo "fail: $hits leftover volume(s) of purged applications ($n_apps purged applications checked)"; exit 1; fi
 if [[ "$invalid" != 0 ]]; then echo "fail: $invalid purged application row(s) have an id the scan cannot match, so the scan is incomplete"; exit 1; fi
