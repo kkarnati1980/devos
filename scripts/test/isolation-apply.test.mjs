@@ -214,6 +214,7 @@ for (const [name, bad] of [
     const r = run(h);
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /refused: .*nothing changed/);
+    assert.equal(reason(r), "refused", "DEVOS-128 reason code");
     assert.equal(restores(h), 1, "nothing applied");
     assert.equal(fs.readFileSync(installed(h), "utf8"), before);
   });
@@ -321,6 +322,17 @@ test("AT8 self-test that passed before and fails after rolls back to the previou
     assert.equal(nf(h, "DOCKER-USER").match(/DEVOS-ISO-FWD/g).length, 1);
     assert.doesNotMatch(fs.readFileSync(installed(h), "utf8"), /gamma/);
   } finally { l.stop(); }
+});
+
+test("DEVOS-128: an isolation directory that cannot be created says lock", () => {
+  const h = host(STATE);
+  fs.rmSync(path.join(h, "devos/isolation"), { recursive: true, force: true });
+  fs.writeFileSync(path.join(h, "devos/isolation"), "not a directory\n");
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /cannot create .*isolation/);
+  assert.equal(reason(r), "lock");
+  assert.equal(restores(h), 0, "nothing applied");
 });
 
 test("DEVOS-128: a rollback that cannot complete says rollback, not self-test", async () => {
