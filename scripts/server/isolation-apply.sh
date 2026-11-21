@@ -502,14 +502,18 @@ if ! post_msg="$(selftest)"; then
   echo "self-test failed after apply ($post_msg): rolling back"
   # Codex PR210-r1: every rollback step counts. The live part first; then the pending cuts and the boot block,
   # each run whatever the other did. Any failure is "rollback", so a half-restored host is never "self-test".
-  if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && record "$PREV" || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
-    rb_what="rolled back to the previous block"; rb_boot="$PREV"
-  else
-    remove_block && rm -f "$ISO/live.sha256" || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
-    rb_what="rolled back: S4 block removed"; rb_boot=""
-  fi
+  # Only a failed live restore asks for --remove (Codex PR210-r2); a bookkeeping failure after it is named and
+  # the remaining steps still run.
   rb_rc=0
+  if [[ -n "$PREV" ]]; then
+    install_block "$PREV" || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
+    rb_what="rolled back to the previous block"; rb_boot="$PREV"
+    record "$PREV" || { echo "$rb_what, but $ISO/installed.rules could not be recorded"; rb_rc=1; }
+  else
+    remove_block || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
+    rb_what="rolled back: S4 block removed"; rb_boot=""
+    rm -f "$ISO/live.sha256" || { echo "$rb_what, but $ISO/live.sha256 could not be deleted"; rb_rc=1; }
+  fi
   ct_restore || { echo "$rb_what, but $ISO/conntrack.pending could not be restored"; rb_rc=1; }
   boot_sync "$rb_boot" || { echo "$rb_what, but the boot block in $UFW_AFTER could not be restored"; rb_rc=1; }
   (( rb_rc == 0 )) || fail rollback

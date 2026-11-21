@@ -335,9 +335,10 @@ test("DEVOS-128: an isolation directory that cannot be created says lock", () =>
   assert.equal(restores(h), 0, "nothing applied");
 });
 
-test("DEVOS-128: a rollback that cannot complete says rollback, not self-test", async () => {
+test("DEVOS-128: a rollback whose record fails says rollback, names the step, and still restores the rest", async () => {
   const h = host(STATE);
   assert.equal(run(h).code, 0);
+  const good = nf(h, "DEVOS-ISO-FWD");
   const l = await listener();
   try {
     targets(h, upPort, l.port);
@@ -345,8 +346,10 @@ test("DEVOS-128: a rollback that cannot complete says rollback, not self-test", 
     fs.mkdirSync(path.join(h, "devos/isolation/installed.rules.tmp")); // the rollback's record() cannot write
     const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
     assert.equal(r.code, 1, r.out);
-    assert.match(r.out, /rollback failed: run .* --remove from the console/);
+    assert.match(r.out, /rolled back to the previous block, but .*installed\.rules could not be recorded/);
+    assert.doesNotMatch(r.out, /--remove/, "a restored live block is never followed by a --remove instruction (PR210-r2)");
     assert.equal(reason(r), "rollback");
+    assert.equal(nf(h, "DEVOS-ISO-FWD"), good, "the live rollback happened");
   } finally { l.stop(); }
 });
 
