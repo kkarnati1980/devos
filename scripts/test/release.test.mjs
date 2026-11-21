@@ -71,6 +71,18 @@ test("R3 AT3 every server-required variable is required (:?) in compose; the das
   req("worker", "DEVOS_POLICY_HMAC_KEY");
 });
 
+// M2.4-d4a (DEVOS-21): the provisioning settings reach the api by name; the fallbacks live in the api (PR20-r2).
+test("M2.4-d4a the api gets the provisioning settings by name, and DEVOS_BIND_IP for their fallbacks", () => {
+  const e = compose.services.api.environment;
+  assert.equal(e.DEVOS_BIND_IP, "${DEVOS_BIND_IP:?DEVOS_BIND_IP is required}");
+  for (const k of ["DEVOS_TAILNET_IP", "DEVOS_COOLIFY_URL", "DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_SERVER_UUID", "DEVOS_PROJECT_PORTS"]) {
+    assert.equal(e[k], `\${${k}:-}`, k);
+  }
+  for (const s of ["dashboard", "worker", "migrate"]) {
+    for (const k of ["DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_URL", "DEVOS_COOLIFY_SERVER_UUID"]) assert.equal(compose.services[s].environment?.[k], undefined, `${s} does not get ${k}`);
+  }
+});
+
 test("R3 AT1 the api image healthcheck follows the api's protocol (HTTPS whenever a certificate file is set)", () => {
   const hc = dockerfile.match(/FROM runtime AS api[\s\S]*?HEALTHCHECK[^\n]*\n\s*CMD ([^\n]*)/)?.[1] ?? "";
   assert.match(hc, /DEVOS_TLS_CERT_FILE/);

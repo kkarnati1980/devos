@@ -81,9 +81,13 @@ export interface ProvisionConfig {
 /** Reads the sweep's configuration by name; a missing or malformed value is a fixed code, never the value. */
 export function provisionConfig(env: NodeJS.ProcessEnv): ProvisionConfig | { off: string } {
   const owner = env.DEVOS_GITHUB_OWNER ?? "";
-  const coolifyOrigin = env.DEVOS_COOLIFY_URL ?? "";
+  // M2.4-d4a (DEVOS-21): an unset or empty tailnet address or Coolify origin falls back to DEVOS_BIND_IP, which R1
+  // requires and which is the tailnet IPv4 on the server; Coolify answers on its published port 8000 there (M0.1's
+  // DOCKER-USER passes private sources). The same checks as for a set value apply to the fallback.
+  const bindIp = env.DEVOS_BIND_IP || "";
+  const tailnetIp = env.DEVOS_TAILNET_IP || bindIp;
+  const coolifyOrigin = env.DEVOS_COOLIFY_URL || (IPV4_RE.test(bindIp) ? `http://${bindIp}:8000` : "");
   const serverUuid = env.DEVOS_COOLIFY_SERVER_UUID ?? "";
-  const tailnetIp = env.DEVOS_TAILNET_IP ?? "";
   const devosSha = env.GIT_SHA ?? "";
   if (!OWNER_RE.test(owner)) return { off: "provision-github-owner-not-set" };
   let origin: URL | null = null;
@@ -98,7 +102,7 @@ export function provisionConfig(env: NodeJS.ProcessEnv): ProvisionConfig | { off
   const [o1 = -1, o2 = -1] = tailnetIp.split(".").map(Number);
   if (o1 !== 100 || o2 < 64 || o2 > 127) return { off: "provision-tailnet-ip-not-tailnet" };
   if (!SHA_RE.test(devosSha)) return { off: "provision-devos-sha-unknown" };
-  return { owner, coolifyOrigin: origin.origin, serverUuid, tailnetIp, devosSha, portsRaw: env.DEVOS_PROJECT_PORTS };
+  return { owner, coolifyOrigin: origin.origin, serverUuid, tailnetIp, devosSha, portsRaw: env.DEVOS_PROJECT_PORTS || undefined };
 }
 
 /**

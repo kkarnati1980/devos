@@ -90,6 +90,17 @@ services:
       DEVOS_ISOLATION_STATE_TOKEN: ${DEVOS_ISOLATION_STATE_TOKEN:?DEVOS_ISOLATION_STATE_TOKEN is required}
       API_INTERNAL_PORT: "3002"
       API_INTERNAL_BIND: 0.0.0.0
+      # M2.4-d4a (DEVOS-21): the provisioning sweep's settings, by name (docs/modules/M2.4.md, "M2.4-d4a decisions").
+      # None is a secret. Unset ones fall back in the api, never here (PR20-r2): the tailnet address and the Coolify
+      # origin come from DEVOS_BIND_IP (R1: the tailnet IPv4 on the server), so a value Coolify drops (R3) cannot
+      # turn them off. DEVOS_GITHUB_OWNER and DEVOS_COOLIFY_SERVER_UUID have no fallback: until both are set, the sweep
+      # stays off with a fixed code.
+      DEVOS_BIND_IP: ${DEVOS_BIND_IP:?DEVOS_BIND_IP is required}
+      DEVOS_TAILNET_IP: ${DEVOS_TAILNET_IP:-}
+      DEVOS_COOLIFY_URL: ${DEVOS_COOLIFY_URL:-}
+      DEVOS_GITHUB_OWNER: ${DEVOS_GITHUB_OWNER:-}
+      DEVOS_COOLIFY_SERVER_UUID: ${DEVOS_COOLIFY_SERVER_UUID:-}
+      DEVOS_PROJECT_PORTS: ${DEVOS_PROJECT_PORTS:-}
     ports:
       # M1.2 deploy requirement: published on the host directly (no proxy), so the tailnet peer
       # address reaches the whois identity check.
