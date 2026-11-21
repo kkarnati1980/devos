@@ -208,3 +208,15 @@ test("DEVOS-236: Codex PR209-r7 — two JSON values, on one line or in the inspe
   assert.equal(twoArrays.code, 1, twoArrays.out);
   assert.match(twoArrays.out, /^fail: unreadable docker volume inspect output$/m);
 });
+
+test("DEVOS-236: Codex PR209-r8 — a NUL byte in the CLI, volume ls or inspect output is malformed, never dropped into valid JSON", () => {
+  const live = [{ Name: "live-volume", Labels: null }];
+  const cli = run({ cli: '{\u0000"uuids":[],"invalid":0}', vols: live });
+  assert.equal(cli.code, 1, cli.out);
+  assert.match(cli.out, /^fail: unreadable purged-application list$/m);
+  const ins = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: live, inspect: `[\u0000${JSON.stringify(live).slice(1)}` });
+  assert.equal(ins.code, 1, ins.out);
+  assert.match(ins.out, /^fail: unreadable docker volume inspect output$/m);
+  const ls = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "live\u0000volume", Labels: null }] });
+  assert.equal(ls.code, 1, ls.out);
+});

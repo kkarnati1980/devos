@@ -16,13 +16,20 @@ CLI=(node deploy/with-db-url.mjs node apps/api/dist/teardown-volumes-cli.js purg
 clean() { printf '%s' "$1" | tr -cd 'A-Za-z0-9._:/=,+-' | cut -c1-120; }
 command -v docker >/dev/null 2>&1 || { echo "skipped: docker not installed (DevOS not deployed yet)"; exit 3; }
 command -v jq >/dev/null 2>&1 || { echo "fail: jq not installed"; exit 1; }
+tmpd="$(mktemp -d 2>/dev/null)" || { echo "fail: cannot create a temp directory"; exit 1; }
+trap 'rm -rf -- "$tmpd"' EXIT
+# Codex PR209-r8: output is captured to a file and refused when it holds a NUL byte, because a command substitution
+# drops NULs silently and could turn malformed output into valid JSON.
+nonul() { [[ "$(LC_ALL=C tr -cd '\000' < "$1" | wc -c)" -eq 0 ]]; }
 # Codex PR209-r1: a failed or timed-out `docker ps` fails; only a successful search that finds no API skips.
 ps="$(timeout "$EXEC_S" docker ps --filter label=io.devos.service=api --filter status=running --format '{{.ID}}' 2>/dev/null)"; prc=$?
 [[ $prc -eq 0 ]] || { echo "fail: docker ps failed (exit $prc)"; exit 1; }
 ID="$(printf '%s\n' "$ps" | head -n1)"
 [[ -n "$ID" ]] || { echo "skipped: no running DevOS API container (DevOS not deployed yet)"; exit 3; }
 [[ "$ID" =~ ^[0-9a-f]{12,64}$ ]] || { echo "fail: unreadable docker ps output"; exit 1; }
-out="$(timeout "$EXEC_S" docker exec "$ID" "${CLI[@]}" 2>/dev/null)"; rc=$?
+timeout "$EXEC_S" docker exec "$ID" "${CLI[@]}" >"$tmpd/cli.out" 2>/dev/null; rc=$?
+nonul "$tmpd/cli.out" || { echo "fail: unreadable purged-application list"; exit 1; }
+out="$(cat "$tmpd/cli.out")"
 line="$(printf '%s\n' "$out" | grep -m1 '^{' || true)"
 case "$rc" in
   0) ;;
@@ -51,20 +58,22 @@ while IFS= read -r u; do
 done <<<"$uuids"
 # Pre-review 1/2: labels are read as JSON (`docker volume inspect`), never split from text, so a label
 # value holding a comma or a newline can neither hide a uuid nor fake one.
-names="$(timeout "$EXEC_S" docker volume ls -q 2>/dev/null)"; vrc=$?
+timeout "$EXEC_S" docker volume ls -q >"$tmpd/ls.out" 2>/dev/null; vrc=$?
 [[ $vrc -eq 0 ]] || { echo "fail: docker volume ls failed (exit $vrc)"; exit 1; }
+nonul "$tmpd/ls.out" || { echo "fail: unreadable docker volume ls output"; exit 1; }
+names="$(cat "$tmpd/ls.out")"
 n_apps=0; [[ -n "$uuids" ]] && n_apps="$(printf '%s\n' "$uuids" | grep -c .)"
 hitlist=""
 if [[ -n "$uuids" && -n "$names" ]]; then
   mapfile -t vlist <<<"$names"
-  json="$(timeout "$EXEC_S" docker volume inspect -- "${vlist[@]}" 2>/dev/null)"; irc=$?
+  timeout "$EXEC_S" docker volume inspect -- "${vlist[@]}" >"$tmpd/inspect.out" 2>/dev/null; irc=$?
   [[ $irc -eq 0 ]] || { echo "fail: docker volume inspect failed (exit $irc)"; exit 1; }
+  nonul "$tmpd/inspect.out" || { echo "fail: unreadable docker volume inspect output"; exit 1; }
+  json="$(cat "$tmpd/inspect.out")"
   # Codex PR209-r2: empty output would make jq run zero times and pass; it is unreadable, never clean.
   [[ -n "${json//[[:space:]]/}" ]] || { echo "fail: unreadable docker volume inspect output"; exit 1; }
   # Codex PR209-r4: the uuid and name lists go to jq through temp files (--slurpfile), never as arguments, so 2,000
   # rows of 64-character uuids stay under Linux's 128 KiB per-argument limit.
-  tmpd="$(mktemp -d 2>/dev/null)" || { echo "fail: cannot create a temp directory"; exit 1; }
-  trap 'rm -rf -- "$tmpd"' EXIT
   printf '%s\n' "$uuids" | jq -R . | jq -s . >"$tmpd/u.json" 2>/dev/null || { echo "fail: cannot write the purged-application list"; exit 1; }
   # One "<uuid>\t<name>" line per hit: the name is a purged uuid or starts with one and `-` or `_`, or a label value
   # is exactly one. Volume names are reduced to the fixed set before they leave jq, so no newline gets through.
