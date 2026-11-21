@@ -62,6 +62,8 @@ esac
 # Codex PR209-r7: and that line holds exactly one JSON value, an object (jq would read two values on one line).
 line="$(printf '%s' "$line" | jq -c -s 'if length == 1 and (.[0] | type) == "object" then .[0] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 uuids="$(printf '%s' "$line" | jq -r '.uuids | if type == "array" and all(.[]; type == "string" and test("\\A[A-Za-z0-9-]{8,64}\\z")) then .[] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
+# Codex PR209-r12: the live application uuids, same shape; a missing or malformed list is unreadable, never empty.
+live="$(printf '%s' "$line" | jq -r '.live | if type == "array" and all(.[]; type == "string" and test("\\A[A-Za-z0-9-]{8,64}\\z")) then .[] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 invalid="$(printf '%s' "$line" | jq -r '.invalid | if type == "number" then . else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 [[ "$invalid" =~ ^[0-9]{1,9}$ ]] || { echo "fail: unreadable purged-application list"; exit 1; }
 while IFS= read -r u; do
@@ -90,10 +92,12 @@ if [[ -n "$uuids" && -n "$names" ]]; then
   # One "<uuid>\t<name>" line per hit: the name is a purged uuid or starts with one and `-` or `_`, or a label value
   # is exactly one. Volume names are reduced to the fixed set before they leave jq, so no newline gets through.
   printf '%s\n' "${vlist[@]}" | jq -R . | jq -s . >"$tmpd/n.json" 2>/dev/null || { echo "fail: cannot write the volume list"; exit 1; }
+  printf '%s\n' "$live" | jq -R 'select(length > 0)' | jq -s . >"$tmpd/l.json" 2>/dev/null || { echo "fail: cannot write the live application list"; exit 1; }
   # Codex PR209-r1: the output must describe exactly the listed volumes, each with a name and a Labels field (an
   # object, or null for none); a missing volume or field makes the scan incomplete, never clean.
-  hitlist="$(printf '%s' "$json" | jq -r -s --slurpfile us "$tmpd/u.json" --slurpfile ws "$tmpd/n.json" '
-    $us[0] as $u | $ws[0] as $want |
+  hitlist="$(printf '%s' "$json" | jq -r -s --slurpfile us "$tmpd/u.json" --slurpfile ws "$tmpd/n.json" --slurpfile ls "$tmpd/l.json" '
+    $us[0] as $u | $ws[0] as $want | $ls[0] as $live |
+    def names($n; $x): $n == $x or ($n | startswith($x + "-")) or ($n | startswith($x + "_"));
     # Codex PR209-r7: the inspect output is exactly one JSON value; several arrays are malformed, never merged.
     if length == 1 then .[0] else error("bad") end |
     if type == "array" and length == ($want | length)
@@ -104,7 +108,16 @@ if [[ -n "$uuids" && -n "$names" ]]; then
     then .[] else error("bad") end
     | .Name as $n
     | [(.Labels // {})[]] as $vals
-    | first($u[] as $x | select($n == $x or ($n | startswith($x + "-")) or ($n | startswith($x + "_")) or ($vals | index([$x]) != null)) | $x) as $hit
+    # Codex PR209-r12: a label holding a purged uuid is a hit. Otherwise a label holding a live uuid keeps the volume
+    # off the list, and a name match counts only for the longest purged uuid it names, when no longer live uuid names
+    # it too (a live `app12345-prod_data` is never reported against a purged `app12345`).
+    | (first($u[] as $x | select($vals | index([$x]) != null) | $x) //
+       (if any($live[]; . as $y | $vals | index([$y]) != null) then empty else
+          ([$u[] | select(names($n; .))] | max_by(length)) as $p
+          | if $p == null then empty
+            elif any($live[]; names($n; .) and length > ($p | length)) then empty
+            else $p end
+        end)) as $hit
     | "\($hit)\t\($n | gsub("[^A-Za-z0-9._:/=,+-]"; ""))"' 2>/dev/null)" || { echo "fail: unreadable docker volume inspect output"; exit 1; }
 fi
 hits=0

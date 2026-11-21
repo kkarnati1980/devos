@@ -2,8 +2,9 @@
 // for orphaned application volumes. Runs inside the deployed API container, started by
 // `scripts/server/checks/teardown-orphan-volumes.sh` through
 // `docker exec … node deploy/with-db-url.mjs node apps/api/dist/teardown-volumes-cli.js purged-apps`.
-// It prints one JSON line, `{"uuids":[…],"invalid":n}`: the Coolify application uuids of `resource` rows a purge
-// marked deleted. Exit 0 listed, 1 failed, 2 usage, 3 skipped (no database here). It only reads; it never prints a
+// It prints one JSON line, `{"uuids":[…],"live":[…],"invalid":n}`: the Coolify application uuids of `resource` rows a
+// purge marked deleted, and (Codex PR209-r12) those of rows not deleted, so the check never reports a live
+// application's volume against a purged uuid that is a prefix of the live one. Exit 0 listed, 1 failed, 2 usage, 3 skipped (no database here). It only reads; it never prints a
 // secret or a database message (errors are a fixed code).
 import { fileURLToPath } from "node:url";
 
@@ -15,7 +16,11 @@ export const SCAN_UUID_RE = /^[A-Za-z0-9-]{8,64}$/;
 export const MAX_ROWS = 2000;
 export const USAGE = "teardown-volumes-cli.js purged-apps";
 
-export interface DeletedAppReader { deletedApplicationIds(limit: number): Promise<string[]> }
+export interface DeletedAppReader {
+  deletedApplicationIds(limit: number): Promise<string[]>;
+  /** Codex PR209-r12: Coolify application rows that are not deleted. */
+  liveApplicationIds(limit: number): Promise<string[]>;
+}
 
 /**
  * The CLI's core over an injected reader. Rows whose id cannot be matched safely are counted as `invalid` (never
@@ -24,32 +29,42 @@ export interface DeletedAppReader { deletedApplicationIds(limit: number): Promis
 export async function purgedAppsCli(argv: string[], reader: () => Promise<DeletedAppReader>): Promise<CliResult> {
   if (argv.length !== 1 || argv[0] !== "purged-apps") return { code: 2, out: { error: "usage", usage: USAGE } };
   let ids: string[];
+  let liveIds: string[];
   try {
-    ids = await (await reader()).deletedApplicationIds(MAX_ROWS + 1);
+    const r = await reader();
+    ids = await r.deletedApplicationIds(MAX_ROWS + 1);
+    liveIds = await r.liveApplicationIds(MAX_ROWS + 1);
   } catch {
     return { code: 1, out: { error: "teardown-volumes-read-failed" } };
   }
-  if (ids.length > MAX_ROWS) return { code: 1, out: { error: "teardown-volumes-too-many-rows", max: MAX_ROWS } };
-  const uuids = [...new Set(ids.filter((id) => typeof id === "string" && SCAN_UUID_RE.test(id)))].sort();
-  const invalid = ids.filter((id) => !(typeof id === "string" && SCAN_UUID_RE.test(id))).length;
-  return { code: 0, out: { uuids, invalid } };
+  if (!Array.isArray(ids) || !Array.isArray(liveIds)) return { code: 1, out: { error: "teardown-volumes-read-failed" } };
+  if (ids.length > MAX_ROWS || liveIds.length > MAX_ROWS) return { code: 1, out: { error: "teardown-volumes-too-many-rows", max: MAX_ROWS } };
+  const ok = (id: unknown): id is string => typeof id === "string" && SCAN_UUID_RE.test(id);
+  // A live id the check cannot match safely is left out: it can only make the check report more, never hide a leftover.
+  const live = [...new Set(liveIds.filter(ok))].sort();
+  // A uuid that is both deleted and live (a row still live) is treated as live, so live data is never reported.
+  const uuids = [...new Set(ids.filter(ok))].filter((u) => !live.includes(u)).sort();
+  const invalid = ids.filter((id) => !ok(id)).length;
+  return { code: 0, out: { uuids, live, invalid } };
 }
 
-/** The Prisma reader: Coolify `application` rows with status `deleted`, newest deletion first. Read-only. */
+/** The Prisma reader: Coolify `application` rows, deleted (newest deletion first) or not deleted. Read-only. */
 export function prismaDeletedApps(db: any, timeoutMs: number): DeletedAppReader {
+  const read = async (status: unknown, limit: number) => {
+    const rows = await db.$transaction(
+      (tx: any) => tx.resource.findMany({
+        where: { provider: "coolify", kind: "application", status },
+        select: { externalId: true },
+        orderBy: [{ deletedAt: "desc" }, { id: "asc" }],
+        take: limit,
+      }),
+      { timeout: timeoutMs, maxWait: timeoutMs },
+    );
+    return rows.map((r: { externalId: string }) => r.externalId);
+  };
   return {
-    async deletedApplicationIds(limit) {
-      const rows = await db.$transaction(
-        (tx: any) => tx.resource.findMany({
-          where: { provider: "coolify", kind: "application", status: "deleted" },
-          select: { externalId: true },
-          orderBy: [{ deletedAt: "desc" }, { id: "asc" }],
-          take: limit,
-        }),
-        { timeout: timeoutMs, maxWait: timeoutMs },
-      );
-      return rows.map((r: { externalId: string }) => r.externalId);
-    },
+    deletedApplicationIds: (limit) => read("deleted", limit),
+    liveApplicationIds: (limit) => read({ not: "deleted" }, limit),
   };
 }
 
