@@ -25,6 +25,7 @@ One Coolify **Docker Compose** application built from this repo:
 | `DEVOS_TLS_CERT_FILE`, `DEVOS_TLS_KEY_FILE` | yes (compose refuses to start without them) | paths **inside** the container, e.g. `/certs/dashboard.crt`, `/certs/dashboard.key`; the api and the dashboard use the same files |
 | `DEVOS_COOKIE_SECURE` | default `1` | api and dashboard; keep `1` on the server (M1.3-a). With `1` the api and the dashboard each refuse to start (`config-tls-required`) unless both TLS files are readable |
 | `DEVOS_ISOLATION_STATE_TOKEN` | yes (secret) | S4 isolation state listener; set on the server by `scripts/server/isolation-token-setup.sh`, never typed (S4-t1) |
+| `DEVOS_TAILNET_IP`, `DEVOS_COOLIFY_URL`, `DEVOS_PROJECT_PORTS` | no | M2.4 provisioning (d4a): unset, the API uses `DEVOS_BIND_IP` (a tailnet address) and `http://<DEVOS_BIND_IP>:8000`, and ports `20000-20999`. The owner and the Coolify server uuid come with M2.4-d4b |
 | `API_INTERNAL_PORT` | default `3002` | host loopback port of the isolation state listener (`127.0.0.1` only). The container port stays 3002. Change it only together with `API_INTERNAL_PORT=` in the host's `/root/.devos/server-agent.conf`, which `isolation-apply.sh` reads |
 | `DEVOS_API_PORT`, `DASHBOARD_PORT` | default `3001`, `3000` | host ports on `DEVOS_BIND_IP` |
 | `DEVOS_TAILSCALE_SOCKET_HOST` | default `/var/run/tailscale/tailscaled.sock` | mounted read-only into the api |

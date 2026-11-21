@@ -128,6 +128,32 @@ test("d1 wiring: a name_conflict raises the rename-or-adopt card for that projec
   assert.equal(rec.cards[0].target, "project:11111111-1111-4111-8111-111111111111/github/repo");
 });
 
+test("M2.4-d4a: the tailnet address and the Coolify origin fall back to DEVOS_BIND_IP; a set value wins", () => {
+  const { DEVOS_TAILNET_IP, DEVOS_COOLIFY_URL, ...rest } = ENV;
+  const bind = { ...rest, DEVOS_BIND_IP: "100.64.0.9" };
+  for (const env of [bind, { ...bind, DEVOS_TAILNET_IP: "", DEVOS_COOLIFY_URL: "", DEVOS_PROJECT_PORTS: "" }]) {
+    const c = provisionConfig(env);
+    assert.equal(c.tailnetIp, "100.64.0.9");
+    assert.equal(c.coolifyOrigin, "http://100.64.0.9:8000");
+    assert.equal(c.portsRaw, undefined, "an empty port range is the default range, not an invalid one");
+  }
+  const set = provisionConfig({ ...ENV, DEVOS_BIND_IP: "100.64.0.9" });
+  assert.equal(set.tailnetIp, "100.64.0.7");
+  assert.equal(set.coolifyOrigin, "http://devos-coolify:8000");
+  // The fallback passes the same checks as a set value.
+  assert.deepEqual(provisionConfig({ ...rest, DEVOS_COOLIFY_URL: "http://c:8000", DEVOS_BIND_IP: "192.168.1.10" }), { off: "provision-tailnet-ip-not-tailnet" });
+  assert.deepEqual(provisionConfig({ ...rest, DEVOS_BIND_IP: "not-an-ip" }), { off: "provision-coolify-url-not-set" });
+  // Pre-review: no Coolify fallback for a bind address outside the tailnet (CI's loopback, a LAN or public address).
+  for (const ip of ["127.0.0.1", "192.168.1.10", "200.234.41.176"]) {
+    assert.deepEqual(provisionConfig({ ...ENV, DEVOS_COOLIFY_URL: "", DEVOS_BIND_IP: ip }), { off: "provision-coolify-url-not-set" }, ip);
+  }
+  assert.equal(provisionConfig({ ...ENV, DEVOS_BIND_IP: "not-an-ip" }).tailnetIp, "100.64.0.7", "a set tailnet address ignores the bind address");
+  assert.deepEqual(provisionConfig({ ...rest, DEVOS_COOLIFY_URL: "http://c:8000" }), { off: "provision-tailnet-ip-not-set" }, "no bind address: off, as before");
+  // The owner and the server uuid have no fallback.
+  assert.deepEqual(provisionConfig({ ...bind, DEVOS_GITHUB_OWNER: "" }), { off: "provision-github-owner-not-set" });
+  assert.deepEqual(provisionConfig({ ...bind, DEVOS_COOLIFY_SERVER_UUID: "" }), { off: "provision-coolify-server-not-set" });
+});
+
 test("d1 wiring: off, with a fixed code, without a vault or any required setting (fail closed, never allowAll)", () => {
   assert.deepEqual(wire({ w: { vault: null } }).job, { off: "provision-vault-not-configured" });
   const cases = [
