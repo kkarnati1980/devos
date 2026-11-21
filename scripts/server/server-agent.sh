@@ -89,9 +89,18 @@ fi
 # Redact token shapes, Bearer values and the literal Coolify token (read from its 600 file, never echoed).
 redact() {
   local out
+  out="$(sed -E 's/(sk-[A-Za-z0-9_*.-]{4})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g; s/(Bearer )[A-Za-z0-9._|=~+\/-]+/\1[redacted]/g')"
+  if [[ -n "$CF_TOKEN_FILE" && -s "$CF_TOKEN_FILE" ]]; then
+    awk -v tf="$CF_TOKEN_FILE" 'BEGIN{getline t < tf} { if (t != "") { while ((i = index($0, t)) > 0) $0 = substr($0, 1, i-1) "[redacted]" substr($0, i+length(t)) } print }' <<<"$out"
+  else
+    printf '%s\n' "$out"
+  fi
+}
+# Codex PR204-r11/r14: the isolation tick's own copy. It returns non-zero when its sed fails, so no caller takes
+# partial output as redacted; the shared redact() above stays exactly as before for every other caller.
+redact_strict() {
+  local out
   out="$(sed -E 's/(sk-[A-Za-z0-9_*.-]{4})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g; s/(Bearer )[A-Za-z0-9._|=~+\/-]+/\1[redacted]/g')" || return 1
-  # Codex PR204-r11: a failed sed returns non-zero even where errexit is off (an if condition), so no caller ever
-  # takes partial output as redacted; awk or printf, the last command, gives the status otherwise.
   if [[ -n "$CF_TOKEN_FILE" && -s "$CF_TOKEN_FILE" ]]; then
     awk -v tf="$CF_TOKEN_FILE" 'BEGIN{getline t < tf} { if (t != "") { while ((i = index($0, t)) > 0) $0 = substr($0, 1, i-1) "[redacted]" substr($0, i+length(t)) } print }' <<<"$out"
   else
@@ -396,14 +405,13 @@ isolation_tick() {
   set +e; DEVOS_DIR="$DIR" timeout "$ISOLATION_TIMEOUT" bash "$BIN/isolation-apply.sh" > "$TMP/iso.out" 2>&1 </dev/null; rc=$?; set -e
   # Codex PR204-r12: the agent-log copy is a condition, so a failed redaction (redact returns non-zero) is logged
   # and the run goes on to the guarded state write below; it never aborts the agent under errexit.
-  if ! redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done; then
+  if ! redact_strict < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done; then
     log "isolation: could not redact the run's output for the agent log"
   fi
   case "$rc" in 0) st=ok;; 4) st="fail (disabled)";; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
   if [[ ! -e "$ST/isolation.enforced" && $rc -ne 4 ]]; then
     if (( rc == 3 )) || { (( rc == 1 )) && grep -qx 'state fetch failed (curl exit 7): nothing changed' "$TMP/iso.out"; }; then st=skipped; fi
   fi
-  now="$(date +%s)"
   # v1.5.1: the run's output for the check's message (docs/modules/S4.md, "S4-c isolation-apply diagnosis"). It is
   # kept in isolation.state itself, after the result line: the run's non-empty output lines, all of them when there
   # are at most 19, else the first 9, a count of the lines left out and the last 9 (Codex PR204-r1..r4: no pick of
@@ -417,7 +425,8 @@ isolation_tick() {
   # full disk, say) stops before the rename, leaves the previous complete file in place, removes the partial one and
   # is logged. (pipefail is on, so a failed stage of the filter fails the chain; grep's exit 1, "no line left", is
   # the only status taken as success, Codex PR204-r10.)
-  if redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || [[ $? -eq 1 ]]; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" \
+  # Codex PR204-r14: the timestamp is read inside the chain too, so a failed date is a failed write, never an abort.
+  if now="$(date +%s)" && redact_strict < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || [[ $? -eq 1 ]]; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" \
      && printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && isolation_lines >> "$ST/isolation.state.new" \
      && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; then :; else
     rm -f "$ST/isolation.state.new" 2>/dev/null || :
