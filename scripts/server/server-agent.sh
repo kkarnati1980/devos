@@ -398,17 +398,19 @@ isolation_tick() {
   # first 9, a count of the lines left out and the last 9 (Codex PR204-r1..r4: no pick of single lines or prefixes
   # keeps both the cause, printed first, and the outcome, printed last). The check's output is then at most 20
   # lines, all of which the server-check comment shows. Redacted first, then only a fixed character set is kept and
-  # each line is cut to 200, so no secret-shaped value or control character reaches the public comment. Written
-  # BEFORE isolation.state, after the previous run's file was removed; the check shows it only when both epochs match.
+  # each line is cut to 200, so no secret-shaped value or control character reaches the public comment.
+  # Order (Codex PR204-r6): the previous run's file is removed before the run, isolation.state is written first and
+  # this file after it, and the check shows it only when its epoch is the state's. So a reader at any moment sees
+  # either no file (nothing shown) or this run's file with this run's state; two runs in one second cannot cross.
   # A failed write is only logged (the check then shows nothing).
+  { printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
+    || log "isolation: could not write isolation.state"
   redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" || : > "$TMP/iso.clean"
   { { printf '%s\n' "$now"
       if (( $(wc -l < "$TMP/iso.clean") <= 19 )); then cat "$TMP/iso.clean"
       else head -n 9 "$TMP/iso.clean"; echo "... $(( $(wc -l < "$TMP/iso.clean") - 18 )) lines left out ..."; tail -n 9 "$TMP/iso.clean"; fi
     } > "$ST/isolation.last.new" && mv -f "$ST/isolation.last.new" "$ST/isolation.last"; } \
     || log "isolation: could not write isolation.last"
-  { printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
-    || log "isolation: could not write isolation.state"
   [[ "$st" == ok && ! -e "$ST/isolation.enforced" ]] && { touch "$ST/isolation.enforced"; log "isolation: enforced from now on (a skip is a failure)"; }
   log "isolation: $st"
 }
