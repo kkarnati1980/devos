@@ -171,3 +171,15 @@ test("DEVOS-236: Codex PR209-r4 — 2,000 purged applications with 64-character 
   assert.equal(clean.code, 0, clean.out);
   assert.match(clean.out, /^ok: no leftover volume \(2000 purged applications checked\)/m);
 });
+
+test("DEVOS-236: Codex PR209-r5 — only the CLI's fixed error codes are printed; other error text never leaves the container", () => {
+  const known = run({ cli: '{"error":"teardown-volumes-too-many-rows","max":2000}', cliRc: 1 });
+  assert.equal(known.code, 1, known.out);
+  assert.match(known.out, /^fail: the purged-application read failed \(exit 1\): teardown-volumes-too-many-rows$/m);
+  const leak = run({ cli: '{"error":"password=Hunter2secretValue connection refused"}', cliRc: 1 });
+  assert.equal(leak.code, 1, leak.out);
+  assert.match(leak.out, /^fail: the purged-application read failed \(exit 1\): unrecognised error$/m);
+  assert.doesNotMatch(leak.out, /Hunter2|password/);
+  const none = run({ cli: "not json", cliRc: 1 });
+  assert.match(none.out, /^fail: the purged-application read failed \(exit 1\): no output$/m);
+});

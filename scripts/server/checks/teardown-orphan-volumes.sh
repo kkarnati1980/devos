@@ -28,7 +28,10 @@ case "$rc" in
   0) ;;
   3) echo "fail: the API container has no database, so the scan cannot run"; exit 1 ;;   # Codex PR209-r2: never a skip
   124) echo "fail: the purged-application read timed out"; exit 1 ;;
-  *) echo "fail: the purged-application read failed (exit $rc): $(clean "$(printf '%s' "$line" | jq -r '.error // "no output"' 2>/dev/null)")"; exit 1 ;;
+  *) # Codex PR209-r5: only the CLI's own fixed codes are printed; any other error text is never copied out.
+     code="$(printf '%s' "$line" | jq -r '.error | if type == "string" then . else "" end' 2>/dev/null)"
+     case "$code" in usage|teardown-volumes-read-failed|teardown-volumes-too-many-rows|teardown-volumes-error) ;; "") code="no output" ;; *) code="unrecognised error" ;; esac
+     echo "fail: the purged-application read failed (exit $rc): $code"; exit 1 ;;
 esac
 # Only uuids in the CLI's own shape are used; anything else makes the result incomplete, never clean (Codex
 # PR209-r1: each element must be a string of the uuid shape inside jq, so an empty string or a number fails; r3: the
