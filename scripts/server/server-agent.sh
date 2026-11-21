@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
 # Version: 1.5.1
-# v1.5.1 (DEVOS-128, 21 Nov 2026): the isolation run's last two output lines, redacted and reduced to a fixed character
-# set (letters, digits, space and . _ : / ( ) = , + -; at most 200 each), are kept in agent/isolation.last with the
-# run's epoch, so the project-isolation-apply check can say why that run failed (only "exit 1" since 19 Nov).
+# v1.5.1 (DEVOS-128, 21 Nov 2026): the isolation run's output lines (at most 19), redacted and reduced to a fixed
+# character set (letters, digits, space and . _ : / ( ) = , + -; at most 200 each), are kept in agent/isolation.state
+# after its result line, in one atomic write, so the project-isolation-apply check can say why that run failed.
 # v1.5.0 (DEVOS-127, S4-b2a): the allow-list gains scripts/server/isolation-apply.sh (S4-b). Every tick, after the
 # cert renewal and before anything that needs GitHub, the agent runs it under `timeout 60` (deferred while a
 # deployment is in flight: its self-test would see the DevOS API restarting). The redacted output goes to the
@@ -383,9 +383,6 @@ isolation_tick() {
     log "isolation deferred: a deployment is in flight"; return 0
   done
   if [[ $DRY -eq 1 ]]; then log "WOULD run isolation-apply.sh"; return 0; fi
-  # v1.5.1 (Codex PR204-r5): the previous run's output is removed before this run, so a failed write below can
-  # never leave it in place for this run's result, even within the same second.
-  rm -f "$ST/isolation.last" || { log "isolation: could not remove the previous isolation.last"; }
   set +e; DEVOS_DIR="$DIR" timeout "$ISOLATION_TIMEOUT" bash "$BIN/isolation-apply.sh" > "$TMP/iso.out" 2>&1 </dev/null; rc=$?; set -e
   redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done
   case "$rc" in 0) st=ok;; 4) st="fail (disabled)";; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
@@ -393,24 +390,21 @@ isolation_tick() {
     if (( rc == 3 )) || { (( rc == 1 )) && grep -qx 'state fetch failed (curl exit 7): nothing changed' "$TMP/iso.out"; }; then st=skipped; fi
   fi
   now="$(date +%s)"
-  # v1.5.1: the run's output for the check's message (docs/modules/S4.md, "S4-c isolation-apply diagnosis"): the
-  # run's epoch on the first line, then its non-empty output lines, all of them when there are at most 19, else the
-  # first 9, a count of the lines left out and the last 9 (Codex PR204-r1..r4: no pick of single lines or prefixes
-  # keeps both the cause, printed first, and the outcome, printed last). The check's output is then at most 20
-  # lines, all of which the server-check comment shows. Redacted first, then only a fixed character set is kept and
-  # each line is cut to 200, so no secret-shaped value or control character reaches the public comment.
-  # Order (Codex PR204-r6): the previous run's file is removed before the run, isolation.state is written first and
-  # this file after it, and the check shows it only when its epoch is the state's. So a reader at any moment sees
-  # either no file (nothing shown) or this run's file with this run's state; two runs in one second cannot cross.
-  # A failed write is only logged (the check then shows nothing).
-  { printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
-    || log "isolation: could not write isolation.state"
+  # v1.5.1: the run's output for the check's message (docs/modules/S4.md, "S4-c isolation-apply diagnosis"). It is
+  # kept in isolation.state itself, after the result line: the run's non-empty output lines, all of them when there
+  # are at most 19, else the first 9, a count of the lines left out and the last 9 (Codex PR204-r1..r4: no pick of
+  # single lines or prefixes keeps both the cause, printed first, and the outcome, printed last). Redacted first,
+  # then only a fixed character set is kept and each line is cut to 200, so no secret-shaped value or control
+  # character reaches the public comment.
+  # Codex PR204-r7: one file, written to a temp file and renamed, so the result and its lines are replaced together
+  # and a reader sees one run's whole file or the previous run's whole file, never a mix (no pairing by epoch).
+  # The first line keeps its format, so a v1.5.0 check reads it unchanged. A failed write is only logged.
   redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" || : > "$TMP/iso.clean"
-  { { printf '%s\n' "$now"
+  { { printf '%s %s\n' "$now" "$st"
       if (( $(wc -l < "$TMP/iso.clean") <= 19 )); then cat "$TMP/iso.clean"
       else head -n 9 "$TMP/iso.clean"; echo "... $(( $(wc -l < "$TMP/iso.clean") - 18 )) lines left out ..."; tail -n 9 "$TMP/iso.clean"; fi
-    } > "$ST/isolation.last.new" && mv -f "$ST/isolation.last.new" "$ST/isolation.last"; } \
-    || log "isolation: could not write isolation.last"
+    } > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
+    || log "isolation: could not write isolation.state"
   [[ "$st" == ok && ! -e "$ST/isolation.enforced" ]] && { touch "$ST/isolation.enforced"; log "isolation: enforced from now on (a skip is a failure)"; }
   log "isolation: $st"
 }

@@ -48,7 +48,7 @@ function commit(files, msg = "c") {
 
 // S4-b2a: a stand-in for isolation-apply.sh (its own tests are isolation-apply.test.mjs): counts runs, prints a
 // secret-shaped value (must be redacted) and exits with FAKE_ISO_RC (default 0); FAKE_ISO_SLEEP makes it hang.
-const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + ' Bearer abcDEF+ghi/jkl012345678901234567890="; [[ -n "${FAKE_ISO_MSG:-}" ]] && echo "$FAKE_ISO_MSG"; [[ -n "${FAKE_ISO_PEEK:-}" ]] && { [[ -e "$DEVOS_DIR/agent/isolation.last" ]] && echo "peek: previous file present" || echo "peek: none"; }; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
+const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + ' Bearer abcDEF+ghi/jkl012345678901234567890="; [[ -n "${FAKE_ISO_MSG:-}" ]] && echo "$FAKE_ISO_MSG"; [[ -n "${FAKE_ISO_PEEK:-}" ]] && { [[ -e "$DEVOS_DIR/agent/isolation.last" ]] && echo "peek: separate file present" || echo "peek: none"; }; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
 const real = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
 const baseFiles = () => ({
   "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
@@ -728,6 +728,7 @@ test("DEVOS-87 AT13: an allow-listed file missing from bin/ is installed again f
 // ---- S4-b2a (DEVOS-127): isolation-apply.sh every tick, reported by checks/project-isolation-apply.sh ----
 const isoCount = () => (fs.existsSync(path.join(D(), "iso.count")) ? fs.readFileSync(path.join(D(), "iso.count"), "utf8").split("\n").filter(Boolean).length : 0);
 const isoState = () => fs.readFileSync(path.join(D(), "agent/isolation.state"), "utf8");
+const isoFirst = () => isoState().split("\n")[0]; // the result line; v1.5.1 keeps the run's output lines after it
 
 test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and runs every tick; output redacted; result kept", async () => {
   resetMock(); freshState();
@@ -743,30 +744,30 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.match(r2.out, /isolation: ok/);
   assert.doesNotMatch(r2.out, /abcdefghijklmnop1234/, "isolation output is redacted");
   assert.doesNotMatch(r2.out, /ghi\/jkl012345/, "a base64 Bearer value is redacted whole");
-  assert.match(isoState(), /^\d{1,12} ok\n$/);
+  assert.match(isoFirst(), /^\d{1,12} ok$/);
   assert.ok(fs.existsSync(path.join(D(), "agent/isolation.enforced")), "the first ok marks isolation as enforced");
   await runAgent();
   assert.equal(isoCount(), 3, "runs again on the next tick (not daily)");
   // Once enforced, "not set up" and a missing listener are failures, never a silent skip (pre-review 1/2).
   await runAgent({ FAKE_ISO_RC: "3" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 3\)\n$/);
+  assert.match(isoFirst(), /^\d{1,12} fail \(exit 3\)$/);
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  assert.match(isoFirst(), /^\d{1,12} fail \(exit 1\)$/);
   await runAgent({ FAKE_ISO_RC: "1" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
-  // DEVOS-128: the last output line is kept, redacted and reduced to the fixed character set (\x07, ; and " dropped).
+  assert.match(isoFirst(), /^\d{1,12} fail \(exit 1\)$/);
+  // DEVOS-128: the run's output lines follow the result line in isolation.state, redacted and reduced to the fixed
+  // character set (\x07, ; and " dropped; [ ] are outside the set).
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed;\x07 \"x\" Bearer abcDEF+ghi/jkl012345678901234567890=" });
-  const lastF = () => fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8");
-  const epoch = () => isoState().split(" ")[0];
-  // The run's epoch, then its output lines, redacted and filtered (\x07, ; and " dropped; [ ] are outside the set).
-  assert.equal(lastF(), `${epoch()}\niso run ${lastF().split("\n")[1].slice(8)}\nstate fetch failed (curl exit 22): nothing changed x Bearer redacted\n`);
+  const lastF = () => isoState();
+  assert.equal(lastF(), `${isoFirst()}\niso run ${lastF().split("\n")[1].slice(8)}\nstate fetch failed (curl exit 22): nothing changed x Bearer redacted\n`);
+  assert.match(isoFirst(), /^\d{1,12} fail \(exit 1\)$/, "the result line keeps its format");
   assert.match(lastF().split("\n")[1], /^iso run sk-\w{4}redacted Bearer redacted$/);
   assert.doesNotMatch(lastF(), /abcdefghijklmnop1234|ghi\/jkl012345/, "redacted");
   // Codex PR204-r2..r4: a cause, any lines after it and the outcome are all kept, however long the lines between.
   const mid = Array.from({ length: 5 }, (_, k) => `conntrack clean-up incomplete, pending ${"10.208.0.0/24 ".repeat(12)}${k}`).join("\n");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: `${mid}\nboot persistence: the DEVOS S4 markers are broken\nunchanged: 2 stacks, block in place, but not persisted for boot` });
   const lines = lastF().split("\n");
-  assert.equal(lines[0], epoch());
+  assert.match(lines[0], /^\d{1,12} fail \(exit 1\)$/);
   assert.ok(lines.includes("boot persistence: the DEVOS S4 markers are broken"), "the cause is kept");
   assert.equal(lines.at(-2), "unchanged: 2 stacks, block in place, but not persisted for boot", "the outcome is kept");
   assert.ok(lines.every((l) => l.length <= 200), "each line at most 200 characters");
@@ -781,20 +782,20 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.equal(many.at(-1), "line 29");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
   assert.equal(lastF().split("\n")[2], "y".repeat(200), "at most 200 characters");
-  // Codex PR204-r5: the previous run's file is gone before the next run starts, so a failed write cannot leave it.
-  assert.ok(fs.existsSync(path.join(D(), "agent/isolation.last")));
+  // Codex PR204-r7: one file, replaced whole by a rename; no separate output file is ever written, so nothing can be
+  // paired with another run's result.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_PEEK: "1" });
-  assert.doesNotMatch(lastF(), /peek: previous file present/, "removed before the run");
   assert.match(lastF(), /peek: none/);
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.last")), "no separate output file");
   // Pre-review: blank lines are skipped.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
-  assert.equal(lastF().split("\n").length, 3, "epoch, the one non-empty line, end");
-  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.last.new")), "no temp file left");
+  assert.equal(lastF().split("\n").length, 3, "result, the one non-empty line, end");
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state.new")), "no temp file left");
   await runAgent({ FAKE_ISO_RC: "4" });
-  assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
+  assert.match(isoFirst(), /^\d{1,12} fail \(disabled\)$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
   assert.equal(r6.code, 0, r6.out);
-  assert.match(isoState(), /^\d{1,12} fail \(timeout\)\n$/, "the agent's timeout bounds the run");
+  assert.match(isoFirst(), /^\d{1,12} fail \(timeout\)$/, "the agent's timeout bounds the run");
   const before = isoCount();
   const r7 = await runAgent({}, ["--dry-run"]);
   assert.match(r7.out, /WOULD run isolation-apply\.sh/);
@@ -807,15 +808,15 @@ test("S4-b2a AT-b2a-1b: before the first ok, no token (exit 3) or no listener ye
   M.main = sha; green(sha); pass(sha);
   await runAgent({ FAKE_ISO_RC: "3" });
   await runAgent({ FAKE_ISO_RC: "3" });
-  assert.match(isoState(), /^\d{1,12} skipped\n$/, "no token yet");
+  assert.match(isoFirst(), /^\d{1,12} skipped$/, "no token yet");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
-  assert.match(isoState(), /^\d{1,12} skipped\n$/, "token present, listener not deployed yet (S4-t2)");
+  assert.match(isoFirst(), /^\d{1,12} skipped$/, "token present, listener not deployed yet (S4-t2)");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/, "a listener that answers with an error is a failure");
+  assert.match(isoFirst(), /^\d{1,12} fail \(exit 1\)$/, "a listener that answers with an error is a failure");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "self-test failed after the change; previous block restored" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  assert.match(isoFirst(), /^\d{1,12} fail \(exit 1\)$/);
   await runAgent({ FAKE_ISO_RC: "4" });
-  assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "disabled is a failure even before the first ok");
+  assert.match(isoFirst(), /^\d{1,12} fail \(disabled\)$/, "disabled is a failure even before the first ok");
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.enforced")));
 });
 
@@ -824,7 +825,7 @@ test("S4-b2a AT-b2a-1c: a new SHA's server-check reports isolation-apply.sh as i
   const sha1 = commit({ ...baseFiles(), "xb2a1c": "1" }, "s4-b2a working script");
   M.main = sha1; green(sha1); pass(sha1);
   await runAgent(); await runAgent();
-  assert.match(isoState(), /ok\n$/);
+  assert.match(isoFirst(), / ok$/);
   const broken = '#!/usr/bin/env bash\necho x >> "$DEVOS_DIR/iso.count"; exit 1\n';
   const sha2 = commit({ ...baseFiles(), "scripts/server/isolation-apply.sh": broken,
     "scripts/server/checks/project-isolation-apply.sh": real("scripts/server/checks/project-isolation-apply.sh"), "xb2a1c": "2" }, "s4-b2a broken script");
@@ -835,7 +836,7 @@ test("S4-b2a AT-b2a-1c: a new SHA's server-check reports isolation-apply.sh as i
   const sc = statusPosts("server-check").find(() => true);
   assert.ok(sc, r.out);
   assert.equal(sc.state, "failure", "the broken script's result is in this SHA's server-check");
-  assert.match(isoState(), /fail \(exit 1\)\n$/);
+  assert.match(isoFirst(), / fail \(exit 1\)$/);
 });
 
 test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed copy missing from bin/ is repaired", async () => {
@@ -865,11 +866,10 @@ test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed
 });
 
 const ISO_CHECK = path.join(ROOT, "scripts/server/checks/project-isolation-apply.sh");
-function isoCheck(state, extra = {}, lastLine = null) {
+function isoCheck(state, extra = {}) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "iso-check-"));
   fs.mkdirSync(path.join(d, "agent"));
   if (state !== null) fs.writeFileSync(path.join(d, "agent/isolation.state"), state);
-  if (lastLine !== null) fs.writeFileSync(path.join(d, "agent/isolation.last"), lastLine);
   const r = spawnSync("bash", [ISO_CHECK], { env: { ...process.env, DEVOS_DIR: d, ...extra }, encoding: "utf8" });
   fs.rmSync(d, { recursive: true, force: true });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -889,21 +889,33 @@ test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips
   assert.equal(isoCheck("garbage\n").code, 1, "unreadable fails, never passes");
   assert.equal(isoCheck(`${ago(60)} ok extra\n`).code, 1);
   assert.equal(isoCheck(`${ago(100)} ok\n`, { ISOLATION_MAX_AGE: "50" }).code, 1);
-  // DEVOS-128: a failure names the run's last line; the check filters it again; an ok or skip never prints it.
+  // DEVOS-128: a failure names the run's output lines (kept after the result line in the same file); the check
+  // filters them again; an ok or skip never prints them.
   const t = ago(60);
   const age = "\\d+s ago"; // Codex PR204-r4: the age is read from the clock in each subprocess
-  const why = isoCheck(`${t} fail (exit 1)\n`, {}, `${t}\nself-test failed after apply (ssh 100.64.0.1:22 refused): rolling back\nrolled back to the previous block\n`);
+  const why = isoCheck(`${t} fail (exit 1)\nself-test failed after apply (ssh 100.64.0.1:22 refused): rolling back\nrolled back to the previous block\n`);
   assert.equal(why.code, 1);
   assert.match(why.out, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n  it said: self-test failed after apply \\(ssh 100\\.64\\.0\\.1:22 refused\\): rolling back\\n  it said: rolled back to the previous block\\n$`));
-  // Codex PR204-r1: output from another run (an older epoch) is never shown.
-  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t - 180}\nold cause\n`).out, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n$`));
+  // Codex PR204-r7: a stray isolation.last (another run's output) is never read.
+  const d2 = fs.mkdtempSync(path.join(os.tmpdir(), "iso-check-"));
+  fs.mkdirSync(path.join(d2, "agent"));
+  fs.writeFileSync(path.join(d2, "agent/isolation.state"), `${t} fail (exit 1)\n`);
+  fs.writeFileSync(path.join(d2, "agent/isolation.last"), `${t}\nother run cause\n`);
+  const stray = spawnSync("bash", [ISO_CHECK], { env: { ...process.env, DEVOS_DIR: d2 }, encoding: "utf8" });
+  fs.rmSync(d2, { recursive: true, force: true });
+  assert.match(stray.stdout, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n$`));
+  // A v1.5.0 state file (one line) still reads the same.
+  assert.match(isoCheck(`${t} fail (exit 1)\n`).out, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n$`));
   // Read again through the filter, the 200-character cut and the 19-line limit.
-  const dirty = isoCheck(`${t} fail (exit 1)\n`, {}, `${t}\na;b\`c$d\x1b[31m${"z".repeat(300)}\n` + Array.from({ length: 30 }, (_, k) => `l${k}`).join("\n") + "\n");
+  const dirty = isoCheck(`${t} fail (exit 1)\na;b\`c$d\x1b[31m${"z".repeat(300)}\n` + Array.from({ length: 30 }, (_, k) => `l${k}`).join("\n") + "\n");
   const out = dirty.out.split("\n").slice(1, -1);
   assert.equal(out[0], `  it said: abcd31m${"z".repeat(193)}`);
   assert.equal(out.length, 19, "at most 19 lines after the fail line");
-  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t}\n`).out, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n$`), "a run with no output adds nothing");
-  assert.doesNotMatch(isoCheck(`${t} ok\n`, {}, `${t}\nold failure\n`).out, /old failure/);
+  // The result line is still checked first: lines after a malformed one never make it readable.
+  assert.equal(isoCheck(`garbage\n${t} ok\n`).code, 1);
+  assert.equal(isoCheck(`${t} ok\nfail (exit 1)\n`).code, 0, "an ok with lines after it is still an ok");
+  assert.doesNotMatch(isoCheck(`${t} ok\nold failure\n`).out, /old failure/);
+  assert.doesNotMatch(isoCheck(`${t} skipped\nold failure\n`).out, /old failure/);
 });
 
 // ---- DEVOS-90: re-checks on request and every 6 hours ----
