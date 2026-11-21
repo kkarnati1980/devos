@@ -5,8 +5,9 @@
 # picked here from a fixed list (config, token, state-fetch, refused, lock, deadline, conntrack, apply, self-test,
 # rollback, record, boot-persistence, ipv6). The server agent keeps only that code, next to the exit code, in
 # isolation.state, so the project-isolation-apply check says why a run failed without any raw output reaching
-# GitHub. The code names the step that stopped the run; an earlier IPv6 failure is "ipv6" only when nothing
-# else failed. Messages and exit codes are unchanged.
+# GitHub. The code names the step that stopped the run (a rollback that is not complete in every part is
+# "rollback"); an earlier IPv6 failure is "ipv6" only when nothing else failed. Exit codes are unchanged; a
+# rollback now names the part it could not restore (Codex PR210-r1).
 # v1.4.0 (DEVOS-127, S4-b2c): the IPv6 defence-in-depth drop. Chain DEVOS-ISO6 (`-i devos-p+ -j DROP`: every IPv6
 # packet from a project bridge, which S4 names devos-p<idx>) is jumped to first from the ip6tables DOCKER-USER,
 # FORWARD and INPUT on every apply run, and kept in /etc/ufw/after6.rules for boot. A failure there does not stop
@@ -499,11 +500,20 @@ if ! post_msg="$(selftest)"; then
     echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; fail self-test
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
+  # Codex PR210-r1: every rollback step counts. The live part first; then the pending cuts and the boot block,
+  # each run whatever the other did. Any failure is "rollback", so a half-restored host is never "self-test".
   if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && record "$PREV" && { ct_restore; boot_sync "$PREV"; echo "rolled back to the previous block"; } || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
+    install_block "$PREV" && record "$PREV" || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
+    rb_what="rolled back to the previous block"; rb_boot="$PREV"
   else
-    remove_block && rm -f "$ISO/live.sha256" && { ct_restore; boot_sync ""; echo "rolled back: S4 block removed"; } || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
+    remove_block && rm -f "$ISO/live.sha256" || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
+    rb_what="rolled back: S4 block removed"; rb_boot=""
   fi
+  rb_rc=0
+  ct_restore || { echo "$rb_what, but $ISO/conntrack.pending could not be restored"; rb_rc=1; }
+  boot_sync "$rb_boot" || { echo "$rb_what, but the boot block in $UFW_AFTER could not be restored"; rb_rc=1; }
+  (( rb_rc == 0 )) || fail rollback
+  echo "$rb_what"
   fail self-test
 fi
 record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; fail record; }

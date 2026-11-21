@@ -350,6 +350,23 @@ test("DEVOS-128: a rollback that cannot complete says rollback, not self-test", 
   } finally { l.stop(); }
 });
 
+test("DEVOS-128 (Codex PR210-r1): a rollback whose boot block cannot be restored says rollback; the live block is restored", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const good = nf(h, "DEVOS-ISO-FWD");
+  const l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
+    fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD);   // M0.1's block gone: boot_sync cannot write
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /rolled back to the previous block, but the boot block in .* could not be restored/);
+    assert.equal(reason(r), "rollback");
+    assert.equal(nf(h, "DEVOS-ISO-FWD"), good, "the live rollback itself still happened");
+  } finally { l.stop(); }
+});
+
 test("AT8 self-test failure on the first apply removes the block entirely", async () => {
   const h = host(STATE);
   const l = await listener();
