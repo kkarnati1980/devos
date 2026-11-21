@@ -79,7 +79,9 @@ test("M2.4-d4a the api gets three provisioning settings by name and DEVOS_BIND_I
   // Not before M2.4-d4b: with both set the sweep provisions, and no project stack may run before DEVOS-128 passes.
   for (const k of ["DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_SERVER_UUID"]) assert.equal(e[k], undefined, `${k} is not passed yet`);
   for (const s of ["dashboard", "worker", "migrate"]) {
-    for (const k of ["DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_URL", "DEVOS_COOLIFY_SERVER_UUID"]) assert.equal(compose.services[s].environment?.[k], undefined, `${s} does not get ${k}`);
+    for (const k of ["DEVOS_TAILNET_IP", "DEVOS_COOLIFY_URL", "DEVOS_PROJECT_PORTS", "DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_SERVER_UUID"]) {
+      assert.equal(compose.services[s].environment?.[k], undefined, `${s} does not get ${k}`);
+    }
   }
 });
 
