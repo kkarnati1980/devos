@@ -13,5 +13,6 @@ Both runners were idle from 19 Nov 19:45 IST for about 35 hours. P2 could not cl
 3. **Found in this review, to do now (P2):** `project-isolation-apply` has failed (exit 1) since #157 (19 Nov 2026). First the check is made to say why (server agent v1.5.1, DEVOS-128), then the cause is fixed. G2's own probe (`devos-probe-m24`, M2.4 AT13) provisions a project stack, so it waits for this check too.
 
 ## Consequences
+- `project-isolation` stays `skipped` on the server until the probe network exists. ADR-0013 §2 then pauses delegated G2 approval on that check. Whether G2 may close with AT10 carried is KK's gate decision. The runners do not turn the skip into a pass (Codex PR203-r3).
 - M3.5's first step is the F3 live run on `devos-probe-s4`.
 - DEVOS-65 closes when the check passes and the carried items are open on DEVOS-7, listed in its closing evidence comment.
