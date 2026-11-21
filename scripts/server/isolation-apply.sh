@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.5.0
+# Version: 1.5.1
+# v1.5.1 (DEVOS-128): the "conntrack" reason code is split in three, so server-check tells which fix is needed:
+# conntrack-missing (the conntrack tool is not installed: a package to install), conntrack-incomplete (a cut ran
+# and failed or was not reached: retried next tick) and conntrack-queue (the pending list could not be written,
+# nothing changed). ct_flush returns 1 for a missing tool and 2 for an incomplete cut. Exit codes are unchanged.
 # v1.5.0 (DEVOS-128): every exit 1 of an apply run ends its output with one fixed line, "reason: <code>", the code
-# picked here from a fixed list (config, token, state-fetch, refused, lock, deadline, conntrack, apply, self-test,
+# picked here from a fixed list (config, token, state-fetch, refused, lock, deadline, conntrack-*, apply, self-test,
 # rollback, record, boot-persistence, ipv6). The server agent keeps only that code, next to the exit code, in
 # isolation.state, so the project-isolation-apply check says why a run failed without any raw output reaching
 # GitHub. The code names the step that stopped the run (a rollback that is not complete in every part is
@@ -235,7 +239,8 @@ shrunk() {  # $1 = previous block, $2 = new block -> the /24 sources (or the poo
   comm -23 <(grep -E -- "$re" <<<"$1" | LC_ALL=C sort -u) <(LC_ALL=C sort -u <<<"$2") \
     | grep -oE -- '-s 10\.[0-9]+\.[0-9]+\.0/24' | cut -d' ' -f2 | LC_ALL=C sort -u
 }
-ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack; 0 when nothing is left pending
+ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack; 0 when nothing is left pending,
+  # 1 when the conntrack tool is missing, 2 when a cut failed or was not reached (DEVOS-128 v1.5.1)
   local f="$ISO/conntrack.pending" src out rc left=""
   [[ -s "$f" ]] || return 0
   if ! command -v conntrack >/dev/null 2>&1; then
@@ -249,7 +254,11 @@ ct_flush() {  # the sources in $ISO/conntrack.pending -> deleted from conntrack;
     out="$(timeout 10 conntrack -D -s "$src" 2>&1)"; rc=$?
     (( rc == 0 )) || { (( rc == 1 )) && [[ "$out" == *": 0 flow entries have been deleted"* ]]; } || left+="$src"$'\n'
   done < "$f"
-  if [[ -n "$left" ]]; then printf '%s' "$left" > "$f.tmp" && mv -f "$f.tmp" "$f"; echo "conntrack clean-up incomplete, retried next tick: $(paste -sd' ' "$f")"; return 1; fi
+  if [[ -n "$left" ]]; then
+    # A failed rewrite keeps the whole previous list, so nothing is lost; it is still an incomplete cut.
+    printf '%s' "$left" > "$f.tmp" && mv -f "$f.tmp" "$f"
+    echo "conntrack clean-up incomplete, retried next tick: $(paste -sd' ' "$f")"; return 2
+  fi
   rm -f "$f"; return 0
 }
 ct_queue() {  # $1 = previous block, $2 = new block, $3 = 1 when the live chains drifted -> pending list
@@ -311,6 +320,7 @@ if [[ "$MODE" == apply ]]; then
 fi
 # DEVOS-128: the last output line of every failed apply run; the agent accepts only these codes.
 fail() { echo "reason: $1"; exit 1; }
+ct_code() { (( $1 == 1 )) && echo conntrack-missing || echo conntrack-incomplete; }  # ct_flush's non-zero return -> code
 done_ok() { (( V6_RC == 0 )) || fail ipv6; exit 0; }  # $1 names the path, for the reader
 
 # --- 1. fetch and validate the approved state -------------------------------------------------------------
@@ -484,9 +494,9 @@ exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply ru
 PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
   # Pre-review: the clean-up runs whatever the boot step says, so a broken after.rules cannot hold it back.
-  rc=0; ct_flush || rc=1
+  rc=0; ct_flush || rc=$?
   boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; fail boot-persistence; }
-  (( rc == 0 )) || fail conntrack
+  (( rc == 0 )) || fail "$(ct_code "$rc")"
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; done_ok "unchanged"
 fi
 
@@ -507,7 +517,7 @@ ct_restore() {  # the pending list as it was before this run's ct_queue
   if [[ -n "$CT_SNAP" ]]; then printf '%s\n' "$CT_SNAP" > "$ISO/conntrack.pending.tmp" && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
   else rm -f "$ISO/conntrack.pending"; fi
 }
-ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; fail conntrack; }
+ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; fail conntrack-queue; }
 install_block "$BLOCK" deadline; irc=$?
 if (( irc == 2 )); then ct_restore; fail deadline; fi
 if (( irc != 0 )); then
@@ -541,8 +551,8 @@ if ! post_msg="$(selftest)"; then
   fail self-test
 fi
 record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; fail record; }
-ct_ok=0; ct_flush || ct_ok=1
+ct_ok=0; ct_flush || ct_ok=$?
 boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; fail boot-persistence; }
-(( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; fail conntrack; }
+(( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; fail "$(ct_code "$ct_ok")"; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"
 done_ok "applied"

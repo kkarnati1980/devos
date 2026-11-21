@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.6.1
+# Version: 1.6.2
+# v1.6.2 (DEVOS-128): the reason list gains conntrack-missing, conntrack-incomplete and conntrack-queue
+# (isolation-apply.sh v1.5.1); "conntrack" stays listed, so a run of the previous script is still read.
 # v1.6.1 (DEVOS-128): a /recheck request may carry the runners' fixed attribution footer (they cannot post a comment
 # without it), and the reason-code read uses grep -a, so a NUL byte in the run's output cannot hide the code (PR210-r6).
 # v1.6.0 (DEVOS-128): an isolation run that exits 1 is kept as "fail (exit 1, <code>)". The code is the run's own last
@@ -377,8 +379,8 @@ cert_renewal() {
 # (KK ran --remove; isolation/disabled exists) is always "fail (disabled)": kept off, and visible.
 ISOLATION_DEFER_MAX="${ISOLATION_DEFER_MAX:-1800}"   # an in-flight deploy marker older than this no longer defers
                                                       # (below the check's 2700 s, so a long deploy is never stale)
-# DEVOS-128: the reason codes isolation-apply.sh v1.5.0 prints; the check accepts the same list plus "unknown".
-ISOLATION_REASONS='config|token|state-fetch|refused|lock|deadline|conntrack|apply|self-test|rollback|record|boot-persistence|ipv6'
+# DEVOS-128: the reason codes isolation-apply.sh v1.5.1 prints (plus v1.5.0's conntrack); the check accepts the same list plus "unknown".
+ISOLATION_REASONS='config|token|state-fetch|refused|lock|deadline|conntrack|conntrack-missing|conntrack-incomplete|conntrack-queue|apply|self-test|rollback|record|boot-persistence|ipv6'
 isolation_tick() {
   local f rc st now code
   [[ -f "$BIN/isolation-apply.sh" ]] || { log "isolation: not installed yet"; return 0; }

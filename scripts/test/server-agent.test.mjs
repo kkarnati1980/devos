@@ -802,6 +802,13 @@ test("DEVOS-128: a failed run keeps only its own fixed reason code; anything els
   // a NUL byte elsewhere in the output does not make grep treat it as binary and hide the code (Codex PR210-r6)
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_NUL: "1", FAKE_ISO_MSG: "reason: conntrack" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 1, conntrack\)\n$/);
+  // DEVOS-128 v1.6.2: the three split conntrack codes are kept as they are; the old one above still is.
+  for (const c of ["conntrack-missing", "conntrack-incomplete", "conntrack-queue"]) {
+    await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "reason: " + c });
+    assert.match(isoState(), new RegExp(`^\\d{1,12} fail \\(exit 1, ${c}\\)\\n$`), c);
+  }
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "reason: conntrack-other" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1, unknown\)\n$/, "an unlisted conntrack-* code is unknown");
   // other exits keep their shape; the code is only for exit 1
   await runAgent({ FAKE_ISO_RC: "3", FAKE_ISO_MSG: "reason: apply" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 3\)\n$/);
@@ -876,6 +883,16 @@ test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips
   assert.equal(isoCheck(`${ago(60)} fail (exit 1, unknown)\n`).code, 1);
   assert.match(isoCheck(`${ago(60)} fail (exit 1, Bearer abc)\n`).out, /^fail: unreadable isolation state\n$/, "only listed codes");
   assert.match(isoCheck(`${ago(60)} fail (exit 3, conntrack)\n`).out, /unreadable/, "a code only with exit 1");
+  // DEVOS-128 v1.5.1: the split codes; only conntrack-missing names the one-package fix.
+  const missing = isoCheck(`${ago(60)} fail (exit 1, conntrack-missing)\n`);
+  assert.equal(missing.code, 1);
+  assert.match(missing.out, /^fail: last isolation run \d+s ago: fail \(exit 1, conntrack-missing\); the conntrack tool is not installed \(apt-get install -y conntrack\)\n$/);
+  for (const c of ["conntrack-incomplete", "conntrack-queue", "conntrack"]) {
+    const o = isoCheck(`${ago(60)} fail (exit 1, ${c})\n`);
+    assert.equal(o.code, 1, c);
+    assert.match(o.out, new RegExp(`^fail: last isolation run \\d+s ago: fail \\(exit 1, ${c}\\)\\n$`), c);
+  }
+  assert.match(isoCheck(`${ago(60)} fail (exit 1, conntrack-other)\n`).out, /unreadable/, "only listed conntrack codes");
   assert.equal(isoCheck(`${ago(60)} fail (timeout)\n`).code, 1);
   const stale = isoCheck(`${ago(2701)} ok\n`);
   assert.equal(stale.code, 1, "an old ok is a failure");
