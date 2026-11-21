@@ -145,7 +145,7 @@ function run(h, args = [], env = {}) {
   }
   return { code: r.status, out, stdout: r.stdout };
 }
-const REASON_LINE = /^reason: (config|token|state-fetch|refused|lock|deadline|conntrack|apply|self-test|rollback|record|boot-persistence|ipv6)$/;
+const REASON_LINE = /^reason: (config|token|state-fetch|refused|lock|deadline|conntrack-missing|conntrack-incomplete|conntrack-queue|apply|self-test|rollback|record|boot-persistence|ipv6)$/;
 const reason = (r) => (r.stdout.trimEnd().split("\n").at(-1).match(REASON_LINE) || [])[1];
 const nf = (h, c) => (fs.existsSync(path.join(h, "nf", c)) ? fs.readFileSync(path.join(h, "nf", c), "utf8") : null);
 const restores = (h) => fs.readdirSync(path.join(h, "log")).filter((f) => f.startsWith("restore.")).length;
@@ -715,6 +715,12 @@ test("S4-b2d: 'no entry matched' counts as done; a failed clean-up is kept pendi
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /conntrack clean-up incomplete, retried next tick: 10\.209\.1\.0\/24/);
   assert.match(r.out, /self-test passed; old connections not yet cut/);
+  assert.equal(reason(r), "conntrack-incomplete", "DEVOS-128 v1.5.1: a cut that ran and failed");
+  assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24");
+  // The unchanged tick that fails again is also an incomplete cut.
+  const again = run(h, [], { FAKE_CT_RC: "2" });
+  assert.equal(again.code, 1, again.out);
+  assert.equal(reason(again), "conntrack-incomplete");
   assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24");
   assert.match(nf(h, "DEVOS-ISO-FWD"), /alpha\/preview/, "the new block is in place regardless");
   r = run(h);
@@ -839,10 +845,28 @@ test("S4-b2d (pre-review): without the conntrack tool the run says so, exits 1 a
   }
   const r = run(h, [], { PATH: `${nob}:${core}` });
   assert.equal(r.code, 1, r.out);
-  assert.equal(reason(r), "conntrack", "DEVOS-128 reason code");
+  assert.equal(reason(r), "conntrack-missing", "DEVOS-128 reason code (v1.5.1 split)");
   assert.match(r.out, /conntrack not installed/);
   assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.0.0/14");
   assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/, "the block itself does not need conntrack");
+  // DEVOS-128 v1.5.1: the next (unchanged) tick names the same cause, not an incomplete cut.
+  const r2 = run(h, [], { PATH: `${nob}:${core}` });
+  assert.equal(r2.code, 1, r2.out);
+  assert.match(r2.out, /conntrack not installed/);
+  assert.equal(reason(r2), "conntrack-missing");
+});
+
+test("DEVOS-128 v1.5.1: a pending list that cannot be written is conntrack-queue, and nothing changes", () => {
+  const h = host(STATE);
+  // A directory where the temp file goes makes the atomic write fail, even as root.
+  fs.mkdirSync(path.join(h, "devos/isolation"), { recursive: true });
+  fs.mkdirSync(pending(h) + ".tmp");
+  const r = run(h);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /could not write .*conntrack\.pending: nothing changed/);
+  assert.equal(reason(r), "conntrack-queue");
+  assert.equal(fs.existsSync(pending(h)), false);
+  assert.doesNotMatch(nf(h, "DEVOS-ISO-FWD") || "", /alpha/, "no block was installed");
 });
 
 test("S4-b2d (pre-review r2): the cut is queued before the change, so a failed record cannot lose it", () => {
