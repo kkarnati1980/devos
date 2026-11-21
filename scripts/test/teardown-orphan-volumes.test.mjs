@@ -195,3 +195,16 @@ test("DEVOS-236: Codex PR209-r6 — a successful read must print exactly one res
   const one = run({ cli: '{"uuids":[],"invalid":0}', vols });
   assert.equal(one.code, 0, one.out);
 });
+
+test("DEVOS-236: Codex PR209-r7 — two JSON values, on one line or in the inspect output, are malformed, never clean", () => {
+  const vols = [{ Name: `${U1}-data`, Labels: null }];
+  const twoOnOne = run({ cli: '{"uuids":[],"invalid":0} {"uuids":[],"invalid":0}', vols });
+  assert.equal(twoOnOne.code, 1, twoOnOne.out);
+  assert.match(twoOnOne.out, /^fail: unreadable purged-application list$/m);
+  const notObject = run({ cli: '{"uuids":[],"invalid":0}'.replace(/^\{/, "[{").concat("]"), vols });
+  assert.equal(notObject.code, 1, notObject.out);
+  const live = [{ Name: "live-volume", Labels: null }];
+  const twoArrays = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: live, inspect: `${JSON.stringify(live)}\n${JSON.stringify(live)}` });
+  assert.equal(twoArrays.code, 1, twoArrays.out);
+  assert.match(twoArrays.out, /^fail: unreadable docker volume inspect output$/m);
+});

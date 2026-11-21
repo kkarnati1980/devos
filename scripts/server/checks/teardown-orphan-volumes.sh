@@ -40,6 +40,8 @@ esac
 # Codex PR209-r6: a successful read prints exactly one result, one JSON line and nothing else; a second result (or
 # any other line) makes the output malformed, never the first line taken as the whole answer.
 [[ "$(printf '%s\n' "$out" | grep -c '[^[:space:]]')" == 1 ]] || { echo "fail: unreadable purged-application list"; exit 1; }
+# Codex PR209-r7: and that line holds exactly one JSON value, an object (jq would read two values on one line).
+line="$(printf '%s' "$line" | jq -c -s 'if length == 1 and (.[0] | type) == "object" then .[0] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 uuids="$(printf '%s' "$line" | jq -r '.uuids | if type == "array" and all(.[]; type == "string" and test("\\A[A-Za-z0-9-]{8,64}\\z")) then .[] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 invalid="$(printf '%s' "$line" | jq -r '.invalid | if type == "number" then . else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 [[ "$invalid" =~ ^[0-9]{1,9}$ ]] || { echo "fail: unreadable purged-application list"; exit 1; }
@@ -69,8 +71,10 @@ if [[ -n "$uuids" && -n "$names" ]]; then
   printf '%s\n' "${vlist[@]}" | jq -R . | jq -s . >"$tmpd/n.json" 2>/dev/null || { echo "fail: cannot write the volume list"; exit 1; }
   # Codex PR209-r1: the output must describe exactly the listed volumes, each with a name and a Labels field (an
   # object, or null for none); a missing volume or field makes the scan incomplete, never clean.
-  hitlist="$(printf '%s' "$json" | jq -r --slurpfile us "$tmpd/u.json" --slurpfile ws "$tmpd/n.json" '
+  hitlist="$(printf '%s' "$json" | jq -r -s --slurpfile us "$tmpd/u.json" --slurpfile ws "$tmpd/n.json" '
     $us[0] as $u | $ws[0] as $want |
+    # Codex PR209-r7: the inspect output is exactly one JSON value; several arrays are malformed, never merged.
+    if length == 1 then .[0] else error("bad") end |
     if type == "array" and length == ($want | length)
        and all(.[]; type == "object" and (.Name | type) == "string" and has("Labels")
                and ((.Labels | type) == "object" or .Labels == null)
