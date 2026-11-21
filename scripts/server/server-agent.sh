@@ -373,7 +373,7 @@ cert_renewal() {
 ISOLATION_DEFER_MAX="${ISOLATION_DEFER_MAX:-1800}"   # an in-flight deploy marker older than this no longer defers
                                                       # (below the check's 2700 s, so a long deploy is never stale)
 isolation_tick() {
-  local f rc st now cause outcome
+  local f rc st now
   [[ -f "$BIN/isolation-apply.sh" ]] || { log "isolation: not installed yet"; return 0; }
   now="$(date +%s)"
   for f in "$ST"/deploy-started.*; do
@@ -390,18 +390,18 @@ isolation_tick() {
     if (( rc == 3 )) || { (( rc == 1 )) && grep -qx 'state fetch failed (curl exit 7): nothing changed' "$TMP/iso.out"; }; then st=skipped; fi
   fi
   now="$(date +%s)"
-  # v1.5.1: the run's output in one line for the check's message (docs/modules/S4.md, "S4-c isolation-apply
-  # diagnosis"): every non-empty line in order, joined by " // " and cut to 200 characters, then " // " and the
-  # LAST line (Codex PR204-r2/r3: isolation-apply.sh prints its cause first and its outcome last, with any number
-  # of lines between, so no fixed pick of lines or list of prefixes keeps both). Redacted first, then only a fixed
-  # character set is kept, so no secret-shaped value or control character reaches the public server-check comment.
-  # The line starts with this run's epoch and is written BEFORE isolation.state, so the check shows it only when
-  # both epochs match (Codex PR204-r1). A run with no output writes just the epoch. A failed write is only logged.
+  # v1.5.1: the run's output for the check's message (docs/modules/S4.md, "S4-c isolation-apply diagnosis"): the
+  # run's epoch on the first line, then its non-empty output lines, all of them when there are at most 19, else the
+  # first 9, a count of the lines left out and the last 9 (Codex PR204-r1..r4: no pick of single lines or prefixes
+  # keeps both the cause, printed first, and the outcome, printed last). The check's output is then at most 20
+  # lines, all of which the server-check comment shows. Redacted first, then only a fixed character set is kept and
+  # each line is cut to 200, so no secret-shaped value or control character reaches the public comment. Written
+  # BEFORE isolation.state; the check shows it only when both epochs match. A failed write is only logged.
   redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" || : > "$TMP/iso.clean"
-  outcome="$(tail -n1 "$TMP/iso.clean")"
-  cause="$(head -n -1 "$TMP/iso.clean" | paste -sd'~' - | sed 's#~# // #g' | cut -c1-200)"
-  [[ -n "$cause" ]] && outcome="$cause // $outcome"
-  { printf '%s %s\n' "$now" "$outcome" > "$ST/isolation.last.new" && mv -f "$ST/isolation.last.new" "$ST/isolation.last"; } \
+  { { printf '%s\n' "$now"
+      if (( $(wc -l < "$TMP/iso.clean") <= 19 )); then cat "$TMP/iso.clean"
+      else head -n 9 "$TMP/iso.clean"; echo "... $(( $(wc -l < "$TMP/iso.clean") - 18 )) lines left out ..."; tail -n 9 "$TMP/iso.clean"; fi
+    } > "$ST/isolation.last.new" && mv -f "$ST/isolation.last.new" "$ST/isolation.last"; } \
     || log "isolation: could not write isolation.last"
   { printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
     || log "isolation: could not write isolation.state"

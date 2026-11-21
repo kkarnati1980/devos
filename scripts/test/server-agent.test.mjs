@@ -758,23 +758,32 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed;\x07 \"x\" Bearer abcDEF+ghi/jkl012345678901234567890=" });
   const lastF = () => fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8");
   const epoch = () => isoState().split(" ")[0];
-  // Every line in order (the earlier ones cut to 200), then the last line, after the run's epoch (the state's epoch).
-  assert.match(lastF(), /^\d{1,12} iso run sk-\w{4}redacted Bearer redacted \/\/ state fetch failed \(curl exit 22\): nothing changed x Bearer redacted\n$/);
-  assert.equal(lastF().split(" ")[0], epoch(), "written for the same run as the state line");
+  // The run's epoch, then its output lines, redacted and filtered (\x07, ; and " dropped; [ ] are outside the set).
+  assert.equal(lastF(), `${epoch()}\niso run ${lastF().split("\n")[1].slice(8)}\nstate fetch failed (curl exit 22): nothing changed x Bearer redacted\n`);
+  assert.match(lastF().split("\n")[1], /^iso run sk-\w{4}redacted Bearer redacted$/);
   assert.doesNotMatch(lastF(), /abcdefghijklmnop1234|ghi\/jkl012345/, "redacted");
-  // Codex PR204-r2/r3: lines between the cause and the outcome cannot push either out.
-  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "boot persistence: the DEVOS S4 markers are broken\nboot sync: rules rewritten\nunchanged: 2 stacks, block in place, but not persisted for boot" });
-  assert.match(lastF(), /^\d{1,12} iso run .* \/\/ boot persistence: the DEVOS S4 markers are broken \/\/ boot sync: rules rewritten \/\/ unchanged: 2 stacks, block in place, but not persisted for boot\n$/);
-  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "a".repeat(190) + "\n" + "b".repeat(190) + "\nrolled back to the previous block" });
-  const cut = lastF().replace(/^\d{1,12} /, "");
-  assert.ok(cut.endsWith(" // rolled back to the previous block\n"), "the last line is always kept");
-  const earlier = cut.slice(0, -" // rolled back to the previous block\n".length);
-  assert.ok(earlier.startsWith("iso run ") && earlier.length <= 200 && !earlier.includes("b".repeat(10)), "the earlier lines are cut to 200, oldest first");
+  // Codex PR204-r2..r4: a cause, any lines after it and the outcome are all kept, however long the lines between.
+  const mid = Array.from({ length: 5 }, (_, k) => `conntrack clean-up incomplete, pending ${"10.208.0.0/24 ".repeat(12)}${k}`).join("\n");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: `${mid}\nboot persistence: the DEVOS S4 markers are broken\nunchanged: 2 stacks, block in place, but not persisted for boot` });
+  const lines = lastF().split("\n");
+  assert.equal(lines[0], epoch());
+  assert.ok(lines.includes("boot persistence: the DEVOS S4 markers are broken"), "the cause is kept");
+  assert.equal(lines.at(-2), "unchanged: 2 stacks, block in place, but not persisted for boot", "the outcome is kept");
+  assert.ok(lines.every((l) => l.length <= 200), "each line at most 200 characters");
+  // More than 19 lines: the first 9, a count, the last 9.
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: Array.from({ length: 30 }, (_, k) => `line ${k}`).join("\n") });
+  const many = lastF().split("\n").slice(1, -1);
+  assert.equal(many.length, 19);
+  assert.match(many[0], /^iso run /);
+  assert.equal(many[8], "line 7", "the first 9 lines");
+  assert.equal(many[10], "line 21", "the last 9 lines");
+  assert.equal(many[9], "... 13 lines left out ...");
+  assert.equal(many.at(-1), "line 29");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
-  assert.ok(lastF().endsWith(" // " + "y".repeat(200) + "\n"), "each line at most 200 characters");
-  // Pre-review: trailing blank lines are skipped.
+  assert.equal(lastF().split("\n")[2], "y".repeat(200), "at most 200 characters");
+  // Pre-review: blank lines are skipped.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
-  assert.match(lastF(), /^\d{1,12} iso run .*Bearer redacted\n$/);
+  assert.equal(lastF().split("\n").length, 3, "epoch, the one non-empty line, end");
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.last.new")), "no temp file left");
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
@@ -877,15 +886,19 @@ test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips
   assert.equal(isoCheck(`${ago(100)} ok\n`, { ISOLATION_MAX_AGE: "50" }).code, 1);
   // DEVOS-128: a failure names the run's last line; the check filters it again; an ok or skip never prints it.
   const t = ago(60);
-  const why = isoCheck(`${t} fail (exit 1)\n`, {}, `${t} self-test failed after apply (ssh 100.64.0.1:22 refused): rolling back // rolled back to the previous block\n`);
+  const age = "\\d+s ago"; // Codex PR204-r4: the age is read from the clock in each subprocess
+  const why = isoCheck(`${t} fail (exit 1)\n`, {}, `${t}\nself-test failed after apply (ssh 100.64.0.1:22 refused): rolling back\nrolled back to the previous block\n`);
   assert.equal(why.code, 1);
-  assert.match(why.out, /^fail: last isolation run 6\ds ago: fail \(exit 1\); it said: self-test failed after apply \(ssh 100\.64\.0\.1:22 refused\): rolling back \/\/ rolled back to the previous block\n$/);
-  // Codex PR204-r1: a line from another run (an older epoch) is never shown.
-  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t - 180} old cause\n`).out, /^fail: last isolation run 6\ds ago: fail \(exit 1\)\n$/);
-  const dirty = isoCheck(`${t} fail (exit 1)\n`, {}, `${t} a;b\`c$d\x1b[31m` + "z".repeat(500) + "\nsecond line\n");
-  assert.match(dirty.out, new RegExp(`^fail: last isolation run 6\\ds ago: fail \\(exit 1\\); it said: abcd31m${"z".repeat(413)}\\n$`), "filtered again and capped");
-  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t} \n`).out, /^fail: last isolation run 6\ds ago: fail \(exit 1\)\n$/, "a run with no output adds nothing");
-  assert.doesNotMatch(isoCheck(`${t} ok\n`, {}, `${t} old failure\n`).out, /old failure/);
+  assert.match(why.out, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n  it said: self-test failed after apply \\(ssh 100\\.64\\.0\\.1:22 refused\\): rolling back\\n  it said: rolled back to the previous block\\n$`));
+  // Codex PR204-r1: output from another run (an older epoch) is never shown.
+  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t - 180}\nold cause\n`).out, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n$`));
+  // Read again through the filter, the 200-character cut and the 19-line limit.
+  const dirty = isoCheck(`${t} fail (exit 1)\n`, {}, `${t}\na;b\`c$d\x1b[31m${"z".repeat(300)}\n` + Array.from({ length: 30 }, (_, k) => `l${k}`).join("\n") + "\n");
+  const out = dirty.out.split("\n").slice(1, -1);
+  assert.equal(out[0], `  it said: abcd31m${"z".repeat(193)}`);
+  assert.equal(out.length, 19, "at most 19 lines after the fail line");
+  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t}\n`).out, new RegExp(`^fail: last isolation run ${age}: fail \\(exit 1\\)\\n$`), "a run with no output adds nothing");
+  assert.doesNotMatch(isoCheck(`${t} ok\n`, {}, `${t}\nold failure\n`).out, /old failure/);
 });
 
 // ---- DEVOS-90: re-checks on request and every 6 hours ----
