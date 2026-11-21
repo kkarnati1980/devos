@@ -20,14 +20,15 @@ tmpd="$(mktemp -d 2>/dev/null)" || { echo "fail: cannot create a temp directory"
 trap 'rm -rf -- "$tmpd"' EXIT
 # Codex PR209-r8: output is captured to a file and refused when it holds a NUL byte, because a command substitution
 # drops NULs silently and could turn malformed output into valid JSON.
-nonul() { [[ "$(LC_ALL=C tr -cd '\000' < "$1" | wc -c)" -eq 0 ]]; }
+# Codex PR209-r11: a failed read of a captured file fails too (pipefail is on), never counts as empty output.
+nonul() { local n; n="$(LC_ALL=C tr -cd '\000' < "$1" | wc -c)" || return 1; [[ "$n" =~ ^[[:space:]]*0$ ]]; }
 # Codex PR209-r1: a failed or timed-out `docker ps` fails; only a successful search that finds no API skips.
 timeout "$EXEC_S" docker ps --filter label=io.devos.service=api --filter status=running --format '{{.ID}}' >"$tmpd/ps.out" 2>/dev/null; prc=$?
 [[ $prc -eq 0 ]] || { echo "fail: docker ps failed (exit $prc)"; exit 1; }
 # Codex PR209-r10: docker ps output is captured to a file too, and a NUL byte fails, because a command substitution
 # would drop it and turn malformed output into a blank line, that is a skip.
 nonul "$tmpd/ps.out" || { echo "fail: unreadable docker ps output"; exit 1; }
-ps="$(cat "$tmpd/ps.out")"
+ps="$(cat -- "$tmpd/ps.out")" || { echo "fail: unreadable docker ps output"; exit 1; }
 # Codex PR209-r9: blank lines are ignored, and every other line must be a container id, so a blank first line can
 # never hide a listed API container behind a skip.
 ID=""
@@ -40,7 +41,7 @@ done <<<"$ps"
 [[ "$ID" =~ ^[0-9a-f]{12,64}$ ]] || { echo "fail: unreadable docker ps output"; exit 1; }
 timeout "$EXEC_S" docker exec "$ID" "${CLI[@]}" >"$tmpd/cli.out" 2>/dev/null; rc=$?
 nonul "$tmpd/cli.out" || { echo "fail: unreadable purged-application list"; exit 1; }
-out="$(cat "$tmpd/cli.out")"
+out="$(cat -- "$tmpd/cli.out")" || { echo "fail: unreadable purged-application list"; exit 1; }
 line="$(printf '%s\n' "$out" | grep -m1 '^{' || true)"
 case "$rc" in
   0) ;;
@@ -72,7 +73,7 @@ done <<<"$uuids"
 timeout "$EXEC_S" docker volume ls -q >"$tmpd/ls.out" 2>/dev/null; vrc=$?
 [[ $vrc -eq 0 ]] || { echo "fail: docker volume ls failed (exit $vrc)"; exit 1; }
 nonul "$tmpd/ls.out" || { echo "fail: unreadable docker volume ls output"; exit 1; }
-names="$(cat "$tmpd/ls.out")"
+names="$(cat -- "$tmpd/ls.out")" || { echo "fail: unreadable docker volume ls output"; exit 1; }
 n_apps=0; [[ -n "$uuids" ]] && n_apps="$(printf '%s\n' "$uuids" | grep -c .)"
 hitlist=""
 if [[ -n "$uuids" && -n "$names" ]]; then
@@ -80,7 +81,7 @@ if [[ -n "$uuids" && -n "$names" ]]; then
   timeout "$EXEC_S" docker volume inspect -- "${vlist[@]}" >"$tmpd/inspect.out" 2>/dev/null; irc=$?
   [[ $irc -eq 0 ]] || { echo "fail: docker volume inspect failed (exit $irc)"; exit 1; }
   nonul "$tmpd/inspect.out" || { echo "fail: unreadable docker volume inspect output"; exit 1; }
-  json="$(cat "$tmpd/inspect.out")"
+  json="$(cat -- "$tmpd/inspect.out")" || { echo "fail: unreadable docker volume inspect output"; exit 1; }
   # Codex PR209-r2: empty output would make jq run zero times and pass; it is unreadable, never clean.
   [[ -n "${json//[[:space:]]/}" ]] || { echo "fail: unreadable docker volume inspect output"; exit 1; }
   # Codex PR209-r4: the uuid and name lists go to jq through temp files (--slurpfile), never as arguments, so 2,000

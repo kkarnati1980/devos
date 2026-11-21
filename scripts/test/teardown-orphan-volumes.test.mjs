@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const CHECK = path.join(ROOT, "scripts/server/checks/teardown-orphan-volumes.sh");
 
 // vols: [{ Name, Labels }], as `docker volume inspect` returns them.
-function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0, insRc = 0, inspect = null, api = true, psRc = 0, psOut = "" } = {}) {
+function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0, insRc = 0, inspect = null, api = true, psRc = 0, psOut = "", failRead = "", failTool = "" } = {}) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-orphan-"));
   fs.writeFileSync(path.join(bin, "cli"), cli + "\n");
   fs.writeFileSync(path.join(bin, "vols.json"), JSON.stringify(vols));
@@ -30,8 +30,21 @@ esac
 exit 99
 `);
   fs.chmodSync(path.join(bin, "docker"), 0o755);
+  // Codex PR209-r11: failRead names one captured file ("ps.out", "ls.out", …) and failTool the tool ("cat" or "tr");
+  // that tool's read of that file fails with no output, as an unreadable file would. Every other call is the real tool.
+  for (const tool of ["cat", "tr"]) {
+    const real = ["/usr/bin/" + tool, "/bin/" + tool].find((p) => fs.existsSync(p));
+    fs.writeFileSync(path.join(bin, tool), `#!/usr/bin/env bash
+if [[ -n "\${FAKE_FAIL_READ:-}" && "\${FAKE_FAIL_TOOL:-}" == ${tool} ]]; then
+  for a in "$@"; do [[ "$a" == */"$FAKE_FAIL_READ" ]] && exit 1; done
+  [[ "${tool}" == tr && "$(readlink -f /proc/$$/fd/0 2>/dev/null)" == */"$FAKE_FAIL_READ" ]] && exit 1
+fi
+exec ${real} "$@"
+`);
+    fs.chmodSync(path.join(bin, tool), 0o755);
+  }
   const r = spawnSync("bash", [CHECK], {
-    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc), FAKE_INS_RC: String(insRc), FAKE_PS_RC: String(psRc), FAKE_PS_OUT: psOut },
+    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc), FAKE_INS_RC: String(insRc), FAKE_PS_RC: String(psRc), FAKE_PS_OUT: psOut, FAKE_FAIL_READ: failRead, FAKE_FAIL_TOOL: failTool },
     encoding: "utf8",
   });
   const args = fs.existsSync(path.join(bin, "docker.args")) ? fs.readFileSync(path.join(bin, "docker.args"), "utf8") : "";
@@ -240,4 +253,26 @@ test("DEVOS-236: Codex PR209-r10 — a NUL byte in docker ps output fails, never
     assert.match(r.out, /^fail: unreadable docker ps output$/m);
     assert.doesNotMatch(r.args, /^exec /m);
   }
+});
+
+test("DEVOS-236: Codex PR209-r11 — a failed read of captured docker or CLI output fails, never reads as empty", () => {
+  const vols = [{ Name: `${U1}-data`, Labels: null }];
+  const cli = JSON.stringify({ uuids: [U1], invalid: 0 });
+  const cases = [
+    ["ps.out", /^fail: unreadable docker ps output$/m],
+    ["cli.out", /^fail: unreadable purged-application list$/m],
+    ["ls.out", /^fail: unreadable docker volume ls output$/m],
+    ["inspect.out", /^fail: unreadable docker volume inspect output$/m],
+  ];
+  for (const [file, msg] of cases) {
+    for (const tool of ["cat", "tr"]) {
+      const r = run({ cli, vols, failRead: file, failTool: tool });
+      assert.equal(r.code, 1, `${tool} ${file}: ${r.out}`);
+      assert.match(r.out, msg);
+      assert.doesNotMatch(r.out, /^ok:|^skipped:/m);
+    }
+  }
+  const good = run({ cli, vols });
+  assert.equal(good.code, 1, good.out);
+  assert.match(good.out, new RegExp(`leftover volume: ${U1}-data`));
 });
