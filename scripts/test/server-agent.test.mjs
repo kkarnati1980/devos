@@ -790,6 +790,9 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   // Pre-review: blank lines are skipped.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
   assert.equal(lastF().split("\n").length, 3, "result, the one non-empty line, end");
+  // Codex PR204-r15: a line made only of dropped characters is blank after the filter, and is skipped too.
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "###\n\u00a7\u00a7" });
+  assert.equal(lastF().split("\n").length, 3, "a line of dropped characters takes no place");
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state.new")), "no temp file left");
   // Codex PR204-r8: a failed write (here a full disk: the temp file points at /dev/full) keeps the previous complete
   // file, removes the partial one and is logged.
@@ -1177,6 +1180,27 @@ test("DEVOS-90: the 6-hour clock restarts when a new SHA's normal checks run", a
   assert.equal(checkRuns(), 2, "normal checks for the new SHA " + r1.out);
   const r2 = await runAgent();
   assert.equal(checkRuns(), 2, "no timed re-check right after the normal checks " + r2.out);
+});
+
+// Codex PR204-r15: redact_strict fails (no output) when the token file cannot be read or reads empty, and redacts
+// the exact token when it can.
+test("S4 diagnosis: redact_strict fails closed on an unreadable or empty token file and redacts a readable one", () => {
+  const src = execFileSync("sed", ["-n", "/^redact_strict() {/,/^}/p", "scripts/server/server-agent.sh"], { cwd: ROOT, encoding: "utf8" });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "redact-strict-"));
+  const sh = (tokenFile) => spawnSync("bash", ["-c", `set -uo pipefail\n${src}\nCF_TOKEN_FILE="$1"\nprintf 'cause tok3n-Value9 here\\n' | redact_strict`, "x", tokenFile], { encoding: "utf8" });
+  fs.writeFileSync(path.join(dir, "ok"), "tok3n-Value9");
+  const ok = sh(path.join(dir, "ok"));
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(ok.stdout, "cause [redacted] here\n");
+  fs.mkdirSync(path.join(dir, "unreadable"));  // -s is true for a directory, but getline cannot read it
+  const bad = sh(path.join(dir, "unreadable"));
+  assert.notEqual(bad.status, 0);
+  assert.equal(bad.stdout, "", "nothing printed without the exact-token pass");
+  fs.writeFileSync(path.join(dir, "empty-first"), "\ntok3n-Value9\n");
+  const empty = sh(path.join(dir, "empty-first"));
+  assert.notEqual(empty.status, 0);
+  assert.equal(empty.stdout, "");
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 // DEVOS-114 AT21: gh_all_runs must list a workflow-run page larger than the kernel's 128 KiB per-argument limit.

@@ -97,12 +97,13 @@ redact() {
   fi
 }
 # Codex PR204-r11/r14: the isolation tick's own copy. It returns non-zero when its sed fails, so no caller takes
-# partial output as redacted; the shared redact() above stays exactly as before for every other caller.
+# partial output as redacted; the shared redact() above stays exactly as before for every other caller. A token file
+# that cannot be read (or reads empty) is a failure too, never output with the exact token left in (Codex PR204-r15).
 redact_strict() {
   local out
   out="$(sed -E 's/(sk-[A-Za-z0-9_*.-]{4})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g; s/(Bearer )[A-Za-z0-9._|=~+\/-]+/\1[redacted]/g')" || return 1
   if [[ -n "$CF_TOKEN_FILE" && -s "$CF_TOKEN_FILE" ]]; then
-    awk -v tf="$CF_TOKEN_FILE" 'BEGIN{getline t < tf} { if (t != "") { while ((i = index($0, t)) > 0) $0 = substr($0, 1, i-1) "[redacted]" substr($0, i+length(t)) } print }' <<<"$out"
+    awk -v tf="$CF_TOKEN_FILE" 'BEGIN{ if ((getline t < tf) <= 0 || t == "") exit 3 } { if (t != "") { while ((i = index($0, t)) > 0) $0 = substr($0, 1, i-1) "[redacted]" substr($0, i+length(t)) } print }' <<<"$out"
   else
     printf '%s\n' "$out"
   fi
@@ -424,9 +425,10 @@ isolation_tick() {
   # Codex PR204-r8/r9: every write is chained with &&, the staging file iso.clean included, so any failed write (a
   # full disk, say) stops before the rename, leaves the previous complete file in place, removes the partial one and
   # is logged. (pipefail is on, so a failed stage of the filter fails the chain; grep's exit 1, "no line left", is
-  # the only status taken as success, Codex PR204-r10.)
+  # the only status taken as success, Codex PR204-r10.) Blank lines are dropped after the character filter, so a line
+  # made only of dropped characters never takes one of the 19 places (Codex PR204-r15).
   # Codex PR204-r14: the timestamp is read inside the chain too, so a failed date is a failed write, never an abort.
-  if now="$(date +%s)" && redact_strict < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || [[ $? -eq 1 ]]; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" \
+  if now="$(date +%s)" && redact_strict < "$TMP/iso.out" | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 | { grep -v '^[[:space:]]*$' || [[ $? -eq 1 ]]; } > "$TMP/iso.clean" \
      && printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && isolation_lines >> "$ST/isolation.state.new" \
      && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; then :; else
     rm -f "$ST/isolation.state.new" 2>/dev/null || :
