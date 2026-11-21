@@ -791,6 +791,14 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
   assert.equal(lastF().split("\n").length, 3, "result, the one non-empty line, end");
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state.new")), "no temp file left");
+  // Codex PR204-r8: a failed write (here a full disk: the temp file points at /dev/full) keeps the previous complete
+  // file, removes the partial one and is logged.
+  const prev = isoState();
+  fs.symlinkSync("/dev/full", path.join(D(), "agent/isolation.state.new"));
+  const rFull = await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "a new cause" });
+  assert.equal(isoState(), prev, "the previous file is kept whole");
+  assert.match(rFull.out, /isolation: could not write isolation\.state/);
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state.new")) && !fs.lstatSync(path.join(D(), "agent")).isSymbolicLink(), "the partial file is removed");
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoFirst(), /^\d{1,12} fail \(disabled\)$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });

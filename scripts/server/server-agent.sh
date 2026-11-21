@@ -372,6 +372,14 @@ cert_renewal() {
 # (KK ran --remove; isolation/disabled exists) is always "fail (disabled)": kept off, and visible.
 ISOLATION_DEFER_MAX="${ISOLATION_DEFER_MAX:-1800}"   # an in-flight deploy marker older than this no longer defers
                                                       # (below the check's 2700 s, so a long deploy is never stale)
+# isolation_lines: the kept output lines of $TMP/iso.clean (all of them up to 19, else the first 9, a count and the
+# last 9). Returns non-zero if any read or write fails (Codex PR204-r8).
+isolation_lines() {
+  local n
+  n="$(wc -l < "$TMP/iso.clean")" || return 1
+  if (( n <= 19 )); then cat "$TMP/iso.clean"
+  else head -n 9 "$TMP/iso.clean" && echo "... $(( n - 18 )) lines left out ..." && tail -n 9 "$TMP/iso.clean"; fi
+}
 isolation_tick() {
   local f rc st now
   [[ -f "$BIN/isolation-apply.sh" ]] || { log "isolation: not installed yet"; return 0; }
@@ -400,11 +408,13 @@ isolation_tick() {
   # and a reader sees one run's whole file or the previous run's whole file, never a mix (no pairing by epoch).
   # The first line keeps its format, so a v1.5.0 check reads it unchanged. A failed write is only logged.
   redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" || : > "$TMP/iso.clean"
-  { { printf '%s %s\n' "$now" "$st"
-      if (( $(wc -l < "$TMP/iso.clean") <= 19 )); then cat "$TMP/iso.clean"
-      else head -n 9 "$TMP/iso.clean"; echo "... $(( $(wc -l < "$TMP/iso.clean") - 18 )) lines left out ..."; tail -n 9 "$TMP/iso.clean"; fi
-    } > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
-    || log "isolation: could not write isolation.state"
+  # Codex PR204-r8: every write is chained with &&, so any failed write (a full disk, say) stops before the rename,
+  # leaves the previous complete file in place, removes the partial one and is logged.
+  if printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && isolation_lines >> "$ST/isolation.state.new" \
+     && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; then :; else
+    rm -f "$ST/isolation.state.new" 2>/dev/null || :
+    log "isolation: could not write isolation.state"
+  fi
   [[ "$st" == ok && ! -e "$ST/isolation.enforced" ]] && { touch "$ST/isolation.enforced"; log "isolation: enforced from now on (a skip is a failure)"; }
   log "isolation: $st"
 }
