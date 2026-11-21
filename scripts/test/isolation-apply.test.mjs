@@ -421,8 +421,13 @@ test("DEVOS-128 (Codex PR210-r4): --remove without iptables or ip6tables fails, 
   const h = host(STATE);
   assert.equal(run(h).code, 0);
   const bin2 = fs.mkdtempSync(path.join(tmp, "bin-noipt-"));
-  for (const n of fs.readdirSync(bin)) if (!/^ip6?tables$/.test(n)) fs.symlinkSync(path.join(bin, n), path.join(bin2, n));
-  const r = run(h, ["--remove"], { PATH: `${bin2}:/usr/bin:/bin` });
+  // Codex PR210-r5: PATH is only bin2, so no real firewall command can be found: the fakes (minus the two
+  // firewall ones) plus every system tool except any iptables/ip6tables variant.
+  const link = (dir, n) => { const t = path.join(bin2, n); if (!fs.existsSync(t)) try { fs.symlinkSync(path.join(dir, n), t); } catch {} };
+  for (const n of fs.readdirSync(bin)) if (!/^ip6?tables/.test(n)) link(bin, n);
+  for (const d of ["/usr/bin", "/bin"]) if (fs.existsSync(d)) for (const n of fs.readdirSync(d)) if (!/^ip6?tables/.test(n)) link(d, n);
+  assert.equal(spawnSync("bash", ["-c", "command -v iptables ip6tables"], { env: { PATH: bin2 } }).status, 1, "no firewall command on PATH");
+  const r = run(h, ["--remove"], { PATH: bin2 });
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /iptables is not installed, so the IPv4 S4 rules cannot be checked/);
   assert.match(r.out, /ip6tables is not installed, so the IPv6 drop cannot be checked/);
