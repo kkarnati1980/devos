@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const CHECK = path.join(ROOT, "scripts/server/checks/teardown-orphan-volumes.sh");
 
 // vols: [{ Name, Labels }], as `docker volume inspect` returns them.
-function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0, insRc = 0, inspect = null, api = true } = {}) {
+function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0, insRc = 0, inspect = null, api = true, psRc = 0 } = {}) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-orphan-"));
   fs.writeFileSync(path.join(bin, "cli"), cli + "\n");
   fs.writeFileSync(path.join(bin, "vols.json"), JSON.stringify(vols));
@@ -22,7 +22,7 @@ function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0
   fs.writeFileSync(path.join(bin, "docker"), `#!/usr/bin/env bash
 echo "$*" >> "$FAKE_DIR/docker.args"
 case "$1 \${2:-}" in
-  "ps "*) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit 0;;
+  "ps "*) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit "$FAKE_PS_RC";;
   "exec "*) cat "$FAKE_DIR/cli"; exit "$FAKE_CLI_RC";;
   "volume ls") [[ "\${3:-}" == -q ]] || exit 98; jq -r '.[].Name' "$FAKE_DIR/vols.json"; exit "$FAKE_VOL_RC";;
   "volume inspect") if [[ -f "$FAKE_DIR/inspect" ]]; then cat "$FAKE_DIR/inspect"; else cat "$FAKE_DIR/vols.json"; fi; exit "$FAKE_INS_RC";;
@@ -31,7 +31,7 @@ exit 99
 `);
   fs.chmodSync(path.join(bin, "docker"), 0o755);
   const r = spawnSync("bash", [CHECK], {
-    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc), FAKE_INS_RC: String(insRc) },
+    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc), FAKE_INS_RC: String(insRc), FAKE_PS_RC: String(psRc) },
     encoding: "utf8",
   });
   const args = fs.existsSync(path.join(bin, "docker.args")) ? fs.readFileSync(path.join(bin, "docker.args"), "utf8") : "";
@@ -89,7 +89,7 @@ test("DEVOS-236: rows the scan cannot match make it incomplete → fail, never c
 });
 
 test("DEVOS-236: an unreadable or malformed list fails, never passes", () => {
-  for (const cli of ["not json", '{"uuids":"x","invalid":0}', '{"uuids":[],"invalid":"0"}', '{"uuids":["a;b c"],"invalid":0}', '{"invalid":0}']) {
+  for (const cli of ["not json", '{"uuids":"x","invalid":0}', '{"uuids":[""],"invalid":0}', '{"uuids":[12345678],"invalid":0}', '{"uuids":[null],"invalid":0}', '{"uuids":[],"invalid":"0"}', '{"uuids":["a;b c"],"invalid":0}', '{"invalid":0}']) {
     const r = run({ cli });
     assert.equal(r.code, 1, `${cli}: ${r.out}`);
     assert.match(r.out, /fail: unreadable purged-application list/);
@@ -109,25 +109,34 @@ test("DEVOS-236: the CLI failing or timing out fails with its fixed code; a dock
   r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "v1", Labels: {} }], insRc: 1 });
   assert.equal(r.code, 1);
   assert.match(r.out, /fail: docker volume inspect failed \(exit 1\)/);
-  for (const inspect of ["not json", '{"Name":"v1"}', '[{"Name":5}]', '[{"Name":"v1","Labels":"x"}]']) {
+  // Codex PR209-r1: the inspect output must describe exactly the listed volumes, each with a Labels field.
+  for (const inspect of ["not json", '{"Name":"v1"}', '[{"Name":5}]', '[{"Name":"v1","Labels":"x"}]', "[]", '[{"Name":"v1"}]',
+                         '[{"Name":"other","Labels":{}}]', '[{"Name":"v1","Labels":{}},{"Name":"v1","Labels":{}}]', '[{"Name":"v1","Labels":{"a":5}}]']) {
     r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "v1", Labels: {} }], inspect });
     assert.equal(r.code, 1, `${inspect}: ${r.out}`);
     assert.match(r.out, /fail: unreadable docker volume inspect output/);
   }
 });
 
-test("DEVOS-236: skipped when DevOS is not deployed or has no database", () => {
+test("DEVOS-236: skipped when DevOS is not deployed or has no database; a failed docker ps fails", () => {
   let r = run({ api: false });
   assert.equal(r.code, 3);
   assert.match(r.out, /skipped: no running DevOS API container/);
+  // Codex PR209-r1: a Docker error or a timeout is not "not deployed".
+  for (const psRc of [1, 124]) {
+    r = run({ api: false, psRc });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, new RegExp(`fail: docker ps failed \\(exit ${psRc}\\)`));
+  }
   r = run({ cli: '{"code":"skipped"}', cliRc: 3 });
   assert.equal(r.code, 3);
   assert.match(r.out, /skipped: no database/);
 });
 
 test("DEVOS-236: names are printed in a fixed character set and the list stops at 15", () => {
-  const vols = Array.from({ length: 18 }, (_, i) => ({ Name: `${U1}-v${i}`, Labels: {} }));
-  const inspect = JSON.stringify(vols.map((v) => ({ ...v, Name: `${v.Name}$(id)\n` })));
+  // Docker never allows these characters in a name; the check removes them anyway.
+  const vols = Array.from({ length: 18 }, (_, i) => ({ Name: `${U1}-v${i}$(id)`, Labels: {} }));
+  const inspect = JSON.stringify(vols);
   const r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols, inspect });
   assert.equal(r.code, 1);
   assert.doesNotMatch(r.out, /\$\(id/);
@@ -139,6 +148,10 @@ test("DEVOS-236: names are printed in a fixed character set and the list stops a
 test("DEVOS-236: several purged applications, each with its own leftover, are all reported (pre-review 8)", () => {
   const vols = [{ Name: `${U1}-db`, Labels: {} }, { Name: "x-cache", Labels: { "com.docker.compose.project": U2 } }, { Name: "keep", Labels: {} }];
   const r = run({ cli: JSON.stringify({ uuids: [U1, U2], invalid: 0 }), vols });
+  // A subset of the listed volumes is never accepted (Codex PR209-r1).
+  const sub = run({ cli: JSON.stringify({ uuids: [U1, U2], invalid: 0 }), vols, inspect: JSON.stringify(vols.slice(2)) });
+  assert.equal(sub.code, 1, sub.out);
+  assert.match(sub.out, /fail: unreadable docker volume inspect output/);
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, new RegExp(`leftover volume: ${U1}-db \\(purged application ${U1}\\)`));
   assert.match(r.out, new RegExp(`leftover volume: x-cache \\(purged application ${U2}\\)`));
