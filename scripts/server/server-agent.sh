@@ -383,6 +383,9 @@ isolation_tick() {
     log "isolation deferred: a deployment is in flight"; return 0
   done
   if [[ $DRY -eq 1 ]]; then log "WOULD run isolation-apply.sh"; return 0; fi
+  # v1.5.1 (Codex PR204-r5): the previous run's output is removed before this run, so a failed write below can
+  # never leave it in place for this run's result, even within the same second.
+  rm -f "$ST/isolation.last" || { log "isolation: could not remove the previous isolation.last"; }
   set +e; DEVOS_DIR="$DIR" timeout "$ISOLATION_TIMEOUT" bash "$BIN/isolation-apply.sh" > "$TMP/iso.out" 2>&1 </dev/null; rc=$?; set -e
   redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done
   case "$rc" in 0) st=ok;; 4) st="fail (disabled)";; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
@@ -396,7 +399,8 @@ isolation_tick() {
   # keeps both the cause, printed first, and the outcome, printed last). The check's output is then at most 20
   # lines, all of which the server-check comment shows. Redacted first, then only a fixed character set is kept and
   # each line is cut to 200, so no secret-shaped value or control character reaches the public comment. Written
-  # BEFORE isolation.state; the check shows it only when both epochs match. A failed write is only logged.
+  # BEFORE isolation.state, after the previous run's file was removed; the check shows it only when both epochs match.
+  # A failed write is only logged (the check then shows nothing).
   redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" || : > "$TMP/iso.clean"
   { { printf '%s\n' "$now"
       if (( $(wc -l < "$TMP/iso.clean") <= 19 )); then cat "$TMP/iso.clean"

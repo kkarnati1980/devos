@@ -25,8 +25,10 @@ case "$st" in
      # DEVOS-128 / S4 "isolation-apply diagnosis": the run's own output, kept by the server agent (v1.5.1) as an
      # epoch line and then at most 19 lines. Shown only when the epoch is this run's (Codex PR204-r1), and read again
      # through the same fixed character set, length and line count, so a hand-edited file cannot add anything.
-     if [[ -f "$L" && "$(head -n1 "$L" 2>/dev/null)" == "$at" ]]; then
-       tail -n +2 "$L" 2>/dev/null | head -n 19 | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 | sed 's/^/  it said: /'
+     # Codex PR204-r5: the file is read once, so the epoch and the lines come from the same file.
+     out="$(head -c 8192 "$L" 2>/dev/null)" || out=""
+     if [[ -n "$out" && "${out%%$'\n'*}" == "$at" && "$out" == *$'\n'* ]]; then
+       printf '%s\n' "${out#*$'\n'}" | head -n 19 | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 | { grep -v '^$' || true; } | sed 's/^/  it said: /'
      fi
      exit 1 ;;
 esac

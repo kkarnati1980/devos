@@ -48,7 +48,7 @@ function commit(files, msg = "c") {
 
 // S4-b2a: a stand-in for isolation-apply.sh (its own tests are isolation-apply.test.mjs): counts runs, prints a
 // secret-shaped value (must be redacted) and exits with FAKE_ISO_RC (default 0); FAKE_ISO_SLEEP makes it hang.
-const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + ' Bearer abcDEF+ghi/jkl012345678901234567890="; [[ -n "${FAKE_ISO_MSG:-}" ]] && echo "$FAKE_ISO_MSG"; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
+const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + ' Bearer abcDEF+ghi/jkl012345678901234567890="; [[ -n "${FAKE_ISO_MSG:-}" ]] && echo "$FAKE_ISO_MSG"; [[ -n "${FAKE_ISO_PEEK:-}" ]] && { [[ -e "$DEVOS_DIR/agent/isolation.last" ]] && echo "peek: previous file present" || echo "peek: none"; }; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
 const real = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
 const baseFiles = () => ({
   "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
@@ -781,6 +781,11 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.equal(many.at(-1), "line 29");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
   assert.equal(lastF().split("\n")[2], "y".repeat(200), "at most 200 characters");
+  // Codex PR204-r5: the previous run's file is gone before the next run starts, so a failed write cannot leave it.
+  assert.ok(fs.existsSync(path.join(D(), "agent/isolation.last")));
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_PEEK: "1" });
+  assert.doesNotMatch(lastF(), /peek: previous file present/, "removed before the run");
+  assert.match(lastF(), /peek: none/);
   // Pre-review: blank lines are skipped.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
   assert.equal(lastF().split("\n").length, 3, "epoch, the one non-empty line, end");
