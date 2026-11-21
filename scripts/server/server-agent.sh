@@ -102,7 +102,9 @@ redact() {
 redact_strict() {
   local out
   out="$(sed -E 's/(sk-[A-Za-z0-9_*.-]{4})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g; s/(Bearer )[A-Za-z0-9._|=~+\/-]+/\1[redacted]/g')" || return 1
-  if [[ -n "$CF_TOKEN_FILE" && -s "$CF_TOKEN_FILE" ]]; then
+  # Codex PR204-r16: a set token file that is missing or empty is a failure, never output without the exact-token pass.
+  if [[ -n "$CF_TOKEN_FILE" ]]; then
+    [[ -s "$CF_TOKEN_FILE" ]] || return 1
     awk -v tf="$CF_TOKEN_FILE" 'BEGIN{ if ((getline t < tf) <= 0 || t == "") exit 3 } { if (t != "") { while ((i = index($0, t)) > 0) $0 = substr($0, 1, i-1) "[redacted]" substr($0, i+length(t)) } print }' <<<"$out"
   else
     printf '%s\n' "$out"

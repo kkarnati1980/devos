@@ -1196,6 +1196,16 @@ test("S4 diagnosis: redact_strict fails closed on an unreadable or empty token f
   const bad = sh(path.join(dir, "unreadable"));
   assert.notEqual(bad.status, 0);
   assert.equal(bad.stdout, "", "nothing printed without the exact-token pass");
+  // Codex PR204-r16: a set token file that is missing or zero bytes fails too.
+  for (const f of ["missing", "zero"]) {
+    if (f === "zero") fs.writeFileSync(path.join(dir, f), "");
+    const r = sh(path.join(dir, f));
+    assert.notEqual(r.status, 0, f);
+    assert.equal(r.stdout, "", f);
+  }
+  const unset = sh("");
+  assert.equal(unset.status, 0, unset.stderr);
+  assert.equal(unset.stdout, "cause tok3n-Value9 here\n", "no Coolify env: the regex pass only, as before");
   fs.writeFileSync(path.join(dir, "empty-first"), "\ntok3n-Value9\n");
   const empty = sh(path.join(dir, "empty-first"));
   assert.notEqual(empty.status, 0);
