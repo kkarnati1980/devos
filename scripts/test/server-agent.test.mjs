@@ -799,6 +799,14 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.equal(isoState(), prev, "the previous file is kept whole");
   assert.match(rFull.out, /isolation: could not write isolation\.state/);
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.state.new")) && !fs.lstatSync(path.join(D(), "agent")).isSymbolicLink(), "the partial file is removed");
+  // Codex PR204-r9: a failed staging write (the filter's own output) is a failed write too: the previous file stays.
+  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "iso-cut-"));
+  fs.writeFileSync(path.join(fakeBin, "cut"), `#!/usr/bin/env bash\n[[ "$*" == "-c1-200" ]] && { cat >/dev/null; exit 1; }\nexec ${spawnSync("bash", ["-c", "command -v cut"], { encoding: "utf8" }).stdout.trim()} "$@"\n`);
+  fs.chmodSync(path.join(fakeBin, "cut"), 0o755);
+  const rCut = await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "a newer cause", PATH: `${fakeBin}:${process.env.PATH}` });
+  fs.rmSync(fakeBin, { recursive: true, force: true });
+  assert.equal(isoState(), prev, "the previous file is kept whole");
+  assert.match(rCut.out, /isolation: could not write isolation\.state/);
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoFirst(), /^\d{1,12} fail \(disabled\)$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });

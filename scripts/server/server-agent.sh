@@ -407,10 +407,11 @@ isolation_tick() {
   # Codex PR204-r7: one file, written to a temp file and renamed, so the result and its lines are replaced together
   # and a reader sees one run's whole file or the previous run's whole file, never a mix (no pairing by epoch).
   # The first line keeps its format, so a v1.5.0 check reads it unchanged. A failed write is only logged.
-  redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" || : > "$TMP/iso.clean"
-  # Codex PR204-r8: every write is chained with &&, so any failed write (a full disk, say) stops before the rename,
-  # leaves the previous complete file in place, removes the partial one and is logged.
-  if printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && isolation_lines >> "$ST/isolation.state.new" \
+  # Codex PR204-r8/r9: every write is chained with &&, the staging file iso.clean included, so any failed write (a
+  # full disk, say) stops before the rename, leaves the previous complete file in place, removes the partial one and
+  # is logged. (pipefail is on, so a failed stage of the filter fails the chain.)
+  if redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" \
+     && printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && isolation_lines >> "$ST/isolation.state.new" \
      && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; then :; else
     rm -f "$ST/isolation.state.new" 2>/dev/null || :
     log "isolation: could not write isolation.state"
