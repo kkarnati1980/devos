@@ -37,6 +37,9 @@ esac
 # PR209-r1: each element must be a string of the uuid shape inside jq, so an empty string or a number fails; r3: the
 # pattern is anchored with \A and \z, because jq's `$` also matches before a final newline).
 [[ -n "$line" ]] || { echo "fail: unreadable purged-application list"; exit 1; }
+# Codex PR209-r6: a successful read prints exactly one result, one JSON line and nothing else; a second result (or
+# any other line) makes the output malformed, never the first line taken as the whole answer.
+[[ "$(printf '%s\n' "$out" | grep -c '[^[:space:]]')" == 1 ]] || { echo "fail: unreadable purged-application list"; exit 1; }
 uuids="$(printf '%s' "$line" | jq -r '.uuids | if type == "array" and all(.[]; type == "string" and test("\\A[A-Za-z0-9-]{8,64}\\z")) then .[] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 invalid="$(printf '%s' "$line" | jq -r '.invalid | if type == "number" then . else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 [[ "$invalid" =~ ^[0-9]{1,9}$ ]] || { echo "fail: unreadable purged-application list"; exit 1; }

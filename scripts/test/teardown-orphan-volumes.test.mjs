@@ -183,3 +183,15 @@ test("DEVOS-236: Codex PR209-r5 — only the CLI's fixed error codes are printed
   const none = run({ cli: "not json", cliRc: 1 });
   assert.match(none.out, /^fail: the purged-application read failed \(exit 1\): no output$/m);
 });
+
+test("DEVOS-236: Codex PR209-r6 — a successful read must print exactly one result; a second result or extra line fails", () => {
+  const vols = [{ Name: `${U1}-data`, Labels: null }];
+  const two = run({ cli: `{"uuids":[],"invalid":0}\n${JSON.stringify({ uuids: [U1], invalid: 0 })}`, vols });
+  assert.equal(two.code, 1, two.out);
+  assert.match(two.out, /^fail: unreadable purged-application list$/m);
+  const extra = run({ cli: '{"uuids":[],"invalid":0}\nsome other line', vols });
+  assert.equal(extra.code, 1, extra.out);
+  assert.match(extra.out, /^fail: unreadable purged-application list$/m);
+  const one = run({ cli: '{"uuids":[],"invalid":0}', vols });
+  assert.equal(one.code, 0, one.out);
+});
