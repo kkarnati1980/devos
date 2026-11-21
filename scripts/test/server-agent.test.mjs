@@ -754,6 +754,12 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
   await runAgent({ FAKE_ISO_RC: "1" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  // DEVOS-128: the last output line is kept, redacted and reduced to the fixed character set (\x07, ; and " dropped).
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed;\x07 \"x\" Bearer abcDEF+ghi/jkl012345678901234567890=" });
+  const last = fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8");
+  assert.equal(last, "state fetch failed (curl exit 22): nothing changed x Bearer redacted\n", "[ ] are outside the set too");
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
+  assert.equal(fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8"), "y".repeat(200) + "\n", "at most 200 characters");
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
@@ -829,10 +835,11 @@ test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed
 });
 
 const ISO_CHECK = path.join(ROOT, "scripts/server/checks/project-isolation-apply.sh");
-function isoCheck(state, extra = {}) {
+function isoCheck(state, extra = {}, lastLine = null) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "iso-check-"));
   fs.mkdirSync(path.join(d, "agent"));
   if (state !== null) fs.writeFileSync(path.join(d, "agent/isolation.state"), state);
+  if (lastLine !== null) fs.writeFileSync(path.join(d, "agent/isolation.last"), lastLine);
   const r = spawnSync("bash", [ISO_CHECK], { env: { ...process.env, DEVOS_DIR: d, ...extra }, encoding: "utf8" });
   fs.rmSync(d, { recursive: true, force: true });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -852,6 +859,14 @@ test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips
   assert.equal(isoCheck("garbage\n").code, 1, "unreadable fails, never passes");
   assert.equal(isoCheck(`${ago(60)} ok extra\n`).code, 1);
   assert.equal(isoCheck(`${ago(100)} ok\n`, { ISOLATION_MAX_AGE: "50" }).code, 1);
+  // DEVOS-128: a failure names the run's last line; the check filters it again; an ok or skip never prints it.
+  const why = isoCheck(`${ago(60)} fail (exit 1)\n`, {}, "state fetch failed (curl exit 22): nothing changed\n");
+  assert.equal(why.code, 1);
+  assert.equal(why.out, "fail: last isolation run 60s ago: fail (exit 1); it said: state fetch failed (curl exit 22): nothing changed\n");
+  const dirty = isoCheck(`${ago(60)} fail (exit 1)\n`, {}, "a;b`c$d\x1b[31m" + "z".repeat(300) + "\nsecond line\n");
+  assert.equal(dirty.out, `fail: last isolation run 60s ago: fail (exit 1); it said: abcd31m${"z".repeat(193)}\n`);
+  assert.equal(isoCheck(`${ago(60)} fail (exit 1)\n`, {}, "").out, "fail: last isolation run 60s ago: fail (exit 1)\n", "an empty file adds nothing");
+  assert.doesNotMatch(isoCheck(`${ago(60)} ok\n`, {}, "old failure\n").out, /old failure/);
 });
 
 // ---- DEVOS-90: re-checks on request and every 6 hours ----

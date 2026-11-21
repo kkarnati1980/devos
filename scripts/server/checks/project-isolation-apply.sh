@@ -8,6 +8,7 @@
 set -uo pipefail
 DIR="${DEVOS_DIR:-/root/.devos}"
 F="$DIR/agent/isolation.state"
+L="$DIR/agent/isolation.last"   # DEVOS-128: the run's last output line, already redacted and reduced by the agent
 MAX_AGE="${ISOLATION_MAX_AGE:-2700}"   # 45 min: ticks are minutes apart; a deploy defers it for at most 30 min
 [[ -f "$F" ]] || { echo "skipped: the server agent has not run isolation-apply.sh yet"; exit 3; }
 line="$(head -n1 "$F" 2>/dev/null)"
@@ -20,5 +21,8 @@ age=$(( $(date +%s) - at ))
 case "$st" in
   ok) echo "isolation block applied or unchanged ${age}s ago"; exit 0 ;;
   skipped) echo "skipped: isolation not set up yet (no state token or listener), ${age}s ago"; exit 3 ;;
-  *) echo "fail: last isolation run ${age}s ago: $st"; exit 1 ;;
+  *) last=""
+     # Read again through the same fixed character set and length, so a hand-edited file cannot add anything.
+     [[ -f "$L" ]] && last="$(head -n1 "$L" 2>/dev/null | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+-' | cut -c1-200)"
+     echo "fail: last isolation run ${age}s ago: $st${last:+; it said: $last}"; exit 1 ;;
 esac

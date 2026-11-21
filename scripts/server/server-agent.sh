@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.5.0
+# Version: 1.5.1
+# v1.5.1 (DEVOS-128, 21 Nov 2026): the isolation run's last output line, redacted and reduced to a fixed character
+# set (letters, digits, space and . _ : / ( ) = , + -; at most 200), is kept in agent/isolation.last, so the
+# project-isolation-apply check can say why a run failed (it had failed with only "exit 1" since 19 Nov).
 # v1.5.0 (DEVOS-127, S4-b2a): the allow-list gains scripts/server/isolation-apply.sh (S4-b). Every tick, after the
 # cert renewal and before anything that needs GitHub, the agent runs it under `timeout 60` (deferred while a
 # deployment is in flight: its self-test would see the DevOS API restarting). The redacted output goes to the
@@ -388,6 +391,12 @@ isolation_tick() {
   fi
   { printf '%s %s\n' "$(date +%s)" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
     || log "isolation: could not write isolation.state"
+  # v1.5.1: the last non-empty output line, for the check's message (decision in docs/modules/S4.md, "S4-c
+  # isolation-apply diagnosis"). Redacted first, then only a fixed character set is kept, so no secret-shaped
+  # value or control character reaches the public server-check comment. A failed write is only logged.
+  { redact < "$TMP/iso.out" | grep -v '^[[:space:]]*$' | tail -n1 | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+-' | cut -c1-200 \
+      > "$ST/isolation.last.new" && mv -f "$ST/isolation.last.new" "$ST/isolation.last"; } \
+    || log "isolation: could not write isolation.last"
   [[ "$st" == ok && ! -e "$ST/isolation.enforced" ]] && { touch "$ST/isolation.enforced"; log "isolation: enforced from now on (a skip is a failure)"; }
   log "isolation: $st"
 }
