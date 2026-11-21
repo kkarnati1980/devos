@@ -89,7 +89,7 @@ test("DEVOS-236: rows the scan cannot match make it incomplete → fail, never c
 });
 
 test("DEVOS-236: an unreadable or malformed list fails, never passes", () => {
-  for (const cli of ["not json", '{"uuids":"x","invalid":0}', '{"uuids":[""],"invalid":0}', '{"uuids":[12345678],"invalid":0}', '{"uuids":[null],"invalid":0}', '{"uuids":[],"invalid":"0"}', '{"uuids":["a;b c"],"invalid":0}', '{"invalid":0}']) {
+  for (const cli of ["not json", '{"uuids":"x","invalid":0}', '{"uuids":[""],"invalid":0}', '{"uuids":[12345678],"invalid":0}', '{"uuids":[null],"invalid":0}', '{"uuids":["abcdefgh\\n"],"invalid":0}', '{"uuids":["\\nabcdefgh"],"invalid":0}', '{"uuids":[],"invalid":"0"}', '{"uuids":["a;b c"],"invalid":0}', '{"invalid":0}']) {
     const r = run({ cli });
     assert.equal(r.code, 1, `${cli}: ${r.out}`);
     assert.match(r.out, /fail: unreadable purged-application list/);

@@ -31,9 +31,10 @@ case "$rc" in
   *) echo "fail: the purged-application read failed (exit $rc): $(clean "$(printf '%s' "$line" | jq -r '.error // "no output"' 2>/dev/null)")"; exit 1 ;;
 esac
 # Only uuids in the CLI's own shape are used; anything else makes the result incomplete, never clean (Codex
-# PR209-r1: each element must be a string of the uuid shape inside jq, so an empty string or a number fails).
+# PR209-r1: each element must be a string of the uuid shape inside jq, so an empty string or a number fails; r3: the
+# pattern is anchored with \A and \z, because jq's `$` also matches before a final newline).
 [[ -n "$line" ]] || { echo "fail: unreadable purged-application list"; exit 1; }
-uuids="$(printf '%s' "$line" | jq -r '.uuids | if type == "array" and all(.[]; type == "string" and test("^[A-Za-z0-9-]{8,64}$")) then .[] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
+uuids="$(printf '%s' "$line" | jq -r '.uuids | if type == "array" and all(.[]; type == "string" and test("\\A[A-Za-z0-9-]{8,64}\\z")) then .[] else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 invalid="$(printf '%s' "$line" | jq -r '.invalid | if type == "number" then . else error("bad") end' 2>/dev/null)" || { echo "fail: unreadable purged-application list"; exit 1; }
 [[ "$invalid" =~ ^[0-9]{1,9}$ ]] || { echo "fail: unreadable purged-application list"; exit 1; }
 while IFS= read -r u; do
