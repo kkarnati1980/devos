@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DevOS server check (S4-b2a, DEVOS-127, docs/modules/S4.md): the host firewall block for project isolation
 # (isolation-apply.sh, S4-b) was applied, or found unchanged, by a recent server-agent tick.
-# Reads only $DEVOS_DIR/agent/isolation.state, one line written by server-agent.sh v1.6.0 (DEVOS-128):
+# Reads only $DEVOS_DIR/agent/isolation.state, one line written by server-agent.sh v1.6.0+ (DEVOS-128):
 #   "<epoch> <ok|skipped|fail (disabled)|fail (exit 1, <code>)|fail (exit n)|fail (timeout)>"
 # <code> is one fixed reason code picked by isolation-apply.sh (or "unknown"); no raw output is ever stored.
 # DEVOS-128 (isolation-apply.sh v1.5.1): "conntrack" is split into conntrack-missing, conntrack-incomplete and
