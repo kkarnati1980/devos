@@ -393,8 +393,9 @@ isolation_tick() {
     || log "isolation: could not write isolation.state"
   # v1.5.1: the last non-empty output line, for the check's message (decision in docs/modules/S4.md, "S4-c
   # isolation-apply diagnosis"). Redacted first, then only a fixed character set is kept, so no secret-shaped
-  # value or control character reaches the public server-check comment. A failed write is only logged.
-  { redact < "$TMP/iso.out" | grep -v '^[[:space:]]*$' | tail -n1 | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+-' | cut -c1-200 \
+  # value or control character reaches the public server-check comment. A run with no output writes an empty
+  # file (grep's no-match exit is not a failure), so an older run's cause is never shown. A failed write is only logged.
+  { redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | tail -n1 | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+-' | cut -c1-200 \
       > "$ST/isolation.last.new" && mv -f "$ST/isolation.last.new" "$ST/isolation.last"; } \
     || log "isolation: could not write isolation.last"
   [[ "$st" == ok && ! -e "$ST/isolation.enforced" ]] && { touch "$ST/isolation.enforced"; log "isolation: enforced from now on (a skip is a failure)"; }

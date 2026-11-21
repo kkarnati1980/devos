@@ -760,6 +760,10 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.equal(last, "state fetch failed (curl exit 22): nothing changed x Bearer redacted\n", "[ ] are outside the set too");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
   assert.equal(fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8"), "y".repeat(200) + "\n", "at most 200 characters");
+  // Pre-review: trailing blank lines are skipped (the fake's first line is then the last non-empty one).
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
+  assert.match(fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8"), /^iso run .*Bearer redacted\n$/);
+  assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.last.new")), "no temp file left");
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
