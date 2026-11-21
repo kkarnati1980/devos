@@ -358,7 +358,9 @@ cert_renewal() {
   done
   if [[ $DRY -eq 1 ]]; then log "WOULD run the daily cert renewal"; return 0; fi
   set +e; DEVOS_DIR="$DIR" timeout 300 bash "$BIN/cert-renew.sh" > "$TMP/cert.out" 2>&1 </dev/null; rc=$?; set -e
-  redact < "$TMP/cert.out" | tail -n 20 | while IFS= read -r l; do log "cert-renew: $l"; done
+  if ! redact < "$TMP/cert.out" | tail -n 20 | while IFS= read -r l; do log "cert-renew: $l"; done; then  # Codex PR204-r12
+    log "cert-renew: could not redact the run's output for the agent log"
+  fi
   case "$rc" in 0) st=ok;; 3) st=skipped;; *) st="fail (exit $rc)";; esac
   printf '%s %s\n' "$now" "$st" > "$ST/cert-renew.state.new" && mv -f "$ST/cert-renew.state.new" "$ST/cert-renew.state"
   log "cert renewal: $st"
@@ -394,7 +396,11 @@ isolation_tick() {
   done
   if [[ $DRY -eq 1 ]]; then log "WOULD run isolation-apply.sh"; return 0; fi
   set +e; DEVOS_DIR="$DIR" timeout "$ISOLATION_TIMEOUT" bash "$BIN/isolation-apply.sh" > "$TMP/iso.out" 2>&1 </dev/null; rc=$?; set -e
-  redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done
+  # Codex PR204-r12: the agent-log copy is a condition, so a failed redaction (redact returns non-zero) is logged
+  # and the run goes on to the guarded state write below; it never aborts the agent under errexit.
+  if ! redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done; then
+    log "isolation: could not redact the run's output for the agent log"
+  fi
   case "$rc" in 0) st=ok;; 4) st="fail (disabled)";; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
   if [[ ! -e "$ST/isolation.enforced" && $rc -ne 4 ]]; then
     if (( rc == 3 )) || { (( rc == 1 )) && grep -qx 'state fetch failed (curl exit 7): nothing changed' "$TMP/iso.out"; }; then st=skipped; fi

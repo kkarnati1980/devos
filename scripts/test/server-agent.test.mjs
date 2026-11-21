@@ -837,6 +837,31 @@ exec ${realSed} "$@"
   assert.equal(sedCalls, 2, rSed.out);
   assert.equal(isoState(), prev, "the previous file is kept whole");
   assert.match(rSed.out, /isolation: could not write isolation\.state/);
+  // Codex PR204-r12: a failed FIRST redaction (the agent-log copy) is logged and never aborts the agent: the state
+  // write still runs (its own redaction succeeds) and the tick carries on to its result line.
+  const fakeSed1 = fs.mkdtempSync(path.join(os.tmpdir(), "iso-sed1-"));
+  fs.writeFileSync(path.join(fakeSed1, "sed"), `#!/usr/bin/env bash
+if [[ "$1" == -E && "$2" == *redacted* ]]; then
+  in="$(cat)"
+  if [[ "$in" == *"a fifth cause"* ]]; then
+    n=$(( $(cat "${fakeSed1}/n" 2>/dev/null || echo 0) + 1 )); echo $n > "${fakeSed1}/n"
+    (( n == 1 )) && { printf '%s' "\${in:0:3}"; exit 4; }
+  fi
+  printf '%s\\n' "$in" | exec ${realSed} "$@"
+fi
+exec ${realSed} "$@"
+`);
+  fs.chmodSync(path.join(fakeSed1, "sed"), 0o755);
+  const rSed1 = await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "a fifth cause", PATH: `${fakeSed1}:${process.env.PATH}` });
+  const sed1Calls = Number(fs.readFileSync(path.join(fakeSed1, "n"), "utf8"));
+  fs.rmSync(fakeSed1, { recursive: true, force: true });
+  assert.equal(rSed1.code, 0, rSed1.out);
+  assert.equal(sed1Calls, 2, rSed1.out);
+  assert.match(rSed1.out, /isolation: could not redact the run's output for the agent log/);
+  assert.doesNotMatch(rSed1.out, /isolation: could not write isolation\.state/);
+  assert.match(rSed1.out, /isolation: fail \(exit 1\)/);
+  assert.notEqual(isoState(), prev, "this run's state replaced the previous file");
+  assert.match(isoState(), /fail \(exit 1\)\n[^]*a fifth cause/, "this run's state and its line are written");
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoFirst(), /^\d{1,12} fail \(disabled\)$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
