@@ -807,6 +807,14 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   fs.rmSync(fakeBin, { recursive: true, force: true });
   assert.equal(isoState(), prev, "the previous file is kept whole");
   assert.match(rCut.out, /isolation: could not write isolation\.state/);
+  // Codex PR204-r10: a grep error in the filter (exit 2) is a failed staging write; only exit 1 (no line left) is not.
+  const fakeGrep = fs.mkdtempSync(path.join(os.tmpdir(), "iso-grep-"));
+  fs.writeFileSync(path.join(fakeGrep, "grep"), `#!/usr/bin/env bash\n[[ "$*" == "-v ^[[:space:]]*$" ]] && { head -c 5; exit 2; }\nexec ${spawnSync("bash", ["-c", "command -v grep"], { encoding: "utf8" }).stdout.trim()} "$@"\n`);
+  fs.chmodSync(path.join(fakeGrep, "grep"), 0o755);
+  const rGrep = await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "a third cause", PATH: `${fakeGrep}:${process.env.PATH}` });
+  fs.rmSync(fakeGrep, { recursive: true, force: true });
+  assert.equal(isoState(), prev, "the previous file is kept whole");
+  assert.match(rGrep.out, /isolation: could not write isolation\.state/);
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoFirst(), /^\d{1,12} fail \(disabled\)$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });

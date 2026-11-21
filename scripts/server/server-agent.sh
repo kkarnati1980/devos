@@ -409,8 +409,9 @@ isolation_tick() {
   # The first line keeps its format, so a v1.5.0 check reads it unchanged. A failed write is only logged.
   # Codex PR204-r8/r9: every write is chained with &&, the staging file iso.clean included, so any failed write (a
   # full disk, say) stops before the rename, leaves the previous complete file in place, removes the partial one and
-  # is logged. (pipefail is on, so a failed stage of the filter fails the chain.)
-  if redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" \
+  # is logged. (pipefail is on, so a failed stage of the filter fails the chain; grep's exit 1, "no line left", is
+  # the only status taken as success, Codex PR204-r10.)
+  if redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || [[ $? -eq 1 ]]; } | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 > "$TMP/iso.clean" \
      && printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && isolation_lines >> "$ST/isolation.state.new" \
      && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; then :; else
     rm -f "$ST/isolation.state.new" 2>/dev/null || :
