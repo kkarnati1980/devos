@@ -758,12 +758,15 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed;\x07 \"x\" Bearer abcDEF+ghi/jkl012345678901234567890=" });
   const lastF = () => fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8");
   const epoch = () => isoState().split(" ")[0];
-  // The run's last two lines, joined by " // ", after the run's epoch (the same epoch as isolation.state).
-  assert.match(lastF(), /^\d{1,12} iso run sk-\w{4}redacted Bearer redacted \/\/ state fetch failed \(curl exit 22\): nothing changed x Bearer redacted\n$/);
+  // The run's cause line (the first that names one) and its last line, after the run's epoch (the state's epoch).
+  assert.match(lastF(), /^\d{1,12} state fetch failed \(curl exit 22\): nothing changed x Bearer redacted\n$/, "cause = outcome: shown once");
   assert.equal(lastF().split(" ")[0], epoch(), "written for the same run as the state line");
   assert.doesNotMatch(lastF(), /abcdefghijklmnop1234|ghi\/jkl012345/, "redacted");
+  // Codex PR204-r2: lines between the failing target and the outcome cannot push the target out.
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "self-test failed after apply (ssh 100.64.0.1:22 refused): rolling back\nboot sync: rules rewritten\nboot sync: second line\nrolled back to the previous block" });
+  assert.match(lastF(), /^\d{1,12} self-test failed after apply \(ssh 100\.64\.0\.1:22 refused\): rolling back \/\/ rolled back to the previous block\n$/);
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
-  assert.ok(lastF().endsWith(" // " + "y".repeat(200) + "\n"), "each line at most 200 characters");
+  assert.match(lastF(), new RegExp(`^\\d{1,12} ${"y".repeat(200)}\\n$`), "no cause line: the last line, at most 200 characters");
   // Pre-review: trailing blank lines are skipped.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
   assert.match(lastF(), /^\d{1,12} iso run .*Bearer redacted\n$/);
@@ -871,12 +874,12 @@ test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips
   const t = ago(60);
   const why = isoCheck(`${t} fail (exit 1)\n`, {}, `${t} self-test failed after apply (ssh 100.64.0.1:22 refused): rolling back // rolled back to the previous block\n`);
   assert.equal(why.code, 1);
-  assert.equal(why.out, "fail: last isolation run 60s ago: fail (exit 1); it said: self-test failed after apply (ssh 100.64.0.1:22 refused): rolling back // rolled back to the previous block\n");
+  assert.match(why.out, /^fail: last isolation run 6\ds ago: fail \(exit 1\); it said: self-test failed after apply \(ssh 100\.64\.0\.1:22 refused\): rolling back \/\/ rolled back to the previous block\n$/);
   // Codex PR204-r1: a line from another run (an older epoch) is never shown.
-  assert.equal(isoCheck(`${t} fail (exit 1)\n`, {}, `${t - 180} old cause\n`).out, "fail: last isolation run 60s ago: fail (exit 1)\n");
+  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t - 180} old cause\n`).out, /^fail: last isolation run 6\ds ago: fail \(exit 1\)\n$/);
   const dirty = isoCheck(`${t} fail (exit 1)\n`, {}, `${t} a;b\`c$d\x1b[31m` + "z".repeat(500) + "\nsecond line\n");
-  assert.equal(dirty.out, `fail: last isolation run 60s ago: fail (exit 1); it said: abcd31m${"z".repeat(413)}\n`, "filtered again and capped");
-  assert.equal(isoCheck(`${t} fail (exit 1)\n`, {}, `${t} \n`).out, "fail: last isolation run 60s ago: fail (exit 1)\n", "a run with no output adds nothing");
+  assert.match(dirty.out, new RegExp(`^fail: last isolation run 6\\ds ago: fail \\(exit 1\\); it said: abcd31m${"z".repeat(413)}\\n$`), "filtered again and capped");
+  assert.match(isoCheck(`${t} fail (exit 1)\n`, {}, `${t} \n`).out, /^fail: last isolation run 6\ds ago: fail \(exit 1\)\n$/, "a run with no output adds nothing");
   assert.doesNotMatch(isoCheck(`${t} ok\n`, {}, `${t} old failure\n`).out, /old failure/);
 });
 
