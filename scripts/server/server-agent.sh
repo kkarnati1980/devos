@@ -89,7 +89,9 @@ fi
 # Redact token shapes, Bearer values and the literal Coolify token (read from its 600 file, never echoed).
 redact() {
   local out
-  out="$(sed -E 's/(sk-[A-Za-z0-9_*.-]{4})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g; s/(Bearer )[A-Za-z0-9._|=~+\/-]+/\1[redacted]/g')"
+  out="$(sed -E 's/(sk-[A-Za-z0-9_*.-]{4})[A-Za-z0-9_*.-]*/\1[redacted]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g; s/(Bearer )[A-Za-z0-9._|=~+\/-]+/\1[redacted]/g')" || return 1
+  # Codex PR204-r11: a failed sed returns non-zero even where errexit is off (an if condition), so no caller ever
+  # takes partial output as redacted; awk or printf, the last command, gives the status otherwise.
   if [[ -n "$CF_TOKEN_FILE" && -s "$CF_TOKEN_FILE" ]]; then
     awk -v tf="$CF_TOKEN_FILE" 'BEGIN{getline t < tf} { if (t != "") { while ((i = index($0, t)) > 0) $0 = substr($0, 1, i-1) "[redacted]" substr($0, i+length(t)) } print }' <<<"$out"
   else

@@ -815,6 +815,28 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   fs.rmSync(fakeGrep, { recursive: true, force: true });
   assert.equal(isoState(), prev, "the previous file is kept whole");
   assert.match(rGrep.out, /isolation: could not write isolation\.state/);
+  // Codex PR204-r11: a failed redaction (sed) inside the staging filter is a failed write too. The fake sed fails
+  // only on the second redaction of this run's output (the first is the agent-log copy), after printing part of it.
+  const fakeSed = fs.mkdtempSync(path.join(os.tmpdir(), "iso-sed-"));
+  const realSed = spawnSync("bash", ["-c", "command -v sed"], { encoding: "utf8" }).stdout.trim();
+  fs.writeFileSync(path.join(fakeSed, "sed"), `#!/usr/bin/env bash
+if [[ "$1" == -E && "$2" == *redacted* ]]; then
+  in="$(cat)"
+  if [[ "$in" == *"a fourth cause"* ]]; then
+    n=$(( $(cat "${fakeSed}/n" 2>/dev/null || echo 0) + 1 )); echo $n > "${fakeSed}/n"
+    (( n >= 2 )) && { printf '%s' "\${in:0:3}"; exit 4; }
+  fi
+  printf '%s\\n' "$in" | exec ${realSed} "$@"
+fi
+exec ${realSed} "$@"
+`);
+  fs.chmodSync(path.join(fakeSed, "sed"), 0o755);
+  const rSed = await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "a fourth cause", PATH: `${fakeSed}:${process.env.PATH}` });
+  const sedCalls = Number(fs.readFileSync(path.join(fakeSed, "n"), "utf8"));
+  fs.rmSync(fakeSed, { recursive: true, force: true });
+  assert.equal(sedCalls, 2, rSed.out);
+  assert.equal(isoState(), prev, "the previous file is kept whole");
+  assert.match(rSed.out, /isolation: could not write isolation\.state/);
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoFirst(), /^\d{1,12} fail \(disabled\)$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
