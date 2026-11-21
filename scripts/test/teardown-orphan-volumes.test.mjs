@@ -232,3 +232,12 @@ test("DEVOS-236: Codex PR209-r9 — a blank first docker ps line never hides a l
   const none = run({ psOut: "\\n  \\n" });
   assert.equal(none.code, 3, none.out);
 });
+
+test("DEVOS-236: Codex PR209-r10 — a NUL byte in docker ps output fails, never turns into a blank line and a skip", () => {
+  for (const psOut of ["\\0\\n", "\\0abcdef123456\\n", "abcdef123456\\0\\n"]) {
+    const r = run({ psOut });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /^fail: unreadable docker ps output$/m);
+    assert.doesNotMatch(r.args, /^exec /m);
+  }
+});

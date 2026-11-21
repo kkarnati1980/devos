@@ -22,8 +22,12 @@ trap 'rm -rf -- "$tmpd"' EXIT
 # drops NULs silently and could turn malformed output into valid JSON.
 nonul() { [[ "$(LC_ALL=C tr -cd '\000' < "$1" | wc -c)" -eq 0 ]]; }
 # Codex PR209-r1: a failed or timed-out `docker ps` fails; only a successful search that finds no API skips.
-ps="$(timeout "$EXEC_S" docker ps --filter label=io.devos.service=api --filter status=running --format '{{.ID}}' 2>/dev/null)"; prc=$?
+timeout "$EXEC_S" docker ps --filter label=io.devos.service=api --filter status=running --format '{{.ID}}' >"$tmpd/ps.out" 2>/dev/null; prc=$?
 [[ $prc -eq 0 ]] || { echo "fail: docker ps failed (exit $prc)"; exit 1; }
+# Codex PR209-r10: docker ps output is captured to a file too, and a NUL byte fails, because a command substitution
+# would drop it and turn malformed output into a blank line, that is a skip.
+nonul "$tmpd/ps.out" || { echo "fail: unreadable docker ps output"; exit 1; }
+ps="$(cat "$tmpd/ps.out")"
 # Codex PR209-r9: blank lines are ignored, and every other line must be a container id, so a blank first line can
 # never hide a listed API container behind a skip.
 ID=""
