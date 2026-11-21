@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const CHECK = path.join(ROOT, "scripts/server/checks/teardown-orphan-volumes.sh");
 
 // vols: [{ Name, Labels }], as `docker volume inspect` returns them.
-function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0, insRc = 0, inspect = null, api = true, psRc = 0 } = {}) {
+function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0, insRc = 0, inspect = null, api = true, psRc = 0, psOut = "" } = {}) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-orphan-"));
   fs.writeFileSync(path.join(bin, "cli"), cli + "\n");
   fs.writeFileSync(path.join(bin, "vols.json"), JSON.stringify(vols));
@@ -22,7 +22,7 @@ function run({ cli = '{"uuids":[],"invalid":0}', cliRc = 0, vols = [], volRc = 0
   fs.writeFileSync(path.join(bin, "docker"), `#!/usr/bin/env bash
 echo "$*" >> "$FAKE_DIR/docker.args"
 case "$1 \${2:-}" in
-  "ps "*) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit "$FAKE_PS_RC";;
+  "ps "*) [[ -n "\${FAKE_PS_OUT:-}" ]] && { printf '%b' "$FAKE_PS_OUT"; exit "$FAKE_PS_RC"; }; [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit "$FAKE_PS_RC";;
   "exec "*) cat "$FAKE_DIR/cli"; exit "$FAKE_CLI_RC";;
   "volume ls") [[ "\${3:-}" == -q ]] || exit 98; jq -r '.[].Name' "$FAKE_DIR/vols.json"; exit "$FAKE_VOL_RC";;
   "volume inspect") if [[ -f "$FAKE_DIR/inspect" ]]; then cat "$FAKE_DIR/inspect"; else cat "$FAKE_DIR/vols.json"; fi; exit "$FAKE_INS_RC";;
@@ -31,7 +31,7 @@ exit 99
 `);
   fs.chmodSync(path.join(bin, "docker"), 0o755);
   const r = spawnSync("bash", [CHECK], {
-    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc), FAKE_INS_RC: String(insRc), FAKE_PS_RC: String(psRc) },
+    env: { PATH: `${bin}:${process.env.PATH}`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_VOL_RC: String(volRc), FAKE_INS_RC: String(insRc), FAKE_PS_RC: String(psRc), FAKE_PS_OUT: psOut },
     encoding: "utf8",
   });
   const args = fs.existsSync(path.join(bin, "docker.args")) ? fs.readFileSync(path.join(bin, "docker.args"), "utf8") : "";
@@ -219,4 +219,16 @@ test("DEVOS-236: Codex PR209-r8 — a NUL byte in the CLI, volume ls or inspect 
   assert.match(ins.out, /^fail: unreadable docker volume inspect output$/m);
   const ls = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "live\u0000volume", Labels: null }] });
   assert.equal(ls.code, 1, ls.out);
+});
+
+test("DEVOS-236: Codex PR209-r9 — a blank first docker ps line never hides a listed API container; other junk fails", () => {
+  const vols = [{ Name: `${U1}-data`, Labels: null }];
+  const blankFirst = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols, psOut: "\\nabcdef123456\\n" });
+  assert.equal(blankFirst.code, 1, blankFirst.out);
+  assert.match(blankFirst.out, new RegExp(`leftover volume: ${U1}-data`));
+  const junk = run({ psOut: "abcdef123456\\nnot-an-id\\n" });
+  assert.equal(junk.code, 1, junk.out);
+  assert.match(junk.out, /^fail: unreadable docker ps output$/m);
+  const none = run({ psOut: "\\n  \\n" });
+  assert.equal(none.code, 3, none.out);
 });

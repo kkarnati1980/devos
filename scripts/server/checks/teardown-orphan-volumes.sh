@@ -24,7 +24,14 @@ nonul() { [[ "$(LC_ALL=C tr -cd '\000' < "$1" | wc -c)" -eq 0 ]]; }
 # Codex PR209-r1: a failed or timed-out `docker ps` fails; only a successful search that finds no API skips.
 ps="$(timeout "$EXEC_S" docker ps --filter label=io.devos.service=api --filter status=running --format '{{.ID}}' 2>/dev/null)"; prc=$?
 [[ $prc -eq 0 ]] || { echo "fail: docker ps failed (exit $prc)"; exit 1; }
-ID="$(printf '%s\n' "$ps" | head -n1)"
+# Codex PR209-r9: blank lines are ignored, and every other line must be a container id, so a blank first line can
+# never hide a listed API container behind a skip.
+ID=""
+while IFS= read -r l; do
+  [[ -z "${l//[[:space:]]/}" ]] && continue
+  [[ "$l" =~ ^[0-9a-f]{12,64}$ ]] || { echo "fail: unreadable docker ps output"; exit 1; }
+  [[ -z "$ID" ]] && ID="$l"
+done <<<"$ps"
 [[ -n "$ID" ]] || { echo "skipped: no running DevOS API container (DevOS not deployed yet)"; exit 3; }
 [[ "$ID" =~ ^[0-9a-f]{12,64}$ ]] || { echo "fail: unreadable docker ps output"; exit 1; }
 timeout "$EXEC_S" docker exec "$ID" "${CLI[@]}" >"$tmpd/cli.out" 2>/dev/null; rc=$?
