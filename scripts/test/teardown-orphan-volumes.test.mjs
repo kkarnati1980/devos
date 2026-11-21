@@ -110,7 +110,7 @@ test("DEVOS-236: the CLI failing or timing out fails with its fixed code; a dock
   assert.equal(r.code, 1);
   assert.match(r.out, /fail: docker volume inspect failed \(exit 1\)/);
   // Codex PR209-r1: the inspect output must describe exactly the listed volumes, each with a Labels field.
-  for (const inspect of ["not json", '{"Name":"v1"}', '[{"Name":5}]', '[{"Name":"v1","Labels":"x"}]', "[]", '[{"Name":"v1"}]',
+  for (const inspect of ["not json", '{"Name":"v1"}', '[{"Name":5}]', '[{"Name":"v1","Labels":"x"}]', "[]", "", "  \n", '[{"Name":"v1"}]',
                          '[{"Name":"other","Labels":{}}]', '[{"Name":"v1","Labels":{}},{"Name":"v1","Labels":{}}]', '[{"Name":"v1","Labels":{"a":5}}]']) {
     r = run({ cli: JSON.stringify({ uuids: [U1], invalid: 0 }), vols: [{ Name: "v1", Labels: {} }], inspect });
     assert.equal(r.code, 1, `${inspect}: ${r.out}`);
@@ -118,7 +118,7 @@ test("DEVOS-236: the CLI failing or timing out fails with its fixed code; a dock
   }
 });
 
-test("DEVOS-236: skipped when DevOS is not deployed or has no database; a failed docker ps fails", () => {
+test("DEVOS-236: skipped only when DevOS is not deployed; no database or a failed docker ps fails", () => {
   let r = run({ api: false });
   assert.equal(r.code, 3);
   assert.match(r.out, /skipped: no running DevOS API container/);
@@ -128,9 +128,10 @@ test("DEVOS-236: skipped when DevOS is not deployed or has no database; a failed
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, new RegExp(`fail: docker ps failed \\(exit ${psRc}\\)`));
   }
+  // Codex PR209-r2: once the API container runs, a CLI without a database is a failure, not a skip.
   r = run({ cli: '{"code":"skipped"}', cliRc: 3 });
-  assert.equal(r.code, 3);
-  assert.match(r.out, /skipped: no database/);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /fail: the API container has no database/);
 });
 
 test("DEVOS-236: names are printed in a fixed character set and the list stops at 15", () => {

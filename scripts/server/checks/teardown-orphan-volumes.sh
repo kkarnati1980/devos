@@ -8,8 +8,8 @@
 # 2. `docker volume ls` lists every volume with its labels. A volume is a hit when its name is a purged uuid or
 #    starts with one followed by `-` or `_` (Coolify's volume naming), or when one of its label values is exactly
 #    a purged uuid.
-# Exit 0 pass (no hit), 1 fail (hits, an incomplete list, or a read error), 3 skipped (DevOS not deployed, no
-# database). Prints fixed lines plus volume names and uuids, reduced to a fixed character set; never a secret.
+# Exit 0 pass (no hit), 1 fail (hits, an incomplete list, or a read error), 3 skipped (DevOS not deployed: no docker
+# on the host, or a successful `docker ps` finds no running API container). Prints fixed lines plus volume names and uuids, reduced to a fixed character set; never a secret.
 set -uo pipefail
 EXEC_S="${ORPHAN_EXEC_SECONDS:-30}"
 CLI=(node deploy/with-db-url.mjs node apps/api/dist/teardown-volumes-cli.js purged-apps)
@@ -26,7 +26,7 @@ out="$(timeout "$EXEC_S" docker exec "$ID" "${CLI[@]}" 2>/dev/null)"; rc=$?
 line="$(printf '%s\n' "$out" | grep -m1 '^{' || true)"
 case "$rc" in
   0) ;;
-  3) echo "skipped: no database in the API container"; exit 3 ;;
+  3) echo "fail: the API container has no database, so the scan cannot run"; exit 1 ;;   # Codex PR209-r2: never a skip
   124) echo "fail: the purged-application read timed out"; exit 1 ;;
   *) echo "fail: the purged-application read failed (exit $rc): $(clean "$(printf '%s' "$line" | jq -r '.error // "no output"' 2>/dev/null)")"; exit 1 ;;
 esac
@@ -50,6 +50,8 @@ if [[ -n "$uuids" && -n "$names" ]]; then
   mapfile -t vlist <<<"$names"
   json="$(timeout "$EXEC_S" docker volume inspect -- "${vlist[@]}" 2>/dev/null)"; irc=$?
   [[ $irc -eq 0 ]] || { echo "fail: docker volume inspect failed (exit $irc)"; exit 1; }
+  # Codex PR209-r2: empty output would make jq run zero times and pass; it is unreadable, never clean.
+  [[ -n "${json//[[:space:]]/}" ]] || { echo "fail: unreadable docker volume inspect output"; exit 1; }
   ujson="$(printf '%s\n' "$uuids" | jq -R . | jq -s .)"
   # One "<uuid>\t<name>" line per hit: the name is a purged uuid or starts with one and `-` or `_`, or a label value
   # is exactly one. Volume names are reduced to the fixed set before they leave jq, so no newline gets through.
