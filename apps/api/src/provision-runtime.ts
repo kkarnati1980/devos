@@ -69,6 +69,13 @@ const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const UUID_LIKE_RE = /^[A-Za-z0-9-]{1,64}$/;
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 
+/** An IPv4 address in the tailnet's CGNAT range, 100.64.0.0/10. */
+function isTailnetV4(ip: string): boolean {
+  if (!IPV4_RE.test(ip)) return false;
+  const [o1 = -1, o2 = -1] = ip.split(".").map(Number);
+  return o1 === 100 && o2 >= 64 && o2 <= 127;
+}
+
 export interface ProvisionConfig {
   owner: string;
   coolifyOrigin: string;
@@ -84,9 +91,11 @@ export function provisionConfig(env: NodeJS.ProcessEnv): ProvisionConfig | { off
   // M2.4-d4a (DEVOS-21): an unset or empty tailnet address or Coolify origin falls back to DEVOS_BIND_IP, which R1
   // requires and which is the tailnet IPv4 on the server; Coolify answers on its published port 8000 there (M0.1's
   // DOCKER-USER passes private sources). The same checks as for a set value apply to the fallback.
+  // Pre-review: the Coolify fallback is used only for a tailnet bind address, so the token never goes to a loopback
+  // (CI's 127.0.0.1), private or public address by default.
   const bindIp = env.DEVOS_BIND_IP || "";
   const tailnetIp = env.DEVOS_TAILNET_IP || bindIp;
-  const coolifyOrigin = env.DEVOS_COOLIFY_URL || (IPV4_RE.test(bindIp) ? `http://${bindIp}:8000` : "");
+  const coolifyOrigin = env.DEVOS_COOLIFY_URL || (isTailnetV4(bindIp) ? `http://${bindIp}:8000` : "");
   const serverUuid = env.DEVOS_COOLIFY_SERVER_UUID ?? "";
   const devosSha = env.GIT_SHA ?? "";
   if (!OWNER_RE.test(owner)) return { off: "provision-github-owner-not-set" };
@@ -99,8 +108,7 @@ export function provisionConfig(env: NodeJS.ProcessEnv): ProvisionConfig | { off
   // Codex PR145-r3: the address must be a tailnet (CGNAT, 100.64.0.0/10) address, the same rule as M2.4-c2's
   // isTailnetIpv4, or every project's step list would throw `tailnet-ip-invalid` and park after five ticks.
   if (!IPV4_RE.test(tailnetIp)) return { off: "provision-tailnet-ip-not-set" };
-  const [o1 = -1, o2 = -1] = tailnetIp.split(".").map(Number);
-  if (o1 !== 100 || o2 < 64 || o2 > 127) return { off: "provision-tailnet-ip-not-tailnet" };
+  if (!isTailnetV4(tailnetIp)) return { off: "provision-tailnet-ip-not-tailnet" };
   if (!SHA_RE.test(devosSha)) return { off: "provision-devos-sha-unknown" };
   return { owner, coolifyOrigin: origin.origin, serverUuid, tailnetIp, devosSha, portsRaw: env.DEVOS_PROJECT_PORTS || undefined };
 }

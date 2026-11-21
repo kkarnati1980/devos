@@ -143,6 +143,11 @@ test("M2.4-d4a: the tailnet address and the Coolify origin fall back to DEVOS_BI
   // The fallback passes the same checks as a set value.
   assert.deepEqual(provisionConfig({ ...rest, DEVOS_BIND_IP: "192.168.1.10" }), { off: "provision-tailnet-ip-not-tailnet" });
   assert.deepEqual(provisionConfig({ ...rest, DEVOS_BIND_IP: "not-an-ip" }), { off: "provision-coolify-url-not-set" });
+  // Pre-review: no Coolify fallback for a bind address outside the tailnet (CI's loopback, a LAN or public address).
+  for (const ip of ["127.0.0.1", "192.168.1.10", "200.234.41.176"]) {
+    assert.deepEqual(provisionConfig({ ...ENV, DEVOS_COOLIFY_URL: "", DEVOS_BIND_IP: ip }), { off: "provision-coolify-url-not-set" }, ip);
+  }
+  assert.equal(provisionConfig({ ...ENV, DEVOS_BIND_IP: "not-an-ip" }).tailnetIp, "100.64.0.7", "a set tailnet address ignores the bind address");
   assert.deepEqual(provisionConfig({ ...rest, DEVOS_COOLIFY_URL: "http://c:8000" }), { off: "provision-tailnet-ip-not-set" }, "no bind address: off, as before");
   // The owner and the server uuid have no fallback.
   assert.deepEqual(provisionConfig({ ...bind, DEVOS_GITHUB_OWNER: "" }), { off: "provision-github-owner-not-set" });
