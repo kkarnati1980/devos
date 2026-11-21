@@ -102,7 +102,9 @@ s4_gone() {  # $1 = query function (ipt/ip6t), then the S4 chain names; 0 only i
   local q="$1" out c; shift
   out="$("$q" -S 2>/dev/null)" || { echo "the firewall did not answer ($q -S): the S4 rules may still be in place"; return 1; }
   for c in "$@"; do
-    grep -qE -- "^-N $c\$| -j $c( |\$)" <<<"$out" && return 1
+    # Codex PR210-r4 (low): only the chain line or a rule whose target is the chain (an S4 jump has no target
+    # options, so it ends the line); a comment that merely mentions the name does not match.
+    grep -qE -- "^-N $c\$|^-A [^ ]+ (.* )?-j $c\$" <<<"$out" && return 1
   done
   return 0
 }
@@ -201,7 +203,10 @@ v6_sync() {  # 0 when the IPv6 drop is live (one rule, every jump first, once) a
 }
 v6_remove() {  # deletes the IPv6 jumps, the chain and the after6.rules block; 0 if nothing of it is left
   local chain rc=0
-  if command -v ip6tables >/dev/null 2>&1; then
+  if ! command -v ip6tables >/dev/null 2>&1; then
+    # Codex PR210-r4: as for IPv4, a missing command is never "nothing left".
+    echo "remove: ip6tables is not installed, so the IPv6 drop cannot be checked or removed"; rc=1
+  else
     # Pre-review (low): a failed query must not read as "nothing left", so ip6tables must answer first.
     if ip6t -S INPUT >/dev/null 2>&1; then
       for chain in DOCKER-USER FORWARD INPUT; do
@@ -260,14 +265,17 @@ ct_queue() {  # $1 = previous block, $2 = new block, $3 = 1 when the live chains
 }
 
 if [[ "$MODE" == remove ]]; then
-  command -v iptables >/dev/null 2>&1 || { echo "iptables not installed: nothing to remove"; exit 0; }
+  # Codex PR210-r4: a missing iptables command does not prove the kernel holds no S4 rule, so it is a failure
+  # (named below), and the marker, both boot blocks and the IPv6 step still run.
   mkdir -p "$ISO" && exec 9>"$ISO/.lock" && flock -w 60 9 || { echo "remove: could not take $ISO/.lock within 60 s"; exit 1; }
   # Codex PR165-r1: each step runs whatever the others did, so a failure in one family cannot leave the other's
   # boot block in place or the agent free to re-apply. The marker comes first (the next tick sees it even if a
   # later step fails); every failure is named and the run still exits 1.
   RM_RC=0
   date -u +%FT%TZ > "$ISO/disabled" || { echo "remove: could not write $ISO/disabled: the agent will apply the block again"; RM_RC=1; }
-  if remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "remove: iptables is not installed, so the IPv4 S4 rules cannot be checked or removed (install it and run --remove again)"; RM_RC=1
+  elif remove_block; then rm -f "$ISO/installed.rules" "$ISO/live.sha256"
   else echo "remove: some IPv4 S4 rules are still in place (iptables -S DOCKER-USER, FORWARD, INPUT)"; RM_RC=1; fi
   boot_sync "" || { echo "remove: the boot block is still in $UFW_AFTER: delete the DEVOS S4 ISOLATION lines there"; RM_RC=1; }
   v6_remove || { echo "remove: the IPv6 drop or its block in $UFW_AFTER6 is still in place (ip6tables -S DEVOS-ISO6)"; RM_RC=1; }

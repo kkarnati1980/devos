@@ -417,6 +417,30 @@ test("DEVOS-128 (Codex PR210-r3): --remove does not report success while iptable
   assert.doesNotMatch(r.out, /^removed:/m);
 });
 
+test("DEVOS-128 (Codex PR210-r4): --remove without iptables or ip6tables fails, says why, and still turns the block off", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const bin2 = fs.mkdtempSync(path.join(tmp, "bin-noipt-"));
+  for (const n of fs.readdirSync(bin)) if (!/^ip6?tables$/.test(n)) fs.symlinkSync(path.join(bin, n), path.join(bin2, n));
+  const r = run(h, ["--remove"], { PATH: `${bin2}:/usr/bin:/bin` });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /iptables is not installed, so the IPv4 S4 rules cannot be checked/);
+  assert.match(r.out, /ip6tables is not installed, so the IPv6 drop cannot be checked/);
+  assert.doesNotMatch(r.out, /^removed:/m);
+  assert.equal(fs.existsSync(path.join(h, "devos/isolation/disabled")), true, "the agent is still kept from re-applying");
+  assert.doesNotMatch(fs.readFileSync(path.join(h, "after.rules"), "utf8"), /DEVOS S4 ISOLATION/, "the boot block is still removed");
+});
+
+test("DEVOS-128 (Codex PR210-r4): a rule whose comment only mentions an S4 chain does not block a completed removal", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.appendFileSync(path.join(h, "nf/INPUT"), '-A INPUT -m comment --comment "old -j DEVOS-ISO-IN rule" -j ACCEPT\n');
+  const r = run(h, ["--remove"]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /^removed:/m);
+  assert.match(nf(h, "INPUT"), /old -j DEVOS-ISO-IN rule/, "the unrelated rule is untouched");
+});
+
 test("a host self-test already failing before the change keeps the block (isolation is the floor) and reports it", () => {
   const h = host(STATE);
   targets(h, downPort);
