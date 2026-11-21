@@ -41,6 +41,7 @@ test("listDue: only archived projects whose purge_after has passed, oldest first
   // rows. The page is now every due row the database holds at `now` (counted with the query's own filter), plus one.
   const dueCount = await db.project.count({ where: { stage: "archived", purgeAfter: { lte: now } } });
   const all = await q.listDue(now, dueCount + 1);
+  // Exact while this file runs alone on its database (CI: one Postgres per job, --test-concurrency=1).
   assert.equal(all.length, dueCount, "the page holds every due row");
   const due = all.filter((p) => mine.has(p.id));
   assert.deepEqual(due.map((p) => p.id), [older.id, newer.id, exact.id], "purge_after <= now (inclusive), ascending");
