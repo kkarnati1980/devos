@@ -158,3 +158,16 @@ test("DEVOS-236: several purged applications, each with its own leftover, are al
   assert.match(r.out, new RegExp(`leftover volume: x-cache \\(purged application ${U2}\\)`));
   assert.match(r.out, /fail: 2 leftover volume\(s\) of purged applications \(2 purged applications checked\)/);
 });
+
+test("DEVOS-236: Codex PR209-r4 — 2,000 purged applications with 64-character ids (the documented limit) are scanned, not refused", () => {
+  const uuids = Array.from({ length: 2000 }, (_, i) => `u${String(i).padStart(4, "0")}`.padEnd(64, "a"));
+  assert.ok(JSON.stringify(uuids).length > 131072, "the list must exceed one argument's limit to exercise the fix");
+  const vols = [{ Name: `${uuids[1999]}-data`, Labels: null }, { Name: "other-volume", Labels: { x: "y" } }];
+  const r = run({ cli: JSON.stringify({ uuids, invalid: 0 }), vols });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, new RegExp(`leftover volume: ${uuids[1999]}-data \\(purged application ${uuids[1999]}\\)`));
+  assert.match(r.out, /fail: 1 leftover volume\(s\) of purged applications \(2000 purged applications checked\)/);
+  const clean = run({ cli: JSON.stringify({ uuids, invalid: 0 }), vols: [vols[1]] });
+  assert.equal(clean.code, 0, clean.out);
+  assert.match(clean.out, /^ok: no leftover volume \(2000 purged applications checked\)/m);
+});

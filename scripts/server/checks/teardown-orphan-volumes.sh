@@ -53,13 +53,18 @@ if [[ -n "$uuids" && -n "$names" ]]; then
   [[ $irc -eq 0 ]] || { echo "fail: docker volume inspect failed (exit $irc)"; exit 1; }
   # Codex PR209-r2: empty output would make jq run zero times and pass; it is unreadable, never clean.
   [[ -n "${json//[[:space:]]/}" ]] || { echo "fail: unreadable docker volume inspect output"; exit 1; }
-  ujson="$(printf '%s\n' "$uuids" | jq -R . | jq -s .)"
+  # Codex PR209-r4: the uuid and name lists go to jq through temp files (--slurpfile), never as arguments, so 2,000
+  # rows of 64-character uuids stay under Linux's 128 KiB per-argument limit.
+  tmpd="$(mktemp -d 2>/dev/null)" || { echo "fail: cannot create a temp directory"; exit 1; }
+  trap 'rm -rf -- "$tmpd"' EXIT
+  printf '%s\n' "$uuids" | jq -R . | jq -s . >"$tmpd/u.json" 2>/dev/null || { echo "fail: cannot write the purged-application list"; exit 1; }
   # One "<uuid>\t<name>" line per hit: the name is a purged uuid or starts with one and `-` or `_`, or a label value
   # is exactly one. Volume names are reduced to the fixed set before they leave jq, so no newline gets through.
-  njson="$(printf '%s\n' "${vlist[@]}" | jq -R . | jq -s .)"
+  printf '%s\n' "${vlist[@]}" | jq -R . | jq -s . >"$tmpd/n.json" 2>/dev/null || { echo "fail: cannot write the volume list"; exit 1; }
   # Codex PR209-r1: the output must describe exactly the listed volumes, each with a name and a Labels field (an
   # object, or null for none); a missing volume or field makes the scan incomplete, never clean.
-  hitlist="$(printf '%s' "$json" | jq -r --argjson u "$ujson" --argjson want "$njson" '
+  hitlist="$(printf '%s' "$json" | jq -r --slurpfile us "$tmpd/u.json" --slurpfile ws "$tmpd/n.json" '
+    $us[0] as $u | $ws[0] as $want |
     if type == "array" and length == ($want | length)
        and all(.[]; type == "object" and (.Name | type) == "string" and has("Labels")
                and ((.Labels | type) == "object" or .Labels == null)
