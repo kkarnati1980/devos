@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # DevOS — host firewall block for project network isolation, F3-1 (S4-b, DEVOS-65)
-# Version: 1.4.0
+# Version: 1.5.0
+# v1.5.0 (DEVOS-128): every exit 1 of an apply run ends its output with one fixed line, "reason: <code>", the code
+# picked here from a fixed list (config, token, state-fetch, refused, lock, deadline, conntrack, apply, self-test,
+# rollback, record, boot-persistence, ipv6). The server agent keeps only that code, next to the exit code, in
+# isolation.state, so the project-isolation-apply check says why a run failed without any raw output reaching
+# GitHub. The code names the step that stopped the run; an earlier IPv6 failure is "ipv6" only when nothing
+# else failed. Messages and exit codes are unchanged.
 # v1.4.0 (DEVOS-127, S4-b2c): the IPv6 defence-in-depth drop. Chain DEVOS-ISO6 (`-i devos-p+ -j DROP`: every IPv6
 # packet from a project bridge, which S4 names devos-p<idx>) is jumped to first from the ip6tables DOCKER-USER,
 # FORWARD and INPUT on every apply run, and kept in /etc/ufw/after6.rules for boot. A failure there does not stop
@@ -282,20 +288,22 @@ if [[ "$MODE" == apply ]]; then
   T0=$(( T0 + SECONDS - V6_T0 ))
   (( V6_RC == 0 )) || echo "IPv6 drop not in place: $V6_MSG"
 fi
-done_ok() { (( V6_RC == 0 )) || exit 1; exit 0; }  # $1 names the path, for the reader
+# DEVOS-128: the last output line of every failed apply run; the agent accepts only these codes.
+fail() { echo "reason: $1"; exit 1; }
+done_ok() { (( V6_RC == 0 )) || fail ipv6; exit 0; }  # $1 names the path, for the reader
 
 # --- 1. fetch and validate the approved state -------------------------------------------------------------
 PORT="$(conf API_INTERNAL_PORT)"; PORT="${PORT:-3002}"
-[[ "$PORT" =~ ^[0-9]{1,5}$ ]] || { echo "bad API_INTERNAL_PORT in $CONF"; exit 1; }
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] || { echo "bad API_INTERNAL_PORT in $CONF"; fail config; }
 URL="$(conf ISOLATION_STATE_URL)"; URL="${URL:-http://127.0.0.1:$PORT/internal/isolation-state}"
 [[ "$URL" =~ ^http://(127\.0\.0\.1|\[::1\]|localhost):[0-9]{1,5}/[A-Za-z0-9/_-]*$ ]] \
-  || { echo "refused: ISOLATION_STATE_URL must be a loopback http URL"; exit 1; }
+  || { echo "refused: ISOLATION_STATE_URL must be a loopback http URL"; fail config; }
 tok="$(head -c 512 "$TOKEN_FILE" | tr -d '\r\n')"
-[[ "$tok" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "refused: the isolation state token file is malformed"; exit 1; }
+[[ "$tok" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "refused: the isolation state token file is malformed"; fail token; }
 state="$(curl -sS --fail --connect-timeout 3 --max-time 10 --max-filesize 1048576 --proto =http \
   -H @<(printf 'Authorization: Bearer %s\n' "$tok") "$URL" 2>/dev/null)"; crc=$?
 unset tok
-(( crc == 0 )) || { echo "state fetch failed (curl exit $crc): nothing changed"; exit 1; }
+(( crc == 0 )) || { echo "state fetch failed (curl exit $crc): nothing changed"; fail state-fetch; }
 
 # Structure: exactly one JSON document {"stacks":[{"slug","env","idx","egress","tailnet":[...]}, ...]} and
 # nothing else. Every string is checked against its pattern inside jq BEFORE it is turned into a line, so no
@@ -313,7 +321,7 @@ rows="$(jq -r -s '
       and all(.tailnet[]; type == "string" and test("^[0-9a-fA-F.:/]{1,49}$"))
     then [(.idx | tostring), .slug, .env, (.egress | tostring), (.tailnet | join(" "))] | @tsv else "BAD" end
   else "BAD" end end' <<<"$state" 2>/dev/null)" || rows=BAD
-[[ "$rows" != *BAD* ]] || { echo "refused: the isolation state is not one valid JSON document of the documented shape; nothing changed"; exit 1; }
+[[ "$rows" != *BAD* ]] || { echo "refused: the isolation state is not one valid JSON document of the documented shape; nothing changed"; fail refused; }
 
 v4_in_tailnet() {  # a.b.c.d/p -> 0 if it is a well-formed IPv4 CIDR inside 100.64.0.0/10
   [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
@@ -327,17 +335,17 @@ declare -A seen_idx=() seen_stack=()
 STACKS=()
 while IFS=$'\t' read -r idx slug env egress tailnet; do
   [[ -n "$idx$slug" ]] || continue
-  [[ "$idx" =~ ^(0|[1-9][0-9]{0,3})$ ]] && (( idx <= 1023 )) || { echo "refused: stack index '$idx' outside 0-1023; nothing changed"; exit 1; }
-  [[ "$slug" =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || { echo "refused: invalid project slug in the isolation state; nothing changed"; exit 1; }
-  [[ "$env" == preview || "$env" == live ]] || { echo "refused: invalid environment for $slug; nothing changed"; exit 1; }
-  [[ -z "${seen_idx[$idx]:-}" ]] || { echo "refused: stack index $idx used twice; nothing changed"; exit 1; }
-  [[ -z "${seen_stack[$slug/$env]:-}" ]] || { echo "refused: $slug/$env listed twice; nothing changed"; exit 1; }
+  [[ "$idx" =~ ^(0|[1-9][0-9]{0,3})$ ]] && (( idx <= 1023 )) || { echo "refused: stack index '$idx' outside 0-1023; nothing changed"; fail refused; }
+  [[ "$slug" =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || { echo "refused: invalid project slug in the isolation state; nothing changed"; fail refused; }
+  [[ "$env" == preview || "$env" == live ]] || { echo "refused: invalid environment for $slug; nothing changed"; fail refused; }
+  [[ -z "${seen_idx[$idx]:-}" ]] || { echo "refused: stack index $idx used twice; nothing changed"; fail refused; }
+  [[ -z "${seen_stack[$slug/$env]:-}" ]] || { echo "refused: $slug/$env listed twice; nothing changed"; fail refused; }
   seen_idx[$idx]=1; seen_stack[$slug/$env]=1
   v4=""
   if [[ -n "$tailnet" ]]; then
     read -r -a cidrs <<<"$tailnet"
     for c in "${cidrs[@]}"; do
-      v4_in_tailnet "$c" || { echo "refused: tailnet entry for $slug/$env is not an IPv4 CIDR inside 100.64.0.0/10 (IPv6 entries are refused: project networks have no IPv6, S4-b2c decision 6); nothing changed"; exit 1; }
+      v4_in_tailnet "$c" || { echo "refused: tailnet entry for $slug/$env is not an IPv4 CIDR inside 100.64.0.0/10 (IPv6 entries are refused: project networks have no IPv6, S4-b2c decision 6); nothing changed"; fail refused; }
       v4+="$c "
     done
   fi
@@ -446,7 +454,7 @@ selftest() {  # every target host:port must accept a TCP connection within 3 s
   done
 }
 
-mkdir -p "$ISO" && chmod 700 "$ISO" || { echo "cannot create $ISO"; exit 1; }
+mkdir -p "$ISO" && chmod 700 "$ISO" || { echo "cannot create $ISO"; fail lock; }
 # One run at a time (the agent tick and KK's --remove must not interleave).
 exec 9>"$ISO/.lock" && flock -n 9 || { echo "skipped: another isolation-apply run holds $ISO/.lock"; exit 3; }
 # Codex PR158-r1: --remove may have run (and released the lock) while this run fetched the state, so the marker
@@ -456,8 +464,8 @@ PREV=""; [[ -s "$ISO/installed.rules" ]] && PREV="$(cat "$ISO/installed.rules")"
 if [[ "$BLOCK" == "$PREV" ]] && [[ -z "$(jump_ops)" ]] && live_matches "$BLOCK"; then
   # Pre-review: the clean-up runs whatever the boot step says, so a broken after.rules cannot hold it back.
   rc=0; ct_flush || rc=1
-  boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; exit 1; }
-  (( rc == 0 )) || exit 1
+  boot_sync "$BLOCK" || { echo "unchanged: ${#STACKS[@]} stacks, block in place, but not persisted for boot"; fail boot-persistence; }
+  (( rc == 0 )) || fail conntrack
   echo "unchanged: ${#STACKS[@]} stacks, block already in place"; done_ok "unchanged"
 fi
 
@@ -467,7 +475,7 @@ fi
 pre_ok=1; pre_msg="$(selftest)" || pre_ok=0
 # S4-b decision 11 / S4-b2d: start no change late in the run, so the post-change self-test and a rollback
 # (iptables-restore 15 s + the self-test) still fit inside the agent's 60 s.
-(( SECONDS - T0 <= DEADLINE )) || { echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; exit 1; }
+(( SECONDS - T0 <= DEADLINE )) || { echo "deadline: $((SECONDS - T0)) s spent before the change (limit $DEADLINE s); nothing changed, retried next tick"; fail deadline; }
 # Pre-review: the cut is queued BEFORE the change, so a kill, a failed record or a failed boot step after it can
 # never lose it. A cut queued for a change that then fails or rolls back is harmless (decision 2).
 # Pre-review r2: a cut resets NATed connections (the mapping goes with the entry), so it must not happen for a
@@ -478,29 +486,29 @@ ct_restore() {  # the pending list as it was before this run's ct_queue
   if [[ -n "$CT_SNAP" ]]; then printf '%s\n' "$CT_SNAP" > "$ISO/conntrack.pending.tmp" && mv -f "$ISO/conntrack.pending.tmp" "$ISO/conntrack.pending"
   else rm -f "$ISO/conntrack.pending"; fi
 }
-ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; exit 1; }
+ct_queue "$PREV" "$BLOCK" "$drift" || { echo "could not write $ISO/conntrack.pending: nothing changed"; fail conntrack; }
 install_block "$BLOCK" deadline; irc=$?
-if (( irc == 2 )); then ct_restore; exit 1; fi
+if (( irc == 2 )); then ct_restore; fail deadline; fi
 if (( irc != 0 )); then
   ct_restore
-  echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; exit 1
+  echo "apply failed (iptables-restore refused the transaction): the previous block is still in place"; fail apply
 fi
 if ! post_msg="$(selftest)"; then
   if (( pre_ok == 0 )); then
     record "$BLOCK"; ct_flush; boot_sync "$BLOCK"
-    echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; exit 1
+    echo "applied: ${#STACKS[@]} stacks, block kept; the host self-test was already failing before the change ($pre_msg)"; fail self-test
   fi
   echo "self-test failed after apply ($post_msg): rolling back"
   if [[ -n "$PREV" ]]; then
-    install_block "$PREV" && record "$PREV" && { ct_restore; boot_sync "$PREV"; echo "rolled back to the previous block"; } || echo "rollback failed: run $0 --remove from the console"
+    install_block "$PREV" && record "$PREV" && { ct_restore; boot_sync "$PREV"; echo "rolled back to the previous block"; } || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
   else
-    remove_block && rm -f "$ISO/live.sha256" && { ct_restore; boot_sync ""; echo "rolled back: S4 block removed"; } || echo "rollback failed: run $0 --remove from the console"
+    remove_block && rm -f "$ISO/live.sha256" && { ct_restore; boot_sync ""; echo "rolled back: S4 block removed"; } || { echo "rollback failed: run $0 --remove from the console"; fail rollback; }
   fi
-  exit 1
+  fail self-test
 fi
-record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; exit 1; }
+record "$BLOCK" || { echo "applied, but could not record $ISO/installed.rules"; fail record; }
 ct_ok=0; ct_flush || ct_ok=1
-boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; exit 1; }
-(( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; exit 1; }
+boot_sync "$BLOCK" || { echo "applied: ${#STACKS[@]} stacks, self-test passed, but not persisted for boot"; fail boot-persistence; }
+(( ct_ok == 0 )) || { echo "applied: ${#STACKS[@]} stacks, self-test passed; old connections not yet cut"; fail conntrack; }
 echo "applied: ${#STACKS[@]} stacks, self-test passed"
 done_ok "applied"

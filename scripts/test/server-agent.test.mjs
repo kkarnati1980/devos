@@ -751,9 +751,9 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   await runAgent({ FAKE_ISO_RC: "3" });
   assert.match(isoState(), /^\d{1,12} fail \(exit 3\)\n$/);
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1, unknown\)\n$/);
   await runAgent({ FAKE_ISO_RC: "1" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1, unknown\)\n$/);
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
   const r6 = await runAgent({ FAKE_ISO_SLEEP: "5", ISOLATION_TIMEOUT: "1" });
@@ -775,12 +775,35 @@ test("S4-b2a AT-b2a-1b: before the first ok, no token (exit 3) or no listener ye
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 7): nothing changed" });
   assert.match(isoState(), /^\d{1,12} skipped\n$/, "token present, listener not deployed yet (S4-t2)");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/, "a listener that answers with an error is a failure");
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1, unknown\)\n$/, "a listener that answers with an error is a failure");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "self-test failed after the change; previous block restored" });
-  assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1, unknown\)\n$/);
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "disabled is a failure even before the first ok");
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.enforced")));
+});
+
+test("DEVOS-128: a failed run keeps only its own fixed reason code; anything else is unknown", async () => {
+  resetMock(); freshState();
+  const sha = commit({ ...baseFiles(), "x128": "1" }, "devos-128 reason codes");
+  M.main = sha; green(sha); pass(sha);
+  await runAgent(); await runAgent();
+  assert.match(isoState(), /^\d{1,12} ok\n$/);
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "reason: state-fetch" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1, state-fetch\)\n$/);
+  // stderr after the reason line (an EXIT trap) does not hide it; the last reason line counts
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "reason: apply\nreason: rollback\nrm: cannot remove x" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 1, rollback\)\n$/);
+  // a code outside the list, or a line carrying more text, is never copied
+  for (const msg of ["reason: " + SK, "reason: self-test extra", " reason: apply", "reason:apply"]) {
+    await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: msg });
+    assert.match(isoState(), /^\d{1,12} fail \(exit 1, unknown\)\n$/, msg);
+  }
+  // other exits keep their shape; the code is only for exit 1
+  await runAgent({ FAKE_ISO_RC: "3", FAKE_ISO_MSG: "reason: apply" });
+  assert.match(isoState(), /^\d{1,12} fail \(exit 3\)\n$/);
+  await runAgent({ FAKE_ISO_RC: "0", FAKE_ISO_MSG: "reason: apply" });
+  assert.match(isoState(), /^\d{1,12} ok\n$/);
 });
 
 test("S4-b2a AT-b2a-1c: a new SHA's server-check reports isolation-apply.sh as installed by that SHA (pre-review r2)", async () => {
@@ -799,7 +822,7 @@ test("S4-b2a AT-b2a-1c: a new SHA's server-check reports isolation-apply.sh as i
   const sc = statusPosts("server-check").find(() => true);
   assert.ok(sc, r.out);
   assert.equal(sc.state, "failure", "the broken script's result is in this SHA's server-check");
-  assert.match(isoState(), /fail \(exit 1\)\n$/);
+  assert.match(isoState(), /fail \(exit 1, unknown\)\n$/);
 });
 
 test("S4-b2a AT-b2a-2: deferred while a deployment is in flight; an allow-listed copy missing from bin/ is repaired", async () => {
@@ -843,7 +866,13 @@ test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips
   assert.equal(isoCheck(`${ago(60)} ok\n`).code, 0);
   assert.equal(isoCheck(null).code, 3, "never run yet");
   assert.equal(isoCheck(`${ago(60)} skipped\n`).code, 3, "not set up yet");
-  assert.equal(isoCheck(`${ago(60)} fail (exit 1)\n`).code, 1);
+  assert.equal(isoCheck(`${ago(60)} fail (exit 1)\n`).code, 1, "the v1.5.0 shape is still read");
+  const coded = isoCheck(`${ago(60)} fail (exit 1, state-fetch)\n`);
+  assert.equal(coded.code, 1, "DEVOS-128");
+  assert.match(coded.out, /^fail: last isolation run \d+s ago: fail \(exit 1, state-fetch\)\n$/);
+  assert.equal(isoCheck(`${ago(60)} fail (exit 1, unknown)\n`).code, 1);
+  assert.match(isoCheck(`${ago(60)} fail (exit 1, Bearer abc)\n`).out, /^fail: unreadable isolation state\n$/, "only listed codes");
+  assert.match(isoCheck(`${ago(60)} fail (exit 3, conntrack)\n`).out, /unreadable/, "a code only with exit 1");
   assert.equal(isoCheck(`${ago(60)} fail (timeout)\n`).code, 1);
   const stale = isoCheck(`${ago(2701)} ok\n`);
   assert.equal(stale.code, 1, "an old ok is a failure");

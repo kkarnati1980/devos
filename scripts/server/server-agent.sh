@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.5.0
+# Version: 1.6.0
+# v1.6.0 (DEVOS-128): an isolation run that exits 1 is kept as "fail (exit 1, <code>)". The code is the run's own last
+# "reason: <code>" output line (isolation-apply.sh v1.5.0), taken only when it is one of a fixed list; anything
+# else is "unknown". Only that code reaches isolation.state and the server-check; the output stays in the log.
 # v1.5.0 (DEVOS-127, S4-b2a): the allow-list gains scripts/server/isolation-apply.sh (S4-b). Every tick, after the
 # cert renewal and before anything that needs GitHub, the agent runs it under `timeout 60` (deferred while a
 # deployment is in flight: its self-test would see the DevOS API restarting). The redacted output goes to the
@@ -362,15 +365,17 @@ cert_renewal() {
 # S4-b2a (DEVOS-127): the host firewall block for project isolation (S4-b), applied every tick. It reads the
 # approved state from the DevOS API on loopback and changes only the S4 chains; exit 0 applied or unchanged,
 # 1 failed (previous block kept or restored), 3 not set up yet (or its lock held). The result line in
-# isolation.state is "<epoch> <ok|skipped|fail (exit n)|fail (timeout)>"; checks/project-isolation-apply.sh
-# reports it. "Not set up" is "skipped" only until the first ok run (marker isolation.enforced): before it, exit 3
+# isolation.state is "<epoch> <ok|skipped|fail (disabled)|fail (exit 1, <code>)|fail (exit n)|fail (timeout)>";
+# checks/project-isolation-apply.sh reports it. "Not set up" is "skipped" only until the first ok run (marker isolation.enforced): before it, exit 3
 # or a refused connection to the state listener (curl exit 7: the token exists, the listener is not deployed
 # yet) is skipped; after it, every non-zero exit is a failure, so isolation can never stop silently. Exit 4
 # (KK ran --remove; isolation/disabled exists) is always "fail (disabled)": kept off, and visible.
 ISOLATION_DEFER_MAX="${ISOLATION_DEFER_MAX:-1800}"   # an in-flight deploy marker older than this no longer defers
                                                       # (below the check's 2700 s, so a long deploy is never stale)
+# DEVOS-128: the reason codes isolation-apply.sh v1.5.0 prints; the check accepts the same list plus "unknown".
+ISOLATION_REASONS='config|token|state-fetch|refused|lock|deadline|conntrack|apply|self-test|rollback|record|boot-persistence|ipv6'
 isolation_tick() {
-  local f rc st now
+  local f rc st now code
   [[ -f "$BIN/isolation-apply.sh" ]] || { log "isolation: not installed yet"; return 0; }
   now="$(date +%s)"
   for f in "$ST"/deploy-started.*; do
@@ -382,7 +387,12 @@ isolation_tick() {
   if [[ $DRY -eq 1 ]]; then log "WOULD run isolation-apply.sh"; return 0; fi
   set +e; DEVOS_DIR="$DIR" timeout "$ISOLATION_TIMEOUT" bash "$BIN/isolation-apply.sh" > "$TMP/iso.out" 2>&1 </dev/null; rc=$?; set -e
   redact < "$TMP/iso.out" | tail -n 20 | while IFS= read -r l; do log "isolation: $l"; done
-  case "$rc" in 0) st=ok;; 4) st="fail (disabled)";; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
+  # DEVOS-128: the reason code comes from this run's own output file, so it can never pair with another run's
+  # result; only a fixed-list code is kept (no raw output reaches isolation.state or GitHub).
+  # The last such line counts (stderr, e.g. from an EXIT trap, may follow it); none, or none valid, is "unknown".
+  code="$(grep -E -x "reason: ($ISOLATION_REASONS)" "$TMP/iso.out" 2>/dev/null | tail -n 1)" || code=""
+  if [[ "$code" =~ ^reason:\ ($ISOLATION_REASONS)$ ]]; then code="${BASH_REMATCH[1]}"; else code=unknown; fi
+  case "$rc" in 0) st=ok;; 1) st="fail (exit 1, $code)";; 4) st="fail (disabled)";; 124) st="fail (timeout)";; *) st="fail (exit $rc)";; esac
   if [[ ! -e "$ST/isolation.enforced" && $rc -ne 4 ]]; then
     if (( rc == 3 )) || { (( rc == 1 )) && grep -qx 'state fetch failed (curl exit 7): nothing changed' "$TMP/iso.out"; }; then st=skipped; fi
   fi

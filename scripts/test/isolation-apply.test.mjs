@@ -128,8 +128,18 @@ const setState = (h, s) => fs.writeFileSync(path.join(h, "state.json"), typeof s
 function run(h, args = [], env = {}) {
   const r = spawnSync("bash", [SCRIPT, ...args], { encoding: "utf8", env: { PATH: `${bin}:/usr/bin:/bin`, DEVOS_DIR: path.join(h, "devos"),
     FAKE_NF: path.join(h, "nf"), FAKE_LOG: path.join(h, "log"), FAKE_STATE: path.join(h, "state.json"), ...env } });
-  return { code: r.status, out: r.stdout + r.stderr };
+  const out = r.stdout + r.stderr;
+  // DEVOS-128 (v1.5.0): every failed apply run (exit 1) ends with exactly one fixed reason line; the agent keeps
+  // only that code. Checked on every exit-1 run in this file, so no failure path can be missed.
+  if (r.status === 1 && !args.includes("--remove")) {
+    // stdout's last line (stderr, e.g. from an EXIT trap, can land after it; the agent reads the last reason line)
+    assert.match(r.stdout.trimEnd().split("\n").at(-1), REASON_LINE, `exit 1 without a reason line:\n${out}`);
+    assert.equal(out.split("\n").filter((l) => l.startsWith("reason: ")).length, 1, `one reason line only:\n${out}`);
+  }
+  return { code: r.status, out, stdout: r.stdout };
 }
+const REASON_LINE = /^reason: (config|token|state-fetch|refused|lock|deadline|conntrack|apply|self-test|rollback|record|boot-persistence|ipv6)$/;
+const reason = (r) => (r.stdout.trimEnd().split("\n").at(-1).match(REASON_LINE) || [])[1];
 const nf = (h, c) => (fs.existsSync(path.join(h, "nf", c)) ? fs.readFileSync(path.join(h, "nf", c), "utf8") : null);
 const restores = (h) => fs.readdirSync(path.join(h, "log")).filter((f) => f.startsWith("restore.")).length;
 const installed = (h) => path.join(h, "devos/isolation/installed.rules");
@@ -213,6 +223,7 @@ test("AT6 a failed state fetch changes nothing", () => {
   const h = host(STATE);
   const r = run(h, [], { FAKE_CURL_RC: "7" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "state-fetch", "DEVOS-128 reason code");
   assert.match(r.out, /state fetch failed \(curl exit 7\): nothing changed/);
   assert.equal(restores(h), 0);
 });
@@ -225,6 +236,7 @@ test("AT7 a failed iptables-restore leaves the previous chains, jumps and record
   setState(h, { stacks: [] });
   const r = run(h, [], { FAKE_RESTORE_RC: "1" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "apply", "DEVOS-128 reason code");
   assert.match(r.out, /apply failed .*previous block is still in place/);
   assert.deepEqual(["DOCKER-USER", "INPUT", "DEVOS-ISO-FWD", "DEVOS-ISO-IN"].map((c) => nf(h, c)), snap);
   assert.equal(fs.readFileSync(installed(h), "utf8"), before);
@@ -302,11 +314,27 @@ test("AT8 self-test that passed before and fails after rolls back to the previou
     setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
     const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
     assert.equal(r.code, 1, r.out);
+    assert.equal(reason(r), "self-test", "DEVOS-128 reason code");
     assert.match(r.out, /self-test failed after apply \(self-test: 127\.0\.0\.1:\d+ did not answer\)/);
     assert.match(r.out, /rolled back to the previous block/);
     assert.equal(nf(h, "DEVOS-ISO-FWD"), good);
     assert.equal(nf(h, "DOCKER-USER").match(/DEVOS-ISO-FWD/g).length, 1);
     assert.doesNotMatch(fs.readFileSync(installed(h), "utf8"), /gamma/);
+  } finally { l.stop(); }
+});
+
+test("DEVOS-128: a rollback that cannot complete says rollback, not self-test", async () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  const l = await listener();
+  try {
+    targets(h, upPort, l.port);
+    setState(h, { stacks: [{ slug: "gamma", env: "live", idx: 5, egress: true, tailnet: [] }] });
+    fs.mkdirSync(path.join(h, "devos/isolation/installed.rules.tmp")); // the rollback's record() cannot write
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid) });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /rollback failed: run .* --remove from the console/);
+    assert.equal(reason(r), "rollback");
   } finally { l.stop(); }
 });
 
@@ -330,6 +358,7 @@ test("a host self-test already failing before the change keeps the block (isolat
   targets(h, downPort);
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "self-test", "DEVOS-128 reason code");
   assert.match(r.out, /block kept; the host self-test was already failing before the change/);
   assert.equal(nf(h, "DOCKER-USER").split("\n")[0], "-A DOCKER-USER -j DEVOS-ISO-FWD");
   assert.equal(fs.readFileSync(installed(h), "utf8"), fs.readFileSync(GOLDEN, "utf8"));
@@ -401,6 +430,7 @@ test("skipped (exit 3) without a token; refuses a non-loopback state URL", () =>
   h = host(STATE, { conf: "ISOLATION_STATE_URL=http://example.com:80/internal/isolation-state\n" });
   r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "config", "DEVOS-128 reason code");
   assert.match(r.out, /loopback/);
   assert.equal(fs.existsSync(path.join(h, "log/curl.args")), false, "no request made");
 });
@@ -409,6 +439,7 @@ test("DEVOS-237: a token shorter than 32 characters is refused before any reques
   const h = host(STATE, { token: "t0ken-" + "a".repeat(25) }); // 31 characters
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "token", "DEVOS-128 reason code");
   assert.match(r.out, /token file is malformed/);
   assert.equal(fs.existsSync(path.join(h, "log/curl.args")), false, "no request made");
   assert.equal(restores(h), 0);
@@ -501,6 +532,7 @@ test("S4-b2b: without M0.1's block the boot block is not written (exit 1), the l
   fs.writeFileSync(path.join(h, "after.rules"), UFW_HEAD);
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "boot-persistence", "DEVOS-128 reason code");
   assert.match(r.out, /M0\.1's DEVOS UFW AND DOCKER block is not in .*; not written/);
   assert.match(r.out, /self-test passed, but not persisted for boot/);
   assert.equal(afterRules(h), UFW_HEAD, "after.rules untouched");
@@ -640,6 +672,7 @@ test("S4-b2d: no change starts after the run deadline; nothing changes and the n
   const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=0\n" });
   const r = run(h, [], { FAKE_CURL_SLEEP: "1.2" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "deadline", "DEVOS-128 reason code");
   assert.match(r.out, /deadline: \d+ s spent before the change \(limit 0 s\); nothing changed/);
   assert.equal(restores(h), 0);
   assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
@@ -653,6 +686,7 @@ test("Codex PR163-r1: a deadline used up by the iptables queries just before the
   const h = host(STATE, { conf: "ISOLATION_DEADLINE_S=1\n" });
   const r = run(h, [], { FAKE_IPT_S_SLEEP: "2" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "deadline", "DEVOS-128 reason code");
   assert.match(r.out, /deadline: \d+ s spent before the change \(limit 1 s\); nothing changed/);
   assert.equal(restores(h), 0, "iptables-restore never started");
   assert.equal(nf(h, "DEVOS-ISO-FWD"), null);
@@ -712,6 +746,7 @@ test("S4-b2d (pre-review): without the conntrack tool the run says so, exits 1 a
   }
   const r = run(h, [], { PATH: `${nob}:${core}` });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "conntrack", "DEVOS-128 reason code");
   assert.match(r.out, /conntrack not installed/);
   assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.208.0.0/14");
   assert.match(nf(h, "DEVOS-ISO-FWD"), /DEVOS-ISO-FWD/, "the block itself does not need conntrack");
@@ -724,6 +759,7 @@ test("S4-b2d (pre-review r2): the cut is queued before the change, so a failed r
   fs.mkdirSync(path.join(h, "devos/isolation/installed.rules.tmp")); // record() cannot write its temp file
   const r = run(h, [], { FAKE_CT_RC: "2" });
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "record", "DEVOS-128 reason code");
   assert.match(r.out, /could not record/);
   assert.equal(fs.readFileSync(pending(h), "utf8").trim(), "10.209.1.0/24", "queued before iptables-restore ran");
 });
@@ -829,6 +865,7 @@ test("S4-b2c: without M0.1's IPv6 block the drop is applied live but not written
   fs.writeFileSync(path.join(h, "after6.rules"), UFW_HEAD6);
   const r = run(h);
   assert.equal(r.code, 1, r.out);
+  assert.equal(reason(r), "ipv6", "DEVOS-128 reason code");
   assert.match(r.out, /M0\.1's DEVOS UFW AND DOCKER block is not in .*after6\.rules; not written/);
   assert.equal(after6(h), UFW_HEAD6, "after6.rules untouched");
   assert.equal(nf6(h, "DEVOS-ISO6"), RULE6, "live drop in place");
