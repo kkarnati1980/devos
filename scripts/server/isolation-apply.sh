@@ -93,7 +93,18 @@ remove_block() {  # deletes every jump to the S4 chains, then the chains; 0 if n
   for c in $FWD $IN; do
     if ipt -S "$c" >/dev/null 2>&1; then ipt -F "$c" && ipt -X "$c" || rc=1; fi
   done
+  # Codex PR210-r3: the queries above read any failure (a held xtables lock, a timeout) as "absent", so the
+  # result is confirmed with one whole-table listing whose failure counts as "still in place".
+  s4_gone ipt "$FWD" "$IN" || rc=1
   return $rc
+}
+s4_gone() {  # $1 = query function (ipt/ip6t), then the S4 chain names; 0 only if the table lists none of them
+  local q="$1" out c; shift
+  out="$("$q" -S 2>/dev/null)" || { echo "the firewall did not answer ($q -S): the S4 rules may still be in place"; return 1; }
+  for c in "$@"; do
+    grep -qE -- "^-N $c\$| -j $c( |\$)" <<<"$out" && return 1
+  done
+  return 0
 }
 
 # --- boot persistence (S4-b2b) ------------------------------------------------------------------------------
@@ -197,6 +208,7 @@ v6_remove() {  # deletes the IPv6 jumps, the chain and the after6.rules block; 0
         while ip6t -C "$chain" -j "$ISO6" 2>/dev/null; do ip6t -D "$chain" -j "$ISO6" || { rc=1; break; }; done
       done
       if ip6t -S "$ISO6" >/dev/null 2>&1; then ip6t -F "$ISO6" && ip6t -X "$ISO6" || rc=1; fi
+      s4_gone ip6t "$ISO6" || rc=1  # Codex PR210-r3: a failed query never reads as removed
     else
       echo "remove: ip6tables does not answer; the IPv6 drop may still be in place (ip6tables -S DEVOS-ISO6)"; rc=1
     fi

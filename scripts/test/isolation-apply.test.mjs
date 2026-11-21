@@ -25,6 +25,12 @@ before(async () => {
   w("iptables", `exec 8>"$FAKE_LOG/xtables.lock"; flock -w 1 8 || { echo "xtables lock held" >&2; exit 4; }
 [[ "$1" == -w ]] && shift 2
 echo "$*" >> "$FAKE_LOG/iptables.log"
+# Codex PR210-r3: after a restore with FAKE_QFAIL set, every query fails like a held xtables lock (exit 4).
+[[ -f "$FAKE_LOG/qfail" && ( "$1" == -S || "$1" == -C ) ]] && { echo "xtables lock held" >&2; exit 4; }
+if [[ "$*" == -S ]]; then  # whole-table listing: every chain, its policy or -N line, then its rules
+  for f in "$FAKE_NF"/*; do [[ -f "$f" ]] || continue; ch="\${f##*/}"
+    [[ "$ch" == INPUT || "$ch" == FORWARD ]] && echo "-P $ch DROP" || echo "-N $ch"; cat "$f"; done; exit 0
+fi
 op="$1" ch="$2"; shift 2; f="$FAKE_NF/$ch"
 [[ "$op" == -S && -n "\${FAKE_IPT_S_SLEEP:-}" ]] && sleep "$FAKE_IPT_S_SLEEP"
 [[ "$op" == -D && -n "\${FAKE_IPT_D_RC:-}" ]] && exit "$FAKE_IPT_D_RC"  # Codex PR165-r1: a failed rule delete
@@ -52,6 +58,7 @@ while IFS= read -r l; do
     -I\\ *) r="\${l#-I $c 1 }"; { echo "-A $c $r"; cat "$f"; } > "$f.n" && mv "$f.n" "$f" ;;
   esac
 done <<<"$in"
+[[ -z "\${FAKE_QFAIL:-}" ]] || : > "$FAKE_LOG/qfail"
 if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sleep 0.3; fi`);
   // curl: logs argv (to prove the token is not on it) and prints FAKE_STATE; FAKE_CURL_RC fails the fetch.
   w("curl", `echo "$*" >> "$FAKE_LOG/curl.args"; [[ -z "\${FAKE_CURL_SLEEP:-}" ]] || sleep "$FAKE_CURL_SLEEP"; [[ "\${FAKE_CURL_RC:-0}" == 0 ]] || exit "$FAKE_CURL_RC"; [[ -z "\${FAKE_CURL_TOUCH:-}" ]] || : > "$FAKE_CURL_TOUCH"; cat "$FAKE_STATE"`);
@@ -59,7 +66,7 @@ if [[ -n "\${FAKE_KILL_PID:-}" ]]; then kill -9 "$FAKE_KILL_PID" 2>/dev/null; sl
   // ip6tables / ip6tables-restore (S4-b2c): the same fakes over $FAKE_NF/v6 and $FAKE_LOG/v6, so the IPv4
   // restore count and logs are not mixed with IPv6. FAKE_V6_RC fails every ip6tables call; FAKE_V6_RESTORE_RC the restore.
   w("ip6tables", `[[ "\${FAKE_V6_RC:-0}" == 0 ]] || exit "$FAKE_V6_RC"; FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_IPT_S_SLEEP="\${FAKE_V6_S_SLEEP:-}" FAKE_IPT_D_RC= exec "\${0%/*}/iptables" "$@"`);
-  w("ip6tables-restore", `FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_RESTORE_RC="\${FAKE_V6_RESTORE_RC:-0}" FAKE_KILL_PID= exec "\${0%/*}/iptables-restore" "$@"`);
+  w("ip6tables-restore", `FAKE_NF="$FAKE_NF/v6" FAKE_LOG="$FAKE_LOG/v6" FAKE_RESTORE_RC="\${FAKE_V6_RESTORE_RC:-0}" FAKE_KILL_PID= FAKE_QFAIL= exec "\${0%/*}/iptables-restore" "$@"`);
   // conntrack (S4-b2d): logs argv; FAKE_CT_RC fails it with another message; with no match the real one exits 1.
   w("conntrack", `echo "$*" >> "$FAKE_LOG/conntrack.log"; [[ "\${FAKE_CT_RC:-0}" == 0 ]] || { echo "conntrack v1.4.7 (conntrack-tools): Operation failed: injected" >&2; exit "$FAKE_CT_RC"; }
 [[ -n "\${FAKE_CT_NOMATCH:-}" ]] && { echo "conntrack v1.4.7 (conntrack-tools): 0 flow entries have been deleted." >&2; exit 1; }
@@ -383,6 +390,31 @@ test("AT8 self-test failure on the first apply removes the block entirely", asyn
     assert.doesNotMatch(nf(h, "INPUT"), /DEVOS-ISO/);
     assert.equal(fs.existsSync(installed(h)), false);
   } finally { l.stop(); }
+});
+
+test("DEVOS-128 (Codex PR210-r3): a first-apply rollback whose firewall queries fail says rollback and asks for --remove", async () => {
+  const h = host(STATE);
+  const l = await listener();
+  try {
+    targets(h, l.port);
+    const r = run(h, [], { FAKE_KILL_PID: String(l.pid), FAKE_QFAIL: "1" });  // every query fails after the restore
+    assert.equal(r.code, 1, r.out);
+    assert.doesNotMatch(r.out, /rolled back: S4 block removed/, "a failed query never reads as removed");
+    assert.match(r.out, /the firewall did not answer \(ipt -S\)/);
+    assert.match(r.out, /rollback failed: run .* --remove from the console/);
+    assert.equal(reason(r), "rollback");
+    assert.match(nf(h, "DOCKER-USER"), /DEVOS-ISO-FWD/, "the rules really are still in place");
+  } finally { l.stop(); }
+});
+
+test("DEVOS-128 (Codex PR210-r3): --remove does not report success while iptables queries fail", () => {
+  const h = host(STATE);
+  assert.equal(run(h).code, 0);
+  fs.writeFileSync(path.join(h, "log/qfail"), "");
+  const r = run(h, ["--remove"]);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /some IPv4 S4 rules are still in place/);
+  assert.doesNotMatch(r.out, /^removed:/m);
 });
 
 test("a host self-test already failing before the change keeps the block (isolation is the floor) and reports it", () => {
