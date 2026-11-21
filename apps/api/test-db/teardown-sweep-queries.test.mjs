@@ -37,7 +37,11 @@ test("listDue: only archived projects whose purge_after has passed, oldest first
   const noDate = await mk({ stage: "archived", archivedAt: at(-1) });
 
   const mine = new Set([older, newer, exact, notYet, notArchived, noDate].map((p) => p.id));
-  const all = await q.listDue(now, 1000);
+  // Codex PR199-r1 (low): a fixed 1,000-row page could miss these fixtures on a reused database with more earlier due
+  // rows. The page is now every due row the database holds at `now` (counted with the query's own filter), plus one.
+  const dueCount = await db.project.count({ where: { stage: "archived", purgeAfter: { lte: now } } });
+  const all = await q.listDue(now, dueCount + 1);
+  assert.equal(all.length, dueCount, "the page holds every due row");
   const due = all.filter((p) => mine.has(p.id));
   assert.deepEqual(due.map((p) => p.id), [older.id, newer.id, exact.id], "purge_after <= now (inclusive), ascending");
   for (const p of [notYet, notArchived, noDate]) assert.ok(!due.some((d) => d.id === p.id), p.slug);
