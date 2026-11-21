@@ -23,6 +23,11 @@ case "$st" in
   skipped) echo "skipped: isolation not set up yet (no state token or listener), ${age}s ago"; exit 3 ;;
   *) last=""
      # Read again through the same fixed character set and length, so a hand-edited file cannot add anything.
-     [[ -f "$L" ]] && last="$(head -n1 "$L" 2>/dev/null | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+-' | cut -c1-200)"
+     # Codex PR204-r1: only a line written for the same run (same epoch as the state line) is shown.
+     if [[ -f "$L" ]]; then
+       raw="$(head -n1 "$L" 2>/dev/null)"
+       [[ "${raw%% *}" == "$at" ]] && last="$(printf '%s' "${raw#* }" | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+-' | cut -c1-420)"
+       last="${last#"${last%%[! ]*}"}"
+     fi
      echo "fail: last isolation run ${age}s ago: $st${last:+; it said: $last}"; exit 1 ;;
 esac

@@ -2,7 +2,7 @@
 
 - **Linear:** DEVOS-74 (amended by DEVOS-83, DEVOS-82, DEVOS-87, DEVOS-90, DEVOS-114) · P1 · Lane C · critical path (blocks DEVOS-47, the G1 gate)
 - **Depends on:** M0.3 (read-only deploy key `/root/.ssh/devos_ro`), the review watcher (DEVOS-60: `codex-review` commit status and the GitHub token in `/root/.devos/github-review.env`), M0.4 (local Coolify API on `http://localhost:8000/api/v1`).
-- **Owned files:** `scripts/server/server-agent.sh` (v1.5.1), `scripts/server/install-server-agent.sh` (v1.3.0), `scripts/server/coolify-token-check.sh` (v1.0.1), `scripts/server/checks/*.sh`, `scripts/test/server-agent.test.mjs`, this contract.
+- **Owned files:** `scripts/server/server-agent.sh` (v1.4.0), `scripts/server/install-server-agent.sh` (v1.3.0), `scripts/server/coolify-token-check.sh` (v1.0.1), `scripts/server/checks/*.sh`, `scripts/test/server-agent.test.mjs`, this contract.
 - **Approved by KK:** 6 Nov 2026 (DEVOS-74). It removes the need for KK at the server terminal after one install.
 - **Applies:** ADR-0011 (timeouts on every outbound call, retries only for safe operations), D1 (merge and deploy only on green CI + Codex PASS for the exact SHA), the continuous-build runbook (no runner access to the server; one installer that KK runs once).
 
@@ -130,5 +130,3 @@ AT1–AT9 and AT11–AT22 run in CI (39 tests in total, including the PR11-r1 re
 ## DEVOS-238 (16 Nov 2026, runner B): `coolify-token-check.sh` v1.0.2
 
 On a connection error curl prints `%{http_code}` as `000` itself, and the old `|| echo 000` fallback appended another, so `why` reported "Coolify API answered HTTP 000000" instead of "not reachable". `req()` now keeps curl's output only when it is a three-digit HTTP code and otherwise returns `000`. The exit code was already right (1); only the message changes. Test: `server-agent.test.mjs` "DEVOS-238" runs the check against a closed port and expects "Coolify API not reachable at …" (it fails on v1.0.1).
-
-**v1.5.1 (21 Nov 2026, DEVOS-128, runner B):** each isolation run's last output line is kept, redacted and reduced to a fixed character set, in `agent/isolation.last`, and `checks/project-isolation-apply.sh` prints it on a failure. Design and tests: `docs/modules/S4.md`, "S4-c isolation-apply diagnosis". v1.5.0 (DEVOS-127, S4-b2a, the isolation run every tick) is recorded in S4.md and in the script header; the owned-files line above was still at v1.4.0 and now names the current version.

@@ -756,13 +756,17 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   assert.match(isoState(), /^\d{1,12} fail \(exit 1\)\n$/);
   // DEVOS-128: the last output line is kept, redacted and reduced to the fixed character set (\x07, ; and " dropped).
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed;\x07 \"x\" Bearer abcDEF+ghi/jkl012345678901234567890=" });
-  const last = fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8");
-  assert.equal(last, "state fetch failed (curl exit 22): nothing changed x Bearer redacted\n", "[ ] are outside the set too");
+  const lastF = () => fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8");
+  const epoch = () => isoState().split(" ")[0];
+  // The run's last two lines, joined by " // ", after the run's epoch (the same epoch as isolation.state).
+  assert.match(lastF(), /^\d{1,12} iso run sk-\w{4}redacted Bearer redacted \/\/ state fetch failed \(curl exit 22\): nothing changed x Bearer redacted\n$/);
+  assert.equal(lastF().split(" ")[0], epoch(), "written for the same run as the state line");
+  assert.doesNotMatch(lastF(), /abcdefghijklmnop1234|ghi\/jkl012345/, "redacted");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
-  assert.equal(fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8"), "y".repeat(200) + "\n", "at most 200 characters");
-  // Pre-review: trailing blank lines are skipped (the fake's first line is then the last non-empty one).
+  assert.ok(lastF().endsWith(" // " + "y".repeat(200) + "\n"), "each line at most 200 characters");
+  // Pre-review: trailing blank lines are skipped.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
-  assert.match(fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8"), /^iso run .*Bearer redacted\n$/);
+  assert.match(lastF(), /^\d{1,12} iso run .*Bearer redacted\n$/);
   assert.ok(!fs.existsSync(path.join(D(), "agent/isolation.last.new")), "no temp file left");
   await runAgent({ FAKE_ISO_RC: "4" });
   assert.match(isoState(), /^\d{1,12} fail \(disabled\)\n$/, "KK's --remove keeps it off, and shows as a failure");
@@ -864,13 +868,16 @@ test("S4-b2a AT-b2a-3: project-isolation-apply check passes on a fresh ok, skips
   assert.equal(isoCheck(`${ago(60)} ok extra\n`).code, 1);
   assert.equal(isoCheck(`${ago(100)} ok\n`, { ISOLATION_MAX_AGE: "50" }).code, 1);
   // DEVOS-128: a failure names the run's last line; the check filters it again; an ok or skip never prints it.
-  const why = isoCheck(`${ago(60)} fail (exit 1)\n`, {}, "state fetch failed (curl exit 22): nothing changed\n");
+  const t = ago(60);
+  const why = isoCheck(`${t} fail (exit 1)\n`, {}, `${t} self-test failed after apply (ssh 100.64.0.1:22 refused): rolling back // rolled back to the previous block\n`);
   assert.equal(why.code, 1);
-  assert.equal(why.out, "fail: last isolation run 60s ago: fail (exit 1); it said: state fetch failed (curl exit 22): nothing changed\n");
-  const dirty = isoCheck(`${ago(60)} fail (exit 1)\n`, {}, "a;b`c$d\x1b[31m" + "z".repeat(300) + "\nsecond line\n");
-  assert.equal(dirty.out, `fail: last isolation run 60s ago: fail (exit 1); it said: abcd31m${"z".repeat(193)}\n`);
-  assert.equal(isoCheck(`${ago(60)} fail (exit 1)\n`, {}, "").out, "fail: last isolation run 60s ago: fail (exit 1)\n", "an empty file adds nothing");
-  assert.doesNotMatch(isoCheck(`${ago(60)} ok\n`, {}, "old failure\n").out, /old failure/);
+  assert.equal(why.out, "fail: last isolation run 60s ago: fail (exit 1); it said: self-test failed after apply (ssh 100.64.0.1:22 refused): rolling back // rolled back to the previous block\n");
+  // Codex PR204-r1: a line from another run (an older epoch) is never shown.
+  assert.equal(isoCheck(`${t} fail (exit 1)\n`, {}, `${t - 180} old cause\n`).out, "fail: last isolation run 60s ago: fail (exit 1)\n");
+  const dirty = isoCheck(`${t} fail (exit 1)\n`, {}, `${t} a;b\`c$d\x1b[31m` + "z".repeat(500) + "\nsecond line\n");
+  assert.equal(dirty.out, `fail: last isolation run 60s ago: fail (exit 1); it said: abcd31m${"z".repeat(413)}\n`, "filtered again and capped");
+  assert.equal(isoCheck(`${t} fail (exit 1)\n`, {}, `${t} \n`).out, "fail: last isolation run 60s ago: fail (exit 1)\n", "a run with no output adds nothing");
+  assert.doesNotMatch(isoCheck(`${t} ok\n`, {}, `${t} old failure\n`).out, /old failure/);
 });
 
 // ---- DEVOS-90: re-checks on request and every 6 hours ----

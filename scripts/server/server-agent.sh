@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
 # Version: 1.5.1
-# v1.5.1 (DEVOS-128, 21 Nov 2026): the isolation run's last output line, redacted and reduced to a fixed character
-# set (letters, digits, space and . _ : / ( ) = , + -; at most 200), is kept in agent/isolation.last, so the
-# project-isolation-apply check can say why a run failed (it had failed with only "exit 1" since 19 Nov).
+# v1.5.1 (DEVOS-128, 21 Nov 2026): the isolation run's last two output lines, redacted and reduced to a fixed character
+# set (letters, digits, space and . _ : / ( ) = , + -; at most 200 each), are kept in agent/isolation.last with the
+# run's epoch, so the project-isolation-apply check can say why that run failed (only "exit 1" since 19 Nov).
 # v1.5.0 (DEVOS-127, S4-b2a): the allow-list gains scripts/server/isolation-apply.sh (S4-b). Every tick, after the
 # cert renewal and before anything that needs GitHub, the agent runs it under `timeout 60` (deferred while a
 # deployment is in flight: its self-test would see the DevOS API restarting). The redacted output goes to the
@@ -389,15 +389,19 @@ isolation_tick() {
   if [[ ! -e "$ST/isolation.enforced" && $rc -ne 4 ]]; then
     if (( rc == 3 )) || { (( rc == 1 )) && grep -qx 'state fetch failed (curl exit 7): nothing changed' "$TMP/iso.out"; }; then st=skipped; fi
   fi
-  { printf '%s %s\n' "$(date +%s)" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
-    || log "isolation: could not write isolation.state"
-  # v1.5.1: the last non-empty output line, for the check's message (decision in docs/modules/S4.md, "S4-c
-  # isolation-apply diagnosis"). Redacted first, then only a fixed character set is kept, so no secret-shaped
-  # value or control character reaches the public server-check comment. A run with no output writes an empty
-  # file (grep's no-match exit is not a failure), so an older run's cause is never shown. A failed write is only logged.
-  { redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | tail -n1 | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+-' | cut -c1-200 \
+  now="$(date +%s)"
+  # v1.5.1: the run's last two non-empty output lines, for the check's message (docs/modules/S4.md, "S4-c
+  # isolation-apply diagnosis"). Redacted first, then only a fixed character set is kept, so no secret-shaped value
+  # or control character reaches the public server-check comment. The line starts with this run's epoch and is
+  # written BEFORE isolation.state, so the check shows it only when both epochs match (Codex PR204-r1): a failed
+  # write or a reader in between can never pair an older cause with a newer result. A run with no output writes
+  # just the epoch. A failed write is only logged.
+  { printf '%s %s\n' "$now" "$(redact < "$TMP/iso.out" | { grep -v '^[[:space:]]*$' || true; } | tail -n2 \
+        | LC_ALL=C tr -cd 'A-Za-z0-9 ._:/()=,+\n-' | cut -c1-200 | paste -sd'~' - | sed 's/~/ \/\/ /')" \
       > "$ST/isolation.last.new" && mv -f "$ST/isolation.last.new" "$ST/isolation.last"; } \
     || log "isolation: could not write isolation.last"
+  { printf '%s %s\n' "$now" "$st" > "$ST/isolation.state.new" && mv -f "$ST/isolation.state.new" "$ST/isolation.state"; } \
+    || log "isolation: could not write isolation.state"
   [[ "$st" == ok && ! -e "$ST/isolation.enforced" ]] && { touch "$ST/isolation.enforced"; log "isolation: enforced from now on (a skip is a failure)"; }
   log "isolation: $st"
 }
