@@ -758,15 +758,20 @@ test("S4-b2a AT-b2a-1: isolation-apply.sh is installed from the allow-list and r
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "state fetch failed (curl exit 22): nothing changed;\x07 \"x\" Bearer abcDEF+ghi/jkl012345678901234567890=" });
   const lastF = () => fs.readFileSync(path.join(D(), "agent/isolation.last"), "utf8");
   const epoch = () => isoState().split(" ")[0];
-  // The run's cause line (the first that names one) and its last line, after the run's epoch (the state's epoch).
-  assert.match(lastF(), /^\d{1,12} state fetch failed \(curl exit 22\): nothing changed x Bearer redacted\n$/, "cause = outcome: shown once");
+  // Every line in order (the earlier ones cut to 200), then the last line, after the run's epoch (the state's epoch).
+  assert.match(lastF(), /^\d{1,12} iso run sk-\w{4}redacted Bearer redacted \/\/ state fetch failed \(curl exit 22\): nothing changed x Bearer redacted\n$/);
   assert.equal(lastF().split(" ")[0], epoch(), "written for the same run as the state line");
   assert.doesNotMatch(lastF(), /abcdefghijklmnop1234|ghi\/jkl012345/, "redacted");
-  // Codex PR204-r2: lines between the failing target and the outcome cannot push the target out.
-  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "self-test failed after apply (ssh 100.64.0.1:22 refused): rolling back\nboot sync: rules rewritten\nboot sync: second line\nrolled back to the previous block" });
-  assert.match(lastF(), /^\d{1,12} self-test failed after apply \(ssh 100\.64\.0\.1:22 refused\): rolling back \/\/ rolled back to the previous block\n$/);
+  // Codex PR204-r2/r3: lines between the cause and the outcome cannot push either out.
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "boot persistence: the DEVOS S4 markers are broken\nboot sync: rules rewritten\nunchanged: 2 stacks, block in place, but not persisted for boot" });
+  assert.match(lastF(), /^\d{1,12} iso run .* \/\/ boot persistence: the DEVOS S4 markers are broken \/\/ boot sync: rules rewritten \/\/ unchanged: 2 stacks, block in place, but not persisted for boot\n$/);
+  await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "a".repeat(190) + "\n" + "b".repeat(190) + "\nrolled back to the previous block" });
+  const cut = lastF().replace(/^\d{1,12} /, "");
+  assert.ok(cut.endsWith(" // rolled back to the previous block\n"), "the last line is always kept");
+  const earlier = cut.slice(0, -" // rolled back to the previous block\n".length);
+  assert.ok(earlier.startsWith("iso run ") && earlier.length <= 200 && !earlier.includes("b".repeat(10)), "the earlier lines are cut to 200, oldest first");
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "y".repeat(300) });
-  assert.match(lastF(), new RegExp(`^\\d{1,12} ${"y".repeat(200)}\\n$`), "no cause line: the last line, at most 200 characters");
+  assert.ok(lastF().endsWith(" // " + "y".repeat(200) + "\n"), "each line at most 200 characters");
   // Pre-review: trailing blank lines are skipped.
   await runAgent({ FAKE_ISO_RC: "1", FAKE_ISO_MSG: "   " });
   assert.match(lastF(), /^\d{1,12} iso run .*Bearer redacted\n$/);
