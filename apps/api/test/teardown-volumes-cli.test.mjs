@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { purgedAppsCli, prismaDeletedApps, MAX_ROWS, SCAN_UUID_RE } from "../dist/teardown-volumes-cli.js";
 
-const reader = (ids, live = []) => async () => ({ deletedApplicationIds: async () => ids, liveApplicationIds: async () => live });
+const reader = (ids, live = []) => async () => ({ applicationIds: async () => ({ deleted: ids, live }) });
 
 test("DEVOS-236: lists the deleted application uuids, sorted and without duplicates", async () => {
   const r = await purgedAppsCli(["purged-apps"], reader(["zz9app0001", "ab12cd34ef", "zz9app0001"]));
@@ -20,10 +20,10 @@ test("DEVOS-236: an id the check cannot match safely is counted, never printed",
 });
 
 test("DEVOS-236: a read error is a fixed code, never the database message", async () => {
-  const r = await purgedAppsCli(["purged-apps"], async () => ({ deletedApplicationIds: async () => { throw new Error("password=hunter2 connection refused"); }, liveApplicationIds: async () => [] }));
+  const r = await purgedAppsCli(["purged-apps"], async () => ({ applicationIds: async () => { throw new Error("password=hunter2 connection refused"); } }));
   assert.equal(r.code, 1);
   assert.deepEqual(r.out, { error: "teardown-volumes-read-failed" });
-  const r2 = await purgedAppsCli(["purged-apps"], async () => ({ deletedApplicationIds: async () => [], liveApplicationIds: async () => { throw new Error("password=hunter2"); } }));
+  const r2 = await purgedAppsCli(["purged-apps"], async () => ({ applicationIds: async () => ({ deleted: [], live: null }) }));
   assert.equal(r2.code, 1);
   assert.deepEqual(r2.out, { error: "teardown-volumes-read-failed" });
 });
@@ -38,7 +38,7 @@ test("DEVOS-236: more rows than the limit fail instead of being cut silently", a
 test("DEVOS-236: wrong arguments are usage (exit 2) and read nothing", async () => {
   let read = false;
   for (const argv of [[], ["purge"], ["purged-apps", "x"]]) {
-    const r = await purgedAppsCli(argv, async () => { read = true; return { deletedApplicationIds: async () => [], liveApplicationIds: async () => [] }; });
+    const r = await purgedAppsCli(argv, async () => { read = true; return { applicationIds: async () => ({ deleted: [], live: [] }) }; });
     assert.equal(r.code, 2);
   }
   assert.equal(read, false);
@@ -48,17 +48,16 @@ test("DEVOS-236: the Prisma reader asks only for deleted Coolify application row
   const calls = [];
   const tx = { resource: { findMany: async (q) => { calls.push(q); return [{ externalId: "abcd1234ef" }]; } } };
   const db = { $transaction: async (fn, opts) => { calls.push(opts); return fn(tx); } };
-  const ids = await prismaDeletedApps(db, 10_000).deletedApplicationIds(7);
-  assert.deepEqual(ids, ["abcd1234ef"]);
-  assert.deepEqual(calls[0], { timeout: 10_000, maxWait: 10_000 });
+  const r = await prismaDeletedApps(db, 10_000).applicationIds(7);
+  assert.deepEqual(r, { deleted: ["abcd1234ef"], live: ["abcd1234ef"] });
+  // Codex PR209-r13: one transaction, one snapshot (REPEATABLE READ), both reads inside it.
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0], { timeout: 10_000, maxWait: 10_000, isolationLevel: "RepeatableRead" });
   assert.deepEqual(calls[1].where, { provider: "coolify", kind: "application", status: "deleted" });
   assert.equal(calls[1].take, 7);
   // Codex PR209-r12: the live read asks for the same rows that are not deleted.
-  const live = await prismaDeletedApps(db, 10_000).liveApplicationIds(9);
-  assert.deepEqual(live, ["abcd1234ef"]);
-  assert.deepEqual(calls[2], { timeout: 10_000, maxWait: 10_000 });
-  assert.deepEqual(calls[3].where, { provider: "coolify", kind: "application", status: { not: "deleted" } });
-  assert.equal(calls[3].take, 9);
+  assert.deepEqual(calls[2].where, { provider: "coolify", kind: "application", status: { not: "deleted" } });
+  assert.equal(calls[2].take, 7);
   assert.deepEqual(Object.keys(tx.resource), ["findMany"]);
 });
 

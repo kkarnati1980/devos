@@ -17,9 +17,11 @@ export const MAX_ROWS = 2000;
 export const USAGE = "teardown-volumes-cli.js purged-apps";
 
 export interface DeletedAppReader {
-  deletedApplicationIds(limit: number): Promise<string[]>;
-  /** Codex PR209-r12: Coolify application rows that are not deleted. */
-  liveApplicationIds(limit: number): Promise<string[]>;
+  /**
+   * Coolify application rows, deleted and (Codex PR209-r12) not deleted, read from one snapshot (Codex PR209-r13), so
+   * a purge that lands during the read can never leave a row out of both lists.
+   */
+  applicationIds(limit: number): Promise<{ deleted: string[]; live: string[] }>;
 }
 
 /**
@@ -31,9 +33,7 @@ export async function purgedAppsCli(argv: string[], reader: () => Promise<Delete
   let ids: string[];
   let liveIds: string[];
   try {
-    const r = await reader();
-    ids = await r.deletedApplicationIds(MAX_ROWS + 1);
-    liveIds = await r.liveApplicationIds(MAX_ROWS + 1);
+    ({ deleted: ids, live: liveIds } = await (await reader()).applicationIds(MAX_ROWS + 1));
   } catch {
     return { code: 1, out: { error: "teardown-volumes-read-failed" } };
   }
@@ -48,23 +48,22 @@ export async function purgedAppsCli(argv: string[], reader: () => Promise<Delete
   return { code: 0, out: { uuids, live, invalid } };
 }
 
-/** The Prisma reader: Coolify `application` rows, deleted (newest deletion first) or not deleted. Read-only. */
+/**
+ * The Prisma reader: Coolify `application` rows, deleted (newest deletion first) and not deleted. Both reads run in one
+ * REPEATABLE READ transaction, so they see one snapshot (Codex PR209-r13). Read-only.
+ */
 export function prismaDeletedApps(db: any, timeoutMs: number): DeletedAppReader {
-  const read = async (status: unknown, limit: number) => {
-    const rows = await db.$transaction(
-      (tx: any) => tx.resource.findMany({
-        where: { provider: "coolify", kind: "application", status },
-        select: { externalId: true },
-        orderBy: [{ deletedAt: "desc" }, { id: "asc" }],
-        take: limit,
-      }),
-      { timeout: timeoutMs, maxWait: timeoutMs },
-    );
-    return rows.map((r: { externalId: string }) => r.externalId);
-  };
+  const ids = (tx: any, status: unknown, limit: number) => tx.resource.findMany({
+    where: { provider: "coolify", kind: "application", status },
+    select: { externalId: true },
+    orderBy: [{ deletedAt: "desc" }, { id: "asc" }],
+    take: limit,
+  }).then((rows: { externalId: string }[]) => rows.map((r) => r.externalId));
   return {
-    deletedApplicationIds: (limit) => read("deleted", limit),
-    liveApplicationIds: (limit) => read({ not: "deleted" }, limit),
+    applicationIds: (limit) => db.$transaction(
+      async (tx: any) => ({ deleted: await ids(tx, "deleted", limit), live: await ids(tx, { not: "deleted" }, limit) }),
+      { timeout: timeoutMs, maxWait: timeoutMs, isolationLevel: "RepeatableRead" },
+    ),
   };
 }
 
