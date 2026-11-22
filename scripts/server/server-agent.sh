@@ -301,6 +301,8 @@ stored_uuid_values() {
 # older meaning. A response can upgrade the schema, never downgrade it.
 # Codex PR214-r21: a row is non-preview only with an explicit is_preview false (missing or null is not false), and
 # any row of a checked key whose is_preview is not a boolean fails the check. The same rule is used in both read-backs.
+# Codex PR214-r23: a hidden value (no read:sensitive) cannot be compared between the two reads, so a replaced row
+# would look unchanged; a stored uuid is kept only when Coolify returns its value, on every copy.
 stored_uuid_ok() {
   jq -e --arg re "$SERVER_UUID_JQ" --argjson modern "$CF_MODERN" '
     ($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
@@ -308,8 +310,8 @@ stored_uuid_ok() {
     | ($g | map(.value // null) | unique) as $v
     | all(.[]?; .key != "DEVOS_COOLIFY_SERVER_UUID" or ((.is_preview | type) == "boolean"))
     and ($g | length) > 0 and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
-      and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))
-    and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1)' <<<"$1" >/dev/null
+      and ((.value | type) == "string" and (.value | test($re))))
+    and ($v | length) == 1' <<<"$1" >/dev/null
 }
 provision_env() {
   local envs="$1" owner="${REPO%%/*}" servers uuid="" flags

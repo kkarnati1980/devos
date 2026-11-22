@@ -743,6 +743,34 @@ test("M2.4-d4b (PR214-r14): an env read-back with a non-object element starts no
   assert.match(r.out, /Coolify envs read-back: unexpected response/);
 });
 
+// PR214-r23: a hidden stored value cannot be compared between reads (a replaced row would look the same), so it is
+// never kept; with no server found, no deploy is submitted.
+for (const [name, row] of [["no value field", {}], ["a null value", { value: null }]]) {
+  test(`M2.4-d4b (PR214-r23): no server found and a single stored uuid with ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true, ...row });
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4h23${name.length}`]: "1" }, "d4b h23");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+test("M2.4-d4b (PR214-r23): a kept stored uuid whose read-back hides the value starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  M.envRawAfterBulk = (out) => JSON.stringify(out.map((e) => { if (e.key !== "DEVOS_COOLIFY_SERVER_UUID") return e; const { value, ...r } = e; return { ...r, uuid: "row-new" }; }));
+  const sha = commit({ ...baseFiles(), "x4h23r": "1" }, "d4b h23r");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
 // PR214-r22: every env row must have a string key, so each row can be classified; an unclassifiable row makes the
 // whole read inconclusive (first read: nothing upserted; read-back: no deploy).
 for (const [name, row] of [["no key", { value: "x", is_preview: false }], ["a null key", { key: null, value: "x", is_preview: false }],
