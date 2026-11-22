@@ -538,7 +538,8 @@ test("M2.4-d4b: no server found but a stored uuid is kept (not upserted) and the
   assert.equal(M.deployPosts, 1);
 });
 
-for (const [name, stale] of [["removed", { key: "GONE" }], ["made non-runtime", { is_runtime: false }]]) {
+for (const [name, stale] of [["removed", { key: "GONE" }], ["made non-runtime", { is_runtime: false }],
+  ["replaced by another well-formed uuid (PR214-r3)", { value: "srv-other" }]]) {
   test(`M2.4-d4b (PR214-r1): a kept stored uuid ${name} between the reads starts no deploy`, async () => {
     resetMock(); freshState({ deploy: true });
     M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });

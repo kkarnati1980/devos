@@ -250,6 +250,11 @@ SERVER_UUID_RE='^[A-Za-z0-9-]{1,64}$'
 # Codex PR214-r2: in jq, \A and \z anchor the whole string; "$" would also match before a trailing newline, and
 # bash's $(...) strips one, so the shape is checked inside jq on the value exactly as Coolify returned it.
 SERVER_UUID_JQ='\A[A-Za-z0-9-]{1,64}\z'
+# stored_uuid_values envs-json -> the JSON list of the non-preview DEVOS_COOLIFY_SERVER_UUID values (null where Coolify
+# returns none), so the fresh read can be compared with the first one (Codex PR214-r3).
+stored_uuid_values() {
+  jq -c '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false)) | .value // null]' <<<"$1"
+}
 # stored_uuid_ok envs-json -> 0 when a non-preview DEVOS_COOLIFY_SERVER_UUID exists and every copy is runtime (where
 # Coolify has that flag) and, when values are returned, has the API's uuid shape.
 stored_uuid_ok() {
@@ -277,7 +282,7 @@ provision_env() {
     # values, has the API's uuid shape; otherwise the deploy waits, as with none stored.
     if stored_uuid_ok "$envs"; then
       log "Coolify server uuid not found (no single server named localhost); keeping the stored DEVOS_COOLIFY_SERVER_UUID"
-      PROV_KEPT=1
+      PROV_KEPT=1; stored_uuid_values "$envs" > "$TMP/prov.stored"
     else
       log "Coolify server uuid not found (no single server named localhost) and no usable stored value"; return 1
     fi
@@ -322,7 +327,8 @@ set_git_sha_env() {
     || { log "Coolify env provisioning variables did not read back as runtime"; PROV_FAILED=1; return 1; }
   # Codex PR214-r1: a kept stored uuid is not in the upsert, so it is checked again on the fresh read; a value that
   # was removed or changed in between submits no deploy.
-  if [[ $PROV_KEPT -eq 1 ]] && ! stored_uuid_ok "$envs"; then
+  # Codex PR214-r3: it must also still hold the same value(s) as on the first read, not just any well-formed uuid.
+  if [[ $PROV_KEPT -eq 1 ]] && { ! stored_uuid_ok "$envs" || [[ "$(stored_uuid_values "$envs")" != "$(cat "$TMP/prov.stored")" ]]; }; then
     log "Coolify env stored DEVOS_COOLIFY_SERVER_UUID is no longer usable"; PROV_FAILED=1; return 1
   fi
 }
