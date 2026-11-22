@@ -740,6 +740,33 @@ test("M2.4-d4b (PR214-r14): an env read-back with a non-object element starts no
   assert.match(r.out, /Coolify envs read-back: unexpected response/);
 });
 
+// PR214-r15: the first read shows the newer flags; a read-back in the older shape (is_build_time only) must not pass.
+const legacyRows = (out) => JSON.stringify(out.map(({ is_buildtime, is_runtime, ...e }) => ({ ...e, is_build_time: e.key === "GIT_SHA" })));
+test("M2.4-d4b (PR214-r15): a read-back in the older flag shape after a newer first read starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envRawAfterBulk = legacyRows;
+  const sha = commit({ ...baseFiles(), "x4bs": "1" }, "d4b s");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /did not read back/);
+});
+
+test("M2.4-d4b (PR214-r15): a kept stored uuid read back in the older flag shape starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  M.envRawAfterBulk = legacyRows;
+  const sha = commit({ ...baseFiles(), "x4bt": "1" }, "d4b t");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
   for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });

@@ -270,6 +270,7 @@ self_update() {  # sha -> installs the allow-list at sha; 0 only if every step s
 # upsert with GIT_SHA (runtime only; the build does not need them). The owner is the tracked repo's owner. The Coolify
 # server uuid is the one server named "localhost" (Coolify's own host, M0.4's rule); when it cannot be found, a stored
 # non-preview value is kept (left out of the upsert) and otherwise this fails, so no deploy is submitted.
+CF_MODERN=false   # set by set_git_sha_env from the first env read of each deploy (Codex PR214-r15)
 OWNER_RE='^[A-Za-z0-9][A-Za-z0-9-]{0,38}$'
 SERVER_UUID_RE='^[A-Za-z0-9-]{1,64}$'
 # Codex PR214-r2: in jq, \A and \z anchor the whole string; "$" would also match before a trailing newline, and
@@ -287,9 +288,11 @@ stored_uuid_values() {
 # true on each copy; only the older schema (is_build_time only) has every variable at runtime without the flag.
 # Codex PR214-r6: a copy counts as the older schema only when it carries is_build_time; a copy with no flags at all fails.
 # Codex PR214-r7: that is_build_time must be a boolean (true or false); null or a string fails.
+# Codex PR214-r15: the schema ($modern) is decided once, from the first env read (CF_MODERN), never re-inferred
+# from a later response, so a read-back cannot downgrade the runtime check.
 stored_uuid_ok() {
-  jq -e --arg re "$SERVER_UUID_JQ" 'any(.[]?; has("is_buildtime") or has("is_runtime")) as $modern
-    | [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
+  jq -e --arg re "$SERVER_UUID_JQ" --argjson modern "$CF_MODERN" '
+    [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
     | ($g | map(.value // null) | unique) as $v
     | ($g | length) > 0 and all($g[]; (if $modern then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
       and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))
@@ -306,7 +309,7 @@ provision_env() {
       | if type == "string" and test($re) then . else "" end' <<<"$servers")"
     [[ "$uuid" =~ $SERVER_UUID_RE ]] || uuid=""
   fi
-  if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
+  if [[ "$CF_MODERN" == true ]]; then
     flags='{is_preview: false, is_buildtime: false, is_runtime: true}'
   else
     flags='{is_preview: false, is_build_time: false}'
@@ -335,9 +338,11 @@ set_git_sha_env() {
   # Codex PR214-r14: of objects only; a string element made has() error, which the flag checks read as the old schema.
   envs="$(cf_json GET "/applications/$CF_APP/envs")" && jq -e 'type == "array" and all(.[]; type == "object")' <<<"$envs" >/dev/null 2>&1 \
     || { log "Coolify envs: unexpected response"; return 1; }
+  # Codex PR214-r15: the flag schema is taken from this first read only and used for the upsert and every read-back.
+  if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then CF_MODERN=true; else CF_MODERN=false; fi
   # M2.4-d4b: the provisioning variables go in the same upsert; no uuid found and none stored submits nothing.
   provision_env "$envs" || { PROV_FAILED=1; return 1; }
-  if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
+  if [[ "$CF_MODERN" == true ]]; then
     jq -n --arg v "$sha" --slurpfile p "$TMP/prov.json" '{data: ([{key: "GIT_SHA", value: $v, is_preview: false, is_buildtime: true, is_runtime: true}] + $p[0])}'
   else
     jq -n --arg v "$sha" --slurpfile p "$TMP/prov.json" '{data: ([{key: "GIT_SHA", value: $v, is_preview: false, is_build_time: true}] + $p[0])}'
@@ -349,17 +354,18 @@ set_git_sha_env() {
   # Read back: the non-preview GIT_SHA exists, is build-time (and runtime where Coolify has that flag), and its
   # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
   # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).
-  jq -e --arg v "$sha" '[.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
+  # Codex PR214-r15: with the newer schema (from the first read) both is_buildtime and is_runtime must be true.
+  jq -e --arg v "$sha" --argjson modern "$CF_MODERN" '[.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
     | ($g | length) > 0
-      and all($g[]; (if has("is_buildtime") then .is_buildtime else .is_build_time end) == true
-                    and ((has("is_runtime") | not) or .is_runtime == true)
+      and all($g[]; (if $modern then .is_buildtime == true and .is_runtime == true
+                     else .is_build_time == true and ((has("is_runtime") | not) or .is_runtime == true) end)
                     and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
     || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
   # M2.4-d4b read-back: each upserted provisioning variable exists (non-preview), is runtime, and holds the value sent
   # when values are returned. Older Coolify (is_build_time only) has every value at runtime. Codex PR214-r5: with the
   # newer flags, is_runtime must be present and true; and every copy must hold one value (a hidden value is accepted
   # only on a single copy), so a stale duplicate cannot leave a second target.
-  jq -e --slurpfile p "$TMP/prov.json" '. as $e | any($e[]?; has("is_buildtime") or has("is_runtime")) as $modern
+  jq -e --slurpfile p "$TMP/prov.json" --argjson modern "$CF_MODERN" '. as $e
     | all($p[0][]; . as $w
       | [$e[]? | select(.key == $w.key and ((.is_preview // false) == false))] as $g
       | ($g | map(.value // null) | unique) as $v
