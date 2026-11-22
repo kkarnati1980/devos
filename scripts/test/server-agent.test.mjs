@@ -511,7 +511,7 @@ for (const [name, servers] of [
     assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
     assert.equal(writes().filter((q) => q.path.endsWith("/envs/bulk")).length, 0, "nothing upserted");
     assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
-    assert.match(r.out, /could not set DEVOS_COOLIFY_SERVER_UUID/);
+    assert.match(r.out, /could not set the provisioning variables/);
     assert.equal(provEnv("DEVOS_COOLIFY_SERVER_UUID").length, 0);
     M.servers = [{ uuid: "srv-uuid-1", name: "localhost" }];
     r = await runAgent();
@@ -536,6 +536,20 @@ test("M2.4-d4b: no server found but a stored uuid is kept (not upserted) and the
   assert.equal(M.deployPosts, 1);
 });
 
+for (const [name, stored] of [["runtime false", { value: "srv-stored", is_runtime: false }], ["a malformed value", { value: "srv stored", is_runtime: true }]]) {
+  test(`M2.4-d4b: no server found and a stored uuid with ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, ...stored });
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4bf-${name.length}`]: "1" }, `d4b f ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+
 for (const [name, patch] of [["is_runtime: false", { is_runtime: false }], ["another value", { value: "someone-else" }]]) {
   test(`M2.4-d4b: a DEVOS_GITHUB_OWNER read back with ${name} starts no deploy`, async () => {
     resetMock(); freshState({ deploy: true });
@@ -546,6 +560,7 @@ for (const [name, patch] of [["is_runtime: false", { is_runtime: false }], ["ano
     assert.equal(r.code, 0, r.out);
     assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
     assert.match(r.out, /provisioning variables did not read back/);
+    assert.match(r.out, /could not set the provisioning variables/);
     assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
   });
 }

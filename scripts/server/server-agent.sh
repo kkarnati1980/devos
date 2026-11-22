@@ -261,10 +261,14 @@ provision_env() {
     flags='{is_preview: false, is_build_time: false}'
   fi
   if [[ -z "$uuid" ]]; then
-    if jq -e 'any(.[]?; .key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))' <<<"$envs" >/dev/null; then
+    # Pre-review: a stored value is kept only when it is runtime (where Coolify has that flag) and, when Coolify returns
+    # values, has the API's uuid shape; otherwise the deploy waits, as with none stored.
+    if jq -e --arg re "$SERVER_UUID_RE" '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
+        | ($g | length) > 0 and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
+          and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))' <<<"$envs" >/dev/null; then
       log "Coolify server uuid not found (no single server named localhost); keeping the stored DEVOS_COOLIFY_SERVER_UUID"
     else
-      log "Coolify server uuid not found (no single server named localhost) and none stored"; return 1
+      log "Coolify server uuid not found (no single server named localhost) and no usable stored value"; return 1
     fi
   fi
   jq -n --arg o "$owner" --arg u "$uuid" "[{key: \"DEVOS_GITHUB_OWNER\", value: \$o} + $flags]
@@ -304,7 +308,7 @@ set_git_sha_env() {
       | ($g | length) > 0
         and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
                       and ((has("value") | not) or .value == null or .value == $w.value)))' <<<"$envs" >/dev/null \
-    || { log "Coolify env provisioning variables did not read back as runtime"; return 1; }
+    || { log "Coolify env provisioning variables did not read back as runtime"; PROV_FAILED=1; return 1; }
 }
 
 # Deploy is never submitted twice for a SHA. deploy-started.<sha> is written before the first Coolify call;
@@ -324,7 +328,7 @@ deploy() {  # sha -> 0 when Coolify finished deploying exactly this sha
       || { log "${sha:0:7}: could not set git_commit_sha; deploy not started, next tick retries"; return 2; }
     PROV_FAILED=0
     set_git_sha_env "$sha" || {
-      if [[ $PROV_FAILED -eq 1 ]]; then log "${sha:0:7}: could not set DEVOS_COOLIFY_SERVER_UUID in the Coolify env; deploy not started, next tick retries"
+      if [[ $PROV_FAILED -eq 1 ]]; then log "${sha:0:7}: could not set the provisioning variables (DEVOS_GITHUB_OWNER, DEVOS_COOLIFY_SERVER_UUID) in the Coolify env; deploy not started, next tick retries"
       else log "${sha:0:7}: could not set GIT_SHA in the Coolify env; deploy not started, next tick retries"; fi
       return 2; }
     touch "$ST/deploy-started.$sha" || return 1

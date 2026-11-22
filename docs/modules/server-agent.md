@@ -140,7 +140,7 @@ On a connection error curl prints `%{http_code}` as `000` itself, and the old `|
 
 ## v1.7.0 (22 Nov 2026, DEVOS-21 M2.4-d4b, runner B): provisioning settings in the deploy upsert
 - **Why:** the provisioning sweep needs `DEVOS_GITHUB_OWNER` and `DEVOS_COOLIFY_SERVER_UUID` (M2.4 contract, "M2.4-d4b decisions"). Compose will require both (d4b-2, the next PR), so something must set them before every deploy without KK. This version lands first, because a SHA is deployed by the agent that was running before it installed that SHA.
-- **Change:** `provision_env` builds the two runtime entries; `set_git_sha_env` sends them in the same bulk upsert as `GIT_SHA` and reads them back (present, non-preview, runtime, value). The owner is `REPO`'s owner. The server uuid is the single server named `localhost` in `GET /servers` (M0.4's rule); if it cannot be found, a stored value is kept, and with none stored no deploy is submitted ("could not set DEVOS_COOLIFY_SERVER_UUID"; next tick retries). No new token permission; nothing read from GitHub is used.
-- **Tests:** 9 "M2.4-d4b" cases; the DEVOS-83 order test still expects exactly one env upsert before `/deploy`.
+- **Change:** `provision_env` builds the two runtime entries; `set_git_sha_env` sends them in the same bulk upsert as `GIT_SHA` and reads them back (present, non-preview, runtime, value). The owner is `REPO`'s owner. The server uuid is the single server named `localhost` in `GET /servers` (M0.4's rule); if it cannot be found, a stored runtime value of the right shape is kept, and with none stored no deploy is submitted ("could not set DEVOS_COOLIFY_SERVER_UUID"; next tick retries). No new token permission; nothing read from GitHub is used.
+- **Tests:** 11 "M2.4-d4b" cases; the DEVOS-83 order test still expects exactly one env upsert before `/deploy`.
 - **Install:** on the allow-list, so it self-updates when this merges; KK runs nothing.
 
