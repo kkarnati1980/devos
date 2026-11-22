@@ -72,12 +72,12 @@ test("R3 AT3 every server-required variable is required (:?) in compose; the das
 });
 
 // M2.4-d4a (DEVOS-21): the provisioning settings reach the api by name; the fallbacks live in the api (PR20-r2).
-test("M2.4-d4a the api gets three provisioning settings by name and DEVOS_BIND_IP for their fallbacks; not the owner or server uuid yet", () => {
+test("M2.4-d4a/d4b-2 the api gets three provisioning settings by name, DEVOS_BIND_IP for their fallbacks, and requires the owner and server uuid", () => {
   const e = compose.services.api.environment;
   assert.equal(e.DEVOS_BIND_IP, "${DEVOS_BIND_IP:?DEVOS_BIND_IP is required}");
   for (const k of ["DEVOS_TAILNET_IP", "DEVOS_COOLIFY_URL", "DEVOS_PROJECT_PORTS"]) assert.equal(e[k], `\${${k}:-}`, k);
-  // Not before M2.4-d4b: with both set the sweep provisions, and no project stack may run before DEVOS-128 passes.
-  for (const k of ["DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_SERVER_UUID"]) assert.equal(e[k], undefined, `${k} is not passed yet`);
+  // M2.4-d4b-2: required (:?, DEVOS-81: Coolify keeps required values); the server agent v1.7.0 upserts both (d4b-1).
+  for (const k of ["DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_SERVER_UUID"]) assert.equal(e[k], `\${${k}:?${k} is required}`, k);
   for (const s of ["dashboard", "worker", "migrate"]) {
     for (const k of ["DEVOS_TAILNET_IP", "DEVOS_COOLIFY_URL", "DEVOS_PROJECT_PORTS", "DEVOS_GITHUB_OWNER", "DEVOS_COOLIFY_SERVER_UUID"]) {
       assert.equal(compose.services[s].environment?.[k], undefined, `${s} does not get ${k}`);
