@@ -295,11 +295,16 @@ stored_uuid_values() {
 # Codex PR214-r18: one rule for every copy of every read-back: a copy that carries either newer flag (is_buildtime or
 # is_runtime) is in the newer shape, so is_runtime must be present and true; only a copy with neither newer flag
 # relies on the older meaning (every variable at runtime). The first read still decides which flags are sent.
+# Codex PR214-r19: the shape is decided per response, not per copy: $m is true when the first read was newer
+# (CF_MODERN) or when any row of this response carries a newer flag; then every checked copy needs is_runtime true
+# (and GIT_SHA is_buildtime true). Only a response with no newer flag anywhere, after an older first read, uses the
+# older meaning. A response can upgrade the schema, never downgrade it.
 stored_uuid_ok() {
   jq -e --arg re "$SERVER_UUID_JQ" --argjson modern "$CF_MODERN" '
-    [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
+    ($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
+    | [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
     | ($g | map(.value // null) | unique) as $v
-    | ($g | length) > 0 and all($g[]; (if $modern or has("is_buildtime") or has("is_runtime") then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
+    | ($g | length) > 0 and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
       and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))
     and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1)' <<<"$1" >/dev/null
 }
@@ -363,11 +368,12 @@ set_git_sha_env() {
   # Codex PR214-r17: with the older schema, an explicit newer is_buildtime still takes precedence over is_build_time
   # (as before d4b), so is_buildtime:false with a stale is_build_time:true fails.
   # Codex PR214-r18: a copy carrying is_buildtime or is_runtime must also have is_runtime true (same rule as below).
-  jq -e --arg v "$sha" --argjson modern "$CF_MODERN" '[.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
+  # Codex PR214-r19: $m (newer first read, or any newer flag in this response) requires both newer flags true;
+  # otherwise is_build_time must be true. The same $m rule is used for the provisioning and kept-uuid checks.
+  jq -e --arg v "$sha" --argjson modern "$CF_MODERN" '($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
+    | [.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
     | ($g | length) > 0
-      and all($g[]; (if $modern then .is_buildtime == true and .is_runtime == true
-                     else (if has("is_buildtime") then .is_buildtime else .is_build_time end) == true
-                          and (if has("is_buildtime") or has("is_runtime") then .is_runtime == true else true end) end)
+      and all($g[]; (if $m then .is_buildtime == true and .is_runtime == true else .is_build_time == true end)
                     and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
     || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
   # M2.4-d4b read-back: each upserted provisioning variable exists (non-preview), is runtime, and holds the value sent
@@ -375,11 +381,12 @@ set_git_sha_env() {
   # newer flags, is_runtime must be present and true; and every copy must hold one value (a hidden value is accepted
   # only on a single copy), so a stale duplicate cannot leave a second target.
   jq -e --slurpfile p "$TMP/prov.json" --argjson modern "$CF_MODERN" '. as $e
+    | ($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
     | all($p[0][]; . as $w
       | [$e[]? | select(.key == $w.key and ((.is_preview // false) == false))] as $g
       | ($g | map(.value // null) | unique) as $v
       | ($g | length) > 0
-        and all($g[]; (if $modern or has("is_buildtime") or has("is_runtime") then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
+        and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
                       and ((has("value") | not) or .value == null or .value == $w.value))
         and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1))' <<<"$envs" >/dev/null \
     || { log "Coolify env provisioning variables did not read back as runtime"; PROV_FAILED=1; return 1; }

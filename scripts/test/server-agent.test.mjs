@@ -768,20 +768,23 @@ test("M2.4-d4b (PR214-r15): a kept stored uuid read back in the older flag shape
 });
 
 // PR214-r16: older first read (is_build_time only); a read-back copy that carries is_runtime must have it true.
+const modernGit = (out) => out.map((e) => (e.key === "GIT_SHA" ? { ...e, is_buildtime: true, is_runtime: true } : e));
 const legacyFirst = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true }];
 const withRuntime = (keys, rt) => (out) => JSON.stringify(out.map((e) => (keys.includes(e.key) ? { ...e, is_runtime: rt } : e)));
 for (const [name, rt, ok] of [["is_runtime false starts no deploy", false, false], ["is_runtime true still deploys", true, true]]) {
   test(`M2.4-d4b (PR214-r16): older first read; a provisioning read-back with ${name}`, async () => {
     resetMock(); freshState({ deploy: true });
     M.envs = legacyFirst.map((e) => ({ ...e }));
-    M.envRawAfterBulk = withRuntime(["DEVOS_COOLIFY_SERVER_UUID", "DEVOS_GITHUB_OWNER"], rt);
+    // PR214-r19: a newer flag anywhere puts the whole response in the newer shape, so the positive case returns
+    // GIT_SHA with the newer flags too; the negative case may now fail first on GIT_SHA (either way, no deploy).
+    M.envRawAfterBulk = (out) => withRuntime(["DEVOS_COOLIFY_SERVER_UUID", "DEVOS_GITHUB_OWNER"], rt)(rt ? modernGit(out) : out);
     const sha = commit({ ...baseFiles(), [`x4bu-${rt}`]: "1" }, `d4b u ${rt}`);
     M.main = sha; green(sha); pass(sha);
     const r = await runAgent();
     assert.equal(r.code, 0, r.out);
     assert.ok(M.bulkDone, "the upsert ran");
     if (ok) assert.equal(M.deployPosts, 1, r.out);
-    else { assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); assert.match(r.out, /provisioning variables did not read back as runtime/); }
+    else { assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); assert.match(r.out, /did not read back/); }
   });
 }
 
@@ -805,7 +808,8 @@ for (const [name, patch, ok] of [
   test(`M2.4-d4b (PR214-r17): older first read; a GIT_SHA read-back with ${name}`, async () => {
     resetMock(); freshState({ deploy: true });
     M.envs = legacyFirst.map((e) => ({ ...e }));
-    M.envRawAfterBulk = (out) => JSON.stringify(out.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)));
+    // PR214-r19: the positive case returns the provisioning rows with is_runtime true too (a fully newer response).
+    M.envRawAfterBulk = (out) => JSON.stringify(out.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : ok ? { ...e, is_runtime: true } : e)));
     const sha = commit({ ...baseFiles(), [`x4bw-${ok}`]: "1" }, `d4b w ${ok}`);
     M.main = sha; green(sha); pass(sha);
     const r = await runAgent();
@@ -829,7 +833,7 @@ test("M2.4-d4b (PR214-r18): older first read; a provisioning read-back with is_b
   assert.equal(r.code, 0, r.out);
   assert.ok(M.bulkDone, "the upsert ran");
   assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
-  assert.match(r.out, /provisioning variables did not read back as runtime/);
+  assert.match(r.out, /did not read back/);
 });
 
 test("M2.4-d4b (PR214-r18): older first read; a kept stored uuid read back with is_buildtime and no is_runtime starts no deploy", async () => {
@@ -855,6 +859,34 @@ test("M2.4-d4b (PR214-r18): older first read; a GIT_SHA read-back with is_buildt
   assert.equal(r.code, 0, r.out);
   assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
   assert.match(r.out, /GIT_SHA did not read back/);
+});
+
+// PR214-r19: older first read; a read-back where GIT_SHA carries the newer flags but a provisioning copy carries only
+// is_build_time is a mixed response, so the whole response is judged in the newer shape and no deploy starts.
+test("M2.4-d4b (PR214-r19): older first read; a mixed read-back (newer GIT_SHA, older owner) starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = legacyFirst.map((e) => ({ ...e }));
+  M.envRawAfterBulk = (out) => JSON.stringify(modernGit(out));
+  const sha = commit({ ...baseFiles(), "x4ca": "1" }, "d4b ca");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /provisioning variables did not read back as runtime/);
+});
+
+test("M2.4-d4b (PR214-r19): older first read; a kept stored uuid in a mixed read-back starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [...legacyFirst.map((e) => ({ ...e })), { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_build_time: false }];
+  M.servers = 500;
+  M.envRawAfterBulk = (out) => JSON.stringify(modernGit(out).map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, is_runtime: true } : e)));
+  const sha = commit({ ...baseFiles(), "x4cb": "1" }, "d4b cb");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
 });
 
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
