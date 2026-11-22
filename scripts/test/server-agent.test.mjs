@@ -103,6 +103,9 @@ function handler(req, res) {
         const envs = patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs;
         const out = M.provPatch ? envs.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, ...M.provPatch } : e)) : envs;
         if (M.envObjectAfterBulk && M.bulkDone) return json(200, Object.fromEntries(out.map((e, i) => [String(i), e])));
+        if (M.envNulAfterBulk && M.bulkDone) {
+          res.writeHead(200, { "content-type": "application/json" }); res.end(Buffer.concat([Buffer.from(JSON.stringify(out)), Buffer.from([0])])); return;
+        }
         if (M.envTwoArraysAfterBulk && M.bulkDone) {
           res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify([]) + "\n" + JSON.stringify(out)); return;
         }
@@ -121,6 +124,10 @@ function handler(req, res) {
       return json(201, {});
     }
     if (p === "/cf/servers" && req.method === "GET") {
+      if (M.servers === "trailingNul") {  // PR214-r11: a valid localhost array followed by a raw NUL byte
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(Buffer.concat([Buffer.from(JSON.stringify([{ uuid: "srv-uuid-1", name: "localhost" }])), Buffer.from([0])])); return;
+      }
       if (M.servers === "twoArrays") {  // PR214-r10: one valid localhost array, then an empty one, in one body
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify([{ uuid: "srv-uuid-1", name: "localhost" }]) + "\n" + JSON.stringify([])); return;
@@ -515,6 +522,7 @@ for (const [name, servers] of [
   ["a uuid with a trailing newline (PR214-r2)", [{ uuid: "srv-uuid-1\n", name: "localhost" }]],
   ["a failed GET /servers", 500],
   ["a GET /servers body holding two JSON arrays (PR214-r10)", "twoArrays"],
+  ["a GET /servers body with a trailing raw NUL byte (PR214-r11)", "trailingNul"],
 ]) {
   test(`M2.4-d4b: ${name} with no stored uuid starts no deploy; once found, the next tick deploys once`, async () => {
     resetMock(); freshState({ deploy: true });
@@ -660,6 +668,18 @@ test("M2.4-d4b (PR214-r9): an env read-back holding two JSON arrays starts no de
   resetMock(); freshState({ deploy: true });
   M.envTwoArraysAfterBulk = true;
   const sha = commit({ ...baseFiles(), "x4bn": "1" }, "d4b n");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs read-back: unexpected response/);
+});
+
+test("M2.4-d4b (PR214-r11): an env read-back followed by a raw NUL byte starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envNulAfterBulk = true;
+  const sha = commit({ ...baseFiles(), "x4bo": "1" }, "d4b o");
   M.main = sha; green(sha); pass(sha);
   const r = await runAgent();
   assert.equal(r.code, 0, r.out);

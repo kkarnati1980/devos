@@ -122,10 +122,13 @@ cf() { http "$TMP/cf.auth" "$1" "$COOLIFY_API$2" "${3:-}"; }
 # cf_json method path [body] -> the response, compacted, only when it is exactly one JSON value (Codex PR214-r10).
 # jq reads several top-level values from one input and runs its filter on each, so every Coolify body that a
 # provisioning decision reads goes through this first; an empty body, junk or two values fail here.
+# Codex PR214-r11: the raw body goes to a file and jq parses the file, never a $(...) capture, because bash drops
+# NUL bytes from command substitution (a valid array followed by a raw NUL would otherwise parse). jq rejects a NUL
+# in its input, and its -c output escapes any NUL in a string, so what this prints is safe to capture.
 cf_json() {
-  local body
-  body="$(cf "$@")" || return 1
-  jq -cs 'if length == 1 then .[0] else error("not exactly one JSON value") end' <<<"$body" 2>/dev/null
+  cf "$@" > "$TMP/cf_json.resp" || { rm -f "$TMP/cf_json.resp"; return 1; }
+  jq -cs 'if length == 1 then .[0] else error("not exactly one JSON value") end' "$TMP/cf_json.resp" 2>/dev/null
+  local rc=$?; rm -f "$TMP/cf_json.resp"; return $rc
 }
 
 
