@@ -103,6 +103,9 @@ function handler(req, res) {
         const envs = patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs;
         const out = M.provPatch ? envs.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, ...M.provPatch } : e)) : envs;
         if (M.envObjectAfterBulk && M.bulkDone) return json(200, Object.fromEntries(out.map((e, i) => [String(i), e])));
+        if (M.envRawBeforeBulk && !M.bulkDone) {
+          res.writeHead(200, { "content-type": "application/json" }); res.end(M.envRawBeforeBulk(out)); return;
+        }
         if (M.envRawAfterBulk && M.bulkDone) {
           res.writeHead(200, { "content-type": "application/json" }); res.end(M.envRawAfterBulk(out)); return;
         }
@@ -712,6 +715,30 @@ for (const [name, raw] of [
     assert.match(r.out, /Coolify envs read-back: unexpected response/);
   });
 }
+
+test("M2.4-d4b (PR214-r14): a first env read with a non-object element upserts nothing and starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envRawBeforeBulk = (out) => JSON.stringify(["not-a-row", ...out]);
+  const sha = commit({ ...baseFiles(), "x4bq": "1" }, "d4b q");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(writes().filter((q) => q.path.endsWith("/envs/bulk")).length, 0, "nothing upserted");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs: unexpected response/);
+});
+
+test("M2.4-d4b (PR214-r14): an env read-back with a non-object element starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envRawAfterBulk = (out) => JSON.stringify([...out, 7]);
+  const sha = commit({ ...baseFiles(), "x4br": "1" }, "d4b r");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs read-back: unexpected response/);
+});
 
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
