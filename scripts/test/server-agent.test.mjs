@@ -103,6 +103,9 @@ function handler(req, res) {
         const envs = patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs;
         const out = M.provPatch ? envs.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, ...M.provPatch } : e)) : envs;
         if (M.envObjectAfterBulk && M.bulkDone) return json(200, Object.fromEntries(out.map((e, i) => [String(i), e])));
+        if (M.envRawAfterBulk && M.bulkDone) {
+          res.writeHead(200, { "content-type": "application/json" }); res.end(M.envRawAfterBulk(out)); return;
+        }
         if (M.envNulAfterBulk && M.bulkDone) {
           res.writeHead(200, { "content-type": "application/json" }); res.end(Buffer.concat([Buffer.from(JSON.stringify(out)), Buffer.from([0])])); return;
         }
@@ -687,6 +690,26 @@ test("M2.4-d4b (PR214-r11): an env read-back followed by a raw NUL byte starts n
   assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
   assert.match(r.out, /Coolify envs read-back: unexpected response/);
 });
+
+// PR214-r12: jq reads NaN (printed as null, i.e. "hidden") and keeps only the last of duplicate keys; both must fail.
+const ownerRow = (rest) => `{"key":"DEVOS_GITHUB_OWNER",${rest},"is_preview":false,"is_buildtime":false,"is_runtime":true}`;
+const others = (out) => out.filter((e) => e.key !== "DEVOS_GITHUB_OWNER").map((e) => JSON.stringify(e));
+for (const [name, raw] of [
+  ["a bare NaN as the owner value", (out) => `[${[...others(out), ownerRow('"value":NaN')].join(",")}]`],
+  ["a duplicate value key on the owner row", (out) => `[${[...others(out), ownerRow('"value":"stale-owner","value":"kkarnati1980"')].join(",")}]`],
+]) {
+  test(`M2.4-d4b (PR214-r12): an env read-back with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawAfterBulk = raw;
+    const sha = commit({ ...baseFiles(), [`x4bp-${name.length}`]: "1" }, `d4b p ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /Coolify envs read-back: unexpected response/);
+  });
+}
 
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });

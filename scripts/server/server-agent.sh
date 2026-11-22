@@ -125,10 +125,20 @@ cf() { http "$TMP/cf.auth" "$1" "$COOLIFY_API$2" "${3:-}"; }
 # Codex PR214-r11: the raw body goes to a file and jq parses the file, never a $(...) capture, because bash drops
 # NUL bytes from command substitution (a valid array followed by a raw NUL would otherwise parse). jq rejects a NUL
 # in its input, and its -c output escapes any NUL in a string, so what this prints is safe to capture.
+# Codex PR214-r12: jq is lenient where strict JSON is not. It reads NaN and Infinity and prints them as null (which a
+# read-back would take for a hidden value), so any non-finite number fails. It keeps only the last of duplicate keys,
+# so its stream form (one event per key occurrence) must show no path twice. Other leniencies (01, .5, +1) only
+# change numbers, and every value a provisioning decision compares is a string or a boolean.
 cf_json() {
-  cf "$@" > "$TMP/cf_json.resp" || { rm -f "$TMP/cf_json.resp"; return 1; }
-  jq -cs 'if length == 1 then .[0] else error("not exactly one JSON value") end' "$TMP/cf_json.resp" 2>/dev/null
-  local rc=$?; rm -f "$TMP/cf_json.resp"; return $rc
+  local f="$TMP/cf_json.resp" out
+  cf "$@" > "$f" || { rm -f "$f"; return 1; }
+  if jq -en --stream '[inputs | select(length == 2) | .[0]] | length == (unique | length)' "$f" >/dev/null 2>&1 \
+     && out="$(jq -cs 'if length != 1 then error("not exactly one JSON value")
+                       elif any(.[0] | .. | numbers; isnan or isinfinite) then error("non-finite number")
+                       else .[0] end' "$f" 2>/dev/null)"; then
+    rm -f "$f"; printf '%s\n' "$out"; return 0
+  fi
+  rm -f "$f"; return 1
 }
 
 
