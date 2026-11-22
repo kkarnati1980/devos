@@ -290,11 +290,13 @@ stored_uuid_values() {
 # Codex PR214-r7: that is_build_time must be a boolean (true or false); null or a string fails.
 # Codex PR214-r15: the schema ($modern) is decided once, from the first env read (CF_MODERN), never re-inferred
 # from a later response, so a read-back cannot downgrade the runtime check.
+# Codex PR214-r16: with the older schema, a copy that does carry is_runtime must have it true; an explicit
+# is_runtime: false (e.g. the flags changed between reads) fails, as in the GIT_SHA read-back.
 stored_uuid_ok() {
   jq -e --arg re "$SERVER_UUID_JQ" --argjson modern "$CF_MODERN" '
     [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
     | ($g | map(.value // null) | unique) as $v
-    | ($g | length) > 0 and all($g[]; (if $modern then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
+    | ($g | length) > 0 and all($g[]; (if $modern then .is_runtime == true else ((.is_build_time | type) == "boolean") and ((has("is_runtime") | not) or .is_runtime == true) end)
       and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))
     and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1)' <<<"$1" >/dev/null
 }
@@ -370,7 +372,7 @@ set_git_sha_env() {
       | [$e[]? | select(.key == $w.key and ((.is_preview // false) == false))] as $g
       | ($g | map(.value // null) | unique) as $v
       | ($g | length) > 0
-        and all($g[]; (if $modern then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
+        and all($g[]; (if $modern then .is_runtime == true else ((.is_build_time | type) == "boolean") and ((has("is_runtime") | not) or .is_runtime == true) end)
                       and ((has("value") | not) or .value == null or .value == $w.value))
         and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1))' <<<"$envs" >/dev/null \
     || { log "Coolify env provisioning variables did not read back as runtime"; PROV_FAILED=1; return 1; }

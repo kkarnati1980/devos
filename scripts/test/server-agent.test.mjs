@@ -767,6 +767,37 @@ test("M2.4-d4b (PR214-r15): a kept stored uuid read back in the older flag shape
   assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
 });
 
+// PR214-r16: older first read (is_build_time only); a read-back copy that carries is_runtime must have it true.
+const legacyFirst = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true }];
+const withRuntime = (keys, rt) => (out) => JSON.stringify(out.map((e) => (keys.includes(e.key) ? { ...e, is_runtime: rt } : e)));
+for (const [name, rt, ok] of [["is_runtime false starts no deploy", false, false], ["is_runtime true still deploys", true, true]]) {
+  test(`M2.4-d4b (PR214-r16): older first read; a provisioning read-back with ${name}`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs = legacyFirst.map((e) => ({ ...e }));
+    M.envRawAfterBulk = withRuntime(["DEVOS_COOLIFY_SERVER_UUID", "DEVOS_GITHUB_OWNER"], rt);
+    const sha = commit({ ...baseFiles(), [`x4bu-${rt}`]: "1" }, `d4b u ${rt}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    if (ok) assert.equal(M.deployPosts, 1, r.out);
+    else { assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); assert.match(r.out, /provisioning variables did not read back as runtime/); }
+  });
+}
+
+test("M2.4-d4b (PR214-r16): older first read; a kept stored uuid read back with is_runtime false starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [...legacyFirst.map((e) => ({ ...e })), { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_build_time: false }];
+  M.servers = 500;
+  M.envRawAfterBulk = withRuntime(["DEVOS_COOLIFY_SERVER_UUID"], false);
+  const sha = commit({ ...baseFiles(), "x4bv": "1" }, "d4b v");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
   for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
