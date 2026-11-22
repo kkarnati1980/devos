@@ -313,7 +313,10 @@ provision_env() {
   PROV_KEPT=0
   [[ "$owner" =~ $OWNER_RE ]] || { log "tracked repo owner is not a GitHub login"; return 1; }
   # Codex PR214-r10: read through cf_json, so a body of two arrays is a failed discovery, not a found uuid.
-  if servers="$(cf_json GET "/servers")" && jq -e 'type == "array"' <<<"$servers" >/dev/null 2>&1; then
+  # Codex PR214-r20: every row must be an object with a string name, so each row can be classified as localhost or
+  # not; one unclassifiable row makes the whole discovery inconclusive (the discovery-failure path below).
+  if servers="$(cf_json GET "/servers")" \
+     && jq -e 'type == "array" and all(.[]; type == "object" and ((.name | type) == "string"))' <<<"$servers" >/dev/null 2>&1; then
     uuid="$(jq -r --arg re "$SERVER_UUID_JQ" '[.[]? | select(type == "object" and .name == "localhost") | .uuid]
       | if length == 1 then (.[0] // "") else "" end
       | if type == "string" and test($re) then . else "" end' <<<"$servers")"

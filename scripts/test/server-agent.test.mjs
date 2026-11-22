@@ -529,6 +529,9 @@ for (const [name, servers] of [
   ["a failed GET /servers", 500],
   ["a GET /servers body holding two JSON arrays (PR214-r10)", "twoArrays"],
   ["a GET /servers body with a trailing raw NUL byte (PR214-r11)", "trailingNul"],
+  ["a localhost row beside a row with no name (PR214-r20)", [{ uuid: "srv-uuid-1", name: "localhost" }, { uuid: "srv-x" }]],
+  ["a localhost row beside a row with a non-string name (PR214-r20)", [{ uuid: "srv-uuid-1", name: "localhost" }, { uuid: "srv-x", name: 7 }]],
+  ["a localhost row beside a non-object row (PR214-r20)", [{ uuid: "srv-uuid-1", name: "localhost" }, "srv-x"]],
 ]) {
   test(`M2.4-d4b: ${name} with no stored uuid starts no deploy; once found, the next tick deploys once`, async () => {
     resetMock(); freshState({ deploy: true });
