@@ -20,7 +20,8 @@ const reqs = [];
 function resetMock() {
   M = { main: null, runs: {}, statuses: {}, pulls: {}, trees: {}, failStatus: 0, deployPatch: [], deployStatus: "finished",
     envs: [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_buildtime: true, is_runtime: true }], failEnv: 0, runtimeOnly: false, envPatch: null,
-    cfPerms: "read write deploy", appSha: "HEAD" };
+    cfPerms: "read write deploy", appSha: "HEAD",
+    servers: [{ uuid: "srv-uuid-1", name: "localhost", ip: "host.docker.internal" }], provPatch: null };
   reqs.length = 0;
 }
 
@@ -99,7 +100,8 @@ function handler(req, res) {
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs$/)) && req.method === "GET") {
       {
         const patch = M.envPatch || (M.runtimeOnly ? { is_buildtime: false } : null);
-        return json(200, patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs);
+        const envs = patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs;
+        return json(200, M.provPatch ? envs.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, ...M.provPatch } : e)) : envs);
       }
     }
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs\/bulk$/)) && req.method === "PATCH") {
@@ -111,6 +113,7 @@ function handler(req, res) {
       }
       return json(201, {});
     }
+    if (p === "/cf/servers" && req.method === "GET") return M.servers === 500 ? json(500, {}) : json(200, M.servers);
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "GET") {
       if (!M.cfPerms.split(" ").includes("read")) return json(403, { message: "forbidden" });
       return json(200, { uuid: m[1], name: "devos", git_commit_sha: M.appSha });
@@ -459,6 +462,90 @@ for (const [name, patch] of [
     assert.equal(r.code, 0, r.out);
     assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
     assert.match(r.out, /did not read back/);
+    assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
+  });
+}
+
+// M2.4-d4b (DEVOS-21): the GIT_SHA upsert also sets the provisioning sweep's owner and Coolify server uuid, runtime.
+const provEnv = (k) => M.envs.filter((e) => e.key === k);
+
+test("M2.4-d4b: DEVOS_GITHUB_OWNER and DEVOS_COOLIFY_SERVER_UUID are upserted runtime in the GIT_SHA upsert, before the deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_GITHUB_OWNER", value: "someone-else", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = [{ uuid: "srv-other", name: "worker-2", ip: "10.0.0.9" }, { uuid: "srv-uuid-1", name: "localhost", ip: "host.docker.internal" }];
+  const sha = commit({ ...baseFiles(), "x4ba": "1" }, "d4b a");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(cfOrder(), ["PATCH /cf/applications/app-uuid-1234", "PATCH /cf/applications/app-uuid-1234/envs/bulk", "POST /cf/deploy"]);
+  assert.deepEqual(provEnv("DEVOS_GITHUB_OWNER"), [{ key: "DEVOS_GITHUB_OWNER", value: "kkarnati1980", is_preview: false, is_buildtime: false, is_runtime: true }]);
+  assert.deepEqual(provEnv("DEVOS_COOLIFY_SERVER_UUID"), [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-uuid-1", is_preview: false, is_buildtime: false, is_runtime: true }]);
+  assert.equal(gitSha()[0].value, sha);
+  assert.equal(M.deployPosts, 1);
+});
+
+test("M2.4-d4b: an older Coolify (is_build_time) gets is_build_time false on the provisioning variables", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true }];
+  const sha = commit({ ...baseFiles(), "x4bb": "1" }, "d4b b");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(provEnv("DEVOS_COOLIFY_SERVER_UUID"), [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-uuid-1", is_preview: false, is_build_time: false }]);
+  assert.equal(M.deployPosts, 1);
+});
+
+for (const [name, servers] of [
+  ["no server named localhost", [{ uuid: "srv-other", name: "worker-2" }]],
+  ["two servers named localhost", [{ uuid: "srv-a", name: "localhost" }, { uuid: "srv-b", name: "localhost" }]],
+  ["a malformed uuid", [{ uuid: "srv uuid; rm", name: "localhost" }]],
+  ["a failed GET /servers", 500],
+]) {
+  test(`M2.4-d4b: ${name} with no stored uuid starts no deploy; once found, the next tick deploys once`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.servers = servers;
+    const sha = commit({ ...baseFiles(), [`x4bc-${name.length}`]: "1" }, `d4b c ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    let r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.equal(writes().filter((q) => q.path.endsWith("/envs/bulk")).length, 0, "nothing upserted");
+    assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
+    assert.match(r.out, /could not set DEVOS_COOLIFY_SERVER_UUID/);
+    assert.equal(provEnv("DEVOS_COOLIFY_SERVER_UUID").length, 0);
+    M.servers = [{ uuid: "srv-uuid-1", name: "localhost" }];
+    r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts, 1, "deployed once on the retry");
+    assert.equal(provEnv("DEVOS_COOLIFY_SERVER_UUID")[0].value, "srv-uuid-1");
+  });
+}
+
+test("M2.4-d4b: no server found but a stored uuid is kept (not upserted) and the deploy goes ahead", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  const sha = commit({ ...baseFiles(), "x4bd": "1" }, "d4b d");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  const sent = JSON.parse(writes().find((q) => q.path.endsWith("/envs/bulk")).body).data.map((e) => e.key);
+  assert.deepEqual(sent, ["GIT_SHA", "DEVOS_GITHUB_OWNER"]);
+  assert.equal(provEnv("DEVOS_COOLIFY_SERVER_UUID")[0].value, "srv-stored");
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts, 1);
+});
+
+for (const [name, patch] of [["is_runtime: false", { is_runtime: false }], ["another value", { value: "someone-else" }]]) {
+  test(`M2.4-d4b: a DEVOS_GITHUB_OWNER read back with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.provPatch = patch;
+    const sha = commit({ ...baseFiles(), [`x4be-${name.length}`]: "1" }, `d4b e ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /provisioning variables did not read back/);
     assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
   });
 }

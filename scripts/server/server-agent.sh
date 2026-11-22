@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.6.2
+# Version: 1.7.0
+# v1.7.0 (DEVOS-21, M2.4-d4b): before a deploy, the same env upsert as GIT_SHA also sets DEVOS_GITHUB_OWNER (the owner
+# of the tracked repo) and DEVOS_COOLIFY_SERVER_UUID (Coolify's own server, the one named "localhost" in GET /servers,
+# as M0.4 found it) as runtime variables, and reads both back. compose requires them (:?), so a dropped value comes
+# back on the next deploy. No uuid found and none stored yet: no deploy is submitted and the next tick retries.
 # v1.6.2 (DEVOS-128): the reason list gains conntrack-missing, conntrack-incomplete and conntrack-queue
 # (isolation-apply.sh v1.5.1); "conntrack" stays listed, so a run of the previous script is still read.
 # v1.6.1 (DEVOS-128): a /recheck request may carry the runners' fixed attribution footer (they cannot post a comment
@@ -237,6 +241,36 @@ self_update() {  # sha -> installs the allow-list at sha; 0 only if every step s
   return 0
 }
 
+# M2.4-d4b (DEVOS-21): provision_env envs-json -> writes $TMP/prov.json, the JSON array of provisioning variables to
+# upsert with GIT_SHA (runtime only; the build does not need them). The owner is the tracked repo's owner. The Coolify
+# server uuid is the one server named "localhost" (Coolify's own host, M0.4's rule); when it cannot be found, a stored
+# non-preview value is kept (left out of the upsert) and otherwise this fails, so no deploy is submitted.
+OWNER_RE='^[A-Za-z0-9][A-Za-z0-9-]{0,38}$'
+SERVER_UUID_RE='^[A-Za-z0-9-]{1,64}$'
+provision_env() {
+  local envs="$1" owner="${REPO%%/*}" servers uuid="" flags
+  [[ "$owner" =~ $OWNER_RE ]] || { log "tracked repo owner is not a GitHub login"; return 1; }
+  if servers="$(cf GET "/servers")" && jq -e 'type == "array"' <<<"$servers" >/dev/null 2>&1; then
+    uuid="$(jq -r '[.[]? | select(type == "object" and .name == "localhost") | .uuid] | if length == 1 then (.[0] // "") else "" end
+      | if type == "string" then . else "" end' <<<"$servers")"
+    [[ "$uuid" =~ $SERVER_UUID_RE ]] || uuid=""
+  fi
+  if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
+    flags='{is_preview: false, is_buildtime: false, is_runtime: true}'
+  else
+    flags='{is_preview: false, is_build_time: false}'
+  fi
+  if [[ -z "$uuid" ]]; then
+    if jq -e 'any(.[]?; .key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))' <<<"$envs" >/dev/null; then
+      log "Coolify server uuid not found (no single server named localhost); keeping the stored DEVOS_COOLIFY_SERVER_UUID"
+    else
+      log "Coolify server uuid not found (no single server named localhost) and none stored"; return 1
+    fi
+  fi
+  jq -n --arg o "$owner" --arg u "$uuid" "[{key: \"DEVOS_GITHUB_OWNER\", value: \$o} + $flags]
+    + (if \$u == \"\" then [] else [{key: \"DEVOS_COOLIFY_SERVER_UUID\", value: \$u} + $flags] end)" > "$TMP/prov.json"
+}
+
 # set_git_sha_env sha -> upserts the app env GIT_SHA=<sha> as build-time AND runtime, then reads it back.
 # deploy/compose.yaml passes GIT_SHA as a build arg; Coolify passes only build-time variables to the build, so
 # without this the image reports "unknown" (DEVOS-83). Coolify renamed is_build_time to is_buildtime (with a
@@ -245,10 +279,12 @@ set_git_sha_env() {
   local sha="$1" envs
   envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
   jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs: unexpected response"; return 1; }
+  # M2.4-d4b: the provisioning variables go in the same upsert; no uuid found and none stored submits nothing.
+  provision_env "$envs" || { PROV_FAILED=1; return 1; }
   if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
-    jq -n --arg v "$sha" '{data: [{key: "GIT_SHA", value: $v, is_preview: false, is_buildtime: true, is_runtime: true}]}'
+    jq -n --arg v "$sha" --slurpfile p "$TMP/prov.json" '{data: ([{key: "GIT_SHA", value: $v, is_preview: false, is_buildtime: true, is_runtime: true}] + $p[0])}'
   else
-    jq -n --arg v "$sha" '{data: [{key: "GIT_SHA", value: $v, is_preview: false, is_build_time: true}]}'
+    jq -n --arg v "$sha" --slurpfile p "$TMP/prov.json" '{data: ([{key: "GIT_SHA", value: $v, is_preview: false, is_build_time: true}] + $p[0])}'
   fi > "$TMP/env.json"
   cf PATCH "/applications/$CF_APP/envs/bulk" "$TMP/env.json" >/dev/null || return 1
   envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
@@ -261,6 +297,14 @@ set_git_sha_env() {
                     and ((has("is_runtime") | not) or .is_runtime == true)
                     and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
     || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
+  # M2.4-d4b read-back: each upserted provisioning variable exists (non-preview), is runtime where Coolify has that
+  # flag, and holds the value sent when values are returned. Older Coolify (is_build_time only) has every value at runtime.
+  jq -e --slurpfile p "$TMP/prov.json" '. as $e | all($p[0][]; . as $w
+      | [$e[]? | select(.key == $w.key and ((.is_preview // false) == false))] as $g
+      | ($g | length) > 0
+        and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
+                      and ((has("value") | not) or .value == null or .value == $w.value)))' <<<"$envs" >/dev/null \
+    || { log "Coolify env provisioning variables did not read back as runtime"; return 1; }
 }
 
 # Deploy is never submitted twice for a SHA. deploy-started.<sha> is written before the first Coolify call;
@@ -278,8 +322,11 @@ deploy() {  # sha -> 0 when Coolify finished deploying exactly this sha
     jq -n --arg s "$sha" '{git_commit_sha: $s}' > "$TMP/patch.json"
     cf PATCH "/applications/$CF_APP" "$TMP/patch.json" >/dev/null \
       || { log "${sha:0:7}: could not set git_commit_sha; deploy not started, next tick retries"; return 2; }
-    set_git_sha_env "$sha" \
-      || { log "${sha:0:7}: could not set GIT_SHA in the Coolify env; deploy not started, next tick retries"; return 2; }
+    PROV_FAILED=0
+    set_git_sha_env "$sha" || {
+      if [[ $PROV_FAILED -eq 1 ]]; then log "${sha:0:7}: could not set DEVOS_COOLIFY_SERVER_UUID in the Coolify env; deploy not started, next tick retries"
+      else log "${sha:0:7}: could not set GIT_SHA in the Coolify env; deploy not started, next tick retries"; fi
+      return 2; }
     touch "$ST/deploy-started.$sha" || return 1
     dep="$(cf POST "/deploy?uuid=$CF_APP&force=false" | jq -r '[.. | objects | .deployment_uuid? // empty] | first // empty')" || return 1
     [[ "$dep" =~ ^[A-Za-z0-9-]+$ ]] || { log "deploy returned no deployment uuid"; return 1; }
