@@ -279,7 +279,7 @@ SERVER_UUID_JQ='\A[A-Za-z0-9-]{1,64}\z'
 # stored_uuid_values envs-json -> the JSON list of the non-preview DEVOS_COOLIFY_SERVER_UUID values (null where Coolify
 # returns none), so the fresh read can be compared with the first one (Codex PR214-r3).
 stored_uuid_values() {
-  jq -c '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false)) | .value // null]' <<<"$1"
+  jq -c '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and (.is_preview == false)) | .value // null]' <<<"$1"
 }
 # stored_uuid_ok envs-json -> 0 when a non-preview DEVOS_COOLIFY_SERVER_UUID exists and every copy is runtime (where
 # Coolify has that flag) and, when values are returned, has the API's uuid shape. Codex PR214-r4: the copies must name
@@ -299,12 +299,15 @@ stored_uuid_values() {
 # (CF_MODERN) or when any row of this response carries a newer flag; then every checked copy needs is_runtime true
 # (and GIT_SHA is_buildtime true). Only a response with no newer flag anywhere, after an older first read, uses the
 # older meaning. A response can upgrade the schema, never downgrade it.
+# Codex PR214-r21: a row is non-preview only with an explicit is_preview false (missing or null is not false), and
+# any row of a checked key whose is_preview is not a boolean fails the check. The same rule is used in both read-backs.
 stored_uuid_ok() {
   jq -e --arg re "$SERVER_UUID_JQ" --argjson modern "$CF_MODERN" '
     ($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
-    | [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
+    | [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and (.is_preview == false))] as $g
     | ($g | map(.value // null) | unique) as $v
-    | ($g | length) > 0 and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
+    | all(.[]?; .key != "DEVOS_COOLIFY_SERVER_UUID" or ((.is_preview | type) == "boolean"))
+    and ($g | length) > 0 and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
       and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))
     and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1)' <<<"$1" >/dev/null
 }
@@ -374,8 +377,9 @@ set_git_sha_env() {
   # Codex PR214-r19: $m (newer first read, or any newer flag in this response) requires both newer flags true;
   # otherwise is_build_time must be true. The same $m rule is used for the provisioning and kept-uuid checks.
   jq -e --arg v "$sha" --argjson modern "$CF_MODERN" '($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
-    | [.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
-    | ($g | length) > 0
+    | [.[]? | select(.key == "GIT_SHA" and (.is_preview == false))] as $g
+    | all(.[]?; .key != "GIT_SHA" or ((.is_preview | type) == "boolean"))
+    and ($g | length) > 0
       and all($g[]; (if $m then .is_buildtime == true and .is_runtime == true else .is_build_time == true end)
                     and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
     || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
@@ -386,9 +390,10 @@ set_git_sha_env() {
   jq -e --slurpfile p "$TMP/prov.json" --argjson modern "$CF_MODERN" '. as $e
     | ($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
     | all($p[0][]; . as $w
-      | [$e[]? | select(.key == $w.key and ((.is_preview // false) == false))] as $g
+      | [$e[]? | select(.key == $w.key and (.is_preview == false))] as $g
       | ($g | map(.value // null) | unique) as $v
-      | ($g | length) > 0
+      | all($e[]?; .key != $w.key or ((.is_preview | type) == "boolean"))
+        and ($g | length) > 0
         and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
                       and ((has("value") | not) or .value == null or .value == $w.value))
         and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1))' <<<"$envs" >/dev/null \

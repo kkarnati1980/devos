@@ -892,6 +892,46 @@ test("M2.4-d4b (PR214-r19): older first read; a kept stored uuid in a mixed read
   assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
 });
 
+// PR214-r21: a checked row must say it is non-preview (is_preview: false); a missing or null flag is not taken as false,
+// and any row of a checked key without a boolean is_preview makes the read inconclusive.
+for (const [name, edit, msg] of [
+  ["an owner row with is_preview null", (out) => out.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, is_preview: null } : e)), /provisioning variables did not read back/],
+  ["an owner row with no is_preview", (out) => out.map((e) => { if (e.key !== "DEVOS_GITHUB_OWNER") return e; const { is_preview, ...r } = e; return r; }), /provisioning variables did not read back/],
+  ["a second owner copy with is_preview null beside a good one", (out) => [...out, { ...out.find((e) => e.key === "DEVOS_GITHUB_OWNER"), is_preview: null }], /provisioning variables did not read back/],
+  ["a server uuid row with is_preview null", (out) => out.map((e) => (e.key === "DEVOS_COOLIFY_SERVER_UUID" ? { ...e, is_preview: null } : e)), /provisioning variables did not read back/],
+  ["a GIT_SHA row with is_preview null", (out) => out.map((e) => (e.key === "GIT_SHA" ? { ...e, is_preview: null } : e)), /GIT_SHA did not read back/]]) {
+  test(`M2.4-d4b (PR214-r21): a read-back with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawAfterBulk = (out) => JSON.stringify(edit(out));
+    const sha = commit({ ...baseFiles(), [`x4r21${name.length}`]: "1" }, "d4b r21");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, msg);
+  });
+}
+
+for (const [name, rows] of [
+  ["a stored uuid with is_preview null", [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: null, is_buildtime: false, is_runtime: true }]],
+  ["a stored uuid with no is_preview", [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_buildtime: false, is_runtime: true }]],
+  ["a good stored uuid beside a copy with is_preview null", [
+    { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true },
+    { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: null, is_buildtime: false, is_runtime: true }]]]) {
+  test(`M2.4-d4b (PR214-r21): no server found and ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push(...rows);
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4s21${name.length}`]: "1" }, "d4b s21");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
   for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
