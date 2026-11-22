@@ -201,12 +201,14 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
 
 /**
  * The probe project's row: paused from creation, so the provisioning sweep (which lists only unpaused
- * `provisioning` projects) never picks it; only the probe runs provisioning for it. Cap 0: it spends nothing.
+ * `provisioning` projects) never picks it; only the probe runs provisioning for it. It makes no model call, so its cap
+ * is the smallest one the `project_cap_positive` CHECK (`cap_usd > 0`) allows: $0.000001, the least Decimal(12,6)
+ * holds. The first server run (aace3de, 22 Nov 2026) showed a cap of 0 is refused by that CHECK (`probe-error`).
  */
 export const PROBE_PROJECT_DATA = {
   slug: PROBE_SLUG,
   name: "DevOS provisioning probe (AT13)",
-  capUsd: 0,
+  capUsd: "0.000001",
   continuousRun: false,
   preflightState: "approved",
 } as const;
