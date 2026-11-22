@@ -798,6 +798,24 @@ test("M2.4-d4b (PR214-r16): older first read; a kept stored uuid read back with 
   assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
 });
 
+// PR214-r17: older first read; a GIT_SHA read-back with is_buildtime:false beside a stale is_build_time:true fails.
+for (const [name, patch, ok] of [
+  ["is_buildtime false and a stale is_build_time true starts no deploy", { is_build_time: true, is_buildtime: false, is_runtime: true }, false],
+  ["is_buildtime true and is_runtime true still deploys", { is_build_time: true, is_buildtime: true, is_runtime: true }, true]]) {
+  test(`M2.4-d4b (PR214-r17): older first read; a GIT_SHA read-back with ${name}`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs = legacyFirst.map((e) => ({ ...e }));
+    M.envRawAfterBulk = (out) => JSON.stringify(out.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)));
+    const sha = commit({ ...baseFiles(), [`x4bw-${ok}`]: "1" }, `d4b w ${ok}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    if (ok) assert.equal(M.deployPosts, 1, r.out);
+    else { assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); assert.match(r.out, /GIT_SHA did not read back/); }
+  });
+}
+
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
   for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });

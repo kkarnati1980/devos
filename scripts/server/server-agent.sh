@@ -357,10 +357,13 @@ set_git_sha_env() {
   # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
   # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).
   # Codex PR214-r15: with the newer schema (from the first read) both is_buildtime and is_runtime must be true.
+  # Codex PR214-r17: with the older schema, an explicit newer is_buildtime still takes precedence over is_build_time
+  # (as before d4b), so is_buildtime:false with a stale is_build_time:true fails.
   jq -e --arg v "$sha" --argjson modern "$CF_MODERN" '[.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
     | ($g | length) > 0
       and all($g[]; (if $modern then .is_buildtime == true and .is_runtime == true
-                     else .is_build_time == true and ((has("is_runtime") | not) or .is_runtime == true) end)
+                     else (if has("is_buildtime") then .is_buildtime else .is_build_time end) == true
+                          and ((has("is_runtime") | not) or .is_runtime == true) end)
                     and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
     || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
   # M2.4-d4b read-back: each upserted provisioning variable exists (non-preview), is runtime, and holds the value sent
