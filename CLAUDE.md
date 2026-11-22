@@ -9,7 +9,7 @@ These rules bind every agent working in this repo. `CLAUDE.md` (Claude) and `AGE
 - **Codex reviews** read-only; it never edits code. Auto-fix is off.
 - **Release** integrates in dependency order and deploys.
 - **KK** answers decision cards and approves gates, or the runner approves G2–G4 under KK's recorded delegation (ADR-0013 §2: its four conditions plus stored floor-guard, pass-rule and merge-gate results, decided by `scripts/gates/evaluate-gate.mjs` exit 0; a missing result pauses only that gate, with no KK card). G5, a first production launch, and anything involving money, data deletion, legal, D11 or D13 stay with KK.
-- **Runners:** runner A takes Lane A, unlaned issues and the gates; runner B takes Lanes B and C. Neither touches the other's branches or PRs (ADR-0013).
+- **Runners:** runner A takes Lanes A and B, unlaned issues and the gates; runner B takes Lane C. Neither touches the other's branches or PRs (ADR-0013, lane split as amended by decision 0033).
 
 ## Before coding
 1. Read the module contract in `docs/modules/<id>.md` and the requirement IDs it cites.
