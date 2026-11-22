@@ -743,6 +743,34 @@ test("M2.4-d4b (PR214-r14): an env read-back with a non-object element starts no
   assert.match(r.out, /Coolify envs read-back: unexpected response/);
 });
 
+// PR214-r22: every env row must have a string key, so each row can be classified; an unclassifiable row makes the
+// whole read inconclusive (first read: nothing upserted; read-back: no deploy).
+for (const [name, row] of [["no key", { value: "x", is_preview: false }], ["a null key", { key: null, value: "x", is_preview: false }],
+  ["a numeric key", { key: 7, value: "x", is_preview: false }]]) {
+  test(`M2.4-d4b (PR214-r22): a first env read with a row with ${name} upserts nothing and starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawBeforeBulk = (out) => JSON.stringify([...out, row]);
+    const sha = commit({ ...baseFiles(), [`x4f22${name.length}`]: "1" }, "d4b f22");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(writes().filter((q) => q.path.endsWith("/envs/bulk")).length, 0, "nothing upserted");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /Coolify envs: unexpected response/);
+  });
+  test(`M2.4-d4b (PR214-r22): an env read-back with a row with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawAfterBulk = (out) => JSON.stringify([...out, row]);
+    const sha = commit({ ...baseFiles(), [`x4b22${name.length}`]: "1" }, "d4b b22");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /Coolify envs read-back: unexpected response/);
+  });
+}
+
 // PR214-r15: the first read shows the newer flags; a read-back in the older shape (is_build_time only) must not pass.
 const legacyRows = (out) => JSON.stringify(out.map(({ is_buildtime, is_runtime, ...e }) => ({ ...e, is_build_time: e.key === "GIT_SHA" })));
 test("M2.4-d4b (PR214-r15): a read-back in the older flag shape after a newer first read starts no deploy", async () => {
