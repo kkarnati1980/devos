@@ -569,6 +569,35 @@ for (const [name, stored] of [["runtime false", { value: "srv-stored", is_runtim
   });
 }
 
+for (const [name, rows] of [
+  ["two copies with different values (PR214-r4)", [{ value: "srv-a" }, { value: "srv-b" }]],
+  ["two copies with hidden values (PR214-r4)", [{}, {}]],
+  ["one hidden and one visible value (PR214-r4)", [{}, { value: "srv-a" }]]]) {
+  test(`M2.4-d4b: no server found and ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    for (const row of rows) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true, ...row });
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4bh-${name.length}`]: "1" }, `d4b h ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+
+test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
+  resetMock(); freshState({ deploy: true });
+  for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  const sha = commit({ ...baseFiles(), "x4bi": "1" }, "d4b i");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts, 1);
+});
+
 for (const [name, patch] of [["is_runtime: false", { is_runtime: false }], ["another value", { value: "someone-else" }]]) {
   test(`M2.4-d4b: a DEVOS_GITHUB_OWNER read back with ${name} starts no deploy`, async () => {
     resetMock(); freshState({ deploy: true });

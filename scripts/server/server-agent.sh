@@ -256,11 +256,14 @@ stored_uuid_values() {
   jq -c '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false)) | .value // null]' <<<"$1"
 }
 # stored_uuid_ok envs-json -> 0 when a non-preview DEVOS_COOLIFY_SERVER_UUID exists and every copy is runtime (where
-# Coolify has that flag) and, when values are returned, has the API's uuid shape.
+# Coolify has that flag) and, when values are returned, has the API's uuid shape. Codex PR214-r4: the copies must name
+# one server, so they must share one value; when Coolify hides the value, only a single copy is accepted.
 stored_uuid_ok() {
   jq -e --arg re "$SERVER_UUID_JQ" '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
+    | ($g | map(.value // null) | unique) as $v
     | ($g | length) > 0 and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
-      and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))' <<<"$1" >/dev/null
+      and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))
+    and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1)' <<<"$1" >/dev/null
 }
 provision_env() {
   local envs="$1" owner="${REPO%%/*}" servers uuid="" flags
