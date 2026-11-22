@@ -51,6 +51,10 @@ jobs:
             echo "DEVOS_SMTP_FROM=devos@example.com"
             echo "DEVOS_TLS_DIR=$RUNNER_TEMP/tls"
             echo "DEVOS_TAILSCALE_SOCKET_HOST=$RUNNER_TEMP/tailscaled.sock"
+            # M2.4-d4b-2 (DEVOS-21): compose requires both (the server agent sets them on the server). With
+            # DEVOS_BIND_IP=127.0.0.1 there is no Coolify origin, so the sweep stays off (provision-coolify-url-not-set).
+            echo "DEVOS_GITHUB_OWNER=ci-owner"
+            echo "DEVOS_COOLIFY_SERVER_UUID=00000000-0000-4000-8000-000000000000"
           } >> "$GITHUB_ENV"
       - name: S4-t2 throwaway isolation state token (masked)
         run: |
@@ -66,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           docker compose config -q   # everything set: accepted
-          for v in DEVOS_POLICY_HMAC_KEY DEVOS_VAULT_KEY DEVOS_TLS_CERT_FILE DEVOS_TLS_KEY_FILE DEVOS_API_ORIGIN; do
+          for v in DEVOS_POLICY_HMAC_KEY DEVOS_VAULT_KEY DEVOS_TLS_CERT_FILE DEVOS_TLS_KEY_FILE DEVOS_API_ORIGIN DEVOS_GITHUB_OWNER DEVOS_COOLIFY_SERVER_UUID; do
             if env -u "$v" docker compose config -q 2>err.txt; then echo "compose accepted a missing $v"; exit 1; fi
             grep -q "$v is required" err.txt || { echo "no '$v is required' message"; exit 1; }
             # An empty value is refused too (:? also rejects empty), so a value Coolify blanked cannot slip through.
@@ -94,6 +98,7 @@ jobs:
               DEVOS_POLICY_HMAC_KEY=set-in-coolify DEVOS_VAULT_KEY=set-in-coolify DEVOS_API_ORIGIN=https://set.in.coolify:3001 \
               DEVOS_TLS_CERT_FILE=/certs/set-in-coolify.crt DEVOS_TLS_KEY_FILE=/certs/set-in-coolify.key \
               DEVOS_ISOLATION_STATE_TOKEN=set-in-coolify \
+              DEVOS_GITHUB_OWNER=set-by-server-agent DEVOS_COOLIFY_SERVER_UUID=set-by-server-agent \
               "$@" docker compose -f deploy/compose.yaml config > "$out/compose.rendered.yaml"
           }
           scan() { gitleaks dir --no-banner --redact --exit-code 1 "$out" > /dev/null 2>&1; }
