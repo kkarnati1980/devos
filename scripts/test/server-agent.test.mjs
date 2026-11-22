@@ -816,6 +816,47 @@ for (const [name, patch, ok] of [
   });
 }
 
+// PR214-r18: older first read; a read-back copy that carries is_buildtime but no is_runtime is in the newer shape,
+// so its runtime availability is unconfirmed and no deploy starts.
+const addFlags = (keys, flags) => (out) => JSON.stringify(out.map((e) => (keys.includes(e.key) ? { ...e, ...flags } : e)));
+test("M2.4-d4b (PR214-r18): older first read; a provisioning read-back with is_buildtime and no is_runtime starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = legacyFirst.map((e) => ({ ...e }));
+  M.envRawAfterBulk = addFlags(["DEVOS_COOLIFY_SERVER_UUID", "DEVOS_GITHUB_OWNER"], { is_buildtime: true });
+  const sha = commit({ ...baseFiles(), "x4bx": "1" }, "d4b x");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /provisioning variables did not read back as runtime/);
+});
+
+test("M2.4-d4b (PR214-r18): older first read; a kept stored uuid read back with is_buildtime and no is_runtime starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [...legacyFirst.map((e) => ({ ...e })), { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_build_time: false }];
+  M.servers = 500;
+  M.envRawAfterBulk = addFlags(["DEVOS_COOLIFY_SERVER_UUID"], { is_buildtime: false });
+  const sha = commit({ ...baseFiles(), "x4by": "1" }, "d4b y");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
+test("M2.4-d4b (PR214-r18): older first read; a GIT_SHA read-back with is_buildtime true and no is_runtime starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = legacyFirst.map((e) => ({ ...e }));
+  M.envRawAfterBulk = addFlags(["GIT_SHA"], { is_buildtime: true });
+  const sha = commit({ ...baseFiles(), "x4bz": "1" }, "d4b z");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /GIT_SHA did not read back/);
+});
+
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
   for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
