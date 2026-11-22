@@ -111,6 +111,7 @@ function handler(req, res) {
         const i = M.envs.findIndex((x) => x.key === e.key && !x.is_preview);
         if (i >= 0) M.envs[i] = { ...M.envs[i], ...e }; else M.envs.push(e);
       }
+      if (M.staleStored) M.envs = M.envs.map((x) => (x.key === "DEVOS_COOLIFY_SERVER_UUID" ? { ...x, ...M.staleStored } : x));
       return json(201, {});
     }
     if (p === "/cf/servers" && req.method === "GET") return M.servers === 500 ? json(500, {}) : json(200, M.servers);
@@ -535,6 +536,21 @@ test("M2.4-d4b: no server found but a stored uuid is kept (not upserted) and the
   assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
   assert.equal(M.deployPosts, 1);
 });
+
+for (const [name, stale] of [["removed", { key: "GONE" }], ["made non-runtime", { is_runtime: false }]]) {
+  test(`M2.4-d4b (PR214-r1): a kept stored uuid ${name} between the reads starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+    M.servers = 500; M.staleStored = stale;
+    const sha = commit({ ...baseFiles(), [`x4bg-${name.length}`]: "1" }, `d4b g ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
+    assert.match(r.out, /no longer usable/);
+  });
+}
 
 for (const [name, stored] of [["runtime false", { value: "srv-stored", is_runtime: false }], ["a malformed value", { value: "srv stored", is_runtime: true }]]) {
   test(`M2.4-d4b: no server found and a stored uuid with ${name} is not kept; no deploy`, async () => {

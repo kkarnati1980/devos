@@ -247,8 +247,16 @@ self_update() {  # sha -> installs the allow-list at sha; 0 only if every step s
 # non-preview value is kept (left out of the upsert) and otherwise this fails, so no deploy is submitted.
 OWNER_RE='^[A-Za-z0-9][A-Za-z0-9-]{0,38}$'
 SERVER_UUID_RE='^[A-Za-z0-9-]{1,64}$'
+# stored_uuid_ok envs-json -> 0 when a non-preview DEVOS_COOLIFY_SERVER_UUID exists and every copy is runtime (where
+# Coolify has that flag) and, when values are returned, has the API's uuid shape.
+stored_uuid_ok() {
+  jq -e --arg re "$SERVER_UUID_RE" '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
+    | ($g | length) > 0 and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
+      and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))' <<<"$1" >/dev/null
+}
 provision_env() {
   local envs="$1" owner="${REPO%%/*}" servers uuid="" flags
+  PROV_KEPT=0
   [[ "$owner" =~ $OWNER_RE ]] || { log "tracked repo owner is not a GitHub login"; return 1; }
   if servers="$(cf GET "/servers")" && jq -e 'type == "array"' <<<"$servers" >/dev/null 2>&1; then
     uuid="$(jq -r '[.[]? | select(type == "object" and .name == "localhost") | .uuid] | if length == 1 then (.[0] // "") else "" end
@@ -263,10 +271,9 @@ provision_env() {
   if [[ -z "$uuid" ]]; then
     # Pre-review: a stored value is kept only when it is runtime (where Coolify has that flag) and, when Coolify returns
     # values, has the API's uuid shape; otherwise the deploy waits, as with none stored.
-    if jq -e --arg re "$SERVER_UUID_RE" '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
-        | ($g | length) > 0 and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
-          and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))' <<<"$envs" >/dev/null; then
+    if stored_uuid_ok "$envs"; then
       log "Coolify server uuid not found (no single server named localhost); keeping the stored DEVOS_COOLIFY_SERVER_UUID"
+      PROV_KEPT=1
     else
       log "Coolify server uuid not found (no single server named localhost) and no usable stored value"; return 1
     fi
@@ -309,6 +316,11 @@ set_git_sha_env() {
         and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
                       and ((has("value") | not) or .value == null or .value == $w.value)))' <<<"$envs" >/dev/null \
     || { log "Coolify env provisioning variables did not read back as runtime"; PROV_FAILED=1; return 1; }
+  # Codex PR214-r1: a kept stored uuid is not in the upsert, so it is checked again on the fresh read; a value that
+  # was removed or changed in between submits no deploy.
+  if [[ $PROV_KEPT -eq 1 ]] && ! stored_uuid_ok "$envs"; then
+    log "Coolify env stored DEVOS_COOLIFY_SERVER_UUID is no longer usable"; PROV_FAILED=1; return 1
+  fi
 }
 
 # Deploy is never submitted twice for a SHA. deploy-started.<sha> is written before the first Coolify call;
