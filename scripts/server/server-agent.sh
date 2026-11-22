@@ -306,7 +306,8 @@ provision_env() {
 set_git_sha_env() {
   local sha="$1" envs
   envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
-  jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs: unexpected response"; return 1; }
+  # Codex PR214-r9: slurped, so the response must be exactly one JSON value, and that value an array.
+  jq -se 'length == 1 and (.[0] | type) == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs: unexpected response"; return 1; }
   # M2.4-d4b: the provisioning variables go in the same upsert; no uuid found and none stored submits nothing.
   provision_env "$envs" || { PROV_FAILED=1; return 1; }
   if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
@@ -317,7 +318,7 @@ set_git_sha_env() {
   cf PATCH "/applications/$CF_APP/envs/bulk" "$TMP/env.json" >/dev/null || return 1
   envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
   # Codex PR214-r8: the read-back must be an env list too; jq's .[]? would also walk an object's values.
-  jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs read-back: unexpected response"; PROV_FAILED=1; return 1; }
+  jq -se 'length == 1 and (.[0] | type) == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs read-back: unexpected response"; PROV_FAILED=1; return 1; }
   # Read back: the non-preview GIT_SHA exists, is build-time (and runtime where Coolify has that flag), and its
   # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
   # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).
