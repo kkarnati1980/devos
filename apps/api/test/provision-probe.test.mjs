@@ -258,11 +258,11 @@ function fakeDb(seed = {}) {
 }
 const NOW = new Date("2026-11-16T00:00:00Z");
 
-test("pre-review M3: ensureProbeProject creates a paused, cap-0 probe row with its started row; re-pauses its own row", async () => {
+test("pre-review M3: ensureProbeProject creates a paused, least-cap probe row with its started row; re-pauses its own row", async () => {
   const db = fakeDb();
   const p = await ensureProbeProject(db, NOW, 5000);
   const row = db.projects[0];
-  assert.deepEqual([row.slug, row.capUsd, row.pausedAt, row.stage], [PROBE_SLUG, 0, NOW, "intake"]);
+  assert.deepEqual([row.slug, row.capUsd, row.pausedAt, row.stage], [PROBE_SLUG, "0.000001", NOW, "intake"]);
   assert.equal(db.audits.filter((a) => a.action === "provision.probe_started" && a.projectId === p.id).length, 1);
   row.pausedAt = null;
   const again = await ensureProbeProject(db, NOW, 5000);
