@@ -247,10 +247,13 @@ self_update() {  # sha -> installs the allow-list at sha; 0 only if every step s
 # non-preview value is kept (left out of the upsert) and otherwise this fails, so no deploy is submitted.
 OWNER_RE='^[A-Za-z0-9][A-Za-z0-9-]{0,38}$'
 SERVER_UUID_RE='^[A-Za-z0-9-]{1,64}$'
+# Codex PR214-r2: in jq, \A and \z anchor the whole string; "$" would also match before a trailing newline, and
+# bash's $(...) strips one, so the shape is checked inside jq on the value exactly as Coolify returned it.
+SERVER_UUID_JQ='\A[A-Za-z0-9-]{1,64}\z'
 # stored_uuid_ok envs-json -> 0 when a non-preview DEVOS_COOLIFY_SERVER_UUID exists and every copy is runtime (where
 # Coolify has that flag) and, when values are returned, has the API's uuid shape.
 stored_uuid_ok() {
-  jq -e --arg re "$SERVER_UUID_RE" '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
+  jq -e --arg re "$SERVER_UUID_JQ" '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
     | ($g | length) > 0 and all($g[]; ((has("is_runtime") | not) or .is_runtime == true)
       and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))' <<<"$1" >/dev/null
 }
@@ -259,8 +262,9 @@ provision_env() {
   PROV_KEPT=0
   [[ "$owner" =~ $OWNER_RE ]] || { log "tracked repo owner is not a GitHub login"; return 1; }
   if servers="$(cf GET "/servers")" && jq -e 'type == "array"' <<<"$servers" >/dev/null 2>&1; then
-    uuid="$(jq -r '[.[]? | select(type == "object" and .name == "localhost") | .uuid] | if length == 1 then (.[0] // "") else "" end
-      | if type == "string" then . else "" end' <<<"$servers")"
+    uuid="$(jq -r --arg re "$SERVER_UUID_JQ" '[.[]? | select(type == "object" and .name == "localhost") | .uuid]
+      | if length == 1 then (.[0] // "") else "" end
+      | if type == "string" and test($re) then . else "" end' <<<"$servers")"
     [[ "$uuid" =~ $SERVER_UUID_RE ]] || uuid=""
   fi
   if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then

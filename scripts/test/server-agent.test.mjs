@@ -500,6 +500,7 @@ for (const [name, servers] of [
   ["no server named localhost", [{ uuid: "srv-other", name: "worker-2" }]],
   ["two servers named localhost", [{ uuid: "srv-a", name: "localhost" }, { uuid: "srv-b", name: "localhost" }]],
   ["a malformed uuid", [{ uuid: "srv uuid; rm", name: "localhost" }]],
+  ["a uuid with a trailing newline (PR214-r2)", [{ uuid: "srv-uuid-1\n", name: "localhost" }]],
   ["a failed GET /servers", 500],
 ]) {
   test(`M2.4-d4b: ${name} with no stored uuid starts no deploy; once found, the next tick deploys once`, async () => {
@@ -552,7 +553,8 @@ for (const [name, stale] of [["removed", { key: "GONE" }], ["made non-runtime", 
   });
 }
 
-for (const [name, stored] of [["runtime false", { value: "srv-stored", is_runtime: false }], ["a malformed value", { value: "srv stored", is_runtime: true }]]) {
+for (const [name, stored] of [["runtime false", { value: "srv-stored", is_runtime: false }], ["a malformed value", { value: "srv stored", is_runtime: true }],
+  ["a trailing newline (PR214-r2)", { value: "srv-stored\n", is_runtime: true }]]) {
   test(`M2.4-d4b: no server found and a stored uuid with ${name} is not kept; no deploy`, async () => {
     resetMock(); freshState({ deploy: true });
     M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, ...stored });
