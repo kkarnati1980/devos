@@ -261,11 +261,12 @@ stored_uuid_values() {
 # Codex PR214-r5: when any variable carries the newer flags (is_buildtime/is_runtime), is_runtime must be present and
 # true on each copy; only the older schema (is_build_time only) has every variable at runtime without the flag.
 # Codex PR214-r6: a copy counts as the older schema only when it carries is_build_time; a copy with no flags at all fails.
+# Codex PR214-r7: that is_build_time must be a boolean (true or false); null or a string fails.
 stored_uuid_ok() {
   jq -e --arg re "$SERVER_UUID_JQ" 'any(.[]?; has("is_buildtime") or has("is_runtime")) as $modern
     | [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and ((.is_preview // false) == false))] as $g
     | ($g | map(.value // null) | unique) as $v
-    | ($g | length) > 0 and all($g[]; (if $modern then .is_runtime == true else has("is_build_time") end)
+    | ($g | length) > 0 and all($g[]; (if $modern then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
       and ((has("value") | not) or .value == null or ((.value | type) == "string" and (.value | test($re)))))
     and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1)' <<<"$1" >/dev/null
 }
@@ -333,7 +334,7 @@ set_git_sha_env() {
       | [$e[]? | select(.key == $w.key and ((.is_preview // false) == false))] as $g
       | ($g | map(.value // null) | unique) as $v
       | ($g | length) > 0
-        and all($g[]; (if $modern then .is_runtime == true else has("is_build_time") end)
+        and all($g[]; (if $modern then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
                       and ((has("value") | not) or .value == null or .value == $w.value))
         and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1))' <<<"$envs" >/dev/null \
     || { log "Coolify env provisioning variables did not read back as runtime"; PROV_FAILED=1; return 1; }

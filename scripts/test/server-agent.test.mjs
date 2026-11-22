@@ -614,7 +614,9 @@ test("M2.4-d4b (PR214-r5): an upserted provisioning variable read back without i
 
 for (const [name, row, kept] of [
   ["with is_build_time is kept (older Coolify)", { is_build_time: false }, true],
-  ["with no flags at all is not kept (PR214-r6)", {}, false]]) {
+  ["with no flags at all is not kept (PR214-r6)", {}, false],
+  ["with is_build_time null is not kept (PR214-r7)", { is_build_time: null }, false],
+  ["with is_build_time as a string is not kept (PR214-r7)", { is_build_time: "false" }, false]]) {
   test(`M2.4-d4b: no server found; an older-Coolify stored uuid ${name}`, async () => {
     resetMock(); freshState({ deploy: true });
     M.envs = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true },
