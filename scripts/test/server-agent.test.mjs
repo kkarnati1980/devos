@@ -555,7 +555,8 @@ for (const [name, stale] of [["removed", { key: "GONE" }], ["made non-runtime", 
 }
 
 for (const [name, stored] of [["runtime false", { value: "srv-stored", is_runtime: false }], ["a malformed value", { value: "srv stored", is_runtime: true }],
-  ["a trailing newline (PR214-r2)", { value: "srv-stored\n", is_runtime: true }]]) {
+  ["a trailing newline (PR214-r2)", { value: "srv-stored\n", is_runtime: true }],
+  ["is_buildtime but no is_runtime flag (PR214-r5)", { value: "srv-stored", is_buildtime: true }]]) {
   test(`M2.4-d4b: no server found and a stored uuid with ${name} is not kept; no deploy`, async () => {
     resetMock(); freshState({ deploy: true });
     M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, ...stored });
@@ -585,6 +586,31 @@ for (const [name, rows] of [
     assert.match(r.out, /no usable stored value/);
   });
 }
+
+for (const [name, stale] of [["a hidden value (PR214-r5)", {}], ["another visible value (PR214-r5)", { value: "srv-old" }]]) {
+  test(`M2.4-d4b: a found uuid upserted over one copy while a stale second copy has ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true, ...stale });
+    const sha = commit({ ...baseFiles(), [`x4bj-${name.length}`]: "1" }, `d4b j ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /provisioning variables did not read back as runtime/);
+  });
+}
+
+test("M2.4-d4b (PR214-r5): an upserted provisioning variable read back without is_runtime (newer flags) starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.provPatch = { is_runtime: undefined };
+  const sha = commit({ ...baseFiles(), "x4bk": "1" }, "d4b k");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /provisioning variables did not read back as runtime/);
+});
 
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
