@@ -20,7 +20,8 @@ const reqs = [];
 function resetMock() {
   M = { main: null, runs: {}, statuses: {}, pulls: {}, trees: {}, failStatus: 0, deployPatch: [], deployStatus: "finished",
     envs: [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_buildtime: true, is_runtime: true }], failEnv: 0, runtimeOnly: false, envPatch: null,
-    cfPerms: "read write deploy", appSha: "HEAD" };
+    cfPerms: "read write deploy", appSha: "HEAD",
+    servers: [{ uuid: "srv-uuid-1", name: "localhost", ip: "host.docker.internal" }], provPatch: null };
   reqs.length = 0;
 }
 
@@ -99,17 +100,45 @@ function handler(req, res) {
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs$/)) && req.method === "GET") {
       {
         const patch = M.envPatch || (M.runtimeOnly ? { is_buildtime: false } : null);
-        return json(200, patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs);
+        const envs = patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs;
+        const out = M.provPatch ? envs.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, ...M.provPatch } : e)) : envs;
+        if (M.envObjectAfterBulk && M.bulkDone) return json(200, Object.fromEntries(out.map((e, i) => [String(i), e])));
+        if (M.envRawBeforeBulk && !M.bulkDone) {
+          res.writeHead(200, { "content-type": "application/json" }); res.end(M.envRawBeforeBulk(out)); return;
+        }
+        if (M.envRawAfterBulk && M.bulkDone) {
+          res.writeHead(200, { "content-type": "application/json" }); res.end(M.envRawAfterBulk(out)); return;
+        }
+        if (M.envNulAfterBulk && M.bulkDone) {
+          res.writeHead(200, { "content-type": "application/json" }); res.end(Buffer.concat([Buffer.from(JSON.stringify(out)), Buffer.from([0])])); return;
+        }
+        if (M.envTwoArraysAfterBulk && M.bulkDone) {
+          res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify([]) + "\n" + JSON.stringify(out)); return;
+        }
+        return json(200, out);
       }
     }
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs\/bulk$/)) && req.method === "PATCH") {
       if (M.failEnv > 0) { M.failEnv--; return json(403, { message: "forbidden" }); }
+      M.bulkDone = true;
       // Mock Coolify bulk upsert: update the non-preview variable with this key, or create it.
       for (const e of JSON.parse(body).data) {
         const i = M.envs.findIndex((x) => x.key === e.key && !x.is_preview);
         if (i >= 0) M.envs[i] = { ...M.envs[i], ...e }; else M.envs.push(e);
       }
+      if (M.staleStored) M.envs = M.envs.map((x) => (x.key === "DEVOS_COOLIFY_SERVER_UUID" ? { ...x, ...M.staleStored } : x));
       return json(201, {});
+    }
+    if (p === "/cf/servers" && req.method === "GET") {
+      if (M.servers === "trailingNul") {  // PR214-r11: a valid localhost array followed by a raw NUL byte
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(Buffer.concat([Buffer.from(JSON.stringify([{ uuid: "srv-uuid-1", name: "localhost" }])), Buffer.from([0])])); return;
+      }
+      if (M.servers === "twoArrays") {  // PR214-r10: one valid localhost array, then an empty one, in one body
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify([{ uuid: "srv-uuid-1", name: "localhost" }]) + "\n" + JSON.stringify([])); return;
+      }
+      return M.servers === 500 ? json(500, {}) : json(200, M.servers);
     }
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "GET") {
       if (!M.cfPerms.split(" ").includes("read")) return json(403, { message: "forbidden" });
@@ -459,6 +488,529 @@ for (const [name, patch] of [
     assert.equal(r.code, 0, r.out);
     assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
     assert.match(r.out, /did not read back/);
+    assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
+  });
+}
+
+// M2.4-d4b (DEVOS-21): the GIT_SHA upsert also sets the provisioning sweep's owner and Coolify server uuid, runtime.
+const provEnv = (k) => M.envs.filter((e) => e.key === k);
+
+test("M2.4-d4b: DEVOS_GITHUB_OWNER and DEVOS_COOLIFY_SERVER_UUID are upserted runtime in the GIT_SHA upsert, before the deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_GITHUB_OWNER", value: "someone-else", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = [{ uuid: "srv-other", name: "worker-2", ip: "10.0.0.9" }, { uuid: "srv-uuid-1", name: "localhost", ip: "host.docker.internal" }];
+  const sha = commit({ ...baseFiles(), "x4ba": "1" }, "d4b a");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(cfOrder(), ["PATCH /cf/applications/app-uuid-1234", "PATCH /cf/applications/app-uuid-1234/envs/bulk", "POST /cf/deploy"]);
+  assert.deepEqual(provEnv("DEVOS_GITHUB_OWNER"), [{ key: "DEVOS_GITHUB_OWNER", value: "kkarnati1980", is_preview: false, is_buildtime: false, is_runtime: true }]);
+  assert.deepEqual(provEnv("DEVOS_COOLIFY_SERVER_UUID"), [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-uuid-1", is_preview: false, is_buildtime: false, is_runtime: true }]);
+  assert.equal(gitSha()[0].value, sha);
+  assert.equal(M.deployPosts, 1);
+});
+
+test("M2.4-d4b: an older Coolify (is_build_time) gets is_build_time false on the provisioning variables", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true }];
+  const sha = commit({ ...baseFiles(), "x4bb": "1" }, "d4b b");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(provEnv("DEVOS_COOLIFY_SERVER_UUID"), [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-uuid-1", is_preview: false, is_build_time: false }]);
+  assert.equal(M.deployPosts, 1);
+});
+
+for (const [name, servers] of [
+  ["no server named localhost", [{ uuid: "srv-other", name: "worker-2" }]],
+  ["two servers named localhost", [{ uuid: "srv-a", name: "localhost" }, { uuid: "srv-b", name: "localhost" }]],
+  ["a malformed uuid", [{ uuid: "srv uuid; rm", name: "localhost" }]],
+  ["a uuid with a trailing newline (PR214-r2)", [{ uuid: "srv-uuid-1\n", name: "localhost" }]],
+  ["a failed GET /servers", 500],
+  ["a GET /servers body holding two JSON arrays (PR214-r10)", "twoArrays"],
+  ["a GET /servers body with a trailing raw NUL byte (PR214-r11)", "trailingNul"],
+  ["a localhost row beside a row with no name (PR214-r20)", [{ uuid: "srv-uuid-1", name: "localhost" }, { uuid: "srv-x" }]],
+  ["a localhost row beside a row with a non-string name (PR214-r20)", [{ uuid: "srv-uuid-1", name: "localhost" }, { uuid: "srv-x", name: 7 }]],
+  ["a localhost row beside a non-object row (PR214-r20)", [{ uuid: "srv-uuid-1", name: "localhost" }, "srv-x"]],
+]) {
+  test(`M2.4-d4b: ${name} with no stored uuid starts no deploy; once found, the next tick deploys once`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.servers = servers;
+    const sha = commit({ ...baseFiles(), [`x4bc-${name.length}`]: "1" }, `d4b c ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    let r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.equal(writes().filter((q) => q.path.endsWith("/envs/bulk")).length, 0, "nothing upserted");
+    assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
+    assert.match(r.out, /could not set the provisioning variables/);
+    assert.equal(provEnv("DEVOS_COOLIFY_SERVER_UUID").length, 0);
+    M.servers = [{ uuid: "srv-uuid-1", name: "localhost" }];
+    r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts, 1, "deployed once on the retry");
+    assert.equal(provEnv("DEVOS_COOLIFY_SERVER_UUID")[0].value, "srv-uuid-1");
+  });
+}
+
+test("M2.4-d4b: no server found but a stored uuid is kept (not upserted) and the deploy goes ahead", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  const sha = commit({ ...baseFiles(), "x4bd": "1" }, "d4b d");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  const sent = JSON.parse(writes().find((q) => q.path.endsWith("/envs/bulk")).body).data.map((e) => e.key);
+  assert.deepEqual(sent, ["GIT_SHA", "DEVOS_GITHUB_OWNER"]);
+  assert.equal(provEnv("DEVOS_COOLIFY_SERVER_UUID")[0].value, "srv-stored");
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts, 1);
+});
+
+for (const [name, stale] of [["removed", { key: "GONE" }], ["made non-runtime", { is_runtime: false }],
+  ["replaced by another well-formed uuid (PR214-r3)", { value: "srv-other" }]]) {
+  test(`M2.4-d4b (PR214-r1): a kept stored uuid ${name} between the reads starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+    M.servers = 500; M.staleStored = stale;
+    const sha = commit({ ...baseFiles(), [`x4bg-${name.length}`]: "1" }, `d4b g ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
+    assert.match(r.out, /no longer usable/);
+  });
+}
+
+for (const [name, stored] of [["runtime false", { value: "srv-stored", is_runtime: false }], ["a malformed value", { value: "srv stored", is_runtime: true }],
+  ["a trailing newline (PR214-r2)", { value: "srv-stored\n", is_runtime: true }],
+  ["is_buildtime but no is_runtime flag (PR214-r5)", { value: "srv-stored", is_buildtime: true }]]) {
+  test(`M2.4-d4b: no server found and a stored uuid with ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, ...stored });
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4bf-${name.length}`]: "1" }, `d4b f ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+
+for (const [name, rows] of [
+  ["two copies with different values (PR214-r4)", [{ value: "srv-a" }, { value: "srv-b" }]],
+  ["two copies with hidden values (PR214-r4)", [{}, {}]],
+  ["one hidden and one visible value (PR214-r4)", [{}, { value: "srv-a" }]]]) {
+  test(`M2.4-d4b: no server found and ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    for (const row of rows) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true, ...row });
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4bh-${name.length}`]: "1" }, `d4b h ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+
+for (const [name, stale] of [["a hidden value (PR214-r5)", {}], ["another visible value (PR214-r5)", { value: "srv-old" }]]) {
+  test(`M2.4-d4b: a found uuid upserted over one copy while a stale second copy has ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true, ...stale });
+    const sha = commit({ ...baseFiles(), [`x4bj-${name.length}`]: "1" }, `d4b j ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /provisioning variables did not read back as runtime/);
+  });
+}
+
+test("M2.4-d4b (PR214-r5): an upserted provisioning variable read back without is_runtime (newer flags) starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.provPatch = { is_runtime: undefined };
+  const sha = commit({ ...baseFiles(), "x4bk": "1" }, "d4b k");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /provisioning variables did not read back as runtime/);
+});
+
+for (const [name, row, kept] of [
+  ["with is_build_time is kept (older Coolify)", { is_build_time: false }, true],
+  ["with no flags at all is not kept (PR214-r6)", {}, false],
+  ["with is_build_time null is not kept (PR214-r7)", { is_build_time: null }, false],
+  ["with is_build_time as a string is not kept (PR214-r7)", { is_build_time: "false" }, false]]) {
+  test(`M2.4-d4b: no server found; an older-Coolify stored uuid ${name}`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true },
+      { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, ...row }];
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4bl-${name.length}`]: "1" }, `d4b l ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    if (kept) { assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/); assert.equal(M.deployPosts, 1); }
+    else { assert.match(r.out, /no usable stored value/); assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); }
+  });
+}
+
+test("M2.4-d4b (PR214-r8): an env read-back that is an object, not a list, starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envObjectAfterBulk = true;
+  const sha = commit({ ...baseFiles(), "x4bm": "1" }, "d4b m");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs read-back: unexpected response/);
+});
+
+test("M2.4-d4b (PR214-r9): an env read-back holding two JSON arrays starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envTwoArraysAfterBulk = true;
+  const sha = commit({ ...baseFiles(), "x4bn": "1" }, "d4b n");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs read-back: unexpected response/);
+});
+
+test("M2.4-d4b (PR214-r11): an env read-back followed by a raw NUL byte starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envNulAfterBulk = true;
+  const sha = commit({ ...baseFiles(), "x4bo": "1" }, "d4b o");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs read-back: unexpected response/);
+});
+
+// PR214-r12: jq reads NaN (printed as null, i.e. "hidden") and keeps only the last of duplicate keys; both must fail.
+const ownerRow = (rest) => `{"key":"DEVOS_GITHUB_OWNER",${rest},"is_preview":false,"is_buildtime":false,"is_runtime":true}`;
+const others = (out) => out.filter((e) => e.key !== "DEVOS_GITHUB_OWNER").map((e) => JSON.stringify(e));
+for (const [name, raw] of [
+  ["a bare NaN as the owner value", (out) => `[${[...others(out), ownerRow('"value":NaN')].join(",")}]`],
+  ["a duplicate value key on the owner row", (out) => `[${[...others(out), ownerRow('"value":"stale-owner","value":"kkarnati1980"')].join(",")}]`],
+  ["a duplicate value key of another shape, then null (PR214-r13)", (out) => `[${[...others(out), ownerRow('"value":{"unexpected":1},"value":null')].join(",")}]`],
+  ["a duplicate key inside a nested object (PR214-r13)", (out) => `[${[...others(out), ownerRow('"value":"kkarnati1980","meta":{"a":[1],"a":[]}')].join(",")}]`],
+]) {
+  test(`M2.4-d4b (PR214-r12): an env read-back with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawAfterBulk = raw;
+    const sha = commit({ ...baseFiles(), [`x4bp-${name.length}`]: "1" }, `d4b p ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /Coolify envs read-back: unexpected response/);
+  });
+}
+
+test("M2.4-d4b (PR214-r14): a first env read with a non-object element upserts nothing and starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envRawBeforeBulk = (out) => JSON.stringify(["not-a-row", ...out]);
+  const sha = commit({ ...baseFiles(), "x4bq": "1" }, "d4b q");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(writes().filter((q) => q.path.endsWith("/envs/bulk")).length, 0, "nothing upserted");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs: unexpected response/);
+});
+
+test("M2.4-d4b (PR214-r14): an env read-back with a non-object element starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envRawAfterBulk = (out) => JSON.stringify([...out, 7]);
+  const sha = commit({ ...baseFiles(), "x4br": "1" }, "d4b r");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs read-back: unexpected response/);
+});
+
+// PR214-r23: a hidden stored value cannot be compared between reads (a replaced row would look the same), so it is
+// never kept; with no server found, no deploy is submitted.
+for (const [name, row] of [["no value field", {}], ["a null value", { value: null }]]) {
+  test(`M2.4-d4b (PR214-r23): no server found and a single stored uuid with ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", is_preview: false, is_buildtime: false, is_runtime: true, ...row });
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4h23${name.length}`]: "1" }, "d4b h23");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+test("M2.4-d4b (PR214-r23): a kept stored uuid whose read-back hides the value starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  M.envRawAfterBulk = (out) => JSON.stringify(out.map((e) => { if (e.key !== "DEVOS_COOLIFY_SERVER_UUID") return e; const { value, ...r } = e; return { ...r, uuid: "row-new" }; }));
+  const sha = commit({ ...baseFiles(), "x4h23r": "1" }, "d4b h23r");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
+// PR214-r22: every env row must have a string key, so each row can be classified; an unclassifiable row makes the
+// whole read inconclusive (first read: nothing upserted; read-back: no deploy).
+for (const [name, row] of [["no key", { value: "x", is_preview: false }], ["a null key", { key: null, value: "x", is_preview: false }],
+  ["a numeric key", { key: 7, value: "x", is_preview: false }]]) {
+  test(`M2.4-d4b (PR214-r22): a first env read with a row with ${name} upserts nothing and starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawBeforeBulk = (out) => JSON.stringify([...out, row]);
+    const sha = commit({ ...baseFiles(), [`x4f22${name.length}`]: "1" }, "d4b f22");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(writes().filter((q) => q.path.endsWith("/envs/bulk")).length, 0, "nothing upserted");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /Coolify envs: unexpected response/);
+  });
+  test(`M2.4-d4b (PR214-r22): an env read-back with a row with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawAfterBulk = (out) => JSON.stringify([...out, row]);
+    const sha = commit({ ...baseFiles(), [`x4b22${name.length}`]: "1" }, "d4b b22");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /Coolify envs read-back: unexpected response/);
+  });
+}
+
+// PR214-r15: the first read shows the newer flags; a read-back in the older shape (is_build_time only) must not pass.
+const legacyRows = (out) => JSON.stringify(out.map(({ is_buildtime, is_runtime, ...e }) => ({ ...e, is_build_time: e.key === "GIT_SHA" })));
+test("M2.4-d4b (PR214-r15): a read-back in the older flag shape after a newer first read starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envRawAfterBulk = legacyRows;
+  const sha = commit({ ...baseFiles(), "x4bs": "1" }, "d4b s");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /did not read back/);
+});
+
+test("M2.4-d4b (PR214-r15): a kept stored uuid read back in the older flag shape starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  M.envRawAfterBulk = legacyRows;
+  const sha = commit({ ...baseFiles(), "x4bt": "1" }, "d4b t");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
+// PR214-r16: older first read (is_build_time only); a read-back copy that carries is_runtime must have it true.
+const modernGit = (out) => out.map((e) => (e.key === "GIT_SHA" ? { ...e, is_buildtime: true, is_runtime: true } : e));
+const legacyFirst = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true }];
+const withRuntime = (keys, rt) => (out) => JSON.stringify(out.map((e) => (keys.includes(e.key) ? { ...e, is_runtime: rt } : e)));
+for (const [name, rt, ok] of [["is_runtime false starts no deploy", false, false], ["is_runtime true still deploys", true, true]]) {
+  test(`M2.4-d4b (PR214-r16): older first read; a provisioning read-back with ${name}`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs = legacyFirst.map((e) => ({ ...e }));
+    // PR214-r19: a newer flag anywhere puts the whole response in the newer shape, so the positive case returns
+    // GIT_SHA with the newer flags too; the negative case may now fail first on GIT_SHA (either way, no deploy).
+    M.envRawAfterBulk = (out) => withRuntime(["DEVOS_COOLIFY_SERVER_UUID", "DEVOS_GITHUB_OWNER"], rt)(rt ? modernGit(out) : out);
+    const sha = commit({ ...baseFiles(), [`x4bu-${rt}`]: "1" }, `d4b u ${rt}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    if (ok) assert.equal(M.deployPosts, 1, r.out);
+    else { assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); assert.match(r.out, /did not read back/); }
+  });
+}
+
+test("M2.4-d4b (PR214-r16): older first read; a kept stored uuid read back with is_runtime false starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [...legacyFirst.map((e) => ({ ...e })), { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_build_time: false }];
+  M.servers = 500;
+  M.envRawAfterBulk = withRuntime(["DEVOS_COOLIFY_SERVER_UUID"], false);
+  const sha = commit({ ...baseFiles(), "x4bv": "1" }, "d4b v");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
+// PR214-r17: older first read; a GIT_SHA read-back with is_buildtime:false beside a stale is_build_time:true fails.
+for (const [name, patch, ok] of [
+  ["is_buildtime false and a stale is_build_time true starts no deploy", { is_build_time: true, is_buildtime: false, is_runtime: true }, false],
+  ["is_buildtime true and is_runtime true still deploys", { is_build_time: true, is_buildtime: true, is_runtime: true }, true]]) {
+  test(`M2.4-d4b (PR214-r17): older first read; a GIT_SHA read-back with ${name}`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs = legacyFirst.map((e) => ({ ...e }));
+    // PR214-r19: the positive case returns the provisioning rows with is_runtime true too (a fully newer response).
+    M.envRawAfterBulk = (out) => JSON.stringify(out.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : ok ? { ...e, is_runtime: true } : e)));
+    const sha = commit({ ...baseFiles(), [`x4bw-${ok}`]: "1" }, `d4b w ${ok}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    if (ok) assert.equal(M.deployPosts, 1, r.out);
+    else { assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); assert.match(r.out, /GIT_SHA did not read back/); }
+  });
+}
+
+// PR214-r18: older first read; a read-back copy that carries is_buildtime but no is_runtime is in the newer shape,
+// so its runtime availability is unconfirmed and no deploy starts.
+const addFlags = (keys, flags) => (out) => JSON.stringify(out.map((e) => (keys.includes(e.key) ? { ...e, ...flags } : e)));
+test("M2.4-d4b (PR214-r18): older first read; a provisioning read-back with is_buildtime and no is_runtime starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = legacyFirst.map((e) => ({ ...e }));
+  M.envRawAfterBulk = addFlags(["DEVOS_COOLIFY_SERVER_UUID", "DEVOS_GITHUB_OWNER"], { is_buildtime: true });
+  const sha = commit({ ...baseFiles(), "x4bx": "1" }, "d4b x");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /did not read back/);
+});
+
+test("M2.4-d4b (PR214-r18): older first read; a kept stored uuid read back with is_buildtime and no is_runtime starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [...legacyFirst.map((e) => ({ ...e })), { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_build_time: false }];
+  M.servers = 500;
+  M.envRawAfterBulk = addFlags(["DEVOS_COOLIFY_SERVER_UUID"], { is_buildtime: false });
+  const sha = commit({ ...baseFiles(), "x4by": "1" }, "d4b y");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
+test("M2.4-d4b (PR214-r18): older first read; a GIT_SHA read-back with is_buildtime true and no is_runtime starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = legacyFirst.map((e) => ({ ...e }));
+  M.envRawAfterBulk = addFlags(["GIT_SHA"], { is_buildtime: true });
+  const sha = commit({ ...baseFiles(), "x4bz": "1" }, "d4b z");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /GIT_SHA did not read back/);
+});
+
+// PR214-r19: older first read; a read-back where GIT_SHA carries the newer flags but a provisioning copy carries only
+// is_build_time is a mixed response, so the whole response is judged in the newer shape and no deploy starts.
+test("M2.4-d4b (PR214-r19): older first read; a mixed read-back (newer GIT_SHA, older owner) starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = legacyFirst.map((e) => ({ ...e }));
+  M.envRawAfterBulk = (out) => JSON.stringify(modernGit(out));
+  const sha = commit({ ...baseFiles(), "x4ca": "1" }, "d4b ca");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /provisioning variables did not read back as runtime/);
+});
+
+test("M2.4-d4b (PR214-r19): older first read; a kept stored uuid in a mixed read-back starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envs = [...legacyFirst.map((e) => ({ ...e })), { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_build_time: false }];
+  M.servers = 500;
+  M.envRawAfterBulk = (out) => JSON.stringify(modernGit(out).map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, is_runtime: true } : e)));
+  const sha = commit({ ...baseFiles(), "x4cb": "1" }, "d4b cb");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+});
+
+// PR214-r21: a checked row must say it is non-preview (is_preview: false); a missing or null flag is not taken as false,
+// and any row of a checked key without a boolean is_preview makes the read inconclusive.
+for (const [name, edit, msg] of [
+  ["an owner row with is_preview null", (out) => out.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, is_preview: null } : e)), /provisioning variables did not read back/],
+  ["an owner row with no is_preview", (out) => out.map((e) => { if (e.key !== "DEVOS_GITHUB_OWNER") return e; const { is_preview, ...r } = e; return r; }), /provisioning variables did not read back/],
+  ["a second owner copy with is_preview null beside a good one", (out) => [...out, { ...out.find((e) => e.key === "DEVOS_GITHUB_OWNER"), is_preview: null }], /provisioning variables did not read back/],
+  ["a server uuid row with is_preview null", (out) => out.map((e) => (e.key === "DEVOS_COOLIFY_SERVER_UUID" ? { ...e, is_preview: null } : e)), /provisioning variables did not read back/],
+  ["a GIT_SHA row with is_preview null", (out) => out.map((e) => (e.key === "GIT_SHA" ? { ...e, is_preview: null } : e)), /GIT_SHA did not read back/]]) {
+  test(`M2.4-d4b (PR214-r21): a read-back with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envRawAfterBulk = (out) => JSON.stringify(edit(out));
+    const sha = commit({ ...baseFiles(), [`x4r21${name.length}`]: "1" }, "d4b r21");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.ok(M.bulkDone, "the upsert ran");
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, msg);
+  });
+}
+
+for (const [name, rows] of [
+  ["a stored uuid with is_preview null", [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: null, is_buildtime: false, is_runtime: true }]],
+  ["a stored uuid with no is_preview", [{ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_buildtime: false, is_runtime: true }]],
+  ["a good stored uuid beside a copy with is_preview null", [
+    { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true },
+    { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: null, is_buildtime: false, is_runtime: true }]]]) {
+  test(`M2.4-d4b (PR214-r21): no server found and ${name} is not kept; no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs.push(...rows);
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4s21${name.length}`]: "1" }, "d4b s21");
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /no usable stored value/);
+  });
+}
+
+test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
+  resetMock(); freshState({ deploy: true });
+  for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
+  M.servers = 500;
+  const sha = commit({ ...baseFiles(), "x4bi": "1" }, "d4b i");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/);
+  assert.equal(M.deployPosts, 1);
+});
+
+for (const [name, patch] of [["is_runtime: false", { is_runtime: false }], ["another value", { value: "someone-else" }]]) {
+  test(`M2.4-d4b: a DEVOS_GITHUB_OWNER read back with ${name} starts no deploy`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.provPatch = patch;
+    const sha = commit({ ...baseFiles(), [`x4be-${name.length}`]: "1" }, `d4b e ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+    assert.match(r.out, /provisioning variables did not read back/);
+    assert.match(r.out, /could not set the provisioning variables/);
     assert.ok(!fs.existsSync(path.join(D(), `agent/deploy-started.${sha}`)), "no start marker");
   });
 }

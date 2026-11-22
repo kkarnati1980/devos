@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.6.2
+# Version: 1.7.0
+# v1.7.0 (DEVOS-21, M2.4-d4b): before a deploy, the same env upsert as GIT_SHA also sets DEVOS_GITHUB_OWNER (the owner
+# of the tracked repo) and DEVOS_COOLIFY_SERVER_UUID (Coolify's own server, the one named "localhost" in GET /servers,
+# as M0.4 found it) as runtime variables, and reads both back. compose requires them (:?), so a dropped value comes
+# back on the next deploy. No uuid found and none stored yet: no deploy is submitted and the next tick retries.
 # v1.6.2 (DEVOS-128): the reason list gains conntrack-missing, conntrack-incomplete and conntrack-queue
 # (isolation-apply.sh v1.5.1); "conntrack" stays listed, so a run of the previous script is still read.
 # v1.6.1 (DEVOS-128): a /recheck request may carry the runners' fixed attribution footer (they cannot post a comment
@@ -115,6 +119,31 @@ http() {  # auth-file method url [json-body-file] -> body on stdout; non-2xx is 
 }
 gh() { http "$TMP/gh.auth" "$1" "$API$2" "${3:-}"; }
 cf() { http "$TMP/cf.auth" "$1" "$COOLIFY_API$2" "${3:-}"; }
+# cf_json method path [body] -> the response, compacted, only when it is exactly one JSON value (Codex PR214-r10).
+# jq reads several top-level values from one input and runs its filter on each, so every Coolify body that a
+# provisioning decision reads goes through this first; an empty body, junk or two values fail here.
+# Codex PR214-r11: the raw body goes to a file and jq parses the file, never a $(...) capture, because bash drops
+# NUL bytes from command substitution (a valid array followed by a raw NUL would otherwise parse). jq rejects a NUL
+# in its input, and its -c output escapes any NUL in a string, so what this prints is safe to capture.
+# Codex PR214-r12: jq is lenient where strict JSON is not. It reads NaN and Infinity and prints them as null (which a
+# read-back would take for a hidden value), so any non-finite number fails. It keeps only the last of duplicate keys.
+# Codex PR214-r13: comparing raw leaf paths alone misses a duplicate whose first value has another shape
+# ({"unexpected":1} then null), so the raw stream's leaf paths must equal, as a multiset, those of the parsed value:
+# a duplicate key, whatever its shapes, leaves at least one raw leaf the parsed value no longer has. Other leniencies
+# (01, .5, +1) only change numbers, and every value a provisioning decision compares is a string or a boolean.
+cf_json() {
+  local f="$TMP/cf_json.resp" rc=1
+  cf "$@" > "$f" || { rm -f "$f"; return 1; }
+  if jq -cs 'if length != 1 then error("not exactly one JSON value")
+             elif any(.[0] | .. | numbers; isnan or isinfinite) then error("non-finite number")
+             else .[0] end' "$f" > "$f.c" 2>/dev/null \
+     && jq -c --stream 'select(length == 2) | .[0]' "$f" 2>/dev/null | LC_ALL=C sort > "$f.raw" \
+     && jq -c 'tostream | select(length == 2) | .[0]' "$f.c" 2>/dev/null | LC_ALL=C sort > "$f.parsed" \
+     && cmp -s "$f.raw" "$f.parsed"; then
+    cat "$f.c"; rc=0
+  fi
+  rm -f "$f" "$f.c" "$f.raw" "$f.parsed"; return $rc
+}
 
 
 # v1.3.1 (DEVOS-114): pages are merged through temp files, never passed as a jq argument, as in review-watch
@@ -237,30 +266,147 @@ self_update() {  # sha -> installs the allow-list at sha; 0 only if every step s
   return 0
 }
 
+# M2.4-d4b (DEVOS-21): provision_env envs-json -> writes $TMP/prov.json, the JSON array of provisioning variables to
+# upsert with GIT_SHA (runtime only; the build does not need them). The owner is the tracked repo's owner. The Coolify
+# server uuid is the one server named "localhost" (Coolify's own host, M0.4's rule); when it cannot be found, a stored
+# non-preview value is kept (left out of the upsert) and otherwise this fails, so no deploy is submitted.
+CF_MODERN=false   # set by set_git_sha_env from the first env read of each deploy (Codex PR214-r15)
+OWNER_RE='^[A-Za-z0-9][A-Za-z0-9-]{0,38}$'
+SERVER_UUID_RE='^[A-Za-z0-9-]{1,64}$'
+# Codex PR214-r2: in jq, \A and \z anchor the whole string; "$" would also match before a trailing newline, and
+# bash's $(...) strips one, so the shape is checked inside jq on the value exactly as Coolify returned it.
+SERVER_UUID_JQ='\A[A-Za-z0-9-]{1,64}\z'
+# stored_uuid_values envs-json -> the JSON list of the non-preview DEVOS_COOLIFY_SERVER_UUID values (null where Coolify
+# returns none), so the fresh read can be compared with the first one (Codex PR214-r3).
+stored_uuid_values() {
+  jq -c '[.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and (.is_preview == false)) | .value // null]' <<<"$1"
+}
+# stored_uuid_ok envs-json -> 0 when a non-preview DEVOS_COOLIFY_SERVER_UUID exists and every copy is runtime (where
+# Coolify has that flag) and, when values are returned, has the API's uuid shape. Codex PR214-r4: the copies must name
+# one server, so they must share one value; when Coolify hides the value, only a single copy is accepted.
+# Codex PR214-r5: when any variable carries the newer flags (is_buildtime/is_runtime), is_runtime must be present and
+# true on each copy; only the older schema (is_build_time only) has every variable at runtime without the flag.
+# Codex PR214-r6: a copy counts as the older schema only when it carries is_build_time; a copy with no flags at all fails.
+# Codex PR214-r7: that is_build_time must be a boolean (true or false); null or a string fails.
+# Codex PR214-r15: the schema ($modern) is decided once, from the first env read (CF_MODERN), never re-inferred
+# from a later response, so a read-back cannot downgrade the runtime check.
+# Codex PR214-r16: with the older schema, a copy that does carry is_runtime must have it true; an explicit
+# is_runtime: false (e.g. the flags changed between reads) fails, as in the GIT_SHA read-back.
+# Codex PR214-r18: one rule for every copy of every read-back: a copy that carries either newer flag (is_buildtime or
+# is_runtime) is in the newer shape, so is_runtime must be present and true; only a copy with neither newer flag
+# relies on the older meaning (every variable at runtime). The first read still decides which flags are sent.
+# Codex PR214-r19: the shape is decided per response, not per copy: $m is true when the first read was newer
+# (CF_MODERN) or when any row of this response carries a newer flag; then every checked copy needs is_runtime true
+# (and GIT_SHA is_buildtime true). Only a response with no newer flag anywhere, after an older first read, uses the
+# older meaning. A response can upgrade the schema, never downgrade it.
+# Codex PR214-r21: a row is non-preview only with an explicit is_preview false (missing or null is not false), and
+# any row of a checked key whose is_preview is not a boolean fails the check. The same rule is used in both read-backs.
+# Codex PR214-r23: a hidden value (no read:sensitive) cannot be compared between the two reads, so a replaced row
+# would look unchanged; a stored uuid is kept only when Coolify returns its value, on every copy.
+stored_uuid_ok() {
+  jq -e --arg re "$SERVER_UUID_JQ" --argjson modern "$CF_MODERN" '
+    ($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
+    | [.[]? | select(.key == "DEVOS_COOLIFY_SERVER_UUID" and (.is_preview == false))] as $g
+    | ($g | map(.value // null) | unique) as $v
+    | all(.[]?; .key != "DEVOS_COOLIFY_SERVER_UUID" or ((.is_preview | type) == "boolean"))
+    and ($g | length) > 0 and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
+      and ((.value | type) == "string" and (.value | test($re))))
+    and ($v | length) == 1' <<<"$1" >/dev/null
+}
+provision_env() {
+  local envs="$1" owner="${REPO%%/*}" servers uuid="" flags
+  PROV_KEPT=0
+  [[ "$owner" =~ $OWNER_RE ]] || { log "tracked repo owner is not a GitHub login"; return 1; }
+  # Codex PR214-r10: read through cf_json, so a body of two arrays is a failed discovery, not a found uuid.
+  # Codex PR214-r20: every row must be an object with a string name, so each row can be classified as localhost or
+  # not; one unclassifiable row makes the whole discovery inconclusive (the discovery-failure path below).
+  if servers="$(cf_json GET "/servers")" \
+     && jq -e 'type == "array" and all(.[]; type == "object" and ((.name | type) == "string"))' <<<"$servers" >/dev/null 2>&1; then
+    uuid="$(jq -r --arg re "$SERVER_UUID_JQ" '[.[]? | select(type == "object" and .name == "localhost") | .uuid]
+      | if length == 1 then (.[0] // "") else "" end
+      | if type == "string" and test($re) then . else "" end' <<<"$servers")"
+    [[ "$uuid" =~ $SERVER_UUID_RE ]] || uuid=""
+  fi
+  if [[ "$CF_MODERN" == true ]]; then
+    flags='{is_preview: false, is_buildtime: false, is_runtime: true}'
+  else
+    flags='{is_preview: false, is_build_time: false}'
+  fi
+  if [[ -z "$uuid" ]]; then
+    # Pre-review: a stored value is kept only when it is runtime (where Coolify has that flag) and, when Coolify returns
+    # values, has the API's uuid shape; otherwise the deploy waits, as with none stored.
+    if stored_uuid_ok "$envs"; then
+      log "Coolify server uuid not found (no single server named localhost); keeping the stored DEVOS_COOLIFY_SERVER_UUID"
+      PROV_KEPT=1; stored_uuid_values "$envs" > "$TMP/prov.stored"
+    else
+      log "Coolify server uuid not found (no single server named localhost) and no usable stored value"; return 1
+    fi
+  fi
+  jq -n --arg o "$owner" --arg u "$uuid" "[{key: \"DEVOS_GITHUB_OWNER\", value: \$o} + $flags]
+    + (if \$u == \"\" then [] else [{key: \"DEVOS_COOLIFY_SERVER_UUID\", value: \$u} + $flags] end)" > "$TMP/prov.json"
+}
+
 # set_git_sha_env sha -> upserts the app env GIT_SHA=<sha> as build-time AND runtime, then reads it back.
 # deploy/compose.yaml passes GIT_SHA as a build arg; Coolify passes only build-time variables to the build, so
 # without this the image reports "unknown" (DEVOS-83). Coolify renamed is_build_time to is_buildtime (with a
 # separate is_runtime); the flag names are taken from the variables this Coolify already returns.
 set_git_sha_env() {
   local sha="$1" envs
-  envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
-  jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs: unexpected response"; return 1; }
-  if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
-    jq -n --arg v "$sha" '{data: [{key: "GIT_SHA", value: $v, is_preview: false, is_buildtime: true, is_runtime: true}]}'
+  # Codex PR214-r9/r10: the response must be exactly one JSON value (cf_json), and that value an array.
+  # Codex PR214-r14: of objects only; a string element made has() error, which the flag checks read as the old schema.
+  envs="$(cf_json GET "/applications/$CF_APP/envs")" && jq -e 'type == "array" and all(.[]; type == "object" and ((.key | type) == "string"))' <<<"$envs" >/dev/null 2>&1 \
+    || { log "Coolify envs: unexpected response"; return 1; }
+  # Codex PR214-r22: every row must have a string key (here and in the read-back), so no row is left unclassified.
+  # Codex PR214-r15: the flag schema is taken from this first read only and used for the upsert and every read-back.
+  if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then CF_MODERN=true; else CF_MODERN=false; fi
+  # M2.4-d4b: the provisioning variables go in the same upsert; no uuid found and none stored submits nothing.
+  provision_env "$envs" || { PROV_FAILED=1; return 1; }
+  if [[ "$CF_MODERN" == true ]]; then
+    jq -n --arg v "$sha" --slurpfile p "$TMP/prov.json" '{data: ([{key: "GIT_SHA", value: $v, is_preview: false, is_buildtime: true, is_runtime: true}] + $p[0])}'
   else
-    jq -n --arg v "$sha" '{data: [{key: "GIT_SHA", value: $v, is_preview: false, is_build_time: true}]}'
+    jq -n --arg v "$sha" --slurpfile p "$TMP/prov.json" '{data: ([{key: "GIT_SHA", value: $v, is_preview: false, is_build_time: true}] + $p[0])}'
   fi > "$TMP/env.json"
   cf PATCH "/applications/$CF_APP/envs/bulk" "$TMP/env.json" >/dev/null || return 1
-  envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
+  # Codex PR214-r8: the read-back must be an env list too; jq's .[]? would also walk an object's values.
+  envs="$(cf_json GET "/applications/$CF_APP/envs")" && jq -e 'type == "array" and all(.[]; type == "object" and ((.key | type) == "string"))' <<<"$envs" >/dev/null 2>&1 \
+    || { log "Coolify envs read-back: unexpected response"; PROV_FAILED=1; return 1; }
   # Read back: the non-preview GIT_SHA exists, is build-time (and runtime where Coolify has that flag), and its
   # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
   # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).
-  jq -e --arg v "$sha" '[.[]? | select(.key == "GIT_SHA" and ((.is_preview // false) == false))] as $g
-    | ($g | length) > 0
-      and all($g[]; (if has("is_buildtime") then .is_buildtime else .is_build_time end) == true
-                    and ((has("is_runtime") | not) or .is_runtime == true)
+  # Codex PR214-r15: with the newer schema (from the first read) both is_buildtime and is_runtime must be true.
+  # Codex PR214-r17: with the older schema, an explicit newer is_buildtime still takes precedence over is_build_time
+  # (as before d4b), so is_buildtime:false with a stale is_build_time:true fails.
+  # Codex PR214-r18: a copy carrying is_buildtime or is_runtime must also have is_runtime true (same rule as below).
+  # Codex PR214-r19: $m (newer first read, or any newer flag in this response) requires both newer flags true;
+  # otherwise is_build_time must be true. The same $m rule is used for the provisioning and kept-uuid checks.
+  jq -e --arg v "$sha" --argjson modern "$CF_MODERN" '($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
+    | [.[]? | select(.key == "GIT_SHA" and (.is_preview == false))] as $g
+    | all(.[]?; .key != "GIT_SHA" or ((.is_preview | type) == "boolean"))
+    and ($g | length) > 0
+      and all($g[]; (if $m then .is_buildtime == true and .is_runtime == true else .is_build_time == true end)
                     and ((has("value") | not) or .value == null or .value == $v))' <<<"$envs" >/dev/null \
     || { log "Coolify env GIT_SHA did not read back as build-time + runtime ${sha:0:7}"; return 1; }
+  # M2.4-d4b read-back: each upserted provisioning variable exists (non-preview), is runtime, and holds the value sent
+  # when values are returned. Older Coolify (is_build_time only) has every value at runtime. Codex PR214-r5: with the
+  # newer flags, is_runtime must be present and true; and every copy must hold one value (a hidden value is accepted
+  # only on a single copy), so a stale duplicate cannot leave a second target.
+  jq -e --slurpfile p "$TMP/prov.json" --argjson modern "$CF_MODERN" '. as $e
+    | ($modern or any(.[]?; (type == "object") and (has("is_buildtime") or has("is_runtime")))) as $m
+    | all($p[0][]; . as $w
+      | [$e[]? | select(.key == $w.key and (.is_preview == false))] as $g
+      | ($g | map(.value // null) | unique) as $v
+      | all($e[]?; .key != $w.key or ((.is_preview | type) == "boolean"))
+        and ($g | length) > 0
+        and all($g[]; (if $m then .is_runtime == true else ((.is_build_time | type) == "boolean") end)
+                      and ((has("value") | not) or .value == null or .value == $w.value))
+        and ($v | length) == 1 and ($v[0] != null or ($g | length) == 1))' <<<"$envs" >/dev/null \
+    || { log "Coolify env provisioning variables did not read back as runtime"; PROV_FAILED=1; return 1; }
+  # Codex PR214-r1: a kept stored uuid is not in the upsert, so it is checked again on the fresh read; a value that
+  # was removed or changed in between submits no deploy.
+  # Codex PR214-r3: it must also still hold the same value(s) as on the first read, not just any well-formed uuid.
+  if [[ $PROV_KEPT -eq 1 ]] && { ! stored_uuid_ok "$envs" || [[ "$(stored_uuid_values "$envs")" != "$(cat "$TMP/prov.stored")" ]]; }; then
+    log "Coolify env stored DEVOS_COOLIFY_SERVER_UUID is no longer usable"; PROV_FAILED=1; return 1
+  fi
 }
 
 # Deploy is never submitted twice for a SHA. deploy-started.<sha> is written before the first Coolify call;
@@ -278,8 +424,11 @@ deploy() {  # sha -> 0 when Coolify finished deploying exactly this sha
     jq -n --arg s "$sha" '{git_commit_sha: $s}' > "$TMP/patch.json"
     cf PATCH "/applications/$CF_APP" "$TMP/patch.json" >/dev/null \
       || { log "${sha:0:7}: could not set git_commit_sha; deploy not started, next tick retries"; return 2; }
-    set_git_sha_env "$sha" \
-      || { log "${sha:0:7}: could not set GIT_SHA in the Coolify env; deploy not started, next tick retries"; return 2; }
+    PROV_FAILED=0
+    set_git_sha_env "$sha" || {
+      if [[ $PROV_FAILED -eq 1 ]]; then log "${sha:0:7}: could not set the provisioning variables (DEVOS_GITHUB_OWNER, DEVOS_COOLIFY_SERVER_UUID) in the Coolify env; deploy not started, next tick retries"
+      else log "${sha:0:7}: could not set GIT_SHA in the Coolify env; deploy not started, next tick retries"; fi
+      return 2; }
     touch "$ST/deploy-started.$sha" || return 1
     dep="$(cf POST "/deploy?uuid=$CF_APP&force=false" | jq -r '[.. | objects | .deployment_uuid? // empty] | first // empty')" || return 1
     [[ "$dep" =~ ^[A-Za-z0-9-]+$ ]] || { log "deploy returned no deployment uuid"; return 1; }
