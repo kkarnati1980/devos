@@ -126,19 +126,23 @@ cf() { http "$TMP/cf.auth" "$1" "$COOLIFY_API$2" "${3:-}"; }
 # NUL bytes from command substitution (a valid array followed by a raw NUL would otherwise parse). jq rejects a NUL
 # in its input, and its -c output escapes any NUL in a string, so what this prints is safe to capture.
 # Codex PR214-r12: jq is lenient where strict JSON is not. It reads NaN and Infinity and prints them as null (which a
-# read-back would take for a hidden value), so any non-finite number fails. It keeps only the last of duplicate keys,
-# so its stream form (one event per key occurrence) must show no path twice. Other leniencies (01, .5, +1) only
-# change numbers, and every value a provisioning decision compares is a string or a boolean.
+# read-back would take for a hidden value), so any non-finite number fails. It keeps only the last of duplicate keys.
+# Codex PR214-r13: comparing raw leaf paths alone misses a duplicate whose first value has another shape
+# ({"unexpected":1} then null), so the raw stream's leaf paths must equal, as a multiset, those of the parsed value:
+# a duplicate key, whatever its shapes, leaves at least one raw leaf the parsed value no longer has. Other leniencies
+# (01, .5, +1) only change numbers, and every value a provisioning decision compares is a string or a boolean.
 cf_json() {
-  local f="$TMP/cf_json.resp" out
+  local f="$TMP/cf_json.resp" rc=1
   cf "$@" > "$f" || { rm -f "$f"; return 1; }
-  if jq -en --stream '[inputs | select(length == 2) | .[0]] | length == (unique | length)' "$f" >/dev/null 2>&1 \
-     && out="$(jq -cs 'if length != 1 then error("not exactly one JSON value")
-                       elif any(.[0] | .. | numbers; isnan or isinfinite) then error("non-finite number")
-                       else .[0] end' "$f" 2>/dev/null)"; then
-    rm -f "$f"; printf '%s\n' "$out"; return 0
+  if jq -cs 'if length != 1 then error("not exactly one JSON value")
+             elif any(.[0] | .. | numbers; isnan or isinfinite) then error("non-finite number")
+             else .[0] end' "$f" > "$f.c" 2>/dev/null \
+     && jq -c --stream 'select(length == 2) | .[0]' "$f" 2>/dev/null | LC_ALL=C sort > "$f.raw" \
+     && jq -c 'tostream | select(length == 2) | .[0]' "$f.c" 2>/dev/null | LC_ALL=C sort > "$f.parsed" \
+     && cmp -s "$f.raw" "$f.parsed"; then
+    cat "$f.c"; rc=0
   fi
-  rm -f "$f"; return 1
+  rm -f "$f" "$f.c" "$f.raw" "$f.parsed"; return $rc
 }
 
 

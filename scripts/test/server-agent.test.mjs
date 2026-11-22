@@ -697,6 +697,8 @@ const others = (out) => out.filter((e) => e.key !== "DEVOS_GITHUB_OWNER").map((e
 for (const [name, raw] of [
   ["a bare NaN as the owner value", (out) => `[${[...others(out), ownerRow('"value":NaN')].join(",")}]`],
   ["a duplicate value key on the owner row", (out) => `[${[...others(out), ownerRow('"value":"stale-owner","value":"kkarnati1980"')].join(",")}]`],
+  ["a duplicate value key of another shape, then null (PR214-r13)", (out) => `[${[...others(out), ownerRow('"value":{"unexpected":1},"value":null')].join(",")}]`],
+  ["a duplicate key inside a nested object (PR214-r13)", (out) => `[${[...others(out), ownerRow('"value":"kkarnati1980","meta":{"a":[1],"a":[]}')].join(",")}]`],
 ]) {
   test(`M2.4-d4b (PR214-r12): an env read-back with ${name} starts no deploy`, async () => {
     resetMock(); freshState({ deploy: true });
