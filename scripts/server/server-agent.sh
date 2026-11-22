@@ -119,6 +119,14 @@ http() {  # auth-file method url [json-body-file] -> body on stdout; non-2xx is 
 }
 gh() { http "$TMP/gh.auth" "$1" "$API$2" "${3:-}"; }
 cf() { http "$TMP/cf.auth" "$1" "$COOLIFY_API$2" "${3:-}"; }
+# cf_json method path [body] -> the response, compacted, only when it is exactly one JSON value (Codex PR214-r10).
+# jq reads several top-level values from one input and runs its filter on each, so every Coolify body that a
+# provisioning decision reads goes through this first; an empty body, junk or two values fail here.
+cf_json() {
+  local body
+  body="$(cf "$@")" || return 1
+  jq -cs 'if length == 1 then .[0] else error("not exactly one JSON value") end' <<<"$body" 2>/dev/null
+}
 
 
 # v1.3.1 (DEVOS-114): pages are merged through temp files, never passed as a jq argument, as in review-watch
@@ -274,7 +282,8 @@ provision_env() {
   local envs="$1" owner="${REPO%%/*}" servers uuid="" flags
   PROV_KEPT=0
   [[ "$owner" =~ $OWNER_RE ]] || { log "tracked repo owner is not a GitHub login"; return 1; }
-  if servers="$(cf GET "/servers")" && jq -e 'type == "array"' <<<"$servers" >/dev/null 2>&1; then
+  # Codex PR214-r10: read through cf_json, so a body of two arrays is a failed discovery, not a found uuid.
+  if servers="$(cf_json GET "/servers")" && jq -e 'type == "array"' <<<"$servers" >/dev/null 2>&1; then
     uuid="$(jq -r --arg re "$SERVER_UUID_JQ" '[.[]? | select(type == "object" and .name == "localhost") | .uuid]
       | if length == 1 then (.[0] // "") else "" end
       | if type == "string" and test($re) then . else "" end' <<<"$servers")"
@@ -305,9 +314,9 @@ provision_env() {
 # separate is_runtime); the flag names are taken from the variables this Coolify already returns.
 set_git_sha_env() {
   local sha="$1" envs
-  envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
-  # Codex PR214-r9: slurped, so the response must be exactly one JSON value, and that value an array.
-  jq -se 'length == 1 and (.[0] | type) == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs: unexpected response"; return 1; }
+  # Codex PR214-r9/r10: the response must be exactly one JSON value (cf_json), and that value an array.
+  envs="$(cf_json GET "/applications/$CF_APP/envs")" && jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 \
+    || { log "Coolify envs: unexpected response"; return 1; }
   # M2.4-d4b: the provisioning variables go in the same upsert; no uuid found and none stored submits nothing.
   provision_env "$envs" || { PROV_FAILED=1; return 1; }
   if jq -e 'any(.[]; has("is_buildtime") or has("is_runtime"))' <<<"$envs" >/dev/null; then
@@ -316,9 +325,9 @@ set_git_sha_env() {
     jq -n --arg v "$sha" --slurpfile p "$TMP/prov.json" '{data: ([{key: "GIT_SHA", value: $v, is_preview: false, is_build_time: true}] + $p[0])}'
   fi > "$TMP/env.json"
   cf PATCH "/applications/$CF_APP/envs/bulk" "$TMP/env.json" >/dev/null || return 1
-  envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
   # Codex PR214-r8: the read-back must be an env list too; jq's .[]? would also walk an object's values.
-  jq -se 'length == 1 and (.[0] | type) == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs read-back: unexpected response"; PROV_FAILED=1; return 1; }
+  envs="$(cf_json GET "/applications/$CF_APP/envs")" && jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 \
+    || { log "Coolify envs read-back: unexpected response"; PROV_FAILED=1; return 1; }
   # Read back: the non-preview GIT_SHA exists, is build-time (and runtime where Coolify has that flag), and its
   # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
   # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).

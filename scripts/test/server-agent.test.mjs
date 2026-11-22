@@ -120,7 +120,13 @@ function handler(req, res) {
       if (M.staleStored) M.envs = M.envs.map((x) => (x.key === "DEVOS_COOLIFY_SERVER_UUID" ? { ...x, ...M.staleStored } : x));
       return json(201, {});
     }
-    if (p === "/cf/servers" && req.method === "GET") return M.servers === 500 ? json(500, {}) : json(200, M.servers);
+    if (p === "/cf/servers" && req.method === "GET") {
+      if (M.servers === "twoArrays") {  // PR214-r10: one valid localhost array, then an empty one, in one body
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify([{ uuid: "srv-uuid-1", name: "localhost" }]) + "\n" + JSON.stringify([])); return;
+      }
+      return M.servers === 500 ? json(500, {}) : json(200, M.servers);
+    }
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)$/)) && req.method === "GET") {
       if (!M.cfPerms.split(" ").includes("read")) return json(403, { message: "forbidden" });
       return json(200, { uuid: m[1], name: "devos", git_commit_sha: M.appSha });
@@ -508,6 +514,7 @@ for (const [name, servers] of [
   ["a malformed uuid", [{ uuid: "srv uuid; rm", name: "localhost" }]],
   ["a uuid with a trailing newline (PR214-r2)", [{ uuid: "srv-uuid-1\n", name: "localhost" }]],
   ["a failed GET /servers", 500],
+  ["a GET /servers body holding two JSON arrays (PR214-r10)", "twoArrays"],
 ]) {
   test(`M2.4-d4b: ${name} with no stored uuid starts no deploy; once found, the next tick deploys once`, async () => {
     resetMock(); freshState({ deploy: true });
