@@ -612,6 +612,23 @@ test("M2.4-d4b (PR214-r5): an upserted provisioning variable read back without i
   assert.match(r.out, /provisioning variables did not read back as runtime/);
 });
 
+for (const [name, row, kept] of [
+  ["with is_build_time is kept (older Coolify)", { is_build_time: false }, true],
+  ["with no flags at all is not kept (PR214-r6)", {}, false]]) {
+  test(`M2.4-d4b: no server found; an older-Coolify stored uuid ${name}`, async () => {
+    resetMock(); freshState({ deploy: true });
+    M.envs = [{ key: "DEVOS_BIND_IP", value: "100.64.0.1", is_preview: false, is_build_time: true },
+      { key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, ...row }];
+    M.servers = 500;
+    const sha = commit({ ...baseFiles(), [`x4bl-${name.length}`]: "1" }, `d4b l ${name}`);
+    M.main = sha; green(sha); pass(sha);
+    const r = await runAgent();
+    assert.equal(r.code, 0, r.out);
+    if (kept) { assert.match(r.out, /keeping the stored DEVOS_COOLIFY_SERVER_UUID/); assert.equal(M.deployPosts, 1); }
+    else { assert.match(r.out, /no usable stored value/); assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); }
+  });
+}
+
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
   for (let i = 0; i < 2; i++) M.envs.push({ key: "DEVOS_COOLIFY_SERVER_UUID", value: "srv-stored", is_preview: false, is_buildtime: false, is_runtime: true });
