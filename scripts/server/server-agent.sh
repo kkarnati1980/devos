@@ -316,6 +316,8 @@ set_git_sha_env() {
   fi > "$TMP/env.json"
   cf PATCH "/applications/$CF_APP/envs/bulk" "$TMP/env.json" >/dev/null || return 1
   envs="$(cf GET "/applications/$CF_APP/envs")" || return 1
+  # Codex PR214-r8: the read-back must be an env list too; jq's .[]? would also walk an object's values.
+  jq -e 'type == "array"' <<<"$envs" >/dev/null 2>&1 || { log "Coolify envs read-back: unexpected response"; PROV_FAILED=1; return 1; }
   # Read back: the non-preview GIT_SHA exists, is build-time (and runtime where Coolify has that flag), and its
   # value is this SHA. Flags are read with has(), not jq's //, because // also replaces an explicit false
   # (Codex PR22-r1): an explicit is_runtime:false or is_buildtime:false fails the read-back (a token without read:sensitive gets no values back; then presence and flags are checked).

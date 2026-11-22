@@ -101,11 +101,14 @@ function handler(req, res) {
       {
         const patch = M.envPatch || (M.runtimeOnly ? { is_buildtime: false } : null);
         const envs = patch ? M.envs.map((e) => (e.key === "GIT_SHA" ? { ...e, ...patch } : e)) : M.envs;
-        return json(200, M.provPatch ? envs.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, ...M.provPatch } : e)) : envs);
+        const out = M.provPatch ? envs.map((e) => (e.key === "DEVOS_GITHUB_OWNER" ? { ...e, ...M.provPatch } : e)) : envs;
+        if (M.envObjectAfterBulk && M.bulkDone) return json(200, Object.fromEntries(out.map((e, i) => [String(i), e])));
+        return json(200, out);
       }
     }
     if ((m = p.match(/^\/cf\/applications\/([\w-]+)\/envs\/bulk$/)) && req.method === "PATCH") {
       if (M.failEnv > 0) { M.failEnv--; return json(403, { message: "forbidden" }); }
+      M.bulkDone = true;
       // Mock Coolify bulk upsert: update the non-preview variable with this key, or create it.
       for (const e of JSON.parse(body).data) {
         const i = M.envs.findIndex((x) => x.key === e.key && !x.is_preview);
@@ -630,6 +633,18 @@ for (const [name, row, kept] of [
     else { assert.match(r.out, /no usable stored value/); assert.equal(M.deployPosts || 0, 0, "no deploy submitted"); }
   });
 }
+
+test("M2.4-d4b (PR214-r8): an env read-back that is an object, not a list, starts no deploy", async () => {
+  resetMock(); freshState({ deploy: true });
+  M.envObjectAfterBulk = true;
+  const sha = commit({ ...baseFiles(), "x4bm": "1" }, "d4b m");
+  M.main = sha; green(sha); pass(sha);
+  const r = await runAgent();
+  assert.equal(r.code, 0, r.out);
+  assert.ok(M.bulkDone, "the upsert ran");
+  assert.equal(M.deployPosts || 0, 0, "no deploy submitted");
+  assert.match(r.out, /Coolify envs read-back: unexpected response/);
+});
 
 test("M2.4-d4b (PR214-r4): two stored copies with the same value are kept and the deploy goes ahead", async () => {
   resetMock(); freshState({ deploy: true });
