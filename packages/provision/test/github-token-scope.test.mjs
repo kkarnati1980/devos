@@ -447,3 +447,21 @@ test("DEVOS-21 part 3 (r25): quoted values follow the quoted-string grammar", ()
   }
   assert.equal(linkNext(h('<https://x/?page=1>; rel="prev"; title="a\tb \\"q\\" [x] ~"')), "none");
 });
+
+// Codex PR223-r26: only SP/HTAB separate tokens; a page with more than 100 entries is unreadable in both readers.
+test("DEVOS-21 part 3 (r26): Unicode spaces are malformed, and an oversized page is unreadable", async () => {
+  const h = (link) => ({ get: (k) => (k.toLowerCase() === "link" ? link : null) });
+  assert.equal(linkNext(h('<https://x/?page=1>; rel="prev\u00a0"')), "malformed");
+  assert.equal(linkNext(h('<https://x/?page=1>;\u00a0rel="prev"')), "malformed");
+  assert.equal(linkNext(h('<https://x/?page=1>; rel="prev",\u2003<https://x/?page=0>; rel="first"')), "malformed");
+  assert.equal(linkNext(h('<https://x/?page=1>;\trel="prev  first"')), "none");
+  const u = (p) => `https://api.github.com/user/repos?per_page=100&page=${p}&affiliation=owner`;
+  const many = Array.from({ length: 101 }, (_, i) => ({ id: i + 1, name: `r${i + 1}`, full_name: `${OWNER}/r${i + 1}`, private: false, description: null, owner: { login: OWNER } }));
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 101, owned_private_repos: 0 }), { status: 200 });
+    return new Response(JSON.stringify(many), { status: 200, headers: { link: `<${u(1)}>; rel="last"` } });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(gh, { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /more entries than the page size/);
+});

@@ -288,8 +288,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
   let i = 0;
   let found = false;
   const n = raw.length;
-  const ws = () => { while (i < n && /[\s,]/.test(raw[i] as string)) i++; };
-  const sp = () => { while (i < n && /\s/.test(raw[i] as string)) i++; };
+  const ws = () => { while (i < n && /[ \t,]/.test(raw[i] as string)) i++; };
+  // Codex PR223-r26: only HTTP whitespace (SP, HTAB) separates tokens and relation types, never Unicode spaces.
+  const sp = () => { while (i < n && /[ \t]/.test(raw[i] as string)) i++; };
   ws();
   while (i < n) {
     if (raw[i] !== "<") return "malformed";
@@ -314,7 +315,7 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
       const nameStart = i;
       while (i < n && TCHAR.test(raw[i] as string)) i++;
       const name = raw.slice(nameStart, i).toLowerCase();
-      if (i < n && !/[\s=;,]/.test(raw[i] as string)) return "malformed";
+      if (i < n && !/[ \t=;,]/.test(raw[i] as string)) return "malformed";
       sp();
       let value = "";
       if (raw[i] === "=") {
@@ -342,7 +343,7 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
           const vs = i;
           while (i < n && TCHAR.test(raw[i] as string)) i++;
           value = raw.slice(vs, i);
-          if (value === "" || (i < n && !/[\s;,]/.test(raw[i] as string))) return "malformed";
+          if (value === "" || (i < n && !/[ \t;,]/.test(raw[i] as string))) return "malformed";
         }
       }
       // Codex PR223-r7: a parameter without a name, or a `rel` without a value (bare, `rel=` or `rel=""`), is
@@ -353,7 +354,7 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
       if (name === "anchor") return "malformed";
       if (name === "rel") {
         rels++;
-        const types = value.split(/\s+/).filter((t) => t !== "");
+        const types = value.split(/[ \t]+/).filter((t) => t !== "");
         if (types.length === 0) return "malformed";
         // Codex PR223-r14 (RFC 8288 §3.3): each relation type is a registered name (a letter, then letters, digits,
         // `.` or `-`; compared case-insensitively) or an absolute URI; anything else (e.g. `next,`) is malformed.
@@ -408,6 +409,8 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
         if (r.status !== 200 || !Array.isArray(r.body)) {
           throw new ProviderError("github", "bad-response", `github GET /user/repos returned an unexpected response (${r.status})`, r.status);
         }
+        // Codex PR223-r26: a page never holds more than the `per_page=100` asked for, or the offsets are wrong.
+        if (r.body.length > 100) throw new ProviderError("github", "bad-response", "github GET /user/repos returned more entries than the page size", r.status);
         for (const x of r.body) {
           // Codex PR48-r4: every field the match reads must be well-formed, or the whole scan is inconclusive.
           // Codex PR48-r5: the field must be present (string or null); an omitted description is inconclusive.
@@ -541,7 +544,8 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     const bound = { last: null as number | null };
     for (let page = 1; page <= maxPages; page++) {
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
-      if (r.status !== 200 || !Array.isArray(r.body)) throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r26: a page never holds more than the `per_page=100` asked for.
+      if (r.status !== 200 || !Array.isArray(r.body) || r.body.length > 100) throw new Error("github-token-scope: the repository list is unreadable");
       // Codex PR223-r2: on the scope proof the list is the only count, so every entry must be an identifiable repo
       // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
       // Codex PR223-r18/r19: on the count path every entry is a repo (a numeric id seen once, a name) too, so a
