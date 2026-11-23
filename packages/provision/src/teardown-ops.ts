@@ -240,15 +240,16 @@ const isLinkTarget = (t: string): boolean => {
  * Codex PR223-r3/r4/r8: GitHub's `Link` response header names a next page (`rel="next"`); a header that cannot be parsed is "malformed". Both the purge scope preflight
  * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
  */
-export function linkNext(headers: { get(name: string): string | null } | undefined, expect?: { path: string; query: Readonly<Record<string, string>> }): "next" | "none" | "malformed" {
+export function linkNext(headers: { get(name: string): string | null } | undefined, expect?: { origin: string; path: string; query: Readonly<Record<string, string>> }): "next" | "none" | "malformed" {
   const raw = headers?.get("link") ?? "";
   // Codex PR223-r11/r12: with `expect`, every `rel=next` target must be exactly the request the reader makes next:
-  // the same path and the same query parameters (each once, same value, none extra; so `page` and `per_page` both
+  // the same origin, the same path and the same query parameters (each once, same value, none extra; so `page` and `per_page` both
   // match), or the header is malformed. A reader that walks pages by counting can then never skip or shift a page.
   const nextOk = (target: string): boolean => {
     if (!expect) return true;
     const u = new URL(target);
-    if (u.pathname !== expect.path) return false;
+    // Codex PR223-r13: the same origin too (scheme, host and port), the one the reader's transport is fixed to.
+    if (u.origin !== expect.origin || u.pathname !== expect.path) return false;
     const keys = [...u.searchParams.keys()];
     const want = Object.keys(expect.query);
     if (keys.length !== want.length) return false;
@@ -353,7 +354,7 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
           }
         }
         // Codex PR223-r4: as in the scope preflight, a short page is the last one only when no Link rel=next follows.
-        const link = linkNext(r.headers, { path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" } });
+        const link = linkNext(r.headers, { origin: gh.http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" } });
         if (link === "malformed") throw new ProviderError("github", "bad-response", "github GET /user/repos returned an unreadable Link header", r.status);
         if (link === "next") continue;
         if (r.body.length < 100) return hits;
@@ -471,7 +472,7 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       }
       seen += r.body.length;
       // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
-      const link = linkNext(r.headers, { path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" } });
+      const link = linkNext(r.headers, { origin: http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" } });
       // Codex PR223-r8: an unparseable Link header makes the whole listing inconclusive.
       if (link === "malformed") throw new Error("github-token-scope: the repository list is unreadable");
       if (link === "next") continue;

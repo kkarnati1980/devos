@@ -47,7 +47,8 @@ export interface HttpResult<T> {
 
 export class Transport {
   readonly provider: string;
-  private readonly origin: string;
+  /** Codex PR223-r13: read by the GitHub pagination readers to check a `rel=next` target's origin. */
+  readonly origin: string;
   private readonly o: Required<Omit<TransportOptions, "provider" | "origin">>;
 
   constructor(opts: TransportOptions) {

@@ -199,8 +199,9 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
     "<https://api.github.com:abc/user/repos?page=2>; rel=last", "<https://u@api.github.com/user/repos>; rel=last", "<https://api.github.com:99999/x>; rel=last", "<ftp://x/y>; rel=last"]) {
     assert.equal(linkNext(h(v)), "malformed", v);
   }
-  const want = { path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
+  const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
   assert.equal(linkNext(h('<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"'), want), "next");
+  assert.equal(linkNext(h('<https://API.github.com:443/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"'), want), "next", "same origin after normalisation");
   assert.equal(linkNext(h('<https://api.github.com/user/repos?page=9>; rel="last"'), want), "none", "rel=last is not checked");
   for (const v of [
     '<https://api.github.com/user/repos?per_page=100&page=3&affiliation=owner>; rel="next"',
@@ -212,6 +213,10 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
     '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=all>; rel="next"',
     '<https://api.github.com/user/repos?page=2&page=3>; rel="next"',
     '<https://api.github.com/user/repos>; rel="next"',
+    // Codex PR223-r13: another origin (scheme, host or port) is not the next request.
+    '<http://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"',
+    '<https://evil.example/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"',
+    '<https://api.github.com:8443/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"',
     '<https://api.github.com/orgs/x/repos?page=2>; rel="next"',
     '<https://api.github.com/evil/user/repos?page=2>; rel="next"',
     '<https://api.github.com/user/repos?page=2>; rel="next", <https://api.github.com/user/repos?page=3>; rel="next"',
