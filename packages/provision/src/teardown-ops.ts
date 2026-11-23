@@ -453,6 +453,8 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
         // Codex PR223-r4: as in the scope preflight, a short page is the last one only when no Link rel=next follows.
         const link = linkNext(r.headers, { origin: gh.http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" }, bound });
         if (link === "malformed") throw new ProviderError("github", "bad-response", "github GET /user/repos returned an unreadable Link header", r.status);
+        // Codex PR223-r30: as in the scope preflight, an empty page that names a next page contradicts itself.
+        if (link === "next" && r.body.length === 0) throw new ProviderError("github", "bad-response", "github GET /user/repos returned an empty page that names a next page", r.status);
         advertised = link === "next";
         if (link === "next") continue;
         // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
@@ -589,7 +591,8 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
       const link = linkNext(r.headers, { origin: http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" }, bound });
       // Codex PR223-r8: an unparseable Link header makes the whole listing inconclusive.
-      if (link === "malformed") throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r30: an empty page is always the end, so one that names a next page contradicts itself.
+      if (link === "malformed" || (link === "next" && r.body.length === 0)) throw new Error("github-token-scope: the repository list is unreadable");
       advertised = link === "next";
       if (link === "next") continue;
       // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.

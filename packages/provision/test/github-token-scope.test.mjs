@@ -524,3 +524,21 @@ test("DEVOS-21 part 3 (r29): a full page without Link, then an unadvertised empt
   assert.deepEqual(hits, []);
   assert.equal(calls.filter((c) => c.includes("page=2")).length, 2, "both readers read page 2 to confirm the end");
 });
+
+// Codex PR223-r30: page 1 is full with no Link, page 2 is empty but names page 3 with rel=next, page 3 is short.
+// An empty page is always the end, so one that names a next page is unreadable in both readers.
+test("DEVOS-21 part 3 (r30): an empty page that names a next page is unreadable", async () => {
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  const mk = (kind) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 101, owned_private_repos: 0 }), { status: 200 });
+    const page = Number(x.searchParams.get("page"));
+    const entry = (k) => (kind === "scan" ? { full_name: `${OWNER}/r${k}`, name: `r${k}`, description: null }
+      : { id: k + 1, name: `r${k}`, private: false, owner: { login: OWNER } });
+    if (page === 1) return new Response(JSON.stringify(Array.from({ length: 100 }, (_, i) => entry(i))), { status: 200 });
+    if (page === 2) return new Response("[]", { status: 200, headers: { link: `<${u(3)}>; rel="next"` } });
+    return new Response(JSON.stringify([entry(500)]), { status: 200 });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /empty page that names a next page/);
+});
