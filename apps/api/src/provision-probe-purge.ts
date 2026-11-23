@@ -70,9 +70,18 @@ const PREFLIGHT_REASONS: readonly [token: "github" | "coolify", needle: string, 
 export function preflightReason(message: unknown): string {
   if (typeof message !== "string") return "";
   const m = /^purge preflight: (github|coolify)-token-scope: /.exec(message);
-  if (!m) return "";
-  const hit = PREFLIGHT_REASONS.find(([t, needle]) => t === m[1] && message.includes(needle));
-  return `:${hit ? hit[2] : m[1]}`;
+  if (m) {
+    const hit = PREFLIGHT_REASONS.find(([t, needle]) => t === m[1] && message.includes(needle));
+    return `:${hit ? hit[2] : m[1]}`;
+  }
+  // Pre-review 1: the transport (@devos/provision http.ts) throws a non-transient ProviderError for a missing token
+  // and for every non-2xx answer but 404, so an expired or revoked token reaches here as teardown's wrap of that
+  // message (`<provider> token is not available from the vault`, `<provider> GET <path> returned <status>`).
+  const p = /^purge preflight: (github|coolify) (token is not available from the vault$|GET \/\S* returned (\d{3})$)?/.exec(message);
+  if (!p) return "";
+  if (p[2]?.startsWith("token")) return `:${p[1]}-no-token`;
+  if (p[3] === "401" || p[3] === "403" || p[3] === "422") return `:${p[1]}-http-${p[3]}`;
+  return `:${p[1]}`;
 }
 
 /**

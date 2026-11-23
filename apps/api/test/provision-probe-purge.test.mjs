@@ -273,9 +273,9 @@ test("DEVOS-21 part 2: a refused purge preflight names the token and the reason,
   const user = (body) => (p) => (p === "/user" ? { status: 200, body } : { status: 200, body: [{}, {}] });
   const coolRow = [{ provider: "coolify", kind: "project", externalId: "abc-123" }];
   const cases = [
-    [realProvision.githubTokenScopeCheck(gh(() => ({ status: 401, body: {} })), { owner: "kk" }), "github-counts"],
+    [realProvision.githubTokenScopeCheck(gh(() => ({ status: 200, body: { login: "kk" } })), { owner: "kk" }), "github-counts"],
     [realProvision.githubTokenScopeCheck(gh(user({ login: "someone-else", public_repos: 1, owned_private_repos: 1 })), { owner: "kk" }), "github-owner"],
-    [realProvision.githubTokenScopeCheck(gh((p) => (p === "/user" ? { status: 200, body: { login: "kk", public_repos: 1, owned_private_repos: 1 } } : { status: 403, body: null })), { owner: "kk" }), "github-list"],
+    [realProvision.githubTokenScopeCheck(gh((p) => (p === "/user" ? { status: 200, body: { login: "kk", public_repos: 1, owned_private_repos: 1 } } : { status: 200, body: {} })), { owner: "kk" }), "github-list"],
     [realProvision.githubTokenScopeCheck(gh(user({ login: "kk", public_repos: 1, owned_private_repos: 6 })), { owner: "kk" }), "github-repos"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 200 })), async () => [{ ...coolRow[0], externalId: "not a uuid!" }]), "coolify-id"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 404, body: {} })), async () => coolRow), "coolify-team"],
@@ -287,6 +287,30 @@ test("DEVOS-21 part 2: a refused purge preflight names the token and the reason,
       await realTeardown.purgeProject(PID, { store, authorize: async () => "allow", ops: [], scanners: [{ name: "inventory" }, { name: "vault" }], preflight: [check] });
     } catch (e) { err = e; }
     assert.equal(err?.name, "TeardownError", code);
+    assert.deepEqual(purgeStop(err), { error: `purge-permission:preflight:${code}` }, code);
+  }
+  // Pre-review 1/2: what the real transport throws (a non-transient ProviderError) for a missing, expired or narrowed
+  // token names the token too; the path, status text and any other detail are never printed.
+  const { ProviderError } = realProvision;
+  assert.equal(typeof ProviderError, "function");
+  const thrown = (provider, status) => async () => { throw new ProviderError(provider, "http", `${provider} GET /user/repos returned ${status}`, status); };
+  const noToken = (provider) => async () => { throw new ProviderError(provider, "no-token", `${provider} token is not available from the vault`); };
+  const transport = [
+    [realProvision.githubTokenScopeCheck({ http: { pinned: async () => ({ get: thrown("github", 401) }) } }, { owner: "kk" }), "github-http-401"],
+    [realProvision.githubTokenScopeCheck({ http: { pinned: async () => ({ get: thrown("github", 403) }) } }, { owner: "kk" }), "github-http-403"],
+    [realProvision.coolifyTokenScopeCheck({ http: { get: thrown("coolify", 401) } }, async () => coolRow), "coolify-http-401"],
+    [realProvision.coolifyTokenScopeCheck({ http: { get: thrown("coolify", 422) } }, async () => coolRow), "coolify-http-422"],
+    [realProvision.coolifyTokenScopeCheck({ http: { get: thrown("coolify", 409) } }, async () => coolRow), "coolify"],
+    [realProvision.githubTokenScopeCheck({ http: { pinned: async () => ({ get: noToken("github") }) } }, { owner: "kk" }), "github-no-token"],
+    [realProvision.coolifyTokenScopeCheck({ http: { get: noToken("coolify") } }, async () => coolRow), "coolify-no-token"],
+  ];
+  for (const [check, code] of transport) {
+    let err;
+    try {
+      await realTeardown.purgeProject(PID, { store, authorize: async () => "allow", ops: [], scanners: [{ name: "inventory" }, { name: "vault" }], preflight: [check] });
+    } catch (e) { err = e; }
+    assert.equal(err?.name, "TeardownError", code);
+    assert.equal(err.retryable, false, code);
     assert.deepEqual(purgeStop(err), { error: `purge-permission:preflight:${code}` }, code);
   }
   // A preflight message from neither check keeps the plain code; an unknown reason keeps only the token's name.
