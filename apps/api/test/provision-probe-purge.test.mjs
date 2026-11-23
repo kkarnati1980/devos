@@ -281,6 +281,9 @@ test("DEVOS-21 part 2: a refused purge preflight names the token and the reason,
     [realProvision.githubTokenScopeCheck(gh(user({ login: "kk", public_repos: 1, owned_private_repos: 6 })), { owner: "kk" }), "github-repos"],
     // Codex PR223-r36: the total is met, but public entries stand in for a private repository the token does not see.
     [realProvision.githubTokenScopeCheck(gh(user({ login: "kk", public_repos: 0, owned_private_repos: 2 })), { owner: "kk" }), "github-repos"],
+    // DEVOS-21 part 3: a classic token (scopes header) without `repo` and without the private count.
+    [realProvision.githubTokenScopeCheck(gh((p) => (p === "/user" ? { status: 200, body: { login: "kk", public_repos: 1 }, headers: new Headers({ "x-oauth-scopes": "delete_repo" }) } : { status: 200, body: [{}] })), { owner: "kk" }), "github-scopes"],
+    [realProvision.githubTokenScopeCheck(gh((p) => (p === "/user" ? { status: 200, body: { login: "kk", public_repos: 1 } } : { status: 200, body: [{}] })), { owner: "kk" }), "github-counts"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 200 })), async () => [{ ...coolRow[0], externalId: "not a uuid!" }]), "coolify-id"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 404, body: {} })), async () => coolRow), "coolify-team"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 200, body: { uuid: "other" } })), async () => coolRow), "coolify-answer"],
