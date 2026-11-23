@@ -385,6 +385,11 @@ function isRepoName(v: unknown): v is string {
   return typeof v === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(v) && v !== "." && v !== "..";
 }
 
+/** Codex PR223-r27: a GitHub login is 1–39 ASCII letters, digits or single inner hyphens. */
+function isLogin(v: unknown): v is string {
+  return typeof v === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/.test(v);
+}
+
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
@@ -402,8 +407,12 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
       // Codex PR223-r21: a repository seen twice across pages means the listing shifted, so a repository may have
       // been skipped; the scan is then inconclusive. Repos are keyed by full name (unique, case-insensitive on
       // GitHub) and, when present, by numeric id.
+      // Codex PR223-r27: every entry is exactly `<login>/<name>` with a valid login and repo name, every entry of
+      // an `affiliation=owner` listing names the same owner (and `owner.login`, when sent, agrees), so the
+      // lower-cased name alone is a sound duplicate key whether or not ids are sent.
       const seenNames = new Set<string>();
       const seenIds = new Set<number>();
+      let listOwner: string | null = null;
       for (let page = 1; page <= maxPages; page++) {
         const r = await gh.http.get<RepoBody[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
         if (r.status !== 200 || !Array.isArray(r.body)) {
@@ -415,10 +424,16 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
           // Codex PR48-r4: every field the match reads must be well-formed, or the whole scan is inconclusive.
           // Codex PR48-r5: the field must be present (string or null); an omitted description is inconclusive.
           const okDesc = x && (x.description === null || typeof x.description === "string");
-          if (!x || typeof x.full_name !== "string" || typeof x.name !== "string" || !okDesc || x.full_name.split("/")[1] !== x.name) {
+          const parts = x && typeof x.full_name === "string" ? x.full_name.split("/") : [];
+          const ownerLogin = (x as { owner?: { login?: unknown } } | null)?.owner?.login;
+          const ownerOk = (x as { owner?: unknown } | null)?.owner === undefined
+            || (typeof ownerLogin === "string" && ownerLogin.toLowerCase() === (parts[0] ?? "").toLowerCase());
+          if (!x || parts.length !== 2 || !isLogin(parts[0]) || !isRepoName(x.name) || parts[1] !== x.name || !okDesc || !ownerOk
+            || (listOwner !== null && parts[0].toLowerCase() !== listOwner)) {
             throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);
           }
-          const key = x.full_name.toLowerCase();
+          listOwner = parts[0].toLowerCase();
+          const key = x.name.toLowerCase();
           const id = (x as { id?: unknown }).id;
           if (id !== undefined && !isRepoId(id)) {
             throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);

@@ -394,6 +394,23 @@ test("DEVOS-21 part 3 (r21): a link without rel is malformed, and the scan refus
   await assert.rejects(githubScanner(repeat({ full_name: `${OWNER.toUpperCase()}/Other`, name: "Other", description: null })).scan(P), /returned a repository twice/);
   await assert.rejects(githubScanner(repeat({ id: 7, full_name: `${OWNER}/renamed`, name: "renamed", description: null })).scan(P), /returned a repository twice/);
   await assert.rejects(githubScanner(repeat({ id: "8", full_name: `${OWNER}/x`, name: "x", description: null })).scan(P), /malformed entry/);
+  // Codex PR223-r27: full_name is exactly `<login>/<name>` with a valid login and repo name, one owner for the whole
+  // listing, owner.login agreeing when sent; and with no ids a malformed variant of a seen repo cannot evade the
+  // duplicate check.
+  for (const bad of [
+    { full_name: "/other2", name: "other2", description: null },                       // empty owner
+    { full_name: `${OWNER}/x/other2`, name: "other2", description: null },             // extra segment
+    { full_name: `${OWNER}/x/other`, name: "other", description: null },               // extra segment, repeat
+    { full_name: `-bad/other2`, name: "other2", description: null },                    // invalid login
+    { full_name: `${OWNER}/a b`, name: "a b", description: null },                      // invalid repo name
+    { full_name: `${OWNER}/..`, name: "..", description: null },
+    { full_name: `someone-else/other2`, name: "other2", description: null },           // a second owner
+    { full_name: `${OWNER}/other2`, name: "other2", description: null, owner: { login: "someone-else" } },
+    { full_name: `${OWNER}/other2`, name: "other2", description: null, owner: {} },
+  ]) {
+    await assert.rejects(githubScanner(repeat(bad)).scan(P), /malformed entry/, JSON.stringify(bad));
+  }
+  await assert.rejects(githubScanner(repeat({ full_name: `${OWNER}/OTHER`, name: "OTHER", description: null, owner: { login: OWNER.toUpperCase() } })).scan(P), /returned a repository twice/);
   const ok = await githubScanner(repeat({ id: 8, full_name: `${OWNER}/devos-acme`, name: "devos-acme", description: null })).scan(P);
   assert.deepEqual(ok.map((x) => x.externalId), [`${OWNER}/devos-acme`]);
 });
