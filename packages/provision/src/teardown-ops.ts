@@ -281,6 +281,13 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
     lastPage = k;
     return true;
   };
+  // Codex PR223-r32: a page-naming relation (`prev`, `first`) whose target must be exactly page `want` of this
+  // listing, with `want` at least 1 and never after the current page (`prev` is therefore absent on page 1).
+  const pageOk = (target: string, want: number | null): boolean => {
+    if (!expect) return true;
+    if (current === null || want === null || want < 1 || want > current) return false;
+    return sameRequest(target, { ...expect.query, page: String(want) });
+  };
   // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
   // never splits a link. Each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a space-separated
   // list of relation types, quoted or not. Any link whose rel list contains `next` counts. A value that cannot be
@@ -366,6 +373,11 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
           found = true;
         }
         if (types.some((t) => t.toLowerCase() === "last") && !lastOk(target)) return "malformed";
+        // Codex PR223-r32 (decision 1, exact GitHub pagination): `prev` and `first` name pages too, so each must be
+        // exactly what GitHub sends for the current page: `prev` is the page before it (so none on page 1) and
+        // `first` is page 1, both the same request. Any other target contradicts the page just read.
+        if (types.some((t) => t.toLowerCase() === "prev") && !pageOk(target, current === null ? null : current - 1)) return "malformed";
+        if (types.some((t) => t.toLowerCase() === "first") && !pageOk(target, current === null ? null : 1)) return "malformed";
       }
     }
     ws();

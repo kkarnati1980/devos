@@ -559,3 +559,30 @@ test("DEVOS-21 part 3 (r31): an empty page named as the last page is unreadable"
   await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /empty page that names a next or last page/);
 });
+
+// Codex PR223-r32: `prev` and `first` name pages too. On page N, `prev` must be exactly page N-1 and `first` exactly
+// page 1 of the same request, so there is no `prev` on page 1. A short page 1 whose only link is rel=prev to page 2
+// contradicts itself, so both readers refuse instead of reading page 1 as the end.
+test("DEVOS-21 part 3 (r32): rel=prev and rel=first must name exactly the previous and first pages", async () => {
+  const h = (link) => new Headers({ link });
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  const at = (pg) => ({ origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: String(pg + 1), affiliation: "owner" } });
+  // GitHub's own header on page 3 of 5 is accepted.
+  assert.equal(linkNext(h(`<${u(4)}>; rel="next", <${u(5)}>; rel="last", <${u(1)}>; rel="first", <${u(2)}>; rel="prev"`), at(3)), "next");
+  assert.equal(linkNext(h(`<${u(1)}>; rel="first", <${u(2)}>; rel="prev"`), at(3)), "none", "last page of three");
+  for (const [v, pg] of [
+    [`<${u(2)}>; rel="prev"`, 1], [`<${u(1)}>; rel="prev"`, 1], [`<${u(2)}>; rel="first"`, 1],
+    [`<${u(3)}>; rel="prev"`, 3], [`<${u(1)}>; rel="prev"`, 3], [`<${u(2)}>; rel="first"`, 3],
+    [`<https://api.github.com/user/repos?per_page=50&page=2&affiliation=owner>; rel="prev"`, 3],
+  ]) {
+    assert.equal(linkNext(h(v), at(pg)), "malformed", `${v} on page ${pg}`);
+  }
+  const mk = (kind) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1, owned_private_repos: 1 }), { status: 200 });
+    const entry = kind === "scan" ? { full_name: `${OWNER}/r0`, name: "r0", description: null } : { id: 1, name: "r0", private: false, owner: { login: OWNER } };
+    return new Response(JSON.stringify([entry]), { status: 200, headers: { link: `<${u(2)}>; rel="prev"` } });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
+});
