@@ -365,6 +365,16 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
   return found ? "next" : "none";
 }
 
+/** Codex PR223-r24: a GitHub repository id is a positive safe integer. */
+function isRepoId(v: unknown): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+}
+
+/** Codex PR223-r24: a GitHub repository name is one or more ASCII letters, digits, `.`, `-` or `_` (not `.` or `..`). */
+function isRepoName(v: unknown): v is string {
+  return typeof v === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(v) && v !== "." && v !== "..";
+}
+
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
@@ -398,7 +408,7 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
           }
           const key = x.full_name.toLowerCase();
           const id = (x as { id?: unknown }).id;
-          if (id !== undefined && typeof id !== "number") {
+          if (id !== undefined && !isRepoId(id)) {
             throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);
           }
           if (seenNames.has(key) || (typeof id === "number" && seenIds.has(id))) {
@@ -531,7 +541,7 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       // it present); and on the scope path each entry says whether it is private, so public entries are counted alone.
       for (const e of r.body as { id?: unknown; name?: unknown; private?: unknown; owner?: { login?: unknown } }[]) {
         const ownerOk = typeof e?.owner?.login === "string" ? e.owner.login.toLowerCase() === opts.owner.toLowerCase() : priv !== undefined && e?.owner === undefined;
-        const ok = e !== null && typeof e === "object" && typeof e.id === "number" && !ids.has(e.id) && typeof e.name === "string" && e.name !== ""
+        const ok = e !== null && typeof e === "object" && isRepoId(e.id) && !ids.has(e.id) && isRepoName(e.name)
           && !names.has(e.name.toLowerCase()) && ownerOk && (priv !== undefined || typeof e.private === "boolean");
         if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
         ids.add(e.id as number);

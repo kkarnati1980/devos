@@ -423,3 +423,18 @@ test("DEVOS-21 part 3 (r23): a repeated repository name with a new id never coun
   await assert.rejects(check(fake({ user: { ...pub, public_repos: 2 }, scopes: "repo", list: [e(1, "a"), e(2, "A")] })), /repository list is unreadable/);
   await check(fake({ user: { ...pub, public_repos: 2 }, scopes: "repo", list: [e(1, "a"), e(2, "b")] }));
 });
+
+// Codex PR223-r24: an identifiable repo has a positive safe-integer id and a GitHub repo name.
+test("DEVOS-21 part 3 (r24): a malformed id or name is an unreadable listing", async () => {
+  const e = (id, name) => ({ id, name, private: false, owner: { login: OWNER } });
+  for (const bad of [e(-1, "a"), e(0, "a"), e(1.5, "a"), e(Number.MAX_SAFE_INTEGER + 1, "a"), e(1, " "), e(1, "a b"), e(1, ".."), e(1, "x".repeat(101))]) {
+    await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 0 }, list: [bad] })), /repository list is unreadable/, JSON.stringify(bad));
+    await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [bad] })), /repository list is unreadable/, JSON.stringify(bad));
+  }
+  await check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [e(1, "my.repo_-1")] }));
+  const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme" };
+  for (const id of [-1, 0, 1.5]) {
+    const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: async () => new Response(JSON.stringify([{ id, full_name: `${OWNER}/a`, name: "a", description: null }]), { status: 200 }), sleep: async () => {} });
+    await assert.rejects(githubScanner(gh).scan(P), /malformed entry/, String(id));
+  }
+});
