@@ -385,7 +385,8 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
         const link = linkNext(r.headers, { origin: gh.http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" }, bound });
         if (link === "malformed") throw new ProviderError("github", "bad-response", "github GET /user/repos returned an unreadable Link header", r.status);
         if (link === "next") continue;
-        if (r.body.length < 100) return hits;
+        // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
+        if (r.body.length < 100 || bound.last === page) return hits;
       }
       hits.push({ provider: "github", kind: "scan-incomplete", externalId: "", name: `more than ${maxPages * 100} repos; scan not complete` });
       return hits;
@@ -505,7 +506,8 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       // Codex PR223-r8: an unparseable Link header makes the whole listing inconclusive.
       if (link === "malformed") throw new Error("github-token-scope: the repository list is unreadable");
       if (link === "next") continue;
-      if (r.body.length < 100) { complete = true; break; }
+      // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
+      if (r.body.length < 100 || bound.last === page) { complete = true; break; }
     }
     const want = pub + (typeof priv === "number" ? priv : 0);
     // Codex PR223-r16: the list must have been read to its end (no page cap hit) with or without the private count,

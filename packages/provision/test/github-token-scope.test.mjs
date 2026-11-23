@@ -308,3 +308,30 @@ test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=las
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
   await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
 });
+
+// Codex PR223-r17: a full page is the end when a validated rel=last names it, so exactly maxPages × 100 repos read
+// as complete in both readers; a full last page without any rel=last stays inconclusive (unchanged).
+test("DEVOS-21 part 3 (r17): a full page named as last by rel=last ends the listing", async () => {
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  const mkRepos = (n) => Array.from({ length: n }, (_, i) => ({ id: i + 1, name: `r${i}`, owner: { login: OWNER } }));
+  const mkFetch = (pages, kind) => async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 100 }), { status: 200 });
+    const page = Number(x.searchParams.get("page"));
+    const body = kind === "scan" ? Array.from({ length: 100 }, (_, i) => ({ full_name: `${OWNER}/p${page}-${i}`, name: `p${page}-${i}`, description: null }))
+      : mkRepos(100).map((e) => ({ ...e, id: e.id + page * 1000 }));
+    const link = page === 1 ? `<${u(2)}>; rel="next", <${u(2)}>; rel="last"` : `<${u(1)}>; rel="first"`;
+    return new Response(JSON.stringify(page <= pages ? body : []), { status: 200, headers: { link } });
+  };
+  const gh = (k) => new GitHubClient({ token: () => TOKEN, fetchImpl: mkFetch(2, k), sleep: async () => {} });
+  await githubTokenScopeCheck(gh("pf"), { owner: OWNER, maxPages: 2 })();
+  const hits = await githubScanner(gh("scan"), { maxPages: 2 }).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" });
+  assert.deepEqual(hits.filter((h) => h.kind === "scan-incomplete"), []);
+  // Without any rel=last, a full final page at the cap is still inconclusive.
+  const plain = new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 0 }), { status: 200 });
+    return new Response(JSON.stringify(mkRepos(100)), { status: 200 });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(plain, { owner: OWNER, maxPages: 1 })(), /repository list is unreadable/);
+});
