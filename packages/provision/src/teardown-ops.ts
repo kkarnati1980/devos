@@ -360,6 +360,9 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
         }
       }
       seen += r.body.length;
+      // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
+      const more = /<[^>]*>\s*;\s*rel="?next"?/i.test(r.headers?.get("link") ?? "");
+      if (more) continue;
       if (r.body.length < 100) { complete = true; break; }
     }
     const want = pub + (typeof priv === "number" ? priv : 0);

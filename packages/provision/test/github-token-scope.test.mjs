@@ -8,7 +8,7 @@ const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const OWNER = "kkarnati1980";
 
 // A fake api.github.com: GET /user answers `user` with the given scopes header; GET /user/repos pages `repos`.
-function fake({ user, scopes, repos = 1, list }) {
+function fake({ user, scopes, repos = 1, list, link }) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     const u = new URL(url);
@@ -19,7 +19,7 @@ function fake({ user, scopes, repos = 1, list }) {
     if (u.pathname === "/user/repos") {
       const page = Number(u.searchParams.get("page"));
       const all = list ?? Array.from({ length: repos }, (_, i) => ({ id: i + 1, name: `r${i}`, owner: { login: OWNER } }));
-      return new Response(JSON.stringify(all.slice((page - 1) * 100, page * 100)), { status: 200 });
+      return new Response(JSON.stringify(all.slice((page - 1) * 100, page * 100)), { status: 200, headers: link && page === 1 ? { link } : {} });
     }
     return new Response(null, { status: 404 });
   };
@@ -67,6 +67,16 @@ test("Codex PR223-r2: on the scope proof, every listed entry must be an identifi
     await assert.rejects(check(fake({ user: { ...pub, public_repos: list.length }, scopes: "repo", list })), /repository list is unreadable/, JSON.stringify(list));
   }
   await check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [{ ...good, owner: { login: OWNER.toUpperCase() } }] }));
+});
+
+test("Codex PR223-r3: a short page with a Link rel=next is not the last page", async () => {
+  const link = '<https://api.github.com/user/repos?page=2>; rel="next", <https://api.github.com/user/repos?page=2>; rel="last"';
+  // Page 2 is empty here, so the list ends there; the point is that page 2 is read.
+  const f = fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link });
+  await check(f);
+  assert.equal(f.calls.filter((c) => c.path === "/user/repos").length, 2, "page 2 read");
+  // With a page cap of 1 the unread next page is refused.
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link }), { maxPages: 1 }), /repository list is unreadable/);
 });
 
 test("DEVOS-21 part 3: a classic repo token passes at exactly public_repos, reading every page on one token", async () => {
