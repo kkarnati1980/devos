@@ -245,15 +245,33 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
   // Codex PR223-r11/r12: with `expect`, every `rel=next` target must be exactly the request the reader makes next:
   // the same origin, the same path and the same query parameters (each once, same value, none extra; so `page` and `per_page` both
   // match), or the header is malformed. A reader that walks pages by counting can then never skip or shift a page.
-  const nextOk = (target: string): boolean => {
+  const sameRequest = (target: string, query: Readonly<Record<string, string>>): boolean => {
     if (!expect) return true;
     const u = new URL(target);
     // Codex PR223-r13: the same origin too (scheme, host and port), the one the reader's transport is fixed to.
     if (u.origin !== expect.origin || u.pathname !== expect.path) return false;
     const keys = [...u.searchParams.keys()];
-    const want = Object.keys(expect.query);
+    const want = Object.keys(query);
     if (keys.length !== want.length) return false;
-    return want.every((k) => { const v = u.searchParams.getAll(k); return v.length === 1 && v[0] === expect.query[k]; });
+    return want.every((k) => { const v = u.searchParams.getAll(k); return v.length === 1 && v[0] === query[k]; });
+  };
+  const nextOk = (target: string): boolean => sameRequest(target, expect?.query ?? {});
+  // Codex PR223-r15: a `rel=last` link says how many pages exist. With `expect` (whose `page` is the page after the
+  // one just read), its target must be the same request with a decimal `page` no lower than the current page, or the
+  // header is malformed. A last page beyond the current one without a `rel=next` link is a contradiction, and so is a
+  // `rel=next` link when the current page is the last one: both are malformed, never read as the end of the listing.
+  const current = expect && /^[1-9][0-9]*$/.test(expect.query.page ?? "") ? Number(expect.query.page) - 1 : null;
+  let lastPage: number | null = null;
+  const lastOk = (target: string): boolean => {
+    if (!expect) return true;
+    if (current === null) return false;
+    const pg = new URL(target).searchParams.getAll("page");
+    if (pg.length !== 1 || !/^[1-9][0-9]{0,8}$/.test(pg[0] as string)) return false;
+    const k = Number(pg[0]);
+    if (k < current || !sameRequest(target, { ...expect.query, page: pg[0] as string })) return false;
+    if (lastPage !== null && lastPage !== k) return false;
+    lastPage = k;
+    return true;
   };
   // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
   // never splits a link. Each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a space-separated
@@ -320,10 +338,12 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
           if (!nextOk(target)) return "malformed";
           found = true;
         }
+        if (types.some((t) => t.toLowerCase() === "last") && !lastOk(target)) return "malformed";
       }
     }
     ws();
   }
+  if (current !== null && lastPage !== null && (lastPage > current) !== found) return "malformed";
   return found ? "next" : "none";
 }
 

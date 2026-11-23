@@ -202,7 +202,8 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
   const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
   assert.equal(linkNext(h('<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"'), want), "next");
   assert.equal(linkNext(h('<https://API.github.com:443/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"'), want), "next", "same origin after normalisation");
-  assert.equal(linkNext(h('<https://api.github.com/user/repos?page=9>; rel="last"'), want), "none", "rel=last is not checked");
+  // Codex PR223-r15 tightened this: a rel=last that is not the same request (here: missing parameters) is malformed.
+  assert.equal(linkNext(h('<https://api.github.com/user/repos?page=9>; rel="last"'), want), "malformed", "rel=last is checked");
   for (const v of [
     '<https://api.github.com/user/repos?per_page=100&page=3&affiliation=owner>; rel="next"',
     '<https://api.github.com/user/repos?per_page=100&page=02&affiliation=owner>; rel="next"',
@@ -238,4 +239,39 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
   };
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
   await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /Link header/);
+});
+
+// Codex PR223-r15: rel=last says how many pages exist. A last page beyond the current one with no rel=next is
+// malformed, so a short page 1 that advertises page 3 as last is never the end of the listing; nor is a rel=next
+// when page 1 is the last page; and a rel=last must be the same request with a page no lower than the current one.
+test("DEVOS-21 part 3 (r15): rel=last must agree with rel=next", async () => {
+  const h = (link) => new Headers({ link });
+  const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  assert.equal(linkNext(h(`<${u(2)}>; rel="next", <${u(3)}>; rel="last"`), want), "next");
+  assert.equal(linkNext(h(`<${u(1)}>; rel="last"`), want), "none", "page 1 is the last page");
+  assert.equal(linkNext(h(`<${u(1)}>; rel="first", <${u(1)}>; rel="last"`), want), "none");
+  for (const v of [
+    `<${u(3)}>; rel="last"`,
+    `<${u(2)}>; rel="last"`,
+    `<${u(2)}>; rel="next", <${u(1)}>; rel="last"`,
+    `<${u(2)}>; rel="next", <${u(3)}>; rel="last", <${u(4)}>; rel="last"`,
+    `<${u(0)}>; rel="last"`,
+    `<${u("03")}>; rel="last"`,
+    `<https://api.github.com/user/repos?per_page=50&page=3&affiliation=owner>; rel="last"`,
+    `<https://evil.example/user/repos?per_page=100&page=3&affiliation=owner>; rel="last"`,
+    `<https://api.github.com/user/repos?per_page=100&page=3&page=4&affiliation=owner>; rel="last"`,
+  ]) {
+    assert.equal(linkNext(h(v), want), "malformed", v);
+  }
+  // Both readers: a short page 1 that names page 3 as last and has no rel=next is unreadable, never complete.
+  const link = `<${u(3)}>; rel="last"`;
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link })), /repository list is unreadable/);
+  const fetchImpl = async (url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    const body = page === 1 ? [{ full_name: `${OWNER}/other`, name: "other", description: null }] : [];
+    return new Response(JSON.stringify(body), { status: 200, headers: page === 1 ? { link } : {} });
+  };
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
+  await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
 });
