@@ -491,6 +491,7 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       throw new Error("github-token-scope: the token belongs to another account than the repository owner");
     }
     let seen = 0;
+    let seenPublic = 0;
     let complete = false;
     const ids = new Set<number>();
     const bound = { last: null as number | null };
@@ -501,11 +502,15 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
       // Codex PR223-r18/r19: on the count path every entry is a repo (a numeric id seen once, a name) too, so a
       // repeated entry never makes up for a repository the token does not see; the count itself is the owner's.
-      for (const e of r.body as { id?: unknown; name?: unknown; owner?: { login?: unknown } }[]) {
+      // Codex PR223-r20: an entry that names an owner must name this owner on both paths (only the scope path needs
+      // it present); and on the scope path each entry says whether it is private, so public entries are counted alone.
+      for (const e of r.body as { id?: unknown; name?: unknown; private?: unknown; owner?: { login?: unknown } }[]) {
+        const ownerOk = typeof e?.owner?.login === "string" ? e.owner.login.toLowerCase() === opts.owner.toLowerCase() : priv !== undefined && e?.owner === undefined;
         const ok = e !== null && typeof e === "object" && typeof e.id === "number" && !ids.has(e.id) && typeof e.name === "string" && e.name !== ""
-          && (priv !== undefined || (typeof e.owner?.login === "string" && e.owner.login.toLowerCase() === opts.owner.toLowerCase()));
+          && ownerOk && (priv !== undefined || typeof e.private === "boolean");
         if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
         ids.add(e.id as number);
+        if (e.private === false) seenPublic++;
       }
       seen += r.body.length;
       // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
@@ -520,6 +525,8 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     // Codex PR223-r16: the list must have been read to its end (no page cap hit) with or without the private count,
     // so a count that is already met never stands in for a page GitHub still advertises.
     if (!complete) throw new Error("github-token-scope: the repository list is unreadable");
+    // Codex PR223-r20: on the scope path private entries never stand in for public ones.
+    if (priv === undefined && seenPublic < pub) throw new Error(`github-token-scope: the token sees ${seenPublic} of ${pub} public owned repositories; give it access to all repositories`);
     if (seen < want) throw new Error(`github-token-scope: the token sees ${seen} of ${want} owned repositories; give it access to all repositories`);
   };
 }

@@ -18,7 +18,7 @@ function fake({ user, scopes, repos = 1, list, link }) {
     }
     if (u.pathname === "/user/repos") {
       const page = Number(u.searchParams.get("page"));
-      const all = list ?? Array.from({ length: repos }, (_, i) => ({ id: i + 1, name: `r${i}`, owner: { login: OWNER } }));
+      const all = list ?? Array.from({ length: repos }, (_, i) => ({ id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } }));
       return new Response(JSON.stringify(all.slice((page - 1) * 100, page * 100)), { status: 200, headers: link && page === 1 ? { link } : {} });
     }
     return new Response(null, { status: 404 });
@@ -63,7 +63,7 @@ test("DEVOS-21 part 3: the scope proof never replaces the owner check, a full li
 });
 
 test("Codex PR223-r2: on the scope proof, every listed entry must be an identifiable repo of the owner", async () => {
-  const good = { id: 7, name: "r", owner: { login: OWNER } };
+  const good = { id: 7, name: "r", private: false, owner: { login: OWNER } };
   for (const list of [[{}], [null], [{ ...good, id: "7" }], [{ ...good, name: "" }], [{ ...good, owner: undefined }], [{ ...good, owner: { login: "someone-else" } }], [good, good]]) {
     await assert.rejects(check(fake({ user: { ...pub, public_repos: list.length }, scopes: "repo", list })), /repository list is unreadable/, JSON.stringify(list));
   }
@@ -350,4 +350,16 @@ test("DEVOS-21 part 3 (r18): identity on the count path, and any absolute URI as
   for (const v of ['<https://x/y>; rel="urn:example:rel#one#two"', '<https://x/y>; rel="urn:a%2"', '<https://x/y>; rel="urn:"', '<https://x/y>; rel="1urn:x"', '<https://x/y>; rel="urn:a%zz"', '<https://x/y>; rel="urn:a<b"']) {
     assert.equal(linkNext(h(v), want), "malformed", v);
   }
+});
+
+// Codex PR223-r20: on the scope path private entries never stand in for public ones, and every entry says whether
+// it is private; on the count path an entry that names another owner is unreadable (an absent owner is allowed).
+test("DEVOS-21 part 3 (r20): public entries are counted alone, and a named owner must be the owner", async () => {
+  const e = (id, priv, owner = OWNER) => ({ id, name: `r${id}`, private: priv, owner: { login: owner } });
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [e(1, true)] })), /sees 0 of 1 public owned repositories/);
+  await check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [e(1, true), e(2, false)] }));
+  const { private: _drop, ...noFlag } = e(3, false);
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [noFlag] })), /repository list is unreadable/);
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), e(2, true, "someone-else")] })), /repository list is unreadable/);
+  await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), { id: 2, name: "b" }] }));
 });
