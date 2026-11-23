@@ -339,6 +339,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
       // Codex PR223-r7: a parameter without a name, or a `rel` without a value (bare, `rel=` or `rel=""`), is
       // malformed, so it fails closed like any other unparseable header.
       if (name === "") return "malformed";
+      // Codex PR223-r22 (RFC 8288 §3.2): an `anchor` parameter moves a link's context to another resource, so its
+      // `rel=next`/`rel=last` would no longer describe this listing. GitHub never sends one; any `anchor` is malformed.
+      if (name === "anchor") return "malformed";
       if (name === "rel") {
         rels++;
         const types = value.split(/\s+/).filter((t) => t !== "");

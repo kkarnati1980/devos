@@ -397,3 +397,21 @@ test("DEVOS-21 part 3 (r21): a link without rel is malformed, and the scan refus
   const ok = await githubScanner(repeat({ id: 8, full_name: `${OWNER}/devos-acme`, name: "devos-acme", description: null })).scan(P);
   assert.deepEqual(ok.map((x) => x.externalId), [`${OWNER}/devos-acme`]);
 });
+
+// Codex PR223-r22: an `anchor` moves a link's context to another resource, so a rel=last (or rel=next) with an
+// anchor never ends (or continues) this listing; the header is malformed and both readers fail closed.
+test("DEVOS-21 part 3 (r22): a link with an anchor is malformed", async () => {
+  const u = (p) => `https://api.github.com/user/repos?per_page=100&page=${p}&affiliation=owner`;
+  const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" }, bound: { last: null } };
+  assert.equal(linkNext(new Headers({ link: `<${u(1)}>; rel="last"; anchor="https://api.github.com/other"` }), want), "malformed");
+  assert.equal(linkNext(new Headers({ link: `<${u(2)}>; anchor="https://api.github.com/other"; rel="next"` }), want), "malformed");
+  assert.equal(linkNext(new Headers({ link: `<${u(2)}>; rel="next"` }), { ...want, bound: { last: null } }), "next");
+  const mkRepos = (n) => Array.from({ length: n }, (_, i) => ({ id: i + 1, name: `r${i + 1}`, full_name: `${OWNER}/r${i + 1}`, private: false, description: null, owner: { login: OWNER } }));
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 0 }), { status: 200 });
+    return new Response(JSON.stringify(mkRepos(100)), { status: 200, headers: { link: `<${u(1)}>; rel="last"; anchor="https://api.github.com/other"` } });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(gh, { owner: OWNER, maxPages: 3 })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(gh, { maxPages: 3 }).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
+});
