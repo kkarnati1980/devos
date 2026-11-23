@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # DevOS — server agent: self-update, deploy-on-PASS and server checks for each passing main SHA (DEVOS-74)
-# Version: 1.7.0
+# Version: 1.8.0
+# v1.8.0 (DEVOS-251, S4-d): the allow-list gains scripts/server/tailnet-snat.sh, run every tick (before the
+# isolation run, and again right before a new SHA's server checks). It turns tailscaled's subnet-route SNAT off when
+# its masquerade rule is present, so the DevOS API sees the tailnet client's own address, not the bridge gateway.
+# Its output is redacted into the agent log; checks/api-tailnet-peer.sh reports the result on server-check.
 # v1.7.0 (DEVOS-21, M2.4-d4b): before a deploy, the same env upsert as GIT_SHA also sets DEVOS_GITHUB_OWNER (the owner
 # of the tracked repo) and DEVOS_COOLIFY_SERVER_UUID (Coolify's own server, the one named "localhost" in GET /servers,
 # as M0.4 found it) as runtime variables, and reads both back. compose requires them (:?), so a dropped value comes
@@ -62,7 +66,7 @@ GH_ENV="$DIR/github-review.env"
 CF_ENV="$DIR/coolify-deploy.env"
 # The allow-list: the only files ever installed (checks are added from scripts/server/checks/*.sh).
 ALLOW=(scripts/review/review-watch.sh scripts/review/review-commit.sh scripts/server/server-agent.sh scripts/server/cert-renew.sh
-       scripts/server/isolation-apply.sh)
+       scripts/server/isolation-apply.sh scripts/server/tailnet-snat.sh)
 CERT_EVERY="${CERT_EVERY:-86400}"       # R3-d: renew once a day
 CERT_RETRY="${CERT_RETRY:-3600}"        # after a failed renewal, try again after an hour
 ISOLATION_TIMEOUT="${ISOLATION_TIMEOUT:-60}"  # S4-b2a: one isolation-apply.sh run per tick (S4-b decision 9)
@@ -558,6 +562,18 @@ isolation_tick() {
   log "isolation: $st"
 }
 
+# S4-d (DEVOS-251): keep the tailnet client's address on inbound traffic to published ports (tailnet-snat.sh).
+# Exit 0 nothing to do or fixed, 1 failed, 3 skipped; the check api-tailnet-peer.sh is what reports a failure.
+tailnet_snat_tick() {
+  local rc
+  [[ -f "$BIN/tailnet-snat.sh" ]] || return 0
+  if [[ $DRY -eq 1 ]]; then log "WOULD run tailnet-snat.sh"; return 0; fi
+  set +e; timeout 60 bash "$BIN/tailnet-snat.sh" > "$TMP/tsnat.out" 2>&1 </dev/null; rc=$?; set -e
+  redact < "$TMP/tsnat.out" | tail -n 5 | while IFS= read -r l; do log "tailnet-snat: $l"; done
+  (( rc == 0 || rc == 3 )) || log "tailnet-snat: failed (exit $rc)"
+  return 0
+}
+
 # The allow-list grew (v1.3.0): the SHA that installed it ran an older agent with the shorter list, so a new
 # allow-listed file is missing from bin/. Install again from the recorded SHA (it already passed D1).
 repair_allowlist() {
@@ -707,6 +723,7 @@ recheck_tick() {
 # ---- tick ----
 repair_allowlist
 cert_renewal
+tailnet_snat_tick
 isolation_tick
 sha="$(gh GET "/repos/$REPO/commits/main" | jq -r '.sha')" || die "cannot read main"
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "bad main sha"
@@ -790,6 +807,7 @@ else
 fi
 
 if [[ ! -s "$ST/$sha.checks.state" ]]; then
+  tailnet_snat_tick   # S4-d: likewise, with the tailnet-snat.sh this SHA installed
   isolation_tick   # S4-b2a: a fresh run with the script this SHA installed, so its server-check reports it
   run_checks "$sha"
   echo "$(date +%s) $sha normal" > "$ST/recheck.state"   # DEVOS-90: the 6-hour clock restarts after normal checks
