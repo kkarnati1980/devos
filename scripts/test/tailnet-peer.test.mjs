@@ -30,7 +30,7 @@ function run(name, script, { nosnat = false, routes = "null", prefs, setRc = 0, 
   fs.mkdirSync(bin, { recursive: true });
   fs.writeFileSync(path.join(dir, "devos/server-agent.conf"), conf);
   if (pending) fs.writeFileSync(path.join(dir, "devos/tailnet-snat.cut-pending"), "");
-  if (changed) fs.writeFileSync(path.join(dir, "devos/tailnet-snat.changed"), "");
+  if (changed) fs.writeFileSync(path.join(dir, "devos/tailnet-snat.changed"), changed === true ? `${Math.floor(Date.now() / 1000)}\n` : changed);
   const ns = path.join(dir, "nosnat");
   fs.writeFileSync(ns, String(nosnat));
   if (prefs !== undefined) fs.writeFileSync(path.join(dir, "prefs.raw"), prefs);
@@ -54,7 +54,7 @@ esac\n`, { mode: 0o755 });
 f="${dir}/ct.$7"; [[ -f "$f" ]] || exit 1
 cat "$f"; echo "conntrack v1.4.6 (conntrack-tools): 1 flow entries have been shown." >&2\n`, { mode: 0o755 });
   }
-  for (const t of ["timeout", "cat", "bash", "grep", "sed", "head", "jq", "rm"]) {
+  for (const t of ["timeout", "cat", "bash", "grep", "sed", "head", "jq", "rm", "date"]) {
     // The system copy first: a wrapper earlier on the developer's PATH must not stand in for it.
     const sys = ["/usr/bin", "/bin"].map((d) => path.join(d, t)).find((f) => fs.existsSync(f));
     const real = sys || spawnSync("bash", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
@@ -117,7 +117,13 @@ test("AT-d-1m: an unfinished change (journal kept) on a host that now advertises
   assert.equal(a.code, 0, a.out);
   assert.ok(!fs.existsSync(path.join(a.dir, "devos/tailnet-snat.changed")), "a confirmed fix clears the journal");
   const b = run("failjournal", FIX, { setRc: 1 });
-  assert.ok(fs.existsSync(path.join(b.dir, "devos/tailnet-snat.changed")), "a failed set keeps the journal");
+  assert.ok(!fs.existsSync(path.join(b.dir, "devos/tailnet-snat.changed")), "a failed set that left NoSNAT false drops the journal (Codex PR220-r9)");
+  const old = run("stalejournal", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', changed: `${Math.floor(Date.now() / 1000) - 901}\n` });
+  assert.equal(old.code, 0, old.out);
+  assert.match(old.out, /^note: a stale or unreadable change journal was dropped; nothing undone\nok: /);
+  assert.equal(old.sets, 0, "a stale journal never undoes KK's later setting (Codex PR220-r9)");
+  const bad = run("badjournal", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', changed: "x\n" });
+  assert.deepEqual([bad.code, bad.sets], [0, 0], bad.out);
 });
 
 test("AT-d-1d: a failed set, or NoSNAT still false afterwards, are failures", () => {

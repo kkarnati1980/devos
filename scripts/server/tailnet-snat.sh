@@ -85,7 +85,21 @@ undo() {  # always exits 1
   exit 1
 }
 
+# Codex PR220-r9: the journal holds the epoch it was written at and is honoured only for JOURNAL_MAX seconds
+# (default 900: a few agent ticks). An older one cannot tell our change from a setting KK made since, so it is
+# dropped and nothing is undone. A set that fails and leaves NoSNAT false drops it at once (nothing was applied).
+JOURNAL_MAX="${TAILNET_SNAT_JOURNAL_MAX:-900}"
+journal_fresh() {
+  local t now
+  t="$(sed -n '1s/^\([0-9]\{1,12\}\)$/\1/p' "$CHANGED" 2>/dev/null)"; now="$(date +%s)"
+  [[ -n "$t" ]] && (( now - t >= 0 && now - t <= JOURNAL_MAX ))
+}
+
 read_prefs || exit 1
+if [[ -e "$CHANGED" ]] && ! journal_fresh; then
+  rm -f "$CHANGED" || { echo "fail: cannot remove $CHANGED"; exit 1; }
+  echo "note: a stale or unreadable change journal was dropped; nothing undone"
+fi
 if [[ -e "$CHANGED" ]]; then
   (( ROUTES > 0 )) && undo
   if [[ "$NOSNAT" == true ]]; then rm -f "$CHANGED" || { echo "fail: cannot remove $CHANGED"; exit 1; }; fi
@@ -103,10 +117,13 @@ if (( ROUTES > 0 )); then
   exit 1
 fi
 
-: > "$CHANGED" || { echo "fail: cannot write $CHANGED; not changed"; exit 1; }
+date +%s > "$CHANGED" || { echo "fail: cannot write $CHANGED; not changed"; exit 1; }
 : > "$PENDING" || { echo "fail: cannot write $PENDING; not changed"; exit 1; }
-timeout 20 tailscale set --snat-subnet-routes=false >/dev/null 2>&1 \
-  || { echo "fail: tailscale set --snat-subnet-routes=false did not succeed"; exit 1; }
+if ! timeout 20 tailscale set --snat-subnet-routes=false >/dev/null 2>&1; then
+  # Codex PR220-r9: if a re-read shows the change was not applied, the journal goes now; otherwise it stays (bounded).
+  if read_prefs >/dev/null && [[ "$NOSNAT" == false ]]; then rm -f "$CHANGED"; fi
+  echo "fail: tailscale set --snat-subnet-routes=false did not succeed"; exit 1
+fi
 read_prefs || exit 1
 # Codex PR220-r7: tailscale has no compare-and-set, so routes enabled between the first read and the set cannot be
 # excluded beforehand; the confirming read undoes the change if it shows routes (and the journal keeps a failed
