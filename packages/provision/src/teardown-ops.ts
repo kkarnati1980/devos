@@ -420,6 +420,8 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
         }
         // Codex PR223-r26: a page never holds more than the `per_page=100` asked for, or the offsets are wrong.
         if (r.body.length > 100) throw new ProviderError("github", "bad-response", "github GET /user/repos returned more entries than the page size", r.status);
+        // Codex PR223-r28: as in the scope preflight, a page reached through rel=next must not be empty.
+        if (page > 1 && r.body.length === 0) throw new ProviderError("github", "bad-response", "github GET /user/repos returned an empty page it had advertised", r.status);
         for (const x of r.body) {
           // Codex PR48-r4: every field the match reads must be well-formed, or the whole scan is inconclusive.
           // Codex PR48-r5: the field must be present (string or null); an omitted description is inconclusive.
@@ -561,6 +563,9 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
       // Codex PR223-r26: a page never holds more than the `per_page=100` asked for.
       if (r.status !== 200 || !Array.isArray(r.body) || r.body.length > 100) throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r28: a page after the first is read only because the page before named it with rel=next, so
+      // GitHub advertised entries on it; an empty answer contradicts that (the listing shifted), never the end.
+      if (page > 1 && r.body.length === 0) throw new Error("github-token-scope: the repository list is unreadable");
       // Codex PR223-r2: on the scope proof the list is the only count, so every entry must be an identifiable repo
       // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
       // Codex PR223-r18/r19: on the count path every entry is a repo (a numeric id seen once, a name) too, so a

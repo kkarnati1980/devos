@@ -8,7 +8,7 @@ const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const OWNER = "kkarnati1980";
 
 // A fake api.github.com: GET /user answers `user` with the given scopes header; GET /user/repos pages `repos`.
-function fake({ user, scopes, repos = 1, list, link }) {
+function fake({ user, scopes, repos = 1, list, link, pages }) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     const u = new URL(url);
@@ -19,7 +19,8 @@ function fake({ user, scopes, repos = 1, list, link }) {
     if (u.pathname === "/user/repos") {
       const page = Number(u.searchParams.get("page"));
       const all = list ?? Array.from({ length: repos }, (_, i) => ({ id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } }));
-      return new Response(JSON.stringify(all.slice((page - 1) * 100, page * 100)), { status: 200, headers: link && page === 1 ? { link } : {} });
+      const body = pages ? (pages[page] ?? []) : all.slice((page - 1) * 100, page * 100);
+      return new Response(JSON.stringify(body), { status: 200, headers: link && page === 1 ? { link } : {} });
     }
     return new Response(null, { status: 404 });
   };
@@ -72,12 +73,15 @@ test("Codex PR223-r2: on the scope proof, every listed entry must be an identifi
 
 test("Codex PR223-r3: a short page with a Link rel=next is not the last page", async () => {
   const link = '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next", <https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="last"';
-  // Page 2 is empty here, so the list ends there; the point is that page 2 is read.
-  const f = fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link });
+  // Page 1 is short and names page 2, which holds the second repo (Codex PR223-r28: an advertised page is never
+  // empty, so the fixture no longer answers page 2 with []); the point is that page 2 is read.
+  const repo = (i) => ({ id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } });
+  const pages = { 1: [repo(0)], 2: [repo(1)] };
+  const f = fake({ user: { ...pub, public_repos: 2 }, scopes: "repo", pages, link });
   await check(f);
   assert.equal(f.calls.filter((c) => c.path === "/user/repos").length, 2, "page 2 read");
   // With a page cap of 1 the unread next page is refused.
-  await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link }), { maxPages: 1 }), /repository list is unreadable/);
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", pages, link }), { maxPages: 1 }), /repository list is unreadable/);
 });
 
 test("DEVOS-21 part 3: a classic repo token passes at exactly public_repos, reading every page on one token", async () => {
@@ -481,4 +485,22 @@ test("DEVOS-21 part 3 (r26): Unicode spaces are malformed, and an oversized page
   }, sleep: async () => {} });
   await assert.rejects(githubTokenScopeCheck(gh, { owner: OWNER })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /more entries than the page size/);
+});
+
+// Codex PR223-r28: a page reached through rel=next must not be empty. Page 1 is full and names page 2 as next and
+// last; page 2 answers [] with no Link header. Both readers treat that as an unreadable listing, never as its end.
+test("DEVOS-21 part 3 (r28): an advertised next page that answers empty is unreadable", async () => {
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  const mk = (kind) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 0 }), { status: 200 });
+    const page = Number(x.searchParams.get("page"));
+    if (page !== 1) return new Response("[]", { status: 200 });
+    const body = Array.from({ length: 100 }, (_, i) => (kind === "scan"
+      ? { full_name: `${OWNER}/r${i}`, name: `r${i}`, description: null }
+      : { id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } }));
+    return new Response(JSON.stringify(body), { status: 200, headers: { link: `<${u(2)}>; rel="next", <${u(2)}>; rel="last"` } });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /empty page it had advertised/);
 });
