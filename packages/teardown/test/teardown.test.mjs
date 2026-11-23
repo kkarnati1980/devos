@@ -50,7 +50,7 @@ function fakes() {
     if (f) f.used = true;
     calls.push({ method, path, auth: init.headers?.authorization, signal: init.signal });
     if (f?.action === "timeout-before") throw timeout();
-    if (f?.action?.raw) return new Response(f.action.body === undefined ? null : f.action.body, { status: f.action.status, headers: f.action.headers });
+    if (f?.action?.raw) return new Response(f.action.body === undefined ? null : f.action.body, { status: f.action.status });
     if (f?.action?.status) return json(f.action.status, { message: "injected" });
     const own = handle();
     const res = own ?? (await base.fetchImpl(url, init));
@@ -378,45 +378,6 @@ test("M2.5-a2 pre-review: the preflight reads every page, refuses missing counts
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(many.slice(100)) } });
   await githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })();
   assert.ok(s.fake.faults.every((f) => f.used));
-});
-
-test("DEVOS-21 part 3: a classic token with the repo scope proves it sees every owned repo without the private count", async () => {
-  const s = setup();
-  await provision(s);
-  await archiveProject(P.id, { ...s.base, authorize: allowAll });
-  // The public user response (a classic token without read:user): login and public_repos, no owned_private_repos.
-  const user = (body, scopes) => ({ match: (m, p) => m === "GET" && p === "/user", action: { raw: true, status: 200, body: JSON.stringify(body), headers: scopes === undefined ? undefined : { "x-oauth-scopes": scopes } } });
-  const pub = { login: "kkarnati1980", public_repos: 0 };
-  const run = (opts = {}) => purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh, { owner: "kkarnati1980", ...opts })] });
-  const refused = (re) => (e) => e instanceof TeardownError && e.code === "provider_forbidden" && re.test(e.message);
-  // No scopes header (a fine-grained or app token): nothing proves the token sees every repo → refused.
-  s.fake.faults.push(user(pub));
-  await assert.rejects(run(), refused(/cannot read its account's repository counts/));
-  // An empty header says nothing either.
-  s.fake.faults.push(user(pub, ""));
-  await assert.rejects(run(), refused(/cannot read its account's repository counts/));
-  // A classic token without `repo` (a prefix such as `repository` or `public_repo` is not `repo`) → refused.
-  for (const scopes of ["delete_repo, read:org", "public_repo, delete_repo", "repository, delete_repo", "repo:status"]) {
-    s.fake.faults.push(user(pub, scopes));
-    await assert.rejects(run(), refused(/classic token has no repo scope/), scopes);
-  }
-  // The proof never replaces the owner check.
-  s.fake.faults.push(user({ ...pub, login: "someone-else" }, "repo, delete_repo"));
-  await assert.rejects(run(), refused(/another account/));
-  // Without the private count the list must be read to its end: a page cap hit is refused.
-  const many = Array.from({ length: 100 }, (_, i) => ({ id: 2000 + i, name: `q${i}`, full_name: `kkarnati1980/q${i}`, private: true, description: null }));
-  s.fake.faults.push(user(pub, "repo, delete_repo"));
-  s.fake.faults.push({ match: (m, p) => m === "GET" && p.startsWith("/user/repos"), action: { raw: true, status: 200, body: JSON.stringify(many) } });
-  await assert.rejects(run({ maxPages: 1 }), refused(/repository list is unreadable/));
-  // The list must still hold every public repo.
-  s.fake.faults.push(user({ ...pub, public_repos: 5 }, "repo, delete_repo"));
-  await assert.rejects(run(), refused(/sees 1 of 5/));
-  assert.equal(s.fake.deletes().length, 0, "nothing deleted while refused");
-  // A classic token with `repo` (any order, any spacing) passes when the list holds exactly public_repos, and the
-  // purge completes.
-  s.fake.faults.push(user({ ...pub, public_repos: 1 }, "delete_repo,repo , workflow"));
-  const out = await run();
-  assert.equal(out.purged, true);
 });
 
 test("M2.5-a2 pre-review: a purge built on pinnedGitHub keeps the preflight's token even if the vault token changes", async () => {

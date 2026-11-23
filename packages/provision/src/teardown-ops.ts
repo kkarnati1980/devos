@@ -312,10 +312,10 @@ export function classicScopes(headers: { get(name: string): string | null } | un
  * The token's login must also be `owner` (Codex PR55-r1). Throws `github-token-scope` otherwise (the purge stops
  * with `provider_forbidden`, nothing deleted).
  *
- * DEVOS-21 part 3 (docs/modules/M2.5.md, "DEVOS-21 part 3"): GitHub returns `owned_private_repos` only to a classic
+ * DEVOS-21 part 3 (docs/modules/M2.4.md, "AT13 probe failure diagnostics, part 3"): GitHub returns `owned_private_repos` only to a classic
  * token with the `read:user` or `user` scope. A classic token cannot be narrowed to selected repositories at all, so
  * one with the `repo` scope sees every repo its owner owns; that is proof of the same fact. Such a token without
- * the private count passes when its login is the owner, its owned-repo list reads in full and holds at least
+ * the private count field passes when its login is the owner, its owned-repo list reads in full and holds at least
  * `public_repos`. Without the count and without that proof the check still refuses.
  */
 export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; maxPages?: number }): () => Promise<void> {
@@ -328,7 +328,12 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     if (u.status !== 200 || typeof pub !== "number" || typeof u.body?.login !== "string") {
       throw new Error("github-token-scope: the token cannot read its account's repository counts");
     }
-    if (typeof priv !== "number") {
+    // Codex PR223-r1: only an absent field (GitHub's public user response) may take the scope proof; a field that is
+    // present with any non-number value (null, a string, an object) is a malformed answer and stays refused.
+    if (priv !== undefined && typeof priv !== "number") {
+      throw new Error("github-token-scope: the token cannot read its account's repository counts");
+    }
+    if (priv === undefined) {
       const scopes = classicScopes(u.headers);
       if (scopes === null) throw new Error("github-token-scope: the token cannot read its account's repository counts");
       if (!scopes.includes("repo")) throw new Error("github-token-scope: the classic token has no repo scope");
