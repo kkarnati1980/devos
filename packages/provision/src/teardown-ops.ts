@@ -231,6 +231,8 @@ const PCHAR = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})";
 const QCHAR = `(?:${PCHAR}|[/?])`;
 const HOST = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})+";
 const URI_REF = new RegExp(`^https?://${HOST}(?::[0-9]+)?(?:/(?:${PCHAR}|/)*)?(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`, "i");
+/** RFC 3986 absolute URI (scheme, `:`, then URI characters with valid `%` escapes): an extension relation type. */
+const REL_URI = /^[A-Za-z][A-Za-z0-9+.-]*:(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?#[\]]|%[0-9A-Fa-f]{2})+$/;
 const isLinkTarget = (t: string): boolean => {
   if (!URI_REF.test(t)) return false;
   try { new URL(t); return true; } catch { return false; }
@@ -336,7 +338,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
         if (types.length === 0) return "malformed";
         // Codex PR223-r14 (RFC 8288 §3.3): each relation type is a registered name (a letter, then letters, digits,
         // `.` or `-`; compared case-insensitively) or an absolute URI; anything else (e.g. `next,`) is malformed.
-        if (!types.every((t) => /^[A-Za-z][A-Za-z0-9.-]*$/.test(t) || isLinkTarget(t))) return "malformed";
+        // Codex PR223-r18: an extension type is any absolute URI (RFC 3986 `scheme ":" ...`, e.g. `urn:example:x`),
+        // not only an http(s) one; it never names a page, so only its syntax is checked.
+        if (!types.every((t) => /^[A-Za-z][A-Za-z0-9.-]*$/.test(t) || REL_URI.test(t))) return "malformed";
         if (types.some((t) => t.toLowerCase() === "next")) {
           if (!nextOk(target)) return "malformed";
           found = true;
@@ -490,15 +494,14 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     for (let page = 1; page <= maxPages; page++) {
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
       if (r.status !== 200 || !Array.isArray(r.body)) throw new Error("github-token-scope: the repository list is unreadable");
-      // Codex PR223-r2: on the scope proof the list is the only count, so every entry must be an identifiable repo
-      // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
-      if (priv === undefined) {
-        for (const e of r.body as { id?: unknown; name?: unknown; owner?: { login?: unknown } }[]) {
-          const ok = e !== null && typeof e === "object" && typeof e.id === "number" && !ids.has(e.id) && typeof e.name === "string" && e.name !== ""
-            && typeof e.owner?.login === "string" && e.owner.login.toLowerCase() === opts.owner.toLowerCase();
-          if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
-          ids.add(e.id as number);
-        }
+      // Codex PR223-r2: every entry must be an identifiable repo of the owner (a numeric id seen once, a name,
+      // owner.login = owner); anything else is an unreadable list. Codex PR223-r18: on the count path too, so a
+      // repeated entry can never make up for a repository the token does not see.
+      for (const e of r.body as { id?: unknown; name?: unknown; owner?: { login?: unknown } }[]) {
+        const ok = e !== null && typeof e === "object" && typeof e.id === "number" && !ids.has(e.id) && typeof e.name === "string" && e.name !== ""
+          && typeof e.owner?.login === "string" && e.owner.login.toLowerCase() === opts.owner.toLowerCase();
+        if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
+        ids.add(e.id as number);
       }
       seen += r.body.length;
       // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
