@@ -71,7 +71,25 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
   echo "old masqueraded connections on ports ${api:-3001} and ${dash:-3000} cut (clients reconnect)"
 }
 
+# Codex PR220-r8: $CHANGED journals a change this script started. It is written before `tailscale set` and cleared
+# only when a read shows NoSNAT true on a host with no routes. While it exists, a read that shows routes means our
+# change met a route-advertising host, so it is undone (SNAT back on, the state KK chose) on this or a later tick,
+# even after an interrupted run or a failed rollback; a NoSNAT true with routes and no journal is KK's own setting.
+CHANGED="${DEVOS_DIR:-/root/.devos}/tailnet-snat.changed"
+undo() {  # always exits 1
+  if timeout 20 tailscale set --snat-subnet-routes=true >/dev/null 2>&1 && rm -f "$CHANGED"; then
+    echo "fail: this host advertises $ROUTES route(s); the subnet-route SNAT change was undone (KK decision)"
+  else
+    echo "fail: this host advertises $ROUTES route(s); undoing the subnet-route SNAT change failed, retried next tick (KK decision)"
+  fi
+  exit 1
+}
+
 read_prefs || exit 1
+if [[ -e "$CHANGED" ]]; then
+  (( ROUTES > 0 )) && undo
+  if [[ "$NOSNAT" == true ]]; then rm -f "$CHANGED" || { echo "fail: cannot remove $CHANGED"; exit 1; }; fi
+fi
 # A subnet router or exit node is left alone in every branch (Codex PR220-r5): no preference change and no
 # conntrack clean-up; only a report. Changing it there is a KK decision.
 if (( ROUTES > 0 )) && [[ "$NOSNAT" == true ]]; then
@@ -85,22 +103,17 @@ if (( ROUTES > 0 )); then
   exit 1
 fi
 
+: > "$CHANGED" || { echo "fail: cannot write $CHANGED; not changed"; exit 1; }
 : > "$PENDING" || { echo "fail: cannot write $PENDING; not changed"; exit 1; }
 timeout 20 tailscale set --snat-subnet-routes=false >/dev/null 2>&1 \
   || { echo "fail: tailscale set --snat-subnet-routes=false did not succeed"; exit 1; }
 read_prefs || exit 1
 # Codex PR220-r7: tailscale has no compare-and-set, so routes enabled between the first read and the set cannot be
-# excluded beforehand. If the confirming read shows routes, the change is undone at once (SNAT back on, the state
-# KK chose) and the run fails, so the host is never left changed without KK's decision.
-if (( ROUTES > 0 )); then
-  if timeout 20 tailscale set --snat-subnet-routes=true >/dev/null 2>&1; then
-    echo "fail: this host started advertising $ROUTES route(s) during the change; subnet-route SNAT restored (KK decision)"
-  else
-    echo "fail: this host started advertising $ROUTES route(s) during the change, and restoring subnet-route SNAT failed (KK decision)"
-  fi
-  exit 1
-fi
+# excluded beforehand; the confirming read undoes the change if it shows routes (and the journal keeps a failed
+# read or undo owed to the next tick).
+(( ROUTES > 0 )) && undo
 [[ "$NOSNAT" == true ]] || { echo "fail: NoSNAT is still false after tailscale set"; exit 1; }
+rm -f "$CHANGED" || { echo "fail: cannot remove $CHANGED"; exit 1; }
 echo "fixed: subnet-route SNAT turned off; the API now sees the tailnet client's own address"
 cut_old || exit 1
 exit 0
