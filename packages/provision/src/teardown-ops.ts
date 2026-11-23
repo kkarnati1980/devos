@@ -231,11 +231,6 @@ const PCHAR = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})";
 const QCHAR = `(?:${PCHAR}|[/?])`;
 const HOST = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})+";
 const URI_REF = new RegExp(`^https?://${HOST}(?::[0-9]+)?(?:/(?:${PCHAR}|/)*)?(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`, "i");
-/**
- * RFC 3986 absolute URI, an extension relation type: `scheme ":"`, a non-empty path of pchar and `/`, then an optional
- * `?query` and at most one `#fragment` that add only `/` and `?` (Codex PR223-r19: `urn:x#one#two` is not a URI).
- */
-const REL_URI = new RegExp(`^[A-Za-z][A-Za-z0-9+.-]*:(?:${PCHAR}|/)+(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`);
 const isLinkTarget = (t: string): boolean => {
   if (!URI_REF.test(t)) return false;
   try { new URL(t); return true; } catch { return false; }
@@ -369,10 +364,11 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
         const types = value.split(/[ \t]+/).filter((t) => t !== "");
         if (types.length === 0) return "malformed";
         // Codex PR223-r14 (RFC 8288 §3.3): each relation type is a registered name (a letter, then letters, digits,
-        // `.` or `-`; compared case-insensitively) or an absolute URI; anything else (e.g. `next,`) is malformed.
-        // Codex PR223-r18: an extension type is any absolute URI (RFC 3986 `scheme ":" ...`, e.g. `urn:example:x`),
-        // not only an http(s) one; it never names a page, so only its syntax is checked.
-        if (!types.every((t) => /^[A-Za-z][A-Za-z0-9.-]*$/.test(t) || REL_URI.test(t))) return "malformed";
+        // `.` or `-`; compared case-insensitively); anything else (e.g. `next,`) is malformed.
+        // Codex PR223-r34 (decision 1, supersedes the r18/r19 extension-URI rule): GitHub sends only registered
+        // relation names, so an extension (URI) relation type is unparseable. Its grammar can no longer be read
+        // as "no next page", and the reader stays fail-closed.
+        if (!types.every((t) => /^[A-Za-z][A-Za-z0-9.-]*$/.test(t))) return "malformed";
         if (types.some((t) => t.toLowerCase() === "next")) {
           if (!nextOk(target)) return "malformed";
           found = true;

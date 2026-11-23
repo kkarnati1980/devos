@@ -228,11 +228,12 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
   ]) {
     assert.equal(linkNext(h(v), want), "malformed", v);
   }
-  // Codex PR223-r14: every relation type is a registered name or an absolute URI.
+  // Codex PR223-r14: every relation type is a registered name (r34: extension URI types are unparseable).
   for (const v of ['<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next,"', '<https://x/y>; rel="la;st"', '<https://x/y>; rel="1st"', '<https://x/y>; rel="prev ne@xt"']) {
     assert.equal(linkNext(h(v), want), "malformed", v);
   }
-  assert.equal(linkNext(h('<https://x/y>; rel="prev https://example.com/rel/more last"')), "none", "extension URI types are allowed");
+  // Codex PR223-r34 tightened this (was "none"): an extension URI relation type is unparseable.
+  assert.equal(linkNext(h('<https://x/y>; rel="prev https://example.com/rel/more last"')), "malformed", "extension URI types are unparseable");
   // Both readers: page 1 advertises page 3, page 2 is empty with no Link. Neither may read page 2 as the end.
   const link = '<https://api.github.com/user/repos?page=3>; rel="next"';
   await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link })), /repository list is unreadable/);
@@ -342,16 +343,17 @@ test("DEVOS-21 part 3 (r17): a full page named as last by rel=last ends the list
 
 // Codex PR223-r18: (1) with the private count present, a repeated repo id never counts twice; (2) an extension
 // relation type may be any absolute URI, not only an http(s) one.
-test("DEVOS-21 part 3 (r18): identity on the count path, and any absolute URI as a relation type", async () => {
+test("DEVOS-21 part 3 (r18/r34): identity on the count path; an extension URI relation type is unparseable", async () => {
   const dup = [{ id: 1, name: "a", owner: { login: OWNER } }, { id: 1, name: "a", owner: { login: OWNER } }];
   await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: dup })), /repository list is unreadable/);
   await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a" }, { id: "2", name: "b" }] })), /repository list is unreadable/);
   await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a" }, { id: 2, name: "b" }] }));
   const h = (link) => new Headers({ link });
   const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
-  assert.equal(linkNext(h('<https://x.example/meta>; rel="urn:example:metadata"'), want), "none");
-  assert.equal(linkNext(h('<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next tag:example.com,2026:rel"'), want), "next");
-  for (const v of ['<https://x/y>; rel="urn:example:rel#one#two"', '<https://x/y>; rel="urn:a%2"', '<https://x/y>; rel="urn:"', '<https://x/y>; rel="1urn:x"', '<https://x/y>; rel="urn:a%zz"', '<https://x/y>; rel="urn:a<b"']) {
+  // Codex PR223-r34 tightened these two (were "none" and "next"): GitHub sends only registered relation names.
+  for (const v of ['<https://x.example/meta>; rel="urn:example:metadata"', '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next tag:example.com,2026:rel"',
+    '<https://x/y>; rel="https://example.com:abc/relation"', '<https://x/y>; rel="https://example.com/relation"',
+'<https://x/y>; rel="urn:example:rel#one#two"', '<https://x/y>; rel="urn:a%2"', '<https://x/y>; rel="urn:"', '<https://x/y>; rel="1urn:x"', '<https://x/y>; rel="urn:a%zz"', '<https://x/y>; rel="urn:a<b"']) {
     assert.equal(linkNext(h(v), want), "malformed", v);
   }
 });
@@ -598,6 +600,19 @@ test("DEVOS-21 part 3 (r33): a present Link header with no link value is unparse
     if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1, owned_private_repos: 1 }), { status: 200 });
     const entry = kind === "scan" ? { full_name: `${OWNER}/r0`, name: "r0", description: null } : { id: 1, name: "r0", private: false, owner: { login: OWNER } };
     return new Response(JSON.stringify([entry]), { status: 200, headers: { link: ",," } });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
+});
+
+// Codex PR223-r34: a short page whose only link has an extension URI relation (here with a non-numeric port) is
+// unreadable in both readers, never the end of the listing.
+test("DEVOS-21 part 3 (r34): an extension URI relation type makes the listing unreadable", async () => {
+  const mk = (kind) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1, owned_private_repos: 1 }), { status: 200 });
+    const entry = kind === "scan" ? { full_name: `${OWNER}/r0`, name: "r0", description: null } : { id: 1, name: "r0", private: false, owner: { login: OWNER } };
+    return new Response(JSON.stringify([entry]), { status: 200, headers: { link: '<https://x.example/y>; rel="https://example.com:abc/relation"' } });
   }, sleep: async () => {} });
   await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
