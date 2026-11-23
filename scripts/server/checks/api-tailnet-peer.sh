@@ -37,7 +37,8 @@ fi
 if command -v conntrack >/dev/null 2>&1; then
   for p in "$API" "$DASH"; do
     if ! lines="$(timeout 10 conntrack -L -p tcp -d "$TS_IP" --dport "$p" 2>/dev/null)"; then
-      echo "note: conntrack could not be read for port $p"; continue
+      # Codex PR220-r3: the tool is there but did not answer: the independent read failed, so the check fails.
+      echo "fail: conntrack could not be read for port $p"; rc=1; continue
     fi
     n=0; bad=0; ex=""
     while IFS= read -r l; do

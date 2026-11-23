@@ -171,6 +171,12 @@ test("AT-d-2f: no readable chain and no tailnet client in conntrack: skipped, ne
   assert.match(r.out, /skipped: no ts-postrouting chain and no inbound tailnet connection to observe$/);
 });
 
+test("AT-d-2g: conntrack installed but unreadable for a port fails, even with a clean chain (Codex PR220-r3)", () => {
+  const r = run("cctfail", CHECK, { chain: CLEAN, conntrack: { 3001: [ct(KK, KK)] } });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /fail: conntrack could not be read for port 3000/);
+});
+
 test("AT-d-2e: skipped without a tailnet address or with nothing readable; conntrack missing reads the rule only", () => {
   assert.equal(run("cnoip", CHECK, { chain: CLEAN, ip: "" }).code, 3);
   assert.equal(run("cnothing", CHECK, {}).code, 3);
