@@ -220,29 +220,30 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
 }
 
 /**
- * Codex PR223-r3/r4: GitHub's `Link` response header names a next page (`rel="next"`). Both the purge scope preflight
+ * Codex PR223-r3/r4/r8: GitHub's `Link` response header names a next page (`rel="next"`); a header that cannot be parsed is "malformed". Both the purge scope preflight
  * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
  */
-export function linkHasNext(headers: { get(name: string): string | null } | undefined): boolean {
+export function linkNext(headers: { get(name: string): string | null } | undefined): "next" | "none" | "malformed" {
   const raw = headers?.get("link") ?? "";
   // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
   // never splits a link. Each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a space-separated
   // list of relation types, quoted or not. Any link whose rel list contains `next` counts. A value that cannot be
-  // parsed is read as "a next page may exist", so the caller reads on and stops only at its page cap (fail closed).
+  // parsed is "malformed" (Codex PR223-r8): the caller treats the whole listing as unreadable, never as complete.
   let i = 0;
+  let found = false;
   const n = raw.length;
   const ws = () => { while (i < n && /[\s,]/.test(raw[i] as string)) i++; };
   const sp = () => { while (i < n && /\s/.test(raw[i] as string)) i++; };
   ws();
   while (i < n) {
-    if (raw[i] !== "<") return true;
+    if (raw[i] !== "<") return "malformed";
     const close = raw.indexOf(">", i);
-    if (close < 0) return true;
+    if (close < 0) return "malformed";
     i = close + 1;
     for (;;) {
       sp();
       if (i >= n || raw[i] === ",") break;
-      if (raw[i] !== ";") return true;
+      if (raw[i] !== ";") return "malformed";
       i++; sp();
       const nameStart = i;
       while (i < n && !/[\s=;,]/.test(raw[i] as string)) i++;
@@ -260,7 +261,7 @@ export function linkHasNext(headers: { get(name: string): string | null } | unde
             if (c === '"') { closed = true; break; }
             value += c;
           }
-          if (!closed) return true;
+          if (!closed) return "malformed";
         } else {
           const vs = i;
           while (i < n && !/[\s;,]/.test(raw[i] as string)) i++;
@@ -269,16 +270,16 @@ export function linkHasNext(headers: { get(name: string): string | null } | unde
       }
       // Codex PR223-r7: a parameter without a name, or a `rel` without a value (bare, `rel=` or `rel=""`), is
       // malformed, so it fails closed like any other unparseable header.
-      if (name === "") return true;
+      if (name === "") return "malformed";
       if (name === "rel") {
         const types = value.split(/\s+/).filter((t) => t !== "");
-        if (types.length === 0) return true;
-        if (types.some((t) => t.toLowerCase() === "next")) return true;
+        if (types.length === 0) return "malformed";
+        if (types.some((t) => t.toLowerCase() === "next")) found = true;
       }
     }
     ws();
   }
-  return false;
+  return found ? "next" : "none";
 }
 
 /**
@@ -311,7 +312,9 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
           }
         }
         // Codex PR223-r4: as in the scope preflight, a short page is the last one only when no Link rel=next follows.
-        if (linkHasNext(r.headers)) continue;
+        const link = linkNext(r.headers);
+        if (link === "malformed") throw new ProviderError("github", "bad-response", "github GET /user/repos returned an unreadable Link header", r.status);
+        if (link === "next") continue;
         if (r.body.length < 100) return hits;
       }
       hits.push({ provider: "github", kind: "scan-incomplete", externalId: "", name: `more than ${maxPages * 100} repos; scan not complete` });
@@ -427,7 +430,10 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       }
       seen += r.body.length;
       // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
-      if (linkHasNext(r.headers)) continue;
+      const link = linkNext(r.headers);
+      // Codex PR223-r8: an unparseable Link header makes the whole listing inconclusive.
+      if (link === "malformed") throw new Error("github-token-scope: the repository list is unreadable");
+      if (link === "next") continue;
       if (r.body.length < 100) { complete = true; break; }
     }
     const want = pub + (typeof priv === "number" ? priv : 0);

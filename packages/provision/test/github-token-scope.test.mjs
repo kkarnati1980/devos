@@ -2,7 +2,7 @@
 // accepts a classic token's `repo` scope as proof that it sees every owned repo when GitHub withholds the private count.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GitHubClient, githubTokenScopeCheck, classicScopes, githubScanner, linkHasNext } from "../dist/index.js";
+import { GitHubClient, githubTokenScopeCheck, classicScopes, githubScanner, linkNext } from "../dist/index.js";
 
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const OWNER = "kkarnati1980";
@@ -27,6 +27,7 @@ function fake({ user, scopes, repos = 1, list, link }) {
 }
 const check = (f, opts = {}) => githubTokenScopeCheck(f.gh, { owner: OWNER, ...opts })();
 const pub = { login: OWNER, public_repos: 0 };
+const linkHasNext = (hd) => linkNext(hd) === "next";
 
 test("DEVOS-21 part 3: classicScopes reads X-OAuth-Scopes exactly, and nothing from an absent or empty header", () => {
   assert.equal(classicScopes(undefined), null);
@@ -150,13 +151,28 @@ test("DEVOS-21 part 3 (r6): linkHasNext tokenizes quoted values and fails closed
   assert.equal(linkHasNext(h('<https://x/?page=2>; title="say \\"rel=next\\""; rel="last"')), false);
   assert.equal(linkHasNext(h('<https://x/?page=1>; rel="prev", <https://x/?page=9>; rel="last"')), false);
   assert.equal(linkHasNext(h("")), false);
-  // Malformed: read as "a next page may exist", so the caller reads on to its page cap.
-  assert.equal(linkHasNext(h("garbage")), true);
-  assert.equal(linkHasNext(h('<https://x/?page=2>; title="unterminated')), true);
-  assert.equal(linkHasNext(h("<https://x/?page=2")), true);
+  // Malformed (Codex PR223-r8): the caller treats the listing as unreadable.
+  assert.equal(linkNext(h("garbage")), "malformed");
+  assert.equal(linkNext(h('<https://x/?page=2>; title="unterminated')), "malformed");
+  assert.equal(linkNext(h("<https://x/?page=2")), "malformed");
+  assert.equal(linkNext(h('<https://x/?page=2>; rel="next", garbage')), "malformed");
   // Codex PR223-r7: a rel without a value, or a nameless parameter, is malformed too.
   for (const v of ["<https://x/?page=2>; rel=", "<https://x/?page=2>; rel", '<https://x/?page=2>; rel=""', '<https://x/?page=2>; rel="  "', "<https://x/?page=2>; =next", "<https://x/?page=2>; ;"]) {
-    assert.equal(linkHasNext(h(v)), true, v);
+    assert.equal(linkNext(h(v)), "malformed", v);
   }
   assert.equal(linkHasNext(h('<https://x/?page=9>; rel="last"; hreflang=en')), false);
+});
+
+// Codex PR223-r8: a malformed Link header on any page makes the listing inconclusive for both readers.
+test("DEVOS-21 part 3 (r8): a malformed Link header fails the preflight and the leftover scan", async () => {
+  const fetchImpl = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1 }), { status: 200, headers: { "x-oauth-scopes": "repo" } });
+    const page = Number(u.searchParams.get("page"));
+    const body = page === 1 ? [{ id: 1, name: "other", full_name: `${OWNER}/other`, description: null, owner: { login: OWNER } }] : [];
+    return new Response(JSON.stringify(body), { status: 200, headers: page === 1 ? { link: "<https://api.github.com/user/repos?page=2>; rel=" } : {} });
+  };
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(gh, { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
 });
