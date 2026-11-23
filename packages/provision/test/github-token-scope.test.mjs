@@ -165,6 +165,12 @@ test("DEVOS-21 part 3 (r6): linkHasNext tokenizes quoted values and fails closed
   for (const v of ['<https://x/?page=2>; rel=next"', '<https://x/?page=2>; re"l=next', "<https://x/?page=2>; rel=ne<xt", "<https://x/?page=2>; title=a(b); rel=next", "<https://x/?page=2>; ti@tle=x; rel=next", "<https://x/?page=2>; title=; rel=next"]) {
     assert.equal(linkNext(h(v)), "malformed", v);
   }
+  // Codex PR223-r10: the target must be a URI reference.
+  for (const v of ["<bad target>; rel=last", "<>; rel=last", '<https://x/"q>; rel=last', "<https://x/?a=%zz>; rel=last", "<https://x/{a}>; rel=next"]) {
+    assert.equal(linkNext(h(v)), "malformed", v);
+  }
+  assert.equal(linkNext(h("<https://api.github.com/user/repos?page=2&per_page=100>; rel=\"next\", <https://api.github.com/user/repos?page=5&per_page=100>; rel=\"last\"")), "next");
+  assert.equal(linkNext(h("<https://x/a%20b?q=1#f>; rel=last")), "none");
   // Token values with tchar punctuation still parse.
   assert.equal(linkNext(h("<https://x/?page=2>; rel=next; x-a.b_c~=v1!#$%&'*+^`|")), "next");
   assert.equal(linkNext(h("<https://x/?page=2>; rel=last; hreflang=en-US")), "none");

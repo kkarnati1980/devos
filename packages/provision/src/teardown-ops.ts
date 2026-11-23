@@ -225,6 +225,8 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
  */
 /** RFC 7230 §3.2.6 `tchar`. */
 const TCHAR = /^[A-Za-z0-9!#$%&'*+.^_`|~-]$/;
+/** RFC 3986 URI-reference: unreserved, reserved and percent-escapes; non-empty. */
+const URI_REF = /^(?:[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=]|%[0-9A-Fa-f]{2})+$/;
 
 export function linkNext(headers: { get(name: string): string | null } | undefined): "next" | "none" | "malformed" {
   const raw = headers?.get("link") ?? "";
@@ -242,6 +244,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
     if (raw[i] !== "<") return "malformed";
     const close = raw.indexOf(">", i);
     if (close < 0) return "malformed";
+    // Codex PR223-r10: the target must be a URI reference (RFC 3986 characters only, every `%` a valid escape);
+    // a space, quote or other character outside that set (e.g. `<bad target>`) makes the header malformed.
+    if (!URI_REF.test(raw.slice(i + 1, close))) return "malformed";
     i = close + 1;
     for (;;) {
       sp();
