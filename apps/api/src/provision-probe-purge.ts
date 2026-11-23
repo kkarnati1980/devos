@@ -52,12 +52,45 @@ export function grantAuthorizer(policy: { decide(r: unknown): Promise<{ enforced
 const KIND_RE = /^[a-z0-9_]{1,40}$/;
 
 /**
+ * DEVOS-21 diagnostics, part 2: which purge preflight refused, and why, as a fixed code. `purgeProject` wraps a
+ * preflight throw as `purge preflight: <message>`, and the two checks (`githubTokenScopeCheck`,
+ * `coolifyTokenScopeCheck` in @devos/provision) start every message with their own code. Only the codes below are
+ * ever printed, never the message; an unknown reason keeps the token's name, an unknown check reads plain.
+ */
+const PREFLIGHT_REASONS: readonly [token: "github" | "coolify", needle: string, code: string][] = [
+  ["github", "cannot read its account's repository counts", "github-counts"],
+  ["github", "belongs to another account than the repository owner", "github-owner"],
+  ["github", "the repository list is unreadable", "github-list"],
+  ["github", "owned repositories; give it access to all repositories", "github-repos"],
+  ["coolify", "a recorded Coolify project id is not a uuid", "coolify-id"],
+  ["coolify", "cannot see this project's Coolify project", "coolify-team"],
+  ["coolify", "returned an inconclusive answer", "coolify-answer"],
+];
+
+export function preflightReason(message: unknown): string {
+  if (typeof message !== "string") return "";
+  const m = /^purge preflight: (github|coolify)-token-scope: /.exec(message);
+  if (m) {
+    const hit = PREFLIGHT_REASONS.find(([t, needle]) => t === m[1] && message.includes(needle));
+    return `:${hit ? hit[2] : m[1]}`;
+  }
+  // Pre-review 1: the transport (@devos/provision http.ts) throws a non-transient ProviderError for a missing token
+  // and for every non-2xx answer but 404, so an expired or revoked token reaches here as teardown's wrap of that
+  // message (`<provider> token is not available from the vault`, `<provider> GET <path> returned <status>`).
+  const p = /^purge preflight: (github|coolify) (token is not available from the vault$|GET \/\S* returned (\d{3})$)?/.exec(message);
+  if (!p) return "";
+  if (p[2]?.startsWith("token")) return `:${p[1]}-no-token`;
+  if (p[3] === "401" || p[3] === "403" || p[3] === "422") return `:${p[1]}-http-${p[3]}`;
+  return `:${p[1]}`;
+}
+
+/**
  * Decision 1: a teardown stop as the probe reports it. Retryable stops are "in progress" (the next tick runs the
  * purge again, bounded by PROBE_PHASE_MAX_MS); anything else is a fixed code. Any other throw is rethrown, and
  * probeStep treats it as in progress until the phase limit (it never keeps the message).
  */
 export function purgeStop(e: unknown): PurgeOutcome {
-  const x = e as { name?: unknown; code?: unknown; retryable?: unknown; resource?: { provider?: unknown; kind?: unknown } } | null;
+  const x = e as { name?: unknown; code?: unknown; retryable?: unknown; message?: unknown; resource?: { provider?: unknown; kind?: unknown } } | null;
   if (!x || x.name !== "TeardownError" || typeof x.code !== "string") throw e;
   if (x.retryable === true) return "in_progress";
   const where = typeof x.resource?.provider === "string" && typeof x.resource?.kind === "string" && KIND_RE.test(x.resource.provider) && KIND_RE.test(x.resource.kind)
@@ -67,7 +100,8 @@ export function purgeStop(e: unknown): PurgeOutcome {
       // DEVOS-21 diagnostics: name the refusing provider and kind, so the KK step names the right token. A refusal
       // with no resource comes only from the purge preflight (teardown.ts), so it reads `:preflight`; a
       // resource whose provider or kind is outside KIND_RE reads `:resource` (pre-review 1).
-      return { error: `purge-permission${where || (x.resource ? ":resource" : ":preflight")}` };
+      // Part 2: a preflight refusal also names the token and the reason (`:preflight:github-owner`, ...).
+      return { error: `purge-permission${where || (x.resource ? ":resource" : `:preflight${preflightReason(x.message)}`)}` };
     case "approval_required":
     case "policy_denied":
       return { error: `purge-permission:${x.code}` };
