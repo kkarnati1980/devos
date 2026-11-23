@@ -217,6 +217,17 @@ test("pre-review L1: a purge failure keeps the earlier failure as its cause", as
   const end = (await runToEnd(d)).at(-1);
   assert.deepEqual([end.code, end.detail], ["purge-failed", "purge-permission"]);
   assert.equal(d.log.at(-1).result.cause, "inventory-differs");
+  // DEVOS-21 diagnostics: the earlier failure's detail is kept too, in the record and on the tick the check prints.
+  assert.equal(d.log.at(-1).result.causeDetail, d.log.findLast((r) => r.phase === "purge" && r.result).result.detail);
+  assert.equal(end.cause, "inventory-differs");
+  assert.equal(end.causeDetail, d.log.at(-1).result.causeDetail);
+});
+
+test("DEVOS-21: a clean purge after no earlier failure has no cause on the tick or the record", async () => {
+  const d = fake({ purge: async () => ({ error: "purge-permission:github/repo" }) });
+  const end = (await runToEnd(d)).at(-1);
+  assert.deepEqual([end.code, end.detail, end.cause, end.causeDetail], ["purge-failed", "purge-permission:github/repo", undefined, undefined]);
+  assert.equal(d.log.at(-1).result.cause, undefined);
 });
 
 test("pre-review L2: every call writes at most one phase row", async () => {

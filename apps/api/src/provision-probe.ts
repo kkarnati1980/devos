@@ -21,7 +21,7 @@ export interface PhaseRecord {
   at: string; // ISO time the phase was entered
   fingerprint: string; // hash of the provisioning code in the image when the cycle started
   inventory1?: InventoryRow[];
-  result?: { ok: boolean; code: string; detail?: string; cause?: string };
+  result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
 }
 
 export type RunOutcome = "done" | "in_progress" | { error: string };
@@ -49,7 +49,8 @@ export interface ProbeDeps {
 }
 
 /** exit 0 pass, 1 fail, 3 skipped / in progress (the server agent's codes). */
-export interface ProbeTick { exit: 0 | 1 | 3; phase: Phase | "idle"; cycle: number; code: string; detail?: string }
+/** `cause`/`causeDetail` (DEVOS-21 diagnostics): the earlier failure a failed purge ended, so one check line names both. */
+export interface ProbeTick { exit: 0 | 1 | 3; phase: Phase | "idle"; cycle: number; code: string; detail?: string; cause?: string; causeDetail?: string }
 
 const full = (r: InventoryRow) => `${r.provider}\u0000${r.externalId}\u0000${r.name}`;
 
@@ -145,10 +146,11 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     await d.record({ ...last, ...extra, phase: to, at: at() });
     return { exit: 3, phase: to, cycle, code: "in_progress" };
   };
-  const finish = async (ok: boolean, code: string, detail?: string, cause?: string): Promise<ProbeTick> => {
-    const result = { ok, code, ...(detail !== undefined ? { detail } : {}), ...(cause ? { cause } : {}) };
+  const finish = async (ok: boolean, code: string, detail?: string, cause?: { code: string; detail?: string }): Promise<ProbeTick> => {
+    const why = cause ? { cause: cause.code, ...(cause.detail !== undefined ? { causeDetail: cause.detail } : {}) } : {};
+    const result = { ok, code, ...(detail !== undefined ? { detail } : {}), ...why };
     await d.record({ ...last, phase: "done", at: at(), result });
-    return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail };
+    return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail, ...why };
   };
 
   // Pre-review L3: a deploy that changed the provisioning code mid-cycle makes the compare meaningless.
@@ -190,7 +192,7 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       const earlier = last.result && !last.result.ok ? last.result : undefined;
       if (v === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
       // Pre-review L1: the earlier failure stays in the done row as `cause`.
-      if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier?.code);
+      if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier);
       if (earlier) return finish(false, earlier.code, earlier.detail);
       return finish(true, "pass");
     }
