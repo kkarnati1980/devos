@@ -516,6 +516,9 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     let seenPublic = 0;
     let complete = false;
     const ids = new Set<number>();
+    // Codex PR223-r23: a repository name (case-insensitive; every entry here is the owner's) is seen once too, so a
+    // repository replaced mid-listing (same name, new id) never counts twice and masks an omitted one.
+    const names = new Set<string>();
     const bound = { last: null as number | null };
     for (let page = 1; page <= maxPages; page++) {
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
@@ -529,9 +532,10 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       for (const e of r.body as { id?: unknown; name?: unknown; private?: unknown; owner?: { login?: unknown } }[]) {
         const ownerOk = typeof e?.owner?.login === "string" ? e.owner.login.toLowerCase() === opts.owner.toLowerCase() : priv !== undefined && e?.owner === undefined;
         const ok = e !== null && typeof e === "object" && typeof e.id === "number" && !ids.has(e.id) && typeof e.name === "string" && e.name !== ""
-          && ownerOk && (priv !== undefined || typeof e.private === "boolean");
+          && !names.has(e.name.toLowerCase()) && ownerOk && (priv !== undefined || typeof e.private === "boolean");
         if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
         ids.add(e.id as number);
+        names.add((e.name as string).toLowerCase());
         if (e.private === false) seenPublic++;
       }
       seen += r.body.length;

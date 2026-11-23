@@ -319,7 +319,7 @@ test("DEVOS-21 part 3 (r17): a full page named as last by rel=last ends the list
     if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 100 }), { status: 200 });
     const page = Number(x.searchParams.get("page"));
     const body = kind === "scan" ? Array.from({ length: 100 }, (_, i) => ({ full_name: `${OWNER}/p${page}-${i}`, name: `p${page}-${i}`, description: null }))
-      : mkRepos(100).map((e) => ({ ...e, id: e.id + page * 1000 }));
+      : mkRepos(100).map((e) => ({ ...e, id: e.id + page * 1000, name: `p${page}-${e.name}` }));
     const link = page === 1 ? `<${u(2)}>; rel="next", <${u(2)}>; rel="last"` : `<${u(1)}>; rel="first"`;
     return new Response(JSON.stringify(page <= pages ? body : []), { status: 200, headers: { link } });
   };
@@ -414,4 +414,12 @@ test("DEVOS-21 part 3 (r22): a link with an anchor is malformed", async () => {
   }, sleep: async () => {} });
   await assert.rejects(githubTokenScopeCheck(gh, { owner: OWNER, maxPages: 3 })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(gh, { maxPages: 3 }).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
+});
+
+// Codex PR223-r23: the preflight sees each repository name once (case-insensitive) as well as each id, on both paths.
+test("DEVOS-21 part 3 (r23): a repeated repository name with a new id never counts twice", async () => {
+  const e = (id, name, priv = false) => ({ id, name, private: priv, owner: { login: OWNER } });
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 2, owned_private_repos: 0 }, list: [e(1, "a"), e(2, "a")] })), /repository list is unreadable/);
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 2 }, scopes: "repo", list: [e(1, "a"), e(2, "A")] })), /repository list is unreadable/);
+  await check(fake({ user: { ...pub, public_repos: 2 }, scopes: "repo", list: [e(1, "a"), e(2, "b")] }));
 });
