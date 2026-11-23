@@ -345,9 +345,20 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     }
     let seen = 0;
     let complete = false;
+    const ids = new Set<number>();
     for (let page = 1; page <= maxPages; page++) {
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
       if (r.status !== 200 || !Array.isArray(r.body)) throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r2: on the scope proof the list is the only count, so every entry must be an identifiable repo
+      // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
+      if (priv === undefined) {
+        for (const e of r.body as { id?: unknown; name?: unknown; owner?: { login?: unknown } }[]) {
+          const ok = e !== null && typeof e === "object" && typeof e.id === "number" && !ids.has(e.id) && typeof e.name === "string" && e.name !== ""
+            && typeof e.owner?.login === "string" && e.owner.login.toLowerCase() === opts.owner.toLowerCase();
+          if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
+          ids.add(e.id as number);
+        }
+      }
       seen += r.body.length;
       if (r.body.length < 100) { complete = true; break; }
     }

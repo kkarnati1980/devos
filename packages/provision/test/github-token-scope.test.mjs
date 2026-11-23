@@ -8,7 +8,7 @@ const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const OWNER = "kkarnati1980";
 
 // A fake api.github.com: GET /user answers `user` with the given scopes header; GET /user/repos pages `repos`.
-function fake({ user, scopes, repos = 1 }) {
+function fake({ user, scopes, repos = 1, list }) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     const u = new URL(url);
@@ -18,7 +18,7 @@ function fake({ user, scopes, repos = 1 }) {
     }
     if (u.pathname === "/user/repos") {
       const page = Number(u.searchParams.get("page"));
-      const all = Array.from({ length: repos }, (_, i) => ({ id: i + 1, name: `r${i}` }));
+      const all = list ?? Array.from({ length: repos }, (_, i) => ({ id: i + 1, name: `r${i}`, owner: { login: OWNER } }));
       return new Response(JSON.stringify(all.slice((page - 1) * 100, page * 100)), { status: 200 });
     }
     return new Response(null, { status: 404 });
@@ -59,6 +59,14 @@ test("DEVOS-21 part 3: the scope proof never replaces the owner check, a full li
   await assert.rejects(check(fake({ user: { ...pub, login: "someone-else" }, scopes: "repo" })), /another account/);
   await assert.rejects(check(fake({ user: pub, scopes: "repo", repos: 100 }), { maxPages: 1 }), /repository list is unreadable/);
   await assert.rejects(check(fake({ user: { ...pub, public_repos: 5 }, scopes: "repo", repos: 1 })), /sees 1 of 5/);
+});
+
+test("Codex PR223-r2: on the scope proof, every listed entry must be an identifiable repo of the owner", async () => {
+  const good = { id: 7, name: "r", owner: { login: OWNER } };
+  for (const list of [[{}], [null], [{ ...good, id: "7" }], [{ ...good, name: "" }], [{ ...good, owner: undefined }], [{ ...good, owner: { login: "someone-else" } }], [good, good]]) {
+    await assert.rejects(check(fake({ user: { ...pub, public_repos: list.length }, scopes: "repo", list })), /repository list is unreadable/, JSON.stringify(list));
+  }
+  await check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [{ ...good, owner: { login: OWNER.toUpperCase() } }] }));
 });
 
 test("DEVOS-21 part 3: a classic repo token passes at exactly public_repos, reading every page on one token", async () => {
