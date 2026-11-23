@@ -7,20 +7,14 @@ import { GitHubClient, linkNext } from "../dist/index.js";
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const OWNER = "kkarnati1980";
 
-// A fake api.github.com: GET /user answers `user` (with an optional X-OAuth-Scopes header); GET /user/repos pages `repos`.
-function fake({ user, scopes, repos = 1, list, link, pages }) {
+// A fake api.github.com: GET /user answers `user` (with an optional X-OAuth-Scopes header).
+function fake({ user, scopes }) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     const u = new URL(url);
     calls.push({ path: u.pathname, auth: init.headers?.authorization });
     if (u.pathname === "/user") {
       return new Response(JSON.stringify(user), { status: 200, headers: scopes === undefined ? {} : { "x-oauth-scopes": scopes } });
-    }
-    if (u.pathname === "/user/repos") {
-      const page = Number(u.searchParams.get("page"));
-      const all = list ?? Array.from({ length: repos }, (_, i) => ({ id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } }));
-      const body = pages ? (pages[page] ?? []) : all.slice((page - 1) * 100, page * 100);
-      return new Response(JSON.stringify(body), { status: 200, headers: link && page === 1 ? { link } : {} });
     }
     return new Response(null, { status: 404 });
   };
@@ -126,8 +120,6 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
   }
   // Codex PR223-r34 tightened this (was "none"): an extension URI relation type is unparseable.
   assert.equal(linkNext(h('<https://x/y>; rel="prev https://example.com/rel/more last"')), "malformed", "extension URI types are unparseable");
-  // Both readers: page 1 advertises page 3, page 2 is empty with no Link. Neither may read page 2 as the end.
-  const link = '<https://api.github.com/user/repos?page=3>; rel="next"';
 });
 
 test("DEVOS-21 part 3 (r15): rel=last must agree with rel=next", async () => {
@@ -150,11 +142,9 @@ test("DEVOS-21 part 3 (r15): rel=last must agree with rel=next", async () => {
   ]) {
     assert.equal(linkNext(h(v), want), "malformed", v);
   }
-  // Both readers: a short page 1 that names page 3 as last and has no rel=next is unreadable, never complete.
-  const link = `<${u(3)}>; rel="last"`;
 });
 
-test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=last binds later pages", async () => {
+test("DEVOS-21 part 3 (r16): an earlier rel=last binds later pages", async () => {
   const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
   const want = (pg) => ({ origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: String(pg + 1), affiliation: "owner" } });
   const bound = { last: null };
@@ -165,16 +155,22 @@ test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=las
   assert.equal(linkNext(new Headers({ link: `<${u(3)}>; rel="next"` }), { ...want(2), bound: { last: 3 } }), "next");
   assert.equal(linkNext(new Headers(), { ...want(3), bound: { last: 3 } }), "none", "the told last page, no Link");
   assert.equal(linkNext(new Headers({ link: `<${u(4)}>; rel="next"` }), { ...want(3), bound: { last: 3 } }), "malformed", "a next past the told last page");
-
-  // (1) With the private count present: 100 repos on page 1 meet the count, page 1 says next, the cap is 1 page.
-  const full = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, name: `r${i}`, private: i >= 50, owner: { login: OWNER } }));
+  // Pre-review (DEVOS-253): a page after the told last page is past the end, whatever it answers.
+  assert.equal(linkNext(new Headers(), { ...want(4), bound: { last: 3 } }), "malformed", "a page after the told last page");
 });
 
-test("DEVOS-21 part 3 (r18/r34): identity on the count path; an extension URI relation type is unparseable", async () => {
-  const dup = [{ id: 1, name: "a", private: false, owner: { login: OWNER } }, { id: 1, name: "a", private: true, owner: { login: OWNER } }];
+test("DEVOS-21 part 3 (r34): an extension URI relation type is unparseable", async () => {
+  const h = (link) => new Headers({ link });
+  const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
+  // Codex PR223-r34 tightened these two (were "none" and "next"): GitHub sends only registered relation names.
+  for (const v of ['<https://x.example/meta>; rel="urn:example:metadata"', '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next tag:example.com,2026:rel"',
+    '<https://x/y>; rel="https://example.com:abc/relation"', '<https://x/y>; rel="https://example.com/relation"',
+'<https://x/y>; rel="urn:example:rel#one#two"', '<https://x/y>; rel="urn:a%2"', '<https://x/y>; rel="urn:"', '<https://x/y>; rel="1urn:x"', '<https://x/y>; rel="urn:a%zz"', '<https://x/y>; rel="urn:a<b"']) {
+    assert.equal(linkNext(h(v), want), "malformed", v);
+  }
 });
 
-test("DEVOS-21 part 3 (r21): a link without rel is malformed, and the scan refuses a repeated repository", async () => {
+test("DEVOS-21 part 3 (r21): a link without rel, or with two, is malformed", async () => {
   const h = (link) => new Headers({ link });
   const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
   const next = "https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner";
@@ -184,7 +180,6 @@ test("DEVOS-21 part 3 (r21): a link without rel is malformed, and the scan refus
   assert.equal(linkNext(h(`<https://x/?page=1>; rel="prev", <${next}>`), want), "malformed", "second link has no rel");
   assert.equal(linkNext(h(`<${next}>; rel="next"`), want), "next");
   // A short page whose Link header names page 2 without a rel fails the preflight and the scan.
-  const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme" };
 });
 
 test("DEVOS-21 part 3 (r22): a link with an anchor is malformed", async () => {
@@ -193,7 +188,6 @@ test("DEVOS-21 part 3 (r22): a link with an anchor is malformed", async () => {
   assert.equal(linkNext(new Headers({ link: `<${u(1)}>; rel="last"; anchor="https://api.github.com/other"` }), want), "malformed");
   assert.equal(linkNext(new Headers({ link: `<${u(2)}>; anchor="https://api.github.com/other"; rel="next"` }), want), "malformed");
   assert.equal(linkNext(new Headers({ link: `<${u(2)}>; rel="next"` }), { ...want, bound: { last: null } }), "next");
-  const mkRepos = (n) => Array.from({ length: n }, (_, i) => ({ id: i + 1, name: `r${i + 1}`, full_name: `${OWNER}/r${i + 1}`, private: false, description: null, owner: { login: OWNER } }));
 });
 
 test("DEVOS-21 part 3 (r25): quoted values follow the quoted-string grammar", () => {
@@ -204,14 +198,13 @@ test("DEVOS-21 part 3 (r25): quoted values follow the quoted-string grammar", ()
   assert.equal(linkNext(h('<https://x/?page=1>; rel="prev"; title="a\tb \\"q\\" [x] ~"')), "none");
 });
 
-test("DEVOS-21 part 3 (r26): Unicode spaces are malformed, and an oversized page is unreadable", async () => {
+test("DEVOS-21 part 3 (r26): Unicode spaces are malformed", async () => {
   const h = (link) => ({ get: (k) => (k.toLowerCase() === "link" ? link : null) });
   assert.equal(linkNext(h('<https://x/?page=1>; rel="prev\u00a0"')), "malformed");
   assert.equal(linkNext(h('<https://x/?page=1>;\u00a0rel="prev"')), "malformed");
   assert.equal(linkNext(h('<https://x/?page=1>; rel="prev",\u2003<https://x/?page=0>; rel="first"')), "malformed");
   assert.equal(linkNext(h('<https://x/?page=1>;\trel="prev  first"')), "none");
   const u = (p) => `https://api.github.com/user/repos?per_page=100&page=${p}&affiliation=owner`;
-  const many = Array.from({ length: 101 }, (_, i) => ({ id: i + 1, name: `r${i + 1}`, full_name: `${OWNER}/r${i + 1}`, private: false, description: null, owner: { login: OWNER } }));
 });
 
 test("DEVOS-21 part 3 (r32): rel=prev and rel=first must name exactly the previous and first pages", async () => {
