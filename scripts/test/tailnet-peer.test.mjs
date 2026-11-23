@@ -24,12 +24,13 @@ const ct = (client, back, port = 3001) =>
 // `tailscale set --snat-subnet-routes=false` empties it (unless setNoop) and logs the call; `tailscale debug prefs`
 // prints `prefs`; `tailscale ip -4` prints `ip`; `conntrack -L ... --dport <p>` prints the file ct.<p>.
 function run(name, script, { chain, prefs = '{"AdvertiseRoutes":null}', setRc = 0, setNoop = false, ip = HOST,
-  conntrack, noTailscale = false, noIptables = false, conf = "" } = {}) {
+  conntrack, noTailscale = false, noIptables = false, conf = "", ctDel = "ok", pending = false } = {}) {
   const dir = path.join(tmp, name);
   const bin = path.join(dir, "bin");
   fs.mkdirSync(path.join(dir, "devos"), { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
   fs.writeFileSync(path.join(dir, "devos/server-agent.conf"), conf);
+  if (pending) fs.writeFileSync(path.join(dir, "devos/tailnet-snat.cut-pending"), "");
   const chainFile = path.join(dir, "chain");
   if (chain !== undefined) fs.writeFileSync(chainFile, chain);
   if (!noIptables) fs.writeFileSync(path.join(bin, "iptables"), `#!/usr/bin/env bash
@@ -49,13 +50,16 @@ esac\n`, { mode: 0o755 });
   if (conntrack) {
     for (const [p, lines] of Object.entries(conntrack)) fs.writeFileSync(path.join(dir, `ct.${p}`), lines.join("\n") + (lines.length ? "\n" : ""));
     fs.writeFileSync(path.join(bin, "conntrack"), `#!/usr/bin/env bash
-[[ "$1" == "-D" ]] && { echo "$*" >> "${dir}/ct.del"; exit 0; }
+[[ "$1" == "-D" ]] && { echo "$*" >> "${dir}/ct.del"; case "${ctDel}" in
+  ok) exit 0 ;; none) echo "conntrack v1.4.6 (conntrack-tools): 0 flow entries have been deleted." >&2; exit 1 ;; *) exit 124 ;; esac; }
 [[ "$1 $2 $3 $4 $5" == "-L -p tcp -d ${ip}" && "$6" == "--dport" ]] || exit 9
 f="${dir}/ct.$7"; [[ -f "$f" ]] || exit 1
 cat "$f"; echo "conntrack v1.4.6 (conntrack-tools): 1 flow entries have been shown." >&2\n`, { mode: 0o755 });
   }
-  for (const t of ["timeout", "cat", "bash", "grep", "sed", "head", "jq", "sleep", "printf"]) {
-    const real = spawnSync("bash", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
+  for (const t of ["timeout", "cat", "bash", "grep", "sed", "head", "jq", "sleep", "printf", "rm"]) {
+    // The system copy first: a wrapper earlier on the developer's PATH must not stand in for it.
+    const sys = ["/usr/bin", "/bin"].map((d) => path.join(d, t)).find((f) => fs.existsSync(f));
+    const real = sys || spawnSync("bash", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
     if (real && real.startsWith("/")) fs.symlinkSync(real, path.join(bin, t));
   }
   const r = spawnSync("/bin/bash", [script], { encoding: "utf8", env: { PATH: bin, DEVOS_DIR: path.join(dir, "devos") } });
@@ -76,6 +80,27 @@ test("AT-d-1f: after the fix, old tailnet connections on the API and dashboard p
   assert.match(r.out, /old masqueraded connections on ports 3001 and 3000 cut/);
   assert.deepEqual(fs.readFileSync(path.join(tmp, "cut", "ct.del"), "utf8").trim().split("\n"),
     ["-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3001", "-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3000"]);
+});
+
+test("AT-d-1h: a failed cut is owed: exit 1, marker kept, retried on the next (already clean) tick (Codex PR220-r1)", () => {
+  const a = run("cutfail", FIX, { chain: MASQ, conntrack: {}, ctDel: "timeout" });
+  assert.equal(a.code, 1, a.out);
+  assert.match(a.out, /fail: cutting old connections on port 3001 failed \(conntrack exit 124\); retried next tick/);
+  assert.ok(fs.existsSync(path.join(tmp, "cutfail", "devos/tailnet-snat.cut-pending")), "the cut stays owed");
+  const b = run("cutretry", FIX, { chain: CLEAN, conntrack: {}, ctDel: "none", pending: true });
+  assert.equal(b.code, 0, b.out);
+  assert.match(b.out, /^ok: .*\nold masqueraded connections on ports 3001 and 3000 cut/);
+  assert.ok(!fs.existsSync(path.join(tmp, "cutretry", "devos/tailnet-snat.cut-pending")), "done once, marker gone");
+  const c = run("cutnone", FIX, { chain: CLEAN, conntrack: {} });
+  assert.deepEqual([c.code, c.out], [0, "ok: tailscaled does not masquerade forwarded tailnet traffic"], "nothing owed: no cut");
+  assert.ok(!fs.existsSync(path.join(tmp, "cutnone", "ct.del")));
+});
+
+test("AT-d-1i: prefs without AdvertiseRoutes, or with a non-list value, are not read as \"no routes\" (Codex PR220-r1)", () => {
+  for (const [n, prefs] of [["pempty", "{}"], ["pstr", '{"AdvertiseRoutes":"10.0.0.0/8"}'], ["parr", "[]"]]) {
+    const r = run(n, FIX, { chain: MASQ, prefs });
+    assert.deepEqual([r.code, r.sets, r.out], [1, 0, "fail: cannot read AdvertiseRoutes from tailscale prefs; not changed"], n);
+  }
 });
 
 test("AT-d-1g: skipped without iptables", () => {
@@ -137,6 +162,12 @@ test("AT-d-2d: ports come from server-agent.conf; non-tailnet clients are not co
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /port 4001: 1 inbound/);
   assert.match(r.out, /port 4000: 1 inbound/);
+});
+
+test("AT-d-2f: no readable chain and no tailnet client in conntrack: skipped, never a pass (Codex PR220-r1)", () => {
+  const r = run("cidle", CHECK, { conntrack: { 3001: [ct(HOST, HOST)], 3000: [] } });
+  assert.equal(r.code, 3, r.out);
+  assert.match(r.out, /skipped: no ts-postrouting chain and no inbound tailnet connection to observe$/);
 });
 
 test("AT-d-2e: skipped without a tailnet address or with nothing readable; conntrack missing reads the rule only", () => {

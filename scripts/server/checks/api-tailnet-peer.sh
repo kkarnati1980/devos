@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # DevOS server check (S4-d, DEVOS-251; M1.2 depends on it): inbound tailnet connections to the DevOS API and
 # dashboard keep the client's own address, so AccessGuard's `tailscale whois` sees the real peer and never the
-# bridge gateway. Read-only. Exit 0 pass, 1 fail, 3 skipped (no tailnet IPv4, or nothing could be read).
+# bridge gateway. Read-only. Exit 0 pass, 1 fail, 3 skipped (no tailnet IPv4; or no readable chain and no
+# inbound tailnet connection seen in conntrack, so nothing was observed).
 # Two independent reads:
 #   1. tailscaled's masquerade rule: `iptables -t nat -S ts-postrouting` holding a MASQUERADE rule fails
 #      (tailnet-snat.sh turns it off every agent tick).
@@ -20,7 +21,7 @@ TAILNET='^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$'
 TS_IP="$(timeout 10 tailscale ip -4 2>/dev/null | head -n1)"
 [[ "$TS_IP" =~ $TAILNET ]] || { echo "skipped: no tailnet IPv4 (tailscale ip -4)"; exit 3; }
 
-rc=0; read_any=0
+rc=0; read_any=0; seen=0
 if out="$(timeout 10 iptables -w 5 -t nat -S ts-postrouting 2>/dev/null)"; then
   read_any=1
   if grep -qE -- '^-A ts-postrouting( .*)? -j MASQUERADE( |$)' <<<"$out"; then
@@ -38,7 +39,7 @@ if command -v conntrack >/dev/null 2>&1; then
     if ! lines="$(timeout 10 conntrack -L -p tcp -d "$TS_IP" --dport "$p" 2>/dev/null)"; then
       echo "note: conntrack could not be read for port $p"; continue
     fi
-    read_any=1; n=0; bad=0; ex=""
+    n=0; bad=0; ex=""
     while IFS= read -r l; do
       mapfile -t s < <(grep -oE 'src=[0-9.]+' <<<"$l")
       mapfile -t d < <(grep -oE 'dst=[0-9.]+' <<<"$l")
@@ -48,6 +49,7 @@ if command -v conntrack >/dev/null 2>&1; then
       n=$((n+1))
       if [[ "$back" != "$client" ]]; then bad=$((bad+1)); [[ -n "$ex" ]] || ex=" (e.g. client $client, reply to $back)"; fi
     done <<<"$lines"
+    seen=$((seen+n))
     if (( bad > 0 )); then
       echo "fail: port $p: $bad of $n inbound tailnet connection(s) have a rewritten source$ex"
       rc=1
@@ -59,5 +61,8 @@ else
   echo "note: conntrack not installed: only the masquerade rule is checked"
 fi
 
-(( read_any == 1 )) || { echo "skipped: neither the ts-postrouting chain nor conntrack could be read"; exit 3; }
+# Codex PR220-r1: conntrack proves something only when it shows at least one tailnet client; an idle host with
+# no readable chain has observed nothing, so it is a skip, never a pass.
+(( seen > 0 )) && read_any=1
+(( read_any == 1 || rc != 0 )) || { echo "skipped: no ts-postrouting chain and no inbound tailnet connection to observe"; exit 3; }
 exit "$rc"
