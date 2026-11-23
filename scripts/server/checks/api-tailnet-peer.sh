@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DevOS server check (S4-d, DEVOS-251; M1.2 depends on it): inbound tailnet connections to the DevOS API and
 # dashboard keep the client's own address, so AccessGuard's `tailscale whois` sees the real peer and never the
-# bridge gateway. Read-only. Exit 0 pass, 1 fail, 3 skipped (no tailnet IPv4).
+# bridge gateway. Read-only. Exit 0 pass, 1 fail, 3 skipped (tailscale not installed).
 # Two independent reads:
 #   1. tailscaled's preference: `tailscale debug prefs` with NoSNAT false (subnet-route SNAT on) fails, and so do
 #      unreadable prefs (tailnet-snat.sh turns it off every agent tick).
@@ -17,8 +17,10 @@ API="$(port_of API_PORT)"; API="${API:-3001}"
 DASH="$(port_of DASHBOARD_PORT)"; DASH="${DASH:-3000}"
 TAILNET='^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$'
 
+# Codex PR220-r13: only a host without tailscale is a skip; a lookup that fails or returns no tailnet IPv4 fails.
+command -v tailscale >/dev/null 2>&1 || { echo "skipped: tailscale not installed"; exit 3; }
 TS_IP="$(timeout 10 tailscale ip -4 2>/dev/null | head -n1)"
-[[ "$TS_IP" =~ $TAILNET ]] || { echo "skipped: no tailnet IPv4 (tailscale ip -4)"; exit 3; }
+[[ "$TS_IP" =~ $TAILNET ]] || { echo "fail: no tailnet IPv4 from tailscale ip -4 (lookup failed or tailscale is down)"; exit 1; }
 
 rc=0; read_any=0; seen=0
 # The preference, not a firewall rule: tailscaled runs in nftables mode on the DevOS server (DEVOS-89, 14:10 IST),

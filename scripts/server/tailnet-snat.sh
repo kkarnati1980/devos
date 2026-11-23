@@ -59,6 +59,13 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
   api="$(sed -n 's/^API_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
   dash="$(sed -n 's/^DASHBOARD_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
   for p in "${api:-3001}" "${dash:-3000}"; do
+    # Codex PR220-r13: the routes are read again right before each delete; a host that advertises routes by then
+    # is not cut and the run fails (decision 6). Only the sub-second gap to the delete itself remains (the same
+    # race decision 6 accepts and reports).
+    read_prefs >/dev/null || { echo "fail: cannot read tailscale prefs before cutting port $p; retried next tick"; return 1; }
+    if (( ROUTES > 0 )); then
+      echo "fail: this host started advertising $ROUTES route(s); no further connection is cut (KK decision)"; return 1
+    fi
     # Codex PR220-r2: --src-nat deletes only flows that were source-NATed, so a retry never touches a healthy
     # flow that reconnected with the client's own address.
     err="$(timeout 10 conntrack -D -p tcp -s 100.64.0.0/10 -d "$ts" --dport "$p" --src-nat 2>&1 >/dev/null)"; rc=$?

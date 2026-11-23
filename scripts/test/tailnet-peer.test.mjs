@@ -99,6 +99,21 @@ test("AT-d-1l: routes that appear during the change: nothing undone, nothing cut
   assert.equal(next.code, 1, "the next tick still fails: never reported as success");
 });
 
+test("AT-d-1n: routes that appear during the clean-up stop the next delete and fail (Codex PR220-r13)", () => {
+  const dir = path.join(tmp, "cutrace");
+  // A conntrack fake that turns on routes after its first delete.
+  const r = run("cutrace", FIX, { nosnat: true, conntrack: {}, pending: true, ctDel: "ok" });
+  assert.equal(r.code, 0, r.out);   // baseline: both ports cut with no routes
+  fs.rmSync(path.join(dir, "ct.del"));
+  fs.writeFileSync(path.join(dir, "devos/tailnet-snat.cut-pending"), "");
+  fs.writeFileSync(path.join(dir, "bin/conntrack"), `#!/usr/bin/env bash\necho "$*" >> "${dir}/ct.del"; echo '["10.0.0.0/24"]' > "${dir}/routes"; exit 0\n`, { mode: 0o755 });
+  const r2 = spawnSync("/bin/bash", [FIX], { encoding: "utf8", env: { PATH: path.join(dir, "bin"), DEVOS_DIR: path.join(dir, "devos") } });
+  assert.equal(r2.status, 1, r2.stdout);
+  assert.match(r2.stdout, /fail: this host started advertising 1 route\(s\); no further connection is cut \(KK decision\)/);
+  assert.equal(fs.readFileSync(path.join(dir, "ct.del"), "utf8").trim().split("\n").length, 1, "only the first port was cut");
+  assert.ok(fs.existsSync(path.join(dir, "devos/tailnet-snat.cut-pending")), "the cut stays owed");
+});
+
 test("AT-d-1d: a failed set, or NoSNAT still false afterwards, are failures", () => {
   const b = run("setfail", FIX, { setRc: 1 });
   assert.deepEqual([b.code, b.sets, b.out], [1, 1, "fail: tailscale set --snat-subnet-routes=false did not succeed"]);
@@ -200,8 +215,11 @@ test("AT-d-2g: conntrack installed but unreadable for a port fails, even with No
   assert.match(r.out, /fail: conntrack could not be read for port 3000/);
 });
 
-test("AT-d-2e: skipped without a tailnet address; conntrack missing reads the preference only", () => {
-  assert.equal(run("cnoip", CHECK, { nosnat: true, ip: "" }).code, 3);
+test("AT-d-2e: skipped only without tailscale; no tailnet address fails; conntrack missing reads the preference only", () => {
+  const noip = run("cnoip", CHECK, { nosnat: true, ip: "" });
+  assert.equal(noip.code, 1, "a failed tailnet lookup is a failure, not a skip (Codex PR220-r13)");
+  assert.match(noip.out, /^fail: no tailnet IPv4/);
+  assert.equal(run("cnots", CHECK, { noTailscale: true }).code, 3);
   const r = run("cnoct", CHECK, { nosnat: true });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /note: conntrack not installed: only the preference is checked/);
