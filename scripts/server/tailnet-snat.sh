@@ -67,10 +67,14 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
 }
 
 read_prefs || exit 1
+# A subnet router or exit node is left alone in every branch (Codex PR220-r5): no preference change and no
+# conntrack clean-up; only a report. Changing it there is a KK decision.
+if (( ROUTES > 0 )) && [[ "$NOSNAT" == true ]]; then
+  echo "ok: subnet-route SNAT is off (NoSNAT true); this host advertises $ROUTES route(s), so nothing is cut (KK decision)"; exit 0
+fi
 if [[ "$NOSNAT" == true ]]; then
   echo "ok: subnet-route SNAT is off (NoSNAT true)"; cut_old || exit 1; exit 0
 fi
-# A subnet router or exit node needs the setting; changing it there is a KK decision, so only report.
 if (( ROUTES > 0 )); then
   echo "fail: this host advertises $ROUTES route(s) (subnet router or exit node); subnet-route SNAT left on (KK decision)"
   exit 1

@@ -83,6 +83,13 @@ test("AT-d-1c: a host that advertises routes (subnet router or exit node) is lef
   assert.match(r.out, /advertises 2 route\(s\).*KK decision/);
 });
 
+test("AT-d-1k: a route-advertising host with a cut still owed is never cut (Codex PR220-r5)", () => {
+  const r = run("routercut", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', conntrack: {}, pending: true });
+  assert.deepEqual([r.code, r.sets], [0, 0], r.out);
+  assert.match(r.out, /advertises 1 route\(s\), so nothing is cut \(KK decision\)$/);
+  assert.ok(!fs.existsSync(path.join(r.dir, "ct.del")), "no conntrack delete");
+});
+
 test("AT-d-1d: a failed set, or NoSNAT still false afterwards, are failures", () => {
   const b = run("setfail", FIX, { setRc: 1 });
   assert.deepEqual([b.code, b.sets, b.out], [1, 1, "fail: tailscale set --snat-subnet-routes=false did not succeed"]);
