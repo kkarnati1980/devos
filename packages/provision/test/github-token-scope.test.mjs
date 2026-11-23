@@ -71,7 +71,7 @@ test("Codex PR223-r2: on the scope proof, every listed entry must be an identifi
 });
 
 test("Codex PR223-r3: a short page with a Link rel=next is not the last page", async () => {
-  const link = '<https://api.github.com/user/repos?page=2>; rel="next", <https://api.github.com/user/repos?page=2>; rel="last"';
+  const link = '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next", <https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="last"';
   // Page 2 is empty here, so the list ends there; the point is that page 2 is read.
   const f = fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link });
   await check(f);
@@ -110,7 +110,7 @@ test("DEVOS-21 part 3 (r4): githubScanner follows Link rel=next past a short pag
     const u = new URL(url);
     const page = Number(u.searchParams.get("page"));
     seen.push(page);
-    const headers = page === 1 ? { link: '<https://api.github.com/user/repos?page=2>; rel="next"' } : {};
+    const headers = page === 1 ? { link: '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"' } : {};
     return new Response(JSON.stringify(pages[page] ?? []), { status: 200, headers });
   };
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
@@ -194,15 +194,22 @@ test("DEVOS-21 part 3 (r8): a malformed Link header fails the preflight and the 
 // `rel=next` that names exactly the page it reads next, or the listing is unreadable (never "complete").
 test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must name the next page", async () => {
   const h = (link) => new Headers({ link });
-  for (const v of ["<https://api.github.com/user/repos#one#two>; rel=last", "<user/repos?page=2>; rel=next", "<https://[::1]/user/repos?page=2>; rel=next"]) {
+  for (const v of ["<https://api.github.com/user/repos#one#two>; rel=last", "<user/repos?page=2>; rel=next", "<https://[::1]/user/repos?page=2>; rel=next",
+    // Codex PR223-r12: an invalid authority is unparseable whatever the rel.
+    "<https://api.github.com:abc/user/repos?page=2>; rel=last", "<https://u@api.github.com/user/repos>; rel=last", "<https://api.github.com:99999/x>; rel=last", "<ftp://x/y>; rel=last"]) {
     assert.equal(linkNext(h(v)), "malformed", v);
   }
-  const want = { path: "/user/repos", page: 2 };
+  const want = { path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
   assert.equal(linkNext(h('<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"'), want), "next");
   assert.equal(linkNext(h('<https://api.github.com/user/repos?page=9>; rel="last"'), want), "none", "rel=last is not checked");
   for (const v of [
-    '<https://api.github.com/user/repos?page=3>; rel="next"',
-    '<https://api.github.com/user/repos?page=02>; rel="next"',
+    '<https://api.github.com/user/repos?per_page=100&page=3&affiliation=owner>; rel="next"',
+    '<https://api.github.com/user/repos?per_page=100&page=02&affiliation=owner>; rel="next"',
+    // Codex PR223-r12: a different page size shifts the offset; extra or missing parameters are not the next request.
+    '<https://api.github.com/user/repos?per_page=50&page=2&affiliation=owner>; rel="next"',
+    '<https://api.github.com/user/repos?page=2&affiliation=owner>; rel="next"',
+    '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner&type=all>; rel="next"',
+    '<https://api.github.com/user/repos?per_page=100&page=2&affiliation=all>; rel="next"',
     '<https://api.github.com/user/repos?page=2&page=3>; rel="next"',
     '<https://api.github.com/user/repos>; rel="next"',
     '<https://api.github.com/orgs/x/repos?page=2>; rel="next"',

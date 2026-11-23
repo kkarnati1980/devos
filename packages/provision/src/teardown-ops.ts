@@ -222,29 +222,37 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
 /** RFC 7230 §3.2.6 `tchar`. */
 const TCHAR = /^[A-Za-z0-9!#$%&'*+.^_`|~-]$/;
 /**
- * Codex PR223-r10/r11: a link target is an absolute RFC 3986 URI with an authority, `scheme://authority-and-path`
- * `[?query]` `[#fragment]`. Path and authority hold pchar and `/` only (no `[`/`]`: GitHub never sends an IP-literal
- * host); query and fragment add `?`; every `%` is a valid escape. So a second `#`, a space or a bracket is unparseable.
+ * Codex PR223-r10/r11/r12: a link target is an absolute `http(s)` URI: `scheme://host[:port]` (a reg-name host, a
+ * numeric port, no userinfo and no IP-literal brackets), an optional path of pchar and `/`, then an optional `?query`
+ * and `#fragment` that add only `?`; every `%` is a valid escape. It must also parse as a WHATWG URL. Anything else
+ * (a space, a second `#`, a relative target, `:abc` as a port) is unparseable, whatever its `rel`.
  */
-const P = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=:@/]|%[0-9A-Fa-f]{2})";
-const Q = `(?:${P}|\\?)`;
-const URI_REF = new RegExp(`^[A-Za-z][A-Za-z0-9+.\\-]*://${P}+(?:\\?${Q}*)?(?:#${Q}*)?$`);
+const PCHAR = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})";
+const QCHAR = `(?:${PCHAR}|[/?])`;
+const HOST = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})+";
+const URI_REF = new RegExp(`^https?://${HOST}(?::[0-9]+)?(?:/(?:${PCHAR}|/)*)?(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`, "i");
+const isLinkTarget = (t: string): boolean => {
+  if (!URI_REF.test(t)) return false;
+  try { new URL(t); return true; } catch { return false; }
+};
 
 /**
  * Codex PR223-r3/r4/r8: GitHub's `Link` response header names a next page (`rel="next"`); a header that cannot be parsed is "malformed". Both the purge scope preflight
  * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
  */
-export function linkNext(headers: { get(name: string): string | null } | undefined, expect?: { path: string; page: number }): "next" | "none" | "malformed" {
+export function linkNext(headers: { get(name: string): string | null } | undefined, expect?: { path: string; query: Readonly<Record<string, string>> }): "next" | "none" | "malformed" {
   const raw = headers?.get("link") ?? "";
-  // Codex PR223-r11: with `expect`, every `rel=next` target must be the page the reader requests next (same path,
-  // exactly one `page` parameter equal to `expect.page`), or the header is malformed. A reader that walks pages by
-  // counting can then never skip an advertised page.
+  // Codex PR223-r11/r12: with `expect`, every `rel=next` target must be exactly the request the reader makes next:
+  // the same path and the same query parameters (each once, same value, none extra; so `page` and `per_page` both
+  // match), or the header is malformed. A reader that walks pages by counting can then never skip or shift a page.
   const nextOk = (target: string): boolean => {
     if (!expect) return true;
-    let u: URL;
-    try { u = new URL(target); } catch { return false; }
-    const pages = u.searchParams.getAll("page");
-    return u.pathname === expect.path && pages.length === 1 && pages[0] === String(expect.page);
+    const u = new URL(target);
+    if (u.pathname !== expect.path) return false;
+    const keys = [...u.searchParams.keys()];
+    const want = Object.keys(expect.query);
+    if (keys.length !== want.length) return false;
+    return want.every((k) => { const v = u.searchParams.getAll(k); return v.length === 1 && v[0] === expect.query[k]; });
   };
   // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
   // never splits a link. Each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a space-separated
@@ -263,7 +271,7 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
     // Codex PR223-r10: the target must be a URI reference (RFC 3986 characters only, every `%` a valid escape);
     // a space, quote or other character outside that set (e.g. `<bad target>`) makes the header malformed.
     const target = raw.slice(i + 1, close);
-    if (!URI_REF.test(target)) return "malformed";
+    if (!isLinkTarget(target)) return "malformed";
     i = close + 1;
     for (;;) {
       sp();
@@ -345,7 +353,7 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
           }
         }
         // Codex PR223-r4: as in the scope preflight, a short page is the last one only when no Link rel=next follows.
-        const link = linkNext(r.headers, { path: "/user/repos", page: page + 1 });
+        const link = linkNext(r.headers, { path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" } });
         if (link === "malformed") throw new ProviderError("github", "bad-response", "github GET /user/repos returned an unreadable Link header", r.status);
         if (link === "next") continue;
         if (r.body.length < 100) return hits;
@@ -463,7 +471,7 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       }
       seen += r.body.length;
       // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
-      const link = linkNext(r.headers, { path: "/user/repos", page: page + 1 });
+      const link = linkNext(r.headers, { path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" } });
       // Codex PR223-r8: an unparseable Link header makes the whole listing inconclusive.
       if (link === "malformed") throw new Error("github-token-scope: the repository list is unreadable");
       if (link === "next") continue;
