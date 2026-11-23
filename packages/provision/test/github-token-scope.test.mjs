@@ -161,6 +161,13 @@ test("DEVOS-21 part 3 (r6): linkHasNext tokenizes quoted values and fails closed
     assert.equal(linkNext(h(v)), "malformed", v);
   }
   assert.equal(linkHasNext(h('<https://x/?page=9>; rel="last"; hreflang=en')), false);
+  // Codex PR223-r9: names and unquoted values are RFC 7230 tokens only; any other character is malformed.
+  for (const v of ['<https://x/?page=2>; rel=next"', '<https://x/?page=2>; re"l=next', "<https://x/?page=2>; rel=ne<xt", "<https://x/?page=2>; title=a(b); rel=next", "<https://x/?page=2>; ti@tle=x; rel=next", "<https://x/?page=2>; title=; rel=next"]) {
+    assert.equal(linkNext(h(v)), "malformed", v);
+  }
+  // Token values with tchar punctuation still parse.
+  assert.equal(linkNext(h("<https://x/?page=2>; rel=next; x-a.b_c~=v1!#$%&'*+^`|")), "next");
+  assert.equal(linkNext(h("<https://x/?page=2>; rel=last; hreflang=en-US")), "none");
 });
 
 // Codex PR223-r8: a malformed Link header on any page makes the listing inconclusive for both readers.

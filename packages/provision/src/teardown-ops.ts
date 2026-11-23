@@ -223,6 +223,9 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
  * Codex PR223-r3/r4/r8: GitHub's `Link` response header names a next page (`rel="next"`); a header that cannot be parsed is "malformed". Both the purge scope preflight
  * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
  */
+/** RFC 7230 §3.2.6 `tchar`. */
+const TCHAR = /^[A-Za-z0-9!#$%&'*+.^_`|~-]$/;
+
 export function linkNext(headers: { get(name: string): string | null } | undefined): "next" | "none" | "malformed" {
   const raw = headers?.get("link") ?? "";
   // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
@@ -245,9 +248,13 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
       if (i >= n || raw[i] === ",") break;
       if (raw[i] !== ";") return "malformed";
       i++; sp();
+      // Codex PR223-r9: an allow-list grammar. A parameter name, and an unquoted value, is one or more RFC 7230
+      // token characters; any other character where one is expected (e.g. `rel=next"`, `re"l=next`, `rel=ne<xt`)
+      // makes the header malformed instead of being read as part of the name or value.
       const nameStart = i;
-      while (i < n && !/[\s=;,]/.test(raw[i] as string)) i++;
+      while (i < n && TCHAR.test(raw[i] as string)) i++;
       const name = raw.slice(nameStart, i).toLowerCase();
+      if (i < n && !/[\s=;,]/.test(raw[i] as string)) return "malformed";
       sp();
       let value = "";
       if (raw[i] === "=") {
@@ -264,8 +271,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
           if (!closed) return "malformed";
         } else {
           const vs = i;
-          while (i < n && !/[\s;,]/.test(raw[i] as string)) i++;
+          while (i < n && TCHAR.test(raw[i] as string)) i++;
           value = raw.slice(vs, i);
+          if (value === "" || (i < n && !/[\s;,]/.test(raw[i] as string))) return "malformed";
         }
       }
       // Codex PR223-r7: a parameter without a name, or a `rel` without a value (bare, `rel=` or `rel=""`), is
