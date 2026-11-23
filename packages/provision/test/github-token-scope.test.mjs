@@ -39,7 +39,11 @@ test("DEVOS-21 part 3: classicScopes reads X-OAuth-Scopes exactly, and nothing f
 });
 
 test("DEVOS-21 part 3: with the private count present, the old count rule runs unchanged", async () => {
-  await check(fake({ user: { login: OWNER, public_repos: 0, owned_private_repos: 2 }, repos: 2 }));
+  // Codex PR223-r36: the entries are private, as the reported counts say (a fixture correction: the default fake lists
+  // public entries); two public entries no longer stand in for two private repositories.
+  const privs = [{ id: 1, name: "a", private: true, owner: { login: OWNER } }, { id: 2, name: "b", private: true, owner: { login: OWNER } }];
+  await check(fake({ user: { login: OWNER, public_repos: 0, owned_private_repos: 2 }, list: privs }));
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 0, owned_private_repos: 2 }, repos: 2 })), /sees 0 of 2 private owned repositories/);
   await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 2 }, scopes: "repo", repos: 1 })), /sees 1 of 3/);
 });
 
@@ -303,8 +307,8 @@ test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=las
   assert.equal(linkNext(new Headers({ link: `<${u(4)}>; rel="next"` }), { ...want(3), bound: { last: 3 } }), "malformed", "a next past the told last page");
 
   // (1) With the private count present: 100 repos on page 1 meet the count, page 1 says next, the cap is 1 page.
-  const full = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, name: `r${i}`, owner: { login: OWNER } }));
-  const f1 = fake({ user: { login: OWNER, public_repos: 50, owned_private_repos: 50 }, list: full.concat([{ id: 999, name: "late", owner: { login: OWNER } }]), link: `<${u(2)}>; rel="next"` });
+  const full = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, name: `r${i}`, private: i >= 50, owner: { login: OWNER } }));
+  const f1 = fake({ user: { login: OWNER, public_repos: 50, owned_private_repos: 50 }, list: full.concat([{ id: 999, name: "late", private: true, owner: { login: OWNER } }]), link: `<${u(2)}>; rel="next"` });
   await assert.rejects(githubTokenScopeCheck(f1.gh, { owner: OWNER, maxPages: 1 })(), /repository list is unreadable/);
 
   // (2) Both readers: page 1 (full) names next=2 and last=3; page 2 is short with no Link header.
@@ -324,13 +328,13 @@ test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=las
 // as complete in both readers; a full last page without any rel=last stays inconclusive (unchanged).
 test("DEVOS-21 part 3 (r17): a full page named as last by rel=last ends the listing", async () => {
   const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
-  const mkRepos = (n) => Array.from({ length: n }, (_, i) => ({ id: i + 1, name: `r${i}`, owner: { login: OWNER } }));
+  const mkRepos = (n) => Array.from({ length: n }, (_, i) => ({ id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } }));
   const mkFetch = (pages, kind) => async (url) => {
     const x = new URL(url);
     if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 100 }), { status: 200 });
     const page = Number(x.searchParams.get("page"));
     const body = kind === "scan" ? Array.from({ length: 100 }, (_, i) => ({ full_name: `${OWNER}/p${page}-${i}`, name: `p${page}-${i}`, description: null }))
-      : mkRepos(100).map((e) => ({ ...e, id: e.id + page * 1000, name: `p${page}-${e.name}` }));
+      : mkRepos(100).map((e) => ({ ...e, id: e.id + page * 1000, name: `p${page}-${e.name}`, private: page === 2 }));
     const link = page === 1 ? `<${u(2)}>; rel="next", <${u(2)}>; rel="last"` : `<${u(1)}>; rel="first"`;
     return new Response(JSON.stringify(page <= pages ? body : []), { status: 200, headers: { link } });
   };
@@ -350,10 +354,10 @@ test("DEVOS-21 part 3 (r17): a full page named as last by rel=last ends the list
 // Codex PR223-r18: (1) with the private count present, a repeated repo id never counts twice; (2) an extension
 // relation type may be any absolute URI, not only an http(s) one.
 test("DEVOS-21 part 3 (r18/r34): identity on the count path; an extension URI relation type is unparseable", async () => {
-  const dup = [{ id: 1, name: "a", owner: { login: OWNER } }, { id: 1, name: "a", owner: { login: OWNER } }];
+  const dup = [{ id: 1, name: "a", private: false, owner: { login: OWNER } }, { id: 1, name: "a", private: true, owner: { login: OWNER } }];
   await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: dup })), /repository list is unreadable/);
-  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a" }, { id: "2", name: "b" }] })), /repository list is unreadable/);
-  await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a" }, { id: 2, name: "b" }] }));
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a", private: false }, { id: "2", name: "b", private: true }] })), /repository list is unreadable/);
+  await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a", private: false }, { id: 2, name: "b", private: true }] }));
   const h = (link) => new Headers({ link });
   const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
   // Codex PR223-r34 tightened these two (were "none" and "next"): GitHub sends only registered relation names.
@@ -373,7 +377,12 @@ test("DEVOS-21 part 3 (r20): public entries are counted alone, and a named owner
   const { private: _drop, ...noFlag } = e(3, false);
   await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", list: [noFlag] })), /repository list is unreadable/);
   await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), e(2, true, "someone-else")] })), /repository list is unreadable/);
-  await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), { id: 2, name: "b" }] }));
+  await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), { id: 2, name: "b", private: true }] }));
+  // Codex PR223-r36: on the count path too an entry must say whether it is private (was accepted without the flag),
+  // and public entries never stand in for private ones.
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), { id: 2, name: "b" }] })), /repository list is unreadable/);
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), e(2, false)] })), /sees 0 of 1 private owned repositories/);
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, true), e(2, true)] })), /sees 0 of 1 public owned repositories/);
 });
 
 // Codex PR223-r21: (1) a link with no rel (or two rels) is malformed, so a target without a relation never reads
