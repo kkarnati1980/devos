@@ -47,7 +47,9 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
   api="$(sed -n 's/^API_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
   dash="$(sed -n 's/^DASHBOARD_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
   for p in "${api:-3001}" "${dash:-3000}"; do
-    err="$(timeout 10 conntrack -D -p tcp -s 100.64.0.0/10 -d "$ts" --dport "$p" 2>&1 >/dev/null)"; rc=$?
+    # Codex PR220-r2: --src-nat deletes only flows that were source-NATed, so a retry never touches a healthy
+    # flow that reconnected with the client's own address.
+    err="$(timeout 10 conntrack -D -p tcp -s 100.64.0.0/10 -d "$ts" --dport "$p" --src-nat 2>&1 >/dev/null)"; rc=$?
     (( rc == 0 )) && continue
     grep -q ' 0 flow entries have been deleted' <<<"$err" && continue   # nothing matched: nothing to cut
     echo "fail: cutting old connections on port $p failed (conntrack exit $rc); retried next tick"; bad=1

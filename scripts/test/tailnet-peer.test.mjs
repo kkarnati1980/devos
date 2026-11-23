@@ -79,7 +79,8 @@ test("AT-d-1f: after the fix, old tailnet connections on the API and dashboard p
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /old masqueraded connections on ports 3001 and 3000 cut/);
   assert.deepEqual(fs.readFileSync(path.join(tmp, "cut", "ct.del"), "utf8").trim().split("\n"),
-    ["-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3001", "-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3000"]);
+    ["-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3001 --src-nat", "-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3000 --src-nat"],
+    "only source-NATed flows are deleted (Codex PR220-r2)");
 });
 
 test("AT-d-1h: a failed cut is owed: exit 1, marker kept, retried on the next (already clean) tick (Codex PR220-r1)", () => {
