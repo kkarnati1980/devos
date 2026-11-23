@@ -28,8 +28,9 @@ prefs="$(timeout 10 tailscale debug prefs 2>/dev/null)"; prc=$?
 nosnat=unknown
 if (( prc == 0 )); then
   # S4-d decision 6: NoSNAT true on a host that advertises routes is a KK decision, never a pass ("router").
-  nosnat="$(jq -rs 'if length == 1 and (.[0] | type == "object" and (.NoSNAT | type) == "boolean"
-      and (.AdvertiseRoutes == null or (.AdvertiseRoutes | type) == "array"))
+  # Codex PR220-r12: both fields must be present, the same rule as tailnet-snat.sh, so an unknown route state never passes.
+  nosnat="$(jq -rs 'if length == 1 and (.[0] | type == "object" and has("NoSNAT") and (.NoSNAT | type) == "boolean"
+      and has("AdvertiseRoutes") and (.AdvertiseRoutes == null or (.AdvertiseRoutes | type) == "array"))
     then (if .[0].NoSNAT and ((.[0].AdvertiseRoutes // []) | length) > 0 then "router" else .[0].NoSNAT end) else "unknown" end' <<<"$prefs" 2>/dev/null)" || nosnat=unknown
 fi
 case "$nosnat" in

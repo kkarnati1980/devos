@@ -172,7 +172,8 @@ test("AT-d-2b: fail: NoSNAT false, or prefs unreadable", () => {
   const r = run("crouter", CHECK, { nosnat: true, routes: '["10.0.0.0/24"]', conntrack: { 3001: [], 3000: [] } });
   assert.equal(r.code, 1, "NoSNAT true with routes is a KK decision, never a pass (decision 6)");
   assert.match(r.out, /^fail: this host advertises routes with subnet-route SNAT off/);
-  for (const [n, prefs] of [["ctrail", '{"NoSNAT":true} junk'], ["ctwo", '{"NoSNAT":true}\n{"NoSNAT":true}']]) {
+  for (const [n, prefs] of [["ctrail", '{"NoSNAT":true,"AdvertiseRoutes":null} junk'], ["ctwo", '{"NoSNAT":true,"AdvertiseRoutes":null}\n{"NoSNAT":true,"AdvertiseRoutes":null}'],
+    ["cnoroutes", '{"NoSNAT":true}'], ["croutestr", '{"NoSNAT":true,"AdvertiseRoutes":"x"}']]) {
     const c = run(n, CHECK, { prefs, conntrack: { 3001: [], 3000: [] } });
     assert.equal(c.code, 1, n);
     assert.match(c.out, /^fail: cannot read NoSNAT from tailscale prefs/, "trailing text or a second document is not read as true (Codex PR220-r4)");
