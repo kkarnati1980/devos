@@ -24,7 +24,11 @@ rc=0; read_any=0; seen=0
 # The preference, not a firewall rule: tailscaled runs in nftables mode on the DevOS server (DEVOS-89, 14:10 IST),
 # where `iptables -S` does not show its chains; NoSNAT reads the same in both modes.
 prefs="$(timeout 10 tailscale debug prefs 2>/dev/null)"; prc=$?
-nosnat="$( (( prc == 0 )) && jq -r 'if type == "object" and (.NoSNAT | type) == "boolean" then .NoSNAT else "unknown" end' <<<"$prefs" 2>/dev/null)"
+# Codex PR220-r4: exactly one JSON document, and jq's exit status counts.
+nosnat=unknown
+if (( prc == 0 )); then
+  nosnat="$(jq -rs 'if length == 1 and (.[0] | type == "object" and (.NoSNAT | type) == "boolean") then .[0].NoSNAT else "unknown" end' <<<"$prefs" 2>/dev/null)" || nosnat=unknown
+fi
 case "$nosnat" in
   true) read_any=1; echo "tailscale prefs: NoSNAT true (ok)" ;;
   false) read_any=1; rc=1

@@ -27,9 +27,11 @@ command -v tailscale >/dev/null 2>&1 || { echo "skipped: tailscale not installed
 read_prefs() {  # sets NOSNAT (true|false) and ROUTES (count); 1 when the prefs cannot be read
   local prefs out
   prefs="$(timeout 10 tailscale debug prefs 2>/dev/null)" || { echo "fail: cannot read tailscale prefs; not changed"; return 1; }
-  out="$(jq -r 'if type == "object" and has("NoSNAT") and (.NoSNAT | type) == "boolean"
-      and has("AdvertiseRoutes") and (.AdvertiseRoutes == null or (.AdvertiseRoutes | type) == "array")
-    then "\(.NoSNAT) \(.AdvertiseRoutes // [] | length)" else "unknown" end' <<<"$prefs" 2>/dev/null)"
+  # Codex PR220-r4: exactly one JSON document (slurped, so trailing text is a parse error) and jq's exit status
+  # counts; output from a jq that failed is never used.
+  out="$(jq -rs 'if length == 1 and (.[0] | type == "object" and has("NoSNAT") and (.NoSNAT | type) == "boolean"
+      and has("AdvertiseRoutes") and (.AdvertiseRoutes == null or (.AdvertiseRoutes | type) == "array"))
+    then "\(.[0].NoSNAT) \(.[0].AdvertiseRoutes // [] | length)" else "unknown" end' <<<"$prefs" 2>/dev/null)" || out=""
   [[ "$out" =~ ^(true|false)\ ([0-9]+)$ ]] || { echo "fail: cannot read NoSNAT and AdvertiseRoutes from tailscale prefs; not changed"; return 1; }
   NOSNAT="${BASH_REMATCH[1]}"; ROUTES="${BASH_REMATCH[2]}"
 }

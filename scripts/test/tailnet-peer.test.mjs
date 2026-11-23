@@ -121,7 +121,9 @@ test("AT-d-1h: a failed cut is owed: exit 1, marker kept, retried on the next (a
 test("AT-d-1i: prefs that are not JSON, lack a field, or hold the wrong type change nothing (Codex PR220-r1)", () => {
   for (const [n, prefs] of [["pjunk", "not json"], ["pempty", "{}"], ["pnoroutes", '{"NoSNAT":false}'],
     ["pnonosnat", '{"AdvertiseRoutes":null}'], ["pstr", '{"NoSNAT":false,"AdvertiseRoutes":"10.0.0.0/8"}'],
-    ["pnsstr", '{"NoSNAT":"false","AdvertiseRoutes":null}'], ["parr", "[]"]]) {
+    ["pnsstr", '{"NoSNAT":"false","AdvertiseRoutes":null}'], ["parr", "[]"],
+    ["ptrail", '{"NoSNAT":false,"AdvertiseRoutes":null} trailing junk'],
+    ["ptwo", '{"NoSNAT":false,"AdvertiseRoutes":null}\n{"NoSNAT":false,"AdvertiseRoutes":null}']]) {
     const r = run(n, FIX, { prefs });
     assert.deepEqual([r.code, r.sets, r.out], [1, 0, "fail: cannot read NoSNAT and AdvertiseRoutes from tailscale prefs; not changed"], n);
   }
@@ -150,6 +152,11 @@ test("AT-d-2b: fail: NoSNAT false, or prefs unreadable", () => {
   const b = run("cbad", CHECK, { prefs: "{}", conntrack: { 3001: [], 3000: [] } });
   assert.equal(b.code, 1);
   assert.match(b.out, /^fail: cannot read NoSNAT from tailscale prefs/);
+  for (const [n, prefs] of [["ctrail", '{"NoSNAT":true} junk'], ["ctwo", '{"NoSNAT":true}\n{"NoSNAT":true}']]) {
+    const c = run(n, CHECK, { prefs, conntrack: { 3001: [], 3000: [] } });
+    assert.equal(c.code, 1, n);
+    assert.match(c.out, /^fail: cannot read NoSNAT from tailscale prefs/, "trailing text or a second document is not read as true (Codex PR220-r4)");
+  }
 });
 
 test("AT-d-2c: fail: KK's connection replied to the bridge gateway (the 23 Nov conntrack line), even with NoSNAT true", () => {
