@@ -65,8 +65,9 @@ export function purgeStop(e: unknown): PurgeOutcome {
   switch (x.code) {
     case "provider_forbidden":
       // DEVOS-21 diagnostics: name the refusing provider and kind, so the KK step names the right token. A refusal
-      // with no resource comes only from the purge preflight (teardown.ts), so it reads `:preflight`.
-      return { error: `purge-permission${where || ":preflight"}` };
+      // with no resource comes only from the purge preflight (teardown.ts), so it reads `:preflight`; a
+      // resource whose provider or kind is outside KIND_RE reads `:resource` (pre-review 1).
+      return { error: `purge-permission${where || (x.resource ? ":resource" : ":preflight")}` };
     case "approval_required":
     case "policy_denied":
       return { error: `purge-permission:${x.code}` };

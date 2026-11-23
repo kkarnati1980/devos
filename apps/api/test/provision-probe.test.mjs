@@ -223,7 +223,7 @@ test("pre-review L1: a purge failure keeps the earlier failure as its cause", as
   assert.equal(end.causeDetail, d.log.at(-1).result.causeDetail);
 });
 
-test("DEVOS-21: a clean purge after no earlier failure has no cause on the tick or the record", async () => {
+test("DEVOS-21: a failed purge with no earlier failure has no cause on the tick or the record", async () => {
   const d = fake({ purge: async () => ({ error: "purge-permission:github/repo" }) });
   const end = (await runToEnd(d)).at(-1);
   assert.deepEqual([end.code, end.detail, end.cause, end.causeDetail], ["purge-failed", "purge-permission:github/repo", undefined, undefined]);

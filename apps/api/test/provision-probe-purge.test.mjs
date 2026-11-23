@@ -61,7 +61,7 @@ test("d3c-2a decision 1: teardown stops map to fixed probe codes; retryable is i
   assert.equal(purgeStop(terr("provider_error", true)), "in_progress");
   assert.deepEqual(purgeStop(terr("provider_forbidden")), { error: "purge-permission:preflight" }, "DEVOS-21: no resource means the preflight refused");
   assert.deepEqual(purgeStop(terr("provider_forbidden", false, { provider: "github", kind: "repo", externalId: "1", name: "kk/secret-name" })), { error: "purge-permission:github/repo" }, "DEVOS-21: the refusing provider and kind are named, never the name");
-  assert.deepEqual(purgeStop(terr("provider_forbidden", false, { provider: "coolify", kind: "Bad Kind!" })), { error: "purge-permission:preflight" }, "an odd kind is never printed");
+  assert.deepEqual(purgeStop(terr("provider_forbidden", false, { provider: "coolify", kind: "Bad Kind!" })), { error: "purge-permission:resource" }, "an odd kind is never printed, and it is not read as the preflight");
   assert.deepEqual(purgeStop(terr("approval_required")), { error: "purge-permission:approval_required" });
   assert.deepEqual(purgeStop(terr("policy_denied")), { error: "purge-permission:policy_denied" });
   assert.deepEqual(purgeStop(terr("ownership_mismatch", false, { provider: "github", kind: "repo", externalId: "1", name: "kk/secret-name" })), { error: "purge-ownership:github/repo" });
