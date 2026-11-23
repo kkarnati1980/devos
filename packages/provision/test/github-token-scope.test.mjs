@@ -154,4 +154,9 @@ test("DEVOS-21 part 3 (r6): linkHasNext tokenizes quoted values and fails closed
   assert.equal(linkHasNext(h("garbage")), true);
   assert.equal(linkHasNext(h('<https://x/?page=2>; title="unterminated')), true);
   assert.equal(linkHasNext(h("<https://x/?page=2")), true);
+  // Codex PR223-r7: a rel without a value, or a nameless parameter, is malformed too.
+  for (const v of ["<https://x/?page=2>; rel=", "<https://x/?page=2>; rel", '<https://x/?page=2>; rel=""', '<https://x/?page=2>; rel="  "', "<https://x/?page=2>; =next", "<https://x/?page=2>; ;"]) {
+    assert.equal(linkHasNext(h(v)), true, v);
+  }
+  assert.equal(linkHasNext(h('<https://x/?page=9>; rel="last"; hreflang=en')), false);
 });

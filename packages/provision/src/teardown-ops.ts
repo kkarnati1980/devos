@@ -267,7 +267,14 @@ export function linkHasNext(headers: { get(name: string): string | null } | unde
           value = raw.slice(vs, i);
         }
       }
-      if (name === "rel" && value.split(/\s+/).some((t) => t.toLowerCase() === "next")) return true;
+      // Codex PR223-r7: a parameter without a name, or a `rel` without a value (bare, `rel=` or `rel=""`), is
+      // malformed, so it fails closed like any other unparseable header.
+      if (name === "") return true;
+      if (name === "rel") {
+        const types = value.split(/\s+/).filter((t) => t !== "");
+        if (types.length === 0) return true;
+        if (types.some((t) => t.toLowerCase() === "next")) return true;
+      }
     }
     ws();
   }
