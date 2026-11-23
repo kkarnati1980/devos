@@ -219,6 +219,178 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
   };
 }
 
+/** RFC 7230 §3.2.6 `tchar`. */
+const TCHAR = /^[A-Za-z0-9!#$%&'*+.^_`|~-]$/;
+/**
+ * Codex PR223-r10/r11/r12: a link target is an absolute `http(s)` URI: `scheme://host[:port]` (a reg-name host, a
+ * numeric port, no userinfo and no IP-literal brackets), an optional path of pchar and `/`, then an optional `?query`
+ * and `#fragment` that add only `?`; every `%` is a valid escape. It must also parse as a WHATWG URL. Anything else
+ * (a space, a second `#`, a relative target, `:abc` as a port) is unparseable, whatever its `rel`.
+ */
+const PCHAR = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})";
+const QCHAR = `(?:${PCHAR}|[/?])`;
+const HOST = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})+";
+const URI_REF = new RegExp(`^https?://${HOST}(?::[0-9]+)?(?:/(?:${PCHAR}|/)*)?(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`, "i");
+const isLinkTarget = (t: string): boolean => {
+  if (!URI_REF.test(t)) return false;
+  try { new URL(t); return true; } catch { return false; }
+};
+
+/**
+ * Codex PR223-r3/r4/r8: GitHub's `Link` response header names a next page (`rel="next"`); a header that cannot be parsed is "malformed". Both the purge scope preflight
+ * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
+ */
+export function linkNext(headers: { get(name: string): string | null } | undefined, expect?: { origin: string; path: string; query: Readonly<Record<string, string>>; bound?: { last: number | null } }): "next" | "none" | "malformed" {
+  const present = headers?.get("link") ?? null;
+  const raw = present ?? "";
+  // Codex PR223-r11/r12: with `expect`, every `rel=next` target must be exactly the request the reader makes next:
+  // the same origin, the same path and the same query parameters (each once, same value, none extra; so `page` and `per_page` both
+  // match), or the header is malformed. A reader that walks pages by counting can then never skip or shift a page.
+  const sameRequest = (target: string, query: Readonly<Record<string, string>>): boolean => {
+    if (!expect) return true;
+    const u = new URL(target);
+    // Codex PR223-r13: the same origin too (scheme, host and port), the one the reader's transport is fixed to.
+    if (u.origin !== expect.origin || u.pathname !== expect.path) return false;
+    const keys = [...u.searchParams.keys()];
+    const want = Object.keys(query);
+    if (keys.length !== want.length) return false;
+    return want.every((k) => { const v = u.searchParams.getAll(k); return v.length === 1 && v[0] === query[k]; });
+  };
+  const nextOk = (target: string): boolean => sameRequest(target, expect?.query ?? {});
+  // Codex PR223-r15: a `rel=last` link says how many pages exist. With `expect` (whose `page` is the page after the
+  // one just read), its target must be the same request with a decimal `page` no lower than the current page, or the
+  // header is malformed. A last page beyond the current one without a `rel=next` link is a contradiction, and so is a
+  // `rel=next` link when the current page is the last one: both are malformed, never read as the end of the listing.
+  const current = expect && /^[1-9][0-9]*$/.test(expect.query.page ?? "") ? Number(expect.query.page) - 1 : null;
+  // Codex PR223-r16: `bound` carries the last page a reader has been told across its pages, so a later page without
+  // a Link header (or with a different last page) can never drop a bound set by an earlier one.
+  const prior = expect?.bound?.last ?? null;
+  let lastPage: number | null = prior;
+  const lastOk = (target: string): boolean => {
+    if (!expect) return true;
+    if (current === null) return false;
+    const pg = new URL(target).searchParams.getAll("page");
+    if (pg.length !== 1 || !/^[1-9][0-9]{0,8}$/.test(pg[0] as string)) return false;
+    const k = Number(pg[0]);
+    if (k < current || !sameRequest(target, { ...expect.query, page: pg[0] as string })) return false;
+    if (lastPage !== null && lastPage !== k) return false;
+    lastPage = k;
+    return true;
+  };
+  // Codex PR223-r32: a page-naming relation (`prev`, `first`) whose target must be exactly page `want` of this
+  // listing, with `want` at least 1 and never after the current page (`prev` is therefore absent on page 1).
+  const pageOk = (target: string, want: number | null): boolean => {
+    if (!expect) return true;
+    if (current === null || want === null || want < 1 || want > current) return false;
+    return sameRequest(target, { ...expect.query, page: String(want) });
+  };
+  // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
+  // never splits a link. Each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a space-separated
+  // list of relation types, quoted or not. Any link whose rel list contains `next` counts. A value that cannot be
+  // parsed is "malformed" (Codex PR223-r8): the caller treats the whole listing as unreadable, never as complete.
+  let i = 0;
+  let found = false;
+  const n = raw.length;
+  const ws = () => { while (i < n && /[ \t,]/.test(raw[i] as string)) i++; };
+  // Codex PR223-r26: only HTTP whitespace (SP, HTAB) separates tokens and relation types, never Unicode spaces.
+  const sp = () => { while (i < n && /[ \t]/.test(raw[i] as string)) i++; };
+  // Codex PR223-r33: a `Link` header that is present must hold at least one link; one that is empty or only commas
+  // and whitespace carries no link value, so it is unparseable, never the same as an absent header.
+  let links = 0;
+  ws();
+  while (i < n) {
+    if (raw[i] !== "<") return "malformed";
+    links++;
+    const close = raw.indexOf(">", i);
+    if (close < 0) return "malformed";
+    // Codex PR223-r10: the target must be a URI reference (RFC 3986 characters only, every `%` a valid escape);
+    // a space, quote or other character outside that set (e.g. `<bad target>`) makes the header malformed.
+    const target = raw.slice(i + 1, close);
+    if (!isLinkTarget(target)) return "malformed";
+    i = close + 1;
+    // Codex PR223-r21 (RFC 8288 §3.3: `rel` MUST be present, and once): a link with no `rel`, or with a second
+    // `rel`, is malformed, so a target without a relation never reads as "no next page".
+    let rels = 0;
+    for (;;) {
+      sp();
+      if (i >= n || raw[i] === ",") { if (rels !== 1) return "malformed"; break; }
+      if (raw[i] !== ";") return "malformed";
+      i++; sp();
+      // Codex PR223-r9: an allow-list grammar. A parameter name, and an unquoted value, is one or more RFC 7230
+      // token characters; any other character where one is expected (e.g. `rel=next"`, `re"l=next`, `rel=ne<xt`)
+      // makes the header malformed instead of being read as part of the name or value.
+      const nameStart = i;
+      while (i < n && TCHAR.test(raw[i] as string)) i++;
+      const name = raw.slice(nameStart, i).toLowerCase();
+      if (i < n && !/[ \t=;,]/.test(raw[i] as string)) return "malformed";
+      sp();
+      let value = "";
+      if (raw[i] === "=") {
+        i++; sp();
+        if (raw[i] === '"') {
+          i++;
+          let closed = false;
+          // Codex PR223-r25 (RFC 7230 §3.2.6): quoted text is qdtext (HTAB, SP, %x21, %x23-5B, %x5D-7E, obs-text)
+          // and a quoted-pair escapes only HTAB, SP, VCHAR or obs-text; a control character or a dangling `\`
+          // makes the header malformed.
+          while (i < n) {
+            const c = raw[i++] as string;
+            if (c === "\\") {
+              const e = raw[i++];
+              if (e === undefined || !/^[\t \x21-\x7E\x80-\xFF]$/.test(e)) return "malformed";
+              value += e;
+              continue;
+            }
+            if (c === '"') { closed = true; break; }
+            if (!/^[\t \x21\x23-\x5B\x5D-\x7E\x80-\xFF]$/.test(c)) return "malformed";
+            value += c;
+          }
+          if (!closed) return "malformed";
+        } else {
+          const vs = i;
+          while (i < n && TCHAR.test(raw[i] as string)) i++;
+          value = raw.slice(vs, i);
+          if (value === "" || (i < n && !/[ \t;,]/.test(raw[i] as string))) return "malformed";
+        }
+      }
+      // Codex PR223-r7: a parameter without a name, or a `rel` without a value (bare, `rel=` or `rel=""`), is
+      // malformed, so it fails closed like any other unparseable header.
+      if (name === "") return "malformed";
+      // Codex PR223-r22 (RFC 8288 §3.2): an `anchor` parameter moves a link's context to another resource, so its
+      // `rel=next`/`rel=last` would no longer describe this listing. GitHub never sends one; any `anchor` is malformed.
+      if (name === "anchor") return "malformed";
+      if (name === "rel") {
+        rels++;
+        const types = value.split(/[ \t]+/).filter((t) => t !== "");
+        if (types.length === 0) return "malformed";
+        // Codex PR223-r14 (RFC 8288 §3.3): each relation type is a registered name (a letter, then letters, digits,
+        // `.` or `-`; compared case-insensitively); anything else (e.g. `next,`) is malformed.
+        // Codex PR223-r34 (decision 1, supersedes the r18/r19 extension-URI rule): GitHub sends only registered
+        // relation names, so an extension (URI) relation type is unparseable. Its grammar can no longer be read
+        // as "no next page", and the reader stays fail-closed.
+        // Codex PR223-r35: exactly GitHub's four pagination relations; any other name (e.g. `nex`, `prefetch`) is
+        // unparseable too, so a misspelt `next` can never read as "no next page".
+        if (!types.every((t) => /^(?:next|prev|first|last)$/i.test(t))) return "malformed";
+        if (types.some((t) => t.toLowerCase() === "next")) {
+          if (!nextOk(target)) return "malformed";
+          found = true;
+        }
+        if (types.some((t) => t.toLowerCase() === "last") && !lastOk(target)) return "malformed";
+        // Codex PR223-r32 (decision 1, exact GitHub pagination): `prev` and `first` name pages too, so each must be
+        // exactly what GitHub sends for the current page: `prev` is the page before it (so none on page 1) and
+        // `first` is page 1, both the same request. Any other target contradicts the page just read.
+        if (types.some((t) => t.toLowerCase() === "prev") && !pageOk(target, current === null ? null : current - 1)) return "malformed";
+        if (types.some((t) => t.toLowerCase() === "first") && !pageOk(target, current === null ? null : 1)) return "malformed";
+      }
+    }
+    ws();
+  }
+  if (present !== null && links === 0) return "malformed";
+  if (current !== null && lastPage !== null && (lastPage > current) !== found) return "malformed";
+  if (expect?.bound) expect.bound.last = lastPage;
+  return found ? "next" : "none";
+}
+
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
