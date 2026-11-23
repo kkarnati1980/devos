@@ -540,5 +540,22 @@ test("DEVOS-21 part 3 (r30): an empty page that names a next page is unreadable"
     return new Response(JSON.stringify([entry(500)]), { status: 200 });
   }, sleep: async () => {} });
   await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
-  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /empty page that names a next page/);
+  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /empty page that names a next or last page/);
+});
+
+// Codex PR223-r31: page 1 is full with no Link, page 2 answers [] with a valid rel=last naming page 2. An empty page
+// is never the one a rel=last names, so both readers refuse.
+test("DEVOS-21 part 3 (r31): an empty page named as the last page is unreadable", async () => {
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  const mk = (kind) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 0 }), { status: 200 });
+    const page = Number(x.searchParams.get("page"));
+    if (page !== 1) return new Response("[]", { status: 200, headers: { link: `<${u(1)}>; rel="prev", <${u(2)}>; rel="last"` } });
+    return new Response(JSON.stringify(Array.from({ length: 100 }, (_, i) => (kind === "scan"
+      ? { full_name: `${OWNER}/r${i}`, name: `r${i}`, description: null }
+      : { id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } }))), { status: 200 });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /empty page that names a next or last page/);
 });
