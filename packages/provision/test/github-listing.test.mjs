@@ -7,14 +7,14 @@ import { GitHubClient, githubTokenScopeCheck, githubScanner, linkNext } from "..
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const OWNER = "kkarnati1980";
 
-// A fake api.github.com: GET /user answers `user` (with an optional X-OAuth-Scopes header); GET /user/repos pages `repos`.
-function fake({ user, scopes, repos = 1, list, link, pages }) {
+// A fake api.github.com: GET /user answers `user`; GET /user/repos pages `repos`.
+function fake({ user, repos = 1, list, link, pages }) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     const u = new URL(url);
     calls.push({ path: u.pathname, auth: init.headers?.authorization });
     if (u.pathname === "/user") {
-      return new Response(JSON.stringify(user), { status: 200, headers: scopes === undefined ? {} : { "x-oauth-scopes": scopes } });
+      return new Response(JSON.stringify(user), { status: 200 });
     }
     if (u.pathname === "/user/repos") {
       const page = Number(u.searchParams.get("page"));
@@ -215,7 +215,7 @@ test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=las
 
   // (2) Both readers: page 1 (full) names next=2 and last=3; page 2 is short with no Link header.
   const link = `<${u(2)}>; rel="next", <${u(3)}>; rel="last"`;
-  await assert.rejects(check(fake({ user: { ...pub, public_repos: 101 }, list: full.concat([{ id: 999, name: "p2", owner: { login: OWNER } }]), link })), /repository list is unreadable/);
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 101 }, list: full.concat([{ id: 999, name: "p2", private: false, owner: { login: OWNER } }]), link })), /repository list is unreadable/);
   const fetchImpl = async (url) => {
     const page = Number(new URL(url).searchParams.get("page"));
     const mk = (n, k) => Array.from({ length: n }, (_, i) => ({ full_name: `${OWNER}/o${k}-${i}`, name: `o${k}-${i}`, description: null }));
@@ -524,4 +524,14 @@ test("DEVOS-21 part 3 (r34): an extension URI relation type makes the listing un
   }, sleep: async () => {} });
   await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
+});
+
+// Pre-review (DEVOS-252): the leftover scan that reaches its page cap while a page still advertises rel=next is not
+// complete: it keeps the M2.5 `scan-incomplete` hit (any hit makes the sweep report a leftover, so it fails closed).
+test("DEVOS-252: the leftover scan at its page cap with a next page advertised reports scan-incomplete", async () => {
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  const fetchImpl = async () => new Response(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ full_name: `${OWNER}/o-${i}`, name: `o-${i}`, description: null }))), { status: 200, headers: { link: `<${u(2)}>; rel="next"` } });
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
+  const hits = await githubScanner(gh, { maxPages: 1 }).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" });
+  assert.deepEqual(hits.map((h) => h.kind), ["scan-incomplete"]);
 });
