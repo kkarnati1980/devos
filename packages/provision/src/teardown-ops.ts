@@ -413,6 +413,7 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
       const seenNames = new Set<string>();
       const seenIds = new Set<number>();
       let listOwner: string | null = null;
+      let advertised = false;
       for (let page = 1; page <= maxPages; page++) {
         const r = await gh.http.get<RepoBody[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
         if (r.status !== 200 || !Array.isArray(r.body)) {
@@ -420,8 +421,8 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
         }
         // Codex PR223-r26: a page never holds more than the `per_page=100` asked for, or the offsets are wrong.
         if (r.body.length > 100) throw new ProviderError("github", "bad-response", "github GET /user/repos returned more entries than the page size", r.status);
-        // Codex PR223-r28: as in the scope preflight, a page reached through rel=next must not be empty.
-        if (page > 1 && r.body.length === 0) throw new ProviderError("github", "bad-response", "github GET /user/repos returned an empty page it had advertised", r.status);
+        // Codex PR223-r28/r29: as in the scope preflight, a page advertised by rel=next must not be empty.
+        if (advertised && r.body.length === 0) throw new ProviderError("github", "bad-response", "github GET /user/repos returned an empty page it had advertised", r.status);
         for (const x of r.body) {
           // Codex PR48-r4: every field the match reads must be well-formed, or the whole scan is inconclusive.
           // Codex PR48-r5: the field must be present (string or null); an omitted description is inconclusive.
@@ -452,6 +453,7 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
         // Codex PR223-r4: as in the scope preflight, a short page is the last one only when no Link rel=next follows.
         const link = linkNext(r.headers, { origin: gh.http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" }, bound });
         if (link === "malformed") throw new ProviderError("github", "bad-response", "github GET /user/repos returned an unreadable Link header", r.status);
+        advertised = link === "next";
         if (link === "next") continue;
         // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
         if (r.body.length < 100 || bound.last === page) return hits;
@@ -559,13 +561,15 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     // repository replaced mid-listing (same name, new id) never counts twice and masks an omitted one.
     const names = new Set<string>();
     const bound = { last: null as number | null };
+    let advertised = false;
     for (let page = 1; page <= maxPages; page++) {
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
       // Codex PR223-r26: a page never holds more than the `per_page=100` asked for.
       if (r.status !== 200 || !Array.isArray(r.body) || r.body.length > 100) throw new Error("github-token-scope: the repository list is unreadable");
-      // Codex PR223-r28: a page after the first is read only because the page before named it with rel=next, so
-      // GitHub advertised entries on it; an empty answer contradicts that (the listing shifted), never the end.
-      if (page > 1 && r.body.length === 0) throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r28/r29: a page the page before named with rel=next was advertised to hold entries, so an empty
+      // answer contradicts it (the listing shifted), never the end. After a full page with no rel=next and no rel=last
+      // naming it (e.g. exactly 100 repos and no Link header) the reader reads on to confirm, and [] there is the end.
+      if (advertised && r.body.length === 0) throw new Error("github-token-scope: the repository list is unreadable");
       // Codex PR223-r2: on the scope proof the list is the only count, so every entry must be an identifiable repo
       // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
       // Codex PR223-r18/r19: on the count path every entry is a repo (a numeric id seen once, a name) too, so a
@@ -586,6 +590,7 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       const link = linkNext(r.headers, { origin: http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" }, bound });
       // Codex PR223-r8: an unparseable Link header makes the whole listing inconclusive.
       if (link === "malformed") throw new Error("github-token-scope: the repository list is unreadable");
+      advertised = link === "next";
       if (link === "next") continue;
       // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
       if (r.body.length < 100 || bound.last === page) { complete = true; break; }

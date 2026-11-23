@@ -504,3 +504,23 @@ test("DEVOS-21 part 3 (r28): an advertised next page that answers empty is unrea
   await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /empty page it had advertised/);
 });
+
+// Codex PR223-r29: exactly 100 repos on one full page with no Link header. Neither reader can prove the end from
+// page 1, so both read page 2; GitHub never advertised it, so its [] is the end and the listing is complete.
+test("DEVOS-21 part 3 (r29): a full page without Link, then an unadvertised empty page, is a complete listing", async () => {
+  const calls = [];
+  const mk = (kind) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    calls.push(x.pathname + x.search);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 0 }), { status: 200 });
+    const page = Number(x.searchParams.get("page"));
+    if (page !== 1) return new Response("[]", { status: 200 });
+    return new Response(JSON.stringify(Array.from({ length: 100 }, (_, i) => (kind === "scan"
+      ? { full_name: `${OWNER}/r${i}`, name: `r${i}`, description: null }
+      : { id: i + 1, name: `r${i}`, private: false, owner: { login: OWNER } }))), { status: 200 });
+  }, sleep: async () => {} });
+  await githubTokenScopeCheck(mk("pf"), { owner: OWNER })();
+  const hits = await githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" });
+  assert.deepEqual(hits, []);
+  assert.equal(calls.filter((c) => c.includes("page=2")).length, 2, "both readers read page 2 to confirm the end");
+});
