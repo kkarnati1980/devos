@@ -141,3 +141,17 @@ test("DEVOS-21 part 3 (r5): a negative, fractional or unsafe count is refused as
     await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 0, owned_private_repos: n }, repos: 0 })), /cannot read its account's repository counts/);
   }
 });
+
+// Codex PR223-r6: a `<`, `,` or `;` inside a quoted value never splits a link; an unparseable value fails closed.
+test("DEVOS-21 part 3 (r6): linkHasNext tokenizes quoted values and fails closed on a malformed header", () => {
+  const h = (link) => new Headers({ link });
+  assert.equal(linkHasNext(h('<https://api.github.com/user/repos?page=2>; title="More < results"; rel="next"')), true);
+  assert.equal(linkHasNext(h('<https://x/?page=2>; title="a, b; c"; rel="next"')), true);
+  assert.equal(linkHasNext(h('<https://x/?page=2>; title="say \\"rel=next\\""; rel="last"')), false);
+  assert.equal(linkHasNext(h('<https://x/?page=1>; rel="prev", <https://x/?page=9>; rel="last"')), false);
+  assert.equal(linkHasNext(h("")), false);
+  // Malformed: read as "a next page may exist", so the caller reads on to its page cap.
+  assert.equal(linkHasNext(h("garbage")), true);
+  assert.equal(linkHasNext(h('<https://x/?page=2>; title="unterminated')), true);
+  assert.equal(linkHasNext(h("<https://x/?page=2")), true);
+});

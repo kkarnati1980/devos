@@ -225,13 +225,51 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
  */
 export function linkHasNext(headers: { get(name: string): string | null } | undefined): boolean {
   const raw = headers?.get("link") ?? "";
-  // Codex PR223-r5 (RFC 8288): each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a
-  // space-separated list of relation types, quoted or not. Any link whose rel list contains `next` counts.
-  for (const m of raw.matchAll(/<[^>]*>([^<]*)/g)) {
-    for (const p of (m[1] ?? "").matchAll(/;\s*rel\s*=\s*(?:"([^"]*)"|([^\s;,"]+))/gi)) {
-      const v = p[1] ?? p[2] ?? "";
-      if (v.split(/\s+/).some((t) => t.toLowerCase() === "next")) return true;
+  // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
+  // never splits a link. Each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a space-separated
+  // list of relation types, quoted or not. Any link whose rel list contains `next` counts. A value that cannot be
+  // parsed is read as "a next page may exist", so the caller reads on and stops only at its page cap (fail closed).
+  let i = 0;
+  const n = raw.length;
+  const ws = () => { while (i < n && /[\s,]/.test(raw[i] as string)) i++; };
+  const sp = () => { while (i < n && /\s/.test(raw[i] as string)) i++; };
+  ws();
+  while (i < n) {
+    if (raw[i] !== "<") return true;
+    const close = raw.indexOf(">", i);
+    if (close < 0) return true;
+    i = close + 1;
+    for (;;) {
+      sp();
+      if (i >= n || raw[i] === ",") break;
+      if (raw[i] !== ";") return true;
+      i++; sp();
+      const nameStart = i;
+      while (i < n && !/[\s=;,]/.test(raw[i] as string)) i++;
+      const name = raw.slice(nameStart, i).toLowerCase();
+      sp();
+      let value = "";
+      if (raw[i] === "=") {
+        i++; sp();
+        if (raw[i] === '"') {
+          i++;
+          let closed = false;
+          while (i < n) {
+            const c = raw[i++] as string;
+            if (c === "\\") { value += raw[i++] ?? ""; continue; }
+            if (c === '"') { closed = true; break; }
+            value += c;
+          }
+          if (!closed) return true;
+        } else {
+          const vs = i;
+          while (i < n && !/[\s;,]/.test(raw[i] as string)) i++;
+          value = raw.slice(vs, i);
+        }
+      }
+      if (name === "rel" && value.split(/\s+/).some((t) => t.toLowerCase() === "next")) return true;
     }
+    ws();
   }
   return false;
 }
