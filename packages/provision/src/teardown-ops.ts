@@ -224,7 +224,16 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
  * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
  */
 export function linkHasNext(headers: { get(name: string): string | null } | undefined): boolean {
-  return /<[^>]*>\s*;\s*rel="?next"?/i.test(headers?.get("link") ?? "");
+  const raw = headers?.get("link") ?? "";
+  // Codex PR223-r5 (RFC 8288): each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a
+  // space-separated list of relation types, quoted or not. Any link whose rel list contains `next` counts.
+  for (const m of raw.matchAll(/<[^>]*>([^<]*)/g)) {
+    for (const p of (m[1] ?? "").matchAll(/;\s*rel\s*=\s*(?:"([^"]*)"|([^\s;,"]+))/gi)) {
+      const v = p[1] ?? p[2] ?? "";
+      if (v.split(/\s+/).some((t) => t.toLowerCase() === "next")) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -335,12 +344,14 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     const http = await gh.http.pinned();
     const u = await http.get<{ login?: string; public_repos?: number; owned_private_repos?: number }>("/user");
     const pub = u.body?.public_repos; const priv = u.body?.owned_private_repos;
-    if (u.status !== 200 || typeof pub !== "number" || typeof u.body?.login !== "string") {
+    // Codex PR223-r5: a count is a non-negative safe integer, or the answer is malformed and refused.
+    const isCount = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+    if (u.status !== 200 || !isCount(pub) || typeof u.body?.login !== "string") {
       throw new Error("github-token-scope: the token cannot read its account's repository counts");
     }
     // Codex PR223-r1: only an absent field (GitHub's public user response) may take the scope proof; a field that is
     // present with any non-number value (null, a string, an object) is a malformed answer and stays refused.
-    if (priv !== undefined && typeof priv !== "number") {
+    if (priv !== undefined && !isCount(priv)) {
       throw new Error("github-token-scope: the token cannot read its account's repository counts");
     }
     if (priv === undefined) {

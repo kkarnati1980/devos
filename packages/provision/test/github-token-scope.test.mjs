@@ -121,3 +121,23 @@ test("DEVOS-21 part 3 (r4): githubScanner follows Link rel=next past a short pag
   assert.equal(linkHasNext(new Headers({ link: '<https://x/?page=1>; rel="prev"' })), false);
   assert.equal(linkHasNext(new Headers({ link: '<https://x/?page=1>; rel="prev", <https://x/?page=3>; rel="next"' })), true);
 });
+
+// Codex PR223-r5: rel may follow other parameters and may hold several relation types; counts must be valid counts.
+test("DEVOS-21 part 3 (r5): linkHasNext reads rel in any parameter position and in a relation list", () => {
+  const h = (link) => new Headers({ link });
+  assert.equal(linkHasNext(h('<https://api.github.com/user/repos?page=2>; title="More"; rel="next"')), true);
+  assert.equal(linkHasNext(h('<https://api.github.com/user/repos?page=2>; rel="prefetch next"')), true);
+  assert.equal(linkHasNext(h('<https://api.github.com/user/repos?page=2>; REL=next')), true);
+  assert.equal(linkHasNext(h('<https://x/?page=1>; rel="prev", <https://x/?page=3>; title="t"; rel=next')), true);
+  assert.equal(linkHasNext(h('<https://x/?page=1>; rel="prev", <https://x/?page=9>; rel="last"')), false);
+  assert.equal(linkHasNext(h('<https://x/?page=1>; rel="nextish"')), false);
+  assert.equal(linkHasNext(h('<https://x/?page=1>; title="rel=next"')), false);
+});
+
+test("DEVOS-21 part 3 (r5): a negative, fractional or unsafe count is refused as github-counts", async () => {
+  const bad = [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN];
+  for (const n of bad) {
+    await assert.rejects(check(fake({ user: { login: OWNER, public_repos: n }, scopes: "repo", repos: 0 })), /cannot read its account's repository counts/);
+    await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 0, owned_private_repos: n }, repos: 0 })), /cannot read its account's repository counts/);
+  }
+});
