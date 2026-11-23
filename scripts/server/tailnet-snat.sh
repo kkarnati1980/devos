@@ -54,7 +54,8 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
     rm -f "$PENDING" || { echo "fail: cannot remove $PENDING"; return 1; }   # Codex PR220-r7 (low)
     echo "note: conntrack not installed: old masqueraded connections end when they close"; return 0
   fi
-  ts="$(timeout 10 tailscale ip -4 2>/dev/null | head -n1)"
+  ts="$(timeout 10 tailscale ip -4 2>/dev/null)" || { echo "fail: tailscale ip -4 failed: old masqueraded connections not cut"; return 1; }
+  ts="$(head -n1 <<<"$ts")"
   [[ "$ts" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || { echo "fail: no tailnet IPv4: old masqueraded connections not cut"; return 1; }
   api="$(sed -n 's/^API_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
   dash="$(sed -n 's/^DASHBOARD_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
@@ -66,6 +67,8 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
     if (( ROUTES > 0 )); then
       echo "fail: this host started advertising $ROUTES route(s); no further connection is cut (KK decision)"; return 1
     fi
+    # Codex PR220-r14: SNAT back on (NoSNAT false) means a cut now would only be redone; stop and keep it owed.
+    [[ "$NOSNAT" == true ]] || { echo "fail: subnet-route SNAT is on again; no connection is cut, retried next tick"; return 1; }
     # Codex PR220-r2: --src-nat deletes only flows that were source-NATed, so a retry never touches a healthy
     # flow that reconnected with the client's own address.
     err="$(timeout 10 conntrack -D -p tcp -s 100.64.0.0/10 -d "$ts" --dport "$p" --src-nat 2>&1 >/dev/null)"; rc=$?

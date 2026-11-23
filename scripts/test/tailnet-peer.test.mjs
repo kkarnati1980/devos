@@ -23,7 +23,7 @@ const ct = (client, back, port = 3001) =>
 // `tailscale ip -4` prints `ip`; `conntrack -L ... --dport <p>` prints the file ct.<p> (missing: exit 1);
 // `conntrack -D ...` logs its arguments and answers per `ctDel`.
 function run(name, script, { nosnat = false, routes = "null", prefs, setRc = 0, setNoop = false, ip = HOST,
-  conntrack, noTailscale = false, conf = "", ctDel = "ok", pending = false, routesAfterSet } = {}) {
+  conntrack, noTailscale = false, conf = "", ctDel = "ok", pending = false, routesAfterSet, ipRc = 0 } = {}) {
   const dir = path.join(tmp, name);
   const bin = path.join(dir, "bin");
   fs.mkdirSync(path.join(dir, "devos"), { recursive: true });
@@ -37,7 +37,7 @@ function run(name, script, { nosnat = false, routes = "null", prefs, setRc = 0, 
   if (!noTailscale) {
     fs.writeFileSync(path.join(bin, "tailscale"), `#!/usr/bin/env bash
 case "$*" in
-  "ip -4") echo "${ip}" ;;
+  "ip -4") echo "${ip}"; exit ${ipRc} ;;
   "debug prefs") if [[ -f "${dir}/prefs.raw" ]]; then cat "${dir}/prefs.raw"; else echo "{\\"ControlURL\\":\\"x\\",\\"NoSNAT\\":$(cat "${ns}"),\\"AdvertiseRoutes\\":$(cat "${dir}/routes")}"; fi ;;
   "set --snat-subnet-routes=false") echo set >> "${dir}/set.log"; ${setNoop ? "true" : `[[ ${setRc} -eq 0 ]] && echo true > "${ns}"`}${routesAfterSet ? `; echo '${routesAfterSet}' > "${dir}/routes"` : ""}; exit ${setRc} ;;
   *) exit 9 ;;
@@ -110,6 +110,20 @@ test("AT-d-1n: routes that appear during the clean-up stop the next delete and f
   const r2 = spawnSync("/bin/bash", [FIX], { encoding: "utf8", env: { PATH: path.join(dir, "bin"), DEVOS_DIR: path.join(dir, "devos") } });
   assert.equal(r2.status, 1, r2.stdout);
   assert.match(r2.stdout, /fail: this host started advertising 1 route\(s\); no further connection is cut \(KK decision\)/);
+  assert.equal(fs.readFileSync(path.join(dir, "ct.del"), "utf8").trim().split("\n").length, 1, "only the first port was cut");
+  assert.ok(fs.existsSync(path.join(dir, "devos/tailnet-snat.cut-pending")), "the cut stays owed");
+});
+
+test("AT-d-1o: SNAT turned back on during the clean-up stops it and keeps the cut owed (Codex PR220-r14)", () => {
+  const r = run("snatback", FIX, { nosnat: true, conntrack: {}, pending: true });
+  assert.equal(r.code, 0, r.out);
+  const dir = r.dir;
+  fs.rmSync(path.join(dir, "ct.del"));
+  fs.writeFileSync(path.join(dir, "devos/tailnet-snat.cut-pending"), "");
+  fs.writeFileSync(path.join(dir, "bin/conntrack"), `#!/usr/bin/env bash\necho "$*" >> "${dir}/ct.del"; echo false > "${dir}/nosnat"; exit 0\n`, { mode: 0o755 });
+  const r2 = spawnSync("/bin/bash", [FIX], { encoding: "utf8", env: { PATH: path.join(dir, "bin"), DEVOS_DIR: path.join(dir, "devos") } });
+  assert.equal(r2.status, 1, r2.stdout);
+  assert.match(r2.stdout, /fail: subnet-route SNAT is on again; no connection is cut, retried next tick/);
   assert.equal(fs.readFileSync(path.join(dir, "ct.del"), "utf8").trim().split("\n").length, 1, "only the first port was cut");
   assert.ok(fs.existsSync(path.join(dir, "devos/tailnet-snat.cut-pending")), "the cut stays owed");
 });
@@ -220,6 +234,9 @@ test("AT-d-2e: skipped only without tailscale; no tailnet address fails; conntra
   assert.equal(noip.code, 1, "a failed tailnet lookup is a failure, not a skip (Codex PR220-r13)");
   assert.match(noip.out, /^fail: no tailnet IPv4/);
   assert.equal(run("cnots", CHECK, { noTailscale: true }).code, 3);
+  const iprc = run("ciprc", CHECK, { nosnat: true, ipRc: 1, conntrack: { 3001: [], 3000: [] } });
+  assert.equal(iprc.code, 1, "a valid address with a failed exit is still a failed lookup (Codex PR220-r14)");
+  assert.match(iprc.out, /^fail: tailscale ip -4 failed/);
   const r = run("cnoct", CHECK, { nosnat: true });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /note: conntrack not installed: only the preference is checked/);
