@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # DevOS server check (S4-d, DEVOS-251; M1.2 depends on it): inbound tailnet connections to the DevOS API and
 # dashboard keep the client's own address, so AccessGuard's `tailscale whois` sees the real peer and never the
-# bridge gateway. Read-only. Exit 0 pass, 1 fail, 3 skipped (no tailnet IPv4; or no readable chain and no
-# inbound tailnet connection seen in conntrack, so nothing was observed).
+# bridge gateway. Read-only. Exit 0 pass, 1 fail, 3 skipped (no tailnet IPv4).
 # Two independent reads:
-#   1. tailscaled's masquerade rule: `iptables -t nat -S ts-postrouting` holding a MASQUERADE rule fails
-#      (tailnet-snat.sh turns it off every agent tick).
+#   1. tailscaled's preference: `tailscale debug prefs` with NoSNAT false (subnet-route SNAT on) fails, and so do
+#      unreadable prefs (tailnet-snat.sh turns it off every agent tick).
 #   2. conntrack: every tracked TCP connection to this host's tailnet IPv4 on the API port (API_PORT, default
 #      3001) or the dashboard port (DASHBOARD_PORT, default 3000) whose client is another tailnet address must
 #      have its reply addressed to that same client. A reply to any other address (the bridge gateway) means the
@@ -22,17 +21,16 @@ TS_IP="$(timeout 10 tailscale ip -4 2>/dev/null | head -n1)"
 [[ "$TS_IP" =~ $TAILNET ]] || { echo "skipped: no tailnet IPv4 (tailscale ip -4)"; exit 3; }
 
 rc=0; read_any=0; seen=0
-if out="$(timeout 10 iptables -w 5 -t nat -S ts-postrouting 2>/dev/null)"; then
-  read_any=1
-  if grep -qE -- '^-A ts-postrouting( .*)? -j MASQUERADE( |$)' <<<"$out"; then
-    echo "fail: tailscaled masquerades forwarded tailnet traffic (ts-postrouting MASQUERADE): the API sees the bridge gateway, not the client"
-    rc=1
-  else
-    echo "ts-postrouting: no MASQUERADE (ok)"
-  fi
-else
-  echo "note: no ts-postrouting chain to read (tailscaled in nftables mode?)"
-fi
+# The preference, not a firewall rule: tailscaled runs in nftables mode on the DevOS server (DEVOS-89, 14:10 IST),
+# where `iptables -S` does not show its chains; NoSNAT reads the same in both modes.
+prefs="$(timeout 10 tailscale debug prefs 2>/dev/null)"; prc=$?
+nosnat="$( (( prc == 0 )) && jq -r 'if type == "object" and (.NoSNAT | type) == "boolean" then .NoSNAT else "unknown" end' <<<"$prefs" 2>/dev/null)"
+case "$nosnat" in
+  true) read_any=1; echo "tailscale prefs: NoSNAT true (ok)" ;;
+  false) read_any=1; rc=1
+    echo "fail: tailscaled's subnet-route SNAT is on (NoSNAT false): forwarded tailnet traffic reaches the API from the bridge gateway, not the client" ;;
+  *) rc=1; echo "fail: cannot read NoSNAT from tailscale prefs" ;;
+esac
 
 if command -v conntrack >/dev/null 2>&1; then
   for p in "$API" "$DASH"; do
@@ -59,11 +57,11 @@ if command -v conntrack >/dev/null 2>&1; then
     fi
   done
 else
-  echo "note: conntrack not installed: only the masquerade rule is checked"
+  echo "note: conntrack not installed: only the preference is checked"
 fi
 
-# Codex PR220-r1: conntrack proves something only when it shows at least one tailnet client; an idle host with
-# no readable chain has observed nothing, so it is a skip, never a pass.
+# Codex PR220-r1: a pass needs the preference read as NoSNAT true; conntrack alone (no tailnet client seen)
+# never makes a pass.
 (( seen > 0 )) && read_any=1
-(( read_any == 1 || rc != 0 )) || { echo "skipped: no ts-postrouting chain and no inbound tailnet connection to observe"; exit 3; }
+(( read_any == 1 || rc != 0 )) || { echo "skipped: nothing observed"; exit 3; }
 exit "$rc"
