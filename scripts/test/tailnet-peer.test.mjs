@@ -39,6 +39,7 @@ function run(name, script, { nosnat = false, routes = "null", prefs, setRc = 0, 
 case "$*" in
   "ip -4") echo "${ip}" ;;
   "debug prefs") if [[ -f "${dir}/prefs.raw" ]]; then cat "${dir}/prefs.raw"; else echo "{\\"ControlURL\\":\\"x\\",\\"NoSNAT\\":$(cat "${ns}"),\\"AdvertiseRoutes\\":$(cat "${dir}/routes")}"; fi ;;
+  "set --snat-subnet-routes=true") echo restore >> "${dir}/set.log"; echo false > "${ns}" ;;
   "set --snat-subnet-routes=false") echo set >> "${dir}/set.log"; ${setNoop ? "true" : `[[ ${setRc} -eq 0 ]] && echo true > "${ns}"`}${routesAfterSet ? `; echo '${routesAfterSet}' > "${dir}/routes"` : ""}; exit ${setRc} ;;
   *) exit 9 ;;
 esac\n`, { mode: 0o755 });
@@ -90,10 +91,12 @@ test("AT-d-1k: a route-advertising host with a cut still owed is never cut (Code
   assert.ok(!fs.existsSync(path.join(r.dir, "ct.del")), "no conntrack delete");
 });
 
-test("AT-d-1l: routes that appear between the first read and the confirming read stop the cut (Codex PR220-r6)", () => {
+test("AT-d-1l: routes that appear between the first read and the set: the change is undone, nothing cut, exit 1 (Codex PR220-r6/r7)", () => {
   const r = run("routerlate", FIX, { conntrack: {}, routesAfterSet: '["10.0.0.0/24"]' });
-  assert.deepEqual([r.code, r.sets], [0, 1], r.out);
-  assert.match(r.out, /note: this host now advertises 1 route\(s\): no connection is cut \(KK decision\)$/);
+  assert.deepEqual([r.code, r.sets], [1, 2], r.out);
+  assert.equal(r.out, "fail: this host started advertising 1 route(s) during the change; subnet-route SNAT restored (KK decision)");
+  assert.deepEqual(fs.readFileSync(path.join(r.dir, "set.log"), "utf8").trim().split("\n"), ["set", "restore"]);
+  assert.equal(fs.readFileSync(path.join(r.dir, "nosnat"), "utf8").trim(), "false", "back to the state KK chose");
   assert.ok(!fs.existsSync(path.join(r.dir, "ct.del")), "no conntrack delete");
 });
 

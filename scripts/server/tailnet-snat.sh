@@ -51,7 +51,8 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
   fi
   # No conntrack tool: nothing can cut them (M0.1 may not have installed it yet); they end when they close.
   if ! command -v conntrack >/dev/null 2>&1; then
-    rm -f "$PENDING"; echo "note: conntrack not installed: old masqueraded connections end when they close"; return 0
+    rm -f "$PENDING" || { echo "fail: cannot remove $PENDING"; return 1; }   # Codex PR220-r7 (low)
+    echo "note: conntrack not installed: old masqueraded connections end when they close"; return 0
   fi
   ts="$(timeout 10 tailscale ip -4 2>/dev/null | head -n1)"
   [[ "$ts" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || { echo "fail: no tailnet IPv4: old masqueraded connections not cut"; return 1; }
@@ -88,6 +89,17 @@ fi
 timeout 20 tailscale set --snat-subnet-routes=false >/dev/null 2>&1 \
   || { echo "fail: tailscale set --snat-subnet-routes=false did not succeed"; exit 1; }
 read_prefs || exit 1
+# Codex PR220-r7: tailscale has no compare-and-set, so routes enabled between the first read and the set cannot be
+# excluded beforehand. If the confirming read shows routes, the change is undone at once (SNAT back on, the state
+# KK chose) and the run fails, so the host is never left changed without KK's decision.
+if (( ROUTES > 0 )); then
+  if timeout 20 tailscale set --snat-subnet-routes=true >/dev/null 2>&1; then
+    echo "fail: this host started advertising $ROUTES route(s) during the change; subnet-route SNAT restored (KK decision)"
+  else
+    echo "fail: this host started advertising $ROUTES route(s) during the change, and restoring subnet-route SNAT failed (KK decision)"
+  fi
+  exit 1
+fi
 [[ "$NOSNAT" == true ]] || { echo "fail: NoSNAT is still false after tailscale set"; exit 1; }
 echo "fixed: subnet-route SNAT turned off; the API now sees the tailnet client's own address"
 cut_old || exit 1
