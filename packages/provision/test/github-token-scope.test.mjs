@@ -189,3 +189,36 @@ test("DEVOS-21 part 3 (r8): a malformed Link header fails the preflight and the 
   await assert.rejects(githubTokenScopeCheck(gh, { owner: OWNER })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
 });
+
+// Codex PR223-r11: a target with a second `#` is not a URI; and a reader walking pages by count must get a
+// `rel=next` that names exactly the page it reads next, or the listing is unreadable (never "complete").
+test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must name the next page", async () => {
+  const h = (link) => new Headers({ link });
+  for (const v of ["<https://api.github.com/user/repos#one#two>; rel=last", "<user/repos?page=2>; rel=next", "<https://[::1]/user/repos?page=2>; rel=next"]) {
+    assert.equal(linkNext(h(v)), "malformed", v);
+  }
+  const want = { path: "/user/repos", page: 2 };
+  assert.equal(linkNext(h('<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next"'), want), "next");
+  assert.equal(linkNext(h('<https://api.github.com/user/repos?page=9>; rel="last"'), want), "none", "rel=last is not checked");
+  for (const v of [
+    '<https://api.github.com/user/repos?page=3>; rel="next"',
+    '<https://api.github.com/user/repos?page=02>; rel="next"',
+    '<https://api.github.com/user/repos?page=2&page=3>; rel="next"',
+    '<https://api.github.com/user/repos>; rel="next"',
+    '<https://api.github.com/orgs/x/repos?page=2>; rel="next"',
+    '<https://api.github.com/evil/user/repos?page=2>; rel="next"',
+    '<https://api.github.com/user/repos?page=2>; rel="next", <https://api.github.com/user/repos?page=3>; rel="next"',
+  ]) {
+    assert.equal(linkNext(h(v), want), "malformed", v);
+  }
+  // Both readers: page 1 advertises page 3, page 2 is empty with no Link. Neither may read page 2 as the end.
+  const link = '<https://api.github.com/user/repos?page=3>; rel="next"';
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link })), /repository list is unreadable/);
+  const fetchImpl = async (url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    const body = page === 1 ? [{ full_name: `${OWNER}/other`, name: "other", description: null }] : [];
+    return new Response(JSON.stringify(body), { status: 200, headers: page === 1 ? { link } : {} });
+  };
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
+  await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /Link header/);
+});
