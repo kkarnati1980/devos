@@ -12,3 +12,6 @@ M1.2's identity check (AccessGuard) asks `tailscale whois` about the connection'
 - Trusting the bridge gateway, or a forwarded header, as KK: any process on the host or in a container could then act as KK.
 - An own nat rule ahead of tailscaled's chain: tailscaled re-creates its chains on restart (and runs in nftables mode here), so the rule could silently lose.
 - No change to the identity check itself.
+
+## Route-advertising hosts: report, never undo (Codex PR220-r7..r11)
+tailscale has no compare-and-set, so routes enabled during the seconds of a change cannot be ruled out. Rounds r7–r10 tried an automatic undo with a change journal; each version either could reverse a setting KK made or could miss our own change after an uncertain outcome. The design is narrowed: nothing is undone automatically. A host that advertises routes is never changed or cut, and while it shows `NoSNAT` true both `tailnet-snat.sh` and the server check fail, so `server-check` is red until KK decides. No acceptance test was weakened.

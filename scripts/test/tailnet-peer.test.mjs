@@ -23,14 +23,13 @@ const ct = (client, back, port = 3001) =>
 // `tailscale ip -4` prints `ip`; `conntrack -L ... --dport <p>` prints the file ct.<p> (missing: exit 1);
 // `conntrack -D ...` logs its arguments and answers per `ctDel`.
 function run(name, script, { nosnat = false, routes = "null", prefs, setRc = 0, setNoop = false, ip = HOST,
-  conntrack, noTailscale = false, conf = "", ctDel = "ok", pending = false, routesAfterSet, changed = false } = {}) {
+  conntrack, noTailscale = false, conf = "", ctDel = "ok", pending = false, routesAfterSet } = {}) {
   const dir = path.join(tmp, name);
   const bin = path.join(dir, "bin");
   fs.mkdirSync(path.join(dir, "devos"), { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
   fs.writeFileSync(path.join(dir, "devos/server-agent.conf"), conf);
   if (pending) fs.writeFileSync(path.join(dir, "devos/tailnet-snat.cut-pending"), "");
-  if (changed) fs.writeFileSync(path.join(dir, "devos/tailnet-snat.changed"), changed === true ? `${Math.floor(Date.now() / 1000)}\n` : changed);
   const ns = path.join(dir, "nosnat");
   fs.writeFileSync(ns, String(nosnat));
   if (prefs !== undefined) fs.writeFileSync(path.join(dir, "prefs.raw"), prefs);
@@ -40,7 +39,6 @@ function run(name, script, { nosnat = false, routes = "null", prefs, setRc = 0, 
 case "$*" in
   "ip -4") echo "${ip}" ;;
   "debug prefs") if [[ -f "${dir}/prefs.raw" ]]; then cat "${dir}/prefs.raw"; else echo "{\\"ControlURL\\":\\"x\\",\\"NoSNAT\\":$(cat "${ns}"),\\"AdvertiseRoutes\\":$(cat "${dir}/routes")}"; fi ;;
-  "set --snat-subnet-routes=true") echo restore >> "${dir}/set.log"; echo false > "${ns}" ;;
   "set --snat-subnet-routes=false") echo set >> "${dir}/set.log"; ${setNoop ? "true" : `[[ ${setRc} -eq 0 ]] && echo true > "${ns}"`}${routesAfterSet ? `; echo '${routesAfterSet}' > "${dir}/routes"` : ""}; exit ${setRc} ;;
   *) exit 9 ;;
 esac\n`, { mode: 0o755 });
@@ -85,48 +83,20 @@ test("AT-d-1c: a host that advertises routes (subnet router or exit node) is lef
   assert.match(r.out, /advertises 2 route\(s\).*KK decision/);
 });
 
-test("AT-d-1k: a route-advertising host with a cut still owed is never cut (Codex PR220-r5)", () => {
+test("AT-d-1k: NoSNAT true on a host that advertises routes is never touched, never cut, and fails (decision 6)", () => {
   const r = run("routercut", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', conntrack: {}, pending: true });
-  assert.deepEqual([r.code, r.sets], [0, 0], r.out);
-  assert.match(r.out, /advertises 1 route\(s\), so nothing is cut \(KK decision\)$/);
+  assert.deepEqual([r.code, r.sets], [1, 0], r.out);
+  assert.equal(r.out, "fail: this host advertises 1 route(s) with subnet-route SNAT off; left as it is, nothing cut (KK decision)");
   assert.ok(!fs.existsSync(path.join(r.dir, "ct.del")), "no conntrack delete");
 });
 
-test("AT-d-1l: routes that appear between the first read and the set: the change is undone, nothing cut, exit 1 (Codex PR220-r6/r7)", () => {
+test("AT-d-1l: routes that appear during the change: nothing undone, nothing cut, exit 1 (decision 6)", () => {
   const r = run("routerlate", FIX, { conntrack: {}, routesAfterSet: '["10.0.0.0/24"]' });
-  assert.deepEqual([r.code, r.sets], [1, 2], r.out);
-  assert.equal(r.out, "fail: this host advertises 1 route(s); the subnet-route SNAT change was undone (KK decision)");
-  assert.deepEqual(fs.readFileSync(path.join(r.dir, "set.log"), "utf8").trim().split("\n"), ["set", "restore"]);
-  assert.equal(fs.readFileSync(path.join(r.dir, "nosnat"), "utf8").trim(), "false", "back to the state KK chose");
+  assert.deepEqual([r.code, r.sets], [1, 1], r.out);
+  assert.equal(r.out, "fail: this host started advertising 1 route(s) during the change; left as it is, nothing cut (KK decision)");
   assert.ok(!fs.existsSync(path.join(r.dir, "ct.del")), "no conntrack delete");
-});
-
-test("AT-d-1m: an unfinished change (journal kept) on a host that now advertises routes is undone on a later tick (Codex PR220-r8)", () => {
-  const r = run("journal", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', changed: true, pending: true, conntrack: {} });
-  assert.equal(r.code, 1, r.out);
-  assert.equal(r.out, "fail: this host advertises 1 route(s); the subnet-route SNAT change was undone (KK decision)");
-  assert.equal(fs.readFileSync(path.join(r.dir, "nosnat"), "utf8").trim(), "false");
-  assert.ok(!fs.existsSync(path.join(r.dir, "devos/tailnet-snat.changed")), "journal cleared once undone");
-  assert.ok(!fs.existsSync(path.join(r.dir, "ct.del")), "no conntrack delete");
-  const k = run("kkown", FIX, { nosnat: true, routes: '["10.0.0.0/24"]' });
-  assert.deepEqual([k.code, k.sets], [0, 0], "no journal: NoSNAT true with routes is KK's own setting, left alone");
-  const d = run("journaldone", FIX, { nosnat: true, changed: true });
-  assert.equal(d.code, 0, d.out);
-  assert.ok(!fs.existsSync(path.join(d.dir, "devos/tailnet-snat.changed")), "a finished change clears the journal");
-  const a = run("fixjournal", FIX, {});
-  assert.equal(a.code, 0, a.out);
-  assert.ok(!fs.existsSync(path.join(a.dir, "devos/tailnet-snat.changed")), "a confirmed fix clears the journal");
-  const n = run("nojournalnoop", FIX, { setNoop: true });
-  assert.equal(n.code, 1, n.out);
-  assert.ok(!fs.existsSync(path.join(n.dir, "devos/tailnet-snat.changed")), "a set that did not apply leaves no journal (Codex PR220-r10)");
-  const b = run("failjournal", FIX, { setRc: 1 });
-  assert.ok(!fs.existsSync(path.join(b.dir, "devos/tailnet-snat.changed")), "a failed set that left NoSNAT false drops the journal (Codex PR220-r9)");
-  const old = run("stalejournal", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', changed: `${Math.floor(Date.now() / 1000) - 901}\n` });
-  assert.equal(old.code, 0, old.out);
-  assert.match(old.out, /^note: a stale or unreadable change journal was dropped; nothing undone\nok: /);
-  assert.equal(old.sets, 0, "a stale journal never undoes KK's later setting (Codex PR220-r9)");
-  const bad = run("badjournal", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', changed: "x\n" });
-  assert.deepEqual([bad.code, bad.sets], [0, 0], bad.out);
+  const next = run("routerlate2", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', conntrack: {} });
+  assert.equal(next.code, 1, "the next tick still fails: never reported as success");
 });
 
 test("AT-d-1d: a failed set, or NoSNAT still false afterwards, are failures", () => {
@@ -199,6 +169,9 @@ test("AT-d-2b: fail: NoSNAT false, or prefs unreadable", () => {
   const b = run("cbad", CHECK, { prefs: "{}", conntrack: { 3001: [], 3000: [] } });
   assert.equal(b.code, 1);
   assert.match(b.out, /^fail: cannot read NoSNAT from tailscale prefs/);
+  const r = run("crouter", CHECK, { nosnat: true, routes: '["10.0.0.0/24"]', conntrack: { 3001: [], 3000: [] } });
+  assert.equal(r.code, 1, "NoSNAT true with routes is a KK decision, never a pass (decision 6)");
+  assert.match(r.out, /^fail: this host advertises routes with subnet-route SNAT off/);
   for (const [n, prefs] of [["ctrail", '{"NoSNAT":true} junk'], ["ctwo", '{"NoSNAT":true}\n{"NoSNAT":true}']]) {
     const c = run(n, CHECK, { prefs, conntrack: { 3001: [], 3000: [] } });
     assert.equal(c.code, 1, n);

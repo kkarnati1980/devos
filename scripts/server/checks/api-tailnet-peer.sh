@@ -27,12 +27,17 @@ prefs="$(timeout 10 tailscale debug prefs 2>/dev/null)"; prc=$?
 # Codex PR220-r4: exactly one JSON document, and jq's exit status counts.
 nosnat=unknown
 if (( prc == 0 )); then
-  nosnat="$(jq -rs 'if length == 1 and (.[0] | type == "object" and (.NoSNAT | type) == "boolean") then .[0].NoSNAT else "unknown" end' <<<"$prefs" 2>/dev/null)" || nosnat=unknown
+  # S4-d decision 6: NoSNAT true on a host that advertises routes is a KK decision, never a pass ("router").
+  nosnat="$(jq -rs 'if length == 1 and (.[0] | type == "object" and (.NoSNAT | type) == "boolean"
+      and (.AdvertiseRoutes == null or (.AdvertiseRoutes | type) == "array"))
+    then (if .[0].NoSNAT and ((.[0].AdvertiseRoutes // []) | length) > 0 then "router" else .[0].NoSNAT end) else "unknown" end' <<<"$prefs" 2>/dev/null)" || nosnat=unknown
 fi
 case "$nosnat" in
   true) read_any=1; echo "tailscale prefs: NoSNAT true (ok)" ;;
   false) read_any=1; rc=1
     echo "fail: tailscaled's subnet-route SNAT is on (NoSNAT false): forwarded tailnet traffic reaches the API from the bridge gateway, not the client" ;;
+  router) read_any=1; rc=1
+    echo "fail: this host advertises routes with subnet-route SNAT off: a KK decision, not changed by DevOS" ;;
   *) rc=1; echo "fail: cannot read NoSNAT from tailscale prefs" ;;
 esac
 
