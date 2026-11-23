@@ -275,3 +275,36 @@ test("DEVOS-21 part 3 (r15): rel=last must agree with rel=next", async () => {
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
   await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
 });
+
+// Codex PR223-r16: (1) the preflight requires the list read to its end with the private count present too, so a page
+// cap on a page that still advertises rel=next fails even when the count is met; (2) a last page told by an earlier
+// page binds the later ones, so a short page 2 without a Link header is not the end when page 1 named page 3 as last.
+test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=last binds later pages", async () => {
+  const u = (pg) => `https://api.github.com/user/repos?per_page=100&page=${pg}&affiliation=owner`;
+  const want = (pg) => ({ origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: String(pg + 1), affiliation: "owner" } });
+  const bound = { last: null };
+  assert.equal(linkNext(new Headers({ link: `<${u(2)}>; rel="next", <${u(3)}>; rel="last"` }), { ...want(1), bound }), "next");
+  assert.equal(bound.last, 3);
+  assert.equal(linkNext(new Headers(), { ...want(2), bound }), "malformed", "page 2 with no Link header before the told last page");
+  assert.equal(linkNext(new Headers({ link: `<${u(3)}>; rel="next", <${u(4)}>; rel="last"` }), { ...want(2), bound: { last: 3 } }), "malformed", "a different last page");
+  assert.equal(linkNext(new Headers({ link: `<${u(3)}>; rel="next"` }), { ...want(2), bound: { last: 3 } }), "next");
+  assert.equal(linkNext(new Headers(), { ...want(3), bound: { last: 3 } }), "none", "the told last page, no Link");
+  assert.equal(linkNext(new Headers({ link: `<${u(4)}>; rel="next"` }), { ...want(3), bound: { last: 3 } }), "malformed", "a next past the told last page");
+
+  // (1) With the private count present: 100 repos on page 1 meet the count, page 1 says next, the cap is 1 page.
+  const full = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, name: `r${i}`, owner: { login: OWNER } }));
+  const f1 = fake({ user: { login: OWNER, public_repos: 50, owned_private_repos: 50 }, list: full.concat([{ id: 999, name: "late", owner: { login: OWNER } }]), link: `<${u(2)}>; rel="next"` });
+  await assert.rejects(githubTokenScopeCheck(f1.gh, { owner: OWNER, maxPages: 1 })(), /repository list is unreadable/);
+
+  // (2) Both readers: page 1 (full) names next=2 and last=3; page 2 is short with no Link header.
+  const link = `<${u(2)}>; rel="next", <${u(3)}>; rel="last"`;
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 101 }, scopes: "repo", list: full.concat([{ id: 999, name: "p2", owner: { login: OWNER } }]), link })), /repository list is unreadable/);
+  const fetchImpl = async (url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    const mk = (n, k) => Array.from({ length: n }, (_, i) => ({ full_name: `${OWNER}/o${k}-${i}`, name: `o${k}-${i}`, description: null }));
+    const body = page === 1 ? mk(100, 1) : page === 2 ? mk(1, 2) : [];
+    return new Response(JSON.stringify(body), { status: 200, headers: page === 1 ? { link } : {} });
+  };
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
+  await assert.rejects(githubScanner(gh).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
+});
