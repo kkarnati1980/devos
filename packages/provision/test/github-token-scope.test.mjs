@@ -119,7 +119,7 @@ test("DEVOS-21 part 3 (r8): a malformed Link header fails the preflight and the 
     const u = new URL(url);
     if (u.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1 }), { status: 200, headers: { "x-oauth-scopes": "repo" } });
     const page = Number(u.searchParams.get("page"));
-    const body = page === 1 ? [{ id: 1, name: "other", full_name: `${OWNER}/other`, description: null, owner: { login: OWNER } }] : [];
+    const body = page === 1 ? [{ id: 1, name: "other", full_name: `${OWNER}/other`, private: false, description: null, owner: { login: OWNER } }] : [];
     return new Response(JSON.stringify(body), { status: 200, headers: page === 1 ? { link: "<https://api.github.com/user/repos?page=2>; rel=" } : {} });
   };
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
@@ -168,7 +168,7 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
   // Codex PR223-r34 tightened this (was "none"): an extension URI relation type is unparseable.
   assert.equal(linkNext(h('<https://x/y>; rel="prev https://example.com/rel/more last"')), "malformed", "extension URI types are unparseable");
   // Both readers: page 1 advertises page 3, page 2 is empty with no Link. Neither may read page 2 as the end.
-  const link = '<https://api.github.com/user/repos?page=3>; rel="next"';
+  const link = '<https://api.github.com/user/repos?per_page=100&page=3&affiliation=owner>; rel="next"';
   await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link })), /repository list is unreadable/);
   const fetchImpl = async (url) => {
     const page = Number(new URL(url).searchParams.get("page"));
@@ -236,7 +236,7 @@ test("DEVOS-21 part 3 (r16): the list is read to its end, and an earlier rel=las
 
   // (2) Both readers: page 1 (full) names next=2 and last=3; page 2 is short with no Link header.
   const link = `<${u(2)}>; rel="next", <${u(3)}>; rel="last"`;
-  await assert.rejects(check(fake({ user: { ...pub, public_repos: 101 }, scopes: "repo", list: full.concat([{ id: 999, name: "p2", owner: { login: OWNER } }]), link })), /repository list is unreadable/);
+  await assert.rejects(check(fake({ user: { ...pub, public_repos: 51 }, scopes: "repo", list: full.concat([{ id: 999, name: "p2", private: false, owner: { login: OWNER } }]), link })), /repository list is unreadable/);
   const fetchImpl = async (url) => {
     const page = Number(new URL(url).searchParams.get("page"));
     const mk = (n, k) => Array.from({ length: n }, (_, i) => ({ full_name: `${OWNER}/o${k}-${i}`, name: `o${k}-${i}`, description: null }));
