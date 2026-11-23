@@ -270,7 +270,8 @@ test("DEVOS-21 part 2: a refused purge preflight names the token and the reason,
   const http = (routes) => ({ get: async (path) => routes(path) });
   const gh = (routes) => ({ http: { pinned: async () => http(routes) } });
   const cf = (routes) => ({ http: http(routes) });
-  const user = (body) => (p) => (p === "/user" ? { status: 200, body } : { status: 200, body: [{}, {}] });
+  // Codex PR223-r18: listed entries are identifiable repos of the owner, so the count case reaches the count rule.
+  const user = (body) => (p) => (p === "/user" ? { status: 200, body } : { status: 200, body: [{ id: 1, name: "a", owner: { login: "kk" } }, { id: 2, name: "b", owner: { login: "kk" } }] });
   const coolRow = [{ provider: "coolify", kind: "project", externalId: "abc-123" }];
   const cases = [
     [realProvision.githubTokenScopeCheck(gh(() => ({ status: 200, body: { login: "kk" } })), { owner: "kk" }), "github-counts"],

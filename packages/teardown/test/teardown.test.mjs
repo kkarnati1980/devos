@@ -187,7 +187,7 @@ test("AT6 a marked resource missing from the inventory is found by the scan; the
   await archiveProject(P.id, { ...s.base, authorize: allowAll });
   // Created at the provider with the marker, never recorded in the inventory.
   s.fake.projects.set("cfstray0001", { uuid: "cfstray0001", name: "stray", description: `left over devos:${P.id}` });
-  s.fake.repos.set("kkarnati1980/other-name", { id: 99, name: "other-name", full_name: "kkarnati1980/other-name", private: true, description: `x devos:${P.id}` });
+  s.fake.repos.set("kkarnati1980/other-name", { id: 99, name: "other-name", full_name: "kkarnati1980/other-name", owner: { login: "kkarnati1980" }, private: true, description: `x devos:${P.id}` });
   const out = await purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners });
   assert.equal(out.purged, false);
   assert.deepEqual(out.report.hits.map((h) => `${h.provider}:${h.externalId}`).sort(), ["coolify:cfstray0001", "github:kkarnati1980/other-name"]);
@@ -372,7 +372,7 @@ test("M2.5-a2 pre-review: the preflight reads every page, refuses missing counts
   for (let i = 0; i < 3; i++) s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user", action: { status: 503 } });
   await assert.rejects(purgeProject(P.id, { ...s.base, authorize: allowAll, scanners: s.scanners, preflight: [githubTokenScopeCheck(s.gh, { owner: "kkarnati1980" })] }), (e) => e.code === "provider_error" && e.retryable === true);
   // 150 owned repos over two pages: both pages are read and the counts match.
-  const many = Array.from({ length: 150 }, (_, i) => ({ id: 1000 + i, name: `r${i}`, full_name: `kkarnati1980/r${i}`, private: true, description: null }));
+  const many = Array.from({ length: 150 }, (_, i) => ({ id: 1000 + i, name: `r${i}`, full_name: `kkarnati1980/r${i}`, owner: { login: "kkarnati1980" }, private: true, description: null }));
   s.fake.faults.push(user({ login: "kkarnati1980", public_repos: 0, owned_private_repos: 150 }));
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(many.slice(0, 100)) } });
   s.fake.faults.push({ match: (m, p) => m === "GET" && p === "/user/repos", action: { raw: true, status: 200, body: JSON.stringify(many.slice(100)) } });
