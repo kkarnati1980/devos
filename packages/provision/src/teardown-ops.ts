@@ -525,15 +525,28 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
 }
 
 /**
+ * DEVOS-21 part 3: the OAuth scopes of a classic token (or an OAuth app token), from GitHub's `X-OAuth-Scopes`
+ * response header. `null` when the header is absent or empty: GitHub sends no scopes for a fine-grained token or an
+ * app token, so nothing is known about them. Each entry is trimmed; matching is exact, never a prefix.
+ */
+export function classicScopes(headers: { get(name: string): string | null } | undefined): string[] | null {
+  const raw = headers?.get("x-oauth-scopes");
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  return raw.split(",").map((x) => x.trim()).filter((x) => x !== "");
+}
+
+/**
  * M2.5-a2 purge preflight (M2.5 pre-review finding 2): GitHub answers 404 for a private repo the token cannot see,
  * so a token narrowed to selected repositories could make a repo look gone. The token must see every repo its
  * account owns: the owned-repo listing must hold at least `public_repos + owned_private_repos` from `GET /user`.
  * The token's login must also be `owner` (Codex PR55-r1). Throws `github-token-scope` otherwise (the purge stops
  * with `provider_forbidden`, nothing deleted).
  *
- * DEVOS-252, part 3a-2 (docs/modules/M2.4.md, "AT13 probe failure diagnostics, part 3a-2"): the owned-repo listing is read
- * to its proven end by the shared GitHub page rules (`linkNext`), every entry is an identifiable repo of the owner
- * that says whether it is private, and public and private entries are counted apart.
+ * DEVOS-21 part 3 (docs/modules/M2.4.md, "AT13 probe failure diagnostics, part 3"): GitHub returns `owned_private_repos` only to a classic
+ * token with the `read:user` or `user` scope. A classic token cannot be narrowed to selected repositories at all, so
+ * one with the `repo` scope sees every repo its owner owns; that is proof of the same fact. Such a token without
+ * the private count field passes when its login is the owner, its owned-repo list reads in full and holds at least
+ * `public_repos`. Without the count and without that proof the check still refuses.
  */
 export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; maxPages?: number }): () => Promise<void> {
   const maxPages = opts.maxPages ?? 20;
@@ -547,9 +560,15 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     if (u.status !== 200 || !isCount(pub) || typeof u.body?.login !== "string") {
       throw new Error("github-token-scope: the token cannot read its account's repository counts");
     }
-    // Codex PR223-r1: the private count is required; any non-count value (absent, null, a string) is refused.
-    if (!isCount(priv)) {
+    // Codex PR223-r1: only an absent field (GitHub's public user response) may take the scope proof; a field that is
+    // present with any non-number value (null, a string, an object) is a malformed answer and stays refused.
+    if (priv !== undefined && !isCount(priv)) {
       throw new Error("github-token-scope: the token cannot read its account's repository counts");
+    }
+    if (priv === undefined) {
+      const scopes = classicScopes(u.headers);
+      if (scopes === null) throw new Error("github-token-scope: the token cannot read its account's repository counts");
+      if (!scopes.includes("repo")) throw new Error("github-token-scope: the classic token has no repo scope");
     }
     // Codex PR55-r1: the token must belong to the account that owns the project's repos, or its 404s and its owned-
     // repo scan say nothing about them. Checked on the same snapshot the purge uses (pinnedGitHub).
@@ -583,7 +602,7 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       // Codex PR223-r20: an entry that names an owner must name this owner on both paths (only the scope path needs
       // it present); and each entry says whether it is private, so public and private entries are counted apart (r36).
       for (const e of r.body as { id?: unknown; name?: unknown; private?: unknown; owner?: { login?: unknown } }[]) {
-        const ownerOk = typeof e?.owner?.login === "string" ? e.owner.login.toLowerCase() === opts.owner.toLowerCase() : e?.owner === undefined;
+        const ownerOk = typeof e?.owner?.login === "string" ? e.owner.login.toLowerCase() === opts.owner.toLowerCase() : priv !== undefined && e?.owner === undefined;
         const ok = e !== null && typeof e === "object" && isRepoId(e.id) && !ids.has(e.id) && isRepoName(e.name)
           && !names.has(e.name.toLowerCase()) && ownerOk && typeof e.private === "boolean";
         if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
@@ -603,14 +622,15 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
       if (r.body.length < 100 || bound.last === page) { complete = true; break; }
     }
-    const want = pub + priv;
+    const want = pub + (typeof priv === "number" ? priv : 0);
     // Codex PR223-r16: the list must have been read to its end (no page cap hit) with or without the private count,
     // so a count that is already met never stands in for a page GitHub still advertises.
     if (!complete) throw new Error("github-token-scope: the repository list is unreadable");
     if (seen < want) throw new Error(`github-token-scope: the token sees ${seen} of ${want} owned repositories; give it access to all repositories`);
-    // Codex PR223-r20/r36: neither kind of entry stands in for the other.
+    // Codex PR223-r20: on the scope path private entries never stand in for public ones.
+    // Codex PR223-r36: and on the count path neither kind stands in for the other.
     if (seenPublic < pub) throw new Error(`github-token-scope: the token sees ${seenPublic} of ${pub} public owned repositories; give it access to all repositories`);
-    if (seenPrivate < priv) throw new Error(`github-token-scope: the token sees ${seenPrivate} of ${priv} private owned repositories; give it access to all repositories`);
+    if (typeof priv === "number" && seenPrivate < priv) throw new Error(`github-token-scope: the token sees ${seenPrivate} of ${priv} private owned repositories; give it access to all repositories`);
   };
 }
 
