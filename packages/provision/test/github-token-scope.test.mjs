@@ -586,3 +586,19 @@ test("DEVOS-21 part 3 (r32): rel=prev and rel=first must name exactly the previo
   await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
   await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
 });
+
+// Codex PR223-r33: a Link header that is present but holds no link (empty, only commas, commas and spaces) is
+// unparseable, never the same as an absent header; a short page carrying one is unreadable in both readers.
+test("DEVOS-21 part 3 (r33): a present Link header with no link value is unparseable", async () => {
+  const h = (link) => new Headers({ link });
+  for (const v of ["", ",", ",,", " , ,\t,"]) assert.equal(linkNext(h(v)), "malformed", JSON.stringify(v));
+  assert.equal(linkNext(new Headers()), "none", "an absent header is still no next page");
+  const mk = (kind) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const x = new URL(url);
+    if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1, owned_private_repos: 1 }), { status: 200 });
+    const entry = kind === "scan" ? { full_name: `${OWNER}/r0`, name: "r0", description: null } : { id: 1, name: "r0", private: false, owner: { login: OWNER } };
+    return new Response(JSON.stringify([entry]), { status: 200, headers: { link: ",," } });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(mk("pf"), { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(mk("scan")).scan({ id: "11111111-2222-4333-8444-555555555555", slug: "acme" }), /unreadable Link header/);
+});

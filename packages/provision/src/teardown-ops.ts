@@ -246,7 +246,8 @@ const isLinkTarget = (t: string): boolean => {
  * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
  */
 export function linkNext(headers: { get(name: string): string | null } | undefined, expect?: { origin: string; path: string; query: Readonly<Record<string, string>>; bound?: { last: number | null } }): "next" | "none" | "malformed" {
-  const raw = headers?.get("link") ?? "";
+  const present = headers?.get("link") ?? null;
+  const raw = present ?? "";
   // Codex PR223-r11/r12: with `expect`, every `rel=next` target must be exactly the request the reader makes next:
   // the same origin, the same path and the same query parameters (each once, same value, none extra; so `page` and `per_page` both
   // match), or the header is malformed. A reader that walks pages by counting can then never skip or shift a page.
@@ -298,9 +299,13 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
   const ws = () => { while (i < n && /[ \t,]/.test(raw[i] as string)) i++; };
   // Codex PR223-r26: only HTTP whitespace (SP, HTAB) separates tokens and relation types, never Unicode spaces.
   const sp = () => { while (i < n && /[ \t]/.test(raw[i] as string)) i++; };
+  // Codex PR223-r33: a `Link` header that is present must hold at least one link; one that is empty or only commas
+  // and whitespace carries no link value, so it is unparseable, never the same as an absent header.
+  let links = 0;
   ws();
   while (i < n) {
     if (raw[i] !== "<") return "malformed";
+    links++;
     const close = raw.indexOf(">", i);
     if (close < 0) return "malformed";
     // Codex PR223-r10: the target must be a URI reference (RFC 3986 characters only, every `%` a valid escape);
@@ -382,6 +387,7 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
     }
     ws();
   }
+  if (present !== null && links === 0) return "malformed";
   if (current !== null && lastPage !== null && (lastPage > current) !== found) return "malformed";
   if (expect?.bound) expect.bound.last = lastPage;
   return found ? "next" : "none";
