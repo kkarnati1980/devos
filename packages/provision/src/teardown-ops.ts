@@ -220,6 +220,14 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
 }
 
 /**
+ * Codex PR223-r3/r4: GitHub's `Link` response header names a next page (`rel="next"`). Both the purge scope preflight
+ * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
+ */
+export function linkHasNext(headers: { get(name: string): string | null } | undefined): boolean {
+  return /<[^>]*>\s*;\s*rel="?next"?/i.test(headers?.get("link") ?? "");
+}
+
+/**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
  * last page means the scan could not see everything, which is reported as a hit so it is never read as "clean".
@@ -248,6 +256,8 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
             hits.push({ provider: "github", kind: "repo", externalId: x.full_name, name: x.full_name });
           }
         }
+        // Codex PR223-r4: as in the scope preflight, a short page is the last one only when no Link rel=next follows.
+        if (linkHasNext(r.headers)) continue;
         if (r.body.length < 100) return hits;
       }
       hits.push({ provider: "github", kind: "scan-incomplete", externalId: "", name: `more than ${maxPages * 100} repos; scan not complete` });
@@ -361,8 +371,7 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       }
       seen += r.body.length;
       // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
-      const more = /<[^>]*>\s*;\s*rel="?next"?/i.test(r.headers?.get("link") ?? "");
-      if (more) continue;
+      if (linkHasNext(r.headers)) continue;
       if (r.body.length < 100) { complete = true; break; }
     }
     const want = pub + (typeof priv === "number" ? priv : 0);

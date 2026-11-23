@@ -2,7 +2,7 @@
 // accepts a classic token's `repo` scope as proof that it sees every owned repo when GitHub withholds the private count.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GitHubClient, githubTokenScopeCheck, classicScopes } from "../dist/index.js";
+import { GitHubClient, githubTokenScopeCheck, classicScopes, githubScanner, linkHasNext } from "../dist/index.js";
 
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
 const OWNER = "kkarnati1980";
@@ -94,4 +94,30 @@ test("DEVOS-21 part 3: the transport returns headers on 2xx answers only", async
   const miss = await http.get("/nothing");
   assert.equal(miss.status, 404);
   assert.equal(miss.headers, undefined);
+});
+
+// Codex PR223-r4: the purge's leftover scan reads pages the same way as the preflight. A short first page that
+// advertises Link rel=next is not the last page, so a project repo on page 2 is still found.
+test("DEVOS-21 part 3 (r4): githubScanner follows Link rel=next past a short page", async () => {
+  const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme" };
+  const pages = {
+    1: [{ full_name: `${OWNER}/other`, name: "other", description: null }],
+    2: [{ full_name: `${OWNER}/devos-acme`, name: "devos-acme", description: null }],
+  };
+  const seen = [];
+  const fetchImpl = async (url) => {
+    const u = new URL(url);
+    const page = Number(u.searchParams.get("page"));
+    seen.push(page);
+    const headers = page === 1 ? { link: '<https://api.github.com/user/repos?page=2>; rel="next"' } : {};
+    return new Response(JSON.stringify(pages[page] ?? []), { status: 200, headers });
+  };
+  const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
+  const hits = await githubScanner(gh).scan(P);
+  assert.deepEqual(hits.map((h) => h.externalId), [`${OWNER}/devos-acme`]);
+  assert.deepEqual(seen, [1, 2]);
+  // Without the Link header the short first page is still the last one (unchanged behaviour).
+  assert.equal(linkHasNext(new Headers()), false);
+  assert.equal(linkHasNext(new Headers({ link: '<https://x/?page=1>; rel="prev"' })), false);
+  assert.equal(linkHasNext(new Headers({ link: '<https://x/?page=1>; rel="prev", <https://x/?page=3>; rel="next"' })), true);
 });
