@@ -109,7 +109,24 @@ test("d3c-1: report is 3 with no cycle or a running one, 0 or 1 with the finishe
   assert.deepEqual([ok.code, ok.out.code], [0, "pass"]);
   const bad = await probeCli(["report"], logOf(rec({ phase: "done", result: { ok: false, code: "purge-permission", detail: "github_repo", cause: "x" } })));
   assert.deepEqual([bad.code, bad.out.code, bad.out.result.detail], [1, "purge-permission", "github_repo"]);
-  assert.ok(!JSON.stringify(bad.out).includes("cause"), "the stored cause stays in the DB row");
+  // DEVOS-21 diagnostics: the earlier failure is printed too (same safe shape as detail), so one check line names both.
+  assert.equal(bad.out.result.cause, "x");
+  assert.equal(bad.out.result.causeDetail, undefined);
+  const both = await probeCli(["report"], logOf(rec({ phase: "done", result: { ok: false, code: "purge-failed", detail: "purge-permission:github/repo", cause: "run1-failed", causeDetail: "provider_error" } })));
+  assert.deepEqual([both.out.result.cause, both.out.result.causeDetail], ["run1-failed", "provider_error"]);
+  const odd = await probeCli(["report"], logOf(rec({ phase: "done", result: { ok: false, code: "purge-failed", cause: "run1-failed", causeDetail: "token ghp_x leaked here" } })));
+  assert.equal(odd.out.result.causeDetail, "probe-detail-hidden", "a cause detail outside our code shape is never printed");
+});
+
+test("DEVOS-21: step prints the earlier failure behind a failed purge", async () => {
+  const records = [{ cycle: 1, phase: "purge", at: "2026-11-16T00:00:00.000Z", fingerprint: "fp", result: { ok: false, code: "run1-failed", detail: "provider_error" } }];
+  const deps = {
+    offReason: async () => null, last: async () => records.at(-1), record: async (r) => { records.push(r); },
+    provisionOnce: async () => "done", inventory: async () => [], liveAsserts: async () => [], purge: async () => ({ error: "purge-permission:github/repo" }),
+    fingerprint: "fp", now: () => new Date("2026-11-16T00:01:00Z"),
+  };
+  const r = await probeCli(["step"], { log: async () => { throw new Error("not needed"); }, step: async () => deps });
+  assert.deepEqual([r.code, r.out.code, r.out.detail, r.out.cause, r.out.causeDetail], [1, "purge-failed", "purge-permission:github/repo", "run1-failed", "provider_error"]);
 });
 
 test("d3c-1: step runs one probeStep with the built deps and returns its exit", async () => {

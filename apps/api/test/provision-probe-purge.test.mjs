@@ -59,7 +59,9 @@ test("d3c-2a decision 2: the wiring covers every recorded kind, the required sca
 test("d3c-2a decision 1: teardown stops map to fixed probe codes; retryable is in progress; other throws are rethrown", () => {
   assert.equal(purgeStop(terr("delete_unconfirmed", true)), "in_progress");
   assert.equal(purgeStop(terr("provider_error", true)), "in_progress");
-  assert.deepEqual(purgeStop(terr("provider_forbidden")), { error: "purge-permission" });
+  assert.deepEqual(purgeStop(terr("provider_forbidden")), { error: "purge-permission:preflight" }, "DEVOS-21: no resource means the preflight refused");
+  assert.deepEqual(purgeStop(terr("provider_forbidden", false, { provider: "github", kind: "repo", externalId: "1", name: "kk/secret-name" })), { error: "purge-permission:github/repo" }, "DEVOS-21: the refusing provider and kind are named, never the name");
+  assert.deepEqual(purgeStop(terr("provider_forbidden", false, { provider: "coolify", kind: "Bad Kind!" })), { error: "purge-permission:resource" }, "an odd kind is never printed, and it is not read as the preflight");
   assert.deepEqual(purgeStop(terr("approval_required")), { error: "purge-permission:approval_required" });
   assert.deepEqual(purgeStop(terr("policy_denied")), { error: "purge-permission:policy_denied" });
   assert.deepEqual(purgeStop(terr("ownership_mismatch", false, { provider: "github", kind: "repo", externalId: "1", name: "kk/secret-name" })), { error: "purge-ownership:github/repo" });
@@ -107,8 +109,8 @@ test("d3c-2a decision 1: a leftover or scan error is purge-incomplete; a teardow
   assert.deepEqual(await probePurge(PID, hit), { error: "purge-incomplete:leftover:github/repo" });
   const err = purgeDeps({ teardown: { archiveProject: async () => {}, purgeProject: async () => ({ purged: false, report: { hits: [], errors: ["github: 502"] } }) } });
   assert.deepEqual(await probePurge(PID, err), { error: "purge-incomplete:scan-error" });
-  const forb = purgeDeps({ teardown: { archiveProject: async () => { throw terr("provider_forbidden"); }, purgeProject: async () => assert.fail("no purge after a failed archive") } });
-  assert.deepEqual(await probePurge(PID, forb), { error: "purge-permission" });
+  const forb = purgeDeps({ teardown: { archiveProject: async () => { throw terr("provider_forbidden", false, { provider: "github", kind: "repo" }); }, purgeProject: async () => assert.fail("no purge after a failed archive") } });
+  assert.deepEqual(await probePurge(PID, forb), { error: "purge-permission:github/repo" });
   const retry = purgeDeps({ teardown: { archiveProject: async () => {}, purgeProject: async () => { throw terr("delete_unconfirmed", true); } } });
   assert.equal(await probePurge(PID, retry), "in_progress");
 });

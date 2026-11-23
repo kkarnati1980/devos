@@ -31,7 +31,14 @@ export function safeDetail(d: unknown): string | undefined {
   return typeof d === "string" && /^[A-Za-z0-9_:.,\/-]{1,120}$/.test(d) ? d : "probe-detail-hidden";
 }
 const withDetail = (d: unknown) => { const x = safeDetail(d); return x ? { detail: x } : {}; };
-const summary = (r: PhaseRecord) => ({ cycle: r.cycle, phase: r.phase, at: r.at, ...(r.result ? { result: { ok: r.result.ok, code: r.result.code, ...withDetail(r.result.detail) } } : {}) });
+/** DEVOS-21 diagnostics: the earlier failure behind a failed purge, in the same safe shape as `detail`. */
+const withCause = (c: unknown, cd: unknown) => {
+  const x = safeDetail(c);
+  if (!x) return {};
+  const y = safeDetail(cd);
+  return y ? { cause: x, causeDetail: y } : { cause: x };
+};
+const summary = (r: PhaseRecord) => ({ cycle: r.cycle, phase: r.phase, at: r.at, ...(r.result ? { result: { ok: r.result.ok, code: r.result.code, ...withDetail(r.result.detail), ...withCause(r.result.cause, r.result.causeDetail) } } : {}) });
 
 export const USAGE = "provision-probe-cli.js status|report|step";
 /** The command, or null for wrong arguments (exit 2, checked before anything is built or read). */
@@ -62,7 +69,7 @@ export async function probeCli(argv: string[], deps: { log(): Promise<Pick<Probe
   try {
     if (cmd === "step") {
       const t = await probeStep(await deps.step());
-      return { code: t.exit, out: { command: "step", exit: t.exit, phase: t.phase, cycle: t.cycle, code: t.code, ...withDetail(t.detail) } };
+      return { code: t.exit, out: { command: "step", exit: t.exit, phase: t.phase, cycle: t.cycle, code: t.code, ...withDetail(t.detail), ...withCause(t.cause, t.causeDetail) } };
     }
     const last = await (await deps.log()).last();
     if (cmd === "status") return { code: 0, out: { command: "status", ...(last ? summary(last) : { phase: "idle", cycle: 0 }) } };
