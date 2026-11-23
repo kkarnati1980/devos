@@ -24,7 +24,7 @@ const ct = (client, back, port = 3001) =>
 // `tailscale set --snat-subnet-routes=false` empties it (unless setNoop) and logs the call; `tailscale debug prefs`
 // prints `prefs`; `tailscale ip -4` prints `ip`; `conntrack -L ... --dport <p>` prints the file ct.<p>.
 function run(name, script, { chain, prefs = '{"AdvertiseRoutes":null}', setRc = 0, setNoop = false, ip = HOST,
-  conntrack, noTailscale = false, conf = "" } = {}) {
+  conntrack, noTailscale = false, noIptables = false, conf = "" } = {}) {
   const dir = path.join(tmp, name);
   const bin = path.join(dir, "bin");
   fs.mkdirSync(path.join(dir, "devos"), { recursive: true });
@@ -32,7 +32,7 @@ function run(name, script, { chain, prefs = '{"AdvertiseRoutes":null}', setRc = 
   fs.writeFileSync(path.join(dir, "devos/server-agent.conf"), conf);
   const chainFile = path.join(dir, "chain");
   if (chain !== undefined) fs.writeFileSync(chainFile, chain);
-  fs.writeFileSync(path.join(bin, "iptables"), `#!/usr/bin/env bash
+  if (!noIptables) fs.writeFileSync(path.join(bin, "iptables"), `#!/usr/bin/env bash
 [[ "$*" == "-w 5 -t nat -S ts-postrouting" ]] || exit 9
 [[ -f "${chainFile}" ]] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; }
 cat "${chainFile}"\n`, { mode: 0o755 });
@@ -49,6 +49,7 @@ esac\n`, { mode: 0o755 });
   if (conntrack) {
     for (const [p, lines] of Object.entries(conntrack)) fs.writeFileSync(path.join(dir, `ct.${p}`), lines.join("\n") + (lines.length ? "\n" : ""));
     fs.writeFileSync(path.join(bin, "conntrack"), `#!/usr/bin/env bash
+[[ "$1" == "-D" ]] && { echo "$*" >> "${dir}/ct.del"; exit 0; }
 [[ "$1 $2 $3 $4 $5" == "-L -p tcp -d ${ip}" && "$6" == "--dport" ]] || exit 9
 f="${dir}/ct.$7"; [[ -f "$f" ]] || exit 1
 cat "$f"; echo "conntrack v1.4.6 (conntrack-tools): 1 flow entries have been shown." >&2\n`, { mode: 0o755 });
@@ -67,6 +68,18 @@ test("AT-d-1a: the masquerade rule present is turned off once and confirmed gone
   const r = run("fix", FIX, { chain: MASQ });
   assert.deepEqual([r.code, r.sets], [0, 1], r.out);
   assert.match(r.out, /^fixed: subnet-route SNAT turned off/);
+});
+
+test("AT-d-1f: after the fix, old tailnet connections on the API and dashboard ports are cut once (pre-review 1)", () => {
+  const r = run("cut", FIX, { chain: MASQ, conntrack: { 3001: [], 3000: [] }, conf: "API_PORT=3001\n" });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /old masqueraded connections on ports 3001 and 3000 cut/);
+  assert.deepEqual(fs.readFileSync(path.join(tmp, "cut", "ct.del"), "utf8").trim().split("\n"),
+    ["-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3001", "-D -p tcp -s 100.64.0.0/10 -d 100.88.140.76 --dport 3000"]);
+});
+
+test("AT-d-1g: skipped without iptables", () => {
+  assert.equal(run("noipt", FIX, { chain: MASQ, noIptables: true }).code, 3);
 });
 
 test("AT-d-1b: no masquerade rule: nothing changes (idempotent)", () => {

@@ -568,7 +568,7 @@ tailnet_snat_tick() {
   local rc
   [[ -f "$BIN/tailnet-snat.sh" ]] || return 0
   if [[ $DRY -eq 1 ]]; then log "WOULD run tailnet-snat.sh"; return 0; fi
-  set +e; timeout 60 bash "$BIN/tailnet-snat.sh" > "$TMP/tsnat.out" 2>&1 </dev/null; rc=$?; set -e
+  set +e; DEVOS_DIR="$DIR" timeout 120 bash "$BIN/tailnet-snat.sh" > "$TMP/tsnat.out" 2>&1 </dev/null; rc=$?; set -e
   redact < "$TMP/tsnat.out" | tail -n 5 | while IFS= read -r l; do log "tailnet-snat: $l"; done
   (( rc == 0 || rc == 3 )) || log "tailnet-snat: failed (exit $rc)"
   return 0

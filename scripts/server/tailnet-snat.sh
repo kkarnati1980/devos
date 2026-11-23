@@ -29,6 +29,22 @@ masq() {  # 0 the SNAT rule is in ts-postrouting, 1 it is not, 2 the chain canno
   return 1
 }
 
+# Pre-review 1: a connection masqueraded before the fix keeps its NAT mapping (a long-lived stream would keep
+# arriving from the gateway), so its conntrack entries on the API and dashboard ports are deleted once; the client
+# reconnects with its own address. Best effort: needs conntrack-tools 1.4.6+ for the CIDR source.
+cut_old() {
+  local conf="${DEVOS_DIR:-/root/.devos}/server-agent.conf" ts p api dash
+  command -v conntrack >/dev/null 2>&1 || return 0
+  ts="$(timeout 10 tailscale ip -4 2>/dev/null | head -n1)"
+  [[ "$ts" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 0
+  api="$(sed -n 's/^API_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
+  dash="$(sed -n 's/^DASHBOARD_PORT=\([0-9]\{2,5\}\)$/\1/p' "$conf" 2>/dev/null | head -n1)"
+  for p in "${api:-3001}" "${dash:-3000}"; do
+    timeout 10 conntrack -D -p tcp -s 100.64.0.0/10 -d "$ts" --dport "$p" >/dev/null 2>&1 || true
+  done
+  echo "old masqueraded connections on ports ${api:-3001} and ${dash:-3000} cut (clients reconnect)"
+}
+
 masq; rc=$?
 case "$rc" in
   1) echo "ok: tailscaled does not masquerade forwarded tailnet traffic"; exit 0 ;;
@@ -48,7 +64,10 @@ timeout 20 tailscale set --snat-subnet-routes=false >/dev/null 2>&1 \
   || { echo "fail: tailscale set --snat-subnet-routes=false did not succeed"; exit 1; }
 for _ in 1 2 3 4 5; do
   masq; rc=$?
-  (( rc == 1 )) && { echo "fixed: subnet-route SNAT turned off; the API now sees the tailnet client's own address"; exit 0; }
+  if (( rc == 1 )); then
+    echo "fixed: subnet-route SNAT turned off; the API now sees the tailnet client's own address"
+    cut_old; exit 0
+  fi
   sleep 1
 done
 echo "fail: the ts-postrouting MASQUERADE rule is still there after tailscale set"
