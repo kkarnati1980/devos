@@ -322,10 +322,19 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
         if (raw[i] === '"') {
           i++;
           let closed = false;
+          // Codex PR223-r25 (RFC 7230 §3.2.6): quoted text is qdtext (HTAB, SP, %x21, %x23-5B, %x5D-7E, obs-text)
+          // and a quoted-pair escapes only HTAB, SP, VCHAR or obs-text; a control character or a dangling `\`
+          // makes the header malformed.
           while (i < n) {
             const c = raw[i++] as string;
-            if (c === "\\") { value += raw[i++] ?? ""; continue; }
+            if (c === "\\") {
+              const e = raw[i++];
+              if (e === undefined || !/^[\t \x21-\x7E\x80-\xFF]$/.test(e)) return "malformed";
+              value += e;
+              continue;
+            }
             if (c === '"') { closed = true; break; }
+            if (!/^[\t \x21\x23-\x5B\x5D-\x7E\x80-\xFF]$/.test(c)) return "malformed";
             value += c;
           }
           if (!closed) return "malformed";

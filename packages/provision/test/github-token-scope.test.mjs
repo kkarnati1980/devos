@@ -438,3 +438,12 @@ test("DEVOS-21 part 3 (r24): a malformed id or name is an unreadable listing", a
     await assert.rejects(githubScanner(gh).scan(P), /malformed entry/, String(id));
   }
 });
+
+// Codex PR223-r25: a quoted value is an RFC 7230 quoted-string; a control character or a dangling `\` is malformed.
+test("DEVOS-21 part 3 (r25): quoted values follow the quoted-string grammar", () => {
+  const h = (link) => ({ get: (k) => (k.toLowerCase() === "link" ? link : null) });
+  for (const v of ['<https://x/?page=1>; rel="prev"; title="a\vb"', '<https://x/?page=1>; rel="prev"; title="a\u0001b"', '<https://x/?page=1>; rel="prev"; title="a\\\u0001"', '<https://x/?page=1>; rel="prev"; title="a\u007f"', '<https://x/?page=1>; rel="prev"; title="a\\']) {
+    assert.equal(linkNext(h(v)), "malformed", JSON.stringify(v));
+  }
+  assert.equal(linkNext(h('<https://x/?page=1>; rel="prev"; title="a\tb \\"q\\" [x] ~"')), "none");
+});
