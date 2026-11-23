@@ -270,13 +270,17 @@ test("DEVOS-21 part 2: a refused purge preflight names the token and the reason,
   const http = (routes) => ({ get: async (path) => routes(path) });
   const gh = (routes) => ({ http: { pinned: async () => http(routes) } });
   const cf = (routes) => ({ http: http(routes) });
-  const user = (body) => (p) => (p === "/user" ? { status: 200, body } : { status: 200, body: [{}, {}] });
+  // DEVOS-252 (Codex PR223-r18/r36): listed entries are identifiable repos of the owner that say whether they
+  // are private, so the count case reaches the count rule (a fixture correction: `{}` entries are now unreadable).
+  const user = (body) => (p) => (p === "/user" ? { status: 200, body } : { status: 200, body: [{ id: 1, name: "a", private: false, owner: { login: "kk" } }, { id: 2, name: "b", private: true, owner: { login: "kk" } }] });
   const coolRow = [{ provider: "coolify", kind: "project", externalId: "abc-123" }];
   const cases = [
     [realProvision.githubTokenScopeCheck(gh(() => ({ status: 200, body: { login: "kk" } })), { owner: "kk" }), "github-counts"],
     [realProvision.githubTokenScopeCheck(gh(user({ login: "someone-else", public_repos: 1, owned_private_repos: 1 })), { owner: "kk" }), "github-owner"],
     [realProvision.githubTokenScopeCheck(gh((p) => (p === "/user" ? { status: 200, body: { login: "kk", public_repos: 1, owned_private_repos: 1 } } : { status: 200, body: {} })), { owner: "kk" }), "github-list"],
     [realProvision.githubTokenScopeCheck(gh(user({ login: "kk", public_repos: 1, owned_private_repos: 6 })), { owner: "kk" }), "github-repos"],
+    // Codex PR223-r36: the total is met, but public entries stand in for a private repository the token does not see.
+    [realProvision.githubTokenScopeCheck(gh(user({ login: "kk", public_repos: 0, owned_private_repos: 2 })), { owner: "kk" }), "github-repos"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 200 })), async () => [{ ...coolRow[0], externalId: "not a uuid!" }]), "coolify-id"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 404, body: {} })), async () => coolRow), "coolify-team"],
     [realProvision.coolifyTokenScopeCheck(cf(() => ({ status: 200, body: { uuid: "other" } })), async () => coolRow), "coolify-answer"],
