@@ -74,7 +74,7 @@ export function fakeProviders() {
       const b = JSON.parse(init.body);
       const full = `kkarnati1980/${b.name}`;
       if (repos.has(full.toLowerCase())) return json(422, { message: "name already exists on this account" });
-      const r = { id: ++n, name: b.name, full_name: full, private: b.private, description: b.description };
+      const r = { id: ++n, name: b.name, full_name: full, owner: { login: full.split("/")[0] }, private: b.private, description: b.description };
       repos.set(full.toLowerCase(), r);
       return json(201, r);
     }

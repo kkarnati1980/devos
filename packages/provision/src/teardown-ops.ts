@@ -219,6 +219,193 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
   };
 }
 
+/** RFC 7230 §3.2.6 `tchar`. */
+const TCHAR = /^[A-Za-z0-9!#$%&'*+.^_`|~-]$/;
+/**
+ * Codex PR223-r10/r11/r12: a link target is an absolute `http(s)` URI: `scheme://host[:port]` (a reg-name host, a
+ * numeric port, no userinfo and no IP-literal brackets), an optional path of pchar and `/`, then an optional `?query`
+ * and `#fragment` that add only `?`; every `%` is a valid escape. It must also parse as a WHATWG URL. Anything else
+ * (a space, a second `#`, a relative target, `:abc` as a port) is unparseable, whatever its `rel`.
+ */
+const PCHAR = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})";
+const QCHAR = `(?:${PCHAR}|[/?])`;
+const HOST = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})+";
+const URI_REF = new RegExp(`^https?://${HOST}(?::[0-9]+)?(?:/(?:${PCHAR}|/)*)?(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`, "i");
+const isLinkTarget = (t: string): boolean => {
+  if (!URI_REF.test(t)) return false;
+  try { new URL(t); return true; } catch { return false; }
+};
+
+/**
+ * Codex PR223-r3/r4/r8: GitHub's `Link` response header names a next page (`rel="next"`); a header that cannot be parsed is "malformed". Both the purge scope preflight
+ * and the leftover scan read it, so a short page that still has a next page is never taken as the last one.
+ */
+export function linkNext(headers: { get(name: string): string | null } | undefined, expect?: { origin: string; path: string; query: Readonly<Record<string, string>>; bound?: { last: number | null } }): "next" | "none" | "malformed" {
+  const present = headers?.get("link") ?? null;
+  const raw = present ?? "";
+  // Codex PR223-r11/r12: with `expect`, every `rel=next` target must be exactly the request the reader makes next:
+  // the same origin, the same path and the same query parameters (each once, same value, none extra; so `page` and `per_page` both
+  // match), or the header is malformed. A reader that walks pages by counting can then never skip or shift a page.
+  const sameRequest = (target: string, query: Readonly<Record<string, string>>): boolean => {
+    if (!expect) return true;
+    const u = new URL(target);
+    // Codex PR223-r13: the same origin too (scheme, host and port), the one the reader's transport is fixed to.
+    if (u.origin !== expect.origin || u.pathname !== expect.path) return false;
+    const keys = [...u.searchParams.keys()];
+    const want = Object.keys(query);
+    if (keys.length !== want.length) return false;
+    return want.every((k) => { const v = u.searchParams.getAll(k); return v.length === 1 && v[0] === query[k]; });
+  };
+  const nextOk = (target: string): boolean => sameRequest(target, expect?.query ?? {});
+  // Codex PR223-r15: a `rel=last` link says how many pages exist. With `expect` (whose `page` is the page after the
+  // one just read), its target must be the same request with a decimal `page` no lower than the current page, or the
+  // header is malformed. A last page beyond the current one without a `rel=next` link is a contradiction, and so is a
+  // `rel=next` link when the current page is the last one: both are malformed, never read as the end of the listing.
+  const current = expect && /^[1-9][0-9]*$/.test(expect.query.page ?? "") ? Number(expect.query.page) - 1 : null;
+  // Codex PR223-r16: `bound` carries the last page a reader has been told across its pages, so a later page without
+  // a Link header (or with a different last page) can never drop a bound set by an earlier one.
+  const prior = expect?.bound?.last ?? null;
+  let lastPage: number | null = prior;
+  const lastOk = (target: string): boolean => {
+    if (!expect) return true;
+    if (current === null) return false;
+    const pg = new URL(target).searchParams.getAll("page");
+    if (pg.length !== 1 || !/^[1-9][0-9]{0,8}$/.test(pg[0] as string)) return false;
+    const k = Number(pg[0]);
+    if (k < current || !sameRequest(target, { ...expect.query, page: pg[0] as string })) return false;
+    if (lastPage !== null && lastPage !== k) return false;
+    lastPage = k;
+    return true;
+  };
+  // Codex PR223-r32: a page-naming relation (`prev`, `first`) whose target must be exactly page `want` of this
+  // listing, with `want` at least 1 and never after the current page (`prev` is therefore absent on page 1).
+  const pageOk = (target: string, want: number | null): boolean => {
+    if (!expect) return true;
+    if (current === null || want === null || want < 1 || want > current) return false;
+    return sameRequest(target, { ...expect.query, page: String(want) });
+  };
+  // Codex PR223-r5/r6 (RFC 8288 Appendix B): a small tokenizer, so a `<`, `,` or `;` inside a quoted parameter value
+  // never splits a link. Each link is `<uri>` then `;`-separated parameters in any order; `rel` holds a space-separated
+  // list of relation types, quoted or not. Any link whose rel list contains `next` counts. A value that cannot be
+  // parsed is "malformed" (Codex PR223-r8): the caller treats the whole listing as unreadable, never as complete.
+  let i = 0;
+  let found = false;
+  const n = raw.length;
+  const ws = () => { while (i < n && /[ \t,]/.test(raw[i] as string)) i++; };
+  // Codex PR223-r26: only HTTP whitespace (SP, HTAB) separates tokens and relation types, never Unicode spaces.
+  const sp = () => { while (i < n && /[ \t]/.test(raw[i] as string)) i++; };
+  // Codex PR223-r33: a `Link` header that is present must hold at least one link; one that is empty or only commas
+  // and whitespace carries no link value, so it is unparseable, never the same as an absent header.
+  let links = 0;
+  ws();
+  while (i < n) {
+    if (raw[i] !== "<") return "malformed";
+    links++;
+    const close = raw.indexOf(">", i);
+    if (close < 0) return "malformed";
+    // Codex PR223-r10: the target must be a URI reference (RFC 3986 characters only, every `%` a valid escape);
+    // a space, quote or other character outside that set (e.g. `<bad target>`) makes the header malformed.
+    const target = raw.slice(i + 1, close);
+    if (!isLinkTarget(target)) return "malformed";
+    i = close + 1;
+    // Codex PR223-r21 (RFC 8288 §3.3: `rel` MUST be present, and once): a link with no `rel`, or with a second
+    // `rel`, is malformed, so a target without a relation never reads as "no next page".
+    let rels = 0;
+    for (;;) {
+      sp();
+      if (i >= n || raw[i] === ",") { if (rels !== 1) return "malformed"; break; }
+      if (raw[i] !== ";") return "malformed";
+      i++; sp();
+      // Codex PR223-r9: an allow-list grammar. A parameter name, and an unquoted value, is one or more RFC 7230
+      // token characters; any other character where one is expected (e.g. `rel=next"`, `re"l=next`, `rel=ne<xt`)
+      // makes the header malformed instead of being read as part of the name or value.
+      const nameStart = i;
+      while (i < n && TCHAR.test(raw[i] as string)) i++;
+      const name = raw.slice(nameStart, i).toLowerCase();
+      if (i < n && !/[ \t=;,]/.test(raw[i] as string)) return "malformed";
+      sp();
+      let value = "";
+      if (raw[i] === "=") {
+        i++; sp();
+        if (raw[i] === '"') {
+          i++;
+          let closed = false;
+          // Codex PR223-r25 (RFC 7230 §3.2.6): quoted text is qdtext (HTAB, SP, %x21, %x23-5B, %x5D-7E, obs-text)
+          // and a quoted-pair escapes only HTAB, SP, VCHAR or obs-text; a control character or a dangling `\`
+          // makes the header malformed.
+          while (i < n) {
+            const c = raw[i++] as string;
+            if (c === "\\") {
+              const e = raw[i++];
+              if (e === undefined || !/^[\t \x21-\x7E\x80-\xFF]$/.test(e)) return "malformed";
+              value += e;
+              continue;
+            }
+            if (c === '"') { closed = true; break; }
+            if (!/^[\t \x21\x23-\x5B\x5D-\x7E\x80-\xFF]$/.test(c)) return "malformed";
+            value += c;
+          }
+          if (!closed) return "malformed";
+        } else {
+          const vs = i;
+          while (i < n && TCHAR.test(raw[i] as string)) i++;
+          value = raw.slice(vs, i);
+          if (value === "" || (i < n && !/[ \t;,]/.test(raw[i] as string))) return "malformed";
+        }
+      }
+      // Codex PR223-r7: a parameter without a name, or a `rel` without a value (bare, `rel=` or `rel=""`), is
+      // malformed, so it fails closed like any other unparseable header.
+      if (name === "") return "malformed";
+      // Codex PR223-r22 (RFC 8288 §3.2): an `anchor` parameter moves a link's context to another resource, so its
+      // `rel=next`/`rel=last` would no longer describe this listing. GitHub never sends one; any `anchor` is malformed.
+      if (name === "anchor") return "malformed";
+      if (name === "rel") {
+        rels++;
+        const types = value.split(/[ \t]+/).filter((t) => t !== "");
+        if (types.length === 0) return "malformed";
+        // Codex PR223-r14 (RFC 8288 §3.3): each relation type is a registered name (a letter, then letters, digits,
+        // `.` or `-`; compared case-insensitively); anything else (e.g. `next,`) is malformed.
+        // Codex PR223-r34 (decision 1, supersedes the r18/r19 extension-URI rule): GitHub sends only registered
+        // relation names, so an extension (URI) relation type is unparseable. Its grammar can no longer be read
+        // as "no next page", and the reader stays fail-closed.
+        // Codex PR223-r35: exactly GitHub's four pagination relations; any other name (e.g. `nex`, `prefetch`) is
+        // unparseable too, so a misspelt `next` can never read as "no next page".
+        if (!types.every((t) => /^(?:next|prev|first|last)$/i.test(t))) return "malformed";
+        if (types.some((t) => t.toLowerCase() === "next")) {
+          if (!nextOk(target)) return "malformed";
+          found = true;
+        }
+        if (types.some((t) => t.toLowerCase() === "last") && !lastOk(target)) return "malformed";
+        // Codex PR223-r32 (decision 1, exact GitHub pagination): `prev` and `first` name pages too, so each must be
+        // exactly what GitHub sends for the current page: `prev` is the page before it (so none on page 1) and
+        // `first` is page 1, both the same request. Any other target contradicts the page just read.
+        if (types.some((t) => t.toLowerCase() === "prev") && !pageOk(target, current === null ? null : current - 1)) return "malformed";
+        if (types.some((t) => t.toLowerCase() === "first") && !pageOk(target, current === null ? null : 1)) return "malformed";
+      }
+    }
+    ws();
+  }
+  if (present !== null && links === 0) return "malformed";
+  if (current !== null && lastPage !== null && (lastPage > current) !== found) return "malformed";
+  if (expect?.bound) expect.bound.last = lastPage;
+  return found ? "next" : "none";
+}
+
+/** Codex PR223-r24: a GitHub repository id is a positive safe integer. */
+function isRepoId(v: unknown): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+}
+
+/** Codex PR223-r24: a GitHub repository name is one or more ASCII letters, digits, `.`, `-` or `_` (not `.` or `..`). */
+function isRepoName(v: unknown): v is string {
+  return typeof v === "string" && /^[A-Za-z0-9._-]{1,100}$/.test(v) && v !== "." && v !== "..";
+}
+
+/** Codex PR223-r27: a GitHub login is 1–39 ASCII letters, digits or single inner hyphens. */
+function isLogin(v: unknown): v is string {
+  return typeof v === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/.test(v);
+}
+
 /**
  * GitHub leftover scan (decision 6): every repo of the token's account named `devos-<slug>` or whose description
  * carries the project's marker. Independent of the inventory. Pages are bounded (`maxPages` × 100 repos); a full
@@ -232,23 +419,63 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
       if (!SLUG_RE.test(p.slug)) throw new Error("slug-invalid");
       const marker = ownershipMarker(p.id);
       const hits: LeftoverHit[] = [];
+      const bound = { last: null as number | null };
+      // Codex PR223-r21: a repository seen twice across pages means the listing shifted, so a repository may have
+      // been skipped; the scan is then inconclusive. Repos are keyed by full name (unique, case-insensitive on
+      // GitHub) and, when present, by numeric id.
+      // Codex PR223-r27: every entry is exactly `<login>/<name>` with a valid login and repo name, every entry of
+      // an `affiliation=owner` listing names the same owner (and `owner.login`, when sent, agrees), so the
+      // lower-cased name alone is a sound duplicate key whether or not ids are sent.
+      const seenNames = new Set<string>();
+      const seenIds = new Set<number>();
+      let listOwner: string | null = null;
+      let advertised = false;
       for (let page = 1; page <= maxPages; page++) {
         const r = await gh.http.get<RepoBody[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
         if (r.status !== 200 || !Array.isArray(r.body)) {
           throw new ProviderError("github", "bad-response", `github GET /user/repos returned an unexpected response (${r.status})`, r.status);
         }
+        // Codex PR223-r26: a page never holds more than the `per_page=100` asked for, or the offsets are wrong.
+        if (r.body.length > 100) throw new ProviderError("github", "bad-response", "github GET /user/repos returned more entries than the page size", r.status);
+        // Codex PR223-r28/r29: as in the scope preflight, a page advertised by rel=next must not be empty.
+        if (advertised && r.body.length === 0) throw new ProviderError("github", "bad-response", "github GET /user/repos returned an empty page it had advertised", r.status);
         for (const x of r.body) {
           // Codex PR48-r4: every field the match reads must be well-formed, or the whole scan is inconclusive.
           // Codex PR48-r5: the field must be present (string or null); an omitted description is inconclusive.
           const okDesc = x && (x.description === null || typeof x.description === "string");
-          if (!x || typeof x.full_name !== "string" || typeof x.name !== "string" || !okDesc || x.full_name.split("/")[1] !== x.name) {
+          const parts = x && typeof x.full_name === "string" ? x.full_name.split("/") : [];
+          const ownerLogin = (x as { owner?: { login?: unknown } } | null)?.owner?.login;
+          const ownerOk = (x as { owner?: unknown } | null)?.owner === undefined
+            || (typeof ownerLogin === "string" && ownerLogin.toLowerCase() === (parts[0] ?? "").toLowerCase());
+          if (!x || parts.length !== 2 || !isLogin(parts[0]) || !isRepoName(x.name) || parts[1] !== x.name || !okDesc || !ownerOk
+            || (listOwner !== null && parts[0].toLowerCase() !== listOwner)) {
             throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);
           }
+          listOwner = parts[0].toLowerCase();
+          const key = x.name.toLowerCase();
+          const id = (x as { id?: unknown }).id;
+          if (id !== undefined && !isRepoId(id)) {
+            throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);
+          }
+          if (seenNames.has(key) || (typeof id === "number" && seenIds.has(id))) {
+            throw new ProviderError("github", "bad-response", "github GET /user/repos returned a repository twice", r.status);
+          }
+          seenNames.add(key);
+          if (typeof id === "number") seenIds.add(id);
           if (x.name === `devos-${p.slug}` || (x.description ?? "").includes(marker)) {
             hits.push({ provider: "github", kind: "repo", externalId: x.full_name, name: x.full_name });
           }
         }
-        if (r.body.length < 100) return hits;
+        // Codex PR223-r4: as in the scope preflight, a short page is the last one only when no Link rel=next follows.
+        const link = linkNext(r.headers, { origin: gh.http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" }, bound });
+        if (link === "malformed") throw new ProviderError("github", "bad-response", "github GET /user/repos returned an unreadable Link header", r.status);
+        // Codex PR223-r30: as in the scope preflight, an empty page that names a next page contradicts itself.
+        // Codex PR223-r31: nor can an empty page be the one a rel=last names.
+        if (r.body.length === 0 && (link === "next" || bound.last === page)) throw new ProviderError("github", "bad-response", "github GET /user/repos returned an empty page that names a next or last page", r.status);
+        advertised = link === "next";
+        if (link === "next") continue;
+        // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
+        if (r.body.length < 100 || bound.last === page) return hits;
       }
       hits.push({ provider: "github", kind: "scan-incomplete", externalId: "", name: `more than ${maxPages * 100} repos; scan not complete` });
       return hits;
@@ -300,6 +527,10 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
  * account owns: the owned-repo listing must hold at least `public_repos + owned_private_repos` from `GET /user`.
  * The token's login must also be `owner` (Codex PR55-r1). Throws `github-token-scope` otherwise (the purge stops
  * with `provider_forbidden`, nothing deleted).
+ *
+ * DEVOS-252, part 3a (docs/modules/M2.4.md, "AT13 probe failure diagnostics, part 3a"): the owned-repo listing is read
+ * to its proven end by the shared GitHub page rules (`linkNext`), every entry is an identifiable repo of the owner
+ * that says whether it is private, and public and private entries are counted apart.
  */
 export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; maxPages?: number }): () => Promise<void> {
   const maxPages = opts.maxPages ?? 20;
@@ -308,7 +539,13 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     const http = await gh.http.pinned();
     const u = await http.get<{ login?: string; public_repos?: number; owned_private_repos?: number }>("/user");
     const pub = u.body?.public_repos; const priv = u.body?.owned_private_repos;
-    if (u.status !== 200 || typeof pub !== "number" || typeof priv !== "number" || typeof u.body?.login !== "string") {
+    // Codex PR223-r5: a count is a non-negative safe integer, or the answer is malformed and refused.
+    const isCount = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+    if (u.status !== 200 || !isCount(pub) || typeof u.body?.login !== "string") {
+      throw new Error("github-token-scope: the token cannot read its account's repository counts");
+    }
+    // Codex PR223-r1: the private count is required; any non-count value (absent, null, a string) is refused.
+    if (!isCount(priv)) {
       throw new Error("github-token-scope: the token cannot read its account's repository counts");
     }
     // Codex PR55-r1: the token must belong to the account that owns the project's repos, or its 404s and its owned-
@@ -317,13 +554,60 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
       throw new Error("github-token-scope: the token belongs to another account than the repository owner");
     }
     let seen = 0;
+    let seenPublic = 0;
+    // Codex PR223-r36: on the count path too, each entry says whether it is private, and public and private entries
+    // are counted apart, so public entries never stand in for private repositories the token does not see.
+    let seenPrivate = 0;
+    let complete = false;
+    const ids = new Set<number>();
+    // Codex PR223-r23: a repository name (case-insensitive; every entry here is the owner's) is seen once too, so a
+    // repository replaced mid-listing (same name, new id) never counts twice and masks an omitted one.
+    const names = new Set<string>();
+    const bound = { last: null as number | null };
+    let advertised = false;
     for (let page = 1; page <= maxPages; page++) {
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
-      if (r.status !== 200 || !Array.isArray(r.body)) throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r26: a page never holds more than the `per_page=100` asked for.
+      if (r.status !== 200 || !Array.isArray(r.body) || r.body.length > 100) throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r28/r29: a page the page before named with rel=next was advertised to hold entries, so an empty
+      // answer contradicts it (the listing shifted), never the end. After a full page with no rel=next and no rel=last
+      // naming it (e.g. exactly 100 repos and no Link header) the reader reads on to confirm, and [] there is the end.
+      if (advertised && r.body.length === 0) throw new Error("github-token-scope: the repository list is unreadable");
+      // Codex PR223-r2: on the scope proof the list is the only count, so every entry must be an identifiable repo
+      // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
+      // Codex PR223-r18/r19: on the count path every entry is a repo (a numeric id seen once, a name) too, so a
+      // repeated entry never makes up for a repository the token does not see; the count itself is the owner's.
+      // Codex PR223-r20: an entry that names an owner must name this owner on both paths (only the scope path needs
+      // it present); and each entry says whether it is private, so public and private entries are counted apart (r36).
+      for (const e of r.body as { id?: unknown; name?: unknown; private?: unknown; owner?: { login?: unknown } }[]) {
+        const ownerOk = typeof e?.owner?.login === "string" ? e.owner.login.toLowerCase() === opts.owner.toLowerCase() : e?.owner === undefined;
+        const ok = e !== null && typeof e === "object" && isRepoId(e.id) && !ids.has(e.id) && isRepoName(e.name)
+          && !names.has(e.name.toLowerCase()) && ownerOk && typeof e.private === "boolean";
+        if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
+        ids.add(e.id as number);
+        names.add((e.name as string).toLowerCase());
+        if (e.private === false) seenPublic++; else seenPrivate++;
+      }
       seen += r.body.length;
-      if (r.body.length < 100) break;
+      // Codex PR223-r3: a short page is the last one only when GitHub's Link header names no next page.
+      const link = linkNext(r.headers, { origin: http.origin, path: "/user/repos", query: { per_page: "100", page: String(page + 1), affiliation: "owner" }, bound });
+      // Codex PR223-r8: an unparseable Link header makes the whole listing inconclusive.
+      // Codex PR223-r30: an empty page is always the end, so one that names a next page contradicts itself.
+      // Codex PR223-r31: nor can an empty page be the one a rel=last names (GitHub names only a page with entries).
+      if (link === "malformed" || (r.body.length === 0 && (link === "next" || bound.last === page))) throw new Error("github-token-scope: the repository list is unreadable");
+      advertised = link === "next";
+      if (link === "next") continue;
+      // Codex PR223-r17: a full page is the last one too when a validated rel=last names this page.
+      if (r.body.length < 100 || bound.last === page) { complete = true; break; }
     }
-    if (seen < pub + priv) throw new Error(`github-token-scope: the token sees ${seen} of ${pub + priv} owned repositories; give it access to all repositories`);
+    const want = pub + priv;
+    // Codex PR223-r16: the list must have been read to its end (no page cap hit) with or without the private count,
+    // so a count that is already met never stands in for a page GitHub still advertises.
+    if (!complete) throw new Error("github-token-scope: the repository list is unreadable");
+    if (seen < want) throw new Error(`github-token-scope: the token sees ${seen} of ${want} owned repositories; give it access to all repositories`);
+    // Codex PR223-r20/r36: neither kind of entry stands in for the other.
+    if (seenPublic < pub) throw new Error(`github-token-scope: the token sees ${seenPublic} of ${pub} public owned repositories; give it access to all repositories`);
+    if (seenPrivate < priv) throw new Error(`github-token-scope: the token sees ${seenPrivate} of ${priv} private owned repositories; give it access to all repositories`);
   };
 }
 
