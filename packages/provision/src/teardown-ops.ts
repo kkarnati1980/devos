@@ -231,8 +231,11 @@ const PCHAR = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})";
 const QCHAR = `(?:${PCHAR}|[/?])`;
 const HOST = "(?:[A-Za-z0-9\\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})+";
 const URI_REF = new RegExp(`^https?://${HOST}(?::[0-9]+)?(?:/(?:${PCHAR}|/)*)?(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`, "i");
-/** RFC 3986 absolute URI (scheme, `:`, then URI characters with valid `%` escapes): an extension relation type. */
-const REL_URI = /^[A-Za-z][A-Za-z0-9+.-]*:(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?#[\]]|%[0-9A-Fa-f]{2})+$/;
+/**
+ * RFC 3986 absolute URI, an extension relation type: `scheme ":"`, a non-empty path of pchar and `/`, then an optional
+ * `?query` and at most one `#fragment` that add only `/` and `?` (Codex PR223-r19: `urn:x#one#two` is not a URI).
+ */
+const REL_URI = new RegExp(`^[A-Za-z][A-Za-z0-9+.-]*:(?:${PCHAR}|/)+(?:\\?${QCHAR}*)?(?:#${QCHAR}*)?$`);
 const isLinkTarget = (t: string): boolean => {
   if (!URI_REF.test(t)) return false;
   try { new URL(t); return true; } catch { return false; }
@@ -494,12 +497,13 @@ export function githubTokenScopeCheck(gh: GitHubClient, opts: { owner: string; m
     for (let page = 1; page <= maxPages; page++) {
       const r = await http.get<unknown[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
       if (r.status !== 200 || !Array.isArray(r.body)) throw new Error("github-token-scope: the repository list is unreadable");
-      // Codex PR223-r2: every entry must be an identifiable repo of the owner (a numeric id seen once, a name,
-      // owner.login = owner); anything else is an unreadable list. Codex PR223-r18: on the count path too, so a
-      // repeated entry can never make up for a repository the token does not see.
+      // Codex PR223-r2: on the scope proof the list is the only count, so every entry must be an identifiable repo
+      // of the owner (a numeric id seen once, a name, owner.login = owner); anything else is an unreadable list.
+      // Codex PR223-r18/r19: on the count path every entry is a repo (a numeric id seen once, a name) too, so a
+      // repeated entry never makes up for a repository the token does not see; the count itself is the owner's.
       for (const e of r.body as { id?: unknown; name?: unknown; owner?: { login?: unknown } }[]) {
         const ok = e !== null && typeof e === "object" && typeof e.id === "number" && !ids.has(e.id) && typeof e.name === "string" && e.name !== ""
-          && typeof e.owner?.login === "string" && e.owner.login.toLowerCase() === opts.owner.toLowerCase();
+          && (priv !== undefined || (typeof e.owner?.login === "string" && e.owner.login.toLowerCase() === opts.owner.toLowerCase()));
         if (!ok) throw new Error("github-token-scope: the repository list is unreadable");
         ids.add(e.id as number);
       }

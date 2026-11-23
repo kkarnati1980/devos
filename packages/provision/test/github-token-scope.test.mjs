@@ -341,12 +341,13 @@ test("DEVOS-21 part 3 (r17): a full page named as last by rel=last ends the list
 test("DEVOS-21 part 3 (r18): identity on the count path, and any absolute URI as a relation type", async () => {
   const dup = [{ id: 1, name: "a", owner: { login: OWNER } }, { id: 1, name: "a", owner: { login: OWNER } }];
   await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: dup })), /repository list is unreadable/);
-  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 0 }, list: [{ id: 1, name: "a", owner: { login: "other" } }] })), /repository list is unreadable/);
+  await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a" }, { id: "2", name: "b" }] })), /repository list is unreadable/);
+  await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [{ id: 1, name: "a" }, { id: 2, name: "b" }] }));
   const h = (link) => new Headers({ link });
   const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
   assert.equal(linkNext(h('<https://x.example/meta>; rel="urn:example:metadata"'), want), "none");
   assert.equal(linkNext(h('<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next tag:example.com,2026:rel"'), want), "next");
-  for (const v of ['<https://x/y>; rel="urn:"', '<https://x/y>; rel="1urn:x"', '<https://x/y>; rel="urn:a%zz"', '<https://x/y>; rel="urn:a<b"']) {
+  for (const v of ['<https://x/y>; rel="urn:example:rel#one#two"', '<https://x/y>; rel="urn:a%2"', '<https://x/y>; rel="urn:"', '<https://x/y>; rel="1urn:x"', '<https://x/y>; rel="urn:a%zz"', '<https://x/y>; rel="urn:a<b"']) {
     assert.equal(linkNext(h(v), want), "malformed", v);
   }
 });
