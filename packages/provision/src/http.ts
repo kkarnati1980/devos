@@ -41,6 +41,8 @@ export interface TransportOptions {
 export interface HttpResult<T> {
   status: number;
   body: T;
+  /** DEVOS-21 part 3: the response headers of a 2xx answer (read-only; a caller reads a named header, never all). */
+  headers?: { get(name: string): string | null };
 }
 
 export class Transport {
@@ -150,7 +152,7 @@ export class Transport {
       await res.body?.cancel().catch(() => {});
       throw new ProviderError(this.provider, "http", `${this.provider} ${method} ${url.pathname} returned ${res.status}`, res.status);
     }
-    if (res.status === 204) return { status: 204, body: null };
+    if (res.status === 204) return { status: 204, body: null, headers: res.headers };
     // Codex PR44-r1: the body is read under the same timeout signal. A body that stalls or breaks is a transient
     // timeout/network error (a GET is retried; a write goes to the runner's lookup-before-recreate), never a raw error.
     let text: string;
@@ -163,9 +165,9 @@ export class Transport {
       }
       throw new ProviderError(this.provider, "network", `${this.provider} ${method} ${url.pathname} response could not be read`);
     }
-    if (!text) return { status: res.status, body: null };
+    if (!text) return { status: res.status, body: null, headers: res.headers };
     try {
-      return { status: res.status, body: JSON.parse(text) as T };
+      return { status: res.status, body: JSON.parse(text) as T, headers: res.headers };
     } catch {
       throw new ProviderError(this.provider, "bad-response", `${this.provider} ${method} ${url.pathname} returned invalid JSON`, res.status);
     }
