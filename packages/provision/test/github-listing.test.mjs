@@ -98,7 +98,7 @@ test("DEVOS-21 part 3 (r8): a malformed Link header fails the preflight and the 
     const u = new URL(url);
     if (u.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1, owned_private_repos: 0 }), { status: 200 });
     const page = Number(u.searchParams.get("page"));
-    const body = page === 1 ? [{ id: 1, name: "other", full_name: `${OWNER}/other`, description: null, owner: { login: OWNER } }] : [];
+    const body = page === 1 ? [{ id: 1, name: "other", full_name: `${OWNER}/other`, private: false, description: null, owner: { login: OWNER } }] : [];
     return new Response(JSON.stringify(body), { status: 200, headers: page === 1 ? { link: "<https://api.github.com/user/repos?page=2>; rel=" } : {} });
   };
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl, sleep: async () => {} });
@@ -350,6 +350,8 @@ test("DEVOS-21 part 3 (r22): a link with an anchor is malformed", async () => {
   const gh = new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
     const x = new URL(url);
     if (x.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 100, owned_private_repos: 0 }), { status: 200 });
+    // PR225-r1 sweep: page 2 answers [], so a reader that ignored the malformed header would accept the listing.
+    if (x.searchParams.get("page") !== "1") return new Response("[]", { status: 200 });
     return new Response(JSON.stringify(mkRepos(100)), { status: 200, headers: { link: `<${u(1)}>; rel="last"; anchor="https://api.github.com/other"` } });
   }, sleep: async () => {} });
   await assert.rejects(githubTokenScopeCheck(gh, { owner: OWNER, maxPages: 3 })(), /repository list is unreadable/);
