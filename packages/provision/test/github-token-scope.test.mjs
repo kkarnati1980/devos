@@ -363,3 +363,37 @@ test("DEVOS-21 part 3 (r20): public entries are counted alone, and a named owner
   await assert.rejects(check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), e(2, true, "someone-else")] })), /repository list is unreadable/);
   await check(fake({ user: { login: OWNER, public_repos: 1, owned_private_repos: 1 }, list: [e(1, false), { id: 2, name: "b" }] }));
 });
+
+// Codex PR223-r21: (1) a link with no rel (or two rels) is malformed, so a target without a relation never reads
+// as "no next page"; (2) the leftover scan refuses a repository seen twice across pages (the listing shifted).
+test("DEVOS-21 part 3 (r21): a link without rel is malformed, and the scan refuses a repeated repository", async () => {
+  const h = (link) => new Headers({ link });
+  const want = { origin: "https://api.github.com", path: "/user/repos", query: { per_page: "100", page: "2", affiliation: "owner" } };
+  const next = "https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner";
+  assert.equal(linkNext(h(`<${next}>`), want), "malformed", "no parameters");
+  assert.equal(linkNext(h(`<${next}>; title="page 2"`), want), "malformed", "no rel");
+  assert.equal(linkNext(h(`<${next}>; rel="next"; rel="prev"`), want), "malformed", "two rels");
+  assert.equal(linkNext(h(`<https://x/?page=1>; rel="prev", <${next}>`), want), "malformed", "second link has no rel");
+  assert.equal(linkNext(h(`<${next}>; rel="next"`), want), "next");
+  // A short page whose Link header names page 2 without a rel fails the preflight and the scan.
+  const P = { id: "11111111-2222-4333-8444-555555555555", slug: "acme" };
+  const noRel = new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/user") return new Response(JSON.stringify({ login: OWNER, public_repos: 1, owned_private_repos: 0 }), { status: 200 });
+    return new Response(JSON.stringify([{ id: 1, name: "a", full_name: `${OWNER}/a`, private: false, description: null, owner: { login: OWNER } }]), { status: 200, headers: { link: `<${next}>` } });
+  }, sleep: async () => {} });
+  await assert.rejects(githubTokenScopeCheck(noRel, { owner: OWNER })(), /repository list is unreadable/);
+  await assert.rejects(githubScanner(noRel).scan(P), /unreadable Link header/);
+  // The scan: page 2 repeats page 1's repository (by full name, any case, or by id) and has no next link.
+  const repeat = (second) => new GitHubClient({ token: () => TOKEN, fetchImpl: async (url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    const body = page === 1 ? [{ id: 7, full_name: `${OWNER}/other`, name: "other", description: null }] : [second];
+    return new Response(JSON.stringify(body), { status: 200, headers: page === 1 ? { link: `<${next}>; rel="next"` } : {} });
+  }, sleep: async () => {} });
+  await assert.rejects(githubScanner(repeat({ id: 7, full_name: `${OWNER}/other`, name: "other", description: null })).scan(P), /returned a repository twice/);
+  await assert.rejects(githubScanner(repeat({ full_name: `${OWNER.toUpperCase()}/Other`, name: "Other", description: null })).scan(P), /returned a repository twice/);
+  await assert.rejects(githubScanner(repeat({ id: 7, full_name: `${OWNER}/renamed`, name: "renamed", description: null })).scan(P), /returned a repository twice/);
+  await assert.rejects(githubScanner(repeat({ id: "8", full_name: `${OWNER}/x`, name: "x", description: null })).scan(P), /malformed entry/);
+  const ok = await githubScanner(repeat({ id: 8, full_name: `${OWNER}/devos-acme`, name: "devos-acme", description: null })).scan(P);
+  assert.deepEqual(ok.map((x) => x.externalId), [`${OWNER}/devos-acme`]);
+});

@@ -300,9 +300,12 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
     const target = raw.slice(i + 1, close);
     if (!isLinkTarget(target)) return "malformed";
     i = close + 1;
+    // Codex PR223-r21 (RFC 8288 §3.3: `rel` MUST be present, and once): a link with no `rel`, or with a second
+    // `rel`, is malformed, so a target without a relation never reads as "no next page".
+    let rels = 0;
     for (;;) {
       sp();
-      if (i >= n || raw[i] === ",") break;
+      if (i >= n || raw[i] === ",") { if (rels !== 1) return "malformed"; break; }
       if (raw[i] !== ";") return "malformed";
       i++; sp();
       // Codex PR223-r9: an allow-list grammar. A parameter name, and an unquoted value, is one or more RFC 7230
@@ -337,6 +340,7 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
       // malformed, so it fails closed like any other unparseable header.
       if (name === "") return "malformed";
       if (name === "rel") {
+        rels++;
         const types = value.split(/\s+/).filter((t) => t !== "");
         if (types.length === 0) return "malformed";
         // Codex PR223-r14 (RFC 8288 §3.3): each relation type is a registered name (a letter, then letters, digits,
@@ -372,6 +376,11 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
       const marker = ownershipMarker(p.id);
       const hits: LeftoverHit[] = [];
       const bound = { last: null as number | null };
+      // Codex PR223-r21: a repository seen twice across pages means the listing shifted, so a repository may have
+      // been skipped; the scan is then inconclusive. Repos are keyed by full name (unique, case-insensitive on
+      // GitHub) and, when present, by numeric id.
+      const seenNames = new Set<string>();
+      const seenIds = new Set<number>();
       for (let page = 1; page <= maxPages; page++) {
         const r = await gh.http.get<RepoBody[]>(`/user/repos?per_page=100&page=${page}&affiliation=owner`);
         if (r.status !== 200 || !Array.isArray(r.body)) {
@@ -384,6 +393,16 @@ export function githubScanner(gh: GitHubClient, opts: { maxPages?: number } = {}
           if (!x || typeof x.full_name !== "string" || typeof x.name !== "string" || !okDesc || x.full_name.split("/")[1] !== x.name) {
             throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);
           }
+          const key = x.full_name.toLowerCase();
+          const id = (x as { id?: unknown }).id;
+          if (id !== undefined && typeof id !== "number") {
+            throw new ProviderError("github", "bad-response", "github GET /user/repos returned a malformed entry", r.status);
+          }
+          if (seenNames.has(key) || (typeof id === "number" && seenIds.has(id))) {
+            throw new ProviderError("github", "bad-response", "github GET /user/repos returned a repository twice", r.status);
+          }
+          seenNames.add(key);
+          if (typeof id === "number") seenIds.add(id);
           if (x.name === `devos-${p.slug}` || (x.description ?? "").includes(marker)) {
             hits.push({ provider: "github", kind: "repo", externalId: x.full_name, name: x.full_name });
           }
