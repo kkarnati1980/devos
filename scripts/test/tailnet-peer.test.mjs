@@ -116,6 +116,9 @@ test("AT-d-1m: an unfinished change (journal kept) on a host that now advertises
   const a = run("fixjournal", FIX, {});
   assert.equal(a.code, 0, a.out);
   assert.ok(!fs.existsSync(path.join(a.dir, "devos/tailnet-snat.changed")), "a confirmed fix clears the journal");
+  const n = run("nojournalnoop", FIX, { setNoop: true });
+  assert.equal(n.code, 1, n.out);
+  assert.ok(!fs.existsSync(path.join(n.dir, "devos/tailnet-snat.changed")), "a set that did not apply leaves no journal (Codex PR220-r10)");
   const b = run("failjournal", FIX, { setRc: 1 });
   assert.ok(!fs.existsSync(path.join(b.dir, "devos/tailnet-snat.changed")), "a failed set that left NoSNAT false drops the journal (Codex PR220-r9)");
   const old = run("stalejournal", FIX, { nosnat: true, routes: '["10.0.0.0/24"]', changed: `${Math.floor(Date.now() / 1000) - 901}\n` });

@@ -71,7 +71,7 @@ cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next
   echo "old masqueraded connections on ports ${api:-3001} and ${dash:-3000} cut (clients reconnect)"
 }
 
-# Codex PR220-r8: $CHANGED journals a change this script started. It is written before `tailscale set` and cleared
+# Codex PR220-r8: $CHANGED journals a change this script made. It is written once the change is in effect and cleared
 # only when a read shows NoSNAT true on a host with no routes. While it exists, a read that shows routes means our
 # change met a route-advertising host, so it is undone (SNAT back on, the state KK chose) on this or a later tick,
 # even after an interrupted run or a failed rollback; a NoSNAT true with routes and no journal is KK's own setting.
@@ -117,19 +117,26 @@ if (( ROUTES > 0 )); then
   exit 1
 fi
 
-date +%s > "$CHANGED" || { echo "fail: cannot write $CHANGED; not changed"; exit 1; }
+# Codex PR220-r10: the journal is written only once our change is known to be in effect (the set succeeded, or a
+# re-read after a failed set shows NoSNAT true), and is removed when the confirming read shows it did not apply.
+# So a journal never stands for a change this script did not make.
 : > "$PENDING" || { echo "fail: cannot write $PENDING; not changed"; exit 1; }
 if ! timeout 20 tailscale set --snat-subnet-routes=false >/dev/null 2>&1; then
-  # Codex PR220-r9: if a re-read shows the change was not applied, the journal goes now; otherwise it stays (bounded).
-  if read_prefs >/dev/null && [[ "$NOSNAT" == false ]]; then rm -f "$CHANGED"; fi
+  if read_prefs >/dev/null && [[ "$NOSNAT" == true ]]; then
+    date +%s > "$CHANGED" || true
+    (( ROUTES > 0 )) && undo
+  fi
   echo "fail: tailscale set --snat-subnet-routes=false did not succeed"; exit 1
 fi
+date +%s > "$CHANGED" || echo "note: cannot write $CHANGED (this run still checks the routes itself)"
+# A failed confirming read keeps the journal (bounded): the set succeeded, so the change is ours.
 read_prefs || exit 1
+if [[ "$NOSNAT" != true ]]; then
+  rm -f "$CHANGED"; echo "fail: NoSNAT is still false after tailscale set"; exit 1
+fi
 # Codex PR220-r7: tailscale has no compare-and-set, so routes enabled between the first read and the set cannot be
-# excluded beforehand; the confirming read undoes the change if it shows routes (and the journal keeps a failed
-# read or undo owed to the next tick).
+# excluded beforehand; the confirming read undoes the change if it shows routes.
 (( ROUTES > 0 )) && undo
-[[ "$NOSNAT" == true ]] || { echo "fail: NoSNAT is still false after tailscale set"; exit 1; }
 rm -f "$CHANGED" || { echo "fail: cannot remove $CHANGED"; exit 1; }
 echo "fixed: subnet-route SNAT turned off; the API now sees the tailnet client's own address"
 cut_old || exit 1
