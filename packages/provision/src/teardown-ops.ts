@@ -368,7 +368,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
         // Codex PR223-r34 (decision 1, supersedes the r18/r19 extension-URI rule): GitHub sends only registered
         // relation names, so an extension (URI) relation type is unparseable. Its grammar can no longer be read
         // as "no next page", and the reader stays fail-closed.
-        if (!types.every((t) => /^[A-Za-z][A-Za-z0-9.-]*$/.test(t))) return "malformed";
+        // Codex PR223-r35: exactly GitHub's four pagination relations; any other name (e.g. `nex`, `prefetch`) is
+        // unparseable too, so a misspelt `next` can never read as "no next page".
+        if (!types.every((t) => /^(?:next|prev|first|last)$/i.test(t))) return "malformed";
         if (types.some((t) => t.toLowerCase() === "next")) {
           if (!nextOk(target)) return "malformed";
           found = true;

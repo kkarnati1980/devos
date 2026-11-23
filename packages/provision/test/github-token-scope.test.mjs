@@ -131,7 +131,13 @@ test("DEVOS-21 part 3 (r4): githubScanner follows Link rel=next past a short pag
 test("DEVOS-21 part 3 (r5): linkHasNext reads rel in any parameter position and in a relation list", () => {
   const h = (link) => new Headers({ link });
   assert.equal(linkHasNext(h('<https://api.github.com/user/repos?page=2>; title="More"; rel="next"')), true);
-  assert.equal(linkHasNext(h('<https://api.github.com/user/repos?page=2>; rel="prefetch next"')), true);
+  // Codex PR223-r35 tightened this (was a next page): only next, prev, first and last are pagination relations, so
+  // any other relation type, here `prefetch` beside `next`, makes the header unparseable.
+  assert.equal(linkNext(h('<https://api.github.com/user/repos?page=2>; rel="prefetch next"')), "malformed");
+  assert.equal(linkNext(h('<https://api.github.com/user/repos?page=2>; rel="NEXT"')), "next", "relation names are case-insensitive");
+  for (const v of ['<https://x/?page=2>; rel="nex"', '<https://x/?page=2>; rel="nextish"', '<https://x/?page=2>; rel="alternate"', '<https://x/?page=2>; rel="self"']) {
+    assert.equal(linkNext(h(v)), "malformed", v);
+  }
   assert.equal(linkHasNext(h('<https://api.github.com/user/repos?page=2>; REL=next')), true);
   assert.equal(linkHasNext(h('<https://x/?page=1>; rel="prev", <https://x/?page=3>; title="t"; rel=next')), true);
   assert.equal(linkHasNext(h('<https://x/?page=1>; rel="prev", <https://x/?page=9>; rel="last"')), false);
