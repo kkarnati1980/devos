@@ -3,7 +3,7 @@
 # Version: 1.8.0
 # v1.8.0 (DEVOS-251, S4-d): the allow-list gains scripts/server/tailnet-snat.sh, run every tick (before the
 # isolation run, and again right before a new SHA's server checks). It turns tailscaled's subnet-route SNAT off when
-# its masquerade rule is present, so the DevOS API sees the tailnet client's own address, not the bridge gateway.
+# its NoSNAT preference is false, so the DevOS API sees the tailnet client's own address, not the bridge gateway.
 # Its output is redacted into the agent log; checks/api-tailnet-peer.sh reports the result on server-check.
 # v1.7.0 (DEVOS-21, M2.4-d4b): before a deploy, the same env upsert as GIT_SHA also sets DEVOS_GITHUB_OWNER (the owner
 # of the tracked repo) and DEVOS_COOLIFY_SERVER_UUID (Coolify's own server, the one named "localhost" in GET /servers,

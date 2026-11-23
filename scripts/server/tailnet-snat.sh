@@ -45,6 +45,10 @@ PENDING="${DEVOS_DIR:-/root/.devos}/tailnet-snat.cut-pending"
 cut_old() {  # 0 cut done (or nothing owed), 1 failed (marker kept, retried next tick)
   local conf="${DEVOS_DIR:-/root/.devos}/server-agent.conf" ts p api dash err rc bad=0
   [[ -e "$PENDING" ]] || return 0
+  # Codex PR220-r6: ROUTES is from the latest prefs read; a host that advertises routes by then is never cut.
+  if (( ${ROUTES:-1} > 0 )); then
+    echo "note: this host now advertises ${ROUTES:-?} route(s): no connection is cut (KK decision)"; return 0
+  fi
   # No conntrack tool: nothing can cut them (M0.1 may not have installed it yet); they end when they close.
   if ! command -v conntrack >/dev/null 2>&1; then
     rm -f "$PENDING"; echo "note: conntrack not installed: old masqueraded connections end when they close"; return 0
