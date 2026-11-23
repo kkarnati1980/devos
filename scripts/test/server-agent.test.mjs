@@ -50,6 +50,9 @@ function commit(files, msg = "c") {
 // S4-b2a: a stand-in for isolation-apply.sh (its own tests are isolation-apply.test.mjs): counts runs, prints a
 // secret-shaped value (must be redacted) and exits with FAKE_ISO_RC (default 0); FAKE_ISO_SLEEP makes it hang.
 const fakeIso = '#!/usr/bin/env bash\necho "iso run ' + SK + ' Bearer abcDEF+ghi/jkl012345678901234567890="; [[ -n "${FAKE_ISO_MSG:-}" ]] && echo "$FAKE_ISO_MSG"; [[ -n "${FAKE_ISO_NUL:-}" ]] && printf "bin\\0ary\\n"; echo x >> "$DEVOS_DIR/iso.count"; [[ -n "${FAKE_ISO_SLEEP:-}" ]] && sleep "$FAKE_ISO_SLEEP"; exit "${FAKE_ISO_RC:-0}"\n';
+// S4-d (DEVOS-251): a stand-in for tailnet-snat.sh (its own tests are tailnet-peer.test.mjs): counts runs, prints a
+// secret-shaped value (must be redacted) and exits with FAKE_TSNAT_RC (default 0).
+const fakeTsnat = '#!/usr/bin/env bash\necho "tsnat run ' + SK + '"; echo x >> "$DEVOS_DIR/tsnat.count"; echo tsnat >> "$DEVOS_DIR/order.log"; exit "${FAKE_TSNAT_RC:-0}"\n';
 const real = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
 const baseFiles = () => ({
   "scripts/review/review-watch.sh": real("scripts/review/review-watch.sh"),
@@ -57,6 +60,7 @@ const baseFiles = () => ({
   "scripts/server/server-agent.sh": real("scripts/server/server-agent.sh"),
   "scripts/server/cert-renew.sh": real("scripts/server/cert-renew.sh"),
   "scripts/server/isolation-apply.sh": fakeIso,
+  "scripts/server/tailnet-snat.sh": fakeTsnat,
   "scripts/server/checks/project-isolation-apply.sh": null,   // only AT-b2a-1c installs the real check
   "scripts/server/install-server-agent.sh": real("scripts/server/install-server-agent.sh"),
   "scripts/server/checks/ok.sh": "#!/usr/bin/env bash\necho fine\n",
@@ -1864,4 +1868,31 @@ test("DEVOS-234 d3c-3 provision-probe: skipped without docker's API container; a
   const usage = probeFakes({ steps: [`2|0|{"error":"usage"}`] });
   assert.equal(runProbeCheck(usage).code, 1);
   for (const f of [none, usage]) fs.rmSync(f.bin, { recursive: true, force: true });
+});
+
+// ---- S4-d (DEVOS-251): tailnet-snat.sh every tick ----
+const tsnatCount = () => (fs.existsSync(path.join(D(), "tsnat.count")) ? fs.readFileSync(path.join(D(), "tsnat.count"), "utf8").split("\n").filter(Boolean).length : 0);
+
+test("S4-d AT-d-3: tailnet-snat.sh is installed from the allow-list, runs every tick and before a new SHA's checks; redacted; never on --dry-run", async () => {
+  resetMock(); freshState();
+  const order = '#!/usr/bin/env bash\necho check >> "$DEVOS_DIR/order.log"\n';
+  const sha = commit({ ...baseFiles(), "scripts/server/checks/order.sh": order, "xd3": "1" }, "s4-d every tick");
+  M.main = sha; green(sha); pass(sha);
+  const r1 = await runAgent();
+  assert.equal(r1.code, 0, r1.out);
+  assert.ok(fs.existsSync(path.join(D(), "bin/tailnet-snat.sh")), "installed from the allow-list");
+  assert.equal(tsnatCount(), 1, "run once after the install, before the new SHA's server checks");
+  assert.deepEqual(fs.readFileSync(path.join(D(), "order.log"), "utf8").split("\n").filter(Boolean), ["tsnat", "check"],
+    "the SNAT fix runs before the new SHA's server checks (Codex PR220-r2)");
+  const r2 = await runAgent();
+  assert.equal(tsnatCount(), 2, r2.out);
+  assert.match(r2.out, /tailnet-snat: tsnat run/);
+  assert.doesNotMatch(r2.out, /abcdefghijklmnop1234/, "output is redacted");
+  const r3 = await runAgent({ FAKE_TSNAT_RC: "1" });
+  assert.equal(r3.code, 0, "a failure never stops the tick");
+  assert.match(r3.out, /tailnet-snat: failed \(exit 1\)/);
+  const before = tsnatCount();
+  const r4 = await runAgent({}, ["--dry-run"]);
+  assert.match(r4.out, /WOULD run tailnet-snat\.sh/);
+  assert.equal(tsnatCount(), before, "--dry-run never runs it");
 });
