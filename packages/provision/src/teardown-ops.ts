@@ -266,6 +266,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
   // a Link header (or with a different last page) can never drop a bound set by an earlier one.
   const prior = expect?.bound?.last ?? null;
   let lastPage: number | null = prior;
+  // Pre-review (DEVOS-253): a page after a told last page is past the end of the listing, so any answer for it is a
+  // contradiction, never `none`.
+  if (current !== null && prior !== null && current > prior) return "malformed";
   const lastOk = (target: string): boolean => {
     if (!expect) return true;
     if (current === null) return false;

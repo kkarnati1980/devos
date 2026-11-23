@@ -270,8 +270,8 @@ test("DEVOS-21 part 2: a refused purge preflight names the token and the reason,
   const http = (routes) => ({ get: async (path) => routes(path) });
   const gh = (routes) => ({ http: { pinned: async () => http(routes) } });
   const cf = (routes) => ({ http: http(routes) });
-  // Codex PR223-r18: listed entries are identifiable repos of the owner, so the count case reaches the count rule.
-  // Codex PR223-r36: each entry says whether it is private (a fixture correction; the count path now requires it).
+  // DEVOS-252 (Codex PR223-r18/r36): listed entries are identifiable repos of the owner that say whether they
+  // are private, so the count case reaches the count rule (a fixture correction: `{}` entries are now unreadable).
   const user = (body) => (p) => (p === "/user" ? { status: 200, body } : { status: 200, body: [{ id: 1, name: "a", private: false, owner: { login: "kk" } }, { id: 2, name: "b", private: true, owner: { login: "kk" } }] });
   const coolRow = [{ provider: "coolify", kind: "project", externalId: "abc-123" }];
   const cases = [
