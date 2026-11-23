@@ -412,8 +412,9 @@ test("DEVOS-21 part 3: a classic token with the repo scope proves it sees every 
   s.fake.faults.push(user({ ...pub, public_repos: 5 }, "repo, delete_repo"));
   await assert.rejects(run(), refused(/sees 1 of 5/));
   assert.equal(s.fake.deletes().length, 0, "nothing deleted while refused");
-  // A classic token with `repo` (any order, any spacing) passes and the purge completes.
-  s.fake.faults.push(user(pub, "delete_repo,repo , workflow"));
+  // A classic token with `repo` (any order, any spacing) passes when the list holds exactly public_repos, and the
+  // purge completes.
+  s.fake.faults.push(user({ ...pub, public_repos: 1 }, "delete_repo,repo , workflow"));
   const out = await run();
   assert.equal(out.purged, true);
 });
