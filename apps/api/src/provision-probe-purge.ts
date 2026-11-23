@@ -128,19 +128,7 @@ export interface ProbePurgeDeps {
 export async function probePurge(projectId: string, d: ProbePurgeDeps): Promise<PurgeOutcome> {
   const stage = await d.stage();
   if (stage === "purged") return "done";
-  let w: Awaited<ReturnType<ProbePurgeDeps["wiring"]>>;
-  try {
-    w = await d.wiring();
-  } catch (e) {
-    // Codex PR222-r1: the wiring pins both clients (pinnedGitHub / pinnedCoolify) before purgeProject runs, and the pin
-    // reads the vault, so a missing token throws here, never inside the preflight. Same fixed code as the preflight's
-    // own `<token>-no-token`; any other throw keeps its old path (rethrown, so probeStep treats it as in progress).
-    const x = e as { name?: unknown; code?: unknown; provider?: unknown } | null;
-    if (x?.name === "ProviderError" && x.code === "no-token" && (x.provider === "github" || x.provider === "coolify")) {
-      return { error: `purge-permission:preflight:${x.provider}-no-token` };
-    }
-    throw e;
-  }
+  const w = await d.wiring();
   const base = { store: d.store, authorize: d.authorize, ops: w.ops };
   try {
     if (stage !== "archived") await d.teardown.archiveProject(projectId, base);

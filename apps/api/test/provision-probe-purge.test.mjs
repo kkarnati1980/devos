@@ -321,25 +321,22 @@ test("DEVOS-21 part 2: a refused purge preflight names the token and the reason,
   assert.deepEqual(purgeStop(msg("xx purge preflight: github-token-scope: belongs to another account than the repository owner")), { error: "purge-permission:preflight" }, "anchored: only teardown's own wrap counts");
 });
 
-// Codex PR222-r1: in production a missing token throws while the wiring pins the clients, before purgeProject. The
-// real teardownWiring over real pinnedGitHub / pinnedCoolify (whose pin reads the vault) must still name the token.
-test("DEVOS-21 part 2 (PR222-r1): a token missing when the purge wiring pins its clients names the token", async () => {
+// Codex PR222-r2 (supersedes the r1 fix): readToken reports an absent token, a failed vault read and a vault timeout
+// all as `no-token`, so a throw while the wiring pins its clients must stay retryable (rethrown → in progress), never
+// a terminal credential code. An absent token is already named before the cycle by offReasonFor (provisioner.ready()).
+test("DEVOS-21 part 2 (PR222-r2): a throw while the purge wiring pins its clients stays in progress", async () => {
   const { ProviderError } = realProvision;
   const missing = (provider) => ({ http: { pinned: async () => { throw new ProviderError(provider, "no-token", `${provider} token is not available from the vault`); } } });
   const okClient = { http: { pinned: async () => ({ get: async () => ({ status: 200, body: {} }) }) } };
   const store = { activeResources: async () => [] };
-  for (const [gh, cf, code] of [[missing("github"), okClient, "github-no-token"], [okClient, missing("coolify"), "coolify-no-token"]]) {
-    let purged = 0;
-    const out = await probePurge(PID, {
-      teardown: { ...realTeardown, archiveProject: async () => { purged++; }, purgeProject: async () => { purged++; } },
+  for (const [gh, cf] of [[missing("github"), okClient], [okClient, missing("coolify")]]) {
+    let ran = 0;
+    await assert.rejects(probePurge(PID, {
+      teardown: { ...realTeardown, archiveProject: async () => { ran++; }, purgeProject: async () => { ran++; } },
       stage: async () => "archived",
       wiring: () => teardownWiring(realProvision, realTeardown, { gh, cf, store, db: {}, projectId: PID, owner: "kk", timeoutMs: 1000 }),
       store, authorize: async () => "allow",
-    });
-    assert.deepEqual(out, { error: `purge-permission:preflight:${code}` }, code);
-    assert.equal(purged, 0, "nothing runs after a refused pin");
+    }), (e) => e?.name === "ProviderError" && e.code === "no-token");
+    assert.equal(ran, 0, "nothing runs after a failed pin");
   }
-  // Any other wiring throw is rethrown unchanged (old path).
-  await assert.rejects(probePurge(PID, { teardown: realTeardown, stage: async () => "archived", wiring: async () => { throw new Error("boom"); }, store: {}, authorize: async () => "allow" }), /boom/);
-  await assert.rejects(probePurge(PID, { teardown: realTeardown, stage: async () => "archived", wiring: async () => { throw new ProviderError("github", "http", "github GET /x returned 500", 500); }, store: {}, authorize: async () => "allow" }), /returned 500/);
 });
