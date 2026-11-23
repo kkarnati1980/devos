@@ -313,6 +313,9 @@ export function linkNext(headers: { get(name: string): string | null } | undefin
       if (name === "rel") {
         const types = value.split(/\s+/).filter((t) => t !== "");
         if (types.length === 0) return "malformed";
+        // Codex PR223-r14 (RFC 8288 §3.3): each relation type is a registered name (a letter, then letters, digits,
+        // `.` or `-`; compared case-insensitively) or an absolute URI; anything else (e.g. `next,`) is malformed.
+        if (!types.every((t) => /^[A-Za-z][A-Za-z0-9.-]*$/.test(t) || isLinkTarget(t))) return "malformed";
         if (types.some((t) => t.toLowerCase() === "next")) {
           if (!nextOk(target)) return "malformed";
           found = true;

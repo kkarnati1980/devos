@@ -223,6 +223,11 @@ test("DEVOS-21 part 3 (r11): link targets are absolute URIs, and rel=next must n
   ]) {
     assert.equal(linkNext(h(v), want), "malformed", v);
   }
+  // Codex PR223-r14: every relation type is a registered name or an absolute URI.
+  for (const v of ['<https://api.github.com/user/repos?per_page=100&page=2&affiliation=owner>; rel="next,"', '<https://x/y>; rel="la;st"', '<https://x/y>; rel="1st"', '<https://x/y>; rel="prev ne@xt"']) {
+    assert.equal(linkNext(h(v), want), "malformed", v);
+  }
+  assert.equal(linkNext(h('<https://x/y>; rel="prev https://example.com/rel/more last"')), "none", "extension URI types are allowed");
   // Both readers: page 1 advertises page 3, page 2 is empty with no Link. Neither may read page 2 as the end.
   const link = '<https://api.github.com/user/repos?page=3>; rel="next"';
   await assert.rejects(check(fake({ user: { ...pub, public_repos: 1 }, scopes: "repo", repos: 1, link })), /repository list is unreadable/);
