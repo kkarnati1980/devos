@@ -126,9 +126,9 @@ test("d3c-2b: the stored Compose must equal the committed file at the journalled
 
 test("d3c-2b: each app secret's env var is listed, readable and runtime-only", async () => {
   const envs = (list) => ({ [`cf:/api/v1/applications/${APP.production}/envs`]: { status: 200, body: list } });
-  // Missing or preview-only: not listed (part 11). A listed entry without a `value` field: hidden by the token.
+  // Missing: not listed; only a preview entry: preview-only (part 11). A listed entry without a `value` field: hidden by the token.
   assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET")]))), ["env-not-listed:production/DB_PASSWORD"]);
-  assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET"), goodEnv("DB_PASSWORD", { is_preview: true })]))), ["env-not-listed:production/DB_PASSWORD"]);
+  assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET"), goodEnv("DB_PASSWORD", { is_preview: true })]))), ["env-preview-only:production/DB_PASSWORD"]);
   const hidden = (k) => { const e = goodEnv(k); delete e.value; return e; };
   assert.deepEqual(await run(world(envs([hidden("SESSION_SECRET"), goodEnv("DB_PASSWORD")]))), ["env-value-hidden:production/SESSION_SECRET"]);
   // Null or empty value: not readable.

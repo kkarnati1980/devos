@@ -220,7 +220,8 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
       // DEVOS-21 part 11: a listed entry with no `value` field is hidden by the token (no `read:sensitive`), and an
       // entry that is not listed at all was never written; both still fail, each with its own code.
       if (!e) {
-        codes.push(`env-not-listed:${env}/${key}`);
+        // Pre-review 1: a key listed only as a pull-request preview entry was written with the wrong flag.
+        codes.push(envs.some((x) => x.key === key) ? `env-preview-only:${env}/${key}` : `env-not-listed:${env}/${key}`);
         continue;
       }
       if (!Object.prototype.hasOwnProperty.call(e, "value")) {
