@@ -68,7 +68,8 @@ test("AT1 fresh: one Coolify private key and one read-only GitHub deploy key tha
   const posts = keyPosts(s.fake);
   assert.equal(posts.length, 1);
   assert.equal(posts[0].body.name, deployKeyName(P.slug));
-  assert.ok(posts[0].body.description.includes(`devos:${P.id}`));
+  assert.ok(posts[0].body.description.includes(`devos-owner-${P.id}`));
+  assert.ok(!posts[0].body.description.includes(":"), "part 6: Coolify refuses a description holding a colon");
   const pub = describedPublicKey(posts[0].body.description);
   assert.equal(publicFromOpenSsh(posts[0].body.private_key), pub, "Coolify holds the private half of the described key");
   const gk = ghKeys(s.fake);

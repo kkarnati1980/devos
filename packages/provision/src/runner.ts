@@ -119,8 +119,20 @@ export interface RunOptions {
 /** An explicit "no policy" authorizer, for tests and dry runs only. */
 export const allowAll: Authorize = async () => "allow";
 
-/** Ownership marker written into each resource this project creates (decision 3). */
+/** Ownership marker written into each resource this project creates (decision 3). GitHub keeps this form. */
 export const ownershipMarker = (projectId: string): string => `devos:${projectId}`;
+
+/**
+ * M2.4 part 6 (DEVOS-21, cycle 10): Coolify refuses a description holding `:` (`http-422:description`), so every
+ * Coolify description carries this form instead: letters, digits and hyphens only.
+ */
+export const coolifyOwnershipMarker = (projectId: string): string => `devos-owner-${projectId}`;
+
+/** True when the text carries either marker form, so resources made before part 6 (and the purge) still match. */
+export const hasOwnershipMarker = (text: string | null | undefined, projectId: string): boolean => {
+  const t = text ?? "";
+  return t.includes(ownershipMarker(projectId)) || t.includes(coolifyOwnershipMarker(projectId));
+};
 
 const short = (s: string): string => (s.length > 280 ? `${s.slice(0, 277)}...` : s);
 

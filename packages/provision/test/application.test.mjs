@@ -84,7 +84,8 @@ test("AT1 one application per environment, from the repo's Compose after the hoo
     assert.equal(b.server_uuid, SERVER);
     assert.equal(b.instant_deploy, false, "M2.4 deploys nothing");
     assert.equal(b.autogenerate_domain, false, "decision 1: no Coolify domain, tailnet only");
-    assert.ok(b.description.includes(`devos:${P.id}`), "marker in the create call itself");
+    assert.ok(b.description.includes(`devos-owner-${P.id}`), "marker in the create call itself");
+    assert.ok(!b.description.includes(":"), "part 6: Coolify refuses a description holding a colon");
     // M2.4-c2c2: the repo is the source, cloned with the c2c1 key; the committed file is the Compose that runs.
     assert.equal(b.private_key_uuid, FIXTURE_PK);
     assert.equal(b.git_repository, "git@github.com:kkarnati1980/devos-acme.git");
