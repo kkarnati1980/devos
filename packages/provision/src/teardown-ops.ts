@@ -175,12 +175,20 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
     },
     archive: async (item) => {
       const id = uuid(item);
-      // Stop is idempotent: stopping a stopped app is a no-op at Coolify (a GET, so the transport may retry it).
-      const r = await cf.http.get<unknown>(`/api/v1/applications/${id}/stop`);
-      // Pre-review 3: an app deleted since Archive's inspect has nothing to stop; confirm with a fresh read.
-      if (r.status === 404 && (await inspect(id)) === null) return;
+      // AT13 fix, part 10 (DEVOS-21): Coolify 4.5 takes the stop as a POST (a GET answers 405). It is a write, so
+      // the transport makes exactly one attempt; stopping a stopped app is a no-op, so a failed Archive can be re-run.
+      let r: { status: number };
+      try {
+        // Codex PR234-r3: `docker_cleanup=false`. Coolify defaults it to true, which may clean unused Docker resources
+        // server-wide; Archive must keep everything for Restore, and only an approved Purge deletes.
+        r = await cf.http.write<unknown>("POST", `/api/v1/applications/${id}/stop?docker_cleanup=false`);
+      } catch (e) {
+        // Pre-review 3: an app deleted since Archive's inspect has nothing to stop; confirm with a fresh read.
+        if (gone(e) && (await inspect(id)) === null) return;
+        throw e;
+      }
       if (r.status !== 200) {
-        throw new ProviderError("coolify", r.status === 404 ? "http" : "bad-response", `coolify stop of an application returned ${r.status}`, r.status);
+        throw new ProviderError("coolify", "bad-response", `coolify stop of an application returned ${r.status}`, r.status);
       }
       // Codex PR154-r3: Coolify only queues the stop ("Stopping request queued."). Archive succeeds (and the repo
       // turns read-only after it) only once a read shows the app stopped (`exited` or `stopped`, with or without a

@@ -47,7 +47,7 @@ function fakes() {
       if (wrongTeam && /^\/api\/v1\/(projects|applications)\/[^/]+/.test(path)) return json(404, { message: "Not found." });
       if (wrongTeam && method === "GET" && /^\/api\/v1\/(projects|applications)$/.test(path)) return json(200, []);
       if (coolify.projectStatus && method === "GET" && /^\/api\/v1\/projects\/[^/]+$/.test(path)) return json(coolify.projectStatus, { message: "injected" });
-      if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)\/stop$/)) && method === "GET") {
+      if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)\/stop$/)) && method === "POST" && u.searchParams.get("docker_cleanup") === "false") {
         const a = base.apps.get(m[1]);
         if (!a) return json(404, { message: "Application not found." });
         if (stopStatus.value !== 200) return json(stopStatus.value, { message: "injected" });
