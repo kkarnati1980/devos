@@ -60,9 +60,18 @@ export async function probeFingerprint(root: string): Promise<string> {
  * The probe's inventory: one row per `done` provision step, keyed by the step key, joined to its active resource row
  * by provider, kind and external id. A done step whose resource row is missing, or a step done without an external id,
  * is kept with an empty name or id (a silent drop could hide a lost row); `inventoryIncomplete` then fails the read
- * and names it (Codex PR164-r2), so the same gap in both reads cannot pass the compare.
+ * and names it (Codex PR164-r2), so the same gap in both reads cannot pass the compare. AT13 part 8: a journal-only
+ * step (`isJournalOnlyKind`: the core commit, the deploy Compose commit, an app secret) never has a resource row, so its
+ * name is the fixed `JOURNAL_ONLY_NAME`; its external id is still required and still compared between the runs.
  */
-export async function readProbeInventory(db: any, projectId: string, timeoutMs: number): Promise<InventoryRow[]> {
+/** The name a journal-only step carries in the probe's inventory (it has no resource row to take one from). */
+export const JOURNAL_ONLY_NAME = "(journal-only)";
+
+export async function readProbeInventory(
+  db: any, projectId: string, timeoutMs: number,
+  // `@devos/provision`'s `isJournalOnlyKind`, passed in because the api loads that package only at run time.
+  isJournalOnlyKind: (provider: string, kind: string) => boolean,
+): Promise<InventoryRow[]> {
   // Pre-review 3: bounded like PrismaProbeLog (ADR-0011: a timeout on every outbound call), one consistent read.
   const [steps, resources] = await db.$transaction(async (tx: any) => [
     await tx.provisionStep.findMany({ where: { projectId, status: "done" }, orderBy: [{ key: "asc" }], select: { key: true, provider: true, kind: true, externalId: true } }),
@@ -74,7 +83,7 @@ export async function readProbeInventory(db: any, projectId: string, timeoutMs: 
     key: String(s.key),
     provider: String(s.provider),
     externalId: s.externalId == null ? "" : String(s.externalId),
-    name: s.externalId == null ? "" : byId.get(`${s.provider}\u0000${s.kind}\u0000${s.externalId}`) ?? "",
+    name: s.externalId == null ? "" : isJournalOnlyKind(String(s.provider), String(s.kind)) ? JOURNAL_ONLY_NAME : byId.get(`${s.provider}\u0000${s.kind}\u0000${s.externalId}`) ?? "",
   }));
 }
 

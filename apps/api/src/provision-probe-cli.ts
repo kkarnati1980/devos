@@ -144,7 +144,11 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           last: () => log.last(),
           record: (r) => log.record(r),
           provisionOnce: () => probeProvisionOnce(pv, p),
-          inventory: () => readProbeInventory(db, p.id, timeoutMs),
+          inventory: async () => {
+            const provisionModuleName = "@devos/provision";
+            const { isJournalOnlyKind } = (await import(provisionModuleName)) as { isJournalOnlyKind: (provider: string, kind: string) => boolean };
+            return readProbeInventory(db, p.id, timeoutMs, isJournalOnlyKind);
+          },
           // d3c-2b: AT13's live asserts over the recorded ids, on the purge kit's clients (decision 1).
           liveAsserts: liveAssertsFor(w.purge, db, p.id, timeoutMs),
           // d3c-2a: the purge through M2.5 under the KK grant (decisions 1–5), found read-only on each use.
