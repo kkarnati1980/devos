@@ -58,6 +58,10 @@ test("d3c: the inventory joins done steps to active resources; a lost row stays 
       { key: "coolify_project", provider: "coolify", kind: "project", externalId: "p-1" },
       { key: "github_repo", provider: "github", kind: "repo", externalId: "42" },
       { key: "stack_preview", provider: "coolify", kind: "environment", externalId: null },
+      { key: "github/core", provider: "github", kind: "core_commit", externalId: "c0ffee" },
+      { key: "github/deploy_compose", provider: "github", kind: "deploy_compose", externalId: "d00d" },
+      { key: "vault/app_secret/preview/db", provider: "vault", kind: "app_secret", externalId: "s-1" },
+      { key: "vault/app_secret/live/db", provider: "vault", kind: "app_secret", externalId: null },
     ]; } },
     resource: { findMany: async (q) => { seen.push(q.where); return [
       { provider: "coolify", kind: "project", externalId: "p-1", name: "devos-probe-m24" },
@@ -68,12 +72,19 @@ test("d3c: the inventory joins done steps to active resources; a lost row stays 
   };
   const txOpts = [];
   db.$transaction = async (fn, o) => { txOpts.push(o); return fn(db); };
-  const rows = await readProbeInventory(db, "proj-1", 1234);
+  // The same pairs as @devos/provision's JOURNAL_ONLY_KINDS (its runner test pins that list).
+  const journalOnly = (p, k) => [["github", "core_commit"], ["github", "deploy_compose"], ["vault", "app_secret"]].some(([a, b]) => a === p && b === k);
+  const rows = await readProbeInventory(db, "proj-1", 1234, journalOnly);
   assert.deepEqual(txOpts, [{ timeout: 1234, maxWait: 1234 }], "one bounded transaction");
   assert.deepEqual(rows, [
     { key: "coolify_project", provider: "coolify", externalId: "p-1", name: "devos-probe-m24" },
     { key: "github_repo", provider: "github", externalId: "42", name: "kkarnati1980/devos-probe-m24" },
     { key: "stack_preview", provider: "coolify", externalId: "", name: "" },
+    // AT13 part 8: journal-only steps have no resource row by design; their id is kept, a missing id is still a gap.
+    { key: "github/core", provider: "github", externalId: "c0ffee", name: "(journal-only)" },
+    { key: "github/deploy_compose", provider: "github", externalId: "d00d", name: "(journal-only)" },
+    { key: "vault/app_secret/preview/db", provider: "vault", externalId: "s-1", name: "(journal-only)" },
+    { key: "vault/app_secret/live/db", provider: "vault", externalId: "", name: "" },
   ]);
   assert.deepEqual(seen, [{ projectId: "proj-1", status: "done" }, { projectId: "proj-1", status: "active" }]);
 });

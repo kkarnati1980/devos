@@ -33,6 +33,20 @@ export interface StepSpec {
   inventory?: false;
 }
 
+/**
+ * DEVOS-21 (AT13 part 8): the (provider, kind) pairs of the journal-only steps (`inventory: false`). They never get a
+ * resource row, so a reader of the journal (the AT13 probe) must not count their missing row as a lost one. The runner
+ * refuses a journal-only spec whose kind is not listed here, so the list cannot drift from the specs.
+ */
+export const JOURNAL_ONLY_KINDS: ReadonlyArray<readonly [string, string]> = [
+  ["github", "core_commit"],
+  ["github", "deploy_compose"],
+  ["vault", "app_secret"],
+];
+export function isJournalOnlyKind(provider: string, kind: string): boolean {
+  return JOURNAL_ONLY_KINDS.some(([p, k]) => p === provider && k === kind);
+}
+
 export type StepStatus = "pending" | "done" | "failed";
 
 export interface StepRecord {
@@ -79,7 +93,9 @@ export type StepErrorCode =
   | "resource_owned_elsewhere"
   | "port_range_exhausted"
   /** M2.4-c2c2: a DevOS-owned deploy file on `main` differs from what DevOS generates; never overwritten. */
-  | "compose_drift";
+  | "compose_drift"
+  /** DEVOS-21 part 8: a journal-only spec (`inventory: false`) whose kind is not in `JOURNAL_ONLY_KINDS`. */
+  | "journal_only_kind_unlisted";
 
 export class StepError extends Error {
   constructor(
@@ -146,6 +162,11 @@ const errLine = (code: string, e?: unknown): string =>
 
 export async function runStep(projectId: string, spec: StepSpec, opts: RunOptions): Promise<StepResult> {
   const { store } = opts;
+  // Part 8 pre-review: refused before any read, lookup or create, so nothing is written and the cause is typed.
+  if (spec.inventory === false && !isJournalOnlyKind(spec.provider, spec.kind)) {
+    throw new StepError(spec.key, "journal_only_kind_unlisted", false, false,
+      `${spec.provider}/${spec.kind} is journal-only but not listed in JOURNAL_ONLY_KINDS`);
+  }
   const prev = await store.getStep(projectId, spec.key);
   if (prev?.status === "done" && prev.externalId) {
     return { key: spec.key, externalId: prev.externalId, outcome: "recorded" };

@@ -1,7 +1,7 @@
 // M2.4-a acceptance tests on fake providers (docs/modules/M2.4.md: AT1–AT5, AT8, AT9, AT12).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { allowAll, PrismaStore, GitHubClient, CoolifyClient, MemoryStore, githubRepoStep, coolifyProjectStep, runProvision, runStep, StepError, ProviderError, Transport } from "../dist/index.js";
+import { allowAll, PrismaStore, GitHubClient, CoolifyClient, MemoryStore, githubRepoStep, coolifyProjectStep, runProvision, runStep, StepError, ProviderError, Transport, isJournalOnlyKind, JOURNAL_ONLY_KINDS } from "../dist/index.js";
 import { fakeProviders } from "./fakes.mjs";
 
 const TOKEN = "ghp_TESTONLY_not_a_real_token_0123456789";
@@ -386,4 +386,26 @@ test("DEVOS-21 part 5: a 422 keeps the validation field names only; other errors
   assert.deepEqual([eb.code, eb.status, eb.fields], ["http", 422, undefined]);
   const big = async () => new Response(JSON.stringify({ errors: { name: ["x"] } }), { status: 422, headers: { "content-length": "999999" } });
   assert.equal((await write(big)).fields, undefined);
+});
+
+test("DEVOS-21 part 8: a journal-only step must use a listed kind; a listed one journals with no resource row", async () => {
+  assert.deepEqual(JOURNAL_ONLY_KINDS.map(([p, k]) => `${p}/${k}`), ["github/core_commit", "github/deploy_compose", "vault/app_secret"]);
+  assert.equal(isJournalOnlyKind("github", "repo"), false);
+  assert.equal(isJournalOnlyKind("vault", "app_secret"), true);
+  let calls = 0;
+  const mk = (kind) => ({ key: `github/${kind}`, provider: "github", kind, name: "acme@main", action: "provision.github.core", inventory: false,
+    lookup: async () => { calls++; return null; }, create: async () => { calls++; return { externalId: "c0ffee", name: "acme@main", owned: true }; } });
+  const ok = new MemoryStore();
+  const r = await runStep(P.id, mk("core_commit"), { store: ok, authorize: allowAll });
+  assert.equal(r.externalId, "c0ffee");
+  assert.equal(ok.resources.length, 0, "journal-only: no resource row");
+  const bad = new MemoryStore();
+  calls = 0;
+  const err = await runStep(P.id, mk("repo"), { store: bad, authorize: allowAll }).then(() => null, (e) => e);
+  assert.ok(err instanceof StepError, "an unlisted journal-only kind is refused with a typed stop");
+  assert.equal(err.code, "journal_only_kind_unlisted");
+  assert.equal(err.retryable, false);
+  assert.equal(calls, 0, "refused before any lookup or create");
+  assert.equal(bad.steps.size, 0, "nothing journalled");
+  assert.equal(bad.resources.length, 0);
 });
