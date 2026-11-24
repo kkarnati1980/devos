@@ -17,7 +17,7 @@ export interface AssertModule {
   };
   STACK_ENVS: readonly string[];
   APP_SECRET_NAMES: readonly string[];
-  ownershipMarker(projectId: string): string;
+  hasOwnershipMarker(text: string | null | undefined, projectId: string): boolean;
   parseCompose(buf: Buffer): unknown;
 }
 
@@ -143,7 +143,6 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
   });
   const gh = budgeted((await d.mod.pinnedGitHub(d.gh)).http);
   const cf = budgeted((await d.mod.pinnedCoolify(d.cf)).http);
-  const marker = d.mod.ownershipMarker(d.projectId);
   const codes: string[] = [];
   const need = (key: string, re: RegExp): string | null => {
     const v = steps.get(key);
@@ -186,7 +185,7 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
     if (!app) codes.push(`app-unreadable:${env}`);
     else {
       const desc = app.description;
-      if (typeof desc !== "string" || !desc.includes(marker)) codes.push(`app-description-marker:${env}`);
+      if (typeof desc !== "string" || !d.mod.hasOwnershipMarker(desc, d.projectId)) codes.push(`app-description-marker:${env}`);
       if (typeof desc === "string" && desc.length > COOLIFY_DESCRIPTION_MAX) codes.push(`app-description-length:${env}`);
       if (repo && commit && late()) codes.push(`compose-unreadable:${env}`);
       else if (repo && commit) {

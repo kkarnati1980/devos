@@ -1,8 +1,9 @@
 // M2.4-a Coolify client (docs/modules/M2.4.md; endpoints confirmed by the M0.4 spike on Coolify 4.5.3).
-// Ownership marker: the project description carries `devos:<project id>`, set in the create call itself.
+// Ownership marker: the project description carries `devos-owner-<project id>` (part 6; `devos:<id>` still read),
+// set in the create call itself.
 
 import { ProviderError, Transport, type TransportOptions } from "./http.js";
-import { ownershipMarker, type Found, type StepSpec } from "./runner.js";
+import { coolifyOwnershipMarker, hasOwnershipMarker, type Found, type StepSpec } from "./runner.js";
 
 interface ProjectBody {
   uuid: string;
@@ -53,7 +54,7 @@ export class CoolifyClient {
 const toFound = (projectId: string, p: ProjectBody): Found => ({
   externalId: p.uuid,
   name: p.name,
-  owned: (p.description ?? "").includes(ownershipMarker(projectId)),
+  owned: hasOwnershipMarker(p.description, projectId),
 });
 
 /** The Coolify project step: `devos-<slug>`, description carrying the ownership marker. */
@@ -73,7 +74,7 @@ export function coolifyProjectStep(cf: CoolifyClient, p: { id: string; slug: str
       return pick ? toFound(p.id, pick) : null;
     },
     create: async () => {
-      const { uuid } = await cf.createProject(name, `DevOS project ${p.slug} ${ownershipMarker(p.id)}`);
+      const { uuid } = await cf.createProject(name, `DevOS project ${p.slug} ${coolifyOwnershipMarker(p.id)}`);
       const got = await cf.getProject(uuid);
       return toFound(p.id, got ?? { uuid, name, description: null });
     },

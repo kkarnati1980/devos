@@ -9,12 +9,13 @@ import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { ProviderError } from "./http.js";
 import type { CoolifyClient } from "./coolify.js";
 import type { GitHubClient } from "./github.js";
-import { ownershipMarker, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
+import { coolifyOwnershipMarker, hasOwnershipMarker, ownershipMarker, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
 import type { InventoryItem, ResourceOps } from "./teardown-ops.js";
 
 const UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const NAME_RE = /^(?!\.+$)[A-Za-z0-9._-]{1,100}$/; // not "." or ".." (a path segment that would leave the repo)
-const PUB_RE = /\bpub:(ssh-ed25519 [A-Za-z0-9+/]{68})(?=\s|$)/;
+// Part 6: written as `pub ssh-ed25519 …` (Coolify refuses `:`); `pub:ssh-ed25519 …` from before is still read.
+const PUB_RE = /\bpub[: ](ssh-ed25519 [A-Za-z0-9+/]{68})(?=\s|$)/;
 /** The step keys, in order. The GitHub half reads the Coolify half's journal row. */
 export const COOLIFY_KEY_STEP = "coolify/deploy_key";
 export const GITHUB_KEY_STEP = "github/deploy_key";
@@ -94,7 +95,7 @@ async function listCoolifyKeys(cf: CoolifyClient): Promise<CoolifyKey[]> {
 
 const keyOwned = (projectId: string, k: CoolifyKey): boolean => {
   const d = k.description ?? "";
-  return d.includes(ownershipMarker(projectId)) && PUB_RE.test(d);
+  return hasOwnershipMarker(d, projectId) && PUB_RE.test(d);
 };
 
 /** The public key a Coolify key's description carries, or null. */
@@ -112,7 +113,7 @@ function coolifyKeyLookup(cf: CoolifyClient, projectId: string, name: string) {
   };
 }
 
-/** The Coolify half: `devos-<slug>-deploy`, description = marker + `pub:<public key>`. */
+/** The Coolify half: `devos-<slug>-deploy`, description = `devos-owner-<id>` + `pub <public key>` (part 6; the old `devos:<id>` / `pub:` form is still read). */
 export function coolifyDeployKeyStep(cf: CoolifyClient, p: { id: string; slug: string }): StepSpec {
   const name = deployKeyName(p.slug);
   const lookup = coolifyKeyLookup(cf, p.id, name);
@@ -128,7 +129,7 @@ export function coolifyDeployKeyStep(cf: CoolifyClient, p: { id: string; slug: s
     },
     create: async () => {
       let pair: DeployKeyPair | null = generateDeployKeyPair(name);
-      const description = `DevOS deploy key ${p.slug} ${ownershipMarker(p.id)} pub:${pair.publicKey}`;
+      const description = `DevOS deploy key ${p.slug} ${coolifyOwnershipMarker(p.id)} pub ${pair.publicKey}`;
       let uuid: unknown;
       try {
         const r = await cf.http.write<{ uuid?: unknown }>("POST", "/api/v1/security/keys", { name, description, private_key: pair.privateKey });
@@ -239,7 +240,7 @@ export function coolifyPrivateKeyOps(cf: CoolifyClient, projectId: string): Reso
     inspect: async (item) => {
       const uuid = check(item);
       const k = (await listCoolifyKeys(cf)).find((x) => x.uuid === uuid);
-      return k ? { owned: (k.description ?? "").includes(ownershipMarker(projectId)) } : null;
+      return k ? { owned: hasOwnershipMarker(k.description, projectId) } : null;
     },
     remove: async (item) => {
       const uuid = check(item);

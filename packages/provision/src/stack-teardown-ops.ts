@@ -4,7 +4,7 @@
 
 import { ProviderError } from "./http.js";
 import type { CoolifyClient } from "./coolify.js";
-import { ownershipMarker } from "./runner.js";
+import { hasOwnershipMarker } from "./runner.js";
 import { listEnvironments, STACK_ENVS, type StackEnv } from "./stack.js";
 import type { InventoryItem, ResourceOps } from "./teardown-ops.js";
 
@@ -38,7 +38,7 @@ export function coolifyEnvironmentOps(cf: CoolifyClient, projectId: string): Res
       if (r.status !== 200 || !r.body || typeof r.body !== "object" || r.body.uuid !== uuid) {
         throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/projects/{uuid} returned an inconclusive response (${r.status})`, r.status);
       }
-      const owned = typeof r.body.description === "string" && r.body.description.includes(ownershipMarker(projectId));
+      const owned = typeof r.body.description === "string" && hasOwnershipMarker(r.body.description, projectId);
       if (!(await listEnvironments(cf, uuid)).some((e) => e.name === env)) return null;
       return { owned };
     },

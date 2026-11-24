@@ -10,7 +10,7 @@ import { CoreRepo } from "./core-repo.js";
 import { deployComposeStep } from "./deploy-compose.js";
 import type { GitHubClient } from "./github.js";
 import { ProviderError } from "./http.js";
-import { ownershipMarker, StepError, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
+import { coolifyOwnershipMarker, hasOwnershipMarker, StepError, type Found, type ProvisionStore, type StepSpec } from "./runner.js";
 import { STACK_ENVS, type PortRange, type StackEnv } from "./stack.js";
 
 const UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
@@ -143,8 +143,8 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
   if (typeof opts.tailnetIp !== "string" || !isTailnetIpv4(opts.tailnetIp)) throw new Error("tailnet-ip-invalid");
   if (!opts.hooks || typeof opts.hooks.afterStack !== "function") throw new Error("provision-hooks-required: afterStack (S4) must be registered");
   const name = applicationName(p.slug, env);
-  const marker = ownershipMarker(p.id);
-  const toFound = (a: AppBody): Found => ({ externalId: a.uuid, name: a.name, owned: (a.description ?? "").includes(marker) });
+  const marker = coolifyOwnershipMarker(p.id);
+  const toFound = (a: AppBody): Found => ({ externalId: a.uuid, name: a.name, owned: hasOwnershipMarker(a.description, p.id) });
 
   const done = async (key: string, err: string): Promise<string> => {
     const s = await store.getStep(p.id, key);

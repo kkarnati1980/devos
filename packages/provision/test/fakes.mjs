@@ -150,6 +150,11 @@ export function fakeProviders() {
   }
 
   function coolify(method, path, init) {
+    // DEVOS-21 part 6 (cycle 10): like the live Coolify, a description holding ':' is refused with a 422.
+    if ((method === "POST" || method === "PATCH") && init.body) {
+      const d = JSON.parse(init.body).description;
+      if (typeof d === "string" && d.includes(":")) return json(422, { message: "Validation failed.", errors: { description: ["The description format is invalid."] } });
+    }
     let m;
     if ((m = path.match(/^\/api\/v1\/applications\/([^/]+)\/envs$/))) {
       // M2.4-c2b: like Coolify, the list returns values too; POST adds a key, PATCH updates an existing one.

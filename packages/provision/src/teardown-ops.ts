@@ -5,7 +5,7 @@
 import { ProviderError } from "./http.js";
 import type { GitHubClient } from "./github.js";
 import type { CoolifyClient } from "./coolify.js";
-import { ownershipMarker, type ProviderName } from "./runner.js";
+import { hasOwnershipMarker, ownershipMarker, type ProviderName } from "./runner.js";
 import { applicationName, listApplications } from "./application.js";
 import { STACK_ENVS } from "./stack.js";
 
@@ -104,7 +104,7 @@ export function githubRepoOps(gh: GitHubClient, projectId: string): ResourceOps 
   };
 }
 
-/** Coolify project ops: owned = the description carries `devos:<project id>`. */
+/** Coolify project ops: owned = the description carries `devos-owner-<project id>` or the pre-part-6 `devos:<project id>`. */
 export function coolifyProjectOps(cf: CoolifyClient, projectId: string): ResourceOps {
   return {
     provider: "coolify",
@@ -117,7 +117,7 @@ export function coolifyProjectOps(cf: CoolifyClient, projectId: string): Resourc
       if (r.status !== 200 || !r.body || typeof r.body !== "object" || typeof r.body.uuid !== "string") {
         throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/projects/{uuid} returned an inconclusive response (${r.status})`, r.status);
       }
-      return { owned: (r.body.description ?? "").includes(ownershipMarker(projectId)) };
+      return { owned: hasOwnershipMarker(r.body.description, projectId) };
     },
     remove: async (item) => {
       if (!/^[A-Za-z0-9-]{1,64}$/.test(item.externalId)) throw new Error("coolify-uuid-invalid");
@@ -135,7 +135,7 @@ const APP_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const STOPPED_RE = /^(exited|stopped)(:[a-z]+)?$/;
 
 /**
- * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos:<project id>` (M2.4-c2's
+ * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos-owner-<project id>` or the older `devos:<project id>` (M2.4-c2's
  * marker). Archive stops the app; there is no un-archive (Restore leaves stacks stopped; the next deploy starts
  * them). Remove deletes the app with its volumes, configuration and connected networks in one call.
  */
@@ -164,7 +164,7 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
     if (r.status !== 200 || !b || typeof b !== "object" || b.uuid !== id || !(b.description == null || typeof b.description === "string")) {
       throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/applications/{uuid} returned an inconclusive response (${r.status})`, r.status);
     }
-    return { owned: ((b.description as string | null | undefined) ?? "").includes(ownershipMarker(projectId)), status: b.status };
+    return { owned: hasOwnershipMarker(b.description as string | null | undefined, projectId), status: b.status };
   };
   return {
     provider: "coolify",
@@ -492,7 +492,6 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
     name: "coolify",
     scan: async (p) => {
       if (!SLUG_RE.test(p.slug)) throw new Error("slug-invalid");
-      const marker = ownershipMarker(p.id);
       const r = await cf.http.get<{ uuid: string; name: string; description?: string | null }[]>("/api/v1/projects");
       if (r.status !== 200 || !Array.isArray(r.body)) {
         throw new ProviderError("coolify", "bad-response", `coolify GET /api/v1/projects returned an unexpected response (${r.status})`, r.status);
@@ -502,7 +501,7 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
         if (!x || typeof x.uuid !== "string" || typeof x.name !== "string" || !(x.description === null || typeof x.description === "string")) {
           throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/projects returned a malformed project entry", r.status);
         }
-        if (x.name === `devos-${p.slug}` || (x.description ?? "").includes(marker)) {
+        if (x.name === `devos-${p.slug}` || hasOwnershipMarker(x.description, p.id)) {
           hits.push({ provider: "coolify", kind: "project", externalId: x.uuid, name: x.name });
         }
       }
@@ -515,7 +514,7 @@ export function coolifyScanner(cf: CoolifyClient): LeftoverScanner {
         if (!(d === null || typeof d === "string")) {
           throw new ProviderError("coolify", "bad-response", "coolify GET /api/v1/applications returned an application without a description field", 200);
         }
-        if (appNames.has(a.name) || (a.description ?? "").includes(marker)) {
+        if (appNames.has(a.name) || hasOwnershipMarker(a.description, p.id)) {
           hits.push({ provider: "coolify", kind: "application", externalId: a.uuid, name: a.name });
         }
       }
