@@ -93,8 +93,9 @@ test("AT1 one application per environment, from the repo's Compose after the hoo
     assert.equal(b.build_pack, "dockercompose");
     assert.equal(b.ports_exposes, "3000");
     assert.equal(b.docker_compose_location, `/deploy/compose.${env[0]}.devos.yaml`);
-    const raw = Buffer.from(b.docker_compose_raw, "base64");
-    assert.ok(raw.equals(fileOnMain(s.fake, `deploy/compose.${env[0]}.devos.yaml`)), "Coolify's copy equals the committed file byte for byte");
+    assert.ok(!("docker_compose_raw" in b), "part 7: the git-based create sends no docker_compose_raw (the live endpoint rejects it)");
+    const raw = fileOnMain(s.fake, `deploy/compose.${env[0]}.devos.yaml`);
+    assert.ok(raw, "the Compose Coolify loads is committed on main");
     assert.ok(raw.toString().startsWith(DEPLOY_COMPOSE_HEADER), "the file says it is generated");
     const sent = parse(raw.toString("utf8"));
     assert.equal(sent["x-hardened"], env[1], "Coolify gets the hook's Compose");
