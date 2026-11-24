@@ -174,7 +174,7 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
       const port = await done(`coolify/port/${env}`, "port-not-allocated");
       if (!PORT_RE.test(port)) throw new Error("coolify-port-invalid");
       // M2.4-c2c2: the source is the project repo, cloned with the c2c1 key; the Compose that runs is the committed
-      // hardened file (`github/deploy_compose`), so Coolify's stored copy and the repo agree either way.
+      // hardened file (`github/deploy_compose`), the only source (part 7); the live `app-compose-differs` assert checks Coolify's copy.
       const deployCommit = await done("github/deploy_compose", "deploy-compose-not-committed");
       if (!/^[0-9a-f]{40}$/.test(deployCommit)) throw new Error("deploy-compose-commit-invalid");
       await done("github/deploy_key", "github-deploy-key-not-provisioned");
