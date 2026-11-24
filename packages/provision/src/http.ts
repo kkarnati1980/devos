@@ -12,6 +12,11 @@ export class ProviderError extends Error {
     public readonly code: ErrorCode,
     message: string,
     public readonly status?: number,
+    /**
+     * DEVOS-21 part 5: on a 422, the field names a validation error lists (the keys of the body's `errors`
+     * object), filtered to fixed lower-case names; never a value or a message.
+     */
+    public readonly fields?: readonly string[],
   ) {
     super(message);
     this.name = "ProviderError";
@@ -150,8 +155,8 @@ export class Transport {
       return { status: 404, body: null };
     }
     if (res.status < 200 || res.status > 299) {
-      await res.body?.cancel().catch(() => {});
-      throw new ProviderError(this.provider, "http", `${this.provider} ${method} ${url.pathname} returned ${res.status}`, res.status);
+      const fields = res.status === 422 ? await validationFields(res) : (await res.body?.cancel().catch(() => {}), undefined);
+      throw new ProviderError(this.provider, "http", `${this.provider} ${method} ${url.pathname} returned ${res.status}`, res.status, fields);
     }
     if (res.status === 204) return { status: 204, body: null, headers: res.headers };
     // Codex PR44-r1: the body is read under the same timeout signal. A body that stalls or breaks is a transient
@@ -172,5 +177,27 @@ export class Transport {
     } catch {
       throw new ProviderError(this.provider, "bad-response", `${this.provider} ${method} ${url.pathname} returned invalid JSON`, res.status);
     }
+  }
+}
+
+const FIELD_RE = /^[a-z][a-z0-9_]{0,39}$/;
+const MAX_ERROR_BODY = 16_384;
+
+/**
+ * DEVOS-21 part 5: the field names of a 422 validation answer (`{"errors": {"<field>": [...]}}`, the shape Coolify
+ * and GitHub use), read under the request's own timeout signal. Only names matching FIELD_RE are kept (at most 5,
+ * sorted); the messages and values are never read out. Any read or parse failure gives no fields.
+ */
+async function validationFields(res: Response): Promise<readonly string[] | undefined> {
+  try {
+    const text = await res.text();
+    if (text.length > MAX_ERROR_BODY) return undefined;
+    const body = JSON.parse(text) as { errors?: unknown };
+    const errs = body && typeof body === "object" ? body.errors : undefined;
+    if (!errs || typeof errs !== "object" || Array.isArray(errs)) return undefined;
+    const names = Object.keys(errs).filter((k) => FIELD_RE.test(k)).sort().slice(0, 5);
+    return names.length ? names : undefined;
+  } catch {
+    return undefined;
   }
 }

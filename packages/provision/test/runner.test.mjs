@@ -342,3 +342,23 @@ test("DEVOS-21 part 4: a provider_error stop carries the provider error as its c
   // A stop with no cause has none.
   assert.equal(new StepError("github/repo", "name_conflict", false, true, "x").cause, undefined);
 });
+
+test("DEVOS-21 part 5: a 422 keeps the validation field names only; other errors and odd bodies keep none", async () => {
+  const answer = (status, body) => async () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const write = async (fetchImpl) => {
+    const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl, sleep: noSleep });
+    return cf.createProject("devos-acme", "x").then(() => null, (e) => e);
+  };
+  const e1 = await write(answer(422, { message: "Validation failed. token=ghp_secret", errors: { name: ["bad"], description: ["The description format is invalid: devos:abc"] } }));
+  assert.ok(e1 instanceof ProviderError);
+  assert.deepEqual([e1.status, e1.fields], [422, ["description", "name"]]);
+  assert.equal(e1.message.includes("secret") || e1.message.includes("invalid"), false);
+  const e2 = await write(answer(422, { errors: { "Bad Key": ["x"], ok_field: ["y"], "ünicode": ["z"] } }));
+  assert.deepEqual(e2.fields, ["ok_field"]);
+  for (const body of ["not json", { errors: ["a"] }, { errors: null }, { message: "x" }, { errors: { "": ["x"] } }, "x".repeat(20_000)]) {
+    assert.equal((await write(answer(422, body))).fields, undefined, JSON.stringify(body).slice(0, 40));
+  }
+  assert.equal((await write(answer(400, { errors: { name: ["x"] } }))).fields, undefined, "only a 422 is read");
+  const many = Object.fromEntries(["f", "e", "d", "c", "b", "a"].map((k) => [k, ["x"]]));
+  assert.deepEqual((await write(answer(422, { errors: many }))).fields, ["a", "b", "c", "d", "e"]);
+});
