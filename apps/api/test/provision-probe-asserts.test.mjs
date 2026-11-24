@@ -8,7 +8,8 @@ import { probeStep } from "../dist/provision-probe.js";
 import { safeDetail } from "../dist/provision-probe-cli.js";
 
 const PID = "11111111-1111-4111-8111-111111111111";
-const MARKER = `devos:${PID}`;
+// DEVOS-21 part 6: what is written now; the old `devos:<id>` form is still accepted (tested below).
+const MARKER = `devos-owner-${PID}`;
 const COMMIT = "a".repeat(40);
 const TREE = "b".repeat(40);
 const APP = { preview: "app-preview-uuid", production: "app-live-uuid" };
@@ -87,6 +88,13 @@ test("d3c-2b: the app description must keep the marker and fit Coolify's limit",
   const app = (description) => ({ status: 200, body: { description, docker_compose_raw: compose("preview").toString("utf8") } });
   assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: app("DevOS devos-probe-m24 preview stack devos:") })), ["app-description-marker:preview"]);
   assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: app(null) })), ["app-description-marker:preview"]);
+  // Part 6: an application marked the old way passes; another project's marker in either form never does.
+  assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: app(`DevOS devos-probe-m24 preview stack devos:${PID}`) })), []);
+  const other = "99999999-2222-4333-8444-555555555555";
+  assert.notEqual(other, PID);
+  for (const d of [`x devos-owner-${other}`, `x devos:${other}`]) {
+    assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: app(d) })), ["app-description-marker:preview"], d);
+  }
   const long = `${"x".repeat(COOLIFY_DESCRIPTION_MAX)} ${MARKER}`;
   assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: app(long) })), ["app-description-length:preview"]);
   const exact = `${"x".repeat(COOLIFY_DESCRIPTION_MAX - MARKER.length)}${MARKER}`;

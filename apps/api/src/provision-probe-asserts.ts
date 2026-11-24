@@ -17,7 +17,6 @@ export interface AssertModule {
   };
   STACK_ENVS: readonly string[];
   APP_SECRET_NAMES: readonly string[];
-  ownershipMarker(projectId: string): string;
   hasOwnershipMarker(text: string | null | undefined, projectId: string): boolean;
   parseCompose(buf: Buffer): unknown;
 }

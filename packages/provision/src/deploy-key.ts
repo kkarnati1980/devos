@@ -113,7 +113,7 @@ function coolifyKeyLookup(cf: CoolifyClient, projectId: string, name: string) {
   };
 }
 
-/** The Coolify half: `devos-<slug>-deploy`, description = marker + `pub:<public key>`. */
+/** The Coolify half: `devos-<slug>-deploy`, description = `devos-owner-<id>` + `pub <public key>` (part 6; the old `devos:<id>` / `pub:` form is still read). */
 export function coolifyDeployKeyStep(cf: CoolifyClient, p: { id: string; slug: string }): StepSpec {
   const name = deployKeyName(p.slug);
   const lookup = coolifyKeyLookup(cf, p.id, name);

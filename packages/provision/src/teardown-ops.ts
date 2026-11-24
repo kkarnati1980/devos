@@ -104,7 +104,7 @@ export function githubRepoOps(gh: GitHubClient, projectId: string): ResourceOps 
   };
 }
 
-/** Coolify project ops: owned = the description carries `devos:<project id>`. */
+/** Coolify project ops: owned = the description carries `devos-owner-<project id>` or the pre-part-6 `devos:<project id>`. */
 export function coolifyProjectOps(cf: CoolifyClient, projectId: string): ResourceOps {
   return {
     provider: "coolify",
@@ -135,7 +135,7 @@ const APP_UUID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const STOPPED_RE = /^(exited|stopped)(:[a-z]+)?$/;
 
 /**
- * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos:<project id>` (M2.4-c2's
+ * M2.5-a3b (DEVOS-133): Coolify application ops. Owned = the description carries `devos-owner-<project id>` or the older `devos:<project id>` (M2.4-c2's
  * marker). Archive stops the app; there is no un-archive (Restore leaves stacks stopped; the next deploy starts
  * them). Remove deletes the app with its volumes, configuration and connected networks in one call.
  */
