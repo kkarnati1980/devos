@@ -128,7 +128,8 @@ export function purgeStop(e: unknown): PurgeOutcome {
  * DEVOS-21 part 9: the stage and cause of teardown's final provider_error, read from its own fixed message forms
  * only (`<stage> of <resource> failed: <msg>`, teardown.ts writeError). The resource description and any other text
  * are never kept: only the stage word, an HTTP status from the transport's `returned <nnn>` ending, `no-token`, or a
- * known lowercase reason code (teardown shows only its REASON_CODES; anything else reads `unexpected`).
+ * known lowercase reason code (teardown shows only its REASON_CODES, every one of which ends `-invalid`; the
+ * shape is checked here too, so an id-like slug in a provider message is never echoed; pre-review 1).
  */
 const PURGE_STAGES = ["lookup", "archive", "restore", "delete"] as const;
 export function providerErrorTail(message: unknown): string {
@@ -140,7 +141,7 @@ export function providerErrorTail(message: unknown): string {
   const status = / returned (\d{3})$/.exec(msg)?.[1];
   const cause = status ? `http-${status}`
     : /token is not available from the vault$/.test(msg) ? "no-token"
-    : /^[a-z0-9]+(-[a-z0-9]+){1,5}$/.test(msg) && msg.length <= 40 ? msg
+    : /^[a-z0-9]+(-[a-z0-9]+){0,4}-invalid$/.test(msg) && msg.length <= 40 ? msg
     : msg === "unexpected error" ? "unexpected"
     : msg ? "provider" : "";
   return `:${stage}${cause ? `:${cause}` : ""}`;

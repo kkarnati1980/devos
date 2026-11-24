@@ -85,8 +85,10 @@ test("DEVOS-21 part 9: a final provider_error names the kind, the teardown stage
   assert.deepEqual(purgeStop(pe(`something else failed: x returned 500`)), { error: "purge-provider-error:coolify/application" }, "an unknown message form names only the kind");
   assert.deepEqual(purgeStop(pe(`delete of ${d} failed: x returned 500`, { provider: "coolify", kind: "Bad Kind!" })), { error: "purge-provider-error" }, "an odd kind prints nothing more");
   assert.deepEqual(purgeStop(pe(`delete of ${d} failed: x returned 500`, null)), { error: "purge-provider-error" });
+  assert.deepEqual(purgeStop(pe(`delete of ${d} failed: some-id-like-slug`)), { error: "purge-provider-error:coolify/application:delete:provider" }, "pre-review 1: only an -invalid reason code is echoed");
+  assert.deepEqual(purgeStop(pe(`lookup of ${d} failed: coolify GET /api/v1/applications/u1 returned invalid JSON`)), { error: "purge-provider-error:coolify/application:lookup:provider" }, "a bad response reads provider");
   const long = "a".repeat(40);
-  assert.deepEqual(purgeStop(pe(`delete of x failed: ${long.slice(0, 19)}-${long.slice(0, 20)}`, { provider: long, kind: long })), { error: `purge-provider-error:${long}/${long}` }, "a detail over 120 characters drops its tail");
+  assert.deepEqual(purgeStop(pe(`delete of x failed: ${long.slice(0, 32)}-invalid`, { provider: long, kind: long })), { error: `purge-provider-error:${long}/${long}` }, "a detail over 120 characters drops its tail");
 });
 
 function purgeDeps(over = {}) {
