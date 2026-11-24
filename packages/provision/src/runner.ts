@@ -128,10 +128,14 @@ export const ownershipMarker = (projectId: string): string => `devos:${projectId
  */
 export const coolifyOwnershipMarker = (projectId: string): string => `devos-owner-${projectId}`;
 
-/** True when the text carries either marker form, so resources made before part 6 (and the purge) still match. */
+/**
+ * True when the text carries either marker form as a whole word (start or whitespace before, end or whitespace after),
+ * so resources made before part 6 (and the purge) still match. Codex PR230-r1: a bare substring match would also
+ * accept a lookalike such as `devos-owner-<id>-backup`, so only a complete, whitespace-delimited marker counts.
+ */
 export const hasOwnershipMarker = (text: string | null | undefined, projectId: string): boolean => {
-  const t = text ?? "";
-  return t.includes(ownershipMarker(projectId)) || t.includes(coolifyOwnershipMarker(projectId));
+  const words = (text ?? "").split(/\s+/);
+  return words.includes(ownershipMarker(projectId)) || words.includes(coolifyOwnershipMarker(projectId));
 };
 
 const short = (s: string): string => (s.length > 280 ? `${s.slice(0, 277)}...` : s);

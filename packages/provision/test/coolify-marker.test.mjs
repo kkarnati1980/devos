@@ -20,6 +20,15 @@ test("part 6: the two marker forms; the Coolify form has no colon; both are read
   assert.match(coolifyOwnershipMarker(P.id), /^[A-Za-z0-9-]+$/);
   assert.ok(hasOwnershipMarker(`DevOS project acme devos:${P.id}`, P.id));
   assert.ok(hasOwnershipMarker(`DevOS project acme devos-owner-${P.id}`, P.id));
+  assert.ok(hasOwnershipMarker(`devos-owner-${P.id}`, P.id), "the marker alone");
+  assert.ok(hasOwnershipMarker(`DevOS deploy key acme devos-owner-${P.id} pub ssh-ed25519 AAAA`, P.id), "a marker followed by more words");
+  assert.ok(hasOwnershipMarker(`x\tdevos:${P.id}\n`, P.id), "any whitespace delimits");
+  const lookalikes = [
+    `devos-owner-${P.id}-backup`, `xdevos-owner-${P.id}`, `devos-owner-${P.id}x`, `devos-owner-${P.id}.`, `(devos-owner-${P.id})`,
+    `devos:${P.id}-backup`, `xdevos:${P.id}`, `devos:${P.id}:`, `devos-owner-${P.id.slice(0, -1)}`, `devos:${P.id.slice(0, -1)}`,
+  ];
+  // Codex PR230-r1: adjacent characters make a lookalike, never our marker.
+  for (const d of lookalikes) assert.equal(hasOwnershipMarker(`DevOS project acme ${d}`, P.id), false, d);
   for (const d of [null, undefined, "", `devos:${OTHER}`, `devos-owner-${OTHER}`, `devos ${P.id}`]) assert.equal(hasOwnershipMarker(d, P.id), false, String(d));
 });
 
@@ -38,6 +47,7 @@ test("part 6: a project marked the old way before part 6 is adopted, not duplica
   fake.projects.set("cfold00001", { uuid: "cfold00001", name: "devos-acme", description: `DevOS project acme devos:${P.id}`, environments: ["production"] });
   fake.projects.set("cfnew00001", { uuid: "cfnew00001", name: "devos-other", description: `DevOS project other devos-owner-${P.id}`, environments: ["production"] });
   fake.projects.set("cfnot00001", { uuid: "cfnot00001", name: "unrelated", description: `devos-owner-${OTHER}`, environments: ["production"] });
+  fake.projects.set("cflook0001", { uuid: "cflook0001", name: "lookalike", description: `devos-owner-${P.id}-backup`, environments: ["production"] });
   const cf = cfOf(fake);
   const store = new MemoryStore();
   const out = await runProvision(P.id, [coolifyProjectStep(cf, P)], { store, authorize: allowAll });
@@ -47,6 +57,7 @@ test("part 6: a project marked the old way before part 6 is adopted, not duplica
   assert.deepEqual(await ops.inspect({ externalId: "cfold00001" }), { owned: true });
   assert.deepEqual(await ops.inspect({ externalId: "cfnew00001" }), { owned: true });
   assert.deepEqual(await ops.inspect({ externalId: "cfnot00001" }), { owned: false });
+  assert.deepEqual(await ops.inspect({ externalId: "cflook0001" }), { owned: false }, "Codex PR230-r1: a lookalike is not ours");
   const hits = await coolifyScanner(cf).scan({ id: P.id, slug: "acme" });
   assert.deepEqual(hits.filter((h) => h.kind === "project").map((h) => h.externalId).sort(), ["cfnew00001", "cfold00001"]);
 });

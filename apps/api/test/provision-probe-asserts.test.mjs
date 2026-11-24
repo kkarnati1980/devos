@@ -97,7 +97,8 @@ test("d3c-2b: the app description must keep the marker and fit Coolify's limit",
   }
   const long = `${"x".repeat(COOLIFY_DESCRIPTION_MAX)} ${MARKER}`;
   assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: app(long) })), ["app-description-length:preview"]);
-  const exact = `${"x".repeat(COOLIFY_DESCRIPTION_MAX - MARKER.length)}${MARKER}`;
+  // Codex PR230-r1: the marker counts only as a whole word, so a space separates it (still exactly the limit).
+  const exact = `${"x".repeat(COOLIFY_DESCRIPTION_MAX - MARKER.length - 1)} ${MARKER}`;
   assert.equal(exact.length, COOLIFY_DESCRIPTION_MAX);
   assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: app(exact) })), []);
   assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.production}`]: new Error("coolify 502 body") })), ["app-unreadable:production"]);
