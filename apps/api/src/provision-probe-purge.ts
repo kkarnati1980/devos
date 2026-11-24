@@ -111,9 +111,40 @@ export function purgeStop(e: unknown): PurgeOutcome {
     case "scan_incomplete":
     case "unsupported_resource":
       return { error: `purge-incomplete:${x.code}${where}` };
+    case "provider_error":
+      // DEVOS-21 part 9: cycle 13 (22f564e) ended `purge-provider-error` with nothing more, so the failing purge
+      // step was unknown. A final provider_error now names the resource kind, the teardown stage and the cause.
+    {
+      // The CLI hides a detail over 120 characters whole, so a tail that would overflow is dropped.
+      const full = `purge-provider-error${where}${where ? providerErrorTail(x.message) : ""}`;
+      return { error: full.length <= 120 ? full : `purge-provider-error${where}` };
+    }
     default:
       return { error: `purge-${x.code.replace(/_/g, "-")}`.slice(0, 60) };
   }
+}
+
+/**
+ * DEVOS-21 part 9: the stage and cause of teardown's final provider_error, read from its own fixed message forms
+ * only (`<stage> of <resource> failed: <msg>`, teardown.ts writeError). The resource description and any other text
+ * are never kept: only the stage word, an HTTP status from the transport's `returned <nnn>` ending, `no-token`, or a
+ * known lowercase reason code (teardown shows only its REASON_CODES, every one of which ends `-invalid`; the
+ * shape is checked here too, so an id-like slug in a provider message is never echoed; pre-review 1).
+ */
+const PURGE_STAGES = ["lookup", "archive", "restore", "delete"] as const;
+export function providerErrorTail(message: unknown): string {
+  if (typeof message !== "string") return "";
+  const stage = PURGE_STAGES.find((s) => message.startsWith(`${s} of `));
+  if (!stage) return "";
+  const i = message.lastIndexOf(" failed: ");
+  const msg = i >= 0 ? message.slice(i + " failed: ".length) : "";
+  const status = / returned (\d{3})$/.exec(msg)?.[1];
+  const cause = status ? `http-${status}`
+    : /token is not available from the vault$/.test(msg) ? "no-token"
+    : /^[a-z0-9]+(-[a-z0-9]+){0,4}-invalid$/.test(msg) && msg.length <= 40 ? msg
+    : msg === "unexpected error" ? "unexpected"
+    : msg ? "provider" : "";
+  return `:${stage}${cause ? `:${cause}` : ""}`;
 }
 
 export interface ProbePurgeDeps {
