@@ -72,6 +72,23 @@ test("d3c-2a decision 1: teardown stops map to fixed probe codes; retryable is i
   assert.throws(() => purgeStop(other), (e) => e === other);
 });
 
+test("DEVOS-21 part 9: a final provider_error names the kind, the teardown stage and the cause, never the resource", () => {
+  const pe = (message, resource = { provider: "coolify", kind: "application", externalId: "u1", name: "kk-secret-name" }) =>
+    Object.assign(new Error(message), { name: "TeardownError", code: "provider_error", retryable: false, resource });
+  const d = "coolify application kk-secret-name (u1)";
+  assert.deepEqual(purgeStop(pe(`delete of ${d} failed: coolify DELETE /api/v1/applications/u1 returned 422`)), { error: "purge-provider-error:coolify/application:delete:http-422" });
+  assert.deepEqual(purgeStop(pe(`lookup of ${d} failed: coolify token is not available from the vault`)), { error: "purge-provider-error:coolify/application:lookup:no-token" });
+  assert.deepEqual(purgeStop(pe(`archive of ${d} failed: coolify-uuid-invalid`)), { error: "purge-provider-error:coolify/application:archive:coolify-uuid-invalid" });
+  assert.deepEqual(purgeStop(pe(`restore of ${d} failed: unexpected error`)), { error: "purge-provider-error:coolify/application:restore:unexpected" });
+  assert.deepEqual(purgeStop(pe(`delete of ${d} failed: some provider text with ghp_secret`)), { error: "purge-provider-error:coolify/application:delete:provider" }, "other text is never echoed");
+  assert.deepEqual(purgeStop(pe(`delete of ${d} failed: ghp-abcdefghijklmnopqrstuvwxyz0123456789-x`)), { error: "purge-provider-error:coolify/application:delete:provider" }, "a long dash token is not a reason code");
+  assert.deepEqual(purgeStop(pe(`something else failed: x returned 500`)), { error: "purge-provider-error:coolify/application" }, "an unknown message form names only the kind");
+  assert.deepEqual(purgeStop(pe(`delete of ${d} failed: x returned 500`, { provider: "coolify", kind: "Bad Kind!" })), { error: "purge-provider-error" }, "an odd kind prints nothing more");
+  assert.deepEqual(purgeStop(pe(`delete of ${d} failed: x returned 500`, null)), { error: "purge-provider-error" });
+  const long = "a".repeat(40);
+  assert.deepEqual(purgeStop(pe(`delete of x failed: ${long.slice(0, 19)}-${long.slice(0, 20)}`, { provider: long, kind: long })), { error: `purge-provider-error:${long}/${long}` }, "a detail over 120 characters drops its tail");
+});
+
 function purgeDeps(over = {}) {
   const calls = [];
   const d = {
