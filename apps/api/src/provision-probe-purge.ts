@@ -136,8 +136,11 @@ export function providerErrorTail(message: unknown): string {
   if (typeof message !== "string") return "";
   const stage = PURGE_STAGES.find((s) => message.startsWith(`${s} of `));
   if (!stage) return "";
+  // Codex PR233-r1 (low): the fixed form needs its ` failed: ` separator; without it the form is unknown, so only
+  // the resource kind is reported (no stage).
   const i = message.lastIndexOf(" failed: ");
-  const msg = i >= 0 ? message.slice(i + " failed: ".length) : "";
+  if (i < 0) return "";
+  const msg = message.slice(i + " failed: ".length);
   const status = / returned (\d{3})$/.exec(msg)?.[1];
   const cause = status ? `http-${status}`
     : /token is not available from the vault$/.test(msg) ? "no-token"
