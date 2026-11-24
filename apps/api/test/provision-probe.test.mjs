@@ -117,6 +117,47 @@ test("a new cycle starts after 7 days, or at once when the provisioning code cha
   assert.deepEqual([s.cycle, s.phase], [2, "run1"]);
 });
 
+test("DEVOS-21: a failed cycle re-runs at once when a provider token was saved after it ended; a passed one waits", async () => {
+  // Failed cycle (refused purge), then a token saved after it ended: the next tick starts cycle 2.
+  let updated = null;
+  let reads = 0;
+  const d = fake({ purge: async () => ({ error: "purge-permission:preflight:github-counts" }), credentialsUpdatedAt: async () => { reads++; return updated; } });
+  const end = (await runToEnd(d)).at(-1);
+  assert.equal(end.code, "purge-failed");
+  const endedAt = d.log.at(-1).at;
+  assert.equal((await probeStep(d)).code, "probed", "no token update: not due");
+  updated = endedAt;
+  assert.equal((await probeStep(d)).code, "probed", "a token saved at the same moment is not newer");
+  updated = new Date(Date.parse(endedAt) - 60_000).toISOString();
+  assert.equal((await probeStep(d)).code, "probed", "a token saved before the cycle ended does not count");
+  updated = "not-a-date";
+  assert.equal((await probeStep(d)).code, "probed", "an unreadable time keeps the 7-day rule");
+  d.tick(60_000);
+  updated = d.now().toISOString();
+  const r = await probeStep(d);
+  assert.deepEqual([r.cycle, r.phase], [2, "run1"]);
+  assert.ok(reads >= 5);
+
+  // A passed cycle never reads the tokens and waits the 7 days.
+  let passReads = 0;
+  const e = fake({ credentialsUpdatedAt: async () => { passReads++; return "2099-01-01T00:00:00.000Z"; } });
+  await runToEnd(e);
+  e.tick(60_000);
+  assert.equal((await probeStep(e)).code, "probed");
+  assert.equal(passReads, 0);
+
+  // A throwing read keeps the 7-day rule; no dependency at all is the 7-day rule too.
+  const f = fake({ purge: async () => ({ error: "purge-permission" }), credentialsUpdatedAt: async () => { throw new Error("vault down"); } });
+  await runToEnd(f);
+  assert.equal((await probeStep(f)).code, "probed");
+  const g = fake({ purge: async () => ({ error: "purge-permission" }) });
+  await runToEnd(g);
+  assert.equal((await probeStep(g)).code, "probed");
+  g.tick(PROBE_EVERY_MS);
+  const h = await probeStep(g);
+  assert.deepEqual([h.cycle, h.phase], [2, "run1"], "7 days on, the next cycle starts as before");
+});
+
 test("inventoryDiff ignores row order and names a missing or extra row", () => {
   assert.equal(inventoryDiff(ROWS, [...ROWS].reverse()), null);
   assert.equal(inventoryDiff(ROWS, [ROWS[0]]), "missing-in-run2:coolify_project");
