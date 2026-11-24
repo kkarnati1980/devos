@@ -102,7 +102,14 @@ export function purgeStop(e: unknown): PurgeOutcome {
       // with no resource comes only from the purge preflight (teardown.ts), so it reads `:preflight`; a
       // resource whose provider or kind is outside KIND_RE reads `:resource` (pre-review 1).
       // Part 2: a preflight refusal also names the token and the reason (`:preflight:github-owner`, ...).
-      return { error: `purge-permission${where || (x.resource ? ":resource" : `:preflight${preflightReason(x.message)}`)}` };
+      // Part 12: cycle 18 ended `purge-permission:coolify/application` with a key that has every permission box, so
+      // a resource refusal also names the teardown stage and the status (`:archive:http-403`), from teardown's
+      // fixed form only (`<stage> of <resource> was refused by <provider> (http <nnn>): ...`).
+      if (where) {
+        const full = `purge-permission${where}${forbiddenTail(x.message)}`;
+        return { error: full.length <= 120 ? full : `purge-permission${where}` };
+      }
+      return { error: `purge-permission${x.resource ? ":resource" : `:preflight${preflightReason(x.message)}`}` };
     case "approval_required":
     case "policy_denied":
       return { error: `purge-permission:${x.code}` };
@@ -148,6 +155,19 @@ export function providerErrorTail(message: unknown): string {
     : msg === "unexpected error" ? "unexpected"
     : msg ? "provider" : "";
   return `:${stage}${cause ? `:${cause}` : ""}`;
+}
+
+/**
+ * DEVOS-21 part 12: the stage and status of teardown's resource refusal (`writeError` in
+ * `packages/teardown/src/teardown.ts`). Only the stage word and a 401/403 status are kept; the resource description
+ * and any other text never are. Another form gives the stage alone, or nothing.
+ */
+export function forbiddenTail(message: unknown): string {
+  if (typeof message !== "string") return "";
+  const stage = PURGE_STAGES.find((s) => message.startsWith(`${s} of `));
+  if (!stage) return "";
+  const status = / was refused by [a-z0-9-]+ \(http (401|403)\): the token lacks the permission$/.exec(message)?.[1];
+  return `:${stage}${status ? `:http-${status}` : ""}`;
 }
 
 export interface ProbePurgeDeps {
