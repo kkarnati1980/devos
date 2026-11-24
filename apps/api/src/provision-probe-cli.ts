@@ -10,7 +10,7 @@
 //   step     advance the probe by one phase (probeStep)
 import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
-import { probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
+import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
 import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
@@ -172,6 +172,8 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               return raiseProbeGrantCard(p.id, new Date(), { list: (f) => approvals.store.list(f), raise: (c) => approvals.raiseCard(c) });
             },
           ),
+          // DEVOS-21: a failed cycle re-runs once KK saves a new provider token (metadata read only).
+          credentialsUpdatedAt: () => probeCredentialsUpdatedAt(w.vault),
           fingerprint: await probeFingerprint(fileURLToPath(root)),
           now: () => new Date(),
         };

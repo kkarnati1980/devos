@@ -44,6 +44,12 @@ export interface ProbeDeps {
   cycleStart?(): Promise<"ready" | "purge-pending" | { blocked: string }>;
   /** M2.5 purge over the recorded ids only. */
   purge(): Promise<PurgeOutcome>;
+  /**
+   * DEVOS-21 (decision "re-run on a new key"): the newest `updatedAt` (ISO) of the provider tokens the probe uses, or
+   * null when none is set or it cannot be read. Checked only when the newest cycle is done and failed: a token saved
+   * after that cycle ended starts the next cycle at once. Absent means the 7-day rule alone.
+   */
+  credentialsUpdatedAt?(): Promise<string | null>;
   fingerprint: string;
   now(): Date;
 }
@@ -95,9 +101,16 @@ function nextPhase(p: Phase): Phase {
   return PHASES[Math.min(PHASES.indexOf(p) + 1, PHASES.length - 1)] ?? "done";
 }
 
-function due(last: PhaseRecord, d: ProbeDeps): boolean {
+async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   if (last.fingerprint !== d.fingerprint) return true;
-  return d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS;
+  if (d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS) return true;
+  // DEVOS-21: a failed cycle is re-run as soon as KK saves a new provider token after it ended (a passed cycle waits
+  // the 7 days). A read that throws, or a time that is not a valid ISO date, keeps the 7-day rule.
+  if (last.result?.ok !== false || !d.credentialsUpdatedAt) return false;
+  let u: string | null;
+  try { u = await d.credentialsUpdatedAt(); } catch { return false; }
+  const t = u === null ? NaN : Date.parse(u);
+  return Number.isFinite(t) && t > Date.parse(last.at);
 }
 
 /** Runs one effect; a throw becomes `{ thrown: true }` (its message is never kept: it may quote a provider body). */
@@ -117,7 +130,7 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
   const last = await d.last();
   const at = () => d.now().toISOString();
 
-  if (!last || (last.phase === "done" && due(last, d))) {
+  if (!last || (last.phase === "done" && (await due(last, d)))) {
     const start = d.cycleStart ? await d.cycleStart() : "ready";
     if (typeof start === "object") return { exit: 3, phase: "idle", cycle: last?.cycle ?? 0, code: "skipped", detail: start.blocked };
     const cycle = (last?.cycle ?? 0) + 1;

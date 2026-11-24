@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { probeFingerprint, readProbeInventory } from "../dist/provision-probe-cli-parts.js";
+import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "../dist/provision-probe-cli-parts.js";
 
 async function tree(files) {
   const root = await mkdtemp(join(tmpdir(), "probe-fp-"));
@@ -179,4 +179,17 @@ test("d3c-1 pre-review 4: arguments are checked first", () => {
 test("d3c-1 pre-review 5: the probe's wiring is off without a policy key or with a malformed vault key", async () => {
   assert.deepEqual(await stepWiring({}, "postgres://x", {}, 1000), { off: "policy-not-configured" });
   assert.deepEqual(await stepWiring({}, "postgres://x", { DEVOS_POLICY_HMAC_KEY: "k".repeat(32), DEVOS_VAULT_KEY: "not-a-key" }, 1000), { off: "provision-vault-not-configured" });
+});
+
+test("DEVOS-21: probeCredentialsUpdatedAt is the newest update of the GitHub and Coolify tokens only, or null", async () => {
+  const meta = (name, updatedAt) => ({ name, set: updatedAt !== null, updatedAt });
+  const v = (rows) => ({ list: async () => rows });
+  assert.equal(await probeCredentialsUpdatedAt(v([meta("github_token", null), meta("coolify_api_token", null)])), null);
+  assert.equal(await probeCredentialsUpdatedAt(v([
+    meta("github_token", "2026-11-24T07:11:00.000Z"),
+    meta("coolify_api_token", "2026-11-20T00:00:00.000Z"),
+    meta("anthropic_api_key", "2026-11-25T00:00:00.000Z"),
+  ])), "2026-11-24T07:11:00.000Z", "another secret never counts");
+  assert.equal(await probeCredentialsUpdatedAt(v([meta("github_token", "2026-11-01T00:00:00.000Z"), meta("coolify_api_token", "2026-11-02T00:00:00.000Z")])), "2026-11-02T00:00:00.000Z");
+  assert.equal(await probeCredentialsUpdatedAt(v([{ name: "github_token", set: false, updatedAt: "2026-11-02T00:00:00.000Z" }])), null, "an unset row is ignored");
 });

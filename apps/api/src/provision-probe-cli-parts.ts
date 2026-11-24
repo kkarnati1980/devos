@@ -77,3 +77,19 @@ export async function readProbeInventory(db: any, projectId: string, timeoutMs: 
     name: s.externalId == null ? "" : byId.get(`${s.provider}\u0000${s.kind}\u0000${s.externalId}`) ?? "",
   }));
 }
+
+/** DEVOS-21: the vault names of the provider tokens the probe provisions and purges with. */
+export const PROBE_TOKEN_NAMES = ["github_token", "coolify_api_token"] as const;
+
+/**
+ * DEVOS-21: the newest `updatedAt` among the probe's provider tokens (metadata only: no secret is revealed), or null
+ * when none is set.
+ */
+export async function probeCredentialsUpdatedAt(vault: { list(): Promise<Array<{ name: string; set: boolean; updatedAt: string | null }>> }): Promise<string | null> {
+  let newest: string | null = null;
+  for (const m of await vault.list()) {
+    if (!(PROBE_TOKEN_NAMES as readonly string[]).includes(m.name) || !m.set || !m.updatedAt) continue;
+    if (newest === null || Date.parse(m.updatedAt) > Date.parse(newest)) newest = m.updatedAt;
+  }
+  return newest;
+}
