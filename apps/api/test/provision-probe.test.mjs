@@ -136,7 +136,7 @@ test("DEVOS-21: a failed cycle re-runs at once when a provider token was saved a
   updated = d.now().toISOString();
   const r = await probeStep(d);
   assert.deepEqual([r.cycle, r.phase], [2, "run1"]);
-  assert.ok(reads >= 5);
+  assert.equal(reads, 5, "one read per tick after the failed cycle ended");
 
   // A passed cycle never reads the tokens and waits the 7 days.
   let passReads = 0;
