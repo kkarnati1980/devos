@@ -187,7 +187,11 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
       const desc = app.description;
       if (typeof desc !== "string" || !d.mod.hasOwnershipMarker(desc, d.projectId)) codes.push(`app-description-marker:${env}`);
       if (typeof desc === "string" && desc.length > COOLIFY_DESCRIPTION_MAX) codes.push(`app-description-length:${env}`);
-      if (repo && commit && late()) codes.push(`compose-unreadable:${env}`);
+      // DEVOS-21 part 11: cycle 16 (470f831) failed `app-compose-differs` on both stacks. Coolify leaves
+      // `docker_compose_raw` out of an application body for a token without `read:sensitive`, so a missing field is
+      // reported apart (`app-compose-hidden`): that is a token permission, not a wrong file.
+      if (repo && commit && !Object.prototype.hasOwnProperty.call(app, "docker_compose_raw")) codes.push(`app-compose-hidden:${env}`);
+      else if (repo && commit && late()) codes.push(`compose-unreadable:${env}`);
       else if (repo && commit) {
         try {
           tree ??= repo.treeOf(commit);
@@ -213,7 +217,18 @@ export async function probeLiveAsserts(d: AssertDeps): Promise<string[]> {
     }
     for (const key of d.mod.APP_SECRET_NAMES) {
       const e = envs.find((x) => x.key === key && x.is_preview !== true);
-      if (!e || typeof e.value !== "string" || e.value === "") {
+      // DEVOS-21 part 11: a listed entry with no `value` field is hidden by the token (no `read:sensitive`), and an
+      // entry that is not listed at all was never written; both still fail, each with its own code.
+      if (!e) {
+        // Pre-review 1: a key listed only as a pull-request preview entry was written with the wrong flag.
+        codes.push(envs.some((x) => x.key === key) ? `env-preview-only:${env}/${key}` : `env-not-listed:${env}/${key}`);
+        continue;
+      }
+      if (!Object.prototype.hasOwnProperty.call(e, "value")) {
+        codes.push(`env-value-hidden:${env}/${key}`);
+        continue;
+      }
+      if (typeof e.value !== "string" || e.value === "") {
         codes.push(`env-not-readable:${env}/${key}`);
         continue;
       }

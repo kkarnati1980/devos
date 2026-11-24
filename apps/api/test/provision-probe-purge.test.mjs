@@ -83,6 +83,7 @@ test("DEVOS-21 part 9: a final provider_error names the kind, the teardown stage
   assert.deepEqual(purgeStop(pe(`delete of ${d} failed: some provider text with ghp_secret`)), { error: "purge-provider-error:coolify/application:delete:provider" }, "other text is never echoed");
   assert.deepEqual(purgeStop(pe(`delete of ${d} failed: ghp-abcdefghijklmnopqrstuvwxyz0123456789-x`)), { error: "purge-provider-error:coolify/application:delete:provider" }, "a long dash token is not a reason code");
   assert.deepEqual(purgeStop(pe(`something else failed: x returned 500`)), { error: "purge-provider-error:coolify/application" }, "an unknown message form names only the kind");
+  assert.deepEqual(purgeStop(pe(`delete of ${d} was interrupted`)), { error: "purge-provider-error:coolify/application" }, "Codex PR233-r1: a stage prefix without the separator is an unknown form");
   assert.deepEqual(purgeStop(pe(`delete of ${d} failed: x returned 500`, { provider: "coolify", kind: "Bad Kind!" })), { error: "purge-provider-error" }, "an odd kind prints nothing more");
   assert.deepEqual(purgeStop(pe(`delete of ${d} failed: x returned 500`, null)), { error: "purge-provider-error" });
   assert.deepEqual(purgeStop(pe(`delete of ${d} failed: some-id-like-slug`)), { error: "purge-provider-error:coolify/application:delete:provider" }, "pre-review 1: only an -invalid reason code is echoed");

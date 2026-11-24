@@ -108,6 +108,8 @@ test("d3c-2b: the stored Compose must equal the committed file at the journalled
   const raw = (r) => ({ [`cf:/api/v1/applications/${APP.preview}`]: { status: 200, body: { description: `x ${MARKER}`, docker_compose_raw: r } } });
   assert.deepEqual(await run(world(raw(compose("production").toString("utf8")))), ["app-compose-differs:preview"]);
   assert.deepEqual(await run(world(raw(null))), ["app-compose-differs:preview"]);
+  // Part 11: Coolify leaves the field out for a token without read:sensitive; that is its own code.
+  assert.deepEqual(await run(world({ [`cf:/api/v1/applications/${APP.preview}`]: { status: 200, body: { description: `x ${MARKER}` } } })), ["app-compose-hidden:preview"]);
   // Stored as sent (base64) or re-serialized (same document, other key order and layout) both match.
   assert.deepEqual(await run(world(raw(compose("preview").toString("base64")))), []);
   assert.deepEqual(await run(world(raw("services: {app: {ports: [{target: 3000}], image: core-preview}}\n"))), []);
@@ -124,9 +126,12 @@ test("d3c-2b: the stored Compose must equal the committed file at the journalled
 
 test("d3c-2b: each app secret's env var is listed, readable and runtime-only", async () => {
   const envs = (list) => ({ [`cf:/api/v1/applications/${APP.production}/envs`]: { status: 200, body: list } });
-  // Missing, preview-only, null or empty value: not readable.
-  assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET")]))), ["env-not-readable:production/DB_PASSWORD"]);
-  assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET"), goodEnv("DB_PASSWORD", { is_preview: true })]))), ["env-not-readable:production/DB_PASSWORD"]);
+  // Missing: not listed; only a preview entry: preview-only (part 11). A listed entry without a `value` field: hidden by the token.
+  assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET")]))), ["env-not-listed:production/DB_PASSWORD"]);
+  assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET"), goodEnv("DB_PASSWORD", { is_preview: true })]))), ["env-preview-only:production/DB_PASSWORD"]);
+  const hidden = (k) => { const e = goodEnv(k); delete e.value; return e; };
+  assert.deepEqual(await run(world(envs([hidden("SESSION_SECRET"), goodEnv("DB_PASSWORD")]))), ["env-value-hidden:production/SESSION_SECRET"]);
+  // Null or empty value: not readable.
   assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET", { value: null }), goodEnv("DB_PASSWORD", { value: "" })]))), ["env-not-readable:production/DB_PASSWORD", "env-not-readable:production/SESSION_SECRET"]);
   // Build-time under each release's flag names; no flag at all cannot be confirmed.
   assert.deepEqual(await run(world(envs([goodEnv("SESSION_SECRET", { is_build_time: true }), goodEnv("DB_PASSWORD")]))), ["env-build-time:production/SESSION_SECRET"]);
