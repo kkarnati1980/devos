@@ -81,6 +81,8 @@ test("AT1 each environment gets SESSION_SECRET and DB_PASSWORD as Coolify env va
     for (const e of app.envs) {
       assert.equal(e.is_preview, false);
       assert.equal(e.is_literal, true, "Coolify must not interpolate the value");
+      assert.equal(e.is_buildtime, false, "DEVOS-21 part 12: runtime only, never baked into an image");
+      assert.equal(e.is_runtime, true);
       assert.match(e.value, /^[A-Za-z0-9_-]{43}$/, "32 random bytes, base64url");
       assert.equal(s.vault.values.get(`${P.id}/${appSecretVaultName(env, e.key)}`), e.value, "the vault holds the same value");
       seen.add(e.value);
@@ -125,7 +127,7 @@ test("AT7 a generated value appears in no request but its env-var write, no jour
   });
   for (const v of values) assert.ok(!captured.includes(v), "a generated value leaked into captured output");
   // The env-var writes are the only requests carrying a value, and each carries exactly its own key's value.
-  for (const c of allowed) assert.deepEqual(Object.keys(c.body).sort(), ["is_literal", "is_preview", "key", "value"]);
+  for (const c of allowed) assert.deepEqual(Object.keys(c.body).sort(), ["is_buildtime", "is_literal", "is_preview", "is_runtime", "key", "value"]);
   assert.match([...s.store.steps.values()].find((r) => r.key === "vault/app_secret/preview/SESSION_SECRET").lastError, /^provider_error/);
 });
 
@@ -292,4 +294,124 @@ test("names, generation and construction checks", () => {
   assert.throws(() => appSecretStep(cf, store, { has: async () => true, put: async () => {} }, P, "preview", "DB_PASSWORD"), /project-secrets-required/);
   const st = appSecretStep(cf, store, fakeVault(), P, "preview", "DB_PASSWORD");
   assert.deepEqual([st.key, st.provider, st.kind, st.name, st.action, st.inventory], ["vault/app_secret/preview/DB_PASSWORD", "vault", "app_secret", "acme/preview/DB_PASSWORD", "provision.vault.app_secret", false]);
+});
+
+// DEVOS-21 part 12: cycle 18 showed `env-build-time` on all four app secrets (Coolify's default is build-time).
+test("part 12: every write sends the runtime-only flags; the PATCH path too", async () => {
+  const s = await setup();
+  const app = appOf(s.fake, "preview");
+  app.envs = [{ uuid: "ev-x", key: "SESSION_SECRET", value: "set-by-someone-else-0123456789", is_preview: false, is_buildtime: true, is_runtime: true }];
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const w = envWrites(s.fake);
+  assert.equal(w.length, 4);
+  assert.deepEqual(w.filter((c) => c.method === "PATCH").map((c) => c.body.key), ["SESSION_SECRET"], "the PATCH path is exercised");
+  for (const c of w) {
+    assert.equal(c.body.is_buildtime, false, `${c.method} ${c.body.key}`);
+    assert.equal(c.body.is_runtime, true, `${c.method} ${c.body.key}`);
+    assert.equal("is_build_time" in c.body, false, "never the older name next to the newer ones");
+  }
+  for (const a of s.fake.apps.values()) for (const e of a.envs) assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true], e.key);
+});
+
+test("part 12: a lost journal with a build-time entry of the right value is corrected, not adopted; a re-run then writes nothing", async () => {
+  const s = await setup();
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const e = appOf(s.fake, "production").envs.find((x) => x.key === "DB_PASSWORD");
+  e.is_buildtime = true; // the value still matches the vault: only the flag is wrong (an entry from before part 12)
+  for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+  const before = envWrites(s.fake).length;
+  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.deepEqual(out.map((o) => o.outcome), ["adopted", "adopted", "adopted", "created"]);
+  const w = envWrites(s.fake).slice(before);
+  assert.deepEqual(w.map((c) => `${c.method} ${c.body.key}`), ["PATCH DB_PASSWORD"]);
+  assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true]);
+  assert.equal(e.value, s.vault.values.get(`${P.id}/production/DB_PASSWORD`));
+  for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+  const out3 = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.ok(out3.every((o) => o.outcome === "adopted"));
+  assert.equal(envWrites(s.fake).length, before + 1, "the corrected entry is adopted on the next run");
+});
+
+test("part 12: is_runtime false also reads as build-time and is corrected", async () => {
+  const s = await setup();
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const e = appOf(s.fake, "preview").envs.find((x) => x.key === "SESSION_SECRET");
+  e.is_buildtime = false;
+  e.is_runtime = false;
+  for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.equal(out[0].outcome, "created");
+  assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true]);
+});
+
+test("part 12: an older Coolify (is_build_time only) gets is_build_time false, and never the newer names", async () => {
+  const fake = fakeProviders();
+  fake.envFlags.mode = "old";
+  const s = await setup({ fake });
+  // The flag names are read from the application's listed entries, so each application has one already.
+  for (const env of ["preview", "production"]) appOf(s.fake, env).envs = [{ uuid: `ev-o-${env}`, key: "OTHER", value: "x", is_preview: false, is_build_time: true }];
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const w = envWrites(s.fake);
+  assert.equal(w.length, 4);
+  for (const c of w) assert.deepEqual(Object.keys(c.body).sort(), ["is_build_time", "is_literal", "is_preview", "key", "value"]);
+  for (const env of ["preview", "production"]) for (const k of APP_SECRET_NAMES) assert.equal(appOf(s.fake, env).envs.find((e) => e.key === k).is_build_time, false, `${env}/${k}`);
+});
+
+test("part 12 (Codex PR236-r2): an older Coolify whose entries carry only is_build_time: null still gets the older name", async () => {
+  const fake = fakeProviders();
+  fake.envFlags.mode = "old";
+  const s = await setup({ fake });
+  for (const env of ["preview", "production"]) appOf(s.fake, env).envs = [{ uuid: `ev-n-${env}`, key: "OTHER", value: "x", is_preview: false, is_build_time: null }];
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const w = envWrites(s.fake);
+  assert.equal(w.length, 4);
+  for (const c of w) assert.deepEqual(Object.keys(c.body).sort(), ["is_build_time", "is_literal", "is_preview", "key", "value"], "never the newer names (a 422 on an older release)");
+});
+
+test("part 12 (Codex PR236-r1): an entry with no flags, or only null flags, is not adopted; it is rewritten runtime-only", async () => {
+  for (const shape of ["absent", "null"]) {
+    const s = await setup();
+    await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    const e = appOf(s.fake, "preview").envs.find((x) => x.key === "SESSION_SECRET");
+    if (shape === "absent") { delete e.is_buildtime; delete e.is_runtime; } else { e.is_buildtime = null; e.is_runtime = null; }
+    for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+    const before = envWrites(s.fake).length;
+    const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    assert.equal(out[0].outcome, "created", `${shape}: the value matches the vault, but runtime-only is unproven`);
+    assert.deepEqual(envWrites(s.fake).slice(before).map((c) => `${c.method} ${c.body.key}`), ["PATCH SESSION_SECRET"], shape);
+    assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true], shape);
+    assert.equal(e.value, s.vault.values.get(`${P.id}/preview/SESSION_SECRET`), shape);
+  }
+});
+
+test("part 12 (Codex PR236-r3): a 4.5 entry with only one half of the runtime-only proof is not adopted", async () => {
+  for (const half of [{ is_runtime: true }, { is_buildtime: false }, { is_buildtime: false, is_runtime: null }]) {
+    const s = await setup();
+    await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    const e = appOf(s.fake, "preview").envs.find((x) => x.key === "SESSION_SECRET");
+    delete e.is_buildtime; delete e.is_runtime; Object.assign(e, half);
+    for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+    const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    assert.equal(out[0].outcome, "created", JSON.stringify(half));
+    assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true], JSON.stringify(half));
+  }
+});
+
+test("part 12 (Codex PR236-r3): a write Coolify acknowledges but stores build-time fails the step; it is not journalled done", async () => {
+  const fake = fakeProviders();
+  const s = await setup({ fake });
+  fake.envFlags.ignoreWrites = true;
+  await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }), /create failed for vault app_secret/);
+  for (const [k, v] of s.store.steps) if (k.includes("/vault/app_secret/")) assert.notEqual(v.status, "done", k);
+  fake.envFlags.ignoreWrites = false;
+  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.ok(out.every((o) => o.outcome === "adopted" || o.outcome === "created"));
+  for (const a of s.fake.apps.values()) for (const e of a.envs) assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true], e.key);
+});
+
+test("part 12: a flag that is not a boolean makes the list malformed", async () => {
+  const s = await setup();
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  appOf(s.fake, "preview").envs[0].is_runtime = "yes";
+  await assert.rejects(listAppEnvKeys(s.cf, appOf(s.fake, "preview").uuid), /malformed entry/);
 });

@@ -79,10 +79,13 @@ export function composeMatches(stored: unknown, committed: Buffer, parse: (b: Bu
  * releases name the flags `is_build_time`, or `is_buildtime` / `is_runtime`; an entry with none of them cannot be
  * confirmed, so it fails closed (`unknown`).
  */
+// Codex PR236-r3: the same proof as the provision step's `phaseOf` and server-agent.sh's read-back. A newer name
+// present (the 4.5 schema) needs `is_buildtime: false` AND `is_runtime: true`; only the older name needs
+// `is_build_time: false`. A set build flag (or `is_runtime: false`) is build; a missing or null half is unknown.
 export function envPhase(e: Record<string, unknown>): "runtime" | "build" | "unknown" {
-  const flags = ["is_build_time", "is_buildtime", "is_runtime"].filter((k) => typeof e[k] === "boolean");
-  if (flags.length === 0) return "unknown";
-  return e.is_build_time === true || e.is_buildtime === true || e.is_runtime === false ? "build" : "runtime";
+  if (e.is_build_time === true || e.is_buildtime === true || e.is_runtime === false) return "build";
+  if ("is_buildtime" in e || "is_runtime" in e) return e.is_buildtime === false && e.is_runtime === true ? "runtime" : "unknown";
+  return e.is_build_time === false ? "runtime" : "unknown";
 }
 
 /** Decision 5: sorted, without repeats, and cut to fit the printed detail with a `more-<n>` count. */

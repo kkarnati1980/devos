@@ -250,6 +250,7 @@ test("AT8 retries and timeouts: a timed-out delete that succeeded is confirmed b
   await purgeProject(P.id, { ...s3.base, authorize: allowAll, scanners: s3.scanners }).catch((e) => { err = e; });
   assert.equal(err.code, "provider_forbidden");
   assert.equal(err.retryable, false);
+  assert.match(err.message, /^delete of .* was refused by github \(http 403\): the token lacks the permission$/, "DEVOS-21 part 12: the stage and status");
   assert.equal(s3.fake.deletes().filter((d) => d.path.startsWith("/repos/")).length, 1);
 
   // No secret in any error, report or stored row; every call carried the token only in the auth header.

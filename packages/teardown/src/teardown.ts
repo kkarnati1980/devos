@@ -175,7 +175,8 @@ const reasonCode = (e: unknown): string | undefined =>
 /** Maps a provider failure on a write to a teardown error (decision 4, decision 9). */
 function writeError(e: unknown, what: string, r: InventoryItem): TeardownError {
   if (e instanceof ProviderError && e.code === "http" && (e.status === 401 || e.status === 403)) {
-    return new TeardownError("provider_forbidden", false, `${what} of ${describe(r)} was refused by ${r.provider}: the token lacks the permission`, pick(r));
+    // DEVOS-21 part 12 (an M2.4 slice, docs/modules/M2.4.md): the status, so the AT13 probe can name 401 or 403.
+    return new TeardownError("provider_forbidden", false, `${what} of ${describe(r)} was refused by ${r.provider} (http ${e.status}): the token lacks the permission`, pick(r));
   }
   if (e instanceof ProviderError && e.transient) {
     return new TeardownError("provider_error", true, `${what} of ${describe(r)} failed (${e.code}); safe to retry`, pick(r));

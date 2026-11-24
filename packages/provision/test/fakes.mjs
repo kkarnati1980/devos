@@ -4,6 +4,7 @@ export function fakeProviders() {
   const repos = new Map(); // full_name -> body
   const projects = new Map(); // uuid -> body
   const apps = new Map(); // uuid -> application body (M2.4-c2a)
+  const envFlags = { mode: "new" }; // DEVOS-21 part 12: which env-var flag names this fake Coolify uses
   const keys = new Map(); // uuid -> Coolify private key (M2.4-c2c1); the list returns private_key too, like Coolify
   const deployKeys = new Map(); // full_name -> [{ id, title, key, read_only }] (M2.4-c2c1)
   const calls = [];
@@ -164,15 +165,32 @@ export function fakeProviders() {
       if (method === "GET") return json(200, a.envs.map((e) => ({ ...e })));
       const b = JSON.parse(init.body);
       if (typeof b.key !== "string" || typeof b.value !== "string") return json(422, { message: "Validation failed." });
+      // DEVOS-21 part 12: like Coolify, a new env var is build-time unless the body says otherwise, and a field this
+      // release does not know is refused. `envFlags`: "new" (4.5: is_buildtime + is_runtime), "old" (is_build_time),
+      // "none" (no flags listed or accepted).
+      const known = { new: ["is_buildtime", "is_runtime"], old: ["is_build_time"], none: [] }[envFlags.mode];
+      const base = ["key", "value", "is_preview", "is_literal", "is_multiline", "is_shown_once"];
+      const extra = Object.keys(b).filter((k) => !base.includes(k) && !known.includes(k));
+      if (extra.length) return json(422, { message: "Validation failed.", errors: Object.fromEntries(extra.map((k) => [k, ["This field is not allowed."]])) });
+      const setFlags = (e, fresh) => {
+        for (const k of known) {
+          // Codex PR236-r3: `envFlags.ignoreWrites` acknowledges the write but keeps the build-time default.
+          if (typeof b[k] === "boolean" && !envFlags.ignoreWrites) e[k] = b[k];
+          else if (fresh) e[k] = true;
+        }
+      };
       const prev = a.envs.find((e) => e.key === b.key && e.is_preview === Boolean(b.is_preview));
       if (method === "POST") {
         if (prev) return json(409, { message: "Environment variable already exists." });
-        a.envs.push({ uuid: `ev${++n}`, key: b.key, value: b.value, is_preview: Boolean(b.is_preview), is_literal: Boolean(b.is_literal) });
+        const e = { uuid: `ev${++n}`, key: b.key, value: b.value, is_preview: Boolean(b.is_preview), is_literal: Boolean(b.is_literal) };
+        setFlags(e, true);
+        a.envs.push(e);
         return json(201, { uuid: `ev${n}` });
       }
       if (method === "PATCH") {
         if (!prev) return json(404, { message: "Environment variable not found." });
         prev.value = b.value;
+        setFlags(prev, false);
         return json(201, { uuid: prev.uuid });
       }
     }
@@ -238,5 +256,5 @@ export function fakeProviders() {
   }
 
   const creates = () => calls.filter((c) => c.method !== "GET");
-  return { fetchImpl, calls, creates, repos, projects, apps, keys, deployKeys, faults, state, git, gitOf };
+  return { fetchImpl, calls, creates, repos, projects, apps, envFlags, keys, deployKeys, faults, state, git, gitOf };
 }

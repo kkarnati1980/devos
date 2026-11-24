@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { grantProblem } from "@devos/policy";
-import { teardownWiring, purgeStop, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, teardownResource, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
+import { teardownWiring, purgeStop, forbiddenTail, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, teardownResource, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
 import * as realProvision from "@devos/provision";
 import * as realTeardown from "@devos/teardown";
 import { probeStep } from "../dist/provision-probe.js";
@@ -366,4 +366,30 @@ test("DEVOS-21 part 2 (PR222-r2): a throw while the purge wiring pins its client
     }), (e) => e?.name === "ProviderError" && e.code === "no-token");
     assert.equal(ran, 0, "nothing runs after a failed pin");
   }
+});
+
+// DEVOS-21 part 12: cycle 18 ended `purge-permission:coolify/application` with a key that has every permission box.
+test("part 12: a resource refusal names the teardown stage and the 401/403 status, never the resource", () => {
+  const app = { provider: "coolify", kind: "application", externalId: "uuid-secret-1", name: "devos-acme-preview" };
+  const msg = (m) => Object.assign(terr("provider_forbidden", false, app), { message: m });
+  for (const stage of ["lookup", "archive", "restore", "delete"]) {
+    for (const st of ["401", "403"]) {
+      const out = purgeStop(msg(`${stage} of coolify application devos-acme-preview (uuid-secret-1) was refused by coolify (http ${st}): the token lacks the permission`));
+      assert.deepEqual(out, { error: `purge-permission:coolify/application:${stage}:http-${st}` });
+      assert.ok(!out.error.includes("acme") && !out.error.includes("uuid-secret"));
+    }
+  }
+  assert.deepEqual(purgeStop(msg("archive of x was refused by coolify: the token lacks the permission")), { error: "purge-permission:coolify/application:archive" }, "the older form: the stage alone");
+  assert.deepEqual(purgeStop(msg("archive of x was refused by coolify (http 500): the token lacks the permission")), { error: "purge-permission:coolify/application:archive" }, "only 401/403 are named");
+  assert.deepEqual(purgeStop(msg("archive of x was refused by coolify (http 403): the token lacks the permission and more")), { error: "purge-permission:coolify/application:archive" }, "the fixed ending is required");
+  assert.deepEqual(purgeStop(msg("teardown refused: http 403")), { error: "purge-permission:coolify/application" }, "an unknown form names the kind only");
+  assert.deepEqual(purgeStop(terr("provider_forbidden", false, { provider: "github", kind: "repo" })), { error: "purge-permission:github/repo" });
+  assert.equal(forbiddenTail(undefined), "");
+  assert.equal(forbiddenTail("purge preflight: coolify GET /api/v1/projects returned 403"), "");
+});
+
+test("part 12: the preflight and odd-kind refusals are unchanged", () => {
+  assert.deepEqual(purgeStop(terr("provider_forbidden")), { error: "purge-permission:preflight" });
+  const odd = Object.assign(terr("provider_forbidden", false, { provider: "coolify", kind: "Bad Kind!" }), { message: "archive of x was refused by coolify (http 403): the token lacks the permission" });
+  assert.deepEqual(purgeStop(odd), { error: "purge-permission:resource" });
 });
