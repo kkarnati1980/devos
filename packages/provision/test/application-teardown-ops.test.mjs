@@ -45,7 +45,7 @@ test("archive stops the app (one call, then a read that shows it stopped); there
   });
   const ops = coolifyApplicationOps(s.cf, PID);
   await ops.archive(ITEM);
-  assert.deepEqual(s.calls, [["POST", `/api/v1/applications/${UUID}/stop`], ["GET", `/api/v1/applications/${UUID}`]]);
+  assert.deepEqual(s.calls, [["POST", `/api/v1/applications/${UUID}/stop?docker_cleanup=false`], ["GET", `/api/v1/applications/${UUID}`]]);
   assert.equal(ops.unarchive, undefined);
   const bad = coolifyApplicationOps(stub({ [`POST /api/v1/applications/${UUID}/stop`]: new ProviderError("coolify", "http", "coolify POST /api/v1/applications/{uuid}/stop returned 500", 500) }).cf, PID);
   await assert.rejects(bad.archive(ITEM), (e) => e instanceof ProviderError && e.code === "http" && e.status === 500);
@@ -55,7 +55,7 @@ test("AT13 fix, part 10: the stop is a POST (Coolify 4.5 answers a GET with 405)
   const s = stub({ [`GET /api/v1/applications/${UUID}`]: { status: 200, body: { uuid: UUID, description: "", status: "exited" } } });
   await coolifyApplicationOps(s.cf, PID).archive(ITEM);
   assert.ok(!s.calls.some(([m, p]) => m === "GET" && p.endsWith("/stop")), "no GET of the stop route");
-  assert.equal(s.calls.filter(([m, p]) => m === "POST" && p === `/api/v1/applications/${UUID}/stop`).length, 1, "exactly one stop write");
+  assert.equal(s.calls.filter(([m, p]) => m === "POST" && p === `/api/v1/applications/${UUID}/stop?docker_cleanup=false`).length, 1, "exactly one stop write, with docker_cleanup=false (Codex PR234-r3)");
 });
 
 test("Codex PR154-r3: a queued stop that still shows running when the bound ends fails; a missing status is inconclusive", async () => {

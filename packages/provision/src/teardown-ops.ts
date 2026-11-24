@@ -179,7 +179,9 @@ export function coolifyApplicationOps(cf: CoolifyClient, projectId: string, o: A
       // the transport makes exactly one attempt; stopping a stopped app is a no-op, so a failed Archive can be re-run.
       let r: { status: number };
       try {
-        r = await cf.http.write<unknown>("POST", `/api/v1/applications/${id}/stop`);
+        // Codex PR234-r3: `docker_cleanup=false`. Coolify defaults it to true, which may clean unused Docker resources
+        // server-wide; Archive must keep everything for Restore, and only an approved Purge deletes.
+        r = await cf.http.write<unknown>("POST", `/api/v1/applications/${id}/stop?docker_cleanup=false`);
       } catch (e) {
         // Pre-review 3: an app deleted since Archive's inspect has nothing to stop; confirm with a fresh read.
         if (gone(e) && (await inspect(id)) === null) return;
