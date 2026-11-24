@@ -95,7 +95,8 @@ async function listAppEnvs(cf: CoolifyClient, appUuid: string): Promise<{ envs: 
     }
     // Pre-review 2: a newer name counts when present at all (null too), as server-agent.sh's `has(...)` does.
     if ("is_buildtime" in e || "is_runtime" in e) newer = true;
-    else if (typeof e.is_build_time === "boolean") older = true;
+    // Codex PR236-r2: the older name counts when present at all (null too), the same rule as the newer names.
+    else if ("is_build_time" in e) older = true;
     if (e.is_preview !== true) envs.set(e.key, { value: typeof e.value === "string" ? e.value : null, phase: phaseOf(e) });
   }
   return { envs, schema: older && !newer ? "old" : "new" };

@@ -357,6 +357,17 @@ test("part 12: an older Coolify (is_build_time only) gets is_build_time false, a
   for (const env of ["preview", "production"]) for (const k of APP_SECRET_NAMES) assert.equal(appOf(s.fake, env).envs.find((e) => e.key === k).is_build_time, false, `${env}/${k}`);
 });
 
+test("part 12 (Codex PR236-r2): an older Coolify whose entries carry only is_build_time: null still gets the older name", async () => {
+  const fake = fakeProviders();
+  fake.envFlags.mode = "old";
+  const s = await setup({ fake });
+  for (const env of ["preview", "production"]) appOf(s.fake, env).envs = [{ uuid: `ev-n-${env}`, key: "OTHER", value: "x", is_preview: false, is_build_time: null }];
+  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  const w = envWrites(s.fake);
+  assert.equal(w.length, 4);
+  for (const c of w) assert.deepEqual(Object.keys(c.body).sort(), ["is_build_time", "is_literal", "is_preview", "key", "value"], "never the newer names (a 422 on an older release)");
+});
+
 test("part 12 (Codex PR236-r1): an entry with no flags, or only null flags, is not adopted; it is rewritten runtime-only", async () => {
   for (const shape of ["absent", "null"]) {
     const s = await setup();
