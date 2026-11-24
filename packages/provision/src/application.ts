@@ -1,7 +1,7 @@
 // M2.4-c2a/c2c2 (docs/modules/M2.4.md, "What a project gets" row 4; the c2a and c2c2 notes): one git-based Coolify
 // application per environment, cloned from the project repo with the c2c1 deploy key. The Compose that runs is the
-// S4-hardened file committed by `github/deploy_compose` (deploy-compose.ts), named by `docker_compose_location` and
-// also sent as `docker_compose_raw`, with `instant_deploy:false` (M2.4 deploys nothing). Create-or-get by name; the description
+// S4-hardened file committed by `github/deploy_compose` (deploy-compose.ts), named by `docker_compose_location` (part 7:
+// not also sent as `docker_compose_raw`, which this endpoint rejects), with `instant_deploy:false` (M2.4 deploys nothing). Create-or-get by name; the description
 // carries the ownership marker, written in the create call itself (decision 3).
 
 import { parse } from "yaml";
@@ -174,7 +174,7 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
       const port = await done(`coolify/port/${env}`, "port-not-allocated");
       if (!PORT_RE.test(port)) throw new Error("coolify-port-invalid");
       // M2.4-c2c2: the source is the project repo, cloned with the c2c1 key; the Compose that runs is the committed
-      // hardened file (`github/deploy_compose`), so Coolify's stored copy and the repo agree either way.
+      // hardened file (`github/deploy_compose`), the only source (part 7); the live `app-compose-differs` assert checks Coolify's copy.
       const deployCommit = await done("github/deploy_compose", "deploy-compose-not-committed");
       if (!/^[0-9a-f]{40}$/.test(deployCommit)) throw new Error("deploy-compose-commit-invalid");
       await done("github/deploy_key", "github-deploy-key-not-provisioned");
@@ -211,9 +211,9 @@ export function applicationStep(cf: CoolifyClient, gh: GitHubClient, store: Prov
         build_pack: "dockercompose",
         // Pre-review: Coolify's git-based create requires the exposed port (the core app listens on 3000).
         ports_exposes: String(APP_CONTAINER_PORT),
+        // AT13 part 7: the committed file is the only source. The live create answered 422 on `docker_compose_raw`, so
+        // it is not sent (the c2c2 pre-review fallback); Coolify loads the Compose from the repo at this location.
         docker_compose_location: `/${path}`,
-        // The same bytes as the committed file, so Coolify's stored copy equals it whether or not it re-reads the repo.
-        docker_compose_raw: bytes.toString("base64"),
         instant_deploy: false,
         // Decision 1: tailnet only; Coolify must not generate a proxy domain (Codex PR76-r1).
         autogenerate_domain: false,
