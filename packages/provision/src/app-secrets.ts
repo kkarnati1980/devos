@@ -93,7 +93,8 @@ async function listAppEnvs(cf: CoolifyClient, appUuid: string): Promise<{ envs: 
       || !flag(e.is_build_time) || !flag(e.is_buildtime) || !flag(e.is_runtime)) {
       throw new ProviderError("coolify", "bad-response", "coolify env list has a malformed entry", r.status);
     }
-    if (typeof e.is_buildtime === "boolean" || typeof e.is_runtime === "boolean") newer = true;
+    // Pre-review 2: a newer name counts when present at all (null too), as server-agent.sh's `has(...)` does.
+    if ("is_buildtime" in e || "is_runtime" in e) newer = true;
     else if (typeof e.is_build_time === "boolean") older = true;
     if (e.is_preview !== true) envs.set(e.key, { value: typeof e.value === "string" ? e.value : null, phase: phaseOf(e) });
   }

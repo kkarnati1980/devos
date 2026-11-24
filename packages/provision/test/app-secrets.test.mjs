@@ -304,6 +304,7 @@ test("part 12: every write sends the runtime-only flags; the PATCH path too", as
   await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
   const w = envWrites(s.fake);
   assert.equal(w.length, 4);
+  assert.deepEqual(w.filter((c) => c.method === "PATCH").map((c) => c.body.key), ["SESSION_SECRET"], "the PATCH path is exercised");
   for (const c of w) {
     assert.equal(c.body.is_buildtime, false, `${c.method} ${c.body.key}`);
     assert.equal(c.body.is_runtime, true, `${c.method} ${c.body.key}`);
