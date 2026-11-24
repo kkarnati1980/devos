@@ -112,7 +112,7 @@ export async function listAppEnvKeys(cf: CoolifyClient, appUuid: string): Promis
  * Coolify env vars go with their application).
  *
  * Present = the vault holds it, the application lists the key AND the two values agree (compared inside the vault)
- * AND the entry is not build-time (part 12).
+ * AND the entry is proven runtime-only (part 12; Codex PR236-r1: an entry without flags is not).
  * Anything else is (re)created: generate, seal in the vault (a rotation if a row exists), then write the env var
  * (`PATCH` when the key exists, else `POST`). A crash, a rejected or an uncertain write between the two leaves a
  * mismatch, which the re-run rotates; harmless because M2.4 deploys nothing (pre-review finding 1).
@@ -144,9 +144,10 @@ export function appSecretStep(cf: CoolifyClient, store: ProvisionStore, secrets:
       if (!(await secrets.has(p.id, vaultName))) return null;
       const listed = (await listAppEnvs(cf, uuid)).envs.get(key);
       if (!listed || typeof listed.value !== "string") return null;
-      // Part 12: a build-time entry is not present, so a re-run corrects it (a rotation; M2.4 deploys nothing). An
-      // entry without flags cannot be judged here; the probe's live assert fails it closed (`env-build-time-unknown`).
-      if (listed.phase === "build") return null;
+      // Part 12: only an entry proven runtime-only is present. A build-time entry, or one whose flags are all absent
+      // or null (Codex PR236-r1: not proven runtime-only), is not, so a re-run rewrites it with the runtime-only flags
+      // (a rotation; M2.4 deploys nothing). The probe's live assert still fails either closed.
+      if (listed.phase !== "runtime") return null;
       return (await secrets.matches(p.id, vaultName, listed.value)) ? found : null;
     },
     create: async () => {

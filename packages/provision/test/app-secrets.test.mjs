@@ -357,15 +357,20 @@ test("part 12: an older Coolify (is_build_time only) gets is_build_time false, a
   for (const env of ["preview", "production"]) for (const k of APP_SECRET_NAMES) assert.equal(appOf(s.fake, env).envs.find((e) => e.key === k).is_build_time, false, `${env}/${k}`);
 });
 
-test("part 12: an entry with no flags is not judged by the step (the probe's live assert fails it closed)", async () => {
-  const s = await setup();
-  await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
-  const e = appOf(s.fake, "preview").envs.find((x) => x.key === "SESSION_SECRET");
-  delete e.is_buildtime;
-  delete e.is_runtime;
-  for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
-  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
-  assert.equal(out[0].outcome, "adopted");
+test("part 12 (Codex PR236-r1): an entry with no flags, or only null flags, is not adopted; it is rewritten runtime-only", async () => {
+  for (const shape of ["absent", "null"]) {
+    const s = await setup();
+    await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    const e = appOf(s.fake, "preview").envs.find((x) => x.key === "SESSION_SECRET");
+    if (shape === "absent") { delete e.is_buildtime; delete e.is_runtime; } else { e.is_buildtime = null; e.is_runtime = null; }
+    for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+    const before = envWrites(s.fake).length;
+    const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    assert.equal(out[0].outcome, "created", `${shape}: the value matches the vault, but runtime-only is unproven`);
+    assert.deepEqual(envWrites(s.fake).slice(before).map((c) => `${c.method} ${c.body.key}`), ["PATCH SESSION_SECRET"], shape);
+    assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true], shape);
+    assert.equal(e.value, s.vault.values.get(`${P.id}/preview/SESSION_SECRET`), shape);
+  }
 });
 
 test("part 12: a flag that is not a boolean makes the list malformed", async () => {
