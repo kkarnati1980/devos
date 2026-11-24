@@ -53,10 +53,15 @@ interface ListedEnv {
  * DEVOS-21 part 12 (cycle 18: `env-build-time` on all four app secrets): Coolify stores a new env var as build-time
  * by default. Coolify v4 releases name the flags `is_buildtime` / `is_runtime` (4.5, the DevOS server) or
  * `is_build_time` only (older); the same rule as the probe's `envPhase` and the server agent's read-back.
+ * Codex PR236-r3: runtime-only must be proven, as server-agent.sh's read-back does. An entry carrying a newer name
+ * (`is_buildtime` or `is_runtime`, the 4.5 schema) is runtime only with `is_buildtime: false` AND `is_runtime: true`
+ * (and no `is_build_time: true`); an entry with only the older name is runtime only with `is_build_time: false`.
+ * Any build flag set (or `is_runtime: false`) is build; anything else, a missing or null half included, is unknown.
  */
 function phaseOf(e: Partial<EnvBody>): ListedEnv["phase"] {
-  if (![e.is_build_time, e.is_buildtime, e.is_runtime].some((f) => typeof f === "boolean")) return "unknown";
-  return e.is_build_time === true || e.is_buildtime === true || e.is_runtime === false ? "build" : "runtime";
+  if (e.is_build_time === true || e.is_buildtime === true || e.is_runtime === false) return "build";
+  if ("is_buildtime" in e || "is_runtime" in e) return e.is_buildtime === false && e.is_runtime === true ? "runtime" : "unknown";
+  return e.is_build_time === false ? "runtime" : "unknown";
 }
 
 /**
@@ -163,6 +168,13 @@ export function appSecretStep(cf: CoolifyClient, store: ProvisionStore, secrets:
       // `is_literal`: Coolify must not interpolate `$` sequences; `is_preview:false`: the normal deployment's value;
       // part 12: runtime only (never baked into an image), in this release's flag names, on a PATCH too.
       await cf.http.write(exists ? "PATCH" : "POST", `/api/v1/applications/${uuid}/envs`, { key, value, is_preview: false, is_literal: true, ...runtimeFlags(schema) });
+      // Codex PR236-r3: an acknowledged write is not proof. Read the entry back: it must be proven runtime-only and
+      // hold the vault's value, or the step fails (never journalled done) and the next run rewrites it.
+      const back = (await listAppEnvs(cf, uuid)).envs.get(key);
+      if (!back || back.phase !== "runtime") throw new ProviderError("coolify", "bad-response", "coolify env var is not runtime-only after the write", 200);
+      if (typeof back.value !== "string" || !(await secrets.matches(p.id, vaultName, back.value))) {
+        throw new ProviderError("coolify", "bad-response", "coolify env var does not hold the written value after the write", 200);
+      }
       return found;
     },
   };

@@ -393,4 +393,3 @@ test("part 12: the preflight and odd-kind refusals are unchanged", () => {
   const odd = Object.assign(terr("provider_forbidden", false, { provider: "coolify", kind: "Bad Kind!" }), { message: "archive of x was refused by coolify (http 403): the token lacks the permission" });
   assert.deepEqual(purgeStop(odd), { error: "purge-permission:resource" });
 });
-

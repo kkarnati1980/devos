@@ -174,7 +174,8 @@ export function fakeProviders() {
       if (extra.length) return json(422, { message: "Validation failed.", errors: Object.fromEntries(extra.map((k) => [k, ["This field is not allowed."]])) });
       const setFlags = (e, fresh) => {
         for (const k of known) {
-          if (typeof b[k] === "boolean") e[k] = b[k];
+          // Codex PR236-r3: `envFlags.ignoreWrites` acknowledges the write but keeps the build-time default.
+          if (typeof b[k] === "boolean" && !envFlags.ignoreWrites) e[k] = b[k];
           else if (fresh) e[k] = true;
         }
       };

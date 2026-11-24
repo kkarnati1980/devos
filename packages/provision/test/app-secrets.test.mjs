@@ -384,6 +384,31 @@ test("part 12 (Codex PR236-r1): an entry with no flags, or only null flags, is n
   }
 });
 
+test("part 12 (Codex PR236-r3): a 4.5 entry with only one half of the runtime-only proof is not adopted", async () => {
+  for (const half of [{ is_runtime: true }, { is_buildtime: false }, { is_buildtime: false, is_runtime: null }]) {
+    const s = await setup();
+    await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    const e = appOf(s.fake, "preview").envs.find((x) => x.key === "SESSION_SECRET");
+    delete e.is_buildtime; delete e.is_runtime; Object.assign(e, half);
+    for (const k of s.store.steps.keys()) if (k.includes("/vault/app_secret/")) s.store.steps.delete(k);
+    const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+    assert.equal(out[0].outcome, "created", JSON.stringify(half));
+    assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true], JSON.stringify(half));
+  }
+});
+
+test("part 12 (Codex PR236-r3): a write Coolify acknowledges but stores build-time fails the step; it is not journalled done", async () => {
+  const fake = fakeProviders();
+  const s = await setup({ fake });
+  fake.envFlags.ignoreWrites = true;
+  await assert.rejects(runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll }), /create failed for vault app_secret/);
+  for (const [k, v] of s.store.steps) if (k.includes("/vault/app_secret/")) assert.notEqual(v.status, "done", k);
+  fake.envFlags.ignoreWrites = false;
+  const out = await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });
+  assert.ok(out.every((o) => o.outcome === "adopted" || o.outcome === "created"));
+  for (const a of s.fake.apps.values()) for (const e of a.envs) assert.deepEqual([e.is_buildtime, e.is_runtime], [false, true], e.key);
+});
+
 test("part 12: a flag that is not a boolean makes the list malformed", async () => {
   const s = await setup();
   await runProvision(P.id, s.steps(), { store: s.store, authorize: allowAll });

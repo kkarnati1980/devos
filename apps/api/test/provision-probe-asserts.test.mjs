@@ -194,7 +194,12 @@ test("d3c-2b: the joined codes fit the printed detail, with a count of the rest"
 
 test("d3c-2b: helpers", () => {
   assert.equal(envPhase({ is_build_time: false }), "runtime");
-  assert.equal(envPhase({ is_runtime: true }), "runtime");
+  // Codex PR236-r3 (stricter): a 4.5-schema entry is runtime-only only with both halves proven.
+  assert.equal(envPhase({ is_runtime: true }), "unknown");
+  assert.equal(envPhase({ is_buildtime: false }), "unknown");
+  assert.equal(envPhase({ is_buildtime: false, is_runtime: null }), "unknown");
+  assert.equal(envPhase({ is_buildtime: false, is_runtime: true }), "runtime");
+  assert.equal(envPhase({ is_buildtime: false, is_runtime: true, is_build_time: true }), "build");
   assert.equal(envPhase({ is_build_time: "false" }), "unknown");
   assert.equal(composeMatches("", Buffer.from(""), realProvision.parseCompose), false);
   assert.equal(composeMatches("not: [valid", Buffer.from("a: 1\n"), realProvision.parseCompose), false);
