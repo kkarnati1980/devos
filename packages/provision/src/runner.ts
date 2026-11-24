@@ -91,7 +91,9 @@ export class StepError extends Error {
     message: string,
     /**
      * DEVOS-21 diagnostics, part 4: the provider or hook error behind a `provider_error` (ES2022 `cause`). Readers
-     * print only its fixed code and HTTP status, never its message.
+     * print only its fixed code and HTTP status, never its message. The cause's message holds a provider method,
+     * path and status, so never log a StepError whole (`console.error(e)`, `util.inspect`, a logger `err`
+     * serialiser that follows `cause`): log its `code` and `step` only ("No value in any error").
      */
     cause?: unknown,
   ) {

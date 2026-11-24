@@ -327,3 +327,18 @@ test("Codex PR44-r2: a stalled lock connection (connect, SET, lock or end) is bo
   assert.ok(Date.now() - t0 < 2000, "a stalled end() does not hold the run");
   clearTimeout(keepAlive);
 });
+
+test("DEVOS-21 part 4: a provider_error stop carries the provider error as its cause; message and journal unchanged", async () => {
+  const store = new MemoryStore();
+  const pe = new ProviderError("github", "http", "github POST /user/repos returned 403", 403);
+  const spec = { key: "github/repo", provider: "github", kind: "repo", name: "devos-acme", action: "provision.github.repo",
+    lookup: async () => null, create: async () => { throw pe; } };
+  const err = await runStep(P.id, spec, { store, authorize: allowAll }).then(() => null, (e) => e);
+  assert.ok(err instanceof StepError);
+  assert.equal(err.cause, pe);
+  assert.equal(err.message, "create failed for github repo");
+  assert.equal(JSON.stringify(err).includes("403"), false, "cause is not enumerable");
+  assert.equal(store.steps.get(`${P.id}/github/repo`).lastError, "provider_error: github POST /user/repos returned 403");
+  // A stop with no cause has none.
+  assert.equal(new StepError("github/repo", "name_conflict", false, true, "x").cause, undefined);
+});
