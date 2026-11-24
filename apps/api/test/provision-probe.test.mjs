@@ -158,6 +158,24 @@ test("DEVOS-21: a failed cycle re-runs at once when a provider token was saved a
   assert.deepEqual([h.cycle, h.phase], [2, "run1"], "7 days on, the next cycle starts as before");
 });
 
+test("DEVOS-21: after a cleanup cycle whose purge passed, the real cycle starts on the next tick; a failed cleanup waits", async () => {
+  let pending = true;
+  const d = fake({ cycleStart: async () => (pending ? "purge-pending" : "ready") });
+  const end = (await runToEnd(d)).at(-1);
+  assert.deepEqual([end.cycle, end.exit, end.code], [1, 1, "previous-purge-pending"]);
+  pending = false;
+  const r = await probeStep(d);
+  assert.deepEqual([r.cycle, r.phase], [2, "run1"]);
+  const pass = (await runToEnd(d)).at(-1);
+  assert.deepEqual([pass.cycle, pass.code], [2, "pass"]);
+  assert.equal((await probeStep(d)).code, "probed", "a passed cycle waits the 7 days");
+
+  const e = fake({ cycleStart: async () => "purge-pending", purge: async () => ({ error: "purge-permission" }) });
+  const failed = (await runToEnd(e)).at(-1);
+  assert.deepEqual([failed.code, failed.cause], ["purge-failed", "previous-purge-pending"]);
+  assert.equal((await probeStep(e)).code, "probed", "a cleanup whose purge failed is not re-run at once");
+});
+
 test("inventoryDiff ignores row order and names a missing or extra row", () => {
   assert.equal(inventoryDiff(ROWS, [...ROWS].reverse()), null);
   assert.equal(inventoryDiff(ROWS, [ROWS[0]]), "missing-in-run2:coolify_project");

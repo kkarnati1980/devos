@@ -104,6 +104,9 @@ function nextPhase(p: Phase): Phase {
 async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   if (last.fingerprint !== d.fingerprint) return true;
   if (d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS) return true;
+  // DEVOS-21: a cycle that only purged an earlier cycle's leftovers (its purge passed) tested nothing, so the real
+  // cycle is due on the next check run. If that purge had failed, the code would be `purge-failed`, which waits.
+  if (last.result?.ok === false && last.result.code === "previous-purge-pending") return true;
   // DEVOS-21: a failed cycle is re-run as soon as KK saves a new provider token after it ended (a passed cycle waits
   // the 7 days). A read that throws, or a time that is not a valid ISO date, keeps the 7-day rule.
   if (last.result?.ok !== false || !d.credentialsUpdatedAt) return false;
