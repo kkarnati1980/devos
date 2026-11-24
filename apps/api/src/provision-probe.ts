@@ -338,7 +338,11 @@ function stepStop(e: unknown): { code: string; retryable: boolean } {
   const msg = typeof x.message === "string" ? x.message : "";
   const stage = step ? STAGES.find(([re]) => re.test(msg))?.[1] : undefined;
   const cause = step ? causeCode(x.cause) : undefined;
-  return { code: `${x.code}${step}${stage ? `:${stage}` : ""}${cause ? `:${cause}` : ""}`, retryable: x.retryable === true };
+  const base = `${x.code}${step}${stage ? `:${stage}` : ""}`;
+  // Part 5 pre-review: the CLI hides a detail over 120 characters whole, so a cause that would overflow is cut
+  // back to its code and status (the field names go first), and dropped if even that does not fit.
+  const fit = [cause, cause?.split(":")[0]].find((c) => c && base.length + 1 + c.length <= 120);
+  return { code: `${base}${fit ? `:${fit}` : ""}`, retryable: x.retryable === true };
 }
 
 /**

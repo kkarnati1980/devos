@@ -190,6 +190,12 @@ const MAX_ERROR_BODY = 16_384;
  */
 async function validationFields(res: Response): Promise<readonly string[] | undefined> {
   try {
+    // Pre-review: refuse a declared large body before reading it; the read is still capped after.
+    const declared = Number(res.headers.get("content-length") ?? "0");
+    if (!Number.isFinite(declared) || declared > MAX_ERROR_BODY) {
+      await res.body?.cancel().catch(() => {});
+      return undefined;
+    }
     const text = await res.text();
     if (text.length > MAX_ERROR_BODY) return undefined;
     const body = JSON.parse(text) as { errors?: unknown };

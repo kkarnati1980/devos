@@ -423,4 +423,8 @@ test("part 5: a rejected 422 create names the validation fields (at most 3), fil
   assert.deepEqual(await through(new ProviderError("coolify", "http", "m", 422, ["a", "b", "c", "d"])), { error: "provider_error:coolify/project:rejected:http-422:a,b,c" });
   assert.deepEqual(await through(new ProviderError("coolify", "http", "m", 422, ["Bad", 7, "ok"])), { error: "provider_error:coolify/project:rejected:http-422:ok" });
   assert.deepEqual(await through(new ProviderError("coolify", "http", "m", 422)), { error: "provider_error:coolify/project:rejected:http-422" });
+  // A detail that would pass 120 characters drops the field names first, so the step and stage still print.
+  const long = await probeProvisionOnce(pv(async () => { throw Object.assign(new Error("create failed for coolify application"), { name: "StepError", code: "provider_error", retryable: false,
+    step: "coolify/application/production", cause: new ProviderError("coolify", "http", "m", 422, ["custom_docker_run_options", "health_check_response_text", "ports_exposes"]) }); }), P);
+  assert.deepEqual(long, { error: "provider_error:coolify/application/production:create:http-422" });
 });

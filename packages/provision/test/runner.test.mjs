@@ -361,4 +361,10 @@ test("DEVOS-21 part 5: a 422 keeps the validation field names only; other errors
   assert.equal((await write(answer(400, { errors: { name: ["x"] } }))).fields, undefined, "only a 422 is read");
   const many = Object.fromEntries(["f", "e", "d", "c", "b", "a"].map((k) => [k, ["x"]]));
   assert.deepEqual((await write(answer(422, { errors: many }))).fields, ["a", "b", "c", "d", "e"]);
+  // A body that breaks mid-read, and a declared oversized body: no fields, still an http 422.
+  const broken = async () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"errors":')); c.error(new Error("reset")); } }), { status: 422 });
+  const eb = await write(broken);
+  assert.deepEqual([eb.code, eb.status, eb.fields], ["http", 422, undefined]);
+  const big = async () => new Response(JSON.stringify({ errors: { name: ["x"] } }), { status: 422, headers: { "content-length": "999999" } });
+  assert.equal((await write(big)).fields, undefined);
 });
