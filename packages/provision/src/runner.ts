@@ -33,6 +33,20 @@ export interface StepSpec {
   inventory?: false;
 }
 
+/**
+ * DEVOS-21 (AT13 part 8): the (provider, kind) pairs of the journal-only steps (`inventory: false`). They never get a
+ * resource row, so a reader of the journal (the AT13 probe) must not count their missing row as a lost one. The runner
+ * refuses a journal-only spec whose kind is not listed here, so the list cannot drift from the specs.
+ */
+export const JOURNAL_ONLY_KINDS: ReadonlyArray<readonly [string, string]> = [
+  ["github", "core_commit"],
+  ["github", "deploy_compose"],
+  ["vault", "app_secret"],
+];
+export function isJournalOnlyKind(provider: string, kind: string): boolean {
+  return JOURNAL_ONLY_KINDS.some(([p, k]) => p === provider && k === kind);
+}
+
 export type StepStatus = "pending" | "done" | "failed";
 
 export interface StepRecord {
@@ -164,7 +178,9 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
 
   const record = async (f: Found): Promise<void> => {
     try {
-      if (spec.inventory !== false) {
+      if (spec.inventory === false) {
+        if (!isJournalOnlyKind(spec.provider, spec.kind)) throw new Error(`journal-only-kind-unlisted: ${spec.provider}/${spec.kind}`);
+      } else {
         await store.recordResource(projectId, { provider: spec.provider, kind: spec.kind, externalId: f.externalId, name: f.name });
       }
     } catch (e) {
