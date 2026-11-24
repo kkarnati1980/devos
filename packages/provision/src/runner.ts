@@ -89,8 +89,15 @@ export class StepError extends Error {
     /** ADR-0009: policy and budget stops never count as attempts. */
     public readonly countsAsAttempt: boolean,
     message: string,
+    /**
+     * DEVOS-21 diagnostics, part 4: the provider or hook error behind a `provider_error` (ES2022 `cause`). Readers
+     * print only its fixed code and HTTP status, never its message. The cause's message holds a provider method,
+     * path and status, so never log a StepError whole (`console.error(e)`, `util.inspect`, a logger `err`
+     * serialiser that follows `cause`): log its `code` and `step` only ("No value in any error").
+     */
+    cause?: unknown,
   ) {
-    super(message);
+    super(message, cause === undefined ? undefined : { cause });
     this.name = "StepError";
   }
 }
@@ -162,7 +169,7 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
     } catch (e) {
       const transient = e instanceof ProviderError && e.transient;
       await store.markFailed(projectId, spec, errLine("provider_error", e));
-      throw new StepError(spec.key, "provider_error", transient, true, `lookup failed for ${spec.provider} ${spec.kind}`);
+      throw new StepError(spec.key, "provider_error", transient, true, `lookup failed for ${spec.provider} ${spec.kind}`, e);
     }
   };
 
@@ -195,7 +202,7 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
     const nameTaken = e instanceof ProviderError && e.code === "http" && (e.status === 409 || e.status === 422);
     if (!transient && !nameTaken) {
       await store.markFailed(projectId, spec, errLine("provider_error", e));
-      throw new StepError(spec.key, "provider_error", false, true, `create failed for ${spec.provider} ${spec.kind}`);
+      throw new StepError(spec.key, "provider_error", false, true, `create failed for ${spec.provider} ${spec.kind}`, e);
     }
     // The create may have happened (or the name was taken meanwhile): look again, never create again here.
     const again = await lookup();
@@ -203,7 +210,7 @@ export async function runStep(projectId: string, spec: StepSpec, opts: RunOption
     if (!transient) {
       // 409/422 with nothing found under our name: a permanent rejection (e.g. validation), not worth retrying.
       await store.markFailed(projectId, spec, errLine("provider_error", e));
-      throw new StepError(spec.key, "provider_error", false, true, `create rejected for ${spec.provider} ${spec.kind}`);
+      throw new StepError(spec.key, "provider_error", false, true, `create rejected for ${spec.provider} ${spec.kind}`, e);
     }
     await store.markFailed(projectId, spec, errLine("create_unconfirmed", e));
     throw new StepError(spec.key, "create_unconfirmed", true, true, `create of ${spec.provider} ${spec.kind} not confirmed; the next run looks it up first`);

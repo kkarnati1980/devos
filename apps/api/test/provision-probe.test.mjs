@@ -362,3 +362,54 @@ test("pre-review M3: PrismaProbeLog round-trips, returns null with no rows, and 
   db.audits.push({ projectId: "id-1", action: "provision.probe_phase", details: { cycle: "x" } });
   await assert.rejects(log.last(), /probe-phase-unreadable/);
 });
+
+// DEVOS-21 diagnostics, part 4: a final stop names the step, the stage and the cause's fixed code, through the
+// real @devos/provision runner (so a reworded runner message fails here instead of silently losing the stage).
+test("part 4: a final run stop names step, stage and cause through the real runner; never a message", async () => {
+  const { runStep, MemoryStore, allowAll, ProviderError, StepError } = await import("@devos/provision");
+  const pv = (run) => ({ ready: async () => null, run });
+  const spec = (over) => ({ key: "github/repo", provider: "github", kind: "repo", name: "devos-probe-m24", action: "provision.github.repo",
+    lookup: async () => null, create: async () => { throw new Error("unset"); }, ...over });
+  const through = (over) => probeProvisionOnce(pv(() => runStep(P.id, spec(over), { store: new MemoryStore(), authorize: allowAll })), P);
+  const secret = "token=ghp_secret body: Bad credentials";
+  // A create refused with 403: final, names the call.
+  assert.deepEqual(await through({ create: async () => { throw new ProviderError("github", "http", `github POST /user/repos returned 403 ${secret}`, 403); } }),
+    { error: "provider_error:github/repo:create:http-403" });
+  // 422 with nothing found under our name: rejected.
+  assert.deepEqual(await through({ create: async () => { throw new ProviderError("github", "http", secret, 422); } }),
+    { error: "provider_error:github/repo:rejected:http-422" });
+  // A lookup that fails for good (a 404 is not transient), and an unreadable answer.
+  assert.deepEqual(await through({ lookup: async () => { throw new ProviderError("github", "http", secret, 404); } }),
+    { error: "provider_error:github/repo:lookup:http-404" });
+  assert.deepEqual(await through({ key: "coolify/application/production", provider: "coolify", kind: "application",
+    lookup: async () => { throw new ProviderError("coolify", "bad-response", secret, 200); } }),
+    { error: "provider_error:coolify/application/production:lookup:bad-response-200" });
+  // A missing token (no status), a hook refusal with its own fixed code, a plain error: the code alone.
+  assert.deepEqual(await through({ create: async () => { throw new ProviderError("github", "no-token", secret); } }),
+    { error: "provider_error:github/repo:create:no-token" });
+  assert.deepEqual(await through({ create: async () => { throw Object.assign(new Error(secret), { code: "compose_unsafe" }); } }),
+    { error: "provider_error:github/repo:create:compose_unsafe" });
+  assert.deepEqual(await through({ create: async () => { throw new Error(secret); } }), { error: "provider_error:github/repo:create" });
+  // A created resource without our marker.
+  assert.deepEqual(await through({ create: async () => ({ externalId: "1", name: "x", owned: false }) }), { error: "provider_error:github/repo:marker" });
+  // A transient failure stays in progress (the next tick runs again).
+  assert.equal(await through({ lookup: async () => { throw new ProviderError("github", "http", secret, 502); } }), "in_progress");
+  // A step's own typed stop keeps its code and step; no stage or cause is invented.
+  assert.deepEqual(await probeProvisionOnce(pv(async () => { throw new StepError("coolify/environment/production", "port_range_exhausted", false, true, "no free port"); }), P),
+    { error: "port_range_exhausted:coolify/environment/production" });
+  // Odd step keys and cause codes are left out, never printed.
+  assert.deepEqual(await probeProvisionOnce(pv(async () => { throw new StepError("vault/app_secret/production/DATABASE_URL", "provider_error", false, true, "create failed for vault x", new Error("x")); }), P),
+    { error: "provider_error" });
+  assert.deepEqual(await probeProvisionOnce(pv(async () => { throw new StepError("github/repo", "provider_error", false, true, "create failed for github repo", { code: "Bad Code!" }); }), P),
+    { error: "provider_error:github/repo:create" });
+  assert.deepEqual(await probeProvisionOnce(pv(async () => { throw new StepError("github/repo", "provider_error", false, true, "create failed for github repo", new ProviderError("github", "http", "x", 1000)); }), P),
+    { error: "provider_error:github/repo:create:http" });
+});
+
+test("part 4: the run failure detail reaches the done record and survives the CLI filter", async () => {
+  const { safeDetail } = await import("../dist/provision-probe-cli.js");
+  const d = fake({ provisionOnce: async () => ({ error: "provider_error:coolify/application/production:rejected:bad-response-200" }) });
+  const end = (await runToEnd(d)).at(-1);
+  assert.deepEqual([end.exit, end.code, end.detail], [1, "run1-failed", "provider_error:coolify/application/production:rejected:bad-response-200"]);
+  assert.equal(safeDetail(end.detail), end.detail);
+});
