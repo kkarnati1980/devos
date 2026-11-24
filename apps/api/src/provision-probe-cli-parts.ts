@@ -4,7 +4,6 @@
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
-import { isJournalOnlyKind } from "@devos/provision";
 import type { InventoryRow } from "./provision-probe.js";
 
 /** Image paths (relative to the repo root in the image) whose content defines "the provisioning code". */
@@ -68,7 +67,11 @@ export async function probeFingerprint(root: string): Promise<string> {
 /** The name a journal-only step carries in the probe's inventory (it has no resource row to take one from). */
 export const JOURNAL_ONLY_NAME = "(journal-only)";
 
-export async function readProbeInventory(db: any, projectId: string, timeoutMs: number): Promise<InventoryRow[]> {
+export async function readProbeInventory(
+  db: any, projectId: string, timeoutMs: number,
+  // `@devos/provision`'s `isJournalOnlyKind`, passed in because the api loads that package only at run time.
+  isJournalOnlyKind: (provider: string, kind: string) => boolean,
+): Promise<InventoryRow[]> {
   // Pre-review 3: bounded like PrismaProbeLog (ADR-0011: a timeout on every outbound call), one consistent read.
   const [steps, resources] = await db.$transaction(async (tx: any) => [
     await tx.provisionStep.findMany({ where: { projectId, status: "done" }, orderBy: [{ key: "asc" }], select: { key: true, provider: true, kind: true, externalId: true } }),

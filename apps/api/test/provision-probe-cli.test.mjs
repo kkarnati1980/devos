@@ -72,7 +72,9 @@ test("d3c: the inventory joins done steps to active resources; a lost row stays 
   };
   const txOpts = [];
   db.$transaction = async (fn, o) => { txOpts.push(o); return fn(db); };
-  const rows = await readProbeInventory(db, "proj-1", 1234);
+  // The same pairs as @devos/provision's JOURNAL_ONLY_KINDS (its runner test pins that list).
+  const journalOnly = (p, k) => [["github", "core_commit"], ["github", "deploy_compose"], ["vault", "app_secret"]].some(([a, b]) => a === p && b === k);
+  const rows = await readProbeInventory(db, "proj-1", 1234, journalOnly);
   assert.deepEqual(txOpts, [{ timeout: 1234, maxWait: 1234 }], "one bounded transaction");
   assert.deepEqual(rows, [
     { key: "coolify_project", provider: "coolify", externalId: "p-1", name: "devos-probe-m24" },
