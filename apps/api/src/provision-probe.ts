@@ -296,11 +296,44 @@ export class PrismaProbeLog {
   }
 }
 
-/** The runner's stop, read structurally (StepError lives in @devos/provision, loaded at run time). */
+/** A step key of our own shape (`github/repo`, `coolify/application/production`); anything else is not printed. */
+const STEP_RE = /^[a-z0-9_]{1,40}(?:\/[a-z0-9_]{1,40}){1,3}$/;
+/** A fixed error code (a ProviderError's `network`, `http`, `bad-response`, ...; an S4 refusal's `compose_unsafe`). */
+const CAUSE_CODE_RE = /^[a-z][a-z0-9_-]{0,39}$/;
+/** The runner's own fixed messages (packages/provision/src/runner.ts), anchored on our text, never a provider body. */
+const STAGES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^lookup failed for /, "lookup"],
+  [/^create failed for /, "create"],
+  [/^create rejected for /, "rejected"],
+  [/^created .+ lacks the ownership marker$/, "marker"],
+];
+
+/**
+ * DEVOS-21 diagnostics, part 4: the cause of a final stop as fixed codes only. A ProviderError reads
+ * `<code>` plus `-<status>` for a valid HTTP status; any other error with a fixed `code` reads that code; nothing
+ * else (and never a message) is printed.
+ */
+function causeCode(c: unknown): string | undefined {
+  const x = c as { name?: unknown; code?: unknown; status?: unknown } | null | undefined;
+  if (!x || typeof x !== "object" || typeof x.code !== "string" || !CAUSE_CODE_RE.test(x.code)) return undefined;
+  const st = x.status;
+  const status = x.name === "ProviderError" && typeof st === "number" && Number.isInteger(st) && st >= 100 && st <= 599 ? `-${st}` : "";
+  return `${x.code}${status}`;
+}
+
+/**
+ * The runner's stop, read structurally (StepError lives in @devos/provision, loaded at run time). Part 4: a final
+ * stop's detail also names the step, the stage (from the runner's own message) and the cause's fixed code, e.g.
+ * `provider_error:github/repo:create:http-403`, so the server check says which provider call failed and how.
+ */
 function stepStop(e: unknown): { code: string; retryable: boolean } {
-  const x = e as { name?: unknown; code?: unknown; retryable?: unknown } | null;
-  if (x && x.name === "StepError" && typeof x.code === "string") return { code: x.code, retryable: x.retryable === true };
-  return { code: "provision-failed", retryable: true };
+  const x = e as { name?: unknown; code?: unknown; retryable?: unknown; step?: unknown; message?: unknown; cause?: unknown } | null;
+  if (!(x && x.name === "StepError" && typeof x.code === "string")) return { code: "provision-failed", retryable: true };
+  const step = typeof x.step === "string" && STEP_RE.test(x.step) ? `:${x.step}` : "";
+  const msg = typeof x.message === "string" ? x.message : "";
+  const stage = step ? STAGES.find(([re]) => re.test(msg))?.[1] : undefined;
+  const cause = step ? causeCode(x.cause) : undefined;
+  return { code: `${x.code}${step}${stage ? `:${stage}` : ""}${cause ? `:${cause}` : ""}`, retryable: x.retryable === true };
 }
 
 /**
