@@ -342,3 +342,48 @@ test("DEVOS-21 part 4: a provider_error stop carries the provider error as its c
   // A stop with no cause has none.
   assert.equal(new StepError("github/repo", "name_conflict", false, true, "x").cause, undefined);
 });
+
+test("DEVOS-21 part 5: a 422 keeps the validation field names only; other errors and odd bodies keep none", async () => {
+  const answer = (status, body) => async () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const write = async (fetchImpl) => {
+    const cf = new CoolifyClient({ origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl, sleep: noSleep });
+    return cf.createProject("devos-acme", "x").then(() => null, (e) => e);
+  };
+  const e1 = await write(answer(422, { message: "Validation failed. token=ghp_secret", errors: { name: ["bad"], description: ["The description format is invalid: devos:abc"] } }));
+  assert.ok(e1 instanceof ProviderError);
+  assert.deepEqual([e1.status, e1.fields], [422, ["description", "name"]]);
+  assert.equal(e1.message.includes("secret") || e1.message.includes("invalid"), false);
+  // Codex PR229-r1 #2: only keys we sent (`name`, `description`) can be named; odd and unsent keys are dropped.
+  const e2 = await write(answer(422, { errors: { "Bad Key": ["x"], ok_field: ["y"], "ünicode": ["z"], name: ["w"] } }));
+  assert.deepEqual(e2.fields, ["name"]);
+  assert.equal((await write(answer(422, { errors: { token: ["x"], ok_field: ["y"] } }))).fields, undefined, "unsent keys only");
+  for (const body of ["not json", { errors: ["a"] }, { errors: null }, { message: "x" }, { errors: { "": ["x"] } }, "x".repeat(20_000)]) {
+    assert.equal((await write(answer(422, body))).fields, undefined, JSON.stringify(body).slice(0, 40));
+  }
+  assert.equal((await write(answer(400, { errors: { name: ["x"] } }))).fields, undefined, "only a 422 is read");
+  // Six sent and rejected fields cap at five (through the Transport, since createProject sends two).
+  const many = Object.fromEntries(["f", "e", "d", "c", "b", "a"].map((k) => [k, ["x"]]));
+  const t6 = new Transport({ provider: "coolify", origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl: answer(422, { errors: many }), sleep: noSleep });
+  const e6 = await t6.write("POST", "/api/v1/projects", Object.fromEntries(Object.keys(many).map((k) => [k, "v"]))).then(() => null, (e) => e);
+  assert.deepEqual(e6.fields, ["a", "b", "c", "d", "e"]);
+  // A write with no body names no field.
+  const t0 = new Transport({ provider: "coolify", origin: "http://coolify.test:8000", token: () => TOKEN, fetchImpl: answer(422, { errors: { name: ["x"] } }), sleep: noSleep });
+  assert.equal((await t0.write("DELETE", "/api/v1/projects/x").then(() => null, (e) => e)).fields, undefined);
+  // Codex PR229-r1 #1: an endless body with no content-length is read only up to the cap, then cancelled.
+  let pulls = 0;
+  let cancelled = false;
+  const endless = async () => new Response(new ReadableStream({
+    pull(c) { pulls++; c.enqueue(new Uint8Array(4096).fill(32)); },
+    cancel() { cancelled = true; },
+  }), { status: 422 });
+  const ee = await write(endless);
+  assert.deepEqual([ee.code, ee.status, ee.fields], ["http", 422, undefined]);
+  assert.ok(cancelled, "the rest of the body is cancelled");
+  assert.ok(pulls <= 8, `read stopped near the 16 KiB cap (${pulls} chunks of 4 KiB)`);
+  // A body that breaks mid-read, and a declared oversized body: no fields, still an http 422.
+  const broken = async () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"errors":')); c.error(new Error("reset")); } }), { status: 422 });
+  const eb = await write(broken);
+  assert.deepEqual([eb.code, eb.status, eb.fields], ["http", 422, undefined]);
+  const big = async () => new Response(JSON.stringify({ errors: { name: ["x"] } }), { status: 422, headers: { "content-length": "999999" } });
+  assert.equal((await write(big)).fields, undefined);
+});

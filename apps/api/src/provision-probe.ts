@@ -300,6 +300,8 @@ export class PrismaProbeLog {
 const STEP_RE = /^[a-z0-9_]{1,40}(?:\/[a-z0-9_]{1,40}){1,3}$/;
 /** A fixed error code (a ProviderError's `network`, `http`, `bad-response`, ...; an S4 refusal's `compose_unsafe`). */
 const CAUSE_CODE_RE = /^[a-z][a-z0-9_-]{0,39}$/;
+/** A validation field name, as `ProviderError.fields` keeps it (packages/provision/src/http.ts). */
+const FIELD_NAME_RE = /^[a-z][a-z0-9_]{0,39}$/;
 /** The runner's own fixed messages (packages/provision/src/runner.ts), anchored on our text, never a provider body. */
 const STAGES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^lookup failed for /, "lookup"],
@@ -314,11 +316,14 @@ const STAGES: ReadonlyArray<readonly [RegExp, string]> = [
  * else (and never a message) is printed.
  */
 function causeCode(c: unknown): string | undefined {
-  const x = c as { name?: unknown; code?: unknown; status?: unknown } | null | undefined;
+  const x = c as { name?: unknown; code?: unknown; status?: unknown; fields?: unknown } | null | undefined;
   if (!x || typeof x !== "object" || typeof x.code !== "string" || !CAUSE_CODE_RE.test(x.code)) return undefined;
   const st = x.status;
-  const status = x.name === "ProviderError" && typeof st === "number" && Number.isInteger(st) && st >= 100 && st <= 599 ? `-${st}` : "";
-  return `${x.code}${status}`;
+  const isPe = x.name === "ProviderError";
+  const status = isPe && typeof st === "number" && Number.isInteger(st) && st >= 100 && st <= 599 ? `-${st}` : "";
+  // Part 5: a 422's field names (already filtered by the transport; checked again here), joined by commas.
+  const f = isPe && Array.isArray(x.fields) ? x.fields.filter((n): n is string => typeof n === "string" && FIELD_NAME_RE.test(n)).slice(0, 3) : [];
+  return `${x.code}${status}${f.length ? `:${f.join(",")}` : ""}`;
 }
 
 /**
@@ -333,7 +338,11 @@ function stepStop(e: unknown): { code: string; retryable: boolean } {
   const msg = typeof x.message === "string" ? x.message : "";
   const stage = step ? STAGES.find(([re]) => re.test(msg))?.[1] : undefined;
   const cause = step ? causeCode(x.cause) : undefined;
-  return { code: `${x.code}${step}${stage ? `:${stage}` : ""}${cause ? `:${cause}` : ""}`, retryable: x.retryable === true };
+  const base = `${x.code}${step}${stage ? `:${stage}` : ""}`;
+  // Part 5 pre-review: the CLI hides a detail over 120 characters whole, so a cause that would overflow is cut
+  // back to its code and status (the field names go first), and dropped if even that does not fit.
+  const fit = [cause, cause?.split(":")[0]].find((c) => c && base.length + 1 + c.length <= 120);
+  return { code: `${base}${fit ? `:${fit}` : ""}`, retryable: x.retryable === true };
 }
 
 /**
