@@ -317,14 +317,37 @@ test("a card read that throws waits, then times out; a failed raise or an empty 
   assert.equal((await probeStep(d)).phase, "purge");
   assert.equal((await probeStep(d)).code, "card-timeout");
 
-  for (const raise of [async () => { throw new Error("x"); }, async () => ""]) {
-    d = fake({ raisePurgeCard: raise });
-    await until(d, "card");
-    assert.equal((await probeStep(d)).phase, "purge");
+  d = fake({ raisePurgeCard: async () => "" });
+  await until(d, "card");
+  assert.equal((await probeStep(d)).phase, "purge");
+  assert.equal((await probeStep(d)).code, "card-raise-failed");
+  assert.equal(d.calls.purge, 1);
+});
+
+test("Codex PR239-r14: a raise that throws (perhaps after persisting the card) is retried in card, then tracked; purged only after the phase bound", async () => {
+  let d = fake();
+  await until(d, "card");
+  const real = d.raisePurgeCard;
+  let fails = 2;
+  d.raisePurgeCard = async () => { if (fails-- > 0) { d.calls.raise++; throw new Error("db after insert"); } return real(); };
+  for (let i = 0; i < 2; i++) {
     const r = await probeStep(d);
-    assert.equal(r.code, "card-raise-failed");
-    assert.equal(d.calls.purge, 1);
+    assert.deepEqual([r.phase, r.detail], ["card", "card-raise-retry"]);
   }
+  assert.equal(d.calls.purge, 0, "no fallback purge while the card may be pending");
+  let r = await probeStep(d);
+  assert.equal(r.phase, "cardwait");
+  assert.equal(d.log.at(-1).cardId, "card-1");
+  // Throwing for the whole phase bound: purged by the probe.
+  d = fake({ raisePurgeCard: async () => { throw new Error("x"); } });
+  await until(d, "card");
+  d.tick(PROBE_PHASE_MAX_MS - 1);
+  assert.equal((await probeStep(d)).detail, "card-raise-retry");
+  d.tick(1);
+  assert.equal((await probeStep(d)).phase, "purge");
+  r = await probeStep(d);
+  assert.equal(r.code, "card-raise-failed");
+  assert.equal(d.calls.purge, 1);
 });
 
 test("a deploy that changes the fingerprint while KK's card waits does not end the cycle", async () => {

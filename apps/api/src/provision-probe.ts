@@ -294,7 +294,11 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       const r = await attempt(() => d.raisePurgeCard!());
       // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
       if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return toPurge(failed("card-grant-short"));
-      if (!r.ok || typeof r.value !== "string" || r.value === "") return toPurge(failed("card-raise-failed"));
+      // Codex PR239-r14 (medium): a throw may come after the card was persisted (the reads that bind and track it), so
+      // the tick is retried in `card`, whose lookup then finds that card (r1), rather than leaving for a fallback purge
+      // while it is pending. Only after `PROBE_PHASE_MAX_MS` in `card` (the bound every phase has) is it purged.
+      if (!r.ok) return timedOut() ? toPurge(failed("card-raise-failed", "timeout")) : { exit: 3, phase, cycle, code: "in_progress", detail: "card-raise-retry" };
+      if (typeof r.value !== "string" || r.value === "") return toPurge(failed("card-raise-failed"));
       await d.record({ ...last, phase: "cardwait", at: at(), cardId: r.value });
       return { exit: 3, phase: "cardwait", cycle, code: "in_progress" };
     }
