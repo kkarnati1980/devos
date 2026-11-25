@@ -451,14 +451,24 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // Codex PR239-r28 (decision 25): a `card` phase that timed out after persisting its card reaches here without a
       // `cardId`; the current archive's card is looked up instead, so a sweep purge under KK's approved card still counts.
       let id = last.cardId;
+      // Codex PR239-r29 (decision 26): a proof read that throws is retried on later ticks within the phase bound (the
+      // purge itself is then a no-op `done`), so a transient failure never loses AT10's proof; past the bound the
+      // earlier result stands.
+      let readFailed = false;
       if (last.viaCard && !id && d.archiveCardId) {
         const f = await attempt(() => d.archiveCardId!());
-        if (f.ok && typeof f.value === "string" && f.value !== "") id = f.value;
+        if (!f.ok) readFailed = true;
+        else if (typeof f.value === "string" && f.value !== "") id = f.value;
       }
       if (last.viaCard && id && d.cardOutcome) {
         const cardId = id;
         const o = await attempt(() => d.cardOutcome!(cardId));
-        if (o.ok && o.value.stage === "purged" && o.value.card === "approved" && o.value.byCard === true) return finish(true, PASS_CARD, undefined, undefined, restart);
+        if (!o.ok) readFailed = true;
+        else if (o.value.stage === "purged" && o.value.card === "approved" && o.value.byCard === true) return finish(true, PASS_CARD, undefined, undefined, restart);
+      }
+      if (readFailed && (restart || !timedOut())) {
+        if (restart) await d.record({ ...last, ...restart });
+        return { exit: 3, phase, cycle, code: "in_progress", detail: "card-proof-retry" };
       }
       if (earlier) return finish(false, earlier.code, earlier.detail, undefined, restart);
       return finish(true, "pass", undefined, undefined, restart);
