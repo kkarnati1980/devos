@@ -385,6 +385,9 @@ export async function probeCardOutcome(db: any, projectId: string, cardId: strin
       stage: String(p.stage),
       card: !ok ? "missing" : newest ? "approved" : (String(c.status) as CardOutcome["card"]),
       decidedAt: decided instanceof Date ? decided.toISOString() : null,
+      // Codex PR239-r12: when the tracked card was raised, so the wait is measured from the card, not from the tick
+      // that recorded it.
+      raisedAt: ok && c.createdAt instanceof Date ? c.createdAt.toISOString() : null,
       byCard,
     };
   }, { timeout: timeoutMs, maxWait: timeoutMs });
@@ -430,6 +433,7 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   }
   if (now === "purged") throw new Error("probe-card-already-purged");
   if (now !== "archived") throw new Error("probe-card-not-archived");
+  if (!(since instanceof Date)) throw new Error("probe-card-stale");
   // Codex PR239-r8: checked after the lookup above, so a card raised by an earlier tick is never given up here.
   let lasts = false;
   try { lasts = (await d.outlasts()) === true; } catch { lasts = false; }
@@ -440,6 +444,10 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   // nothing expired it) would be skipped by the sweep (`card-before-archive`), so it is not used.
   const archived = await d.archivedAt();
   if (!(archived instanceof Date) || !(card.createdAt instanceof Date) || card.createdAt.getTime() < archived.getTime()) throw new Error("probe-card-stale");
+  // Codex PR239-r12 (medium): the card belongs to the archive this tick read before raising it. A Restore and a new
+  // Archive in between (a later `archived_at`) supersede that archive, so this tick raises nothing for it; the next tick
+  // starts from the new archive and its own card lookup.
+  if (archived.getTime() !== since.getTime()) throw new Error("probe-card-archive-changed");
   // Codex PR239-r2: another purge card for this archive raised between the lookup and the raise (and approved, so
   // the pending dedupe missed it) is the one the sweep acts on first; track the oldest.
   return (await d.existing(archived)) ?? card.id;

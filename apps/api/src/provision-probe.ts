@@ -50,6 +50,8 @@ export interface CardOutcome {
   stage: string;
   card: "pending" | "approved" | "rejected" | "expired" | "missing";
   decidedAt?: string | null;
+  /** Codex PR239-r12: the tracked card's `created_at` (ISO), or null when it reads as missing. */
+  raisedAt?: string | null;
   /** Codex PR239-r1: every allowed purge decision since the card was raised ran under this card's grant (and one did). */
   byCard?: boolean;
 }
@@ -298,9 +300,15 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // Decisions 4 and 5: wait for KK's answer and the sweep's purge; every other end is purged by the probe.
       if (!d.cardOutcome || !last.cardId) return toPurge(failed("card-not-wired"));
       const cardId = last.cardId;
-      const late = d.now().getTime() - Date.parse(last.at) >= PROBE_CARD_MAX_MS;
       const wait = (detail: string): ProbeTick => ({ exit: 3, phase, cycle, code: "in_progress", detail });
       const r = await attempt(() => d.cardOutcome!(cardId));
+      // Codex PR239-r12 (medium): the 8-day wait runs from the earlier of the card's raise and the tick that recorded
+      // it. A card raised by a tick that failed to record `cardwait` and reused later keeps its own deadline, so the
+      // wait never outruns the grant checked when it was raised (decision 11).
+      const raised = r.ok && typeof r.value.raisedAt === "string" ? Date.parse(r.value.raisedAt) : NaN;
+      const recorded = Date.parse(last.at);
+      const start = Number.isFinite(raised) && raised < recorded ? raised : recorded;
+      const late = d.now().getTime() - start >= PROBE_CARD_MAX_MS;
       if (!r.ok) return late ? toPurge(failed("card-timeout", "error")) : wait("card-unreadable");
       const o = r.value;
       // AT10: purged by the sweep under KK's approved card. A purge with no approved card is not that proof.
