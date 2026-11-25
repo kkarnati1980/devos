@@ -57,6 +57,14 @@ export interface PhaseRecord {
    * raise and the `cardwait` record), so the expiry retries keep the deadline the original raise set.
    */
   cardWaitFrom?: string;
+  /**
+   * Codex PR239-r30 (DEVOS-254 decision 27): set when a card cycle leaves `card` or `cardwait` for the probe's own purge.
+   * Only such a cycle can find AT10's proof in the purge phase; one that failed earlier (provisioning, the compare, the
+   * live asserts) went straight to purge and never passes as `pass-card`.
+   */
+  cardReached?: boolean;
+  /** Codex PR239-r30 (decision 28): when the purge phase's first proof read failed; its retries are bounded from here. */
+  proofRetryFrom?: string;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
 }
 
@@ -267,7 +275,7 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
   // pending purge cards (in the purge phase, `expireCards`), so a card persisted by a throwing tick is never left
   // pending behind the fallback purge, however far apart the server checks run.
   const leaveCard = async (result: { ok: boolean; code: string; detail?: string }): Promise<ProbeTick> => {
-    await d.record({ ...last, phase: "purge", at: at(), result, expireCards: true });
+    await d.record({ ...last, phase: "purge", at: at(), result, expireCards: true, cardReached: true });
     return { exit: 3, phase: "purge", cycle, code: "in_progress" };
   };
   const advance = async (extra: Partial<PhaseRecord> = {}): Promise<ProbeTick> => {
@@ -450,25 +458,32 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // card's grant (`byCard`, r1) passes. A purge by the probe itself is under its own grant, so it never does.
       // Codex PR239-r28 (decision 25): a `card` phase that timed out after persisting its card reaches here without a
       // `cardId`; the current archive's card is looked up instead, so a sweep purge under KK's approved card still counts.
+      // Codex PR239-r30 (decision 27): only a cycle that reached the card phases is checked for that proof.
+      const proofOpen = last.viaCard === true && last.cardReached === true;
       let id = last.cardId;
-      // Codex PR239-r29 (decision 26): a proof read that throws is retried on later ticks within the phase bound (the
-      // purge itself is then a no-op `done`), so a transient failure never loses AT10's proof; past the bound the
-      // earlier result stands.
+      // Codex PR239-r29 (decision 26): a proof read that throws is retried on later ticks (the purge itself is then a
+      // no-op `done`), so a transient failure never loses AT10's proof; past the retry window (decision 28) the earlier
+      // result stands.
       let readFailed = false;
-      if (last.viaCard && !id && d.archiveCardId) {
+      if (proofOpen && !id && d.archiveCardId) {
         const f = await attempt(() => d.archiveCardId!());
         if (!f.ok) readFailed = true;
         else if (typeof f.value === "string" && f.value !== "") id = f.value;
       }
-      if (last.viaCard && id && d.cardOutcome) {
+      if (proofOpen && id && d.cardOutcome) {
         const cardId = id;
         const o = await attempt(() => d.cardOutcome!(cardId));
         if (!o.ok) readFailed = true;
         else if (o.value.stage === "purged" && o.value.card === "approved" && o.value.byCard === true) return finish(true, PASS_CARD, undefined, undefined, restart);
       }
-      if (readFailed && (restart || !timedOut())) {
-        if (restart) await d.record({ ...last, ...restart });
-        return { exit: 3, phase, cycle, code: "in_progress", detail: "card-proof-retry" };
+      // Codex PR239-r30 (decision 28): the retries are bounded by their own window, from the first failed read, never by
+      // the purge's timer, so a check that comes long after the purge still gets them.
+      if (readFailed) {
+        const from = last.proofRetryFrom ?? at();
+        if (d.now().getTime() - Date.parse(from) < PROBE_PHASE_MAX_MS) {
+          if (restart || last.proofRetryFrom === undefined) await d.record({ ...last, ...restart, proofRetryFrom: from });
+          return { exit: 3, phase, cycle, code: "in_progress", detail: "card-proof-retry" };
+        }
       }
       if (earlier) return finish(false, earlier.code, earlier.detail, undefined, restart);
       return finish(true, "pass", undefined, undefined, restart);

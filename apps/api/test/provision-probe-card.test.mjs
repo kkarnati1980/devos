@@ -955,3 +955,63 @@ test("Codex PR239-r29: a proof read that fails transiently after a card-authoriz
     assert.equal((await probeStep(e)).code, "card-raise-failed");
   }
 });
+
+test("Codex PR239-r30 (decision 27): a card cycle that failed before the card phase never passes as pass-card, even if a card purge followed", async () => {
+  for (const fail of ["provision", "inventory", "assert"]) {
+    const d = fake({ archiveCardId: async () => "card-1" });
+    if (fail === "provision") d.provisionOnce = async () => ({ error: "boom" });
+    if (fail === "inventory") d.inventory = async () => { throw new Error("db"); };
+    if (fail === "assert") d.liveAsserts = async () => ["repo-private"];
+    const r = await until(d, "purge");
+    assert.equal(r.phase, "purge");
+    assert.equal(d.log.at(-1).viaCard, true);
+    assert.notEqual(d.log.at(-1).cardReached, true);
+    // KK independently approved a purge card and the sweep finished before the cleanup tick.
+    Object.assign(d.state, { stage: "purged", card: "approved", decidedAt: d.now().toISOString(), byCard: true });
+    const done = await probeStep(d);
+    assert.equal(done.phase, "done");
+    assert.equal(done.exit, 1, `${fail}: the earlier failure stands`);
+    assert.notEqual(done.code, "pass-card");
+    assert.equal(d.calls.outcome, 0, `${fail}: no proof read`);
+  }
+});
+
+test("Codex PR239-r30 (decision 28): a proof read that throws on a check long after the purge started is still retried, from its own window", async () => {
+  const d = fake({ archiveCardId: async () => "card-1" });
+  await until(d, "card");
+  d.raisePurgeCard = async () => { throw new Error("db after insert"); };
+  await probeStep(d);
+  d.tick(PROBE_PHASE_MAX_MS);
+  assert.equal((await probeStep(d)).phase, "purge");
+  // The first purge tick clears expireCards and the purge is still running.
+  let purge = "in_progress";
+  d.purge = async () => { d.calls.purge++; return purge; };
+  assert.equal((await probeStep(d)).code, "in_progress");
+  assert.equal(d.log.at(-1).expireCards, false);
+  // The next check comes six hours later: the sweep's card purge is done, and the first proof read throws.
+  purge = "done";
+  Object.assign(d.state, { stage: "purged", card: "approved", decidedAt: d.now().toISOString(), byCard: true });
+  const real = d.cardOutcome;
+  let fails = 1;
+  d.cardOutcome = async (...a) => { if (fails-- > 0) throw new Error("db timeout"); return real(...a); };
+  d.tick(6 * 60 * 60 * 1000);
+  assert.equal((await probeStep(d)).detail, "card-proof-retry");
+  assert.deepEqual(await probeStep(d), { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
+  // A read that keeps throwing gives up once its own window has passed.
+  const e = fake({ archiveCardId: async () => "card-1" });
+  await until(e, "card");
+  e.raisePurgeCard = async () => { throw new Error("db after insert"); };
+  await probeStep(e);
+  e.tick(PROBE_PHASE_MAX_MS);
+  await probeStep(e);
+  e.purge = async () => "in_progress";
+  await probeStep(e);
+  e.purge = async () => "done";
+  e.cardOutcome = async () => { throw new Error("db timeout"); };
+  e.tick(6 * 60 * 60 * 1000);
+  assert.equal((await probeStep(e)).detail, "card-proof-retry");
+  e.tick(PROBE_PHASE_MAX_MS - 60_000);
+  assert.equal((await probeStep(e)).detail, "card-proof-retry");
+  e.tick(60_000);
+  assert.equal((await probeStep(e)).code, "card-raise-failed");
+});
