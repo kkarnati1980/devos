@@ -520,7 +520,12 @@ export class TeardownSweepJob {
     if (p.stage !== "archived" || !p.purgeAfter || this.stopsOwed.has(p.id)) return false;
     const since = p.purgeAfter.getTime();
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
-    if (cards.some((c) => c.status === "pending")) return false;
+    // Decision 15 (Codex PR240-r11): a pending card that does not name this archive (a stale writer's card whose fence
+    // re-read failed, decision 12) does not serve this row: the daily run stays open, the next tick's first pass
+    // expires it (decision 9), and the row then gets its card the same day.
+    const pending = cards.filter((c) => c.status === "pending");
+    if (pending.some((c) => !raisedThisArchive(c, p))) throw new Error("purge-card-stale-pending");
+    if (pending.length) return false;
     // Decision 10 (Codex PR240-r6): the period counts only this archive's cards (decision 8's stamp), so a stale
     // card's rejection or 7-day expiry never suppresses or uses up the current archive's raises.
     const period = cards.filter((c) => c.createdAt.getTime() >= since && raisedThisArchive(c, p));
