@@ -686,3 +686,17 @@ test("M2.5-b5 AT4: a lock that cannot be taken raises nothing and keeps the dail
   await s.job.tick();
   assert.equal((await s.purgeCards("pending")).length, 1);
 });
+
+test("M2.5-b5 pre-review 1: while this process's own purge runs (past its limit), the ask answers at once and the daily run does not queue on the lock", async () => {
+  let finish;
+  const h = askHarness(() => new Promise((resolve) => { finish = resolve; }));
+  const taken = [];
+  // A lock that never frees, as the store's queue behind a purge that runs on.
+  h.job.d.locked = (id) => { taken.push(id); return new Promise(() => {}); };
+  h.job.d.listDue = async () => [{ id: P, slug: "acme", stage: "archived", archivedAt: new Date(T0 - 31 * DAY), purgeAfter: new Date(T0 - DAY) }];
+  await h.job.tick();
+  assert.deepEqual(await h.job.askPurge(P), { ok: false, code: "purge-already-approved" });
+  assert.deepEqual(taken, [], "neither path waited on the lock");
+  assert.equal(h.raised.length, 0);
+  finish({ purged: true, report: { hits: [], errors: [] } });
+});

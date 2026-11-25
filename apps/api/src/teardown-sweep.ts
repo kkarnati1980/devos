@@ -381,6 +381,8 @@ export class TeardownSweepJob {
         // M2.5-b5 decision 2 (DEVOS-255, from Codex PR239-r22): the due check and the raise hold the lifecycle lock and use a fresh
         // read of the row, so no card is raised after a Purge (or a Restore and a new Archive) changed it since listDue.
         const id = listed.id;
+        // Pre-review 1: a purge of this process still running (maybe past its limit) holds the lock; skip, never queue.
+        if (this.purging.has(id)) continue;
         const raise = () => this.raiseDueLocked(id);
         const locked = this.d.locked;
         if (await (locked ? locked(id, raise) : raise())) this.d.log({ level: "info", msg: "teardown-purge-card", projectId: id });
@@ -444,6 +446,8 @@ export class TeardownSweepJob {
   async askPurge(projectId: string): Promise<{ ok: true; approvalId: string; raised: boolean } | { ok: false; code: string }> {
     // M2.5-b5 decision 1 (DEVOS-255, from Codex PR239-r21): the stage check and the raise hold the lifecycle lock, so a card is never
     // persisted after a Purge (or Restore) has moved the project out of `archived`.
+    // Pre-review 1: answered before the lock, so the request never waits on this process's own running purge.
+    if (this.purging.has(projectId)) return { ok: false, code: "purge-already-approved" };
     const locked = this.d.locked;
     return locked ? locked(projectId, () => this.askPurgeLocked(projectId)) : this.askPurgeLocked(projectId);
   }
