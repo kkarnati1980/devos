@@ -88,6 +88,12 @@ const raisedThisArchive = (c: { createdAt: Date; reason?: string | null }, p: Te
   p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime() && cardArchive(c) === p.archivedAt.toISOString();
 
 /**
+ * Decision 31 (Codex PR240-r27): a card that can still purge: it names the current archive and, if scheduled, the
+ * current purge date. Every check that hands a card to KK or lets an approval hold back a new card uses this.
+ */
+const liveCard = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject): boolean => raisedThisArchive(c, p) && !dueMoved(c, p);
+
+/**
  * Decision 13: a card of an archive older than the project's `archivedAt` in this read (its stamp names an earlier
  * archive), or an unstamped card from before decision 8, which never purges.
  */
@@ -725,10 +731,14 @@ export class TeardownSweepJob {
     // that is not older (another process's, after a lost lock) still keeps the row unserved (decision 15).
     let pending = cards.filter((c) => c.status === "pending");
     const older = pending.filter((c) => !raisedThisArchive(c, p) && olderArchive(c, p));
-    if (older.length) {
+    // Decision 31 (Codex PR240-r27): a pending scheduled card of this archive whose purge date has moved is expired
+    // here too (under the lock), so it never serves the row.
+    const notDue = pending.filter((c) => raisedThisArchive(c, p) && dueMoved(c, p));
+    if (older.length || notDue.length) {
       await this.d.lockHeld?.(p.id);
-      await this.d.expire(older.map((c) => c.id), "purge-card-older-archive");
-      pending = pending.filter((c) => !older.includes(c));
+      if (older.length) await this.d.expire(older.map((c) => c.id), "purge-card-older-archive");
+      if (notDue.length) await this.d.expire(notDue.map((c) => c.id), "purge-card-not-due");
+      pending = pending.filter((c) => !older.includes(c) && !notDue.includes(c));
     }
     if (pending.some((c) => !raisedThisArchive(c, p))) throw new Error("purge-card-stale-pending");
     if (pending.length) return false;
@@ -736,7 +746,8 @@ export class TeardownSweepJob {
     // card's rejection or 7-day expiry never suppresses or uses up the current archive's raises.
     const period = cards.filter((c) => c.createdAt.getTime() >= since && raisedThisArchive(c, p));
     if (period.some((c) => c.status === "rejected")) return false;
-    for (const c of cards.filter((x) => x.status === "approved" && raisedThisArchive(x, p))) {
+    // Decision 31: an approval that can no longer purge (its purge date moved) never holds back a new card.
+    for (const c of cards.filter((x) => x.status === "approved" && liveCard(x, p))) {
       if (await this.d.unspentGrant(c.id, new Date(this.now()))) return false;
     }
     // Decision 18 (Codex PR240-r14): only a pending stop card naming this archive blocks it; another archive's is closed
@@ -755,7 +766,8 @@ export class TeardownSweepJob {
   async pendingCard(p: TeardownProject): Promise<string | null> {
     if (p.stage !== "archived") return null;
     const pending = await this.d.cards({ status: "pending", action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE });
-    return pending.find((c) => c.projectId === p.id && raisedThisArchive(c, p) && !this.unfenced.has(c.id))?.id ?? null;
+    // Decision 31: nor one whose purge date has moved (the authorizer would refuse it).
+    return pending.find((c) => c.projectId === p.id && liveCard(c, p) && !this.unfenced.has(c.id))?.id ?? null;
   }
 
   /**
@@ -783,7 +795,8 @@ export class TeardownSweepJob {
     this.assertNoUnfenced(p.id);
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
     const pending = cards.filter((c) => c.status === "pending");
-    const current = pending.find((c) => raisedThisArchive(c, p));
+    // Decision 31 (Codex PR240-r27): only a card that can still purge is handed out.
+    const current = pending.find((c) => liveCard(c, p));
     if (current) {
       // Decision 16 (Codex PR240-r12): an existing card is handed out only behind the same fence as a new one: the lock
       // is still ours and a fresh read still shows this archive. Otherwise nothing is returned and nothing is expired
@@ -791,10 +804,11 @@ export class TeardownSweepJob {
       await this.d.lockHeld?.(p.id);
       const again = await this.d.project(p.id);
       if (!again || again.stage !== "archived" || again.archivedAt?.getTime() !== p.archivedAt.getTime()) throw new Error("purge-card-stale-archive");
+      if (dueMoved(current, again)) throw new Error("purge-card-not-due");
       return { ok: true, approvalId: current.id, raised: false };
     }
     if (this.purging.has(p.id)) return { ok: false, code: "purge-already-approved" };
-    for (const c of cards.filter((x) => x.status === "approved" && raisedThisArchive(x, p))) {
+    for (const c of cards.filter((x) => x.status === "approved" && liveCard(x, p))) {
       // Pre-review 1: an approval whose purge stopped for good never runs again, so it does not block a new card.
       if (this.stopped.has(c.id)) continue;
       if (await this.d.unspentGrant(c.id, new Date(this.now()))) {
@@ -807,6 +821,10 @@ export class TeardownSweepJob {
     await this.d.lockHeld?.(p.id);
     const older = pending.filter((c) => olderArchive(c, p));
     if (older.length) await this.d.expire(older.map((c) => c.id), "purge-card-older-archive");
+    // Decision 31: a pending scheduled card of this archive whose purge date moved is expired first, so the raise below
+    // never dedupes onto it and hands KK a card the authorizer would refuse.
+    const notDue = pending.filter((c) => raisedThisArchive(c, p) && dueMoved(c, p));
+    if (notDue.length) await this.d.expire(notDue.map((c) => c.id), "purge-card-not-due");
     const next = purgeCard(p, await this.d.activeCounts(p.id));
     // Decision 4: the lock is still ours right before the write, or nothing is raised.
     await this.d.lockHeld?.(p.id);

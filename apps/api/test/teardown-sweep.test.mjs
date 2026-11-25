@@ -1292,6 +1292,48 @@ test("M2.5-b5 decision 30 (Codex PR240-r26): an early ask stored while the daily
   assert.equal((await s.approvals.store.get(twin.id)).status, "pending", "the early ask's card stays open");
 });
 
+test("M2.5-b5 decision 31 (Codex PR240-r27): an approved scheduled card whose purge date moved never blocks a new card", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const p = s.projects.get(P);
+  p.purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+  const early = await s.job.askPurge(P);
+  assert.equal(early.ok, true, `the early ask is not told a purge is approved: ${JSON.stringify(early)}`);
+  assert.notEqual(early.approvalId, c.id);
+  assert.equal(s.calls.purge.length, 0);
+});
+
+test("M2.5-b5 decision 31 (Codex PR240-r27): the daily run is not served by an approval whose purge date moved", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const p = s.projects.get(P);
+  // Keep archived moved the date before the approved purge ran; the new date is now due too.
+  p.purgeAfter = new Date(s.now() + 1000);
+  s.advance(DAY);
+  await s.job.tick();
+  const pending = await s.purgeCards("pending");
+  assert.equal(pending.length, 1, "the new purge date gets its own card");
+  assert.equal(cardDue(pending[0]), p.purgeAfter.toISOString());
+});
+
+test("M2.5-b5 decision 31 (Codex PR240-r27): an early ask never hands out a pending scheduled card whose purge date moved, and the panel hides it", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [stale] = await s.purgeCards("pending");
+  s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+  assert.equal(await s.job.pendingCard({ ...s.projects.get(P) }), null, "the panel does not link the stale card");
+  const r = await s.job.askPurge(P);
+  assert.equal(r.ok, true);
+  assert.equal(r.raised, true, "a fresh card was raised");
+  assert.notEqual(r.approvalId, stale.id);
+  assert.equal((await s.approvals.store.get(stale.id)).status, "expired");
+  assert.equal(cardDue(await s.approvals.store.get(r.approvalId)), null, "the early ask names no purge date");
+});
+
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
   const s = setup();
   await s.job.tick();
