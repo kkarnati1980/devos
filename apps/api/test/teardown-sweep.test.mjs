@@ -1017,3 +1017,27 @@ test("M2.5-b5 decision 15 (Codex PR240-r11): a stale archive's pending card writ
   assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString(), "the current archive's card, the same day");
   assert.ok((await s.purgeCards("expired")).some((c) => c.id === stale.id), "the stale card was expired first");
 });
+
+test("M2.5-b5 decision 16 (Codex PR240-r12): an early ask hands out an existing card only behind the fence; a superseded card is never returned", async () => {
+  // The ask's read sees the old archive; the lock drops and the project is restored and archived again before the
+  // card list, which still returns the old archive's pending card.
+  const s = setup();
+  const r0 = await s.job.askPurge(P);
+  assert.equal(r0.raised, true);
+  const cards = s.job.d.cards;
+  s.job.d.cards = async (f) => {
+    s.job.d.cards = cards;
+    s.projects.get(P).archivedAt = new Date(s.now() + 1);
+    return cards(f);
+  };
+  await assert.rejects(s.job.askPurge(P), /purge-card-stale-archive/);
+  assert.deepEqual((await s.purgeCards("pending")).map((c) => c.id), [r0.approvalId], "nothing expired by the ask");
+  // A lost lock hands out nothing either.
+  const t = setup();
+  const t0 = await t.job.askPurge(P);
+  t.job.d.lockHeld = async () => { throw new Error("lock-lost"); };
+  await assert.rejects(t.job.askPurge(P), /lock-lost/);
+  // With the lock held and the same archive, the existing card is returned as before.
+  delete t.job.d.lockHeld;
+  assert.deepEqual(await t.job.askPurge(P), { ok: true, approvalId: t0.approvalId, raised: false });
+});

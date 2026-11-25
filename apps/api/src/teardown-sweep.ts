@@ -576,7 +576,15 @@ export class TeardownSweepJob {
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
     const pending = cards.filter((c) => c.status === "pending");
     const current = pending.find((c) => raisedThisArchive(c, p));
-    if (current) return { ok: true, approvalId: current.id, raised: false };
+    if (current) {
+      // Decision 16 (Codex PR240-r12): an existing card is handed out only behind the same fence as a new one: the lock
+      // is still ours and a fresh read still shows this archive. Otherwise nothing is returned and nothing is expired
+      // (the card is not this call's; if the archive moved on, the tick's first pass expires it, decision 9).
+      await this.d.lockHeld?.(p.id);
+      const again = await this.d.project(p.id);
+      if (!again || again.stage !== "archived" || again.archivedAt?.getTime() !== p.archivedAt.getTime()) throw new Error("purge-card-stale-archive");
+      return { ok: true, approvalId: current.id, raised: false };
+    }
     if (this.purging.has(p.id)) return { ok: false, code: "purge-already-approved" };
     for (const c of cards.filter((x) => x.status === "approved" && raisedThisArchive(x, p))) {
       // Pre-review 1: an approval whose purge stopped for good never runs again, so it does not block a new card.
