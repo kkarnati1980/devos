@@ -461,14 +461,11 @@ export class TeardownSweepJob {
     // archive's valid card; a stale one is cleared by the tick's first pass, decision 9), and nothing is raised.
     const named = (raised as { reason?: unknown }).reason;
     if (typeof named === "string" && cardArchive({ reason: named }) !== cardArchive(card)) throw new Error("purge-card-other-archive");
-    // Decision 6 (Codex PR240-r3): a re-read that fails proves nothing, so the card is expired as for a new archive.
-    let now: TeardownProject | null;
-    try {
-      now = await this.d.project(p.id);
-    } catch (e) {
-      await this.expireCard(id, p.id, "purge-card-unverified");
-      throw e;
-    }
+    // Decision 12 (Codex PR240-r8, replaces decision 6's expiry): a re-read that fails proves nothing either way, and
+    // the returned card may be another caller's valid twin for this same archive, so it is never expired here. It is
+    // safe to leave: it names its archive (decision 8), so it purges only while the row is still in that archive, and
+    // if the archive has moved on, the tick's first pass expires it (decision 9). The call still fails.
+    const now = await this.d.project(p.id);
     if (!now || now.stage !== "archived" || now.archivedAt?.getTime() !== p.archivedAt?.getTime()) {
       await this.expireCard(id, p.id, "purge-card-stale-archive");
       throw new Error("purge-card-stale-archive");
