@@ -227,3 +227,13 @@ test("Codex PR238-r8: a cut list of 10 matched ids is not compared across the ac
   assert.equal(b.code, 1, b.out);
   assert.match(b.out, /^fail: unreadable rules check output$/m);
 });
+
+test("Codex PR238-r9: two deciding codes (`default-deny;denied-by`) are unreadable, never a pass", () => {
+  const row = act("allow", "deny", "default-deny;denied-by", [ID]);
+  for (const reason of ["default-deny;denied-by", "denied-by;allowed-by", "allowed-by;allowed-by;gate-denied-by"]) {
+    const r = run({ cli: line({ result: "pass", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": { ...row, reason }, "teardown.restore": { ...row, reason } } }) });
+    assert.equal(r.code, 1, `${reason} → ${r.out}`);
+    assert.match(r.out, /^fail: unreadable rules check output$/m);
+    assert.doesNotMatch(r.out, /^ok:/m);
+  }
+});

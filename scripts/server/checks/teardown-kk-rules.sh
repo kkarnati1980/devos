@@ -67,7 +67,7 @@ summary="$(printf '%s' "$obj" | jq -r '
   # Every row (PR238-r4..r6): at most 10 distinct matched ids, never more than the rules loaded; in enforce mode no
   # gate code and the rule outcome enforced. A check verdict (`narrow-match`, `sentinels-disagree`) stands alone and
   # needs a matched rule (only a matching rule can be narrow or split the sentinels). Otherwise every part is an
-  # evaluator code, a deciding code first and each naming the recorded outcome; a lone `default-deny` has no matched
+  # evaluator code, exactly one deciding code (Codex PR238-r9: the evaluator writes one, then only gate codes), first and naming the recorded outcome; a lone `default-deny` has no matched
   # rule and no gate, any other has one; a gate code needs 2 matched rules (it is added only when the gate does not
   # decide); codes never repeat; and in observe mode the enforced outcome follows only from the gates. Only keys
   # the helper prints are accepted, and both rows together never name more distinct rules than were loaded. Codex
@@ -85,7 +85,7 @@ summary="$(printf '%s' "$obj" | jq -r '
                       or . == "gate-denied-by" or . == "gate-approval-required-by")
       and (parts[0] | startswith("gate-") | not) and (parts | unique | length) == (parts | length)
       and ((gated | not) or (.matched | length) >= 2)
-      and (head | length) >= 1 and (. as $r | all(head[]; means(.) == $r.outcome))
+      and (head | length) == 1 and (. as $r | all(head[]; means(.) == $r.outcome))
       and (if all(head[]; . == "default-deny") then (.matched | length) == 0 and (gated | not) else (.matched | length) >= 1 end)
       and (has("gate-denied-by") and has("gate-approval-required-by") | not)
       and ($mode == "enforce"
