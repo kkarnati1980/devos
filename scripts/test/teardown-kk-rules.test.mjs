@@ -41,8 +41,8 @@ exit 99
 
 const act = (enforced, outcome = enforced, reason = "allowed-by", matched = [ID]) => ({ outcome, enforced, reason, matched });
 const line = (o) => JSON.stringify(o) + "\n";
-const PASS = line({ result: "pass", mode: "enforce", rules: 1, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow") } });
-const FAIL = line({ result: "fail", mode: "enforce", rules: 0, actions: { "teardown.archive": act("deny", "deny", "default-deny", []), "teardown.restore": act("deny", "deny", "default-deny", []) } });
+const PASS = line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow") } });
+const FAIL = line({ result: "fail", mode: "enforce", rules: 0, pinned: 0, actions: { "teardown.archive": act("deny", "deny", "default-deny", []), "teardown.restore": act("deny", "deny", "default-deny", []) } });
 
 test("DEVOS-112: both allowed → pass, with the mode and the deciding rule", () => {
   const r = run({ cli: PASS });
@@ -56,8 +56,25 @@ test("DEVOS-112: both allowed → pass, with the mode and the deciding rule", ()
 test("DEVOS-112: a default deny in enforce mode → fail, naming it", () => {
   const r = run({ cli: FAIL, cliRc: 1 });
   assert.equal(r.code, 1, r.out);
-  assert.match(r.out, /KK teardown.restore: deny \(rule outcome deny, default-deny\)/);
+  assert.match(r.out, /KK teardown.restore: deny \(rule outcome deny, default-deny\)$/m);
   assert.match(r.out, /^fail: KK's Archive or Restore would be refused by the policy in force$/m);
+});
+
+test("DEVOS-112 pre-review 1: a result that disagrees with its rows is unreadable, never a pass", () => {
+  for (const [result, a, b] of [["pass", act("deny"), act("allow")], ["pass", act("allow"), act("require_approval")], ["fail", act("allow"), act("allow")], ["pass", act("allow"), act("")], ["pass", act("allow"), act("maybe")]]) {
+    const r = run({ cli: line({ result, mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": b } }), cliRc: result === "pass" ? 0 : 1 });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /^fail: unreadable rules check output$/m);
+    assert.doesNotMatch(r.out, /^ok:/m);
+  }
+});
+
+test("DEVOS-112 pre-review 2: rules pinned to a login or a project are reported, not judged", () => {
+  const r = run({ cli: PASS.replace('"pinned":0', '"pinned":2') });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /note: 2 teardown rule\(s\) are pinned to a KK login or a project/);
+  assert.doesNotMatch(run({ cli: PASS }).out, /note:/);
+  assert.equal(run({ cli: PASS.replace('"pinned":0', '"pinned":"2"') }).code, 1);
 });
 
 test("DEVOS-112: an exit code that disagrees with the result fails", () => {
@@ -89,10 +106,11 @@ test("DEVOS-112: helper errors print only fixed codes", () => {
 
 test("DEVOS-112: malformed output is unreadable, never a pass", () => {
   for (const cli of ["", "not json\n", PASS + PASS, "[1]\n", '{"a":1} {"b":2}\n',
-    line({ result: "pass", mode: "enforce", rules: 1, actions: { "teardown.archive": act("allow") } }),
-    line({ result: "pass", mode: "legacy", rules: 1, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow") } }),
-    line({ result: "pass", mode: "enforce", rules: 1, actions: { "teardown.archive": act("allow", "allow", "x\nok: fake"), "teardown.restore": act("allow") } }),
-    line({ result: "pass", mode: "enforce", rules: 1, actions: { "teardown.archive": act("allow", "allow", "allowed-by", ["a b"]), "teardown.restore": act("allow") } }),
+    line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow") } }),
+    line({ result: "pass", mode: "enforce", rules: 1, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow") } }),
+    line({ result: "pass", mode: "legacy", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow") } }),
+    line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "allow", "x\nok: fake"), "teardown.restore": act("allow") } }),
+    line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "allow", "allowed-by", ["a b"]), "teardown.restore": act("allow") } }),
     PASS.replace("\n", "\u0000\n")]) {
     const r = run({ cli });
     assert.equal(r.code, 1, `${JSON.stringify(cli)} → ${r.out}`);

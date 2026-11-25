@@ -7,7 +7,7 @@
 // Prints one JSON line and exits 0 (both allowed), 1 (one is not allowed, or a read failed), 2 (usage) or 3 (no
 // database here). It never prints a secret or a database message: errors are fixed codes, rule ids are uuids.
 import { fileURLToPath } from "node:url";
-import { evaluateRules, type PolicyMode, type PolicyRule } from "@devos/policy";
+import { currentRules, evaluateRules, ruleMatches, wildcard, type PolicyMode, type PolicyRule } from "@devos/policy";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -25,6 +25,20 @@ const RULE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 /** Reasons the evaluator returns, reduced to their fixed part (a rule id is kept only in `matched`). */
 const reasonCode = (reason: string) => reason.split(";").map((p) => p.split(":")[0] ?? "").filter((p) => /^[a-z-]{1,40}$/.test(p)).join(";");
 
+/** A pattern list that could match some value starting with `prefix` (empty = any). */
+const couldMatch = (patterns: readonly string[], prefix: string) =>
+  !patterns.length || patterns.some((p) => p.startsWith(prefix) || (p.endsWith("*") && prefix.startsWith(p.slice(0, -1))));
+
+/**
+ * Pre-review 2: rules in force for KK's teardown actions that could apply to some KK login and some project but do not
+ * match the check's generic principal and sentinel project (pinned to a login or a project, or to a role, environment
+ * or constraint). The check cannot judge them, so it counts them for the report.
+ */
+export function pinnedRules(rules: readonly PolicyRule[], request: (type: string) => Parameters<typeof ruleMatches>[1]): number {
+  return currentRules(rules).filter((r) => KK_TEARDOWN_ACTIONS.some((type) => wildcard(r.actions, type)
+    && couldMatch(r.principals, "kk:") && couldMatch(r.resources, "project:") && !ruleMatches(r, request(type)))).length;
+}
+
 export interface PolicyReader { loadPolicy(): Promise<{ mode: PolicyMode; rules: PolicyRule[] }> }
 
 export async function kkTeardownCli(argv: string[], reader: () => Promise<PolicyReader>, now: () => number = Date.now): Promise<CliResult> {
@@ -38,11 +52,12 @@ export async function kkTeardownCli(argv: string[], reader: () => Promise<Policy
   if (!policy || (policy.mode !== "observe" && policy.mode !== "enforce") || !Array.isArray(policy.rules)) {
     return { code: 1, out: { error: "teardown-rules-read-failed" } };
   }
+  const request = (type: string) => ({ identity: CHECK_IDENTITY, action: { type, resource: `project:${CHECK_PROJECT_ID}`, projectId: CHECK_PROJECT_ID } });
   const actions: Record<string, unknown> = {};
   let allowed = true;
   for (const type of KK_TEARDOWN_ACTIONS) {
     const ev = evaluateRules(
-      { identity: CHECK_IDENTITY, action: { type, resource: `project:${CHECK_PROJECT_ID}`, projectId: CHECK_PROJECT_ID } },
+      request(type),
       policy.rules,
       policy.mode,
       now(),
@@ -55,7 +70,7 @@ export async function kkTeardownCli(argv: string[], reader: () => Promise<Policy
       matched: ev.matchedRuleIds.filter((id) => RULE_ID_RE.test(id)).slice(0, 10),
     };
   }
-  return { code: allowed ? 0 : 1, out: { result: allowed ? "pass" : "fail", mode: policy.mode, rules: policy.rules.length, actions } };
+  return { code: allowed ? 0 : 1, out: { result: allowed ? "pass" : "fail", mode: policy.mode, rules: policy.rules.length, pinned: pinnedRules(policy.rules, request), actions } };
 }
 
 async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {

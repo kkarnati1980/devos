@@ -42,6 +42,9 @@ test("DEVOS-112: a deny beats an allow, a gate deny binds in observe mode, and r
   r = await kkTeardownCli(["kk-teardown"], reader("observe", [rule({ id: DENY, effect: "deny", constraints: { gate: true } })]));
   assert.equal(r.code, 1);
   assert.equal(r.out.actions["teardown.archive"].enforced, "deny");
+  r = await kkTeardownCli(["kk-teardown"], reader("observe", [rule({ id: ALLOW, effect: "require_approval", constraints: { gate: true } })]));
+  assert.equal(r.code, 1);
+  assert.equal(r.out.actions["teardown.archive"].enforced, "require_approval");
   r = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, effect: "require_approval" })]));
   assert.equal(r.code, 1);
   assert.equal(r.out.actions["teardown.archive"].enforced, "require_approval");
@@ -55,6 +58,10 @@ test("DEVOS-112: asks as a generic KK principal on a sentinel project; a rule pi
   ]));
   assert.equal(r.code, 1);
   assert.deepEqual(r.out.actions["teardown.archive"].matched, []);
+  // Pre-review 2: both are counted as pinned (not judged); an agent rule or a non-teardown rule is not.
+  assert.equal(r.out.pinned, 2);
+  const other = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: DENY, effect: "deny", principals: ["agent:*"] }), rule({ id: "x1", actions: ["repo.*"] }), rule({ id: ALLOW })]));
+  assert.equal(other.out.pinned, 0);
   const ok = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, resources: [`project:${CHECK_PROJECT_ID}`] })]));
   assert.equal(ok.code, 0);
 });
