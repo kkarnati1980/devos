@@ -88,7 +88,7 @@ test("DEVOS-112 pre-review 2: rules pinned to a login or a project are reported,
     assert.match(g.out, /KK teardown\.archive: (deny|require_approval) \(rule outcome/);
     assert.match(g.out, /^fail: KK's Archive or Restore would be refused/m);
   }
-  const dis = run({ cli: line({ result: "fail", mode: "enforce", rules: 1, pinned: 1, actions: { "teardown.archive": act("allow", "allow", "sentinels-disagree"), "teardown.restore": act("allow") } }), cliRc: 1 });
+  const dis = run({ cli: line({ result: "fail", mode: "enforce", rules: 1, pinned: 1, actions: { "teardown.archive": act("allow", "allow", "sentinels-disagree"), "teardown.restore": act("allow", "allow", "sentinels-disagree") } }), cliRc: 1 });
   assert.equal(dis.code, 1, dis.out);
   assert.match(dis.out, /KK teardown.archive: allow \(rule outcome allow, sentinels-disagree/);
   assert.match(dis.out, /^fail: KK's Archive or Restore would be refused/m);
@@ -198,7 +198,9 @@ test("DEVOS-112: a row the evaluator cannot produce is unreadable, never a pass"
 test("DEVOS-112 pre-review sweep: object-level output the helper never prints is unreadable", () => {
   const P = JSON.parse(PASS);
   for (const o of [{ ...P, error: false }, { ...P, error: "" }, { ...P, code: "skipped" }, { ...P, actions: { ...P.actions, "teardown.purge": act("allow") } },
-    { ...P, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow", "allow", "allowed-by", [ID2]) } }]) {
+    { ...P, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow", "allow", "allowed-by", [ID2]) } },
+    // Codex PR238-r7: the same sole rule cannot allow one action and deny the other.
+    { ...P, mode: "observe", actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow", "deny", "denied-by") } }]) {
     const r = run({ cli: line(o) });
     assert.equal(r.code, 1, `${JSON.stringify(o)} → ${r.out}`);
     assert.doesNotMatch(r.out, /^ok:/m);

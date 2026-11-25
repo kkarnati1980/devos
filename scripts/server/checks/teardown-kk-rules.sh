@@ -70,7 +70,9 @@ summary="$(printf '%s' "$obj" | jq -r '
   # evaluator code, a deciding code first and each naming the recorded outcome; a lone `default-deny` has no matched
   # rule and no gate, any other has one; a gate code needs 2 matched rules (it is added only when the gate does not
   # decide); codes never repeat; and in observe mode the enforced outcome follows only from the gates. Only keys
-  # the helper prints are accepted, and both rows together never name more distinct rules than were loaded.
+  # the helper prints are accepted, and both rows together never name more distinct rules than were loaded. Codex
+  # PR238-r7: the evaluator reads only the matched rules, and a rule matches the requests of both actions alike, so two rows
+  # with the same matched set are the same row.
   def gated: has("gate-denied-by") or has("gate-approval-required-by");
   def consistent($mode; $nrules):
     (keys == ["enforced", "matched", "outcome", "reason"])
@@ -103,6 +105,7 @@ summary="$(printf '%s' "$obj" | jq -r '
              and (.matched | type) == "array" and all(.matched[]; type == "string" and test("\\A[A-Za-z0-9-]{1,64}\\z"))
              and consistent($mode; $nrules))
      and ([$rows[].matched[]] | unique | length) <= $nrules
+     and (($rows[0].matched | sort) != ($rows[1].matched | sort) or ($rows[0] | del(.matched)) == ($rows[1] | del(.matched)))
      and .result == (if all($rows[]; .enforced == "allow" and .reason != "sentinels-disagree" and .reason != "narrow-match") then "pass" else "fail" end)
   then
     "\(.result)|\(.mode)|\(.rules)|\(.pinned)",
