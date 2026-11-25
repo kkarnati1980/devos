@@ -105,6 +105,11 @@ export interface ProbeDeps {
   raisePurgeCard?(): Promise<string | { grantShort: true }>;
   /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
   cardOutcome?(cardId: string): Promise<CardOutcome>;
+  /**
+   * Codex PR239-r28 (decision 25): the oldest purge card raised in the probe row's current archive (at or after its
+   * `archived_at`), or null. Used only when a card cycle reached `purge` without a tracked `cardId`.
+   */
+  archiveCardId?(): Promise<string | null>;
   /** Codex PR239-r7: true when a probe grant with every use the cycle may still spend is valid at `until` (decision 11). */
   cardGrantOutlasts?(until: Date): Promise<boolean>;
   /**
@@ -443,9 +448,16 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // up on it (`card-purge-unfinished`, then the sweep completed before this tick) is AT10's proof after all. The
       // tracked card is read once more; only a purged row whose every allowed purge decision ran under an approved
       // card's grant (`byCard`, r1) passes. A purge by the probe itself is under its own grant, so it never does.
-      if (last.viaCard && last.cardId && d.cardOutcome) {
-        const id = last.cardId;
-        const o = await attempt(() => d.cardOutcome!(id));
+      // Codex PR239-r28 (decision 25): a `card` phase that timed out after persisting its card reaches here without a
+      // `cardId`; the current archive's card is looked up instead, so a sweep purge under KK's approved card still counts.
+      let id = last.cardId;
+      if (last.viaCard && !id && d.archiveCardId) {
+        const f = await attempt(() => d.archiveCardId!());
+        if (f.ok && typeof f.value === "string" && f.value !== "") id = f.value;
+      }
+      if (last.viaCard && id && d.cardOutcome) {
+        const cardId = id;
+        const o = await attempt(() => d.cardOutcome!(cardId));
         if (o.ok && o.value.stage === "purged" && o.value.card === "approved" && o.value.byCard === true) return finish(true, PASS_CARD, undefined, undefined, restart);
       }
       if (earlier) return finish(false, earlier.code, earlier.detail, undefined, restart);

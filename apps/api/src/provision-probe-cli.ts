@@ -214,6 +214,11 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
             });
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
+          // Codex PR239-r28: the current archive's oldest purge card, for a purge reached without a tracked card.
+          archiveCardId: async () => {
+            const row = await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: p.id }, select: { archivedAt: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
+            return row?.archivedAt instanceof Date ? probeExistingCard(db, p.id, row.archivedAt, timeoutMs) : null;
+          },
           // Codex PR239-r7 (decision 11): the probe grant must outlast the card wait, so the fallback purge can run.
           cardGrantOutlasts: (until) => probeGrantOutlasts(db, p.id, until, timeoutMs, w.purge.grantProblem),
           // Codex PR239-r15: before the probe's own purge after a card, its pending purge cards are expired.
