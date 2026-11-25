@@ -1123,3 +1123,28 @@ test("M2.5-b5 decision 18 (Codex PR240-r14): a stop card from an earlier archive
   assert.equal(ustop.status, "pending");
   assert.equal((await u.purgeCards("pending")).length, 0);
 });
+
+test("M2.5-b5 decision 19 (Codex PR240-r15): a stop raise deduplicated onto an earlier archive's pending stop card still delivers this archive's stop", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const old = { id: P, slug: "acme", archivedAt: new Date(T0 - 60 * DAY) };
+  const purge = s.job.d.purge;
+  let stale;
+  s.job.d.purge = async (...a) => {
+    // An earlier archive's stop card slipped in (decision 18) after this tick's first pass.
+    stale = await s.approvals.raiseCard(purgeStoppedCard(old, "leftover", { github: 1 }));
+    return purge(...a);
+  };
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(stale.id)).status, "expired", "the stale twin is closed");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString(), "this archive's stop reaches KK");
+  assert.match(pending[0].reason, /a DevOS rule does not allow this purge/);
+  // And it keeps holding back the next purge card.
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0);
+});

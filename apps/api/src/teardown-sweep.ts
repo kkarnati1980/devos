@@ -76,6 +76,13 @@ const olderArchive = (c: { reason?: string | null }, p: TeardownProject): boolea
   return named === null || Date.parse(named) < p.archivedAt.getTime();
 };
 
+/** Decision 19: the id of a stored card, or a throw (a stop stays owed). */
+const stopId = (raised: unknown): string => {
+  const id = (raised as { id?: unknown } | null)?.id;
+  if (typeof id !== "string") throw new Error("stop-card-not-raised");
+  return id;
+};
+
 /** Decision 18: `b` (a fresh read) is still the archive `a` was read in. */
 const sameArchive = (a: TeardownProject, b: TeardownProject | null): boolean =>
   b !== null && b.stage === "archived" && a.archivedAt !== null && b.archivedAt?.getTime() === a.archivedAt.getTime();
@@ -452,12 +459,28 @@ export class TeardownSweepJob {
           this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
           continue;
         }
-        await this.d.raise(purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id)));
+        const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id));
+        // Decision 19 (Codex PR240-r15): the store dedupes on action and target, so it can hand back a pending twin from
+        // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
+        // read proved the archive has moved on from it) and the stop is raised again; if a twin of another archive still
+        // comes back, or the expiry fails, the stop stays owed and is retried next tick.
+        let raised = await this.d.raise(card);
+        if (!this.stopServes(raised, card)) {
+          await this.d.expire([stopId(raised)], "stop-card-archive-ended");
+          raised = await this.d.raise(card);
+          if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
+        }
         this.stopsOwed.delete(id);
       } catch {
         this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: o.p.id, code: o.code });
       }
     }
+  }
+
+  /** Decision 19: the stored stop card names the same archive as the one built (a twin of another archive does not). */
+  private stopServes(raised: unknown, card: { reason: string }): boolean {
+    const named = (raised as { reason?: unknown } | null)?.reason;
+    return typeof named === "string" && cardArchive({ reason: named }) === cardArchive(card);
   }
 
   /** 4. Decision (b): the daily purge-due run raises a card; it never deletes. */
