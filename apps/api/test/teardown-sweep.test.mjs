@@ -1722,8 +1722,8 @@ test("M2.5-b5 decision 22 (Codex PR240-r18): a late stop for an older archive ne
   assert.match(stops[0].reason, /the leftover check still found resources of this project/);
 });
 
-test("M2.5-b5 decision 36 (Codex PR240-r32): a stop raise deduplicated onto this archive's pending stop for another failure supersedes it, so KK sees the new failure", async () => {
-  const s = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+test("M2.5-b5 decision 36 (Codex PR240-r32, amended by decision 41): a stop that must be reported, deduplicated onto this archive's pending stop for another failure, supersedes it, so KK sees the new failure", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("ownership_mismatch", false, "not ours"); } });
   await s.job.tick();
   const [c] = await s.purgeCards("pending");
   await approve(s, c.id);
@@ -1741,7 +1741,34 @@ test("M2.5-b5 decision 36 (Codex PR240-r32): a stop raise deduplicated onto this
   const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1);
   assert.equal(cardArchive(pending[0]), p.archivedAt.toISOString());
-  assert.equal(stopWhy(pending[0].reason), "a DevOS rule does not allow this purge", "the new failure reaches KK");
+  assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it", "the new failure reaches KK");
+  // It still holds back the next purge card, and a second tick changes nothing.
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0);
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 1);
+});
+
+test("M2.5-b5 decision 41 (Codex PR240-r37): a scheduled card's denial deduplicated onto this archive's pending stop keeps that stop, through the real purge path", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const p = s.projects.get(P);
+  const purge = s.job.d.purge;
+  let earlier;
+  s.job.d.purge = async (...a) => {
+    // An earlier, unanswered report for this same archive but another failure is still pending when this one is raised.
+    earlier = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 1 }));
+    return purge(...a);
+  };
+  await s.job.tick();
+  const prior = await s.approvals.store.get(earlier.id);
+  assert.equal(prior.status, "pending", "the earlier report is kept");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(cardArchive(pending[0]), p.archivedAt.toISOString());
+  assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project", "the earlier report still reaches KK");
   // It still holds back the next purge card, and a second tick changes nothing.
   s.advance(DAY);
   await s.job.tick();
@@ -1924,6 +1951,25 @@ test("M2.5-b5 decision 40 (Codex PR240-r36): a droppable denial never replaces a
   const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1, "KK still gets the partial purge's report");
   assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+});
+
+test("M2.5-b5 decision 41 (Codex PR240-r37): a droppable denial never supersedes a pending report of a partial purge", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch");
+  const [report] = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.ok(report, "the partial purge's report was raised, so it is no longer owed");
+  // A later scheduled approval for the current date is denied before any deletion.
+  s.advance(60_000);
+  await s.job.raiseStopped({ ...p }, "policy_denied", p.purgeAfter.toISOString());
+  assert.equal((await s.approvals.store.get(report.id)).status, "pending", "the report is not expired");
+  const stops = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 });
+  assert.equal(stops.length, 1, "the denial raises no card over it");
+  assert.equal(stopWhy(stops[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-pending-kept"));
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(report.id)).status, "pending");
 });
 
 test("M2.5-b5 decision 40 (Codex PR240-r36): a stop that must be reported still replaces an owed droppable denial", async () => {

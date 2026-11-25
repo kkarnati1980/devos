@@ -703,6 +703,15 @@ export class TeardownSweepJob {
             this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
             continue;
           }
+          // Decision 41 (Codex PR240-r37): a droppable denial (a scheduled card's denial before any deletion, decision
+          // 35) never supersedes a pending stop for this same archive. That card may be the report of a purge that
+          // stopped after deleting (decision 40 protects it only while it is owed), and the denial deleted nothing, so
+          // the pending card stands and the denial is dropped.
+          if (sameArchiveTwin && o.due !== null) {
+            this.dropOwed(id, o);
+            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-pending-kept" });
+            continue;
+          }
           if (!sameArchiveTwin && !twinOlder(raised, o.p)) {
             this.dropOwed(id, o);
             this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
