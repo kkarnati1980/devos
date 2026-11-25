@@ -812,3 +812,20 @@ test("Codex PR239-r20: a card asked for during the fallback purge is expired onc
   await until(n, "done");
   assert.equal(n.calls.expire, undefined);
 });
+
+test("Codex PR239-r23 (DEVOS-254 d22): a pass-card in cardwait first expires the probe's pending purge cards; a failed expiry waits", async () => {
+  const d = fake();
+  await until(d, "cardwait");
+  d.state.card = "approved"; d.state.decidedAt = d.now().toISOString(); d.state.byCard = true;
+  d.state.stage = "purged";
+  let fail = true;
+  d.calls.expire = 0;
+  d.expirePurgeCards = async () => { d.calls.expire++; if (fail) throw new Error("db"); };
+  let r = await probeStep(d);
+  assert.deepEqual(r, { exit: 3, phase: "cardwait", cycle: 1, code: "in_progress", detail: "card-expire-after-purge" });
+  fail = false;
+  r = await probeStep(d);
+  assert.deepEqual(r, { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
+  assert.equal(d.calls.expire, 2);
+  assert.equal(d.calls.purge, 0);
+});

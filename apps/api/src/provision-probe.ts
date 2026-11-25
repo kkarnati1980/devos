@@ -349,7 +349,16 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       if (o.stage === "purged") {
         if (o.card !== "approved") return finish(false, "card-ended", `${CARD_WORD.test(o.card) ? o.card : "unknown"}:purged`);
         // Codex PR239-r1 (high): purged, but not provably under this card's grant, is not AT10's proof.
-        return o.byCard === true ? finish(true, PASS_CARD) : finish(false, "card-unproven");
+        if (o.byCard !== true) return finish(false, "card-unproven");
+        // Codex PR239-r23 (medium, DEVOS-254 decision 22): KK could ask again between his approval and the sweep's
+        // purge, so a pass first expires the probe's pending purge cards (decision 20's rule, on this path too). Once
+        // purged no card can follow (M2.5-b5, DEVOS-255). A failed expiry waits within the 8-day bound; past it the
+        // cycle passes and the sweep's `project-not-archived` pass expires the card.
+        if (d.expirePurgeCards) {
+          const post = await attempt(() => d.expirePurgeCards!());
+          if (!post.ok && !late) return wait("card-expire-after-purge");
+        }
+        return finish(true, PASS_CARD);
       }
       if (o.stage === "archived" && o.card === "pending") return late ? leaveCard(failed("card-timeout")) : wait("awaiting-card");
       if (o.stage === "archived" && o.card === "approved") {
