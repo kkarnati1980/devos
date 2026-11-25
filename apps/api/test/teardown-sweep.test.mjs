@@ -621,3 +621,68 @@ test("DEVOS-254 d21: an early ask runs under the lifecycle lock; one waiting on 
   await assert.rejects(s.job.askPurge(P), /lock_timeout/);
   assert.equal((await s.purgeCards("pending")).length, 1);
 });
+
+// DEVOS-254 decision 22 (Codex PR239-r22): the daily run's due check and raise hold the lifecycle lock on a fresh read.
+const serialLock = () => {
+  let tail = Promise.resolve();
+  const seen = [];
+  const locked = (id, fn) => {
+    seen.push(id);
+    const run = tail.then(fn);
+    tail = run.catch(() => {});
+    return run;
+  };
+  return { locked, seen };
+};
+
+test("DEVOS-254 d22: the daily run waiting on a purge's lock re-reads the row and raises no card for a purged project", async () => {
+  const s = setup();
+  const lock = serialLock();
+  s.job.d.locked = lock.locked;
+  let release;
+  const held = lock.locked(P, () => new Promise((r) => { release = r; }));
+  const tick = s.job.tick();
+  await new Promise((r) => setImmediate(r));
+  assert.equal((await s.purgeCards()).length, 0, "the daily run waits for the lock");
+  // The purge that held the lock finished (and expired its cards) before releasing it.
+  s.projects.get(P).stage = "purged";
+  release();
+  await held;
+  await tick;
+  assert.equal((await s.purgeCards()).length, 0, "no card after the purge");
+  assert.deepEqual(lock.seen, [P, P]);
+  assert.ok(!s.logs.some((l) => l.msg === "teardown-purge-card"));
+});
+
+test("DEVOS-254 d22: a row restored and archived again after listDue gets no card before its new purge date", async () => {
+  const s = setup();
+  const listDue = s.job.d.listDue;
+  s.job.d.listDue = async (at, limit) => {
+    const due = await listDue(at, limit);
+    // Restore and a new Archive between the due check and the raise.
+    const p = s.projects.get(P);
+    p.archivedAt = new Date(s.now());
+    p.purgeAfter = new Date(s.now() + 30 * DAY);
+    return due;
+  };
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0, "the stale listed row raises nothing");
+  // Unchanged rows still get their card, with or without the lock.
+  const t = setup();
+  t.job.d.locked = serialLock().locked;
+  await t.job.tick();
+  assert.equal((await t.purgeCards("pending")).length, 1);
+});
+
+test("DEVOS-254 d22: a lock that cannot be taken raises nothing and keeps the daily run open", async () => {
+  const s = setup();
+  s.job.d.locked = async () => { throw new Error("lock_timeout"); };
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.code === "purge-due"));
+  // The lock is back: the next tick raises the card.
+  s.job.d.locked = serialLock().locked;
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 1);
+});

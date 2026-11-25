@@ -376,20 +376,31 @@ export class TeardownSweepJob {
   private async duePass(): Promise<void> {
     const due = await this.d.listDue(new Date(this.now()), DUE_PAGE);
     let failed = false;
-    for (const p of due) {
+    for (const listed of due) {
       try {
-        if (await this.shouldRaise(p)) {
-          await this.d.raise(purgeCard(p, await this.d.activeCounts(p.id)));
-          this.d.log({ level: "info", msg: "teardown-purge-card", projectId: p.id });
-        }
+        // DEVOS-254 decision 22 (Codex PR239-r22): the due check and the raise hold the lifecycle lock and use a fresh
+        // read of the row, so no card is raised after a Purge (or a Restore and a new Archive) changed it since listDue.
+        const id = listed.id;
+        const raise = () => this.raiseDueLocked(id);
+        const locked = this.d.locked;
+        if (await (locked ? locked(id, raise) : raise())) this.d.log({ level: "info", msg: "teardown-purge-card", projectId: id });
       } catch {
         failed = true;
-        this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: p.id, code: "purge-due" });
+        this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: listed.id, code: "purge-due" });
       }
     }
     // Codex PR181-r1: any project whose card could not be raised keeps the daily run open, so the next tick tries again
     // (projects already served are not raised twice: a pending card blocks a second one).
     if (failed) throw new Error("teardown-due-partial");
+  }
+
+  /** Decision 22: re-read under the lock; raise only for a row that is still archived and due now. */
+  private async raiseDueLocked(projectId: string): Promise<boolean> {
+    const p = await this.d.project(projectId);
+    if (!p || p.stage !== "archived" || !p.purgeAfter || p.purgeAfter.getTime() > this.now()) return false;
+    if (!(await this.shouldRaise(p))) return false;
+    await this.d.raise(purgeCard(p, await this.d.activeCounts(p.id)));
+    return true;
   }
 
   /**
