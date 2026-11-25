@@ -1062,3 +1062,64 @@ test("M2.5-b5 decision 17 (Codex PR240-r13): a purge denied because the project 
   await t.job.tick();
   assert.equal((await t.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
 });
+
+test("M2.5-b5 decision 18 (Codex PR240-r14): a stop card from an earlier archive never blocks the current archive's purge card, and is closed", async () => {
+  // A: Restore and a new Archive land while the stop card is being built (after deliverStops' re-read).
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const counts = s.job.d.activeCounts;
+  let flip = true;
+  s.job.d.activeCounts = async (id) => {
+    if (flip && (await s.approvals.store.list({ action: PURGE_ACTION, status: "approved", limit: 5 })).length) {
+      flip = false;
+      const p = s.projects.get(P);
+      p.archivedAt = new Date(s.now());
+      p.purgeAfter = new Date(s.now());
+    }
+    return counts(id);
+  };
+  await s.job.tick();
+  const [stop] = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 });
+  assert.ok(stop, "the stop card slipped in for the old archive");
+  assert.equal(cardArchive(stop), new Date(T0 - 31 * DAY).toISOString(), "it names the archive it was built for");
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(stop.id)).status, "expired", "the tick's first pass closes it");
+  const pending = await s.purgeCards("pending");
+  assert.equal(pending.length, 1, "the current archive gets its purge card");
+  assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString());
+
+  // B: a stop owed (its write failed) for an archive that then ended is dropped, never raised, and holds nothing back.
+  const t = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await t.job.tick();
+  const [d] = await t.purgeCards("pending");
+  await t.approvals.approve(t.session, d.id, { confirmation: `PURGE project:${P}` });
+  t.failRaise.n = 1;
+  await t.job.tick();
+  assert.equal((await t.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "the stop write failed; it is owed");
+  const q = t.projects.get(P);
+  t.advance(60_000);
+  q.archivedAt = new Date(t.now());
+  q.purgeAfter = new Date(t.now());
+  t.advance(DAY);
+  await t.job.tick();
+  assert.equal((await t.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "an ended archive's stop is never raised");
+  assert.ok(t.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "archive-superseded"));
+  const fresh = await t.purgeCards("pending");
+  assert.equal(fresh.length, 1);
+  assert.equal(cardArchive(fresh[0]), q.archivedAt.toISOString());
+
+  // C: a stop card of this same archive still blocks the next purge card, and is left open.
+  const u = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await u.job.tick();
+  const [e] = await u.purgeCards("pending");
+  await u.approvals.approve(u.session, e.id, { confirmation: `PURGE project:${P}` });
+  await u.job.tick();
+  u.advance(DAY);
+  await u.job.tick();
+  const [ustop] = await u.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 });
+  assert.equal(ustop.status, "pending");
+  assert.equal((await u.purgeCards("pending")).length, 0);
+});

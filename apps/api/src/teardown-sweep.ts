@@ -76,6 +76,10 @@ const olderArchive = (c: { reason?: string | null }, p: TeardownProject): boolea
   return named === null || Date.parse(named) < p.archivedAt.getTime();
 };
 
+/** Decision 18: `b` (a fresh read) is still the archive `a` was read in. */
+const sameArchive = (a: TeardownProject, b: TeardownProject | null): boolean =>
+  b !== null && b.stage === "archived" && a.archivedAt !== null && b.archivedAt?.getTime() === a.archivedAt.getTime();
+
 /** Decision 7: expired only after its whole 7-day window (closeRestored's cutoff), so KK had the chance to answer it. */
 const unanswered = (c: { createdAt: Date; decidedAt: Date | null }): boolean =>
   c.decidedAt !== null && c.decidedAt.getTime() - c.createdAt.getTime() >= PURGE_CARD_WINDOW_MS;
@@ -181,16 +185,18 @@ const STOP_WORDS: Record<string, string> = {
  * Decision (c): the plain-language card for a non-retryable stop or a scan with hits. Every word is fixed here: only
  * the slug, a fixed reason for the code and the per-provider counts go in, never a provider message.
  */
-export function purgeStoppedCard(p: { id: string; slug: string }, code: string, counts: Record<string, number>) {
+export function purgeStoppedCard(p: { id: string; slug: string; archivedAt: Date | null }, code: string, counts: Record<string, number>) {
   const slug = safeSlug(p.slug);
   const why = STOP_WORDS[code] ?? "it stopped with an error it cannot retry";
+  // M2.5-b5 decision 18 (Codex PR240-r14): a stop card names its archive too (decision 8's stamp), so it counts only for it.
+  const stamp = p.archivedAt ? ` Archive ${p.archivedAt.toISOString()}.` : "";
   return {
     gate: "decision" as const,
     action: PURGE_STOPPED_ACTION,
     target: target(p.id),
     reason:
       `Deleting project ${slug} stopped: ${why}. The project stays archived. ` +
-      `Still recorded (by provider): ${countsText(counts)}.`,
+      `Still recorded (by provider): ${countsText(counts)}.${stamp}`,
     consequence:
       `Nothing more is deleted until you approve a new purge card for ${slug}. ` +
       `Ask Claude to look at the project's teardown report and fix the cause first. Approving or rejecting this card changes nothing.`,
@@ -313,6 +319,17 @@ export class TeardownSweepJob {
     }
     if (restored.length) await this.d.expire(restored, "project-not-archived");
     if (unanswered.length) await this.d.expire(unanswered, "purge-card-unanswered-7-days");
+    // Decision 18 (Codex PR240-r14): a pending stop card that does not name the current archive (raised after a Restore,
+    // or a Restore and a new Archive, slipped in before its write; or unstamped, from before decision 18) is closed
+    // here, so KK is not left a stop prompt for an archive that has ended, and it never blocks the current one's card.
+    const stops = await this.d.cards({ status: "pending", action: PURGE_STOPPED_ACTION, limit: CARD_PAGE });
+    const ended: string[] = [];
+    for (const c of stops) {
+      if (!c.projectId || c.target !== target(c.projectId)) continue;
+      const p = await this.d.project(c.projectId);
+      if (p && !raisedThisArchive(c, p)) ended.push(c.id);
+    }
+    if (ended.length) await this.d.expire(ended, "stop-card-archive-ended");
   }
 
   /** 2. Decision (d): "Keep archived" on a card raised after `purge_after` moves `purge_after` by 30 days, once. */
@@ -427,6 +444,14 @@ export class TeardownSweepJob {
   private async deliverStops(): Promise<void> {
     for (const [id, o] of this.stopsOwed) {
       try {
+        // Decision 18 (Codex PR240-r14): re-read before each try; a stop owed for an archive that has ended is dropped
+        // (KK's newer word), never raised. A failed re-read keeps it owed. One that slips in after this read names its
+        // archive, so it blocks nothing, and the tick's first pass closes it.
+        if (!sameArchive(o.p, await this.d.project(o.p.id))) {
+          this.stopsOwed.delete(id);
+          this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
+          continue;
+        }
         await this.d.raise(purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id)));
         this.stopsOwed.delete(id);
       } catch {
@@ -525,7 +550,10 @@ export class TeardownSweepJob {
    * one, then nothing.
    */
   private async shouldRaise(p: TeardownProject): Promise<boolean> {
-    if (p.stage !== "archived" || !p.purgeAfter || this.stopsOwed.has(p.id)) return false;
+    if (p.stage !== "archived" || !p.purgeAfter) return false;
+    // Decision 18: only a stop owed for this same archive holds the card back (deliverStops drops one that has ended).
+    const owed = this.stopsOwed.get(p.id);
+    if (owed && sameArchive(owed.p, p)) return false;
     const since = p.purgeAfter.getTime();
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
     // Decision 15 (Codex PR240-r11): a pending card that does not name this archive (a stale writer's card whose fence
@@ -541,8 +569,10 @@ export class TeardownSweepJob {
     for (const c of cards.filter((x) => x.status === "approved" && raisedThisArchive(x, p))) {
       if (await this.d.unspentGrant(c.id, new Date(this.now()))) return false;
     }
-    const stops = await this.d.cards({ status: "pending", action: PURGE_STOPPED_ACTION, target: target(p.id), limit: 1 });
-    if (stops.length) return false;
+    // Decision 18 (Codex PR240-r14): only a pending stop card naming this archive blocks it; another archive's is closed
+    // by the tick's first pass.
+    const stops = await this.d.cards({ status: "pending", action: PURGE_STOPPED_ACTION, target: target(p.id), limit: CARD_PAGE });
+    if (stops.some((c) => c.projectId === p.id && raisedThisArchive(c, p))) return false;
     // Decision 7 (Codex PR240-r3): only a card KK left unanswered for its whole 7-day window counts against the
     // re-raise; a card expired early (a stale or unproven card, a Restore) was never his to answer.
     return period.filter((c) => c.status === "expired" && unanswered(c)).length < MAX_UNANSWERED;
