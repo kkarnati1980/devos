@@ -22,6 +22,8 @@ export const PURGE_DUE_MINUTE_IST = 3 * 60 + 10;
 /** Cards read per pass and projects per daily run (bounded reads, ADR-0011 §9). */
 export const CARD_PAGE = 50;
 export const DUE_PAGE = 100;
+/** Decision 25: the tick's cleanup pages through pending cards (newest first) up to this many per action. */
+export const CLEANUP_SCAN_MAX = 1000;
 /** Decision 1: the card is raised once, then re-raised once after an unanswered one; then nothing happens. */
 export const MAX_UNANSWERED = 2;
 /** Decision 1: a purge card unanswered for 7 days expires (then it is re-raised once). */
@@ -109,7 +111,7 @@ export interface TeardownSweepDeps {
   /** Active inventory rows per provider (`resource`), for the card text. */
   activeCounts(projectId: string): Promise<Record<string, number>>;
   /** The M2.3 store's list, newest first; every given field matches exactly. */
-  cards(f: { status?: string; action: string; target?: string; limit: number }): Promise<PurgeCardLike[]>;
+  cards(f: { status?: string; action: string; target?: string; cursor?: string; limit: number }): Promise<PurgeCardLike[]>;
   /** `Approvals.raiseCard` (dedupes against a pending twin with the same gate, action and target). */
   raise(card: ReturnType<typeof purgeCard> | ReturnType<typeof purgeStoppedCard>): Promise<unknown>;
   /** `Approvals.expireCardsById`. */
@@ -317,7 +319,8 @@ export class TeardownSweepJob {
    * daily run can re-raise it once. Only this job's own purge cards are expired here.
    */
   private async closeRestored(): Promise<void> {
-    const pending = await this.d.cards({ status: "pending", action: PURGE_ACTION, limit: CARD_PAGE });
+    // Decision 25 (Codex PR240-r20/r21): every pending card is read, page by page, not only the newest page.
+    const pending = await this.allPending(PURGE_ACTION);
     const restored: string[] = [];
     const unanswered: string[] = [];
     const cutoff = this.now() - PURGE_CARD_WINDOW_MS;
@@ -335,7 +338,7 @@ export class TeardownSweepJob {
     // Decision 18 (Codex PR240-r14): a pending stop card that does not name the current archive (raised after a Restore,
     // or a Restore and a new Archive, slipped in before its write; or unstamped, from before decision 18) is closed
     // here, so KK is not left a stop prompt for an archive that has ended, and it never blocks the current one's card.
-    const stops = await this.d.cards({ status: "pending", action: PURGE_STOPPED_ACTION, limit: CARD_PAGE });
+    const stops = await this.allPending(PURGE_STOPPED_ACTION);
     const ended: string[] = [];
     for (const c of stops) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
@@ -343,6 +346,22 @@ export class TeardownSweepJob {
       if (p && !raisedThisArchive(c, p)) ended.push(c.id);
     }
     if (ended.length) await this.d.expire(ended, "stop-card-archive-ended");
+  }
+
+  /**
+   * Decision 25 (Codex PR240-r21): the pending cards of one action across all projects, paged by the last card's id
+   * (newest first), so a full first page of current cards never hides an older stale one. Bounded by CLEANUP_SCAN_MAX.
+   */
+  private async allPending(action: string): Promise<PurgeCardLike[]> {
+    const out: PurgeCardLike[] = [];
+    let cursor: string | undefined;
+    while (out.length < CLEANUP_SCAN_MAX) {
+      const page = await this.d.cards({ status: "pending", action, cursor, limit: Math.min(CARD_PAGE, CLEANUP_SCAN_MAX - out.length) });
+      out.push(...page);
+      if (page.length < CARD_PAGE) break;
+      cursor = page[page.length - 1]!.id;
+    }
+    return out;
   }
 
   /** 2. Decision (d): "Keep archived" on a card raised after `purge_after` moves `purge_after` by 30 days, once. */

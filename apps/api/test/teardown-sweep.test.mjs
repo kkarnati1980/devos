@@ -10,7 +10,7 @@ import { Approvals, MemoryApprovalStore, parseCard } from "../dist/approvals.js"
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
-  cardArchive,
+  cardArchive, CARD_PAGE,
 } from "../dist/teardown-sweep.js";
 import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
@@ -1065,6 +1065,29 @@ test("M2.5-b5 decision 24 (Codex PR240-r20): a stale card beyond the cleanup's p
   assert.equal(pending.length, 1);
   assert.equal(cardArchive(pending[0]), p.archivedAt.toISOString());
   assert.ok((await s.purgeCards("expired")).some((c) => c.id === (stale.id ?? stale)), "the stale card was expired by the due pass");
+});
+
+test("M2.5-b5 decision 25 (Codex PR240-r21): the cleanup pages past a full first page of current cards to an older stale stop card and a restored project's purge card", async () => {
+  const s = setup();
+  const Q = "33333333-3333-4333-8333-333333333333";
+  s.projects.set(Q, { id: Q, slug: "gone", stage: "active", archivedAt: null, purgeAfter: null });
+  const old = { id: P, slug: "acme", archivedAt: new Date(T0 - 60 * DAY) };
+  const staleStop = await s.approvals.raiseCard(purgeStoppedCard(old, "leftover", { github: 1 }));
+  const restoredCard = await s.approvals.raiseCard(purgeCard({ id: Q, slug: "gone", archivedAt: new Date(T0 - 40 * DAY) }, { github: 1 }));
+  s.advance(1);
+  // A full page (and more) of newer cards that are all still valid: other projects' current archives, not yet due.
+  for (let i = 0; i < CARD_PAGE + 5; i++) {
+    const id = `44444444-4444-4444-8444-${String(i).padStart(12, "0")}`;
+    const at = new Date(T0 - DAY);
+    s.projects.set(id, { id, slug: `p${i}`, stage: "archived", archivedAt: at, purgeAfter: new Date(T0 + 29 * DAY) });
+    await s.approvals.raiseCard(purgeStoppedCard({ id, slug: `p${i}`, archivedAt: at }, "leftover", { github: 1 }));
+    await s.approvals.raiseCard(purgeCard({ id, slug: `p${i}`, archivedAt: at }, { github: 1 }));
+  }
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(staleStop.id)).status, "expired", "the ended archive's stop card is closed");
+  assert.equal((await s.approvals.store.get(restoredCard.id)).status, "expired", "the restored project's purge card is closed");
+  const live = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 200 });
+  assert.equal(live.filter((c) => c.target !== `project:${P}`).length, CARD_PAGE + 5, "current stop cards stay open");
 });
 
 test("M2.5-b5 decision 16 (Codex PR240-r12): an early ask hands out an existing card only behind the fence; a superseded card is never returned", async () => {

@@ -143,7 +143,7 @@ export function purgeCardAuthorizer(
 export const PURGE_LOCK_WAIT_MS = 60_000;
 
 export interface TeardownSweepCards {
-  list(f: { status?: string; action: string; target?: string; limit: number }): Promise<PurgeCardLike[]>;
+  list(f: { status?: string; action: string; target?: string; cursor?: string; limit: number }): Promise<PurgeCardLike[]>;
   raise(card: unknown): Promise<unknown>;
   expire(ids: readonly string[], reason: string): Promise<string[]>;
 }
