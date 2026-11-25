@@ -124,6 +124,14 @@ test("d3c-2a decision 1: Archive then Purge; an archived row skips Archive; a pu
   assert.deepEqual(p.calls, []);
 });
 
+test("DEVOS-254 pre-review r2 3: a not_archived stop on a row another purge finished is done; otherwise it keeps its code", async () => {
+  let stage = "archived";
+  const won = purgeDeps({ stage: async () => stage, teardown: { archiveProject: async () => {}, purgeProject: async () => { stage = "purged"; throw terr("not_archived"); } } });
+  assert.equal(await probePurge(PID, won), "done");
+  const lost = purgeDeps({ stage: async () => "archived", teardown: { archiveProject: async () => {}, purgeProject: async () => { throw terr("not_archived"); } } });
+  assert.deepEqual(await probePurge(PID, lost), { error: "purge-not-archived" });
+});
+
 test("d3c-2a decision 1: a leftover or scan error is purge-incomplete; a teardown stop keeps its code", async () => {
   const hit = purgeDeps({ teardown: { archiveProject: async () => {}, purgeProject: async () => ({ purged: false, report: { hits: [{ provider: "github", kind: "inventory:repo", name: "kk/x" }], errors: [] } }) } });
   assert.deepEqual(await probePurge(PID, hit), { error: "purge-incomplete:leftover:github/repo" });

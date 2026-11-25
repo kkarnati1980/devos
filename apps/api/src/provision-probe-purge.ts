@@ -194,6 +194,9 @@ export async function probePurge(projectId: string, d: ProbePurgeDeps): Promise<
     const where = hit && KIND_RE.test(hit.provider) && KIND_RE.test(hit.kind.replace(/^inventory:/, "")) ? `:${hit.provider}/${hit.kind.replace(/^inventory:/, "")}` : "";
     return { error: `purge-incomplete:${r.report.errors.length ? "scan-error" : "leftover"}${where}` };
   } catch (e) {
+    // DEVOS-254 pre-review r2 3: the sweep's purge under KK's card may have won the project lock and finished first.
+    const c = (e as { name?: unknown; code?: unknown } | null);
+    if (c && c.name === "TeardownError" && c.code === "not_archived" && (await d.stage().catch(() => "")) === "purged") return "done";
     return purgeStop(e);
   }
 }
