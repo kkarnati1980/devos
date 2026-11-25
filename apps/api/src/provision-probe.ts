@@ -38,7 +38,13 @@ export interface PhaseRecord {
 export type RunOutcome = "done" | "in_progress" | { error: string };
 export type PurgeOutcome = "done" | "in_progress" | { error: string };
 /** DEVOS-254 decision 4: the probe row's stage and the purge card's status (`missing` when the card is gone). */
-export interface CardOutcome { stage: string; card: "pending" | "approved" | "rejected" | "expired" | "missing"; decidedAt?: string | null }
+export interface CardOutcome {
+  stage: string;
+  card: "pending" | "approved" | "rejected" | "expired" | "missing";
+  decidedAt?: string | null;
+  /** Codex PR239-r1: every allowed purge decision since the card was raised ran under this card's grant (and one did). */
+  byCard?: boolean;
+}
 
 export interface ProbeDeps {
   /** null when the sweep is off (provisionConfig / vault): the probe is skipped. */
@@ -277,7 +283,11 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       if (!r.ok) return late ? toPurge(failed("card-timeout", "error")) : wait("card-unreadable");
       const o = r.value;
       // AT10: purged by the sweep under KK's approved card. A purge with no approved card is not that proof.
-      if (o.stage === "purged") return o.card === "approved" ? finish(true, PASS_CARD) : finish(false, "card-ended", `${CARD_WORD.test(o.card) ? o.card : "unknown"}:purged`);
+      if (o.stage === "purged") {
+        if (o.card !== "approved") return finish(false, "card-ended", `${CARD_WORD.test(o.card) ? o.card : "unknown"}:purged`);
+        // Codex PR239-r1 (high): purged, but not provably under this card's grant, is not AT10's proof.
+        return o.byCard === true ? finish(true, PASS_CARD) : finish(false, "card-unproven");
+      }
       if (o.stage === "archived" && o.card === "pending") return late ? toPurge(failed("card-timeout")) : wait("awaiting-card");
       if (o.stage === "archived" && o.card === "approved") {
         const t = typeof o.decidedAt === "string" ? Date.parse(o.decidedAt) : NaN;

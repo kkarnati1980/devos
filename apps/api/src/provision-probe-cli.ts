@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeExistingCard, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -185,6 +185,7 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               stage: () => probeStage(db, p.id, timeoutMs),
               archivedAt: async () => (await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: p.id }, select: { archivedAt: true } }), { timeout: timeoutMs, maxWait: timeoutMs }))?.archivedAt ?? null,
               // Decision 3: the probe grant covers the archive only; the purge needs KK's card.
+              existing: (since) => probeExistingCard(db, p.id, since, timeoutMs),
               archive: () => archiveUnderProbeGrant({
                 findGrant: (actions) => findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, actions),
                 archive: async (grant) => {

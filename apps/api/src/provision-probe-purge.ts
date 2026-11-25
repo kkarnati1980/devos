@@ -309,18 +309,42 @@ export async function probeCardCycle(db: any, projectId: string, timeoutMs: numb
 
 const CARD_STATUSES = ["pending", "approved", "rejected", "expired"] as const;
 
+/** Codex PR239-r1 (medium): the purge card this archive already has, in one bounded read. */
+export async function probeExistingCard(db: any, projectId: string, since: Date, timeoutMs: number): Promise<string | null> {
+  const c = await db.$transaction((tx: any) => tx.approval.findFirst({
+    where: { projectId, action: "teardown.purge", target: `project:${projectId}`, createdAt: { gte: since } },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    select: { id: true },
+  }), { timeout: timeoutMs, maxWait: timeoutMs });
+  return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
+}
+
 /** DEVOS-254 decision 4: the probe row's stage and its purge card's status, in one bounded read. */
 export async function probeCardOutcome(db: any, projectId: string, cardId: string, timeoutMs: number): Promise<CardOutcome> {
   return db.$transaction(async (tx: any) => {
     const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true } });
     if (!p) throw new Error("probe-project-missing");
-    const c = await tx.approval.findUnique({ where: { id: cardId }, select: { status: true, decidedAt: true, projectId: true, action: true } });
+    const c = await tx.approval.findUnique({ where: { id: cardId }, select: { status: true, decidedAt: true, createdAt: true, projectId: true, action: true } });
     // Only this project's own purge card counts; anything else reads as missing.
     const ok = c && c.projectId === projectId && c.action === "teardown.purge" && (CARD_STATUSES as readonly string[]).includes(String(c.status));
+    // Codex PR239-r1 (high): AT10 needs the purge to have run under this card's grant. Every allowed `teardown.purge`
+    // decision for this project since the card was raised must carry a grant issued for this card, and there must be
+    // one: a purge under the probe's grant or another card's never counts.
+    let byCard = false;
+    if (ok && String(p.stage) === "purged" && c.createdAt instanceof Date) {
+      const ds: { approvalGrant: { approvalId: string | null } | null }[] = await tx.policyDecision.findMany({
+        where: { projectId, ts: { gte: c.createdAt }, enforcedOutcome: "allow", action: { path: ["type"], equals: "teardown.purge" } },
+        select: { approvalGrant: { select: { approvalId: true } } },
+        orderBy: { ts: "asc" },
+        take: 50,
+      });
+      byCard = ds.length > 0 && ds.length < 50 && ds.every((x) => x.approvalGrant?.approvalId === cardId);
+    }
     return {
       stage: String(p.stage),
       card: ok ? (String(c.status) as CardOutcome["card"]) : "missing",
       decidedAt: ok && c.decidedAt instanceof Date ? c.decidedAt.toISOString() : null,
+      byCard,
     };
   }, { timeout: timeoutMs, maxWait: timeoutMs });
 }
@@ -329,6 +353,8 @@ export interface ProbePurgeCardDeps {
   stage(): Promise<string>;
   /** The row's `archived_at` (pre-review 2: a card raised before it belongs to an earlier archive). */
   archivedAt(): Promise<Date | null>;
+  /** The id of the newest `teardown.purge` card of this project raised at or after `since`, any status, or null. */
+  existing(since: Date): Promise<string | null>;
   /** Archive under the probe's KK grant (`teardown.archive` only); called only when the row is not archived yet. */
   archive(): Promise<void>;
   /** The per-provider counts of the probe's active resources (the card's "what will be deleted"). */
@@ -344,9 +370,17 @@ export interface ProbePurgeCardDeps {
  */
 export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDeps): Promise<string> {
   const stage = await d.stage();
-  if (stage === "purged") throw new Error("probe-card-already-purged");
-  if (stage !== "archived") await d.archive();
-  if ((await d.stage()) !== "archived") throw new Error("probe-card-not-archived");
+  if (stage !== "archived" && stage !== "purged") await d.archive();
+  const now = await d.stage();
+  // Codex PR239-r1 (medium): a tick that raised the card but did not record its id is retried. The card this archive
+  // already has (any status: KK may have approved it, the sweep may have purged) is used again, never a second one.
+  const since = await d.archivedAt();
+  if ((now === "archived" || now === "purged") && since instanceof Date) {
+    const had = await d.existing(since);
+    if (had) return had;
+  }
+  if (now === "purged") throw new Error("probe-card-already-purged");
+  if (now !== "archived") throw new Error("probe-card-not-archived");
   const card = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()));
   if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");
   // Pre-review 2: `raiseCard` dedupes against a pending twin. One left from an earlier archive (the sweep was off and
