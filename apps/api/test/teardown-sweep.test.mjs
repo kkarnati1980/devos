@@ -1366,6 +1366,52 @@ test("M2.5-b5 decision 32 (Codex PR240-r28): a purge denied because Keep archive
   assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "purge-card-not-due"));
 });
 
+test("M2.5-b5 decision 33 (Codex PR240-r29): Keep archived waits for the project lock a purge holds, and reads the row under it", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  s.advance(2 * DAY);
+  await s.approvals.reject(s.session, c.id);
+  const lock = serialLock();
+  s.job.d.locked = lock.locked;
+  let release;
+  // A purge (another card's) holds the lifecycle lock across its authorizer's purge-date read and its deletes.
+  const held = lock.locked(P, () => new Promise((r) => { release = r; }));
+  const tick = s.job.tick();
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(s.calls.keep.length, 0, "the move waits for the lock");
+  assert.ok(lock.seen.length >= 2 && lock.seen.every((id) => id === P));
+  // The purge finished before it released the lock: the move then finds the row purged and writes nothing.
+  s.projects.get(P).stage = "purged";
+  release();
+  await held;
+  await tick;
+  assert.equal(s.calls.keep.length, 0, "no move for a purged project");
+  assert.ok(!s.logs.some((l) => l.msg === "teardown-keep-archived"));
+});
+
+test("M2.5-b5 decision 33 (Codex PR240-r29): Keep archived writes nothing when the lock is lost or times out, and retries next tick", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  s.advance(2 * DAY);
+  await s.approvals.reject(s.session, c.id);
+  s.job.d.locked = serialLock().locked;
+  s.job.d.lockHeld = async () => { throw new Error("provision_lock_lost"); };
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 0, "a lost lock moves nothing");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-keep-failed"));
+  s.job.d.locked = async () => { throw new Error("lock_timeout"); };
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 0, "a lock timeout moves nothing");
+  s.job.d.locked = serialLock().locked;
+  s.job.d.lockHeld = async () => {};
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1, "the next tick moves the date once");
+});
+
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
   const s = setup();
   await s.job.tick();

@@ -435,19 +435,35 @@ export class TeardownSweepJob {
     const rejected = await this.d.cards({ status: "rejected", action: PURGE_ACTION, limit: CARD_PAGE });
     for (const c of rejected) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
-      const p = await this.d.project(c.projectId);
-      // A card raised before purge_after (an early ask) leaves purge_after as it is; a moved purge_after is later than
-      // the card, so each rejection moves it once.
-      // Decision 9 (Codex PR240-r5): only a card naming the current archive moves its purge date.
-      if (!p || p.stage !== "archived" || !p.purgeAfter || !p.archivedAt || c.createdAt.getTime() < p.purgeAfter.getTime() || !raisedThisArchive(c, p)) continue;
-      const from = p.purgeAfter;
-      const base = Math.max(from.getTime(), (c.decidedAt ?? c.createdAt).getTime());
-      // Decision 26 (Codex PR240-r22): the write also matches this read's archive, so a Restore and a new Archive with
-      // the same purge date in between never lets this rejection postpone the new archive.
-      if (await this.d.keepArchived(p.id, from, new Date(base + KEEP_ARCHIVED_MS), c.id, p.archivedAt)) {
-        this.d.log({ level: "info", msg: "teardown-keep-archived", projectId: p.id, approvalId: c.id });
+      const projectId = c.projectId;
+      // Decision 33 (Codex PR240-r29): the move takes the project lifecycle lock, the one a purge holds from its
+      // authorizer's `purge_after` read until its deletes end. So a scheduled card's authorizer never reads a date that
+      // Keep archived is about to move: the move waits for a running purge (then finds the row purged and writes
+      // nothing), and a purge waits for the move (then reads the new date and denies the old card, decision 30). The
+      // row is read under the lock and the lock is checked just before the write. A lock that times out or is lost
+      // skips this card only; it stays rejected, so the next tick tries again.
+      const keep = () => this.keepLocked(c, projectId);
+      const locked = this.d.locked;
+      try {
+        if (await (locked ? locked(projectId, keep) : keep())) this.d.log({ level: "info", msg: "teardown-keep-archived", projectId, approvalId: c.id });
+      } catch {
+        this.d.log({ level: "warn", msg: "teardown-keep-failed", projectId, approvalId: c.id, code: "teardown-keep-failed" });
       }
     }
+  }
+
+  private async keepLocked(c: PurgeCardLike, projectId: string): Promise<boolean> {
+    const p = await this.d.project(projectId);
+    // A card raised before purge_after (an early ask) leaves purge_after as it is; a moved purge_after is later than
+    // the card, so each rejection moves it once.
+    // Decision 9 (Codex PR240-r5): only a card naming the current archive moves its purge date.
+    if (!p || p.stage !== "archived" || !p.purgeAfter || !p.archivedAt || c.createdAt.getTime() < p.purgeAfter.getTime() || !raisedThisArchive(c, p)) return false;
+    const from = p.purgeAfter;
+    const base = Math.max(from.getTime(), (c.decidedAt ?? c.createdAt).getTime());
+    await this.d.lockHeld?.(projectId);
+    // Decision 26 (Codex PR240-r22): the write also matches this read's archive, so a Restore and a new Archive with
+    // the same purge date in between never lets this rejection postpone the new archive.
+    return this.d.keepArchived(p.id, from, new Date(base + KEEP_ARCHIVED_MS), c.id, p.archivedAt);
   }
 
   /**
