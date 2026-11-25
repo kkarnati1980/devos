@@ -387,7 +387,8 @@ export class TeardownSweepJob {
         // read of the row, so no card is raised after a Purge (or a Restore and a new Archive) changed it since listDue.
         const id = listed.id;
         // Pre-review 1: a purge of this process still running (maybe past its limit) holds the lock; skip, never queue.
-        if (this.purging.has(id)) continue;
+        // Codex PR240-r2: the row is not served yet, so the daily run stays open and a later tick checks it again.
+        if (this.purging.has(id)) { failed = true; continue; }
         const raise = () => this.raiseDueLocked(id);
         const locked = this.d.locked;
         if (await (locked ? locked(id, raise) : raise())) this.d.log({ level: "info", msg: "teardown-purge-card", projectId: id });
@@ -408,8 +409,26 @@ export class TeardownSweepJob {
     if (!(await this.shouldRaise(p))) return false;
     const card = purgeCard(p, await this.d.activeCounts(p.id));
     await this.d.lockHeld?.(p.id);
-    await this.d.raise(card);
+    await this.raiseFenced(p, card);
     return true;
+  }
+
+  /**
+   * M2.5-b5 decision 5 (Codex PR240-r2): the card is written on another connection than the lock, so after the write
+   * the row is read again. If it is no longer this archive (`archived` with the same `archivedAt`), the card just
+   * written is expired and nothing is raised. A change after this read gives a newer `archivedAt` than the card's own
+   * creation time, so `raisedThisArchive` already refuses the card for that archive.
+   */
+  private async raiseFenced(p: TeardownProject, card: Parameters<TeardownSweepDeps["raise"]>[0]): Promise<{ id: string }> {
+    const raised = (await this.d.raise(card)) as { id?: unknown } | null;
+    if (!raised || typeof raised.id !== "string") throw new Error("purge-card-not-raised");
+    const id = raised.id;
+    const now = await this.d.project(p.id);
+    if (!now || now.stage !== "archived" || now.archivedAt?.getTime() !== p.archivedAt?.getTime()) {
+      await this.d.expire([id], "purge-card-stale-archive");
+      throw new Error("purge-card-stale-archive");
+    }
+    return { id };
   }
 
   /**
@@ -479,8 +498,7 @@ export class TeardownSweepJob {
     const next = purgeCard(p, await this.d.activeCounts(p.id));
     // Decision 4: the lock is still ours right before the write, or nothing is raised.
     await this.d.lockHeld?.(p.id);
-    const card = (await this.d.raise(next)) as { id?: unknown } | null;
-    if (!card || typeof card.id !== "string") throw new Error("purge-card-not-raised");
+    const card = await this.raiseFenced(p, next);
     this.d.log({ level: "info", msg: "teardown-purge-asked", projectId: p.id, approvalId: card.id });
     return { ok: true, approvalId: card.id, raised: true };
   }

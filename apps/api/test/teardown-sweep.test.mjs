@@ -725,3 +725,25 @@ test("M2.5-b5 decision 4 (Codex PR240-r1): a lock lost before the write raises n
   e.job.d.lockHeld = async () => {};
   assert.equal((await e.job.askPurge(P)).raised, true);
 });
+
+test("M2.5-b5 decision 5 (Codex PR240-r2): a card written after the row moved to a new archive is expired at once", async () => {
+  const s = setup();
+  const raise = s.job.d.raise;
+  // The lock was lost after the ping: Restore and a new Archive finish before the write lands.
+  s.job.d.raise = async (c) => {
+    const p = s.projects.get(P);
+    p.archivedAt = new Date(s.now());
+    p.purgeAfter = new Date(s.now() - 1);
+    return raise(c);
+  };
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0, "the stale card is not left pending");
+  assert.equal((await s.purgeCards("expired")).length, 1);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.code === "purge-due"), "the daily run stays open");
+  // Early ask: same fence, the ask fails and leaves nothing pending.
+  const e = early();
+  const er = e.job.d.raise;
+  e.job.d.raise = async (c) => { e.projects.get(P).stage = "active"; return er(c); };
+  await assert.rejects(e.job.askPurge(P), /purge-card-stale-archive/);
+  assert.equal((await e.purgeCards("pending")).length, 0);
+});
