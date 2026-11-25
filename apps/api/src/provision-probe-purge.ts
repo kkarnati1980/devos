@@ -347,7 +347,7 @@ export async function probeCardOutcome(db: any, projectId: string, cardId: strin
     let byCard = false;
     if (ok && ids.size > 0 && String(p.stage) === "purged") {
       const ds: { approvalGrant: { approvalId: string | null } | null }[] = await tx.policyDecision.findMany({
-        where: { projectId, ts: { gte: c.createdAt }, enforcedOutcome: "allow", action: { path: ["type"], equals: "teardown.purge" } },
+        where: { projectId, ts: { gte: c.createdAt }, enforcedOutcome: "allow", action: { path: ["request", "type"], equals: "teardown.purge" } },
         select: { approvalGrant: { select: { approvalId: true } } },
         orderBy: { ts: "asc" },
         take: 50,

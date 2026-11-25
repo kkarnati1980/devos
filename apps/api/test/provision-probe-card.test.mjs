@@ -337,7 +337,7 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
   const mine = { approvalGrant: { approvalId: "c-1" } };
   let r = await run([mine, mine]);
   assert.equal(r.out.byCard, true);
-  assert.deepEqual(r.seen.q.where, { projectId: "p-1", ts: { gte: created }, enforcedOutcome: "allow", action: { path: ["type"], equals: "teardown.purge" } });
+  assert.deepEqual(r.seen.q.where, { projectId: "p-1", ts: { gte: created }, enforcedOutcome: "allow", action: { path: ["request", "type"], equals: "teardown.purge" } });
   assert.equal(r.seen.q.take, 50);
   for (const ds of [[], [mine, { approvalGrant: { approvalId: "other" } }], [{ approvalGrant: null }], Array(50).fill(mine)]) {
     assert.equal((await run(ds)).out.byCard, false, JSON.stringify(ds).slice(0, 80));
