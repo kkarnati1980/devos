@@ -21,6 +21,8 @@ export interface PhaseRecord {
   at: string; // ISO time the phase was entered
   fingerprint: string; // hash of the provisioning code in the image when the cycle started
   inventory1?: InventoryRow[];
+  /** DEVOS-21 part 13: the provider refusal (`purge-permission:<provider>/<kind>…`) the cycle before this one ended with, if any. */
+  refusalRetry?: string;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
 }
 
@@ -102,20 +104,29 @@ function nextPhase(p: Phase): Phase {
 }
 
 /** A teardown call a provider refused, as `purgeStop` names it (part 12): `purge-permission:coolify/application:delete:http-403`. */
-const PROVIDER_REFUSAL = /^purge-permission:(?:github|coolify)\/[a-z_]+(?::|$)/;
+const PROVIDER_REFUSAL = /^purge-permission:(?:github|coolify)\/[a-z0-9_]{1,40}(?::|$)/;
+
+/** The provider refusal a done cycle ended with, or undefined. */
+function refusalOf(last: PhaseRecord): string | undefined {
+  const r = last.result;
+  return r?.ok === false && r.code === "purge-failed" && PROVIDER_REFUSAL.test(r.detail ?? "") ? r.detail : undefined;
+}
 
 async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   if (last.fingerprint !== d.fingerprint) return true;
   if (d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS) return true;
   // DEVOS-21: a cycle that only purged an earlier cycle's leftovers (its purge passed) tested nothing, so the real
-  // cycle is due on the next check run. If that purge had failed, the code would be `purge-failed`, which waits.
+  // cycle is due on the next check run. If that purge had failed, the code would be `purge-failed`, which waits
+  // (except a provider refusal, part 13, below).
   if (last.result?.ok === false && last.result.code === "previous-purge-pending") return true;
   // DEVOS-21 part 13: a purge that a provider refused (`purge-permission:<provider>/<kind>:...`) is fixed on the
   // provider side, often by editing the existing token's permissions, which no vault save records. Such a cycle is
   // due on the next check run (a new SHA, the 6-hour timer or a `/recheck`), so the fix is tested at once. It
   // starts with the purge again and creates nothing; if the refusal repeats it ends the same way, bounded by that
-  // cadence. A preflight refusal, a lapsed grant or a bare code keeps the earlier rules.
-  if (last.result?.ok === false && last.result.code === "purge-failed" && PROVIDER_REFUSAL.test(last.result.detail ?? "")) return true;
+  // cadence. Once per refusal (Codex pre-review 1): each purge spends uses of KK's probe grant, so a cycle that already
+  // followed the same refusal waits for the earlier rules. A preflight refusal, a lapsed grant or a bare code also waits.
+  const refusal = refusalOf(last);
+  if (refusal !== undefined && last.refusalRetry !== refusal) return true;
   // DEVOS-21: a failed cycle is re-run as soon as KK saves a new provider token after it ended (a passed cycle waits
   // the 7 days). A read that throws, or a time that is not a valid ISO date, keeps the 7-day rule.
   if (last.result?.ok !== false || !d.credentialsUpdatedAt) return false;
@@ -146,12 +157,14 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     const start = d.cycleStart ? await d.cycleStart() : "ready";
     if (typeof start === "object") return { exit: 3, phase: "idle", cycle: last?.cycle ?? 0, code: "skipped", detail: start.blocked };
     const cycle = (last?.cycle ?? 0) + 1;
+    const refusal = last ? refusalOf(last) : undefined;
+    const mark = refusal !== undefined ? { refusalRetry: refusal } : {};
     if (start === "purge-pending") {
       // d3c-2a decision 4: the earlier cycle's resources are purged first; the cycle reports that, never a pass.
-      await d.record({ cycle, phase: "purge", at: at(), fingerprint: d.fingerprint, result: { ok: false, code: "previous-purge-pending" } });
+      await d.record({ cycle, phase: "purge", at: at(), fingerprint: d.fingerprint, ...mark, result: { ok: false, code: "previous-purge-pending" } });
       return { exit: 3, phase: "purge", cycle, code: "in_progress" };
     }
-    await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint });
+    await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint, ...mark });
     return { exit: 3, phase: "run1", cycle, code: "in_progress" };
   }
   if (last.phase === "done") {
