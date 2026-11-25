@@ -1011,8 +1011,29 @@ test("M2.5-b5 decision 14 (Codex PR240-r10): while the daily run stays open, an 
   assert.equal(tries, 3, "the following day's run tries once more");
 });
 
-test("M2.5-b5 decision 15 (Codex PR240-r11): a stale archive's pending card written during the daily run keeps it open; the current card follows the same day", async () => {
+test("M2.5-b5 decision 15 (Codex PR240-r11): a pending card naming a later archive, written during the daily run, keeps it open", async () => {
   const s = setup();
+  const cards = s.job.d.cards;
+  let inject = true;
+  s.job.d.cards = async (f) => {
+    // Another process, after a lost lock, persists a card naming an archive that is not older than this read's.
+    if (inject && f.target) {
+      inject = false;
+      const p = s.projects.get(P);
+      await s.approvals.raiseCard(purgeCard({ ...p, archivedAt: new Date(p.archivedAt.getTime() + DAY) }, s.counts[P]));
+    }
+    return cards(f);
+  };
+  await s.job.tick();
+  const [other] = await s.purgeCards("pending");
+  assert.notEqual(cardArchive(other), s.projects.get(P).archivedAt.toISOString(), "only the other archive's card is pending");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.code === "purge-due"), "the daily run stays open");
+  assert.ok(!s.logs.some((l) => l.msg === "teardown-purge-card"));
+});
+
+test("M2.5-b5 decision 24 (Codex PR240-r20): an older archive's pending card written during the daily run is expired under the lock and the current card follows in the same pass", async () => {
+  const s = setup();
+  s.job.d.locked = serialLock().locked;
   const cards = s.job.d.cards;
   let inject = true;
   s.job.d.cards = async (f) => {
@@ -1025,15 +1046,25 @@ test("M2.5-b5 decision 15 (Codex PR240-r11): a stale archive's pending card writ
     return cards(f);
   };
   await s.job.tick();
-  const [stale] = await s.purgeCards("pending");
-  assert.notEqual(cardArchive(stale), s.projects.get(P).archivedAt.toISOString(), "only the stale card is pending");
-  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.code === "purge-due"), "the daily run stays open");
-  s.advance(5 * 60_000);
+  const pending = await s.purgeCards("pending");
+  assert.equal(pending.length, 1);
+  assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString(), "the current archive's card, in the same pass");
+  assert.equal((await s.purgeCards("expired")).length, 1, "the stale card was expired");
+  assert.ok(!s.logs.some((l) => l.msg === "teardown-card-failed"), "the daily run is served");
+});
+
+test("M2.5-b5 decision 24 (Codex PR240-r20): a stale card beyond the cleanup's page never holds back the current card", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  const stale = await s.approvals.raiseCard(purgeCard({ ...p, archivedAt: new Date(p.archivedAt.getTime() - DAY) }, s.counts[P]));
+  const cards = s.job.d.cards;
+  // The cross-project page is full of newer valid cards of other projects, so the first pass never reaches this one.
+  s.job.d.cards = async (f) => (f.target ? cards(f) : []);
   await s.job.tick();
   const pending = await s.purgeCards("pending");
   assert.equal(pending.length, 1);
-  assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString(), "the current archive's card, the same day");
-  assert.ok((await s.purgeCards("expired")).some((c) => c.id === stale.id), "the stale card was expired first");
+  assert.equal(cardArchive(pending[0]), p.archivedAt.toISOString());
+  assert.ok((await s.purgeCards("expired")).some((c) => c.id === (stale.id ?? stale)), "the stale card was expired by the due pass");
 });
 
 test("M2.5-b5 decision 16 (Codex PR240-r12): an early ask hands out an existing card only behind the fence; a superseded card is never returned", async () => {

@@ -622,7 +622,18 @@ export class TeardownSweepJob {
     // Decision 15 (Codex PR240-r11): a pending card that does not name this archive (a stale writer's card whose fence
     // re-read failed, decision 12) does not serve this row: the daily run stays open, the next tick's first pass
     // expires it (decision 9), and the row then gets its card the same day.
-    const pending = cards.filter((c) => c.status === "pending");
+    // Decision 24 (Codex PR240-r20): decision 9's cleanup reads one page of pending cards across all projects, so with
+    // a page of newer valid cards it may never reach this row's stale one. A pending card of an older archive than
+    // this locked, fresh read is therefore expired right here (as the early ask does, decision 13: the lock is checked
+    // first), and the current archive's card is raised in the same pass. Only a pending card naming another archive
+    // that is not older (another process's, after a lost lock) still keeps the row unserved (decision 15).
+    let pending = cards.filter((c) => c.status === "pending");
+    const older = pending.filter((c) => !raisedThisArchive(c, p) && olderArchive(c, p));
+    if (older.length) {
+      await this.d.lockHeld?.(p.id);
+      await this.d.expire(older.map((c) => c.id), "purge-card-older-archive");
+      pending = pending.filter((c) => !older.includes(c));
+    }
     if (pending.some((c) => !raisedThisArchive(c, p))) throw new Error("purge-card-stale-pending");
     if (pending.length) return false;
     // Decision 10 (Codex PR240-r6): the period counts only this archive's cards (decision 8's stamp), so a stale
