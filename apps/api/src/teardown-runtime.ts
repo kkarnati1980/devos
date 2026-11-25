@@ -124,13 +124,15 @@ export function purgeCardAuthorizer(
   policy: { decide(r: unknown): Promise<{ enforcedOutcome: string; approvalGrantId?: string | null }> },
   projectId: string,
   grantId: string,
-  cardCreatedAt: Date,
+  card: { createdAt: Date; archive: string | null },
   archivedAt: () => Promise<Date | null>,
 ): Authorize {
   return async (action, resource) => {
     if (action !== "teardown.purge" || resource !== teardownResource(projectId)) return "deny";
     const since = await archivedAt();
-    if (!since || cardCreatedAt.getTime() < since.getTime()) return "deny";
+    if (!since || card.createdAt.getTime() < since.getTime()) return "deny";
+    // M2.5-b5 decision 8 (Codex PR240-r4): re-read under the project lock, the card must name this very archive.
+    if (card.archive !== since.toISOString()) return "deny";
     const d = await policy.decide({ identity: PROVISIONER_IDENTITY, action: { type: action, resource, projectId }, approvalGrantId: grantId });
     if (d.enforcedOutcome === "allow") return d.approvalGrantId === grantId ? "allow" : "require_approval";
     return d.enforcedOutcome === "require_approval" ? "require_approval" : "deny";
@@ -220,9 +222,9 @@ export function buildTeardownSweep(w: {
     raise: (card) => cards.raise(card),
     expire: (ids, reason) => cards.expire(ids, reason),
     unspentGrant: q.unspentGrant,
-    purge: async (projectId, grantId, cardCreatedAt) => {
+    purge: async (projectId, grantId, card) => {
       const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs, linear: w.linear ?? null });
-      const authorize = purgeCardAuthorizer(w.policy, projectId, grantId, cardCreatedAt, async () => (await store.project(projectId))?.archivedAt ?? null);
+      const authorize = purgeCardAuthorizer(w.policy, projectId, grantId, card, async () => (await store.project(projectId))?.archivedAt ?? null);
       return td.purgeProject(projectId, { store, authorize, ops: wiring.ops, scanners: wiring.scanners, preflight: wiring.preflight });
     },
     keepArchived: q.keepArchived,

@@ -39,10 +39,10 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
   const counts = { [P]: { github: 2, coolify: 5 } };
   const calls = { purge: [], providerCalls: 0, keep: [] };
   const logs = [];
-  const purge = async (projectId, grantId, cardCreatedAt) => {
+  const purge = async (projectId, grantId, card) => {
     calls.purge.push({ projectId, grantId });
     // The real purge checks `teardown.purge` once before any provider call (M2.5-a1), with the production authorizer.
-    const d = await purgeCardAuthorizer(engine, projectId, grantId, cardCreatedAt, async () => projects.get(projectId)?.archivedAt ?? null)("teardown.purge", `project:${projectId}`);
+    const d = await purgeCardAuthorizer(engine, projectId, grantId, card, async () => projects.get(projectId)?.archivedAt ?? null)("teardown.purge", `project:${projectId}`);
     if (d !== "allow") throw new TeardownError("approval_required", false, "approval needed");
     calls.providerCalls++;
     if (purgeImpl) return purgeImpl(projectId);

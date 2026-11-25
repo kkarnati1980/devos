@@ -39,6 +39,8 @@ export interface PurgeCardLike {
   projectId: string | null;
   createdAt: Date;
   decidedAt: Date | null;
+  /** M2.5-b5 decision 8: the card text, whose last sentence names the archive the card was built for. */
+  reason?: string | null;
 }
 
 export interface TeardownProject {
@@ -49,9 +51,20 @@ export interface TeardownProject {
   archivedAt: Date | null;
 }
 
-/** A card belongs to the project's current archive only if it was raised at or after `archived_at`. */
-const raisedThisArchive = (c: { createdAt: Date }, p: TeardownProject): boolean =>
-  p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime();
+/**
+ * M2.5-b5 decision 8 (Codex PR240-r4): the archive a purge card was built for, from its own text (`Archive <iso>.`, the
+ * last sentence `purgeCard` writes). A card is bound to that archive for good, wherever it is read, after a restart too.
+ */
+const ARCHIVE_STAMP = / Archive (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\.$/;
+export const cardArchive = (c: { reason?: string | null }): string | null =>
+  (typeof c.reason === "string" ? ARCHIVE_STAMP.exec(c.reason)?.[1] : undefined) ?? null;
+
+/**
+ * A card belongs to the project's current archive only if it was raised at or after `archived_at` and (decision 8) it
+ * names that same archive, so a card built from an earlier archive's state but written after a new Archive never counts.
+ */
+const raisedThisArchive = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject): boolean =>
+  p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime() && cardArchive(c) === p.archivedAt.toISOString();
 
 /** Decision 7: expired only after its whole 7-day window (closeRestored's cutoff), so KK had the chance to answer it. */
 const unanswered = (c: { createdAt: Date; decidedAt: Date | null }): boolean =>
@@ -84,7 +97,7 @@ export interface TeardownSweepDeps {
    * allows only when M1.7 actually used this grant (so the attempt spends it, whatever the policy mode or rules) and,
    * re-read under the project lock, the card is not older than the project's `archived_at`.
    */
-  purge(projectId: string, grantId: string, cardCreatedAt: Date): Promise<PurgeResultLike>;
+  purge(projectId: string, grantId: string, card: { createdAt: Date; archive: string | null }): Promise<PurgeResultLike>;
   /** `purge_after` from `from` to `to`, only while the project is archived and `purge_after` is still `from`. */
   keepArchived(projectId: string, from: Date, to: Date, approvalId: string): Promise<boolean>;
   log(e: { level: "info" | "warn"; msg: string; projectId?: string; code?: string; approvalId?: string }): void;
@@ -123,15 +136,17 @@ const safeSlug = (slug: string): string => (SLUG.test(slug) ? slug : "(unnamed)"
  * Decision (a): the purge card. Gate 5 (typed confirmation), action `teardown.purge`, target `project:<id>`, fixed
  * wording with the per-provider counts from the inventory (decision 2), so KK knows what will be deleted.
  */
-export function purgeCard(p: { id: string; slug: string }, counts: Record<string, number>) {
+export function purgeCard(p: { id: string; slug: string; archivedAt: Date | null }, counts: Record<string, number>) {
   const slug = safeSlug(p.slug);
+  // Decision 8: the archive this card is for, as its last sentence; read back by `cardArchive`.
+  const stamp = p.archivedAt ? ` Archive ${p.archivedAt.toISOString()}.` : "";
   return {
     gate: "purge" as const,
     action: PURGE_ACTION,
     target: target(p.id),
     reason:
       `Purge project ${slug}? This deletes its code, stacks, data and backups for good. ` +
-      `What will be deleted (by provider): ${countsText(counts)}.`,
+      `What will be deleted (by provider): ${countsText(counts)}.${stamp}`,
     consequence:
       `Approve (type the confirmation shown) to delete everything now; this cannot be undone. ` +
       `Reject to keep ${slug} archived for another 30 days. ` +
@@ -315,12 +330,12 @@ export class TeardownSweepJob {
         continue;
       }
       seen.add(pid);
-      await this.runPurge(p, c.id, grant, c.createdAt);
+      await this.runPurge(p, c.id, grant, { createdAt: c.createdAt, archive: cardArchive(c) });
     }
   }
 
-  private async runPurge(p: TeardownProject, approvalId: string, grantId: string, cardCreatedAt: Date): Promise<void> {
-    const run = this.d.purge(p.id, grantId, cardCreatedAt);
+  private async runPurge(p: TeardownProject, approvalId: string, grantId: string, card: { createdAt: Date; archive: string | null }): Promise<void> {
+    const run = this.d.purge(p.id, grantId, card);
     this.purging.add(p.id);
     run.then(() => this.purging.delete(p.id), () => this.purging.delete(p.id));
     let result: PurgeResultLike;
