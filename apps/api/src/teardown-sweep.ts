@@ -317,6 +317,8 @@ export class TeardownSweepJob {
    * needs KK's approval before anything more is deleted.
    */
   private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string; due: string | null }>();
+  /** Decision 39: the tail of the queued stop deliveries (one pass at a time). */
+  private deliveryChain: Promise<void> = Promise.resolve();
   /** Decision 26: where each action's cleanup scan resumes on the next tick (the last card id read at the bound). */
   private readonly scanFrom = new Map<string, string>();
   /**
@@ -632,7 +634,19 @@ export class TeardownSweepJob {
     await this.deliverStops();
   }
 
-  private async deliverStops(): Promise<void> {
+  /**
+   * Decision 39 (Codex PR240-r35): deliveries never overlap. Each call queues one full pass over the owed stops behind
+   * any pass still in flight, so a newer stop's delivery never interleaves with an older one's raise or expiry (which
+   * the owed-entry checks of decisions 21, 37 and 38 could not fence once a write was in flight); a pass that finds its
+   * entry replaced skips it, and the queued pass delivers the newer stop.
+   */
+  private deliverStops(): Promise<void> {
+    const run = this.deliveryChain.then(() => this.deliverOnce());
+    this.deliveryChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async deliverOnce(): Promise<void> {
     for (const [id, o] of this.stopsOwed) {
       try {
         // Decision 18 (Codex PR240-r14): re-read before each try; a stop owed for an archive that has ended is dropped

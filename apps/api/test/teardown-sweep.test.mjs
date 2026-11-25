@@ -1830,12 +1830,15 @@ test("M2.5-b5 decision 37 (Codex PR240-r33): an older stop's delivery never supe
   const tick = s.job.tick();
   await new Promise((r) => setImmediate(r));
   s.advance(60_000);
-  await s.job.raiseStopped({ ...p }, "leftover");
+  // Decision 39: the newer stop's delivery queues behind the paused one, never interleaves with it.
+  const late = s.job.raiseStopped({ ...p }, "leftover");
+  await new Promise((r) => setImmediate(r));
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "nothing is written while the older delivery is paused");
+  release();
+  await Promise.all([tick, late]);
+  s.job.d.project = read;
   const [newer] = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(stopWhy(newer.reason), "after deleting, the leftover check still found resources of this project");
-  release();
-  await tick;
-  s.job.d.project = read;
   assert.equal((await s.approvals.store.get(newer.id)).status, "pending", "the newer failure's card is left open");
   const stops = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 });
   assert.equal(stops.length, 1, "the older failure is not raised over it");
@@ -1859,10 +1862,11 @@ test("M2.5-b5 decision 38 (Codex PR240-r34): an older delivery whose entry was r
   s.advance(60_000);
   const late = s.job.raiseStopped({ ...p }, "leftover");
   await new Promise((r) => setImmediate(r));
-  assert.equal(gates.length, 2);
+  // Decision 39: the newer delivery is queued behind the paused one, so only one is in activeCounts.
+  assert.equal(gates.length, 1);
   s.advance(60_000);
   gates[0]();
-  await new Promise((r) => setImmediate(r));
+  while (gates.length < 2) await new Promise((r) => setImmediate(r));
   gates[1]();
   await Promise.all([tick, late]);
   s.job.d.activeCounts = counts;
@@ -1870,6 +1874,39 @@ test("M2.5-b5 decision 38 (Codex PR240-r34): an older delivery whose entry was r
   assert.equal(pending.length, 1);
   assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project", "the newer failure reaches KK");
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1, "the older failure wrote nothing");
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 }))[0].id, pending[0].id);
+});
+
+test("M2.5-b5 decision 39 (Codex PR240-r35): a newer stop raised while an older delivery's expiry is in flight is still delivered", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  // A pending card for failure A, then a stop for failure B is owed (its first raise failed).
+  const a = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 1 }));
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch");
+  const expire = s.job.d.expire;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let paused = false;
+  s.job.d.expire = async (ids, reason) => {
+    if (reason === "stop-card-superseded" && !paused) { paused = true; await gate; }
+    return expire(ids, reason);
+  };
+  // B's delivery deduplicates onto A's card and starts superseding it; a newer stop for failure A arrives meanwhile.
+  const tick = s.job.tick();
+  while (!paused) await new Promise((r) => setImmediate(r));
+  s.advance(60_000);
+  const late = s.job.raiseStopped({ ...p }, "leftover");
+  await new Promise((r) => setImmediate(r));
+  release();
+  await Promise.all([tick, late]);
+  s.job.d.expire = expire;
+  assert.equal((await s.approvals.store.get(a.id)).status, "expired");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1, "KK has a card for the newest failure");
+  assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project");
   s.advance(60_000);
   await s.job.tick();
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 }))[0].id, pending[0].id);
