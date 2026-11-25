@@ -50,6 +50,8 @@ export interface PhaseRecord {
   expireCards?: boolean;
   /** Codex PR239-r15: the purge went ahead without that expiry, because the probe grant would not outlast more retries. */
   cardExpireGaveUp?: boolean;
+  /** Codex PR239-r25: `cardwait` saw the sweep's purge under KK's approved card (AT10's proof); only the expiry is left. */
+  cardProven?: boolean;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
 }
 
@@ -335,6 +337,14 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
         if (!g.ok || g.value !== true) return leaveCard(failed("card-grant-short", detail));
         return { exit: 3, phase, cycle, code: "in_progress", detail };
       };
+      // Codex PR239-r25 (medium): once the proof was seen and recorded, later ticks only retry the expiry; the proof
+      // is never read again, so a failing read or a short grant cannot lose it.
+      if (last.cardProven) {
+        const post = await attempt(async () => { if (d.expirePurgeCards) await d.expirePurgeCards(); });
+        const lateProof = d.now().getTime() - Date.parse(last.at) >= PROBE_CARD_MAX_MS;
+        if (!post.ok && !lateProof) return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
+        return finish(true, PASS_CARD);
+      }
       const r = await attempt(() => d.cardOutcome!(cardId));
       // Codex PR239-r12 (medium): the 8-day wait runs from the earlier of the card's raise and the tick that recorded
       // it. A card raised by a tick that failed to record `cardwait` and reused later keeps its own deadline, so the
@@ -358,7 +368,11 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
           const post = await attempt(() => d.expirePurgeCards!());
           // Codex PR239-r24: the row is already purged, so no fallback purge can follow and the grant is not checked;
           // a plain wait keeps the proof already seen.
-          if (!post.ok && !late) return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
+          if (!post.ok && !late) {
+            // Codex PR239-r25: the proof is recorded first, so the retries never read the card again.
+            await d.record({ ...last, cardProven: true });
+            return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
+          }
         }
         return finish(true, PASS_CARD);
       }

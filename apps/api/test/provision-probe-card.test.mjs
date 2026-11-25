@@ -831,9 +831,16 @@ test("Codex PR239-r23 (DEVOS-254 d22): a pass-card in cardwait first expires the
   r = await probeStep(d);
   assert.equal(r.detail, "card-expire-after-purge");
   assert.equal(d.log.at(-1).phase, "cardwait");
+  // Codex PR239-r25: the proof is recorded; an outcome read that now fails does not lose it.
+  assert.equal(d.log.at(-1).cardProven, true);
+  const reads = d.calls.outcome;
+  d.cardOutcome = async () => { throw new Error("db"); };
+  r = await probeStep(d);
+  assert.equal(r.detail, "card-expire-after-purge");
+  assert.equal(d.calls.outcome, reads, "the card is not read again");
   fail = false;
   r = await probeStep(d);
   assert.deepEqual(r, { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
-  assert.equal(d.calls.expire, 4);
+  assert.equal(d.calls.expire, 5);
   assert.equal(d.calls.purge, 0);
 });
