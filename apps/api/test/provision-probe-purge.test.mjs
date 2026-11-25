@@ -182,7 +182,7 @@ test("d3c-2a decision 3: a KK grant for teardown.* on the probe project is found
   assert.equal(await findProbeGrant(grantDb([grant({ scopeAction: "teardown.purge" })]).db, PID, NOW, 1234, grantProblem, ["teardown.purge"]), "g-1");
 });
 
-test("Codex PR239-r7: probeGrantOutlasts asks for the grant at the later time, with the uses the row still needs", async () => {
+test("Codex PR239-r7/r8: probeGrantOutlasts asks for the grant at the later time, with every use the cycle may still spend", async () => {
   const LATER = new Date("2026-12-05T08:00:00Z");
   const withStage = (stage, rows) => {
     const g = grantDb(rows);
@@ -195,10 +195,14 @@ test("Codex PR239-r7: probeGrantOutlasts asks for the grant at the later time, w
   assert.equal(await probeGrantOutlasts(db, PID, LATER, 1234, grantProblem), true);
   assert.deepEqual(seen.find((q) => q && q.where && q.where.expiresAt).where.expiresAt, { gt: LATER }, "the read asks about the later time");
   assert.ok(seen.filter((q) => q && "timeout" in q).every((o) => o.timeout === 1234 && o.maxWait === 1234), "bounded reads");
-  // Not archived yet: the Archive and the purge each need a use; archived: only the purge.
-  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 29 })]).db, PID, LATER, 1234, grantProblem), false);
-  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 29 })]).db, PID, LATER, 1234, grantProblem), true);
-  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 30 })]).db, PID, LATER, 1234, grantProblem), false);
+  // Codex PR239-r8: a fallback purge after a Restore needs an Archive and a purge again. Not archived yet: the card's
+  // Archive plus those two (3 uses); archived: those two.
+  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 27 })]).db, PID, LATER, 1234, grantProblem), true);
+  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 28 })]).db, PID, LATER, 1234, grantProblem), false);
+  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 28 })]).db, PID, LATER, 1234, grantProblem), true);
+  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 29 })]).db, PID, LATER, 1234, grantProblem), false);
+  // Both actions must be in scope even once archived (the Restore fallback archives again).
+  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ scopeAction: "teardown.purge" })]).db, PID, LATER, 1234, grantProblem), false);
 });
 
 test("d3c-2a decision 3: the authorizer presents the grant to the M1.7 engine as the system provisioner", async () => {

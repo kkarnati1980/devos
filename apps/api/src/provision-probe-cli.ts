@@ -9,7 +9,7 @@
 //   report   the newest finished cycle's result: 0 ok, 1 failed, 3 none yet or still running (read-only)
 //   step     advance the probe by one phase (probeStep)
 import { fileURLToPath } from "node:url";
-import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
+import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_CARD_RAISE_GRANT_MS, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
 import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
@@ -195,6 +195,8 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               }),
               counts: () => probeActiveCounts(db, p.id, timeoutMs),
               raise: (c) => approvals.raiseCard(c),
+              // Codex PR239-r7/r8 (decision 11): only before a new card, from this tick.
+              outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
             });
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),

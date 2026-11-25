@@ -79,11 +79,14 @@ export interface ProbeDeps {
   credentialsUpdatedAt?(): Promise<string | null>;
   /** DEVOS-254 decision 1: true while no cycle has ended `pass-card`, so the next cycle purges through KK's card. */
   cardCycle?(): Promise<boolean>;
-  /** DEVOS-254 decision 3: archive the probe project (unless archived) and raise the M2.5-b2 purge card; its id. */
-  raisePurgeCard?(): Promise<string>;
+  /**
+   * DEVOS-254 decision 3: archive the probe project (unless archived) and raise the M2.5-b2 purge card; its id (the card
+   * this archive already has, on a retried tick). `{ grantShort }` when no card was raised for decision 11.
+   */
+  raisePurgeCard?(): Promise<string | { grantShort: true }>;
   /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
   cardOutcome?(cardId: string): Promise<CardOutcome>;
-  /** Codex PR239-r7: true when a probe grant with the uses still needed is valid at `until` (decision 11). */
+  /** Codex PR239-r7: true when a probe grant with every use the cycle may still spend is valid at `until` (decision 11). */
   cardGrantOutlasts?(until: Date): Promise<boolean>;
   fingerprint: string;
   now(): Date;
@@ -283,12 +286,10 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     }
     case "card": {
       // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
-      if (!d.raisePurgeCard || !d.cardGrantOutlasts) return toPurge(failed("card-not-wired"));
-      // Decision 11 (Codex PR239-r7): no card unless the probe's grant outlasts the card wait and the purge after it.
-      const until = new Date(d.now().getTime() + PROBE_CARD_RAISE_GRANT_MS);
-      const g = await attempt(() => d.cardGrantOutlasts!(until));
-      if (!g.ok || g.value !== true) return toPurge(failed("card-grant-short"));
+      if (!d.raisePurgeCard) return toPurge(failed("card-not-wired"));
       const r = await attempt(() => d.raisePurgeCard!());
+      // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
+      if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return toPurge(failed("card-grant-short"));
       if (!r.ok || typeof r.value !== "string" || r.value === "") return toPurge(failed("card-raise-failed"));
       await d.record({ ...last, phase: "cardwait", at: at(), cardId: r.value });
       return { exit: 3, phase: "cardwait", cycle, code: "in_progress" };
