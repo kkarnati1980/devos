@@ -158,7 +158,9 @@ test("d3c-2a decision 3: a KK grant for teardown.* on the probe project is found
   const { db, seen } = grantDb([grant()]);
   assert.equal(await findProbeGrant(db, PID, NOW, 1234, grantProblem), "g-1");
   assert.deepEqual(seen[0], { timeout: 1234, maxWait: 1234 }, "one bounded read");
-  assert.deepEqual(seen[1].where, { projectId: PID, revokedAt: null, expiresAt: { gt: NOW } });
+  // Codex PR239-r5: a grant issued for a purge card is the sweep's and is never selected.
+  assert.deepEqual(seen[1].where, { projectId: PID, revokedAt: null, expiresAt: { gt: NOW },
+    OR: [{ approvalId: null }, { approval: { is: { action: { not: "teardown.purge" } } } }] });
   assert.deepEqual([...PROBE_GRANT_ACTIONS], ["teardown.archive", "teardown.purge"]);
   for (const [why, g] of [
     ["purge only", grant({ scopeAction: "teardown.purge" })],

@@ -29,7 +29,12 @@ export async function findProbeGrant(
   actions: readonly string[] = PROBE_GRANT_ACTIONS,
 ): Promise<string | null> {
   const rows: GrantRow[] = await db.$transaction((tx: any) => tx.approvalGrant.findMany({
-    where: { projectId, revokedAt: null, expiresAt: { gt: now } },
+    // Codex PR239-r5 (high): never a grant issued for a `teardown.purge` card. That grant is the sweep's (M2.5-b2,
+    // DEVOS-254): the probe spending it would bypass the sweep's archive check and use up the card's one use.
+    where: {
+      projectId, revokedAt: null, expiresAt: { gt: now },
+      OR: [{ approvalId: null }, { approval: { is: { action: { not: "teardown.purge" } } } }],
+    },
     orderBy: [{ expiresAt: "desc" }, { id: "asc" }],
     take: 20,
   }), { timeout: timeoutMs, maxWait: timeoutMs });
