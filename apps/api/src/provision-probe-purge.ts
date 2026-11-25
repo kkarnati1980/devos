@@ -328,11 +328,15 @@ export async function probeExistingCard(db: any, projectId: string, since: Date,
 /** DEVOS-254 decision 4: the probe row's stage and its purge card's status, in one bounded read. */
 export async function probeCardOutcome(db: any, projectId: string, cardId: string, timeoutMs: number): Promise<CardOutcome> {
   return db.$transaction(async (tx: any) => {
-    const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true } });
+    const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true, archivedAt: true } });
     if (!p) throw new Error("probe-project-missing");
     const c = await tx.approval.findUnique({ where: { id: cardId }, select: { status: true, decidedAt: true, createdAt: true, projectId: true, action: true } });
     // Only this project's own purge card counts; anything else reads as missing.
-    const ok = c && c.projectId === projectId && c.action === "teardown.purge" && (CARD_STATUSES as readonly string[]).includes(String(c.status));
+    // Codex PR239-r6: and only while the row is still in the archive the card was raised for. A Restore clears
+    // `archived_at` and a new Archive sets a later one, so a tracked card older than the row's `archived_at` belongs to
+    // an earlier archive: it reads as missing, and the cycle ends as a failed card cycle, never `pass-card`.
+    const sameArchive = p.archivedAt instanceof Date && c?.createdAt instanceof Date && c.createdAt.getTime() >= p.archivedAt.getTime();
+    const ok = c && sameArchive && c.projectId === projectId && c.action === "teardown.purge" && (CARD_STATUSES as readonly string[]).includes(String(c.status));
     // Codex PR239-r3 (medium): the sweep purges under the newest approved purge card of the archive
     // (`Approvals.list`, createdAt desc), which may be a later twin of the tracked one. So the cards that count are
     // this project's approved `teardown.purge` cards on `project:<id>` raised at or after the tracked card (the same

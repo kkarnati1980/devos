@@ -248,11 +248,12 @@ test("raiseProbePurgeCard archives once, then raises the M2.5-b2 purge card unch
 });
 
 /** A fake db for the two bounded reads. */
-function db({ project = { stage: "archived" }, approval = null, count = 0 } = {}) {
+const ARCHIVED = new Date("2026-11-25T09:00:00Z");
+function db({ project = { stage: "archived", archivedAt: ARCHIVED }, approval = null, count = 0 } = {}) {
   const seen = {};
   const tx = {
     project: { findUnique: async (q) => { seen.project = q; return project; } },
-    approval: { findUnique: async (q) => { seen.approval = q; return approval; } },
+    approval: { findUnique: async (q) => { seen.approval = q; return approval; }, findMany: async () => [] },
     auditEvent: { count: async (q) => { seen.count = q; return count; } },
   };
   return { seen, $transaction: async (fn, o) => { seen.opts = o; return fn(tx); } };
@@ -260,7 +261,7 @@ function db({ project = { stage: "archived" }, approval = null, count = 0 } = {}
 
 test("probeCardOutcome reads only this project's own purge card; probeCardCycle reads the probe's phase log", async () => {
   const at = new Date("2026-11-25T10:00:00Z");
-  let x = db({ approval: { status: "approved", decidedAt: at, projectId: "p-1", action: "teardown.purge" } });
+  let x = db({ approval: { status: "approved", decidedAt: at, createdAt: at, projectId: "p-1", action: "teardown.purge" } });
   assert.deepEqual(await probeCardOutcome(x, "p-1", "c-1", 5000), { stage: "archived", card: "approved", decidedAt: at.toISOString(), byCard: false });
   assert.deepEqual(x.seen.approval.where, { id: "c-1" });
   assert.deepEqual(x.seen.opts, { timeout: 5000, maxWait: 5000 });
@@ -324,10 +325,10 @@ test("Codex PR239-r1: a retried card tick uses the card this archive already has
 test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's grant, and probeExistingCard is bounded", async () => {
   const created = new Date("2026-11-25T10:00:00Z");
   const card = { status: "approved", decidedAt: created, createdAt: created, projectId: "p-1", action: "teardown.purge" };
-  const run = async (decisions, approved = [{ id: "c-1", decidedAt: created }]) => {
+  const run = async (decisions, approved = [{ id: "c-1", decidedAt: created }], archivedAt = new Date("2026-11-25T09:00:00Z")) => {
     const seen = {};
     const tx = {
-      project: { findUnique: async () => ({ stage: "purged" }) },
+      project: { findUnique: async () => ({ stage: "purged", archivedAt }) },
       approval: { findUnique: async () => card, findMany: async (q) => { seen.a = q; return approved; } },
       policyDecision: { findMany: async (q) => { seen.q = q; return decisions; } },
     };
@@ -355,6 +356,12 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
   r = await run([mine], []);
   assert.equal(r.out.byCard, false);
   assert.equal(r.out.card, "approved");
+  // Codex PR239-r6: after a Restore and a new Archive, the tracked card is older than the row's archived_at: it reads
+  // as missing and nothing from the later archive counts, so the cycle can never end pass-card.
+  r = await run([twin], [{ id: "c-2", decidedAt: later }], new Date("2026-11-25T10:30:00Z"));
+  assert.deepEqual(r.out, { stage: "purged", card: "missing", decidedAt: null, byCard: false });
+  r = await run([mine], undefined, null);
+  assert.equal(r.out.card, "missing");
   const seen = {};
   const x = { $transaction: async (fn, o) => { seen.o = o; return fn({ approval: { findFirst: async (q) => { seen.q = q; return { id: "c-9" }; } } }); } };
   assert.equal(await probeExistingCard(x, "p-1", created, 5000), "c-9");
