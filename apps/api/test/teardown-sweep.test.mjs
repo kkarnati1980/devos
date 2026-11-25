@@ -747,3 +747,65 @@ test("M2.5-b5 decision 5 (Codex PR240-r2): a card written after the row moved to
   await assert.rejects(e.job.askPurge(P), /purge-card-stale-archive/);
   assert.equal((await e.purgeCards("pending")).length, 0);
 });
+
+test("M2.5-b5 decision 6 (Codex PR240-r3): a card whose fence re-read fails is expired; one whose expiry also fails is owed, never handed out, and retried", async () => {
+  const s = setup();
+  const project = s.job.d.project;
+  let readFails = false;
+  s.job.d.project = async (id) => { if (readFails) throw new Error("db blip"); return project(id); };
+  s.job.d.raise = ((raise) => async (c) => { const r = await raise(c); readFails = true; return r; })(s.job.d.raise);
+  // The re-read after the write fails: the card is expired at once and the daily run stays open.
+  await s.job.tick();
+  readFails = false;
+  assert.equal((await s.purgeCards("pending")).length, 0, "an unproven card is not left pending");
+  assert.equal((await s.purgeCards("expired")).length, 1);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.code === "purge-due"));
+  // The re-read and the expiry both fail: the card is owed its expiry.
+  const t = setup();
+  const tp = t.job.d.project;
+  const te = t.job.d.expire;
+  let tRead = false;
+  let tExp = 1;
+  t.job.d.project = async (id) => { if (tRead) { tRead = false; throw new Error("db blip"); } return tp(id); };
+  t.job.d.expire = async (ids, reason) => { if (tExp > 0) { tExp--; throw new Error("db blip"); } return te(ids, reason); };
+  let tOnce = true;
+  t.job.d.raise = ((raise) => async (c) => { const r = await raise(c); if (tOnce) { tOnce = false; tRead = true; } return r; })(t.job.d.raise);
+  await t.job.tick();
+  const owed = await t.purgeCards("pending");
+  assert.equal(owed.length, 1, "the expiry failed, the card is still pending");
+  assert.ok(t.logs.some((l) => l.msg === "teardown-card-expiry-failed" && l.approvalId === owed[0].id));
+  assert.equal(await t.job.pendingCard({ ...t.projects.get(P) }), null, "the panel never links the owed card");
+  // KK's early ask never reuses the owed card, and raises none beside it.
+  await assert.rejects(t.job.askPurge(P), /purge-card-unverified/);
+  // The next tick expires it first, then the still-open daily run raises a fresh card on a proven read.
+  t.advance(60_000);
+  await t.job.tick();
+  const pending = await t.purgeCards("pending");
+  assert.equal(pending.length, 1);
+  assert.notEqual(pending[0].id, owed[0].id);
+  assert.equal((await t.purgeCards("expired")).map((c) => c.id).includes(owed[0].id), true);
+  assert.equal(await t.job.pendingCard({ ...t.projects.get(P) }), pending[0].id);
+});
+
+test("M2.5-b5 decision 7 (Codex PR240-r3): a card expired early as stale does not use up the daily run's unanswered re-raise", async () => {
+  const s = setup();
+  // An early ask in the current period lands after a new archive (the fence expires it at once), twice.
+  for (let i = 0; i < 2; i++) {
+    const raise = s.job.d.raise;
+    s.job.d.raise = async (c) => { s.job.d.raise = raise; s.projects.get(P).archivedAt = new Date(s.now()); return raise(c); };
+    await assert.rejects(s.job.askPurge(P), /purge-card-stale-archive/);
+    s.advance(1000);
+  }
+  assert.equal((await s.purgeCards("expired")).length, 2);
+  // Both early expiries are in the current period, yet the daily run still raises its scheduled card.
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 1, "the stale expiries did not count as unanswered");
+  // Unanswered for its 7 days: it expires and is re-raised once, then nothing more (MAX_UNANSWERED = 2 still holds).
+  for (let i = 0; i < 3; i++) {
+    s.advance(7 * DAY + 60_000);
+    await s.job.tick();
+  }
+  const all = await s.purgeCards();
+  assert.equal(all.filter((c) => c.status === "pending").length, 0);
+  assert.equal(all.filter((c) => c.status === "expired").length, 4, "2 stale + 2 unanswered, no third raise");
+});

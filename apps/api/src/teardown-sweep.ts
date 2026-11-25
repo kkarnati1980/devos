@@ -53,6 +53,10 @@ export interface TeardownProject {
 const raisedThisArchive = (c: { createdAt: Date }, p: TeardownProject): boolean =>
   p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime();
 
+/** Decision 7: expired only after its whole 7-day window (closeRestored's cutoff), so KK had the chance to answer it. */
+const unanswered = (c: { createdAt: Date; decidedAt: Date | null }): boolean =>
+  c.decidedAt !== null && c.decidedAt.getTime() - c.createdAt.getTime() >= PURGE_CARD_WINDOW_MS;
+
 export interface PurgeResultLike {
   purged: boolean;
   report: { hits: readonly { provider: string; kind: string }[]; errors: readonly unknown[] };
@@ -212,6 +216,13 @@ export class TeardownSweepJob {
    * needs KK's approval before anything more is deleted.
    */
   private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string }>();
+  /**
+   * M2.5-b5 decision 6 (Codex PR240-r3): purge cards written but not proven to belong to the archive they were built
+   * for (the fence's re-read failed or found a new archive) whose expiry also failed, by card id → project id. Retried
+   * at the start of every tick; while one is owed, its project gets no card from either path and is never handed one.
+   * In memory: after a restart such a card ages out through the 7-day expiry (closeRestored).
+   */
+  private readonly unfenced = new Map<string, string>();
   private readonly now: () => number;
 
   constructor(private readonly d: TeardownSweepDeps) {
@@ -226,6 +237,7 @@ export class TeardownSweepJob {
       const daily = minute >= PURGE_DUE_MINUTE_IST && this.lastDailyDay !== day;
       if (daily) this.waitForDaily.clear();
       await this.deliverStops();
+      await this.expireUnfenced();
       await this.step("teardown-restored-pass-failed", () => this.closeRestored());
       await this.step("teardown-keep-pass-failed", () => this.keepArchivedPass());
       await this.step("teardown-approved-pass-failed", () => this.approvedPass());
@@ -406,6 +418,8 @@ export class TeardownSweepJob {
   private async raiseDueLocked(projectId: string): Promise<boolean> {
     const p = await this.d.project(projectId);
     if (!p || p.stage !== "archived" || !p.purgeAfter || p.purgeAfter.getTime() > this.now()) return false;
+    // Decision 6: a card still owed its expiry keeps this row unserved (the daily run stays open).
+    this.assertNoUnfenced(p.id);
     if (!(await this.shouldRaise(p))) return false;
     const card = purgeCard(p, await this.d.activeCounts(p.id));
     await this.d.lockHeld?.(p.id);
@@ -423,12 +437,38 @@ export class TeardownSweepJob {
     const raised = (await this.d.raise(card)) as { id?: unknown } | null;
     if (!raised || typeof raised.id !== "string") throw new Error("purge-card-not-raised");
     const id = raised.id;
-    const now = await this.d.project(p.id);
+    // Decision 6 (Codex PR240-r3): a re-read that fails proves nothing, so the card is expired as for a new archive.
+    let now: TeardownProject | null;
+    try {
+      now = await this.d.project(p.id);
+    } catch (e) {
+      await this.expireCard(id, p.id, "purge-card-unverified");
+      throw e;
+    }
     if (!now || now.stage !== "archived" || now.archivedAt?.getTime() !== p.archivedAt?.getTime()) {
-      await this.d.expire([id], "purge-card-stale-archive");
+      await this.expireCard(id, p.id, "purge-card-stale-archive");
       throw new Error("purge-card-stale-archive");
     }
     return { id };
+  }
+
+  /** Decision 6: expire a card the fence could not prove; one whose expiry fails is owed and retried every tick. */
+  private async expireCard(id: string, projectId: string, reason: string): Promise<void> {
+    this.unfenced.set(id, projectId);
+    try {
+      await this.d.expire([id], reason);
+      this.unfenced.delete(id);
+    } catch {
+      this.d.log({ level: "warn", msg: "teardown-card-expiry-failed", projectId, approvalId: id, code: reason });
+    }
+  }
+
+  private async expireUnfenced(): Promise<void> {
+    for (const [id, projectId] of [...this.unfenced]) await this.expireCard(id, projectId, "purge-card-unverified");
+  }
+
+  private assertNoUnfenced(projectId: string): void {
+    for (const pid of this.unfenced.values()) if (pid === projectId) throw new Error("purge-card-unverified");
   }
 
   /**
@@ -448,7 +488,9 @@ export class TeardownSweepJob {
     }
     const stops = await this.d.cards({ status: "pending", action: PURGE_STOPPED_ACTION, target: target(p.id), limit: 1 });
     if (stops.length) return false;
-    return period.filter((c) => c.status === "expired").length < MAX_UNANSWERED;
+    // Decision 7 (Codex PR240-r3): only a card KK left unanswered for its whole 7-day window counts against the
+    // re-raise; a card expired early (a stale or unproven card, a Restore) was never his to answer.
+    return period.filter((c) => c.status === "expired" && unanswered(c)).length < MAX_UNANSWERED;
   }
 
   /**
@@ -458,7 +500,7 @@ export class TeardownSweepJob {
   async pendingCard(p: TeardownProject): Promise<string | null> {
     if (p.stage !== "archived") return null;
     const pending = await this.d.cards({ status: "pending", action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE });
-    return pending.find((c) => c.projectId === p.id && raisedThisArchive(c, p))?.id ?? null;
+    return pending.find((c) => c.projectId === p.id && raisedThisArchive(c, p) && !this.unfenced.has(c.id))?.id ?? null;
   }
 
   /**
@@ -482,6 +524,8 @@ export class TeardownSweepJob {
     const p = await this.d.project(projectId);
     if (!p) return { ok: false, code: "project-not-found" };
     if (p.stage !== "archived" || !p.archivedAt) return { ok: false, code: "not_archived" };
+    // Decision 6: a card still owed its expiry is never handed to KK, and no new one is raised beside it.
+    this.assertNoUnfenced(p.id);
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
     const pending = cards.filter((c) => c.status === "pending");
     const current = pending.find((c) => raisedThisArchive(c, p));
