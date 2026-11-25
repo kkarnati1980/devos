@@ -450,7 +450,14 @@ export class TeardownSweepJob {
   }
 
   private async raiseStopped(p: TeardownProject, code: string): Promise<void> {
-    this.stopsOwed.set(p.id, { p, code });
+    // Decision 22 (Codex PR240-r18): a stop for an older archive never replaces one owed for a newer archive (a slow
+    // older purge's handler can arrive after the newer one's stop was owed); it is dropped, as in decision 18.
+    const owed = this.stopsOwed.get(p.id);
+    if (owed?.p.archivedAt && (!p.archivedAt || p.archivedAt.getTime() < owed.p.archivedAt.getTime())) {
+      this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "archive-superseded" });
+    } else {
+      this.stopsOwed.set(p.id, { p, code });
+    }
     await this.deliverStops();
   }
 

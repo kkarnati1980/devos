@@ -1209,3 +1209,22 @@ test("M2.5-b5 decision 21 (Codex PR240-r17): an older delivery never clears a ne
   assert.equal(cardArchive(stops[0]), p.archivedAt.toISOString());
   assert.match(stops[0].reason, /the leftover check still found resources of this project/);
 });
+
+test("M2.5-b5 decision 22 (Codex PR240-r18): a late stop for an older archive never replaces the newer archive's owed stop", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  const older = { ...p };
+  s.advance(60_000);
+  p.archivedAt = new Date(s.now());
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "leftover");
+  s.failRaise.n = 1;
+  await s.job.raiseStopped(older, "policy_denied");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "archive-superseded"));
+  await s.job.tick();
+  const stops = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(stops.length, 1, "the newer archive's stop is delivered");
+  assert.equal(cardArchive(stops[0]), p.archivedAt.toISOString());
+  assert.match(stops[0].reason, /the leftover check still found resources of this project/);
+});
