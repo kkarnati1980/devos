@@ -454,14 +454,16 @@ export class TeardownSweepJob {
       // never while this process is running a purge for the project (that purge holds the lock, maybe past the sweep's
       // limit, and the store queues waiters in process before its own lock timeout starts). The card is left for the
       // next tick, so one long purge never stalls the sweep for other projects.
-      if (!keepApplies(c, await this.d.project(projectId))) continue;
-      if (this.purging.has(projectId)) {
-        this.d.log({ level: "info", msg: "teardown-keep-deferred", projectId, approvalId: c.id, code: "purge-running" });
-        continue;
-      }
-      const keep = () => this.keepLocked(c, projectId);
-      const locked = this.d.locked;
+      // Decision 35 (Codex PR240-r31): the unlocked read is inside the per-card try, so a failed read skips this card
+      // only, never the rest of the batch.
       try {
+        if (!keepApplies(c, await this.d.project(projectId))) continue;
+        if (this.purging.has(projectId)) {
+          this.d.log({ level: "info", msg: "teardown-keep-deferred", projectId, approvalId: c.id, code: "purge-running" });
+          continue;
+        }
+        const keep = () => this.keepLocked(c, projectId);
+        const locked = this.d.locked;
         if (await (locked ? locked(projectId, keep) : keep())) this.d.log({ level: "info", msg: "teardown-keep-archived", projectId, approvalId: c.id });
       } catch {
         this.d.log({ level: "warn", msg: "teardown-keep-failed", projectId, approvalId: c.id, code: "teardown-keep-failed" });
@@ -552,14 +554,18 @@ export class TeardownSweepJob {
       // Decision 32 (Codex PR240-r28): likewise, a scheduled card whose purge date Keep archived moved after the
       // approved-card pass is denied by the authorizer (decision 30). That is KK's newer word, not a stop: no stop card
       // is raised, so none blocks the card for the new date. A re-read that fails raises the stop card as before.
-      if (due !== null && due !== (now.purgeAfter?.toISOString() ?? null)) {
+      // Decision 35 (Codex PR240-r31): only the purge's authorizer check (`policy_denied` or `approval_required`, thrown
+      // by purgeProject's `check` before any resource is read or deleted) proves no deletion ran. Any other stop (e.g.
+      // `ownership_mismatch` after a resource was deleted) is always reported, even if Keep archived moved the date.
+      const denied = stop.code === "policy_denied" || stop.code === "approval_required";
+      if (denied && due !== null && due !== (now.purgeAfter?.toISOString() ?? null)) {
         this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, approvalId, code: "purge-card-not-due" });
         return;
       }
       this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
       // Decision 34 (Codex PR240-r30): the stop carries the card's due date, so if the re-read above failed, delivery's
       // own re-read still drops a stop for a scheduled card whose date Keep archived moved.
-      await this.raiseStopped(p, code, due);
+      await this.raiseStopped(p, code, denied ? due : null);
       return;
     }
     // Retryable or unknown. With the grant spent, more deleting needs a new card (the daily run raises it); with the

@@ -1461,6 +1461,37 @@ test("M2.5-b5 decision 34 (Codex PR240-r30): a stop for a scheduled card whose d
   assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "purge-card-not-due"));
 });
 
+test("M2.5-b5 decision 35 (Codex PR240-r31): a stop after deletions ran is reported even when Keep archived moved the date", async () => {
+  const s = setup({ purgeImpl: async () => {
+    // A resource was deleted, then a later one failed its ownership check; Keep archived moved the date meanwhile.
+    s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+    throw new TeardownError("ownership_mismatch", false, "not ours");
+  } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  await s.job.tick();
+  assert.equal(s.calls.providerCalls, 1, "the purge got past its authorizer");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1, "KK gets the stop card");
+  assert.ok(!s.logs.some((l) => l.code === "purge-card-not-due" && l.msg === "teardown-purge-skipped"));
+});
+
+test("M2.5-b5 decision 35 (Codex PR240-r31): a failed project read skips only that rejection; later cards in the batch still move their dates", async () => {
+  const s = setup();
+  s.projects.set(Q, { id: Q, slug: "beta", stage: "archived", archivedAt: new Date(T0 - 30 * DAY), purgeAfter: new Date(T0 - 1) });
+  await s.job.tick();
+  const cards = await s.purgeCards("pending");
+  assert.equal(cards.length, 2);
+  s.advance(2 * DAY);
+  for (const c of cards) await s.approvals.reject(s.session, c.id);
+  const project = s.job.d.project;
+  const first = (await s.approvals.store.list({ status: "rejected", action: cards[0].action, limit: 10 }))[0].projectId;
+  s.job.d.project = async (id) => { if (id === first) throw new Error("db blip"); return project(id); };
+  await s.job.tick();
+  assert.deepEqual(s.calls.keep.map((k) => k.id), [first === P ? Q : P], "the other project's date moved");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-keep-failed" && l.projectId === first));
+});
+
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
   const s = setup();
   await s.job.tick();
