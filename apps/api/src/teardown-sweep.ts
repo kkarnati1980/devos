@@ -323,7 +323,8 @@ export class TeardownSweepJob {
    */
   private async closeRestored(): Promise<void> {
     // Decision 25 (Codex PR240-r20/r21): every pending card is read, page by page, not only the newest page.
-    const pending = await this.allPending(PURGE_ACTION);
+    const scan = await this.allPending(PURGE_ACTION);
+    const pending = scan.cards;
     const restored: string[] = [];
     const unanswered: string[] = [];
     const cutoff = this.now() - PURGE_CARD_WINDOW_MS;
@@ -338,10 +339,13 @@ export class TeardownSweepJob {
     }
     if (restored.length) await this.d.expire(restored, "project-not-archived");
     if (unanswered.length) await this.d.expire(unanswered, "purge-card-unanswered-7-days");
+    // Decision 27 (Codex PR240-r23): the resume point moves only after this batch's cleanup has succeeded.
+    this.commitScan(PURGE_ACTION, scan.next);
     // Decision 18 (Codex PR240-r14): a pending stop card that does not name the current archive (raised after a Restore,
     // or a Restore and a new Archive, slipped in before its write; or unstamped, from before decision 18) is closed
     // here, so KK is not left a stop prompt for an archive that has ended, and it never blocks the current one's card.
-    const stops = await this.allPending(PURGE_STOPPED_ACTION);
+    const stopScan = await this.allPending(PURGE_STOPPED_ACTION);
+    const stops = stopScan.cards;
     const ended: string[] = [];
     for (const c of stops) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
@@ -349,13 +353,14 @@ export class TeardownSweepJob {
       if (p && !raisedThisArchive(c, p)) ended.push(c.id);
     }
     if (ended.length) await this.d.expire(ended, "stop-card-archive-ended");
+    this.commitScan(PURGE_STOPPED_ACTION, stopScan.next);
   }
 
   /**
    * Decision 25 (Codex PR240-r21): the pending cards of one action across all projects, paged by the last card's id
    * (newest first), so a full first page of current cards never hides an older stale one. Bounded by CLEANUP_SCAN_MAX.
    */
-  private async allPending(action: string): Promise<PurgeCardLike[]> {
+  private async allPending(action: string): Promise<{ cards: PurgeCardLike[]; next: string | undefined }> {
     const out: PurgeCardLike[] = [];
     // Decision 26 (Codex PR240-r22): a scan that stops at the bound resumes on the next tick after the last card it
     // read, and starts again from the newest only once it reaches the end, so every pending card is reached in turn.
@@ -363,14 +368,16 @@ export class TeardownSweepJob {
     while (out.length < CLEANUP_SCAN_MAX) {
       const page = await this.d.cards({ status: "pending", action, cursor, limit: Math.min(CARD_PAGE, CLEANUP_SCAN_MAX - out.length) });
       out.push(...page);
-      if (page.length < CARD_PAGE) {
-        this.scanFrom.delete(action);
-        return out;
-      }
+      if (page.length < CARD_PAGE) return { cards: out, next: undefined };
       cursor = page[page.length - 1]!.id;
     }
-    this.scanFrom.set(action, cursor!);
-    return out;
+    return { cards: out, next: cursor };
+  }
+
+  /** Decision 27: set the action's resume point (undefined = start from the newest) once its batch is cleaned up. */
+  private commitScan(action: string, next: string | undefined): void {
+    if (next === undefined) this.scanFrom.delete(action);
+    else this.scanFrom.set(action, next);
   }
 
   /** 2. Decision (d): "Keep archived" on a card raised after `purge_after` moves `purge_after` by 30 days, once. */

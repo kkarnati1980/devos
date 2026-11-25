@@ -1109,6 +1109,31 @@ test("M2.5-b5 decision 26 (Codex PR240-r22): a cleanup scan that stops at its bo
   assert.equal((await s.approvals.store.get(staleStop.id)).status, "expired", "the next tick resumes and closes it");
 });
 
+test("M2.5-b5 decision 27 (Codex PR240-r23): a failed cleanup keeps its resume point, so the next tick re-reads the same batch", async () => {
+  const s = setup();
+  const old = { id: P, slug: "acme", archivedAt: new Date(T0 - 60 * DAY) };
+  s.advance(1);
+  for (let i = 0; i < CLEANUP_SCAN_MAX + 5; i++) {
+    const id = `66666666-6666-4666-8666-${String(i).padStart(12, "0")}`;
+    const at = new Date(T0 - DAY);
+    s.projects.set(id, { id, slug: `p${i}`, stage: "archived", archivedAt: at, purgeAfter: new Date(T0 + 29 * DAY) });
+    await s.approvals.raiseCard(purgeStoppedCard({ id, slug: `p${i}`, archivedAt: at }, "leftover", { github: 1 }));
+  }
+  // A stale stop card inside the first (newest) batch, and an expiry that fails once.
+  const staleStop = await s.approvals.raiseCard(purgeStoppedCard(old, "leftover", { github: 1 }));
+  const expire = s.job.d.expire;
+  let fail = 1;
+  s.job.d.expire = async (ids, reason) => {
+    if (reason === "stop-card-archive-ended" && fail-- > 0) throw new Error("db blip");
+    return expire(ids, reason);
+  };
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(staleStop.id)).status, "pending", "the failed expiry left it open");
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(staleStop.id)).status, "expired", "the next tick re-reads the same batch and closes it");
+});
+
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
   const s = setup();
   await s.job.tick();
