@@ -94,6 +94,14 @@ const raisedThisArchive = (c: { createdAt: Date; reason?: string | null }, p: Te
 const liveCard = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject): boolean => raisedThisArchive(c, p) && !dueMoved(c, p);
 
 /**
+ * Keep archived applies to a rejected card only while the project is archived, the card was raised at or after
+ * `purge_after` (a card raised before it, an early ask, leaves `purge_after` as it is; a moved `purge_after` is later
+ * than the card, so each rejection moves it once) and (decision 9, Codex PR240-r5) the card names the current archive.
+ */
+const keepApplies = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject | null): boolean =>
+  !!p && p.stage === "archived" && !!p.purgeAfter && !!p.archivedAt && c.createdAt.getTime() >= p.purgeAfter.getTime() && raisedThisArchive(c, p);
+
+/**
  * Decision 13: a card of an archive older than the project's `archivedAt` in this read (its stamp names an earlier
  * archive), or an unstamped card from before decision 8, which never purges.
  */
@@ -299,7 +307,7 @@ export class TeardownSweepJob {
    * dedupes a pending twin). In memory: after a restart the daily run raises a fresh purge card instead, which still
    * needs KK's approval before anything more is deleted.
    */
-  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string }>();
+  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string; due: string | null }>();
   /** Decision 26: where each action's cleanup scan resumes on the next tick (the last card id read at the bound). */
   private readonly scanFrom = new Map<string, string>();
   /**
@@ -442,6 +450,15 @@ export class TeardownSweepJob {
       // nothing), and a purge waits for the move (then reads the new date and denies the old card, decision 30). The
       // row is read under the lock and the lock is checked just before the write. A lock that times out or is lost
       // skips this card only; it stays rejected, so the next tick tries again.
+      // Decision 34 (Codex PR240-r30): the lock is taken only for a rejection that still applies on an unlocked read, and
+      // never while this process is running a purge for the project (that purge holds the lock, maybe past the sweep's
+      // limit, and the store queues waiters in process before its own lock timeout starts). The card is left for the
+      // next tick, so one long purge never stalls the sweep for other projects.
+      if (!keepApplies(c, await this.d.project(projectId))) continue;
+      if (this.purging.has(projectId)) {
+        this.d.log({ level: "info", msg: "teardown-keep-deferred", projectId, approvalId: c.id, code: "purge-running" });
+        continue;
+      }
       const keep = () => this.keepLocked(c, projectId);
       const locked = this.d.locked;
       try {
@@ -454,10 +471,7 @@ export class TeardownSweepJob {
 
   private async keepLocked(c: PurgeCardLike, projectId: string): Promise<boolean> {
     const p = await this.d.project(projectId);
-    // A card raised before purge_after (an early ask) leaves purge_after as it is; a moved purge_after is later than
-    // the card, so each rejection moves it once.
-    // Decision 9 (Codex PR240-r5): only a card naming the current archive moves its purge date.
-    if (!p || p.stage !== "archived" || !p.purgeAfter || !p.archivedAt || c.createdAt.getTime() < p.purgeAfter.getTime() || !raisedThisArchive(c, p)) return false;
+    if (!p || !keepApplies(c, p) || !p.purgeAfter || !p.archivedAt) return false;
     const from = p.purgeAfter;
     const base = Math.max(from.getTime(), (c.decidedAt ?? c.createdAt).getTime());
     await this.d.lockHeld?.(projectId);
@@ -543,7 +557,9 @@ export class TeardownSweepJob {
         return;
       }
       this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
-      await this.raiseStopped(p, code);
+      // Decision 34 (Codex PR240-r30): the stop carries the card's due date, so if the re-read above failed, delivery's
+      // own re-read still drops a stop for a scheduled card whose date Keep archived moved.
+      await this.raiseStopped(p, code, due);
       return;
     }
     // Retryable or unknown. With the grant spent, more deleting needs a new card (the daily run raises it); with the
@@ -564,14 +580,14 @@ export class TeardownSweepJob {
     await this.raiseStopped(p, code);
   }
 
-  private async raiseStopped(p: TeardownProject, code: string): Promise<void> {
+  private async raiseStopped(p: TeardownProject, code: string, due: string | null = null): Promise<void> {
     // Decision 22 (Codex PR240-r18): a stop for an older archive never replaces one owed for a newer archive (a slow
     // older purge's handler can arrive after the newer one's stop was owed); it is dropped, as in decision 18.
     const owed = this.stopsOwed.get(p.id);
     if (owed?.p.archivedAt && (!p.archivedAt || p.archivedAt.getTime() < owed.p.archivedAt.getTime())) {
       this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "archive-superseded" });
     } else {
-      this.stopsOwed.set(p.id, { p, code });
+      this.stopsOwed.set(p.id, { p, code, due });
     }
     await this.deliverStops();
   }
@@ -582,9 +598,17 @@ export class TeardownSweepJob {
         // Decision 18 (Codex PR240-r14): re-read before each try; a stop owed for an archive that has ended is dropped
         // (KK's newer word), never raised. A failed re-read keeps it owed. One that slips in after this read names its
         // archive, so it blocks nothing, and the tick's first pass closes it.
-        if (!sameArchive(o.p, await this.d.project(o.p.id))) {
+        const fresh = await this.d.project(o.p.id);
+        if (!sameArchive(o.p, fresh)) {
           this.dropOwed(id, o);
           this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
+          continue;
+        }
+        // Decision 34: a stop owed for a scheduled card whose purge date has since moved is KK's newer word (the
+        // authorizer's denial followed the move), so it is dropped, never raised.
+        if (o.due !== null && o.due !== (fresh?.purgeAfter?.toISOString() ?? null)) {
+          this.dropOwed(id, o);
+          this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "purge-card-not-due" });
           continue;
         }
         const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id));

@@ -1412,6 +1412,55 @@ test("M2.5-b5 decision 33 (Codex PR240-r29): Keep archived writes nothing when t
   assert.equal(s.calls.keep.length, 1, "the next tick moves the date once");
 });
 
+test("M2.5-b5 decision 34 (Codex PR240-r30): Keep archived never queues on the lock behind this process's running purge, nor for a rejection that no longer applies", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  s.advance(2 * DAY);
+  await s.approvals.reject(s.session, c.id);
+  const taken = [];
+  s.job.d.locked = (id) => { taken.push(id); return new Promise(() => {}); };
+  s.job.purging.add(P);
+  await s.job.tick();
+  assert.deepEqual(taken, [], "no lock is queued while the purge runs");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-keep-deferred" && l.code === "purge-running"));
+  assert.equal(s.calls.keep.length, 0);
+  // A rejection that no longer applies (the project was purged) takes no lock either.
+  s.job.purging.delete(P);
+  s.projects.get(P).stage = "purged";
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.deepEqual(taken, []);
+  // The purge ended with the project still archived: the next tick moves the date once.
+  s.projects.get(P).stage = "archived";
+  s.job.d.locked = serialLock().locked;
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1);
+});
+
+test("M2.5-b5 decision 34 (Codex PR240-r30): a stop for a scheduled card whose date moved is dropped at delivery when the handler's re-read failed", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const purge = s.job.d.purge;
+  const project = s.job.d.project;
+  let armed = false;
+  s.job.d.purge = async (...a) => {
+    s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+    try { return await purge(...a); } finally { armed = true; }
+  };
+  s.job.d.project = async (id) => {
+    if (armed) { armed = false; throw new Error("db blip"); }
+    return project(id);
+  };
+  await s.job.tick();
+  assert.equal(s.calls.providerCalls, 0, "nothing was deleted");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "no stop card");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "purge-card-not-due"));
+});
+
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
   const s = setup();
   await s.job.tick();
