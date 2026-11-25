@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { probeStep, PROBE_CARD_MAX_MS, PROBE_PHASE_MAX_MS, PROBE_SLUG } from "../dist/provision-probe.js";
-import { probeCardCycle, probeCardOutcome, raiseProbePurgeCard } from "../dist/provision-probe-purge.js";
+import { archiveUnderProbeGrant, probeActiveCounts, probeCardCycle, probeCardOutcome, raiseProbePurgeCard } from "../dist/provision-probe-purge.js";
 
 const ROWS = [
   { key: "github_repo", provider: "github", externalId: "1", name: "devos-probe-m24" },
@@ -207,11 +207,13 @@ test("a deploy that changes the fingerprint while KK's card waits does not end t
 test("raiseProbePurgeCard archives once, then raises the M2.5-b2 purge card unchanged with the counts", async () => {
   let stage = "live";
   const raised = [];
+  const AT = new Date("2026-11-25T10:00:00Z"), LATER = new Date("2026-11-25T10:00:01Z"), EARLIER = new Date("2026-11-20T00:00:00Z");
   const id = await raiseProbePurgeCard("p-1", {
     stage: async () => stage,
+    archivedAt: async () => AT,
     archive: async () => { stage = "archived"; },
     counts: async () => ({ github: 1, coolify: 3 }),
-    raise: async (c) => { raised.push(c); return { id: "card-9" }; },
+    raise: async (c) => { raised.push(c); return { id: "card-9", createdAt: LATER }; },
   });
   assert.equal(id, "card-9");
   assert.equal(raised.length, 1);
@@ -223,12 +225,16 @@ test("raiseProbePurgeCard archives once, then raises the M2.5-b2 purge card unch
   assert.match(c.reason, new RegExp(`^Purge project ${PROBE_SLUG}\\?`));
   // Already archived (a retried tick): no second archive.
   let archived = 0;
-  await raiseProbePurgeCard("p-1", { stage: async () => "archived", archive: async () => { archived++; }, counts: async () => ({}), raise: async () => ({ id: "card-9" }) });
+  await raiseProbePurgeCard("p-1", { stage: async () => "archived", archivedAt: async () => AT, archive: async () => { archived++; }, counts: async () => ({}), raise: async () => ({ id: "card-9", createdAt: AT }) });
   assert.equal(archived, 0);
   // An archive that did not reach `archived`, a purged row, or no id: no card is used.
-  await assert.rejects(raiseProbePurgeCard("p-1", { stage: async () => "live", archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "x" }) }), /probe-card-not-archived/);
-  await assert.rejects(raiseProbePurgeCard("p-1", { stage: async () => "purged", archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "x" }) }), /probe-card-already-purged/);
-  await assert.rejects(raiseProbePurgeCard("p-1", { stage: async () => "archived", archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "" }) }), /probe-card-not-raised/);
+  await assert.rejects(raiseProbePurgeCard("p-1", { stage: async () => "live", archive: async () => {}, archivedAt: async () => AT, counts: async () => ({}), raise: async () => ({ id: "x", createdAt: LATER }) }), /probe-card-not-archived/);
+  await assert.rejects(raiseProbePurgeCard("p-1", { stage: async () => "purged", archive: async () => {}, archivedAt: async () => AT, counts: async () => ({}), raise: async () => ({ id: "x", createdAt: LATER }) }), /probe-card-already-purged/);
+  await assert.rejects(raiseProbePurgeCard("p-1", { stage: async () => "archived", archive: async () => {}, archivedAt: async () => AT, counts: async () => ({}), raise: async () => ({ id: "", createdAt: LATER }) }), /probe-card-not-raised/);
+  // Pre-review 2: a pending twin from an earlier archive (or one with no times) is never used.
+  for (const [archivedAt, createdAt] of [[AT, EARLIER], [null, LATER], [AT, undefined]]) {
+    await assert.rejects(raiseProbePurgeCard("p-1", { stage: async () => "archived", archivedAt: async () => archivedAt, archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "old", createdAt }) }), /probe-card-stale/);
+  }
 });
 
 /** A fake db for the two bounded reads. */
@@ -258,4 +264,32 @@ test("probeCardOutcome reads only this project's own purge card; probeCardCycle 
   assert.equal(await probeCardCycle(x, "p-1", 5000), true);
   assert.deepEqual(x.seen.count.where, { projectId: "p-1", action: "provision.probe_phase", details: { path: ["result", "code"], equals: "pass-card" } });
   assert.equal(await probeCardCycle(db({ count: 1 }), "p-1", 5000), false);
+});
+
+test("pre-review 1: a failed cycle, card or not, is not due again before the 7 days (no purge on every check run)", async () => {
+  // A cleanup cycle (purge-pending) whose purge fails: before b4 it waited 7 days, and it still does.
+  const d = fake({ purge: async () => { d.calls.purge++; return { error: "purge-incomplete:leftover" }; } });
+  d.log.push({ cycle: 1, phase: "done", at: d.now().toISOString(), fingerprint: "fp-1", result: { ok: false, code: "purge-failed", detail: "purge-incomplete:leftover" } });
+  for (let i = 0; i < 8; i++) {
+    d.tick(6 * 3_600_000);
+    assert.equal((await probeStep(d)).code, "probed");
+  }
+  assert.equal(d.calls.purge, 0);
+  assert.equal(d.calls.provision, 0);
+});
+
+test("pre-review 6: the card cycle's Archive asks for the probe grant on teardown.archive only, and needs one", async () => {
+  const asked = [], used = [];
+  await archiveUnderProbeGrant({ findGrant: async (a) => { asked.push(a); return "g-1"; }, archive: async (g) => { used.push(g); } });
+  assert.deepEqual(asked, [["teardown.archive"]]);
+  assert.deepEqual(used, ["g-1"]);
+  await assert.rejects(archiveUnderProbeGrant({ findGrant: async () => null, archive: async () => { throw new Error("must not run"); } }), /probe-card-no-grant/);
+});
+
+test("pre-review 5: the card's counts are one bounded grouped count", async () => {
+  const seen = {};
+  const x = { $transaction: async (fn, o) => { seen.opts = o; return fn({ resource: { groupBy: async (q) => { seen.q = q; return [{ provider: "github", _count: { _all: 1 } }, { provider: "coolify", _count: { _all: 3 } }]; } } }); } };
+  assert.deepEqual(await probeActiveCounts(x, "p-1", 5000), { github: 1, coolify: 3 });
+  assert.deepEqual(seen.q, { by: ["provider"], where: { projectId: "p-1", status: "active" }, _count: { _all: true } });
+  assert.deepEqual(seen.opts, { timeout: 5000, maxWait: 5000 });
 });

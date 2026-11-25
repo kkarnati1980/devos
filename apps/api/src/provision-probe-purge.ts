@@ -324,12 +324,14 @@ export async function probeCardOutcome(db: any, projectId: string, cardId: strin
 
 export interface ProbePurgeCardDeps {
   stage(): Promise<string>;
+  /** The row's `archived_at` (pre-review 2: a card raised before it belongs to an earlier archive). */
+  archivedAt(): Promise<Date | null>;
   /** Archive under the probe's KK grant (`teardown.archive` only); called only when the row is not archived yet. */
   archive(): Promise<void>;
   /** The per-provider counts of the probe's active resources (the card's "what will be deleted"). */
   counts(): Promise<Record<string, number>>;
   /** `Approvals.raiseCard` (it dedupes a pending twin, so a retried tick gets the same card). */
-  raise(card: ReturnType<typeof purgeCard>): Promise<{ id: string }>;
+  raise(card: ReturnType<typeof purgeCard>): Promise<{ id: string; createdAt?: Date }>;
 }
 
 /**
@@ -344,5 +346,29 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   if ((await d.stage()) !== "archived") throw new Error("probe-card-not-archived");
   const card = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()));
   if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");
+  // Pre-review 2: `raiseCard` dedupes against a pending twin. One left from an earlier archive (the sweep was off and
+  // nothing expired it) would be skipped by the sweep (`card-before-archive`), so it is not used.
+  const archived = await d.archivedAt();
+  if (!(archived instanceof Date) || !(card.createdAt instanceof Date) || card.createdAt.getTime() < archived.getTime()) throw new Error("probe-card-stale");
   return card.id;
+}
+
+/**
+ * DEVOS-254 decision 3: the card cycle's Archive under the probe's KK grant, asked for `teardown.archive` only, so the
+ * probe grant is never presented for `teardown.purge` on this path (pre-review 6).
+ */
+export async function archiveUnderProbeGrant(d: { findGrant(actions: readonly string[]): Promise<string | null>; archive(grantId: string): Promise<void> }): Promise<void> {
+  const grant = await d.findGrant(["teardown.archive"]);
+  if (!grant) throw new Error("probe-card-no-grant");
+  await d.archive(grant);
+}
+
+/** Pre-review 5: the card's per-provider counts as one bounded grouped count (never every row). */
+export async function probeActiveCounts(db: any, projectId: string, timeoutMs: number): Promise<Record<string, number>> {
+  const rows: { provider: unknown; _count: { _all: number } }[] = await db.$transaction((tx: any) => tx.resource.groupBy({
+    by: ["provider"], where: { projectId, status: "active" }, _count: { _all: true },
+  }), { timeout: timeoutMs, maxWait: timeoutMs });
+  const out: Record<string, number> = {};
+  for (const r of rows) out[String(r.provider)] = r._count._all;
+  return out;
 }

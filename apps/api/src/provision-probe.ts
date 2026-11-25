@@ -132,9 +132,10 @@ function refusalOf(last: PhaseRecord): string | undefined {
 async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   if (last.fingerprint !== d.fingerprint) return true;
   if (d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS) return true;
-  // DEVOS-254 decision 1: the first card cycle is due on the next check run; a card cycle that failed waits the
-  // rules below (so a card is raised at most once per cycle, never on every check run).
-  if (!last.viaCard && (await isCardCycle(d))) return true;
+  // DEVOS-254 decision 1: the first card cycle is due on the next check run after a passed non-card cycle. A failed
+  // cycle, card or not, waits the rules below (pre-review 1: a failing cleanup purge must not repeat on every check
+  // run, spending KK's probe grant), so a card is raised at most once per cycle.
+  if (last.result?.ok === true && !last.viaCard && (await isCardCycle(d))) return true;
   // DEVOS-21: a cycle that only purged an earlier cycle's leftovers (its purge passed) tested nothing, so the real
   // cycle is due on the next check run. If that purge had failed, the code would be `purge-failed`, which waits
   // (except a provider refusal, part 13, below).

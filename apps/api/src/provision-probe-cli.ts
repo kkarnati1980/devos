@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -183,19 +183,16 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
             const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
             return raiseProbePurgeCard(p.id, {
               stage: () => probeStage(db, p.id, timeoutMs),
-              archive: async () => {
-                // Decision 3: the probe grant covers the archive only; the purge needs KK's card.
-                const grant = await findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, ["teardown.archive"]);
-                if (!grant) throw new Error("probe-card-no-grant");
-                const wr = await teardownWiring(k.provisionMod, k.teardownMod, { gh: k.gh, cf: k.cf, store: k.store, db, projectId: p.id, owner: k.owner, timeoutMs });
-                await k.teardownMod.archiveProject(p.id, { store: k.store, authorize: grantAuthorizer(k.policy, p.id, grant), ops: wr.ops });
-              },
-              counts: async () => {
-                const out: Record<string, number> = {};
-                const rows: { provider: unknown }[] = await db.$transaction((tx: any) => tx.resource.findMany({ where: { projectId: p.id, status: "active" }, select: { provider: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
-                for (const r of rows) out[String(r.provider)] = (out[String(r.provider)] ?? 0) + 1;
-                return out;
-              },
+              archivedAt: async () => (await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: p.id }, select: { archivedAt: true } }), { timeout: timeoutMs, maxWait: timeoutMs }))?.archivedAt ?? null,
+              // Decision 3: the probe grant covers the archive only; the purge needs KK's card.
+              archive: () => archiveUnderProbeGrant({
+                findGrant: (actions) => findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, actions),
+                archive: async (grant) => {
+                  const wr = await teardownWiring(k.provisionMod, k.teardownMod, { gh: k.gh, cf: k.cf, store: k.store, db, projectId: p.id, owner: k.owner, timeoutMs });
+                  await k.teardownMod.archiveProject(p.id, { store: k.store, authorize: grantAuthorizer(k.policy, p.id, grant), ops: wr.ops });
+                },
+              }),
+              counts: () => probeActiveCounts(db, p.id, timeoutMs),
               raise: (c) => approvals.raiseCard(c),
             });
           },
