@@ -1,7 +1,8 @@
 // DEVOS-234 (M2.4-d3c-2a, docs/modules/M2.4.md "M2.4-d3c-2 decisions"): the AT13 probe's purge through M2.5, as any
 // project would be purged: Archive, then Purge, on the production ops, scanners and preflight list, under the M1.7
 // policy with a KK grant (never `allowAll`, never a delete by name). Output is fixed codes only.
-import type { PurgeOutcome } from "./provision-probe.js";
+import { PROBE_SLUG, type CardOutcome, type PurgeOutcome } from "./provision-probe.js";
+import { purgeCard } from "./teardown-sweep.js";
 import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
 
 type Authorize = (action: string, resource: string) => Promise<"allow" | "deny" | "require_approval">;
@@ -290,4 +291,58 @@ export async function cycleStartWithCard(start: () => Promise<CycleStart>, raise
   } catch {
     return { blocked: "probe-purge-not-approved:card-failed" };
   }
+}
+
+/**
+ * DEVOS-254 decision 1: true while no probe cycle has ended `pass-card` (read on the probe's own phase log only), so
+ * the next cycle purges `devos-probe-m24` through KK's purge card (AT10). Once one has, cycles purge directly again.
+ */
+export async function probeCardCycle(db: any, projectId: string, timeoutMs: number): Promise<boolean> {
+  const n: number = await db.$transaction((tx: any) => tx.auditEvent.count({
+    where: { projectId, action: "provision.probe_phase", details: { path: ["result", "code"], equals: "pass-card" } },
+  }), { timeout: timeoutMs, maxWait: timeoutMs });
+  return n === 0;
+}
+
+const CARD_STATUSES = ["pending", "approved", "rejected", "expired"] as const;
+
+/** DEVOS-254 decision 4: the probe row's stage and its purge card's status, in one bounded read. */
+export async function probeCardOutcome(db: any, projectId: string, cardId: string, timeoutMs: number): Promise<CardOutcome> {
+  return db.$transaction(async (tx: any) => {
+    const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true } });
+    if (!p) throw new Error("probe-project-missing");
+    const c = await tx.approval.findUnique({ where: { id: cardId }, select: { status: true, decidedAt: true, projectId: true, action: true } });
+    // Only this project's own purge card counts; anything else reads as missing.
+    const ok = c && c.projectId === projectId && c.action === "teardown.purge" && (CARD_STATUSES as readonly string[]).includes(String(c.status));
+    return {
+      stage: String(p.stage),
+      card: ok ? (String(c.status) as CardOutcome["card"]) : "missing",
+      decidedAt: ok && c.decidedAt instanceof Date ? c.decidedAt.toISOString() : null,
+    };
+  }, { timeout: timeoutMs, maxWait: timeoutMs });
+}
+
+export interface ProbePurgeCardDeps {
+  stage(): Promise<string>;
+  /** Archive under the probe's KK grant (`teardown.archive` only); called only when the row is not archived yet. */
+  archive(): Promise<void>;
+  /** The per-provider counts of the probe's active resources (the card's "what will be deleted"). */
+  counts(): Promise<Record<string, number>>;
+  /** `Approvals.raiseCard` (it dedupes a pending twin, so a retried tick gets the same card). */
+  raise(card: ReturnType<typeof purgeCard>): Promise<{ id: string }>;
+}
+
+/**
+ * DEVOS-254 decision 3: Archive (unless archived), then raise the M2.5-b2 purge card unchanged (gate 5, `teardown.purge`,
+ * `project:<id>`, fixed wording). The probe never approves it and never purges under it: the sweep job does, once KK
+ * approves it in the inbox. Returns the card's id.
+ */
+export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDeps): Promise<string> {
+  const stage = await d.stage();
+  if (stage === "purged") throw new Error("probe-card-already-purged");
+  if (stage !== "archived") await d.archive();
+  if ((await d.stage()) !== "archived") throw new Error("probe-card-not-archived");
+  const card = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()));
+  if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");
+  return card.id;
 }

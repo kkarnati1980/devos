@@ -7,8 +7,13 @@ export const PROBE_SLUG = "devos-probe-m24";
 export const PROBE_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
 /** A run or purge still "in progress" after this long ends the cycle (`<phase>-timeout`), so a stuck provider never hides. */
 export const PROBE_PHASE_MAX_MS = 2 * 60 * 60 * 1000;
+/** DEVOS-254 decision 5: how long a card cycle waits for KK's answer (the card itself expires after 7 days). */
+export const PROBE_CARD_MAX_MS = 8 * 24 * 60 * 60 * 1000;
+/** DEVOS-254 decision 1: the result code of a cycle whose purge went through KK's approved purge card. */
+export const PASS_CARD = "pass-card";
 
-export const PHASES = ["run1", "inventory1", "run2", "inventory2", "assert", "purge", "done"] as const;
+// DEVOS-254 (M2.5-b4): `card` and `cardwait` run only in a card cycle (`viaCard`), between `assert` and `purge`.
+export const PHASES = ["run1", "inventory1", "run2", "inventory2", "assert", "card", "cardwait", "purge", "done"] as const;
 export type Phase = (typeof PHASES)[number];
 
 /** One inventory row, as AT13 compares it (key, provider, external id, name). */
@@ -23,11 +28,17 @@ export interface PhaseRecord {
   inventory1?: InventoryRow[];
   /** DEVOS-21 part 13: the provider refusal (`purge-permission:<provider>/<kind>…`) the cycle before this one ended with, if any. */
   refusalRetry?: string;
+  /** DEVOS-254: this cycle purges through KK's purge card (AT10), set when the cycle starts. */
+  viaCard?: boolean;
+  /** DEVOS-254: the purge card the `card` phase raised. */
+  cardId?: string;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
 }
 
 export type RunOutcome = "done" | "in_progress" | { error: string };
 export type PurgeOutcome = "done" | "in_progress" | { error: string };
+/** DEVOS-254 decision 4: the probe row's stage and the purge card's status (`missing` when the card is gone). */
+export interface CardOutcome { stage: string; card: "pending" | "approved" | "rejected" | "expired" | "missing"; decidedAt?: string | null }
 
 export interface ProbeDeps {
   /** null when the sweep is off (provisionConfig / vault): the probe is skipped. */
@@ -52,6 +63,12 @@ export interface ProbeDeps {
    * after that cycle ended starts the next cycle at once. Absent means the 7-day rule alone.
    */
   credentialsUpdatedAt?(): Promise<string | null>;
+  /** DEVOS-254 decision 1: true while no cycle has ended `pass-card`, so the next cycle purges through KK's card. */
+  cardCycle?(): Promise<boolean>;
+  /** DEVOS-254 decision 3: archive the probe project (unless archived) and raise the M2.5-b2 purge card; its id. */
+  raisePurgeCard?(): Promise<string>;
+  /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
+  cardOutcome?(cardId: string): Promise<CardOutcome>;
   fingerprint: string;
   now(): Date;
 }
@@ -115,6 +132,9 @@ function refusalOf(last: PhaseRecord): string | undefined {
 async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   if (last.fingerprint !== d.fingerprint) return true;
   if (d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS) return true;
+  // DEVOS-254 decision 1: the first card cycle is due on the next check run; a card cycle that failed waits the
+  // rules below (so a card is raised at most once per cycle, never on every check run).
+  if (!last.viaCard && (await isCardCycle(d))) return true;
   // DEVOS-21: a cycle that only purged an earlier cycle's leftovers (its purge passed) tested nothing, so the real
   // cycle is due on the next check run. If that purge had failed, the code would be `purge-failed`, which waits
   // (except a provider refusal, part 13, below).
@@ -135,6 +155,14 @@ async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   const t = u === null ? NaN : Date.parse(u);
   return Number.isFinite(t) && t > Date.parse(last.at);
 }
+
+/** DEVOS-254 decision 1: a read that throws, or a probe without the card wiring, is a normal cycle. */
+async function isCardCycle(d: ProbeDeps): Promise<boolean> {
+  if (!d.cardCycle || !d.raisePurgeCard || !d.cardOutcome) return false;
+  try { return (await d.cardCycle()) === true; } catch { return false; }
+}
+
+const CARD_WORD = /^[a-z_]{1,20}$/;
 
 /** Runs one effect; a throw becomes `{ thrown: true }` (its message is never kept: it may quote a provider body). */
 async function attempt<T>(fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false }> {
@@ -164,7 +192,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       await d.record({ cycle, phase: "purge", at: at(), fingerprint: d.fingerprint, ...mark, result: { ok: false, code: "previous-purge-pending" } });
       return { exit: 3, phase: "purge", cycle, code: "in_progress" };
     }
-    await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint, ...mark });
+    const card = (await isCardCycle(d)) ? { viaCard: true } : {};
+    await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint, ...mark, ...card });
     return { exit: 3, phase: "run1", cycle, code: "in_progress" };
   }
   if (last.phase === "done") {
@@ -191,8 +220,9 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail, ...why };
   };
 
-  // Pre-review L3: a deploy that changed the provisioning code mid-cycle makes the compare meaningless.
-  if (last.fingerprint !== d.fingerprint && phase !== "purge") return toPurge(failed("fingerprint-changed"));
+  // Pre-review L3: a deploy that changed the provisioning code mid-cycle makes the compare meaningless. DEVOS-254
+  // decision 6: the card phases come after the compare, so a deploy while KK's card waits does not end the cycle.
+  if (last.fingerprint !== d.fingerprint && phase !== "purge" && phase !== "card" && phase !== "cardwait") return toPurge(failed("fingerprint-changed"));
 
   switch (phase) {
     case "run1":
@@ -222,7 +252,40 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     case "assert": {
       const r = await attempt(() => d.liveAsserts());
       if (!r.ok) return toPurge(failed("live-assert-failed", "error"));
-      return r.value.length ? toPurge(failed("live-assert-failed", r.value.join(","))) : advance();
+      if (r.value.length) return toPurge(failed("live-assert-failed", r.value.join(",")));
+      // DEVOS-254 decision 2: only a card cycle goes through `card`; any other cycle purges at once, as before.
+      if (last.viaCard) return advance();
+      await d.record({ ...last, phase: "purge", at: at() });
+      return { exit: 3, phase: "purge", cycle, code: "in_progress" };
+    }
+    case "card": {
+      // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
+      if (!d.raisePurgeCard) return toPurge(failed("card-not-wired"));
+      const r = await attempt(() => d.raisePurgeCard!());
+      if (!r.ok || typeof r.value !== "string" || r.value === "") return toPurge(failed("card-raise-failed"));
+      await d.record({ ...last, phase: "cardwait", at: at(), cardId: r.value });
+      return { exit: 3, phase: "cardwait", cycle, code: "in_progress" };
+    }
+    case "cardwait": {
+      // Decisions 4 and 5: wait for KK's answer and the sweep's purge; every other end is purged by the probe.
+      if (!d.cardOutcome || !last.cardId) return toPurge(failed("card-not-wired"));
+      const cardId = last.cardId;
+      const late = d.now().getTime() - Date.parse(last.at) >= PROBE_CARD_MAX_MS;
+      const wait = (detail: string): ProbeTick => ({ exit: 3, phase, cycle, code: "in_progress", detail });
+      const r = await attempt(() => d.cardOutcome!(cardId));
+      if (!r.ok) return late ? toPurge(failed("card-timeout", "error")) : wait("card-unreadable");
+      const o = r.value;
+      // AT10: purged by the sweep under KK's approved card. A purge with no approved card is not that proof.
+      if (o.stage === "purged") return o.card === "approved" ? finish(true, PASS_CARD) : finish(false, "card-ended", `${CARD_WORD.test(o.card) ? o.card : "unknown"}:purged`);
+      if (o.stage === "archived" && o.card === "pending") return late ? toPurge(failed("card-timeout")) : wait("awaiting-card");
+      if (o.stage === "archived" && o.card === "approved") {
+        const t = typeof o.decidedAt === "string" ? Date.parse(o.decidedAt) : NaN;
+        const purging = Number.isFinite(t) && d.now().getTime() - t < PROBE_PHASE_MAX_MS;
+        return purging && !late ? wait("card-approved") : toPurge(failed("card-purge-unfinished"));
+      }
+      if (o.card === "rejected" || o.card === "expired") return toPurge(failed(`card-${o.card}`));
+      const words = [o.card, o.stage].map((w) => (typeof w === "string" && CARD_WORD.test(w) ? w : "unknown"));
+      return toPurge(failed("card-ended", words.join(":")));
     }
     case "purge": {
       const r = await attempt(() => d.purge());

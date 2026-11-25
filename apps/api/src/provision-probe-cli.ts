@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -176,6 +176,30 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               return raiseProbeGrantCard(p.id, new Date(), { list: (f) => approvals.store.list(f), raise: (c) => approvals.raiseCard(c) });
             },
           ),
+          // DEVOS-254 (AT10): one cycle purges through KK's gate-5 purge card and the sweep job, not the probe grant.
+          cardCycle: () => probeCardCycle(db, p.id, timeoutMs),
+          raisePurgeCard: async () => {
+            const k = w.purge;
+            const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
+            return raiseProbePurgeCard(p.id, {
+              stage: () => probeStage(db, p.id, timeoutMs),
+              archive: async () => {
+                // Decision 3: the probe grant covers the archive only; the purge needs KK's card.
+                const grant = await findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, ["teardown.archive"]);
+                if (!grant) throw new Error("probe-card-no-grant");
+                const wr = await teardownWiring(k.provisionMod, k.teardownMod, { gh: k.gh, cf: k.cf, store: k.store, db, projectId: p.id, owner: k.owner, timeoutMs });
+                await k.teardownMod.archiveProject(p.id, { store: k.store, authorize: grantAuthorizer(k.policy, p.id, grant), ops: wr.ops });
+              },
+              counts: async () => {
+                const out: Record<string, number> = {};
+                const rows: { provider: unknown }[] = await db.$transaction((tx: any) => tx.resource.findMany({ where: { projectId: p.id, status: "active" }, select: { provider: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
+                for (const r of rows) out[String(r.provider)] = (out[String(r.provider)] ?? 0) + 1;
+                return out;
+              },
+              raise: (c) => approvals.raiseCard(c),
+            });
+          },
+          cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
           // DEVOS-21: a failed cycle re-runs once KK saves a new provider token (metadata read only).
           credentialsUpdatedAt: () => probeCredentialsUpdatedAt(w.vault),
           fingerprint: await probeFingerprint(fileURLToPath(root)),
