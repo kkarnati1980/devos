@@ -10,6 +10,7 @@ import { Approvals, MemoryApprovalStore, parseCard } from "../dist/approvals.js"
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
+  cardArchive,
 } from "../dist/teardown-sweep.js";
 import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
@@ -39,10 +40,10 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
   const counts = { [P]: { github: 2, coolify: 5 } };
   const calls = { purge: [], providerCalls: 0, keep: [] };
   const logs = [];
-  const purge = async (projectId, grantId, cardCreatedAt) => {
+  const purge = async (projectId, grantId, card) => {
     calls.purge.push({ projectId, grantId });
     // The real purge checks `teardown.purge` once before any provider call (M2.5-a1), with the production authorizer.
-    const d = await purgeCardAuthorizer(engine, projectId, grantId, cardCreatedAt, async () => projects.get(projectId)?.archivedAt ?? null)("teardown.purge", `project:${projectId}`);
+    const d = await purgeCardAuthorizer(engine, projectId, grantId, card, async () => projects.get(projectId)?.archivedAt ?? null)("teardown.purge", `project:${projectId}`);
     if (d !== "allow") throw new TeardownError("approval_required", false, "approval needed");
     calls.providerCalls++;
     if (purgeImpl) return purgeImpl(projectId);
@@ -408,7 +409,7 @@ test("pre-review r2 1: observe mode or an allow rule never purges un-gated; one 
 test("pre-review r2 2: the authorizer refuses a card older than archived_at, re-read when the purge asks", async () => {
   const s = setup();
   let archivedAt = new Date(T0);
-  const auth = purgeCardAuthorizer(s.engine, P, "00000000-0000-4000-8000-0000000000ff", new Date(T0 - 1), async () => archivedAt);
+  const auth = purgeCardAuthorizer(s.engine, P, "00000000-0000-4000-8000-0000000000ff", { createdAt: new Date(T0 - 1), archive: new Date(T0).toISOString() }, async () => archivedAt);
   assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
   assert.equal(await auth("teardown.archive", `project:${P}`), "deny");
   archivedAt = null;
@@ -534,7 +535,7 @@ test("M2.5-b3: unknown and not-archived projects are refused; a pending card fro
 function askHarness(purgeImpl) {
   const now = T0;
   const p = { id: P, slug: "acme", stage: "archived", archivedAt: new Date(T0 - 2 * DAY), purgeAfter: new Date(T0 + 28 * DAY) };
-  const approved = { id: "33333333-2222-4333-8444-555555555555", status: "approved", action: PURGE_ACTION, target: `project:${P}`, projectId: P, createdAt: new Date(T0 - DAY), decidedAt: new Date(T0 - DAY) };
+  const approved = { id: "33333333-2222-4333-8444-555555555555", status: "approved", action: PURGE_ACTION, target: `project:${P}`, projectId: P, createdAt: new Date(T0 - DAY), decidedAt: new Date(T0 - DAY), reason: `Purge? Archive ${p.archivedAt.toISOString()}.` };
   const cards = [approved];
   const raised = [];
   const job = new TeardownSweepJob({
@@ -808,4 +809,36 @@ test("M2.5-b5 decision 7 (Codex PR240-r3): a card expired early as stale does no
   const all = await s.purgeCards();
   assert.equal(all.filter((c) => c.status === "pending").length, 0);
   assert.equal(all.filter((c) => c.status === "expired").length, 4, "2 stale + 2 unanswered, no third raise");
+});
+
+test("M2.5-b5 decision 8 (Codex PR240-r4): a card is bound to the archive it names; one built for an earlier archive never purges, even approved", async () => {
+  // The fence's re-read and expiry both fail; KK approves the stale card from the inbox; then the process restarts.
+  const s = setup();
+  const raise = s.job.d.raise;
+  s.job.d.raise = async (c) => {
+    s.job.d.raise = raise;
+    // Restore and a new Archive land before the write: the card names the old archive.
+    s.projects.get(P).archivedAt = new Date(s.now() - 1);
+    return raise(c);
+  };
+  const expire = s.job.d.expire;
+  s.job.d.expire = async () => { throw new Error("db blip"); };
+  await s.job.tick();
+  s.job.d.expire = expire;
+  const [stale] = await s.purgeCards("pending");
+  assert.ok(stale, "the stale card is still pending (its expiry failed)");
+  assert.notEqual(cardArchive(stale), s.projects.get(P).archivedAt.toISOString());
+  await approve(s, stale.id);
+  // A fresh job (a restart: nothing in memory) never purges on it, and the authorizer itself refuses it.
+  const fresh = new TeardownSweepJob(s.job.d);
+  s.advance(60_000);
+  await fresh.tick();
+  assert.equal(s.calls.providerCalls, 0, "no provider call on a card for an earlier archive");
+  const grant = [...s.policyStore.grants].find((g) => g.approvalId === stale.id);
+  const auth = purgeCardAuthorizer(s.engine, P, grant.id, { createdAt: stale.createdAt, archive: cardArchive(stale) }, async () => s.projects.get(P).archivedAt);
+  assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
+  // The current archive still gets its own card, which names it.
+  const pending = await s.purgeCards("pending");
+  assert.equal(pending.length, 1);
+  assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString());
 });
