@@ -1176,3 +1176,36 @@ test("M2.5-b5 decision 20 (Codex PR240-r16): a stop raise deduplicated onto a ne
   assert.equal((await s.approvals.store.get(newer.id)).status, "pending", "still open on the next tick");
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
 });
+
+test("M2.5-b5 decision 21 (Codex PR240-r17): an older delivery never clears a newer archive's owed stop", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  s.failRaise.n = 1;
+  await s.job.tick();
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "the old archive's stop is owed");
+  // Restore and a new Archive; the old delivery's re-read is slow, and meanwhile a late purge owes the new archive's stop.
+  const p = s.projects.get(P);
+  s.advance(60_000);
+  p.archivedAt = new Date(s.now());
+  const read = s.job.d.project;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let first = true;
+  s.job.d.project = async (id) => { if (first) { first = false; await gate; } return read(id); };
+  const tick = s.job.tick();
+  await new Promise((r) => setImmediate(r));
+  s.failRaise.n = 1;
+  const late = s.job.raiseStopped({ ...p }, "leftover");
+  release();
+  await Promise.all([tick, late]);
+  s.job.d.project = read;
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
+  s.advance(60_000);
+  await s.job.tick();
+  const stops = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(stops.length, 1, "the new archive's stop is still delivered");
+  assert.equal(cardArchive(stops[0]), p.archivedAt.toISOString());
+  assert.match(stops[0].reason, /the leftover check still found resources of this project/);
+});

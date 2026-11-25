@@ -461,7 +461,7 @@ export class TeardownSweepJob {
         // (KK's newer word), never raised. A failed re-read keeps it owed. One that slips in after this read names its
         // archive, so it blocks nothing, and the tick's first pass closes it.
         if (!sameArchive(o.p, await this.d.project(o.p.id))) {
-          this.stopsOwed.delete(id);
+          this.dropOwed(id, o);
           this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
           continue;
         }
@@ -477,7 +477,7 @@ export class TeardownSweepJob {
         if (!this.stopServes(raised, card)) {
           if (typeof (raised as { reason?: unknown } | null)?.reason !== "string") throw new Error("stop-card-not-raised");
           if (!twinOlder(raised, o.p)) {
-            this.stopsOwed.delete(id);
+            this.dropOwed(id, o);
             this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
             continue;
           }
@@ -485,11 +485,19 @@ export class TeardownSweepJob {
           raised = await this.d.raise(card);
           if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
         }
-        this.stopsOwed.delete(id);
+        this.dropOwed(id, o);
       } catch {
         this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: o.p.id, code: o.code });
       }
     }
+  }
+
+  /**
+   * Decision 21 (Codex PR240-r17): a delivery clears only the stop it read. A purge that ends past its limit can owe a
+   * stop for a newer archive while an older delivery is still awaiting its read; that newer entry stays owed.
+   */
+  private dropOwed(id: string, o: { p: TeardownProject; code: string }): void {
+    if (this.stopsOwed.get(id) === o) this.stopsOwed.delete(id);
   }
 
   /** Decision 19: the stored stop card names the same archive as the one built (a twin of another archive does not). */
