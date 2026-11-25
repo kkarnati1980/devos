@@ -842,3 +842,36 @@ test("M2.5-b5 decision 8 (Codex PR240-r4): a card is bound to the archive it nam
   assert.equal(pending.length, 1);
   assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString());
 });
+
+test("M2.5-b5 decision 9 (Codex PR240-r5): a pending stale card is expired by the next tick, even after a restart; rejecting one never moves purge_after", async () => {
+  const s = setup();
+  const raise = s.job.d.raise;
+  s.job.d.raise = async (c) => { s.job.d.raise = raise; s.projects.get(P).archivedAt = new Date(s.now() - 1); return raise(c); };
+  const expire = s.job.d.expire;
+  s.job.d.expire = async () => { throw new Error("db blip"); };
+  await s.job.tick();
+  s.job.d.expire = expire;
+  const [stale] = await s.purgeCards("pending");
+  assert.ok(stale);
+  // A restart: the owed list is gone; the next tick still expires the stale card and raises the current one.
+  const fresh = new TeardownSweepJob(s.job.d);
+  s.advance(60_000);
+  await fresh.tick();
+  const pending = await s.purgeCards("pending");
+  assert.equal(pending.length, 1);
+  assert.notEqual(pending[0].id, stale.id);
+  assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString());
+  // KK rejects a stale card (one left from before): purge_after stays as it is.
+  const t = setup();
+  const traise = t.job.d.raise;
+  t.job.d.raise = async (c) => { t.job.d.raise = traise; t.projects.get(P).archivedAt = new Date(t.now() - 1); return traise(c); };
+  t.job.d.expire = async () => { throw new Error("db blip"); };
+  await t.job.tick();
+  const [old] = await t.purgeCards("pending");
+  await t.approvals.reject(t.session, old.id);
+  const before = t.projects.get(P).purgeAfter.getTime();
+  t.advance(60_000);
+  await new TeardownSweepJob({ ...t.job.d, listDue: async () => [] }).tick();
+  assert.equal(t.projects.get(P).purgeAfter.getTime(), before, "a stale card's rejection does not move purge_after");
+  assert.equal(t.calls.keep.length, 0);
+});

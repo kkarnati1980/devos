@@ -287,6 +287,9 @@ export class TeardownSweepJob {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
       const p = await this.d.project(c.projectId);
       if (p && p.stage !== "archived") restored.push(c.id);
+      // Decision 9 (Codex PR240-r5): a pending card that does not name the current archive (a stale card whose fence
+      // expiry failed, also after a restart) is expired here, so it never blocks the current archive's card.
+      else if (p && !raisedThisArchive(c, p)) restored.push(c.id);
       else if (c.createdAt.getTime() <= cutoff) unanswered.push(c.id);
     }
     if (restored.length) await this.d.expire(restored, "project-not-archived");
@@ -301,7 +304,8 @@ export class TeardownSweepJob {
       const p = await this.d.project(c.projectId);
       // A card raised before purge_after (an early ask) leaves purge_after as it is; a moved purge_after is later than
       // the card, so each rejection moves it once.
-      if (!p || p.stage !== "archived" || !p.purgeAfter || c.createdAt.getTime() < p.purgeAfter.getTime()) continue;
+      // Decision 9 (Codex PR240-r5): only a card naming the current archive moves its purge date.
+      if (!p || p.stage !== "archived" || !p.purgeAfter || c.createdAt.getTime() < p.purgeAfter.getTime() || !raisedThisArchive(c, p)) continue;
       const from = p.purgeAfter;
       const base = Math.max(from.getTime(), (c.decidedAt ?? c.createdAt).getTime());
       if (await this.d.keepArchived(p.id, from, new Date(base + KEEP_ARCHIVED_MS), c.id)) {
