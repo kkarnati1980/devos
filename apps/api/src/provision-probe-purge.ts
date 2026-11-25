@@ -341,6 +341,30 @@ export async function probeExistingCard(db: any, projectId: string, since: Date,
   return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
 }
 
+/** Codex PR239-r15: the fixed reason the probe gives when it expires its own purge cards. */
+export const PROBE_CARD_EXPIRE_REASON = "AT13 probe: purged by the probe itself, or superseded by a later archive (DEVOS-254)";
+
+/**
+ * Codex PR239-r15 (medium): expire the probe project's pending `teardown.purge` cards on `project:<id>` (only those
+ * raised before `before`, when given) through `Approvals.expireCardsById`, then read again: resolves only when none is
+ * left pending, so a caller never purges, or raises, past a pending card. Bounded reads (ADR-0011 §9), at most 50 ids.
+ */
+export async function expireProbePurgeCards(db: any, projectId: string, timeoutMs: number, expire: (ids: string[], reason: string) => Promise<string[]>, before?: Date): Promise<void> {
+  const pending = async (): Promise<string[]> => {
+    const rows: { id: unknown }[] = await db.$transaction((tx: any) => tx.approval.findMany({
+      where: { projectId, action: "teardown.purge", target: `project:${projectId}`, status: "pending", ...(before ? { createdAt: { lt: before } } : {}) },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      select: { id: true },
+      take: 50,
+    }), { timeout: timeoutMs, maxWait: timeoutMs });
+    return rows.map((r) => r.id).filter((id): id is string => typeof id === "string" && id !== "");
+  };
+  const ids = await pending();
+  if (!ids.length) return;
+  await expire(ids, PROBE_CARD_EXPIRE_REASON);
+  if ((await pending()).length) throw new Error("probe-card-still-pending");
+}
+
 /** DEVOS-254 decision 4: the probe row's stage and its purge card's status, in one bounded read. */
 export async function probeCardOutcome(db: any, projectId: string, cardId: string, timeoutMs: number): Promise<CardOutcome> {
   return db.$transaction(async (tx: any) => {
@@ -410,6 +434,11 @@ export interface ProbePurgeCardDeps {
    * only before a new card is raised, never when this archive already has one (a retried tick keeps its card).
    */
   outlasts(): Promise<boolean>;
+  /**
+   * Codex PR239-r15: expire this project's pending purge cards raised before `before` (an earlier archive's), so
+   * `raiseCard`'s pending-twin dedupe cannot hand back a stale card (`probe-card-stale`). Throws when one stays pending.
+   */
+  expireStale(before: Date): Promise<void>;
 }
 
 /** Decision 11: no new card was raised, because the probe grant would lapse before the probe could purge after it. */
@@ -438,6 +467,7 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   let lasts = false;
   try { lasts = (await d.outlasts()) === true; } catch { lasts = false; }
   if (!lasts) return CARD_GRANT_SHORT;
+  await d.expireStale(since);
   const card = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()));
   if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");
   // Pre-review 2: `raiseCard` dedupes against a pending twin. One left from an earlier archive (the sweep was off and

@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { probeStep, PROBE_CARD_MAX_MS, PROBE_CARD_PURGE_ROOM_MS, PROBE_CARD_RAISE_GRANT_MS, PROBE_CARD_START_GRANT_MS, PROBE_PHASE_MAX_MS, PROBE_SLUG } from "../dist/provision-probe.js";
-import { CARD_GRANT_SHORT, archiveUnderProbeGrant, probeActiveCounts, probeCardCycle, probeCardOutcome, probeExistingCard, raiseProbePurgeCard } from "../dist/provision-probe-purge.js";
+import { CARD_GRANT_SHORT, archiveUnderProbeGrant, probeActiveCounts, probeCardCycle, probeCardOutcome, probeExistingCard, raiseProbePurgeCard, expireProbePurgeCards, PROBE_CARD_EXPIRE_REASON } from "../dist/provision-probe-purge.js";
 
 const ROWS = [
   { key: "github_repo", provider: "github", externalId: "1", name: "devos-probe-m24" },
@@ -32,6 +32,7 @@ function fake(over = {}) {
     raisePurgeCard: async () => { calls.raise++; return "card-1"; },
     // Codex PR239-r7: the probe grant's expiry; by default it outlasts any card wait.
     grantUntil: Infinity,
+    expirePurgeCards: async () => { calls.expire = (calls.expire ?? 0) + 1; },
     cardGrantOutlasts: async (until) => { calls.grantCheck = (calls.grantCheck ?? 0) + 1; return until.getTime() < d.grantUntil; },
     cardOutcome: async (id) => { calls.outcome++; assert.equal(id, "card-1"); return { stage: state.stage, card: state.card, decidedAt: state.decidedAt, byCard: state.byCard, raisedAt: state.raisedAt }; },
     ...over,
@@ -136,7 +137,7 @@ test("Codex PR239-r8: raiseProbePurgeCard checks the grant only before a new car
   const AT = new Date("2026-11-25T09:00:00Z");
   const calls = { outlasts: 0, raise: 0, archive: 0 };
   const base = (over) => ({
-    stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, counts: async () => ({}),
+    stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, counts: async () => ({}), expireStale: async () => {},
     archive: async () => { calls.archive++; }, raise: async () => { calls.raise++; return { id: "card-new", createdAt: AT }; },
     outlasts: async () => { calls.outlasts++; return false; }, ...over,
   });
@@ -366,7 +367,7 @@ test("raiseProbePurgeCard archives once, then raises the M2.5-b2 purge card unch
   let stage = "live";
   const raised = [];
   const AT = new Date("2026-11-25T10:00:00Z"), LATER = new Date("2026-11-25T10:00:01Z"), EARLIER = new Date("2026-11-20T00:00:00Z");
-  const id = await raiseProbePurgeCard("p-1", { outlasts: async () => true,
+  const id = await raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {},
     stage: async () => stage,
     archivedAt: async () => AT, existing: async () => null,
     existing: async () => null,
@@ -384,12 +385,12 @@ test("raiseProbePurgeCard archives once, then raises the M2.5-b2 purge card unch
   assert.match(c.reason, new RegExp(`^Purge project ${PROBE_SLUG}\\?`));
   // Already archived (a retried tick): no second archive.
   let archived = 0;
-  await raiseProbePurgeCard("p-1", { outlasts: async () => true, stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, archive: async () => { archived++; }, counts: async () => ({}), raise: async () => ({ id: "card-9", createdAt: AT }) });
+  await raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {}, stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, archive: async () => { archived++; }, counts: async () => ({}), raise: async () => ({ id: "card-9", createdAt: AT }) });
   assert.equal(archived, 0);
   // An archive that did not reach `archived`, a purged row, or no id: no card is used.
-  await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, stage: async () => "live", archive: async () => {}, archivedAt: async () => AT, existing: async () => null, counts: async () => ({}), raise: async () => ({ id: "x", createdAt: LATER }) }), /probe-card-not-archived/);
-  await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, stage: async () => "purged", archive: async () => {}, archivedAt: async () => AT, existing: async () => null, counts: async () => ({}), raise: async () => ({ id: "x", createdAt: LATER }) }), /probe-card-already-purged/);
-  await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, stage: async () => "archived", archive: async () => {}, archivedAt: async () => AT, existing: async () => null, counts: async () => ({}), raise: async () => ({ id: "", createdAt: LATER }) }), /probe-card-not-raised/);
+  await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {}, stage: async () => "live", archive: async () => {}, archivedAt: async () => AT, existing: async () => null, counts: async () => ({}), raise: async () => ({ id: "x", createdAt: LATER }) }), /probe-card-not-archived/);
+  await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {}, stage: async () => "purged", archive: async () => {}, archivedAt: async () => AT, existing: async () => null, counts: async () => ({}), raise: async () => ({ id: "x", createdAt: LATER }) }), /probe-card-already-purged/);
+  await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {}, stage: async () => "archived", archive: async () => {}, archivedAt: async () => AT, existing: async () => null, counts: async () => ({}), raise: async () => ({ id: "", createdAt: LATER }) }), /probe-card-not-raised/);
   // Codex PR239-r12/r13: a Restore and a new Archive between the lookup and the raise: the card raised within the new
   // archive is the one tracked (bound to the archive read after the raise), never left pending behind a fallback.
   {
@@ -397,14 +398,14 @@ test("raiseProbePurgeCard archives once, then raises the M2.5-b2 purge card unch
     const reads = [AT, NEW];
     const lookups = [];
     let raisedCards = 0;
-    const got = await raiseProbePurgeCard("p-1", { outlasts: async () => true, stage: async () => "archived", archivedAt: async () => reads.shift() ?? NEW, existing: async (since) => { lookups.push(since); return lookups.length === 2 ? "new" : null; }, archive: async () => {}, counts: async () => ({}), raise: async () => { raisedCards++; return { id: "new", createdAt: new Date("2026-11-25T11:00:01Z") }; } });
+    const got = await raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {}, stage: async () => "archived", archivedAt: async () => reads.shift() ?? NEW, existing: async (since) => { lookups.push(since); return lookups.length === 2 ? "new" : null; }, archive: async () => {}, counts: async () => ({}), raise: async () => { raisedCards++; return { id: "new", createdAt: new Date("2026-11-25T11:00:01Z") }; } });
     assert.equal(got, "new");
     assert.equal(raisedCards, 1);
     assert.deepEqual(lookups, [AT, NEW], "the second lookup is against the archive read after the raise");
   }
   // Pre-review 2: a pending twin from an earlier archive (or one with no times) is never used.
   for (const [archivedAt, createdAt] of [[AT, EARLIER], [null, LATER], [AT, undefined]]) {
-    await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, stage: async () => "archived", archivedAt: async () => archivedAt, existing: async () => null, archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "old", createdAt }) }), /probe-card-stale/);
+    await assert.rejects(raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {}, stage: async () => "archived", archivedAt: async () => archivedAt, existing: async () => null, archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "old", createdAt }) }), /probe-card-stale/);
   }
 });
 
@@ -471,7 +472,7 @@ test("Codex PR239-r1: a retried card tick uses the card this archive already has
   const sinceSeen = [];
   for (const stage of ["archived", "purged"]) {
     let raised = 0, archived = 0;
-    const id = await raiseProbePurgeCard("p-1", { outlasts: async () => true,
+    const id = await raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {},
       stage: async () => stage, archivedAt: async () => AT,
       existing: async (since) => { sinceSeen.push(since); return "card-1"; },
       archive: async () => { archived++; }, counts: async () => ({}), raise: async () => { raised++; return { id: "card-2", createdAt: AT }; },
@@ -536,11 +537,140 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
 test("Codex PR239-r2: a card raised by someone else between the lookup and the raise is the one tracked", async () => {
   const AT = new Date("2026-11-25T10:00:00Z"), LATER = new Date("2026-11-25T10:00:05Z");
   let reads = 0;
-  const id = await raiseProbePurgeCard("p-1", { outlasts: async () => true,
+  const id = await raiseProbePurgeCard("p-1", { outlasts: async () => true, expireStale: async () => {},
     stage: async () => "archived", archivedAt: async () => AT,
     existing: async () => (reads++ === 0 ? null : "card-first"),
     archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "card-probe", createdAt: LATER }),
   });
   assert.equal(id, "card-first");
   assert.equal(reads, 2);
+});
+
+const HOUR = 3_600_000;
+
+test("Codex PR239-r15: a card raise that throws across 6 h server checks leaves no pending card behind the probe's purge", async () => {
+  // The production sequence: the raise persists KK's card, then throws; the next check runs 6 h later and throws again.
+  const order = [];
+  const d = fake({ purge: async () => { order.push("purge"); d.calls.purge++; return "done"; } });
+  d.expirePurgeCards = async () => { order.push("expire"); };
+  await until(d, "card");
+  d.raisePurgeCard = async () => { throw new Error("db after insert"); };
+  assert.equal((await probeStep(d)).detail, "card-raise-retry");
+  d.tick(6 * HOUR);
+  const r = await probeStep(d);
+  assert.equal(r.phase, "purge");
+  assert.equal(d.log.at(-1).expireCards, true, "the fallback purge is marked to expire the probe's cards first");
+  d.tick(6 * HOUR);
+  const end = await probeStep(d);
+  assert.deepEqual([end.phase, end.code], ["done", "card-raise-failed"]);
+  assert.deepEqual(order, ["expire", "purge"], "the pending card is expired before the probe purges");
+});
+
+test("Codex PR239-r15: every way out of card and cardwait to the probe's purge expires the cards first; a normal cycle never does", async () => {
+  for (const card of ["pending-timeout", "rejected", "expired", "grant-short"]) {
+    const order = [];
+    const d = fake({ purge: async () => { order.push("purge"); return "done"; } });
+    d.expirePurgeCards = async () => { order.push("expire"); };
+    await until(d, "cardwait");
+    if (card === "pending-timeout") d.tick(PROBE_CARD_MAX_MS);
+    else if (card === "grant-short") d.grantUntil = d.now().getTime();
+    else d.state.card = card;
+    assert.equal((await probeStep(d)).phase, "purge");
+    assert.equal((await probeStep(d)).phase, "done");
+    assert.deepEqual(order, ["expire", "purge"], card);
+  }
+  const n = fake();
+  n.state.proven = true;
+  await until(n, "done");
+  assert.equal(n.calls.expire, undefined, "a normal cycle has no card to expire");
+  // Without the expiry wired, no cycle is a card cycle.
+  const w = fake({ expirePurgeCards: undefined });
+  await until(w, "done");
+  assert.equal(w.log[0].viaCard, undefined);
+  assert.equal(w.calls.raise, 0);
+});
+
+test("Codex PR239-r15: an expiry that fails holds the purge while the grant lasts, then purges anyway; a late success restarts the bound", async () => {
+  let d = fake();
+  let fail = true;
+  d.expirePurgeCards = async () => { if (fail) throw new Error("db"); };
+  await until(d, "cardwait");
+  d.state.card = "rejected";
+  await probeStep(d);
+  d.grantUntil = d.now().getTime() + 3 * DAY;
+  for (let i = 0; i < 4; i++) {
+    d.tick(6 * HOUR);
+    assert.equal((await probeStep(d)).detail, "card-expire-retry");
+  }
+  assert.equal(d.calls.purge, 0, "no purge past a card that may still be pending");
+  // The grant would no longer outlast the next tick and the purge: the purge goes ahead, with a full bound.
+  d.tick(DAY + 1);
+  let r = await probeStep(d);
+  assert.deepEqual([r.phase, r.detail], ["purge", "card-expire-gave-up"]);
+  assert.equal(d.log.at(-1).cardExpireGaveUp, true);
+  assert.equal(d.log.at(-1).expireCards, false);
+  r = await probeStep(d);
+  assert.deepEqual([r.phase, r.code], ["done", "card-rejected"]);
+  assert.equal(d.calls.purge, 1);
+  // A throwing grant check gives up at once, never holds forever.
+  d = fake({ expirePurgeCards: async () => { throw new Error("db"); } });
+  await until(d, "cardwait");
+  d.state.card = "expired";
+  await probeStep(d);
+  d.cardGrantOutlasts = async () => { throw new Error("db"); };
+  assert.equal((await probeStep(d)).detail, "card-expire-gave-up");
+  // An expiry that succeeds after retries purges in that same tick, as any purge tick does.
+  d = fake();
+  fail = true;
+  d.expirePurgeCards = async () => { d.calls.expire = (d.calls.expire ?? 0) + 1; if (fail) throw new Error("db"); };
+  await until(d, "cardwait");
+  d.state.card = "rejected";
+  await probeStep(d);
+  d.tick(6 * HOUR);
+  assert.equal((await probeStep(d)).detail, "card-expire-retry");
+  fail = false;
+  d.tick(6 * HOUR);
+  r = await probeStep(d);
+  assert.deepEqual([r.phase, r.code], ["done", "card-rejected"]);
+  assert.deepEqual([d.calls.expire, d.calls.purge], [2, 1]);
+});
+
+test("Codex PR239-r15: expireProbePurgeCards expires the project's pending purge cards and resolves only when none is left", async () => {
+  const make = (reads) => {
+    const seen = { q: [], expired: [] };
+    const tx = { approval: { findMany: async (q) => { seen.q.push(q); return reads.shift() ?? []; } } };
+    return { db: { $transaction: async (fn, o) => { seen.o = o; return fn(tx); } }, seen, expire: async (ids, reason) => { seen.expired.push({ ids, reason }); return ids; } };
+  };
+  let m = make([[]]);
+  await expireProbePurgeCards(m.db, "p-1", 5000, m.expire);
+  assert.deepEqual(m.seen.expired, [], "nothing pending: no expiry call");
+  assert.deepEqual(m.seen.q[0].where, { projectId: "p-1", action: "teardown.purge", target: "project:p-1", status: "pending" });
+  assert.equal(m.seen.q[0].take, 50);
+  assert.deepEqual(m.seen.o, { timeout: 5000, maxWait: 5000 });
+  m = make([[{ id: "c-1" }, { id: "" }, { id: "c-2" }], []]);
+  await expireProbePurgeCards(m.db, "p-1", 5000, m.expire);
+  assert.deepEqual(m.seen.expired, [{ ids: ["c-1", "c-2"], reason: PROBE_CARD_EXPIRE_REASON }]);
+  m = make([[{ id: "c-1" }], [{ id: "c-1" }]]);
+  await assert.rejects(expireProbePurgeCards(m.db, "p-1", 5000, m.expire), /probe-card-still-pending/);
+  const before = new Date("2026-11-25T10:00:00Z");
+  m = make([[]]);
+  await expireProbePurgeCards(m.db, "p-1", 5000, m.expire, before);
+  assert.deepEqual(m.seen.q[0].where.createdAt, { lt: before }, "only an earlier archive's cards when bounded");
+  m = make([[{ id: "c-1" }]]);
+  await assert.rejects(expireProbePurgeCards(m.db, "p-1", 5000, async () => { throw new Error("db"); }), /db/);
+});
+
+test("Codex PR239-r15: raiseProbePurgeCard expires an earlier archive's pending card before a new raise, and only then", async () => {
+  const AT = new Date("2026-11-25T10:00:00Z");
+  const seen = [];
+  const deps = (over = {}) => ({ outlasts: async () => true, stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, archive: async () => {}, counts: async () => ({}),
+    expireStale: async (b) => { seen.push(["expire", b]); }, raise: async () => { seen.push(["raise"]); return { id: "card-new", createdAt: new Date(AT.getTime() + 1) }; }, ...over });
+  assert.equal(await raiseProbePurgeCard("p-1", deps()), "card-new");
+  assert.deepEqual(seen, [["expire", AT], ["raise"]]);
+  seen.length = 0;
+  assert.equal(await raiseProbePurgeCard("p-1", deps({ existing: async () => "card-1" })), "card-1");
+  assert.equal(await raiseProbePurgeCard("p-1", deps({ outlasts: async () => false })), CARD_GRANT_SHORT);
+  assert.deepEqual(seen, [], "no expiry when this archive has its card or no card is raised");
+  await assert.rejects(raiseProbePurgeCard("p-1", deps({ expireStale: async () => { throw new Error("probe-card-still-pending"); } })), /still-pending/);
+  assert.deepEqual(seen, [], "a stale card that stays pending raises nothing");
 });

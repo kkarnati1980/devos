@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_CARD_RAISE_GRANT_MS, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, expireProbePurgeCards, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -197,11 +197,18 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               raise: (c) => approvals.raiseCard(c),
               // Codex PR239-r7/r8 (decision 11): only before a new card, from this tick.
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
+              // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
+              expireStale: (before) => expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason), before),
             });
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
           // Codex PR239-r7 (decision 11): the probe grant must outlast the card wait, so the fallback purge can run.
           cardGrantOutlasts: (until) => probeGrantOutlasts(db, p.id, until, timeoutMs, w.purge.grantProblem),
+          // Codex PR239-r15: before the probe's own purge after a card, its pending purge cards are expired.
+          expirePurgeCards: async () => {
+            const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
+            await expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason));
+          },
           // DEVOS-21: a failed cycle re-runs once KK saves a new provider token (metadata read only).
           credentialsUpdatedAt: () => probeCredentialsUpdatedAt(w.vault),
           fingerprint: await probeFingerprint(fileURLToPath(root)),
