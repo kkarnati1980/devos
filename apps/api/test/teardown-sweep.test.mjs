@@ -908,3 +908,25 @@ test("M2.5-b5 decision 10 (Codex PR240-r6): a stale card's rejection or 7-day ex
   await s.job.tick();
   assert.equal((await s.purgeCards("pending")).length, 1, "stale unanswered expiries do not count against the current archive");
 });
+
+test("M2.5-b5 decision 11 (Codex PR240-r7): a stale raise deduplicated onto the current archive's card never expires that card", async () => {
+  for (const via of ["ask", "tick"]) {
+    const s = setup();
+    const raise = s.job.d.raise;
+    let valid;
+    s.job.d.raise = async (c) => {
+      s.job.d.raise = raise;
+      // Restore and a new Archive land, and another process raises the new archive's card, before this stale write.
+      s.projects.get(P).archivedAt = new Date(s.now() - 1);
+      valid = await raise(purgeCard({ ...s.projects.get(P) }, {}));
+      return raise(c);
+    };
+    if (via === "ask") await assert.rejects(s.job.askPurge(P), /purge-card-other-archive/);
+    else await s.job.tick();
+    const pending = await s.purgeCards("pending");
+    assert.equal(pending.length, 1, `${via}: the current archive's card is still pending`);
+    assert.equal(pending[0].id, valid.id);
+    assert.equal(cardArchive(pending[0]), s.projects.get(P).archivedAt.toISOString());
+    assert.equal((await s.purgeCards("expired")).length, 0);
+  }
+});

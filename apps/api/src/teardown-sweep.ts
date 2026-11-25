@@ -456,6 +456,11 @@ export class TeardownSweepJob {
     const raised = (await this.d.raise(card)) as { id?: unknown } | null;
     if (!raised || typeof raised.id !== "string") throw new Error("purge-card-not-raised");
     const id = raised.id;
+    // Decision 11 (Codex PR240-r7): a deduplicated raise returns the pending twin already stored. If that card names
+    // another archive than this raise's, this raise wrote nothing: it is never expired here (it may be the current
+    // archive's valid card; a stale one is cleared by the tick's first pass, decision 9), and nothing is raised.
+    const named = (raised as { reason?: unknown }).reason;
+    if (typeof named === "string" && cardArchive({ reason: named }) !== cardArchive(card)) throw new Error("purge-card-other-archive");
     // Decision 6 (Codex PR240-r3): a re-read that fails proves nothing, so the card is expired as for a new archive.
     let now: TeardownProject | null;
     try {
