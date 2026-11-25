@@ -222,6 +222,12 @@ export class TeardownSweepJob {
   private running = false;
   private lastDailyDay: string | null = null;
   /**
+   * M2.5-b5 decision 14 (Codex PR240-r10): the IST day whose daily run last released `waitForDaily`. The daily run can
+   * stay open for many ticks (a purge still running, a card not yet raised), so the release happens once per day, not on
+   * every tick that finds the run open; an approval that fails again before its policy check waits for the next day.
+   */
+  private waitReleasedDay: string | null = null;
+  /**
    * Approved cards whose purge failed before its policy check (the grant is still unspent, so nothing was written at a
    * provider): tried again by the next daily run, not every tick. In memory only; after a restart one more early try
    * is harmless for the same reason.
@@ -260,7 +266,10 @@ export class TeardownSweepJob {
     try {
       const { day, minute } = istClock(this.now());
       const daily = minute >= PURGE_DUE_MINUTE_IST && this.lastDailyDay !== day;
-      if (daily) this.waitForDaily.clear();
+      if (daily && this.waitReleasedDay !== day) {
+        this.waitForDaily.clear();
+        this.waitReleasedDay = day;
+      }
       await this.deliverStops();
       await this.expireUnfenced();
       await this.step("teardown-restored-pass-failed", () => this.closeRestored());

@@ -965,3 +965,30 @@ test("M2.5-b5 decision 13 (Codex PR240-r9): an early ask never expires a pending
   assert.equal(r.raised, true);
   assert.deepEqual(expired, [old.id]);
 });
+
+test("M2.5-b5 decision 14 (Codex PR240-r10): while the daily run stays open, an approval that failed before its policy check waits for the next day", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await s.approvals.approve(s.session, c.id, { confirmation: `PURGE project:${P}`, expiresInHours: 72 });
+  // Fails before the policy check: the grant stays unspent and nothing was written at a provider.
+  let tries = 0;
+  s.job.d.purge = async () => { tries++; throw new TeardownError("lock_timeout", true, "lock busy"); };
+  await s.job.tick();
+  assert.equal(tries, 1);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-retry"));
+  // The next day's run releases it once; it fails again, and the daily run stays open (the due list cannot be read).
+  s.advance(DAY);
+  s.failDue.n = 1000;
+  await s.job.tick();
+  assert.equal(tries, 2, "the next daily run tries once");
+  for (let i = 0; i < 5; i++) {
+    s.advance(5 * 60_000);
+    await s.job.tick();
+  }
+  assert.equal(tries, 2, "an open daily run never releases it again the same day");
+  assert.ok(s.logs.filter((l) => l.code === "teardown-due-pass-failed").length >= 5, "the daily run is still open");
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal(tries, 3, "the following day's run tries once more");
+});
