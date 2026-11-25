@@ -42,7 +42,8 @@ case "$rc" in
   *) rc=99 ;;
 esac
 # Only the helper's own fixed codes are printed; any other text is never copied out.
-err="$(printf '%s' "$obj" | jq -r '.error // "" | if type == "string" then . else "bad" end' 2>/dev/null)" || err="bad"
+# An `error` key that is not a non-empty string is unrecognised, never read as "no error" (pre-review sweep).
+err="$(printf '%s' "$obj" | jq -r 'if has("error") then (.error | if type == "string" and length > 0 then . else "bad" end) else "" end' 2>/dev/null)" || err="bad"
 if [[ -n "$err" || $rc -eq 99 ]]; then
   case "$err" in usage|teardown-rules-read-failed|teardown-rules-error) ;; "") err="no result" ;; *) err="unrecognised error" ;; esac
   echo "fail: the rules check failed: $err"; exit 1
@@ -52,7 +53,7 @@ fi
 # narrow pattern (PR238-r2). In enforce mode the evaluator enforces its rule outcome, so a row whose two differ is
 # malformed (PR238-r3). Every row must be one the evaluator can produce (PR238-r4, r5): its reason codes are the
 # evaluator's own, each deciding code names the recorded outcome (`default-deny` and `denied-by` only with deny), a
-# rule-named code comes with a matched rule, a gate code appears only in observe mode and fits the enforced outcome,
+# rule-named code comes with a matched rule and a lone `default-deny` with none and no gate (PR238-r6), a gate code appears only in observe mode and fits the enforced outcome,
 # and in observe mode an enforced deny needs a deny rule. A `result` that disagrees with its rows is unreadable, never
 # a pass.
 # Fields are joined with `|` (not in any allowed field), so an empty field never shifts the columns.
@@ -63,31 +64,45 @@ summary="$(printf '%s' "$obj" | jq -r '
   def has($p): any(parts[]; . == $p);
   def head: [parts[] | select(startswith("gate-") | not)];
   def means($c): {"allowed-by": "allow", "denied-by": "deny", "default-deny": "deny", "approval-required-by": "require_approval"}[$c];
-  # A check verdict (`narrow-match`, `sentinels-disagree`) stands alone; otherwise every part is an evaluator code,
-  # each deciding code names the recorded outcome, a rule-named code has a matched rule, and the gates fit the mode.
-  def consistent($mode):
-    if .reason == "narrow-match" or .reason == "sentinels-disagree" then true
+  # Every row (PR238-r4..r6): at most 10 distinct matched ids, never more than the rules loaded; in enforce mode no
+  # gate code and the rule outcome enforced. A check verdict (`narrow-match`, `sentinels-disagree`) stands alone and
+  # needs a matched rule (only a matching rule can be narrow or split the sentinels). Otherwise every part is an
+  # evaluator code, a deciding code first and each naming the recorded outcome; a lone `default-deny` has no matched
+  # rule and no gate, any other has one; a gate code needs 2 matched rules (it is added only when the gate does not
+  # decide); codes never repeat; and in observe mode the enforced outcome follows only from the gates. Only keys
+  # the helper prints are accepted, and both rows together never name more distinct rules than were loaded.
+  def gated: has("gate-denied-by") or has("gate-approval-required-by");
+  def consistent($mode; $nrules):
+    (keys == ["enforced", "matched", "outcome", "reason"])
+    and (.matched | length) <= 10 and (.matched | length) <= $nrules and (.matched | unique | length) == (.matched | length)
+    and ($mode != "enforce" or (.enforced == .outcome and (gated | not)))
+    and (.enforced != "deny" or .outcome == "deny") and (.enforced != "require_approval" or .outcome != "allow")
+    and if .reason == "narrow-match" or .reason == "sentinels-disagree" then (.matched | length) >= 1
     else all(parts[]; . == "allowed-by" or . == "denied-by" or . == "default-deny" or . == "approval-required-by"
                       or . == "gate-denied-by" or . == "gate-approval-required-by")
+      and (parts[0] | startswith("gate-") | not) and (parts | unique | length) == (parts | length)
+      and ((gated | not) or (.matched | length) >= 2)
       and (head | length) >= 1 and (. as $r | all(head[]; means(.) == $r.outcome))
-      and (([head[] | select(. != "default-deny")] | length) == 0 or (.matched | length) >= 1)
+      and (if all(head[]; . == "default-deny") then (.matched | length) == 0 and (gated | not) else (.matched | length) >= 1 end)
       and (has("gate-denied-by") and has("gate-approval-required-by") | not)
-      and (if $mode == "enforce" then .enforced == .outcome and (has("gate-denied-by") or has("gate-approval-required-by") | not)
-           else (if has("gate-denied-by") then .enforced == "deny"
-                 elif has("gate-approval-required-by") then .enforced == "require_approval"
-                 else true end)
-             and (.enforced != "deny" or (.outcome == "deny" and has("denied-by")))
-             and (.enforced != "require_approval" or .outcome != "allow")
-             and (.enforced != "allow" or (has("gate-denied-by") or has("gate-approval-required-by") | not))
-           end)
+      and ($mode == "enforce"
+           or ((if has("gate-denied-by") then .enforced == "deny"
+                elif has("gate-approval-required-by") then .enforced == "require_approval"
+                else true end)
+               and (.enforced != "deny" or (.outcome == "deny" and has("denied-by")))
+               and (.enforced != "require_approval" or has("gate-approval-required-by") or .outcome == "require_approval")
+               and (.enforced != "allow" or (gated | not))))
     end;
-  [.actions["teardown.archive"], .actions["teardown.restore"]] as $rows | .mode as $mode |
+  [.actions["teardown.archive"], .actions["teardown.restore"]] as $rows | .mode as $mode | .rules as $nrules |
   if (.mode == "observe" or .mode == "enforce")
-     and (.rules | type) == "number" and (.pinned | type) == "number" and (.actions | type) == "object"
+     and (keys == ["actions", "mode", "pinned", "result", "rules"])
+     and (.rules | type) == "number" and (.pinned | type) == "number" and .pinned <= .rules and (.actions | type) == "object"
+     and (.actions | keys) == ["teardown.archive", "teardown.restore"]
      and all($rows[]; type == "object"
              and eff(.outcome) and eff(.enforced) and ok(.reason)
-             and consistent($mode)
-             and (.matched | type) == "array" and all(.matched[]; type == "string" and test("\\A[A-Za-z0-9-]{1,64}\\z")))
+             and (.matched | type) == "array" and all(.matched[]; type == "string" and test("\\A[A-Za-z0-9-]{1,64}\\z"))
+             and consistent($mode; $nrules))
+     and ([$rows[].matched[]] | unique | length) <= $nrules
      and .result == (if all($rows[]; .enforced == "allow" and .reason != "sentinels-disagree" and .reason != "narrow-match") then "pass" else "fail" end)
   then
     "\(.result)|\(.mode)|\(.rules)|\(.pinned)",

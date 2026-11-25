@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const CHECK = path.join(ROOT, "scripts/server/checks/teardown-kk-rules.sh");
 const ID = "11111111-1111-4111-8111-111111111111";
+const ID2 = "22222222-2222-4222-8222-222222222222";
 
 function run({ cli, cliRc = 0, api = true, psRc = 0, noDocker = false } = {}) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "devos-kkrules-"));
@@ -70,7 +71,9 @@ test("DEVOS-112 pre-review 1: a result that disagrees with its rows is unreadabl
 });
 
 test("DEVOS-112 pre-review 2: rules pinned to a login or a project are reported, not judged", () => {
-  const r = run({ cli: PASS.replace('"pinned":0', '"pinned":2') });
+  const r = run({ cli: PASS.replace('"rules":1,"pinned":0', '"rules":3,"pinned":2') });
+  // Codex PR238-r6 sweep: more pinned rules than rules loaded is unreadable.
+  assert.match(run({ cli: PASS.replace('"pinned":0', '"pinned":2') }).out, /^fail: unreadable rules check output$/m);
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /note: 2 teardown rule\(s\) are pinned to a KK login or a project/);
   assert.doesNotMatch(run({ cli: PASS }).out, /note:/);
@@ -79,7 +82,7 @@ test("DEVOS-112 pre-review 2: rules pinned to a login or a project are reported,
   assert.equal(obs.code, 0, obs.out);
   // Codex PR238-r1: sentinels that disagree are a fail, shown as such.
   // Codex PR238-r4: valid observe-mode gate rows are read and fail, naming the gate.
-  for (const a of [act("deny", "deny", "denied-by;gate-denied-by"), act("require_approval", "require_approval", "approval-required-by;gate-approval-required-by")]) {
+  for (const a of [act("deny", "deny", "denied-by;gate-denied-by", [ID, ID2]), act("require_approval", "require_approval", "approval-required-by;gate-approval-required-by", [ID, ID2]), act("require_approval", "deny", "denied-by;gate-approval-required-by", [ID, ID2])]) {
     const g = run({ cli: line({ result: "fail", mode: "observe", rules: 2, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": act("allow") } }), cliRc: 1 });
     assert.equal(g.code, 1, g.out);
     assert.match(g.out, /KK teardown\.archive: (deny|require_approval) \(rule outcome/);
@@ -162,13 +165,42 @@ test("DEVOS-112: a row the evaluator cannot produce is unreadable, never a pass"
     ["observe", O("deny", "deny", "default-deny", [])],
     ["observe", O("require_approval", "allow", "allowed-by")],
     ["observe", O("allow", "allow", "allowed-by;sentinels-disagree")],
+    ["observe", O("allow", "deny", "default-deny")],
+    ["enforce", O("deny", "deny", "default-deny")],
+    ["observe", O("require_approval", "deny", "default-deny;gate-approval-required-by", [])],
+    ["observe", O("require_approval", "deny", "denied-by")],
+    ["observe", O("deny", "deny", "gate-denied-by;denied-by")],
+    ["enforce", O("deny", "allow", "narrow-match")],
+    ["observe", O("allow", "allow", "narrow-match", [])],
+    ["observe", O("allow", "allow", "allowed-by", [ID, ID]), 2],
+    ["observe", O("allow", "allow", "allowed-by", [ID, ID2])],
+    // Pre-review sweep: each needs `rules` high enough that no other check refuses it.
+    ["observe", O("allow", "allow", "allowed-by", Array.from({ length: 11 }, (_, i) => `${i}`.padStart(8, "0") + "-1111-4111-8111-111111111111")), 20],
+    ["observe", O("deny", "deny", "denied-by;gate-denied-by;gate-approval-required-by", [ID, ID2]), 2],
+    ["observe", O("require_approval", "require_approval", "approval-required-by;gate-denied-by", [ID, ID2]), 2],
+    ["observe", O("deny", "deny", "denied-by;gate-approval-required-by", [ID, ID2]), 2],
+    ["observe", O("deny", "deny", "denied-by;gate-denied-by", [ID]), 2],
+    ["enforce", O("allow", "allow", "allowed-by;allowed-by"), 2],
+    ["observe", O("deny", "allow", "narrow-match"), 2],
+    ["observe", O("require_approval", "allow", "sentinels-disagree"), 2],
+    ["observe", { ...O("allow", "allow", "allowed-by"), extra: 1 }, 2],
   ];
-  for (const [mode, a] of rows) {
-    const result = a.enforced === "allow" ? "pass" : "fail";
-    const cli = line({ result, mode, rules: 1, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": act("allow") } });
+  for (const [mode, a, rules = 1] of rows) {
+    const result = a.enforced === "allow" && a.reason !== "narrow-match" && a.reason !== "sentinels-disagree" ? "pass" : "fail";
+    const cli = line({ result, mode, rules, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": act("allow") } });
     const r = run({ cli, cliRc: result === "pass" ? 0 : 1 });
     assert.equal(r.code, 1, `${mode} ${JSON.stringify(a)} → ${r.out}`);
     assert.match(r.out, /^fail: unreadable rules check output$/m, `${mode} ${JSON.stringify(a)} → ${r.out}`);
+    assert.doesNotMatch(r.out, /^ok:/m);
+  }
+});
+
+test("DEVOS-112 pre-review sweep: object-level output the helper never prints is unreadable", () => {
+  const P = JSON.parse(PASS);
+  for (const o of [{ ...P, error: false }, { ...P, error: "" }, { ...P, code: "skipped" }, { ...P, actions: { ...P.actions, "teardown.purge": act("allow") } },
+    { ...P, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow", "allow", "allowed-by", [ID2]) } }]) {
+    const r = run({ cli: line(o) });
+    assert.equal(r.code, 1, `${JSON.stringify(o)} → ${r.out}`);
     assert.doesNotMatch(r.out, /^ok:/m);
   }
 });
