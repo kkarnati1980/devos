@@ -17,6 +17,7 @@ type Authorize = (action: string, resource: string) => Promise<"allow" | "deny" 
 export interface TeardownRuntimeModule extends TeardownModule {
   restoreProject(projectId: string, o: Record<string, unknown>): Promise<void>;
   PrismaTeardownStore: new (db: unknown, o: Record<string, unknown>) => TeardownStoreLike & {
+    withProjectLock<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
     project(id: string): Promise<{ id: string; slug: string; stage: string; archivedAt: Date | null; purgeAfter: Date | null } | null>;
     lastScan(id: string): Promise<ScanReportLike | null>;
     activeResources(id: string): Promise<readonly { provider: string; kind: string }[]>;
@@ -225,5 +226,7 @@ export function buildTeardownSweep(w: {
     },
     keepArchived: q.keepArchived,
     log: w.log,
+    // DEVOS-254 decision 21: KK's early ask holds the same lifecycle lock as Archive, Restore and Purge.
+    locked: (projectId, fn) => store.withProjectLock(projectId, fn),
   });
 }

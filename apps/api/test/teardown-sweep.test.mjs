@@ -586,3 +586,38 @@ test("pre-review 2 (M2.5-b3): while a purge runs past its 10-minute limit, the a
   await new Promise((r) => setImmediate(r));
   assert.equal(h.raised.length, 0);
 });
+
+// DEVOS-254 decision 21 (Codex PR239-r21): KK's early ask holds the lifecycle lock, so no card follows a Purge.
+test("DEVOS-254 d21: an early ask runs under the lifecycle lock; one waiting on a purge sees not_archived and raises nothing", async () => {
+  const s = early();
+  // A lock with one holder at a time, as the store's advisory lock.
+  let tail = Promise.resolve();
+  const seen = [];
+  s.job.d.locked = (id, fn) => {
+    seen.push(id);
+    const run = tail.then(fn);
+    tail = run.catch(() => {});
+    return run;
+  };
+  // A purge (another process) holds the lock and moves the row to purged before releasing it.
+  let release;
+  const held = s.job.d.locked(P, () => new Promise((r) => { release = r; }));
+  const ask = s.job.askPurge(P);
+  await new Promise((r) => setImmediate(r));
+  assert.equal((await s.purgeCards()).length, 0, "the ask waits for the lock");
+  s.projects.get(P).stage = "purged";
+  release();
+  await held;
+  assert.deepEqual(await ask, { ok: false, code: "not_archived" });
+  assert.equal((await s.purgeCards()).length, 0, "no card for a purged project");
+  assert.deepEqual(seen, [P, P]);
+  // Archived again: the locked ask raises its card as before.
+  s.projects.get(P).stage = "archived";
+  const r = await s.job.askPurge(P);
+  assert.equal(r.raised, true);
+  // A lock that cannot be taken raises nothing.
+  s.job.d.locked = async () => { throw new Error("lock_timeout"); };
+  s.projects.get(P).archivedAt = new Date(s.now());
+  await assert.rejects(s.job.askPurge(P), /lock_timeout/);
+  assert.equal((await s.purgeCards("pending")).length, 1);
+});

@@ -84,6 +84,12 @@ export interface TeardownSweepDeps {
   /** `purge_after` from `from` to `to`, only while the project is archived and `purge_after` is still `from`. */
   keepArchived(projectId: string, from: Date, to: Date, approvalId: string): Promise<boolean>;
   log(e: { level: "info" | "warn"; msg: string; projectId?: string; code?: string; approvalId?: string }): void;
+  /**
+   * DEVOS-254 decision 21 (Codex PR239-r21): runs `fn` under the project lifecycle lock (the teardown store's
+   * `withProjectLock`, which Archive, Restore and Purge take), so KK's early ask reads `archived` and raises its card
+   * with no Purge or Restore in between. Production always passes it.
+   */
+  locked?<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
   now?: () => number;
   intervalMs?: number;
   purgeTimeoutMs?: number;
@@ -425,6 +431,13 @@ export class TeardownSweepJob {
    * the daily run's raises.
    */
   async askPurge(projectId: string): Promise<{ ok: true; approvalId: string; raised: boolean } | { ok: false; code: string }> {
+    // DEVOS-254 decision 21 (Codex PR239-r21): the stage check and the raise hold the lifecycle lock, so a card is never
+    // persisted after a Purge (or Restore) has moved the project out of `archived`.
+    const locked = this.d.locked;
+    return locked ? locked(projectId, () => this.askPurgeLocked(projectId)) : this.askPurgeLocked(projectId);
+  }
+
+  private async askPurgeLocked(projectId: string): Promise<{ ok: true; approvalId: string; raised: boolean } | { ok: false; code: string }> {
     const p = await this.d.project(projectId);
     if (!p) return { ok: false, code: "project-not-found" };
     if (p.stage !== "archived" || !p.archivedAt) return { ok: false, code: "not_archived" };
