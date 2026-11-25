@@ -31,6 +31,8 @@ export const randomSentinels = (): [Sentinel, Sentinel] => [0, 1].map(() => ({
   projectId: randomUUID(),
 })) as [Sentinel, Sentinel];
 const RULE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+/** At most this many matched ids are printed per action (the server check relies on it: a list this long may be cut, Codex PR238-r8). */
+export const MATCHED_CAP = 10;
 /** Reasons the evaluator returns, reduced to their fixed part (a rule id is kept only in `matched`). */
 const reasonCode = (reason: string) => reason.split(";").map((p) => p.split(":")[0] ?? "").filter((p) => /^[a-z-]{1,40}$/.test(p)).join(";");
 
@@ -92,7 +94,7 @@ export async function kkTeardownCli(
       outcome,
       enforced,
       reason: narrow ? "narrow-match" : agree ? reasons.join(";") || "none" : "sentinels-disagree",
-      matched: [...new Set(evs.flatMap((e) => e.matchedRuleIds))].filter((id) => RULE_ID_RE.test(id)).slice(0, 10),
+      matched: [...new Set(evs.flatMap((e) => e.matchedRuleIds))].filter((id) => RULE_ID_RE.test(id)).slice(0, MATCHED_CAP),
     };
   }
   return { code: allowed ? 0 : 1, out: { result: allowed ? "pass" : "fail", mode: policy.mode, rules: policy.rules.length, pinned: pinnedRules(policy.rules, requests), actions } };

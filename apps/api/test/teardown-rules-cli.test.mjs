@@ -1,7 +1,7 @@
 // DEVOS-112 (docs/modules/M2.5.md "DEVOS-112: KK's teardown rules check"): would M1.7 let KK's Archive and Restore through?
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { kkTeardownCli, randomSentinels, KK_TEARDOWN_ACTIONS } from "../dist/teardown-rules-cli.js";
+import { kkTeardownCli, randomSentinels, KK_TEARDOWN_ACTIONS, MATCHED_CAP } from "../dist/teardown-rules-cli.js";
 
 const rule = (o) => ({
   id: o.id, name: o.name ?? o.id, version: 1, priority: o.priority ?? 0, actions: o.actions ?? ["teardown.*"],
@@ -135,4 +135,15 @@ test("DEVOS-112: a rule id that is not id-shaped is never printed", async () => 
   assert.equal(r.code, 0);
   assert.deepEqual(r.out.actions["teardown.archive"].matched, []);
   assert.ok(!JSON.stringify(r.out).includes("rm -rf"));
+});
+
+test("Codex PR238-r8: at most MATCHED_CAP ids are printed, so two cut lists can match while the answers differ", async () => {
+  const allows = Array.from({ length: 10 }, (_, i) => rule({ id: `allow-${i}`, priority: 100 + i }));
+  const r = await kkTeardownCli(["kk-teardown"], reader("enforce", [...allows, rule({ id: DENY, effect: "deny", actions: ["teardown.restore"], priority: 1 })]));
+  assert.equal(r.code, 1);
+  assert.equal(MATCHED_CAP, 10);
+  const a = r.out.actions["teardown.archive"], b = r.out.actions["teardown.restore"];
+  assert.equal(a.enforced, "allow");
+  assert.equal(b.enforced, "deny");
+  assert.ok(a.matched.length <= MATCHED_CAP && b.matched.length === MATCHED_CAP);
 });

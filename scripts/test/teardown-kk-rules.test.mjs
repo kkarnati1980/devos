@@ -206,3 +206,24 @@ test("DEVOS-112 pre-review sweep: object-level output the helper never prints is
     assert.doesNotMatch(r.out, /^ok:/m);
   }
 });
+
+test("Codex PR238-r8: a cut list of 10 matched ids is not compared across the actions", () => {
+  // Ten allows shared by both actions and one deny on Restore only: the helper prints the same 10 ids for both
+  // (MATCHED_CAP), yet Restore is denied. The check must name that deny, not call the output unreadable.
+  const ten = Array.from({ length: 10 }, (_, i) => `allow-${i}`);
+  const cli = line({ result: "fail", mode: "enforce", rules: 11, pinned: 0, actions: {
+    "teardown.archive": act("allow", "allow", "allowed-by", ten),
+    "teardown.restore": act("deny", "deny", "denied-by", ten) } });
+  const r = run({ cli, cliRc: 1 });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /KK teardown.restore: deny \(rule outcome deny, denied-by, rules allow-0,/);
+  assert.match(r.out, /^fail: KK's Archive or Restore would be refused by the policy in force$/m);
+  // Below the cap the r7 rule still holds: 9 shared ids with different answers are unreadable.
+  const nine = ten.slice(0, 9);
+  const bad = line({ result: "fail", mode: "enforce", rules: 11, pinned: 0, actions: {
+    "teardown.archive": act("allow", "allow", "allowed-by", nine),
+    "teardown.restore": act("deny", "deny", "denied-by", nine) } });
+  const b = run({ cli: bad, cliRc: 1 });
+  assert.equal(b.code, 1, b.out);
+  assert.match(b.out, /^fail: unreadable rules check output$/m);
+});

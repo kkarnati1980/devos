@@ -72,7 +72,8 @@ summary="$(printf '%s' "$obj" | jq -r '
   # decide); codes never repeat; and in observe mode the enforced outcome follows only from the gates. Only keys
   # the helper prints are accepted, and both rows together never name more distinct rules than were loaded. Codex
   # PR238-r7: the evaluator reads only the matched rules, and a rule matches the requests of both actions alike, so two rows
-  # with the same matched set are the same row.
+  # with the same matched set are the same row. Codex PR238-r8: the helper prints at most 10 matched ids per action
+  # (MATCHED_CAP in teardown-rules-cli.ts), so a list of 10 may be cut and the rule is applied only below that.
   def gated: has("gate-denied-by") or has("gate-approval-required-by");
   def consistent($mode; $nrules):
     (keys == ["enforced", "matched", "outcome", "reason"])
@@ -105,7 +106,8 @@ summary="$(printf '%s' "$obj" | jq -r '
              and (.matched | type) == "array" and all(.matched[]; type == "string" and test("\\A[A-Za-z0-9-]{1,64}\\z"))
              and consistent($mode; $nrules))
      and ([$rows[].matched[]] | unique | length) <= $nrules
-     and (($rows[0].matched | sort) != ($rows[1].matched | sort) or ($rows[0] | del(.matched)) == ($rows[1] | del(.matched)))
+     and (($rows[0].matched | length) >= 10 or ($rows[1].matched | length) >= 10
+          or ($rows[0].matched | sort) != ($rows[1].matched | sort) or ($rows[0] | del(.matched)) == ($rows[1] | del(.matched)))
      and .result == (if all($rows[]; .enforced == "allow" and .reason != "sentinels-disagree" and .reason != "narrow-match") then "pass" else "fail" end)
   then
     "\(.result)|\(.mode)|\(.rules)|\(.pinned)",
