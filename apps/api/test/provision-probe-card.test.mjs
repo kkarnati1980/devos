@@ -879,3 +879,21 @@ test("Codex PR239-r26: once the proof is recorded, the expiry retries keep the d
     assert.equal((await probeStep(e)).code, "pass-card");
   }
 });
+
+test("Codex PR239-r27: a purged probe that ends without AT10's proof expires its pending purge cards first", async () => {
+  for (const [card, byCard, code] of [["pending", true, "card-ended"], ["approved", false, "card-unproven"]]) {
+    const d = fake();
+    await until(d, "cardwait");
+    d.state.stage = "purged"; d.state.card = card; d.state.byCard = byCard;
+    d.calls.expire = 0;
+    const r = await probeStep(d);
+    assert.deepEqual([r.phase, r.code], ["done", code]);
+    assert.equal(d.calls.expire, 1, `${code}: the pending cards are expired`);
+    // A failed expiry still ends the cycle the same way.
+    const e = fake();
+    await until(e, "cardwait");
+    e.state.stage = "purged"; e.state.card = card; e.state.byCard = byCard;
+    e.expirePurgeCards = async () => { throw new Error("db"); };
+    assert.equal((await probeStep(e)).code, code);
+  }
+});

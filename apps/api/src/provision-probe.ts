@@ -364,9 +364,15 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       const o = r.value;
       // AT10: purged by the sweep under KK's approved card. A purge with no approved card is not that proof.
       if (o.stage === "purged") {
-        if (o.card !== "approved") return finish(false, "card-ended", `${CARD_WORD.test(o.card) ? o.card : "unknown"}:purged`);
+        // Codex PR239-r27 (medium): a purged probe that is not AT10's proof also expires its pending purge cards first,
+        // best effort (a failed expiry is left to the sweep's `project-not-archived` pass), so no prompt is left open.
+        const endPurged = async (code: string, detail?: string): Promise<ProbeTick> => {
+          await attempt(async () => { if (d.expirePurgeCards) await d.expirePurgeCards(); });
+          return finish(false, code, detail);
+        };
+        if (o.card !== "approved") return endPurged("card-ended", `${CARD_WORD.test(o.card) ? o.card : "unknown"}:purged`);
         // Codex PR239-r1 (high): purged, but not provably under this card's grant, is not AT10's proof.
-        if (o.byCard !== true) return finish(false, "card-unproven");
+        if (o.byCard !== true) return endPurged("card-unproven");
         // Codex PR239-r23 (medium, DEVOS-254 decision 22): KK could ask again between his approval and the sweep's
         // purge, so a pass first expires the probe's pending purge cards (decision 20's rule, on this path too). Once
         // purged no card can follow (M2.5-b5, DEVOS-255). A failed expiry waits within the 8-day bound; past it the
