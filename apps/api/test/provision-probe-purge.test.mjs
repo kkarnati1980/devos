@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { grantProblem } from "@devos/policy";
-import { teardownWiring, purgeStop, forbiddenTail, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, probeGrantOutlasts, teardownResource, PROBE_GRANT_ACTIONS, PROBE_PURGE_RETRY_USES } from "../dist/provision-probe-purge.js";
+import { teardownWiring, purgeStop, forbiddenTail, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, probeGrantOutlasts, teardownResource, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
 import * as realProvision from "@devos/provision";
 import * as realTeardown from "@devos/teardown";
 import { probeStep } from "../dist/provision-probe.js";
@@ -195,13 +195,12 @@ test("Codex PR239-r7/r8: probeGrantOutlasts asks for the grant at the later time
   assert.equal(await probeGrantOutlasts(db, PID, LATER, 1234, grantProblem), true);
   assert.deepEqual(seen.find((q) => q && q.where && q.where.expiresAt).where.expiresAt, { gt: LATER }, "the read asks about the later time");
   assert.ok(seen.filter((q) => q && "timeout" in q).every((o) => o.timeout === 1234 && o.maxWait === 1234), "bounded reads");
-  // Codex PR239-r8: a fallback purge after a Restore needs an Archive and a purge again; r9: plus the retry uses. Not
-  // archived yet: the card's Archive, those two and the retries (6 of 30); archived: those two and the retries (5).
-  assert.equal(PROBE_PURGE_RETRY_USES, 3);
-  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 24 })]).db, PID, LATER, 1234, grantProblem), true);
-  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 25 })]).db, PID, LATER, 1234, grantProblem), false);
-  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 25 })]).db, PID, LATER, 1234, grantProblem), true);
-  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 26 })]).db, PID, LATER, 1234, grantProblem), false);
+  // Codex PR239-r8: a fallback purge after a Restore needs an Archive and a purge again. Not archived yet: the card's
+  // Archive and those two (3 of 30); archived: those two (2). r11: no uses are kept for purge retries.
+  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 27 })]).db, PID, LATER, 1234, grantProblem), true);
+  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 28 })]).db, PID, LATER, 1234, grantProblem), false);
+  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 28 })]).db, PID, LATER, 1234, grantProblem), true);
+  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 29 })]).db, PID, LATER, 1234, grantProblem), false);
   // Both actions must be in scope even once archived (the Restore fallback archives again).
   assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ scopeAction: "teardown.purge" })]).db, PID, LATER, 1234, grantProblem), false);
 });
