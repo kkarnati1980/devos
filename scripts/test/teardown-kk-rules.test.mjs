@@ -259,3 +259,29 @@ test("Codex PR238-r11: rules both actions name must come in the same relative or
   assert.match(r.out, /^fail: unreadable rules check output$/m);
   for (const b of [[ID, ID2, ID3], [ID, ID3, ID2], [ID3, ID, ID2]]) assert.equal(run({ cli: mk(b) }).code, 0, JSON.stringify(b));
 });
+
+test("Codex PR238-r13: a duplicate key, or any line that is not jq's compact form, is unreadable", () => {
+  // jq keeps the last of two equal keys: an earlier `"result":"fail"` would be read as the later pass.
+  const dup = PASS.replace('{"result":"pass"', '{"result":"fail","result":"pass"');
+  const dupRow = PASS.replace('"teardown.archive":{"outcome":"allow","enforced":"allow"', '"teardown.archive":{"outcome":"allow","enforced":"deny","enforced":"allow"');
+  assert.notEqual(dupRow, PASS);
+  for (const cli of [dup, dupRow, PASS.replace('"rules":1', '"rules": 1'), PASS.replace('"rules":1', '"rules":1.0')]) {
+    const r = run({ cli });
+    assert.equal(r.code, 1, `${cli} → ${r.out}`);
+    assert.match(r.out, /^fail: unreadable rules check output( \(exit 0\))?$/m);
+    assert.doesNotMatch(r.out, /^ok:/m);
+  }
+  assert.equal(run({ cli: PASS }).code, 0);
+});
+
+test("Codex PR238-r13: with no more than 10 rules loaded a list of 10 is never cut, so the same ids must agree", () => {
+  const ten = Array.from({ length: 10 }, (_, i) => `allow-${i}`);
+  const rows = (n) => line({ result: "fail", mode: "enforce", rules: n, pinned: 0, actions: {
+    "teardown.archive": act("allow", "allow", "allowed-by", ten),
+    "teardown.restore": act("deny", "deny", "denied-by", ten) } });
+  const r = run({ cli: rows(10), cliRc: 1 });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /^fail: unreadable rules check output$/m);
+  // With 11 rules the list may be cut, and the r8 rule still reads it.
+  assert.match(run({ cli: rows(11), cliRc: 1 }).out, /KK teardown.restore: deny/);
+});

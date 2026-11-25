@@ -35,6 +35,11 @@ nonul "$tmpd/cli.out" || { echo "fail: unreadable rules check output"; exit 1; }
 # The helper prints exactly one non-blank line holding exactly one JSON object; anything else is unreadable.
 [[ "$(grep -c '[^[:space:]]' "$tmpd/cli.out")" == 1 ]] || { echo "fail: unreadable rules check output (exit $rc)"; exit 1; }
 obj="$(jq -c -s 'if length == 1 and (.[0] | type) == "object" then .[0] else error("bad") end' "$tmpd/cli.out" 2>/dev/null)" || { echo "fail: unreadable rules check output (exit $rc)"; exit 1; }
+# Codex PR238-r13: jq keeps the last of two equal keys, so a line with a duplicate key would be read as its last
+# value. The helper prints `JSON.stringify` output, which is already jq's compact form; a line that differs from its
+# own compact form (a duplicate key, extra spaces, another number spelling) is not the helper's and is unreadable.
+line="$(grep '[^[:space:]]' "$tmpd/cli.out")" || { echo "fail: unreadable rules check output (exit $rc)"; exit 1; }
+[[ "$line" == "$obj" ]] || { echo "fail: unreadable rules check output (exit $rc)"; exit 1; }
 case "$rc" in
   0|1) ;;
   3) echo "fail: the API container has no database, so the rules cannot be read"; exit 1 ;;
@@ -73,7 +78,7 @@ summary="$(printf '%s' "$obj" | jq -r '
   # the helper prints are accepted, and both rows together never name more distinct rules than were loaded. Codex
   # PR238-r7: the evaluator reads only the matched rules, and a rule matches the requests of both actions alike, so two rows
   # with the same matched set are the same row. Codex PR238-r8: the helper prints at most 10 matched ids per action
-  # (MATCHED_CAP in teardown-rules-cli.ts), so a list of 10 may be cut and the rule is applied only below that. Codex PR238-r10: the evaluator
+  # (MATCHED_CAP in teardown-rules-cli.ts), so a list of 10 may be cut and the rule is applied only below that, or when no more than 10 rules are loaded and nothing can be cut (r13). Codex PR238-r10: the evaluator
   # lists matched rules by priority, then id, so the same set comes in the same order for both actions,
   # and (r11) the rules both rows name come in the same relative order.
   def gated: has("gate-denied-by") or has("gate-approval-required-by");
@@ -108,7 +113,7 @@ summary="$(printf '%s' "$obj" | jq -r '
              and (.matched | type) == "array" and all(.matched[]; type == "string" and test("\\A[A-Za-z0-9-]{1,64}\\z"))
              and consistent($mode; $nrules))
      and ([$rows[].matched[]] | unique | length) <= $nrules
-     and (($rows[0].matched | length) >= 10 or ($rows[1].matched | length) >= 10
+     and (((($rows[0].matched | length) >= 10 or ($rows[1].matched | length) >= 10) and $nrules > 10)
           or ($rows[0].matched | sort) != ($rows[1].matched | sort) or $rows[0] == $rows[1])
      and ([$rows[0].matched[] | select(. as $x | $rows[1].matched | index($x))]
           == [$rows[1].matched[] | select(. as $x | $rows[0].matched | index($x))])
