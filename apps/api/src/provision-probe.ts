@@ -386,6 +386,15 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       }
       // Pre-review L1: the earlier failure stays in the done row as `cause`.
       if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier, restart);
+      // Codex PR239-r17 (medium): a card cycle whose sweep purge under KK's approved card finished after `cardwait` gave
+      // up on it (`card-purge-unfinished`, then the sweep completed before this tick) is AT10's proof after all. The
+      // tracked card is read once more; only a purged row whose every allowed purge decision ran under an approved
+      // card's grant (`byCard`, r1) passes. A purge by the probe itself is under its own grant, so it never does.
+      if (last.viaCard && last.cardId && d.cardOutcome) {
+        const id = last.cardId;
+        const o = await attempt(() => d.cardOutcome!(id));
+        if (o.ok && o.value.stage === "purged" && o.value.card === "approved" && o.value.byCard === true) return finish(true, PASS_CARD, undefined, undefined, restart);
+      }
       if (earlier) return finish(false, earlier.code, earlier.detail, undefined, restart);
       return finish(true, "pass", undefined, undefined, restart);
     }

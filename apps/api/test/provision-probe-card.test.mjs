@@ -690,3 +690,34 @@ test("Codex PR239-r15: raiseProbePurgeCard expires an earlier archive's pending 
   await assert.rejects(raiseProbePurgeCard("p-1", deps({ expireStale: async () => { throw new Error("probe-card-still-pending"); } })), /still-pending/);
   assert.deepEqual(seen, [], "a stale card that stays pending raises nothing");
 });
+
+test("Codex PR239-r17: a sweep purge under KK's card that finishes after cardwait gave up still passes as AT10's proof", async () => {
+  const run = async (state) => {
+    const d = fake();
+    await until(d, "cardwait");
+    d.state.card = "approved"; d.state.decidedAt = d.now().toISOString();
+    d.tick(PROBE_PHASE_MAX_MS);
+    assert.equal((await probeStep(d)).phase, "purge");
+    assert.equal(d.log.at(-1).result.code, "card-purge-unfinished");
+    // The sweep completes before the fallback tick; the probe's purge finds the row purged.
+    Object.assign(d.state, state);
+    d.tick(6 * HOUR);
+    return probeStep(d);
+  };
+  assert.deepEqual(await run({ stage: "purged" }), { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
+  // Not proven under an approved card's grant (r1), or no longer approved: the earlier failure stands.
+  assert.equal((await run({ stage: "purged", byCard: false })).code, "card-purge-unfinished");
+  assert.equal((await run({ stage: "purged", card: "missing" })).code, "card-purge-unfinished");
+  // A read that throws keeps the earlier failure.
+  const d = fake();
+  await until(d, "cardwait");
+  d.state.card = "rejected";
+  await probeStep(d);
+  d.cardOutcome = async () => { throw new Error("db"); };
+  assert.equal((await probeStep(d)).code, "card-rejected");
+  // A normal cycle never reads a card.
+  const n = fake();
+  n.state.proven = true;
+  assert.equal((await until(n, "done")).code, "pass");
+  assert.equal(n.calls.outcome, 0);
+});
