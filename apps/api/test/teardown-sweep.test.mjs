@@ -933,3 +933,35 @@ test("M2.5-b5 decision 11 (Codex PR240-r7): a stale raise deduplicated onto the 
     assert.equal((await s.purgeCards("expired")).length, 0);
   }
 });
+
+test("M2.5-b5 decision 13 (Codex PR240-r9): an early ask never expires a pending card of a later archive, and checks the lock before any expiry", async () => {
+  const s = setup();
+  const cards = s.job.d.cards;
+  let valid;
+  s.job.d.cards = async (f) => {
+    s.job.d.cards = cards;
+    // The lock drops after the ask's read: another process restores, re-archives and raises the new archive's card.
+    s.projects.get(P).archivedAt = new Date(s.now() + 1);
+    valid = await s.approvals.raiseCard(purgeCard({ ...s.projects.get(P) }, {}));
+    return cards(f);
+  };
+  await assert.rejects(s.job.askPurge(P), /purge-card-other-archive/);
+  const pending = await s.purgeCards("pending");
+  assert.deepEqual(pending.map((c) => c.id), [valid.id], "the later archive's card is still pending");
+  assert.equal((await s.purgeCards("expired")).length, 0);
+  // A lost lock is found before the older archive's card is expired: nothing is written.
+  const t = setup();
+  const old = await t.approvals.raiseCard(purgeCard({ ...t.projects.get(P), archivedAt: new Date(t.projects.get(P).archivedAt.getTime() - DAY) }, {}));
+  const expired = [];
+  const te = t.job.d.expire;
+  t.job.d.expire = async (ids, r) => { expired.push(...ids); return te(ids, r); };
+  t.job.d.lockHeld = async () => { throw new Error("lock-lost"); };
+  await assert.rejects(t.job.askPurge(P), /lock-lost/);
+  assert.deepEqual(expired, []);
+  assert.deepEqual((await t.purgeCards("pending")).map((c) => c.id), [old.id]);
+  // With the lock held, the older archive's card is expired and the current one raised.
+  delete t.job.d.lockHeld;
+  const r = await t.job.askPurge(P);
+  assert.equal(r.raised, true);
+  assert.deepEqual(expired, [old.id]);
+});

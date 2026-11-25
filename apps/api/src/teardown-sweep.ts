@@ -66,6 +66,16 @@ export const cardArchive = (c: { reason?: string | null }): string | null =>
 const raisedThisArchive = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject): boolean =>
   p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime() && cardArchive(c) === p.archivedAt.toISOString();
 
+/**
+ * Decision 13: a card of an archive older than the project's `archivedAt` in this read (its stamp names an earlier
+ * archive), or an unstamped card from before decision 8, which never purges.
+ */
+const olderArchive = (c: { reason?: string | null }, p: TeardownProject): boolean => {
+  if (!p.archivedAt) return false;
+  const named = cardArchive(c);
+  return named === null || Date.parse(named) < p.archivedAt.getTime();
+};
+
 /** Decision 7: expired only after its whole 7-day window (closeRestored's cutoff), so KK had the chance to answer it. */
 const unanswered = (c: { createdAt: Date; decidedAt: Date | null }): boolean =>
   c.decidedAt !== null && c.decidedAt.getTime() - c.createdAt.getTime() >= PURGE_CARD_WINDOW_MS;
@@ -561,7 +571,12 @@ export class TeardownSweepJob {
         return { ok: false, code: this.waitForDaily.has(c.id) ? "purge-waits-for-daily-run" : "purge-already-approved" };
       }
     }
-    if (pending.length) await this.d.expire(pending.map((c) => c.id), "purge-card-older-archive");
+    // Decision 13 (Codex PR240-r9): the lock is checked before anything is written, the expiry included, and only a card
+    // of an archive older than this read's is expired. A card naming a later archive (raised by another process after
+    // a lost lock) is left alone; the raise below then dedupes onto it and fails without expiring it (decision 11).
+    await this.d.lockHeld?.(p.id);
+    const older = pending.filter((c) => olderArchive(c, p));
+    if (older.length) await this.d.expire(older.map((c) => c.id), "purge-card-older-archive");
     const next = purgeCard(p, await this.d.activeCounts(p.id));
     // Decision 4: the lock is still ours right before the write, or nothing is raised.
     await this.d.lockHeld?.(p.id);
