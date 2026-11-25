@@ -21,15 +21,22 @@ export const KK_TEARDOWN_ACTIONS = ["teardown.archive", "teardown.restore"] as c
  * rule pinned to one login does not. Codex PR238-r1: the sentinels are fresh random values on every run, two of them,
  * so no rule can be written to match the check's own sentinel and not a real login or project, and both must get the
  * same answer (a rule that matches only one of them is counted as pinned and makes the check fail).
+ * Codex PR238-r2: a rule that matches through a narrow pattern (anything but `*`, empty, or a trailing-star prefix of
+ * `kk:` / `project:`, e.g. `kk:a*`) could match a random sentinel by chance and miss KK's real login, so such a match
+ * is never judged: the action fails with `narrow-match`.
  */
 export interface Sentinel { identity: { id: string; type: "kk" }; projectId: string }
 export const randomSentinels = (): [Sentinel, Sentinel] => [0, 1].map(() => ({
-  identity: { id: `kk:check-${randomUUID()}`, type: "kk" as const },
+  identity: { id: `kk:${randomUUID()}`, type: "kk" as const },
   projectId: randomUUID(),
 })) as [Sentinel, Sentinel];
 const RULE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 /** Reasons the evaluator returns, reduced to their fixed part (a rule id is kept only in `matched`). */
 const reasonCode = (reason: string) => reason.split(";").map((p) => p.split(":")[0] ?? "").filter((p) => /^[a-z-]{1,40}$/.test(p)).join(";");
+
+/** Every value starting with `prefix` is matched by this pattern list (empty = any). */
+export const genericFor = (patterns: readonly string[], prefix: string) =>
+  !patterns.length || patterns.some((p) => p === "*" || (p.endsWith("*") && prefix.startsWith(p.slice(0, -1))));
 
 /** A pattern list that could match some value starting with `prefix` (empty = any). */
 const couldMatch = (patterns: readonly string[], prefix: string) =>
@@ -77,12 +84,14 @@ export async function kkTeardownCli(
     const enforced = evs.map((e) => e.enforcedOutcome as Effect).reduce(worst);
     const outcome = evs.map((e) => e.outcome as Effect).reduce(worst);
     const agree = evs.every((e) => e.enforcedOutcome === evs[0]!.enforcedOutcome && e.outcome === evs[0]!.outcome);
-    if (enforced !== "allow" || !agree) allowed = false;
+    const narrow = currentRules(policy.rules).some((r) => requests.some((q) => ruleMatches(r, q(type)))
+      && !(genericFor(r.principals, "kk:") && genericFor(r.resources, "project:")));
+    if (enforced !== "allow" || !agree || narrow) allowed = false;
     const reasons = [...new Set(evs.map((e) => reasonCode(e.reason)))];
     actions[type] = {
       outcome,
       enforced,
-      reason: agree ? reasons.join(";") || "none" : "sentinels-disagree",
+      reason: narrow ? "narrow-match" : agree ? reasons.join(";") || "none" : "sentinels-disagree",
       matched: [...new Set(evs.flatMap((e) => e.matchedRuleIds))].filter((id) => RULE_ID_RE.test(id)).slice(0, 10),
     };
   }

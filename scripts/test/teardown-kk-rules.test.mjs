@@ -61,7 +61,7 @@ test("DEVOS-112: a default deny in enforce mode → fail, naming it", () => {
 });
 
 test("DEVOS-112 pre-review 1: a result that disagrees with its rows is unreadable, never a pass", () => {
-  for (const [result, a, b] of [["pass", act("deny"), act("allow")], ["pass", act("allow"), act("require_approval")], ["fail", act("allow"), act("allow")], ["pass", act("allow"), act("")], ["pass", act("allow"), act("maybe")], ["pass", act("allow"), act("allow", "allow", "sentinels-disagree")]]) {
+  for (const [result, a, b] of [["pass", act("deny"), act("allow")], ["pass", act("allow"), act("require_approval")], ["fail", act("allow"), act("allow")], ["pass", act("allow"), act("")], ["pass", act("allow"), act("maybe")], ["pass", act("allow"), act("allow", "allow", "sentinels-disagree")], ["pass", act("allow", "allow", "narrow-match"), act("allow")]]) {
     const r = run({ cli: line({ result, mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": b } }), cliRc: result === "pass" ? 0 : 1 });
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /^fail: unreadable rules check output$/m);

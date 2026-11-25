@@ -52,7 +52,7 @@ test("DEVOS-112: a deny beats an allow, a gate deny binds in observe mode, and r
 
 test("DEVOS-112: asks as generic KK principals on random sentinel projects; a rule pinned to one login or project does not match", async () => {
   const [x, y] = randomSentinels();
-  assert.match(x.identity.id, /^kk:check-[0-9a-f-]{36}$/);
+  assert.match(x.identity.id, /^kk:[0-9a-f-]{36}$/);
   assert.notEqual(x.identity.id, y.identity.id);
   assert.notEqual(x.projectId, y.projectId);
   assert.notEqual(randomSentinels()[0].projectId, x.projectId);
@@ -69,7 +69,26 @@ test("DEVOS-112: asks as generic KK principals on random sentinel projects; a ru
   assert.equal(other.code, 0);
 });
 
-test("Codex PR238-r1: a rule that matches only one sentinel makes the sentinels disagree, a fail, never a pass", async () => {
+test("Codex PR238-r2: an allow matched through a narrow pattern is never judged, a fail with narrow-match", async () => {
+  for (const r0 of [rule({ id: ALLOW, principals: ["kk:check-*"] }), rule({ id: ALLOW, principals: ["kk:*", "kk:0*"] }), rule({ id: ALLOW, resources: ["project:1*"] })]) {
+    const fixed = () => [
+      { identity: { id: "kk:check-0a", type: "kk" }, projectId: "1a" },
+      { identity: { id: "kk:check-0b", type: "kk" }, projectId: "1b" },
+    ];
+    const r = await kkTeardownCli(["kk-teardown"], reader("enforce", [r0]), Date.now, fixed);
+    // ["kk:*", "kk:0*"] has a generic pattern too, so it is judged; the others are narrow.
+    const generic = r0.principals.includes("kk:*") && r0.resources.includes("project:*");
+    assert.equal(r.code, generic ? 0 : 1, JSON.stringify(r0));
+    if (!generic) assert.equal(r.out.actions["teardown.archive"].reason, "narrow-match");
+  }
+  // Generic patterns: `*`, `k*`, `kk*`, `kk:*`, `project:*`, `p*` are judged.
+  for (const pr of ["*", "k*", "kk*", "kk:*"]) {
+    const r = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, principals: [pr], resources: ["p*"] })]));
+    assert.equal(r.code, 0, pr);
+  }
+});
+
+test("Codex PR238-r1: a rule that matches only one sentinel is a fail, never a pass (reported as narrow-match since r2)", async () => {
   const fixed = () => [
     { identity: { id: "kk:check-a", type: "kk" }, projectId: "pa" },
     { identity: { id: "kk:check-b", type: "kk" }, projectId: "pb" },
@@ -78,13 +97,13 @@ test("Codex PR238-r1: a rule that matches only one sentinel makes the sentinels 
   let r = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, principals: ["kk:check-a"] })]), Date.now, fixed);
   assert.equal(r.code, 1);
   assert.equal(r.out.actions["teardown.archive"].enforced, "deny");
-  assert.equal(r.out.actions["teardown.archive"].reason, "sentinels-disagree");
+  assert.equal(r.out.actions["teardown.archive"].reason, "narrow-match");
   assert.equal(r.out.pinned, 1);
   // Scoped to one sentinel project, in observe mode: both enforced allow, but the rule outcomes differ.
   r = await kkTeardownCli(["kk-teardown"], reader("observe", [rule({ id: ALLOW, resources: ["project:pa"] })]), Date.now, fixed);
   assert.equal(r.code, 1);
   assert.equal(r.out.actions["teardown.restore"].enforced, "allow");
-  assert.equal(r.out.actions["teardown.restore"].reason, "sentinels-disagree");
+  assert.equal(r.out.actions["teardown.restore"].reason, "narrow-match");
   // On fresh random sentinels such a rule can never match at all: a default deny, a fail.
   r = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, principals: ["kk:teardown*"] }), rule({ id: "r2", resources: ["project:00000000*"] })]));
   assert.equal(r.code, 1);
