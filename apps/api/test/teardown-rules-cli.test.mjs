@@ -147,3 +147,18 @@ test("Codex PR238-r8: at most MATCHED_CAP ids are printed, so two cut lists can 
   assert.equal(b.enforced, "deny");
   assert.ok(a.matched.length <= MATCHED_CAP && b.matched.length === MATCHED_CAP);
 });
+
+test("Codex PR238-r12: matched ids come in the evaluator's order (priority, then id), not sentinel order", async () => {
+  const fixed = () => [
+    { identity: { id: "kk:check-a", type: "kk" }, projectId: "pa" },
+    { identity: { id: "kk:check-b", type: "kk" }, projectId: "pb" },
+  ];
+  // A (priority 10) matches only the second sentinel; B (priority 0) matches both. Sentinel order would print [B, A].
+  const rules = [rule({ id: "rule-a", priority: 10, principals: ["kk:check-b"] }), rule({ id: "rule-b" }),
+    rule({ id: "rule-c", priority: 5, actions: ["teardown.restore"], principals: ["kk:check-a"] })];
+  const r = await kkTeardownCli(["kk-teardown"], reader("enforce", rules), Date.now, fixed);
+  assert.equal(r.code, 1);
+  assert.deepEqual(r.out.actions["teardown.archive"].matched, ["rule-a", "rule-b"]);
+  assert.deepEqual(r.out.actions["teardown.restore"].matched, ["rule-a", "rule-c", "rule-b"]);
+  assert.equal(r.out.actions["teardown.archive"].reason, "narrow-match");
+});

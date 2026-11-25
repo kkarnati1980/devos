@@ -59,6 +59,16 @@ export function pinnedRules(rules: readonly PolicyRule[], requests: readonly ((t
     && couldMatch(r.principals, "kk:") && couldMatch(r.resources, "project:") && !requests.every((q) => ruleMatches(r, q(type))))).length;
 }
 
+/**
+ * Codex PR238-r12: the two sentinels' match lists are merged into one list in the evaluator's own order (priority
+ * descending, then id), not in sentinel order. One total order over all rules means both actions list any rules they
+ * share in the same relative order, even when a narrow rule matches only one sentinel, and a cut list is a prefix of it.
+ */
+export function byPriority(ids: readonly string[], rules: readonly PolicyRule[]): string[] {
+  const prio = new Map(rules.map((r) => [r.id, r.priority] as const));
+  return [...ids].sort((a, b) => (prio.get(b) ?? 0) - (prio.get(a) ?? 0) || (a < b ? -1 : a > b ? 1 : 0));
+}
+
 export interface PolicyReader { loadPolicy(): Promise<{ mode: PolicyMode; rules: PolicyRule[] }> }
 
 export async function kkTeardownCli(
@@ -94,7 +104,7 @@ export async function kkTeardownCli(
       outcome,
       enforced,
       reason: narrow ? "narrow-match" : agree ? reasons.join(";") || "none" : "sentinels-disagree",
-      matched: [...new Set(evs.flatMap((e) => e.matchedRuleIds))].filter((id) => RULE_ID_RE.test(id)).slice(0, MATCHED_CAP),
+      matched: byPriority([...new Set(evs.flatMap((e) => e.matchedRuleIds))], policy.rules).filter((id) => RULE_ID_RE.test(id)).slice(0, MATCHED_CAP),
     };
   }
   return { code: allowed ? 0 : 1, out: { result: allowed ? "pass" : "fail", mode: policy.mode, rules: policy.rules.length, pinned: pinnedRules(policy.rules, requests), actions } };
