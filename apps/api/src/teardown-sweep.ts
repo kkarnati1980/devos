@@ -90,6 +90,11 @@ export interface TeardownSweepDeps {
    * with no Purge or Restore in between. Production always passes it.
    */
   locked?<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
+  /**
+   * M2.5-b5 decision 4 (Codex PR240-r1): throws unless the lock `locked` took is still held (the store's
+   * `assertLockHeld`, a ping on the lock session), checked just before a purge card is written. Passed with `locked`.
+   */
+  lockHeld?(projectId: string): Promise<void>;
   now?: () => number;
   intervalMs?: number;
   purgeTimeoutMs?: number;
@@ -401,7 +406,9 @@ export class TeardownSweepJob {
     const p = await this.d.project(projectId);
     if (!p || p.stage !== "archived" || !p.purgeAfter || p.purgeAfter.getTime() > this.now()) return false;
     if (!(await this.shouldRaise(p))) return false;
-    await this.d.raise(purgeCard(p, await this.d.activeCounts(p.id)));
+    const card = purgeCard(p, await this.d.activeCounts(p.id));
+    await this.d.lockHeld?.(p.id);
+    await this.d.raise(card);
     return true;
   }
 
@@ -469,7 +476,10 @@ export class TeardownSweepJob {
       }
     }
     if (pending.length) await this.d.expire(pending.map((c) => c.id), "purge-card-older-archive");
-    const card = (await this.d.raise(purgeCard(p, await this.d.activeCounts(p.id)))) as { id?: unknown } | null;
+    const next = purgeCard(p, await this.d.activeCounts(p.id));
+    // Decision 4: the lock is still ours right before the write, or nothing is raised.
+    await this.d.lockHeld?.(p.id);
+    const card = (await this.d.raise(next)) as { id?: unknown } | null;
     if (!card || typeof card.id !== "string") throw new Error("purge-card-not-raised");
     this.d.log({ level: "info", msg: "teardown-purge-asked", projectId: p.id, approvalId: card.id });
     return { ok: true, approvalId: card.id, raised: true };

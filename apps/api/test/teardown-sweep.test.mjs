@@ -700,3 +700,28 @@ test("M2.5-b5 pre-review 1: while this process's own purge runs (past its limit)
   assert.equal(h.raised.length, 0);
   finish({ purged: true, report: { hits: [], errors: [] } });
 });
+
+test("M2.5-b5 decision 4 (Codex PR240-r1): a lock lost before the write raises no card in either path", async () => {
+  // Daily run: the lock session dropped after the read; nothing is raised and the run stays open.
+  const s = setup();
+  s.job.d.locked = serialLock().locked;
+  const checked = [];
+  s.job.d.lockHeld = async (id) => { checked.push(id); throw new Error("provision_lock_lost"); };
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0);
+  assert.deepEqual(checked, [P]);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.code === "purge-due"));
+  // The lock holds again: the next tick raises the card, after the check.
+  s.job.d.lockHeld = async (id) => { checked.push(id); };
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 1);
+  // Early ask: a lost lock rejects and raises nothing.
+  const e = early();
+  e.job.d.locked = serialLock().locked;
+  e.job.d.lockHeld = async () => { throw new Error("provision_lock_lost"); };
+  await assert.rejects(e.job.askPurge(P), /provision_lock_lost/);
+  assert.equal((await e.purgeCards()).length, 0);
+  e.job.d.lockHeld = async () => {};
+  assert.equal((await e.job.askPurge(P)).raised, true);
+});

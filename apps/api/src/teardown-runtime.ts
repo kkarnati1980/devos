@@ -18,6 +18,7 @@ export interface TeardownRuntimeModule extends TeardownModule {
   restoreProject(projectId: string, o: Record<string, unknown>): Promise<void>;
   PrismaTeardownStore: new (db: unknown, o: Record<string, unknown>) => TeardownStoreLike & {
     withProjectLock<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
+    assertLockHeld(projectId: string): Promise<void>;
     project(id: string): Promise<{ id: string; slug: string; stage: string; archivedAt: Date | null; purgeAfter: Date | null } | null>;
     lastScan(id: string): Promise<ScanReportLike | null>;
     activeResources(id: string): Promise<readonly { provider: string; kind: string }[]>;
@@ -228,5 +229,7 @@ export function buildTeardownSweep(w: {
     log: w.log,
     // M2.5-b5 decision 1 (DEVOS-255): KK's early ask holds the same lifecycle lock as Archive, Restore and Purge.
     locked: (projectId, fn) => store.withProjectLock(projectId, fn),
+    // M2.5-b5 decision 4 (Codex PR240-r1): the lock session is pinged right before a purge card is written.
+    lockHeld: (projectId) => store.assertLockHeld(projectId),
   });
 }
