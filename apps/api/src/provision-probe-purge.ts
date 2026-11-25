@@ -48,6 +48,28 @@ export async function findProbeGrant(
   return null;
 }
 
+type PolicyRules = { mode: "observe" | "enforce"; rules: readonly unknown[] };
+type Evaluate = (request: any, rules: readonly any[], mode: any, now: number) => { outcome: string; enforcedOutcome: string };
+
+/**
+ * Codex PR239-r19 (high, DEVOS-254 decision 18): true only when the active M1.7 policy would *use* the probe grant for
+ * every action: evaluated read-only (rules loaded, nothing persisted, no grant consumed) with the same rules
+ * evaluator `PolicyEngine.decide` runs, a grant is applied exactly when the outcome needs approval and the enforced
+ * outcome is not a deny. A policy that allows a teardown action outright (no approval gate) or denies it would make
+ * `grantAuthorizer` refuse, so the probe must not provision what it then could not clean up. A rule change after
+ * this check is the d3c-2a case: the purge fails closed and the next cycle starts with the purge.
+ */
+export async function policyUsesProbeGrant(
+  load: () => Promise<PolicyRules>, evaluate: Evaluate, projectId: string, now: Date, actions: readonly string[] = PROBE_GRANT_ACTIONS,
+): Promise<boolean> {
+  const { mode, rules } = await load();
+  return actions.every((type) => {
+    const ev = evaluate({ identity: PROVISIONER_IDENTITY, action: { type, resource: teardownResource(projectId), projectId } }, rules, mode, now.getTime());
+    const needsApproval = ev.outcome === "require_approval" || ev.enforcedOutcome === "require_approval";
+    return needsApproval && ev.enforcedOutcome !== "deny";
+  });
+}
+
 /** The M1.7 authorizer with the KK grant presented (policyAuthorizer's shape, plus `approvalGrantId`). */
 export function grantAuthorizer(policy: { decide(r: unknown): Promise<{ enforcedOutcome: string; approvalGrantId?: string | null }> }, projectId: string, grantId: string): Authorize {
   return async (action, resource) => {
@@ -220,7 +242,10 @@ export type CycleStart = "ready" | "purge-pending" | { blocked: string };
  * checked its `provision.probe_started` marker); an `archived` row (an earlier purge did not finish) starts the
  * cycle with the purge.
  */
-export async function probeCycleStart(db: any, projectId: string, timeoutMs: number, hasGrant: () => Promise<boolean>): Promise<CycleStart> {
+export async function probeCycleStart(db: any, projectId: string, timeoutMs: number, hasGrant: () => Promise<boolean>, policyGated?: () => Promise<boolean>): Promise<CycleStart> {
+  // Codex PR239-r19 (high): a grant the active policy would not use cannot authorize the cleanup, so the cycle is
+  // blocked before anything is created. A fixed code of its own: a new grant card would not help, so none is raised.
+  if (policyGated && !(await policyGated())) return { blocked: "probe-purge-policy-ungated" };
   if (!(await hasGrant())) return { blocked: "probe-purge-not-approved" };
   return db.$transaction(async (tx: any) => {
     const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true } });
@@ -443,6 +468,12 @@ export interface ProbePurgeCardDeps {
    * `raiseCard`'s pending-twin dedupe cannot hand back a stale card (`probe-card-stale`). Throws when one stays pending.
    */
   expireStale(before: Date): Promise<void>;
+  /**
+   * Codex PR239-r19 (medium): runs `fn` under the project lifecycle lock (the teardown store's `withProjectLock`, the
+   * lock Archive, Restore and Purge take), so no Restore can land between the archived-state check and the raise.
+   * Production always passes it; without it `fn` runs as is (unit tests of the other steps).
+   */
+  locked?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 /** Decision 11: no new card was raised, because the probe grant would lapse before the probe could purge after it. */
@@ -455,7 +486,14 @@ export const CARD_GRANT_SHORT = { grantShort: true } as const;
  */
 export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDeps): Promise<string | typeof CARD_GRANT_SHORT> {
   const stage = await d.stage();
+  // The Archive takes the lifecycle lock itself, so it runs before the locked part (the lock is not taken twice).
   if (stage !== "archived" && stage !== "purged") await d.archive();
+  // Codex PR239-r19 (medium): every check from the archived state through the raise holds the lifecycle lock, so a
+  // purge card is raised only while the row is archived (M2.5: purge cards come from the archived state only).
+  return d.locked ? d.locked(() => raiseLocked(projectId, d)) : raiseLocked(projectId, d);
+}
+
+async function raiseLocked(projectId: string, d: ProbePurgeCardDeps): Promise<string | typeof CARD_GRANT_SHORT> {
   const now = await d.stage();
   // Codex PR239-r1 (medium): a tick that raised the card but did not record its id is retried. The card this archive
   // already has (any status: KK may have approved it, the sweep may have purged) is used again, never a second one.

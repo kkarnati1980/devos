@@ -1,8 +1,8 @@
 // DEVOS-234 (M2.4-d3c-2a, docs/modules/M2.4.md "M2.4-d3c-2 decisions"): the probe's purge through M2.5 under a KK grant.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { grantProblem } from "@devos/policy";
-import { teardownWiring, purgeStop, forbiddenTail, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, probeGrantOutlasts, teardownResource, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
+import { grantProblem, evaluateRules } from "@devos/policy";
+import { teardownWiring, purgeStop, forbiddenTail, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, probeGrantOutlasts, teardownResource, policyUsesProbeGrant, cycleStartWithCard, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
 import * as realProvision from "@devos/provision";
 import * as realTeardown from "@devos/teardown";
 import { probeStep } from "../dist/provision-probe.js";
@@ -435,4 +435,45 @@ test("part 12: the preflight and odd-kind refusals are unchanged", () => {
   assert.deepEqual(purgeStop(terr("provider_forbidden")), { error: "purge-permission:preflight" });
   const odd = Object.assign(terr("provider_forbidden", false, { provider: "coolify", kind: "Bad Kind!" }), { message: "archive of x was refused by coolify (http 403): the token lacks the permission" });
   assert.deepEqual(purgeStop(odd), { error: "purge-permission:resource" });
+});
+
+// Codex PR239-r19 (high, DEVOS-254 decision 18): a cycle starts only when the active policy would use the probe grant.
+function rule(id, effect, actions, extra = {}) {
+  return { id, name: id, version: 1, priority: 10, actions, resources: ["*"], principals: ["*"], roles: [], environments: [], effect, enabled: true, ...extra };
+}
+test("Codex PR239-r19: policyUsesProbeGrant is true only when both teardown actions need approval and are not denied", async () => {
+  const gate = rule("gate-5", "require_approval", ["teardown.*"], { constraints: { gate: true } });
+  const allowAll = rule("allow-all", "allow", ["*"]);
+  const deny = rule("deny-purge", "deny", ["teardown.purge"]);
+  const at = new Date("2026-11-25T14:00:00Z");
+  const uses = (mode, rules) => policyUsesProbeGrant(async () => ({ mode, rules }), evaluateRules, PID, at);
+  assert.equal(await uses("enforce", [gate, allowAll]), true);
+  assert.equal(await uses("observe", [gate, allowAll]), true, "observe mode: the gate still binds, so the grant is used");
+  // The finding: a policy that allows teardown outright leaves the grant unused, and grantAuthorizer refuses.
+  assert.equal(await uses("enforce", [allowAll]), false);
+  assert.equal(await uses("observe", [allowAll]), false);
+  assert.equal(await uses("enforce", [gate, allowAll, deny]), false, "a deny is never lifted by a grant");
+  assert.equal(await uses("enforce", []), false, "default deny");
+  assert.equal(await uses("enforce", [rule("gate-archive", "require_approval", ["teardown.archive"]), allowAll]), false, "both actions must be gated");
+  // Read-only: the evaluator sees exactly what grantAuthorizer later asks the engine about.
+  const seen = [];
+  await policyUsesProbeGrant(async () => ({ mode: "enforce", rules: [] }), (r) => { seen.push(r); return { outcome: "require_approval", enforcedOutcome: "require_approval" }; }, PID, at);
+  assert.deepEqual(seen.map((r) => r.action.type), ["teardown.archive", "teardown.purge"]);
+  assert.deepEqual(seen[0], { identity: { id: "system:provisioner", type: "system" }, action: { type: "teardown.archive", resource: teardownResource(PID), projectId: PID } });
+});
+
+test("Codex PR239-r19: an ungated policy blocks the cycle before anything is read or created, and raises no grant card", async () => {
+  const db = projectDb("purged");
+  let grantAsked = 0;
+  const s = await probeCycleStart(db, PID, 1234, async () => { grantAsked++; return true; }, async () => false);
+  assert.deepEqual(s, { blocked: "probe-purge-policy-ungated" });
+  assert.deepEqual(db.writes, []);
+  assert.equal(grantAsked, 0);
+  let raised = 0;
+  assert.deepEqual(await cycleStartWithCard(async () => s, async () => { raised++; return true; }), { blocked: "probe-purge-policy-ungated" });
+  assert.equal(raised, 0, "a new grant card would not help, so none is raised");
+  // Gated: the usual checks follow.
+  assert.equal(await probeCycleStart(projectDb("live"), PID, 1234, async () => true, async () => true), "ready");
+  assert.deepEqual(await probeCycleStart(projectDb("live"), PID, 1234, async () => false, async () => true), { blocked: "probe-purge-not-approved" });
+  await assert.rejects(probeCycleStart(projectDb("live"), PID, 1234, async () => true, async () => { throw new Error("db"); }), /db/);
 });

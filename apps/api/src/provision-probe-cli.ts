@@ -170,7 +170,12 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           },
           // DEVOS-110: a cycle blocked for want of the grant raises the fixed grant card for KK (at most one open).
           cycleStart: () => cycleStartWithCard(
-            () => probeCycleStart(db, p.id, timeoutMs, async () => (await findProbeGrant(db, p.id, new Date(), timeoutMs, w.purge.grantProblem)) !== null),
+            () => probeCycleStart(
+              db, p.id, timeoutMs,
+              async () => (await findProbeGrant(db, p.id, new Date(), timeoutMs, w.purge.grantProblem)) !== null,
+              // Codex PR239-r19 (high): the cleanup is authorized only if the active policy would use the grant.
+              () => w.purge.policyGated(p.id),
+            ),
             async () => {
               const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
               return raiseProbeGrantCard(p.id, new Date(), { list: (f) => approvals.store.list(f), raise: (c) => approvals.raiseCard(c) });
@@ -199,6 +204,13 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
               // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
               expireStale: (before) => expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason), before),
+              // Codex PR239-r19 (medium): the archived-state checks and the raise hold the project lifecycle lock.
+              locked: (fn) => {
+                const lockStore = k.store as unknown as { withProjectLock?<T>(id: string, f: () => Promise<T>): Promise<T> };
+                // Fails closed: without the lock no card is raised.
+                if (typeof lockStore.withProjectLock !== "function") throw new Error("probe-card-no-lock");
+                return lockStore.withProjectLock(p.id, fn);
+              },
             });
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),

@@ -721,3 +721,46 @@ test("Codex PR239-r17: a sweep purge under KK's card that finishes after cardwai
   assert.equal((await until(n, "done")).code, "pass");
   assert.equal(n.calls.outcome, 0);
 });
+
+test("Codex PR239-r19: the archived-state checks and the raise run under the lifecycle lock; a Restore waits for it", async () => {
+  const AT = new Date("2026-11-25T09:00:00Z");
+  let stage = "archived";
+  let held = false;
+  const order = [];
+  // A Restore that takes the same lock: it can only run once the locked part has ended.
+  let waiting = null;
+  const locked = async (fn) => {
+    assert.equal(held, false, "the lock is never taken twice");
+    held = true; order.push("lock");
+    try { return await fn(); } finally { held = false; order.push("unlock"); if (waiting) { const w = waiting; waiting = null; w(); } }
+  };
+  const restore = () => new Promise((resolve) => { const go = () => { stage = "live"; order.push("restore"); resolve(); }; if (held) waiting = go; else go(); });
+  const d = {
+    stage: async () => { order.push(`stage:${stage}:${held}`); return stage; },
+    archivedAt: async () => (stage === "archived" ? AT : null),
+    existing: async () => null,
+    archive: async () => { assert.equal(held, false, "the Archive takes the lock itself"); order.push("archive"); stage = "archived"; },
+    counts: async () => { void restore(); return { github: 1 }; },
+    outlasts: async () => true,
+    expireStale: async () => {},
+    raise: async () => { assert.equal(held, true, "raised under the lock"); assert.equal(stage, "archived"); order.push("raise"); return { id: "card-1", createdAt: AT }; },
+    locked,
+  };
+  assert.equal(await raiseProbePurgeCard("p-1", d), "card-1");
+  assert.deepEqual(order.filter((o) => !o.startsWith("stage")), ["lock", "raise", "unlock", "restore"]);
+  assert.ok(order.includes("stage:archived:true"), "the archived state is read inside the lock");
+  // From live: the Archive runs first, outside the lock, then the locked raise.
+  stage = "live"; order.length = 0;
+  d.counts = async () => ({ github: 1 });
+  assert.equal(await raiseProbePurgeCard("p-1", d), "card-1");
+  assert.deepEqual(order.filter((o) => !o.startsWith("stage")), ["archive", "lock", "raise", "unlock"]);
+  // Restored before the lock was taken: the locked check sees it and no card is raised.
+  stage = "live"; order.length = 0;
+  d.archive = async () => { stage = "archived"; };
+  const restoreFirst = { ...d, locked: async (fn) => { stage = "live"; return locked(fn); } };
+  await assert.rejects(raiseProbePurgeCard("p-1", restoreFirst), /probe-card-not-archived/);
+  assert.ok(!order.includes("raise"));
+  // A lock that cannot be taken raises nothing.
+  stage = "archived";
+  await assert.rejects(raiseProbePurgeCard("p-1", { ...d, locked: async () => { throw new Error("lock_timeout"); } }), /lock_timeout/);
+});
