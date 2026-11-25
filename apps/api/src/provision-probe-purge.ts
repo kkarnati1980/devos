@@ -239,6 +239,17 @@ export async function probeStage(db: any, projectId: string, timeoutMs: number):
   return String(p.stage);
 }
 
+/**
+ * Codex PR239-r7 (medium, DEVOS-254 decision 11): true when a probe grant with the uses the rest of a card cycle may
+ * spend (the Archive, unless the row is already archived, and the fallback purge) is still valid at `until`, so a card
+ * KK rejects or leaves unanswered is still cleaned up by the probe under its own grant. Read-only, bounded reads.
+ */
+export async function probeGrantOutlasts(db: any, projectId: string, until: Date, timeoutMs: number, grantProblem: GrantProblem): Promise<boolean> {
+  const stage = await probeStage(db, projectId, timeoutMs);
+  const actions = stage === "archived" ? ["teardown.purge"] : PROBE_GRANT_ACTIONS;
+  return (await findProbeGrant(db, projectId, until, timeoutMs, grantProblem, actions)) !== null;
+}
+
 /** DEVOS-110 decision 2: a rejected (or approved, then revoked) grant card is not raised again for one probe cycle. */
 export const PROBE_CARD_REASK_MS = 7 * 24 * 60 * 60 * 1000;
 

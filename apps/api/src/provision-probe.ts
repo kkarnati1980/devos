@@ -9,6 +9,14 @@ export const PROBE_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
 export const PROBE_PHASE_MAX_MS = 2 * 60 * 60 * 1000;
 /** DEVOS-254 decision 5: how long a card cycle waits for KK's answer (the card itself expires after 7 days). */
 export const PROBE_CARD_MAX_MS = 8 * 24 * 60 * 60 * 1000;
+/**
+ * Codex PR239-r7 (DEVOS-254 decision 11): a card cycle starts only while a probe grant stays valid this long, and its
+ * card is raised only while one stays valid `PROBE_CARD_RAISE_GRANT_MS` from then, so the probe can still purge after
+ * the longest card wait. The extra day covers the tick after the bound (the check runs at least every 6 h) and the
+ * purge itself (`PROBE_PHASE_MAX_MS`); the start adds one more day for the phases before `card`.
+ */
+export const PROBE_CARD_RAISE_GRANT_MS = PROBE_CARD_MAX_MS + 24 * 60 * 60 * 1000;
+export const PROBE_CARD_START_GRANT_MS = PROBE_CARD_RAISE_GRANT_MS + 24 * 60 * 60 * 1000;
 /** DEVOS-254 decision 1: the result code of a cycle whose purge went through KK's approved purge card. */
 export const PASS_CARD = "pass-card";
 
@@ -75,6 +83,8 @@ export interface ProbeDeps {
   raisePurgeCard?(): Promise<string>;
   /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
   cardOutcome?(cardId: string): Promise<CardOutcome>;
+  /** Codex PR239-r7: true when a probe grant with the uses still needed is valid at `until` (decision 11). */
+  cardGrantOutlasts?(until: Date): Promise<boolean>;
   fingerprint: string;
   now(): Date;
 }
@@ -163,10 +173,16 @@ async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   return Number.isFinite(t) && t > Date.parse(last.at);
 }
 
-/** DEVOS-254 decision 1: a read that throws, or a probe without the card wiring, is a normal cycle. */
+/**
+ * DEVOS-254 decision 1: a read that throws, or a probe without the card wiring, is a normal cycle. Decision 11 (Codex
+ * PR239-r7): so is one whose probe grant would lapse before a card left unanswered could still be purged.
+ */
 async function isCardCycle(d: ProbeDeps): Promise<boolean> {
-  if (!d.cardCycle || !d.raisePurgeCard || !d.cardOutcome) return false;
-  try { return (await d.cardCycle()) === true; } catch { return false; }
+  if (!d.cardCycle || !d.raisePurgeCard || !d.cardOutcome || !d.cardGrantOutlasts) return false;
+  try {
+    if ((await d.cardCycle()) !== true) return false;
+    return (await d.cardGrantOutlasts(new Date(d.now().getTime() + PROBE_CARD_START_GRANT_MS))) === true;
+  } catch { return false; }
 }
 
 const CARD_WORD = /^[a-z_]{1,20}$/;
@@ -267,7 +283,11 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     }
     case "card": {
       // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
-      if (!d.raisePurgeCard) return toPurge(failed("card-not-wired"));
+      if (!d.raisePurgeCard || !d.cardGrantOutlasts) return toPurge(failed("card-not-wired"));
+      // Decision 11 (Codex PR239-r7): no card unless the probe's grant outlasts the card wait and the purge after it.
+      const until = new Date(d.now().getTime() + PROBE_CARD_RAISE_GRANT_MS);
+      const g = await attempt(() => d.cardGrantOutlasts!(until));
+      if (!g.ok || g.value !== true) return toPurge(failed("card-grant-short"));
       const r = await attempt(() => d.raisePurgeCard!());
       if (!r.ok || typeof r.value !== "string" || r.value === "") return toPurge(failed("card-raise-failed"));
       await d.record({ ...last, phase: "cardwait", at: at(), cardId: r.value });

@@ -1,7 +1,7 @@
 // DEVOS-254 (M2.5-b4, docs/modules/M2.5.md "M2.5-b4 decisions"): one AT13 probe cycle purges through KK's purge card.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { probeStep, PROBE_CARD_MAX_MS, PROBE_PHASE_MAX_MS, PROBE_SLUG } from "../dist/provision-probe.js";
+import { probeStep, PROBE_CARD_MAX_MS, PROBE_CARD_RAISE_GRANT_MS, PROBE_CARD_START_GRANT_MS, PROBE_PHASE_MAX_MS, PROBE_SLUG } from "../dist/provision-probe.js";
 import { archiveUnderProbeGrant, probeActiveCounts, probeCardCycle, probeCardOutcome, probeExistingCard, raiseProbePurgeCard } from "../dist/provision-probe-purge.js";
 
 const ROWS = [
@@ -30,6 +30,9 @@ function fake(over = {}) {
     purge: async () => { calls.purge++; return "done"; },
     cardCycle: async () => !state.proven,
     raisePurgeCard: async () => { calls.raise++; return "card-1"; },
+    // Codex PR239-r7: the probe grant's expiry; by default it outlasts any card wait.
+    grantUntil: Infinity,
+    cardGrantOutlasts: async (until) => { calls.grantCheck = (calls.grantCheck ?? 0) + 1; return until.getTime() < d.grantUntil; },
     cardOutcome: async (id) => { calls.outcome++; assert.equal(id, "card-1"); return { stage: state.stage, card: state.card, decidedAt: state.decidedAt, byCard: state.byCard }; },
     ...over,
   };
@@ -86,6 +89,58 @@ test("without the card wiring a probe runs normal cycles (older deps)", async ()
   const r = await until(d, "done");
   assert.equal(r.code, "pass");
   assert.equal(d.log[0].viaCard, undefined);
+});
+
+test("Codex PR239-r7: a probe grant that would lapse during the card wait gives a normal cycle, purged at once", async () => {
+  assert.ok(PROBE_CARD_RAISE_GRANT_MS >= PROBE_CARD_MAX_MS + 2 * PROBE_PHASE_MAX_MS, "room for the purge after the wait");
+  assert.ok(PROBE_CARD_START_GRANT_MS > PROBE_CARD_RAISE_GRANT_MS, "room for the phases before the card");
+  // Valid for the card wait itself, but not for the purge after it.
+  const d = fake();
+  d.grantUntil = d.now().getTime() + PROBE_CARD_MAX_MS + PROBE_PHASE_MAX_MS;
+  const r = await until(d, "done");
+  assert.equal(r.code, "pass");
+  assert.equal(d.log[0].viaCard, undefined);
+  assert.equal(d.calls.raise, 0, "no card KK could leave unanswered past the grant");
+  assert.equal(d.calls.purge, 1, "purged at once under the still-valid grant");
+  // A grant that outlasts the start horizon gives a card cycle.
+  const ok = fake();
+  ok.grantUntil = ok.now().getTime() + PROBE_CARD_START_GRANT_MS + 1;
+  await until(ok, "cardwait");
+  assert.equal(ok.log[0].viaCard, true);
+  assert.equal(ok.calls.raise, 1);
+  // A check that throws is a normal cycle too.
+  const t = fake({ cardGrantOutlasts: async () => { throw new Error("db"); } });
+  assert.equal((await until(t, "done")).code, "pass");
+  assert.equal(t.calls.raise, 0);
+  // Older deps without the check never start a card cycle.
+  const o = fake({ cardGrantOutlasts: undefined });
+  assert.equal((await until(o, "done")).code, "pass");
+  assert.equal(o.calls.raise, 0);
+});
+
+test("Codex PR239-r7: a card cycle whose grant became too short before the card is purged by the probe, no card raised", async () => {
+  const d = fake();
+  await until(d, "card");
+  assert.equal(d.log.at(-1).phase, "card");
+  // KK shortened (or let lapse toward) the standing grant between the cycle's start and the card phase.
+  d.grantUntil = d.now().getTime() + PROBE_CARD_RAISE_GRANT_MS - 1;
+  let r = await probeStep(d);
+  assert.deepEqual(r, { exit: 3, phase: "purge", cycle: 1, code: "in_progress" });
+  assert.equal(d.calls.raise, 0);
+  r = await until(d, "done");
+  assert.equal(r.code, "card-grant-short");
+  assert.equal(d.calls.purge, 1);
+  // The check asks about the time the probe may still need to purge, from the card phase's tick.
+  const seen = [];
+  const e = fake({ cardGrantOutlasts: async (u) => { seen.push(u.getTime() - e.now().getTime()); return true; } });
+  await until(e, "cardwait");
+  assert.deepEqual(seen, [PROBE_CARD_START_GRANT_MS, PROBE_CARD_RAISE_GRANT_MS]);
+  // A throw at the card phase is purged by the probe too.
+  const t = fake();
+  await until(t, "card");
+  t.cardGrantOutlasts = async () => { throw new Error("db"); };
+  assert.equal((await until(t, "done")).code, "card-grant-short");
+  assert.equal(t.calls.raise, 0);
 });
 
 test("a card-cycle read that throws is a normal cycle", async () => {

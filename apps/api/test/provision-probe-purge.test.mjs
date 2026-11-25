@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { grantProblem } from "@devos/policy";
-import { teardownWiring, purgeStop, forbiddenTail, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, teardownResource, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
+import { teardownWiring, purgeStop, forbiddenTail, probePurge, findProbeGrant, grantAuthorizer, probeCycleStart, probeStage, probeGrantOutlasts, teardownResource, PROBE_GRANT_ACTIONS } from "../dist/provision-probe-purge.js";
 import * as realProvision from "@devos/provision";
 import * as realTeardown from "@devos/teardown";
 import { probeStep } from "../dist/provision-probe.js";
@@ -180,6 +180,25 @@ test("d3c-2a decision 3: a KK grant for teardown.* on the probe project is found
   // Pre-review 4: an archived row needs only the purge's use.
   assert.equal(await findProbeGrant(grantDb([grant({ uses: 29 })]).db, PID, NOW, 1234, grantProblem, ["teardown.purge"]), "g-1");
   assert.equal(await findProbeGrant(grantDb([grant({ scopeAction: "teardown.purge" })]).db, PID, NOW, 1234, grantProblem, ["teardown.purge"]), "g-1");
+});
+
+test("Codex PR239-r7: probeGrantOutlasts asks for the grant at the later time, with the uses the row still needs", async () => {
+  const LATER = new Date("2026-12-05T08:00:00Z");
+  const withStage = (stage, rows) => {
+    const g = grantDb(rows);
+    g.db.project = { findUnique: async (q) => { g.seen.push(q); return { stage } } };
+    return g;
+  };
+  // Valid now, but expired by the later time: not enough.
+  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ expiresAt: new Date("2026-12-01T00:00:00Z") })]).db, PID, LATER, 1234, grantProblem), false);
+  const { db, seen } = withStage("live", [grant()]);
+  assert.equal(await probeGrantOutlasts(db, PID, LATER, 1234, grantProblem), true);
+  assert.deepEqual(seen.find((q) => q && q.where && q.where.expiresAt).where.expiresAt, { gt: LATER }, "the read asks about the later time");
+  assert.ok(seen.filter((q) => q && "timeout" in q).every((o) => o.timeout === 1234 && o.maxWait === 1234), "bounded reads");
+  // Not archived yet: the Archive and the purge each need a use; archived: only the purge.
+  assert.equal(await probeGrantOutlasts(withStage("live", [grant({ uses: 29 })]).db, PID, LATER, 1234, grantProblem), false);
+  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 29 })]).db, PID, LATER, 1234, grantProblem), true);
+  assert.equal(await probeGrantOutlasts(withStage("archived", [grant({ uses: 30 })]).db, PID, LATER, 1234, grantProblem), false);
 });
 
 test("d3c-2a decision 3: the authorizer presents the grant to the M1.7 engine as the system provisioner", async () => {
