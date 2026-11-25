@@ -128,12 +128,6 @@ test("DEVOS-112: malformed output is unreadable, never a pass", () => {
     line({ result: "pass", mode: "legacy", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow") } }),
     line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "allow", "x\nok: fake"), "teardown.restore": act("allow") } }),
     line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "allow", "allowed-by", ["a b"]), "teardown.restore": act("allow") } }),
-    // Codex PR238-r4: an observe-mode row that contradicts the evaluator's gate rules.
-    line({ result: "pass", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "deny", "denied-by;gate-denied-by"), "teardown.restore": act("allow") } }),
-    line({ result: "pass", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "require_approval", "approval-required-by;gate-approval-required-by"), "teardown.restore": act("allow") } }),
-    line({ result: "fail", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("deny", "allow", "allowed-by"), "teardown.restore": act("allow") } }),
-    line({ result: "fail", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("require_approval", "allow", "allowed-by"), "teardown.restore": act("allow") } }),
-    line({ result: "fail", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("deny", "deny", "denied-by;gate-denied-by"), "teardown.restore": act("allow") } }),
     PASS.replace("\n", "\u0000\n")]) {
     const r = run({ cli });
     assert.equal(r.code, 1, `${JSON.stringify(cli)} → ${r.out}`);
@@ -145,4 +139,36 @@ test("DEVOS-112: the check only runs docker ps and docker exec (read-only)", () 
   const r = run({ cli: PASS });
   const verbs = r.args.trim().split("\n").map((l) => l.split(" ")[0]);
   assert.deepEqual([...new Set(verbs)].sort(), ["exec", "ps"]);
+});
+
+// Codex PR238-r4, r5: rows the evaluator cannot produce. Each fixture is otherwise consistent (its `result` follows
+// from the rows and the helper's exit code from its `result`), so only the row check can refuse it.
+test("DEVOS-112: a row the evaluator cannot produce is unreadable, never a pass", () => {
+  const O = (enforced, outcome, reason, matched = [ID]) => act(enforced, outcome, reason, matched);
+  const rows = [
+    ["enforce", O("allow", "allow", "default-deny", [])],
+    ["enforce", O("allow", "allow", "denied-by")],
+    ["enforce", O("allow", "allow", "approval-required-by")],
+    ["enforce", O("allow", "allow", "allowed-by", [])],
+    ["enforce", O("allow", "allow", "none")],
+    ["enforce", O("allow", "allow", "allowed-by;gate-denied-by")],
+    ["enforce", O("deny", "deny", "denied-by;gate-denied-by")],
+    ["enforce", O("deny", "deny", "allowed-by")],
+    ["observe", O("allow", "deny", "denied-by;gate-denied-by")],
+    ["observe", O("allow", "require_approval", "approval-required-by;gate-approval-required-by")],
+    ["observe", O("allow", "allow", "default-deny", [])],
+    ["observe", O("allow", "deny", "allowed-by")],
+    ["observe", O("deny", "allow", "allowed-by")],
+    ["observe", O("deny", "deny", "default-deny", [])],
+    ["observe", O("require_approval", "allow", "allowed-by")],
+    ["observe", O("allow", "allow", "allowed-by;sentinels-disagree")],
+  ];
+  for (const [mode, a] of rows) {
+    const result = a.enforced === "allow" ? "pass" : "fail";
+    const cli = line({ result, mode, rules: 1, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": act("allow") } });
+    const r = run({ cli, cliRc: result === "pass" ? 0 : 1 });
+    assert.equal(r.code, 1, `${mode} ${JSON.stringify(a)} → ${r.out}`);
+    assert.match(r.out, /^fail: unreadable rules check output$/m, `${mode} ${JSON.stringify(a)} → ${r.out}`);
+    assert.doesNotMatch(r.out, /^ok:/m);
+  }
 });
