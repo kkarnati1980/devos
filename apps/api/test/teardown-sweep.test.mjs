@@ -1334,6 +1334,38 @@ test("M2.5-b5 decision 31 (Codex PR240-r27): an early ask never hands out a pend
   assert.equal(cardDue(await s.approvals.store.get(r.approvalId)), null, "the early ask names no purge date");
 });
 
+test("M2.5-b5 decision 32 (Codex PR240-r28): an early ask never hands out a same-archive scheduled twin whose purge date moved", async () => {
+  const s = setup();
+  const raise = s.job.d.raise;
+  let twin = null;
+  s.job.d.raise = async (c) => {
+    // A daily raise (after a lost lock) stores its scheduled card after the ask listed pending cards; then Keep
+    // archived moves the date, and the ask's raise dedupes onto that card.
+    const p = s.projects.get(P);
+    twin = await s.approvals.raiseCard(purgeCard(p, { github: 2, coolify: 5 }, { due: p.purgeAfter }));
+    p.purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+    return raise(c);
+  };
+  const r = await s.job.askPurge(P).catch((e) => ({ ok: false, code: e.message }));
+  assert.ok(twin, "the twin was stored");
+  assert.notEqual(r.approvalId, twin.id, `the stale twin is never handed out: ${JSON.stringify(r)}`);
+  assert.equal((await s.approvals.store.get(twin.id)).status, "expired", "the stale twin is expired");
+});
+
+test("M2.5-b5 decision 32 (Codex PR240-r28): a purge denied because Keep archived moved the date raises no stop card", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  // Keep archived moves the purge date after approvedPass validated the card, before the purge took its lock.
+  const purge = s.job.d.purge;
+  s.job.d.purge = async (...a) => { s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS); return purge(...a); };
+  await s.job.tick();
+  assert.equal(s.calls.providerCalls, 0, "nothing was deleted");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "no stop card");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "purge-card-not-due"));
+});
+
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
   const s = setup();
   await s.job.tick();

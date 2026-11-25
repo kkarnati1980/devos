@@ -490,16 +490,16 @@ export class TeardownSweepJob {
       if (e instanceof PurgeTimeout) {
         // The run goes on under the project lock; its outcome is still reported when it ends (pre-review 4).
         this.d.log({ level: "warn", msg: "teardown-purge-timeout", projectId: p.id, approvalId, code: "teardown-purge-timeout" });
-        run.then((r) => this.afterResult(p, approvalId, r), (x) => this.afterError(p, approvalId, grantId, x)).catch(() => undefined);
+        run.then((r) => this.afterResult(p, approvalId, r), (x) => this.afterError(p, approvalId, grantId, x, card.due ?? null)).catch(() => undefined);
         return;
       }
-      await this.afterError(p, approvalId, grantId, e);
+      await this.afterError(p, approvalId, grantId, e, card.due ?? null);
       return;
     }
     await this.afterResult(p, approvalId, result);
   }
 
-  private async afterError(p: TeardownProject, approvalId: string, grantId: string, e: unknown): Promise<void> {
+  private async afterError(p: TeardownProject, approvalId: string, grantId: string, e: unknown, due: string | null = null): Promise<void> {
     const stop = teardownStop(e);
     const code = stop ? stop.code : "teardown-purge-failed";
     // Only a fixed code is logged, never an error's text (it may quote a provider body).
@@ -517,6 +517,13 @@ export class TeardownSweepJob {
       const now = await this.d.project(p.id).catch(() => p);
       if (!now || now.stage !== "archived" || now.archivedAt?.getTime() !== p.archivedAt?.getTime()) {
         this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, approvalId, code: "archive-superseded" });
+        return;
+      }
+      // Decision 32 (Codex PR240-r28): likewise, a scheduled card whose purge date Keep archived moved after the
+      // approved-card pass is denied by the authorizer (decision 30). That is KK's newer word, not a stop: no stop card
+      // is raised, so none blocks the card for the new date. A re-read that fails raises the stop card as before.
+      if (due !== null && due !== (now.purgeAfter?.toISOString() ?? null)) {
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, approvalId, code: "purge-card-not-due" });
         return;
       }
       this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
@@ -683,10 +690,16 @@ export class TeardownSweepJob {
     // or an identical scheduled twin) is expired; an early ask's card names no due date and is never expired here. If
     // this re-read or the expiry fails, decision 30's cleanup expires the pending card and the approved-card pass and
     // the purge authorizer refuse it, so it never purges. The call fails, so the daily run stays open.
-    if (opts.due && now.purgeAfter?.getTime() !== p.purgeAfter?.getTime()) {
-      if (cardDue(raised as { reason?: string | null }) === (p.purgeAfter?.toISOString() ?? null)) await this.expireCard(id, p.id, "purge-card-not-due");
+    // Decision 32 (Codex PR240-r28): this holds on every path, the early ask's included. A deduplicated raise can return
+    // a same-archive scheduled twin written before Keep archived moved the date; the returned card (the stored twin's
+    // text, or this raise's own) is checked against the fresh read, and one whose due date moved is expired and never
+    // returned. A returned card with no due stamp, or with the fresh due date, is never expired here.
+    const returned = { reason: typeof named === "string" ? named : card.reason };
+    if (dueMoved(returned, now)) {
+      await this.expireCard(id, p.id, "purge-card-not-due");
       throw new Error("purge-card-not-due");
     }
+    if (opts.due && now.purgeAfter?.getTime() !== p.purgeAfter?.getTime()) throw new Error("purge-card-not-due");
     return { id };
   }
 
