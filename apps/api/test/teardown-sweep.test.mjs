@@ -1041,3 +1041,24 @@ test("M2.5-b5 decision 16 (Codex PR240-r12): an early ask hands out an existing 
   delete t.job.d.lockHeld;
   assert.deepEqual(await t.job.askPurge(P), { ok: true, approvalId: t0.approvalId, raised: false });
 });
+
+test("M2.5-b5 decision 17 (Codex PR240-r13): a purge denied because the project was restored and archived again raises no stop card", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  // Restore and a new Archive land after approvedPass read the row, before the purge took its lock.
+  const purge = s.job.d.purge;
+  s.job.d.purge = async (...a) => { s.projects.get(P).archivedAt = new Date(s.now()); return purge(...a); };
+  await s.job.tick();
+  assert.equal(s.calls.providerCalls, 0);
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "no stop card");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "archive-superseded"));
+  // A real stop on the same archive still raises its card.
+  const t = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await t.job.tick();
+  const [d] = await t.purgeCards("pending");
+  await t.approvals.approve(t.session, d.id, { confirmation: `PURGE project:${P}` });
+  await t.job.tick();
+  assert.equal((await t.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
+});

@@ -389,6 +389,14 @@ export class TeardownSweepJob {
     }
     if (stop && !stop.retryable) {
       this.stopped.add(approvalId);
+      // Decision 17 (Codex PR240-r13): a Restore and a new Archive after this card's read make the authorizer deny the
+      // superseded card before any provider call. That is KK's newer word, not a stop: no stop card is raised, so none
+      // blocks the new archive's card. A re-read that fails raises the stop card as before.
+      const now = await this.d.project(p.id).catch(() => p);
+      if (!now || now.stage !== "archived" || now.archivedAt?.getTime() !== p.archivedAt?.getTime()) {
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, approvalId, code: "archive-superseded" });
+        return;
+      }
       this.d.log({ level: "warn", msg: "teardown-purge-stopped", projectId: p.id, approvalId, code });
       await this.raiseStopped(p, code);
       return;
