@@ -24,6 +24,8 @@ export const CARD_PAGE = 50;
 export const DUE_PAGE = 100;
 /** Decision 25: the tick's cleanup pages through pending cards (newest first) up to this many per action. */
 export const CLEANUP_SCAN_MAX = 1000;
+/** Decision 36: the resume-point key of Keep archived's scan of rejected purge cards (cleanup keys are action names). */
+const KEEP_SCAN_KEY = "keep:rejected";
 /**
  * Decision 28 (Codex PR240-r24): the most card ids sent in one expiry call. Equal to the approvals API's
  * EXPIRE_IDS_MAX (a test pins the two together); kept here so this job stays free of the approvals module's imports.
@@ -259,6 +261,13 @@ export function purgeStoppedCard(p: { id: string; slug: string; archivedAt: Date
   };
 }
 
+/**
+ * M2.5-b5 decision 36 (Codex PR240-r32): the failure a stop card reports, from its own fixed text (`stopped: <why>.
+ * The project stays archived.`), so a stored twin can be told apart from a stop for another failure of the same archive.
+ */
+const STOP_WHY = /^Deleting project \S+ stopped: (.+?)\. The project stays archived\. /;
+export const stopWhy = (reason: string): string | null => STOP_WHY.exec(reason)?.[1] ?? null;
+
 /** The fields of `@devos/teardown`'s TeardownError the job reads. */
 const teardownStop = (e: unknown): { code: string; retryable: boolean } | null => {
   const x = e as { name?: unknown; code?: unknown; retryable?: unknown } | null;
@@ -419,12 +428,20 @@ export class TeardownSweepJob {
    * (newest first), so a full first page of current cards never hides an older stale one. Bounded by CLEANUP_SCAN_MAX.
    */
   private async allPending(action: string): Promise<{ cards: PurgeCardLike[]; next: string | undefined }> {
+    return this.scanCards("pending", action, action);
+  }
+
+  /**
+   * Decisions 25–26, for any status: the cards of one action across all projects, newest first, paged by cursor from
+   * the resume point `key` names, at most CLEANUP_SCAN_MAX. Decision 36 (Codex PR240-r32) uses it for rejected cards.
+   */
+  private async scanCards(status: string, action: string, key: string): Promise<{ cards: PurgeCardLike[]; next: string | undefined }> {
     const out: PurgeCardLike[] = [];
     // Decision 26 (Codex PR240-r22): a scan that stops at the bound resumes on the next tick after the last card it
     // read, and starts again from the newest only once it reaches the end, so every pending card is reached in turn.
-    let cursor = this.scanFrom.get(action);
+    let cursor = this.scanFrom.get(key);
     while (out.length < CLEANUP_SCAN_MAX) {
-      const page = await this.d.cards({ status: "pending", action, cursor, limit: Math.min(CARD_PAGE, CLEANUP_SCAN_MAX - out.length) });
+      const page = await this.d.cards({ status, action, cursor, limit: Math.min(CARD_PAGE, CLEANUP_SCAN_MAX - out.length) });
       out.push(...page);
       if (page.length < CARD_PAGE) return { cards: out, next: undefined };
       cursor = page[page.length - 1]!.id;
@@ -440,8 +457,14 @@ export class TeardownSweepJob {
 
   /** 2. Decision (d): "Keep archived" on a card raised after `purge_after` moves `purge_after` by 30 days, once. */
   private async keepArchivedPass(): Promise<void> {
-    const rejected = await this.d.cards({ status: "rejected", action: PURGE_ACTION, limit: CARD_PAGE });
-    for (const c of rejected) {
+    // Decision 36 (Codex PR240-r32): every rejected card is reached, not only the newest page: the scan pages by cursor
+    // and resumes where the last tick stopped at its bound (decisions 25–26). Rejections stay rejected after they are
+    // applied, so a page of applied ones would otherwise hide an older one that still applies. Each project is read
+    // once per pass (the move itself re-reads under the lock), and the resume point moves once the batch is done; a
+    // card skipped by a failure is reached again when the scan wraps round to the newest.
+    const scan = await this.scanCards("rejected", PURGE_ACTION, KEEP_SCAN_KEY);
+    const reads = new Map<string, Promise<TeardownProject | null>>();
+    for (const c of scan.cards) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
       const projectId = c.projectId;
       // Decision 33 (Codex PR240-r29): the move takes the project lifecycle lock, the one a purge holds from its
@@ -457,18 +480,29 @@ export class TeardownSweepJob {
       // Decision 35 (Codex PR240-r31): the unlocked read is inside the per-card try, so a failed read skips this card
       // only, never the rest of the batch.
       try {
-        if (!keepApplies(c, await this.d.project(projectId))) continue;
+        let read = reads.get(projectId);
+        if (!read) {
+          read = this.d.project(projectId);
+          reads.set(projectId, read);
+          // A failed read is not cached, so the next card of the project reads again.
+          read.catch(() => reads.delete(projectId));
+        }
+        if (!keepApplies(c, await read)) continue;
         if (this.purging.has(projectId)) {
           this.d.log({ level: "info", msg: "teardown-keep-deferred", projectId, approvalId: c.id, code: "purge-running" });
           continue;
         }
         const keep = () => this.keepLocked(c, projectId);
         const locked = this.d.locked;
-        if (await (locked ? locked(projectId, keep) : keep())) this.d.log({ level: "info", msg: "teardown-keep-archived", projectId, approvalId: c.id });
+        if (await (locked ? locked(projectId, keep) : keep())) {
+          reads.delete(projectId);
+          this.d.log({ level: "info", msg: "teardown-keep-archived", projectId, approvalId: c.id });
+        }
       } catch {
         this.d.log({ level: "warn", msg: "teardown-keep-failed", projectId, approvalId: c.id, code: "teardown-keep-failed" });
       }
     }
+    this.commitScan(KEEP_SCAN_KEY, scan.next);
   }
 
   private async keepLocked(c: PurgeCardLike, projectId: string): Promise<boolean> {
@@ -625,15 +659,19 @@ export class TeardownSweepJob {
         // Decision 20 (Codex PR240-r16): only a twin of an archive OLDER than this stop's is expired. A twin naming a
         // newer archive means a Restore and a new Archive landed after the re-read and that archive has its own stop: it
         // is never touched, and this stop (for an archive that has ended) is dropped, as in decision 18.
+        // Decision 36 (Codex PR240-r32): a twin for this same archive that reports another failure (an earlier stop KK
+        // has not answered) does not serve this stop either: it is superseded (expired) and this stop raised, so KK
+        // always sees the newest failure. Only a twin with this archive and this failure serves it.
         let raised = await this.d.raise(card);
         if (!this.stopServes(raised, card)) {
           if (typeof (raised as { reason?: unknown } | null)?.reason !== "string") throw new Error("stop-card-not-raised");
-          if (!twinOlder(raised, o.p)) {
+          const sameArchiveTwin = this.stopSameArchive(raised, card);
+          if (!sameArchiveTwin && !twinOlder(raised, o.p)) {
             this.dropOwed(id, o);
             this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
             continue;
           }
-          await this.d.expire([stopId(raised)], "stop-card-archive-ended");
+          await this.d.expire([stopId(raised)], sameArchiveTwin ? "stop-card-superseded" : "stop-card-archive-ended");
           raised = await this.d.raise(card);
           if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
         }
@@ -652,8 +690,18 @@ export class TeardownSweepJob {
     if (this.stopsOwed.get(id) === o) this.stopsOwed.delete(id);
   }
 
-  /** Decision 19: the stored stop card names the same archive as the one built (a twin of another archive does not). */
+  /**
+   * Decision 19: the stored stop card names the same archive as the one built (a twin of another archive does not).
+   * Decision 36 (Codex PR240-r32): and the same failure (`stopWhy`), so a pending stop for an earlier failure of this
+   * archive never stands in for a new one.
+   */
   private stopServes(raised: unknown, card: { reason: string }): boolean {
+    const named = (raised as { reason?: unknown } | null)?.reason;
+    return this.stopSameArchive(raised, card) && typeof named === "string" && stopWhy(named) === stopWhy(card.reason);
+  }
+
+  /** Decision 36: the stored stop card names the same archive as the one built, whatever failure it reports. */
+  private stopSameArchive(raised: unknown, card: { reason: string }): boolean {
     const named = (raised as { reason?: unknown } | null)?.reason;
     return typeof named === "string" && cardArchive({ reason: named }) === cardArchive(card);
   }

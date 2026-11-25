@@ -10,7 +10,7 @@ import { Approvals, MemoryApprovalStore, parseCard, EXPIRE_IDS_MAX } from "../di
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
-  cardArchive, cardDue, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
+  cardArchive, cardDue, stopWhy, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
 } from "../dist/teardown-sweep.js";
 import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
@@ -1720,4 +1720,97 @@ test("M2.5-b5 decision 22 (Codex PR240-r18): a late stop for an older archive ne
   assert.equal(stops.length, 1, "the newer archive's stop is delivered");
   assert.equal(cardArchive(stops[0]), p.archivedAt.toISOString());
   assert.match(stops[0].reason, /the leftover check still found resources of this project/);
+});
+
+test("M2.5-b5 decision 36 (Codex PR240-r32): a stop raise deduplicated onto this archive's pending stop for another failure supersedes it, so KK sees the new failure", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const p = s.projects.get(P);
+  const purge = s.job.d.purge;
+  let earlier;
+  s.job.d.purge = async (...a) => {
+    // An earlier, unanswered stop for this same archive but another failure is still pending when this one is raised.
+    earlier = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 1 }));
+    return purge(...a);
+  };
+  await s.job.tick();
+  const prior = await s.approvals.store.get(earlier.id);
+  assert.equal(prior.status, "expired", "the earlier failure's stop is superseded");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(cardArchive(pending[0]), p.archivedAt.toISOString());
+  assert.equal(stopWhy(pending[0].reason), "a DevOS rule does not allow this purge", "the new failure reaches KK");
+  // It still holds back the next purge card, and a second tick changes nothing.
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0);
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 1);
+});
+
+test("M2.5-b5 decision 36 (Codex PR240-r32): a twin with this archive and this failure serves the stop and is kept", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  const twin = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 9 }));
+  await s.job.raiseStopped({ ...p }, "leftover");
+  assert.equal((await s.approvals.store.get(twin.id)).status, "pending");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
+});
+
+test("M2.5-b5 decision 36 (Codex PR240-r32): stopWhy reads the fixed failure text of every stop card", () => {
+  const at = new Date(T0);
+  for (const code of ["leftover", "policy_denied", "scan-error", "no-such-code"]) {
+    const card = purgeStoppedCard({ id: P, slug: "acme", archivedAt: at }, code, { github: 1 });
+    assert.ok(stopWhy(card.reason), code);
+    assert.ok(card.reason.includes(`stopped: ${stopWhy(card.reason)}. `), code);
+  }
+  assert.equal(stopWhy(purgeStoppedCard({ id: P, slug: "BAD SLUG", archivedAt: at }, "leftover", {}).reason), "after deleting, the leftover check still found resources of this project");
+  assert.notEqual(stopWhy(purgeStoppedCard({ id: P, slug: "acme", archivedAt: at }, "leftover", {}).reason), stopWhy(purgeStoppedCard({ id: P, slug: "acme", archivedAt: at }, "incomplete", {}).reason));
+});
+
+async function rejectedOthers(s, n, prefix) {
+  for (let i = 0; i < n; i++) {
+    const id = `${prefix}-${String(i).padStart(12, "0")}`;
+    const at = new Date(s.now() - 40 * DAY);
+    // Rejections that no longer apply (the projects were restored), all newer than P's.
+    s.projects.set(id, { id, slug: `p${i}`, stage: "active", archivedAt: null, purgeAfter: null });
+    const r = await s.approvals.raiseCard(purgeCard({ id, slug: `p${i}`, archivedAt: at }, { github: 1 }));
+    await s.approvals.reject(s.session, r.id ?? r);
+  }
+}
+
+test("M2.5-b5 decision 36 (Codex PR240-r32): Keep archived pages past a full page of newer rejections to an older one that still applies", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  s.advance(1);
+  await s.approvals.reject(s.session, c.id);
+  const decidedAt = s.now();
+  s.advance(1);
+  await rejectedOthers(s, CARD_PAGE + 5, "77777777-7777-4777-8777");
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1, "the older rejection is reached");
+  assert.equal(s.calls.keep[0].approvalId, c.id);
+  assert.equal(s.projects.get(P).purgeAfter.getTime(), decidedAt + KEEP_ARCHIVED_MS);
+});
+
+test("M2.5-b5 decision 36 (Codex PR240-r32): a Keep archived scan that stops at its bound resumes on the next tick", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  s.advance(1);
+  await s.approvals.reject(s.session, c.id);
+  s.advance(1);
+  await rejectedOthers(s, CLEANUP_SCAN_MAX + 5, "88888888-8888-4888-8888");
+  const read = s.job.d.project;
+  let reads = 0;
+  s.job.d.project = async (id) => { reads++; return read(id); };
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 0, "the first scan stops at its bound");
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1, "the next tick resumes and moves the date");
+  assert.equal(s.calls.keep[0].approvalId, c.id);
+  assert.ok(reads > 0);
 });
