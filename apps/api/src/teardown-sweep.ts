@@ -525,7 +525,8 @@ export class TeardownSweepJob {
         // Pre-review 1: a purge of this process still running (maybe past its limit) holds the lock; skip, never queue.
         // Codex PR240-r2: the row is not served yet, so the daily run stays open and a later tick checks it again.
         if (this.purging.has(id)) { failed = true; continue; }
-        const raise = () => this.raiseDueLocked(id);
+        // Decision 23 (Codex PR240-r19): the locked read must still be the archive listDue saw.
+        const raise = () => this.raiseDueLocked(id, listed.archivedAt);
         const locked = this.d.locked;
         if (await (locked ? locked(id, raise) : raise())) this.d.log({ level: "info", msg: "teardown-purge-card", projectId: id });
       } catch {
@@ -538,10 +539,19 @@ export class TeardownSweepJob {
     if (failed) throw new Error("teardown-due-partial");
   }
 
-  /** M2.5-b5 decision 2: re-read under the lock; raise only for a row that is still archived and due now. */
-  private async raiseDueLocked(projectId: string): Promise<boolean> {
+  /**
+   * M2.5-b5 decision 2: re-read under the lock; raise only for a row that is still archived and due now.
+   * Decision 23 (Codex PR240-r19): and only for the same archive listDue returned (same `archivedAt`). A row restored
+   * and archived again after listDue gets no card from this pass, even if the new archive is already due; the next
+   * daily run lists it afresh.
+   */
+  private async raiseDueLocked(projectId: string, listedArchivedAt: Date | null | undefined): Promise<boolean> {
     const p = await this.d.project(projectId);
     if (!p || p.stage !== "archived" || !p.purgeAfter || p.purgeAfter.getTime() > this.now()) return false;
+    if (!listedArchivedAt || p.archivedAt?.getTime() !== listedArchivedAt.getTime()) {
+      this.d.log({ level: "info", msg: "teardown-card-skipped", projectId, code: "archive-changed" });
+      return false;
+    }
     // Decision 6: a card still owed its expiry keeps this row unserved (the daily run stays open).
     this.assertNoUnfenced(p.id);
     if (!(await this.shouldRaise(p))) return false;

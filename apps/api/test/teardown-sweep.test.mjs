@@ -675,6 +675,24 @@ test("M2.5-b5 AT3: a row restored and archived again after listDue gets no card 
   assert.equal((await t.purgeCards("pending")).length, 1);
 });
 
+test("M2.5-b5 AT3 (decision 23, Codex PR240-r19): a row archived again after listDue gets no card from that pass even when the new archive is already due", async () => {
+  const s = setup();
+  s.job.d.locked = serialLock().locked;
+  const listDue = s.job.d.listDue;
+  s.job.d.listDue = async (at, limit) => {
+    const due = await listDue(at, limit);
+    // Restore and a new Archive between the due check and the raise; the new archive is already past its purge date.
+    const p = s.projects.get(P);
+    p.archivedAt = new Date(s.now() - 1000);
+    p.purgeAfter = new Date(s.now() - 500);
+    return due;
+  };
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0, "no card for an archive absent from the due snapshot");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-skipped" && l.code === "archive-changed"));
+  assert.ok(!s.logs.some((l) => l.msg === "teardown-purge-card"));
+});
+
 test("M2.5-b5 AT4: a lock that cannot be taken raises nothing and keeps the daily run open", async () => {
   const s = setup();
   s.job.d.locked = async () => { throw new Error("lock_timeout"); };
