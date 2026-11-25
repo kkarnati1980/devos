@@ -1,7 +1,7 @@
 // DEVOS-112 (docs/modules/M2.5.md "DEVOS-112: KK's teardown rules check"): would M1.7 let KK's Archive and Restore through?
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { kkTeardownCli, CHECK_IDENTITY, CHECK_PROJECT_ID, KK_TEARDOWN_ACTIONS } from "../dist/teardown-rules-cli.js";
+import { kkTeardownCli, randomSentinels, KK_TEARDOWN_ACTIONS } from "../dist/teardown-rules-cli.js";
 
 const rule = (o) => ({
   id: o.id, name: o.name ?? o.id, version: 1, priority: o.priority ?? 0, actions: o.actions ?? ["teardown.*"],
@@ -50,8 +50,12 @@ test("DEVOS-112: a deny beats an allow, a gate deny binds in observe mode, and r
   assert.equal(r.out.actions["teardown.archive"].enforced, "require_approval");
 });
 
-test("DEVOS-112: asks as a generic KK principal on a sentinel project; a rule pinned to one login or project does not match", async () => {
-  assert.match(CHECK_IDENTITY.id, /^kk:/);
+test("DEVOS-112: asks as generic KK principals on random sentinel projects; a rule pinned to one login or project does not match", async () => {
+  const [x, y] = randomSentinels();
+  assert.match(x.identity.id, /^kk:check-[0-9a-f-]{36}$/);
+  assert.notEqual(x.identity.id, y.identity.id);
+  assert.notEqual(x.projectId, y.projectId);
+  assert.notEqual(randomSentinels()[0].projectId, x.projectId);
   const r = await kkTeardownCli(["kk-teardown"], reader("enforce", [
     rule({ id: ALLOW, principals: ["kk:someone@example.com"] }),
     rule({ id: DENY, effect: "deny", resources: ["project:abc"] }),
@@ -62,8 +66,29 @@ test("DEVOS-112: asks as a generic KK principal on a sentinel project; a rule pi
   assert.equal(r.out.pinned, 2);
   const other = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: DENY, effect: "deny", principals: ["agent:*"] }), rule({ id: "x1", actions: ["repo.*"] }), rule({ id: ALLOW })]));
   assert.equal(other.out.pinned, 0);
-  const ok = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, resources: [`project:${CHECK_PROJECT_ID}`] })]));
-  assert.equal(ok.code, 0);
+  assert.equal(other.code, 0);
+});
+
+test("Codex PR238-r1: a rule that matches only one sentinel makes the sentinels disagree, a fail, never a pass", async () => {
+  const fixed = () => [
+    { identity: { id: "kk:check-a", type: "kk" }, projectId: "pa" },
+    { identity: { id: "kk:check-b", type: "kk" }, projectId: "pb" },
+  ];
+  // An allow scoped to the first sentinel (as a rule written for the check's own identity would be).
+  let r = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, principals: ["kk:check-a"] })]), Date.now, fixed);
+  assert.equal(r.code, 1);
+  assert.equal(r.out.actions["teardown.archive"].enforced, "deny");
+  assert.equal(r.out.actions["teardown.archive"].reason, "sentinels-disagree");
+  assert.equal(r.out.pinned, 1);
+  // Scoped to one sentinel project, in observe mode: both enforced allow, but the rule outcomes differ.
+  r = await kkTeardownCli(["kk-teardown"], reader("observe", [rule({ id: ALLOW, resources: ["project:pa"] })]), Date.now, fixed);
+  assert.equal(r.code, 1);
+  assert.equal(r.out.actions["teardown.restore"].enforced, "allow");
+  assert.equal(r.out.actions["teardown.restore"].reason, "sentinels-disagree");
+  // On fresh random sentinels such a rule can never match at all: a default deny, a fail.
+  r = await kkTeardownCli(["kk-teardown"], reader("enforce", [rule({ id: ALLOW, principals: ["kk:teardown*"] }), rule({ id: "r2", resources: ["project:00000000*"] })]));
+  assert.equal(r.code, 1);
+  assert.equal(r.out.actions["teardown.archive"].reason, "default-deny");
 });
 
 test("DEVOS-112: a read error or a malformed policy is a fixed code, never the database message", async () => {

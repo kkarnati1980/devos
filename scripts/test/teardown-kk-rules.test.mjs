@@ -61,7 +61,7 @@ test("DEVOS-112: a default deny in enforce mode → fail, naming it", () => {
 });
 
 test("DEVOS-112 pre-review 1: a result that disagrees with its rows is unreadable, never a pass", () => {
-  for (const [result, a, b] of [["pass", act("deny"), act("allow")], ["pass", act("allow"), act("require_approval")], ["fail", act("allow"), act("allow")], ["pass", act("allow"), act("")], ["pass", act("allow"), act("maybe")]]) {
+  for (const [result, a, b] of [["pass", act("deny"), act("allow")], ["pass", act("allow"), act("require_approval")], ["fail", act("allow"), act("allow")], ["pass", act("allow"), act("")], ["pass", act("allow"), act("maybe")], ["pass", act("allow"), act("allow", "allow", "sentinels-disagree")]]) {
     const r = run({ cli: line({ result, mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": b } }), cliRc: result === "pass" ? 0 : 1 });
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /^fail: unreadable rules check output$/m);
@@ -74,6 +74,11 @@ test("DEVOS-112 pre-review 2: rules pinned to a login or a project are reported,
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /note: 2 teardown rule\(s\) are pinned to a KK login or a project/);
   assert.doesNotMatch(run({ cli: PASS }).out, /note:/);
+  // Codex PR238-r1: sentinels that disagree are a fail, shown as such.
+  const dis = run({ cli: line({ result: "fail", mode: "enforce", rules: 1, pinned: 1, actions: { "teardown.archive": act("allow", "allow", "sentinels-disagree"), "teardown.restore": act("allow") } }), cliRc: 1 });
+  assert.equal(dis.code, 1, dis.out);
+  assert.match(dis.out, /KK teardown.archive: allow \(rule outcome allow, sentinels-disagree/);
+  assert.match(dis.out, /^fail: KK's Archive or Restore would be refused/m);
   assert.equal(run({ cli: PASS.replace('"pinned":0', '"pinned":"2"') }).code, 1);
 });
 
