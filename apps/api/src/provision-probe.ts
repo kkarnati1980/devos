@@ -52,6 +52,11 @@ export interface PhaseRecord {
   cardExpireGaveUp?: boolean;
   /** Codex PR239-r25: `cardwait` saw the sweep's purge under KK's approved card (AT10's proof); only the expiry is left. */
   cardProven?: boolean;
+  /**
+   * Codex PR239-r26: recorded with `cardProven`, the start the 8-day wait was measured from (the earlier of the card's
+   * raise and the `cardwait` record), so the expiry retries keep the deadline the original raise set.
+   */
+  cardWaitFrom?: string;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
 }
 
@@ -341,7 +346,9 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // is never read again, so a failing read or a short grant cannot lose it.
       if (last.cardProven) {
         const post = await attempt(async () => { if (d.expirePurgeCards) await d.expirePurgeCards(); });
-        const lateProof = d.now().getTime() - Date.parse(last.at) >= PROBE_CARD_MAX_MS;
+        // Codex PR239-r26 (medium): measured from the wait's recorded start, never from a later record time alone.
+        const from = typeof last.cardWaitFrom === "string" ? Date.parse(last.cardWaitFrom) : NaN;
+        const lateProof = d.now().getTime() - (Number.isFinite(from) && from < Date.parse(last.at) ? from : Date.parse(last.at)) >= PROBE_CARD_MAX_MS;
         if (!post.ok && !lateProof) return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
         return finish(true, PASS_CARD);
       }
@@ -370,7 +377,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
           // a plain wait keeps the proof already seen.
           if (!post.ok && !late) {
             // Codex PR239-r25: the proof is recorded first, so the retries never read the card again.
-            await d.record({ ...last, cardProven: true });
+            // Codex PR239-r26: with the wait's effective start, so the retries keep the original raise's deadline.
+            await d.record({ ...last, cardProven: true, cardWaitFrom: new Date(start).toISOString() });
             return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
           }
         }

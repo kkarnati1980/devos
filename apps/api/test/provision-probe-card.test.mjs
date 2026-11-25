@@ -844,3 +844,38 @@ test("Codex PR239-r23 (DEVOS-254 d22): a pass-card in cardwait first expires the
   assert.equal(d.calls.expire, 5);
   assert.equal(d.calls.purge, 0);
 });
+
+test("Codex PR239-r26: once the proof is recorded, the expiry retries keep the deadline the card's earlier raise set", async () => {
+  const d = fake();
+  await until(d, "cardwait");
+  // The card was raised 2 days before the tick that recorded `cardwait` (a retried tick reused it).
+  const recorded = Date.parse(d.log.at(-1).at);
+  const raisedAt = recorded - 2 * DAY;
+  d.state.raisedAt = new Date(raisedAt).toISOString();
+  d.state.card = "approved"; d.state.decidedAt = d.now().toISOString(); d.state.byCard = true;
+  d.state.stage = "purged";
+  let fail = true;
+  d.expirePurgeCards = async () => { if (fail) throw new Error("db"); };
+  let r = await probeStep(d);
+  assert.equal(r.detail, "card-expire-after-purge");
+  assert.equal(d.log.at(-1).cardProven, true);
+  assert.equal(d.log.at(-1).cardWaitFrom, new Date(raisedAt).toISOString(), "the wait's start is recorded with the proof");
+  // Just before the raise's deadline the retry still waits; at it, the cycle passes, though the record is 2 days newer.
+  d.tick(raisedAt + PROBE_CARD_MAX_MS - d.now().getTime() - 1);
+  assert.equal((await probeStep(d)).detail, "card-expire-after-purge");
+  d.tick(1);
+  r = await probeStep(d);
+  assert.deepEqual([r.phase, r.code], ["done", "pass-card"]);
+  // A start after the record (clock skew) or an unreadable one never moves the deadline past the record's.
+  for (const from of [new Date(recorded + DAY).toISOString(), "not-a-date"]) {
+    const e = fake();
+    await until(e, "cardwait");
+    const at = Date.parse(e.log.at(-1).at);
+    e.expirePurgeCards = async () => { throw new Error("db"); };
+    e.log.push({ ...e.log.at(-1), cardProven: true, cardWaitFrom: from });
+    e.tick(at + PROBE_CARD_MAX_MS - e.now().getTime() - 1);
+    assert.equal((await probeStep(e)).detail, "card-expire-after-purge");
+    e.tick(1);
+    assert.equal((await probeStep(e)).code, "pass-card");
+  }
+});
