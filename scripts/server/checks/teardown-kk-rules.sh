@@ -74,7 +74,8 @@ summary="$(printf '%s' "$obj" | jq -r '
   # PR238-r7: the evaluator reads only the matched rules, and a rule matches the requests of both actions alike, so two rows
   # with the same matched set are the same row. Codex PR238-r8: the helper prints at most 10 matched ids per action
   # (MATCHED_CAP in teardown-rules-cli.ts), so a list of 10 may be cut and the rule is applied only below that. Codex PR238-r10: the evaluator
-  # lists matched rules by priority, then id, so the same set comes in the same order for both actions.
+  # lists matched rules by priority, then id, so the same set comes in the same order for both actions,
+  # and (r11) the rules both rows name come in the same relative order.
   def gated: has("gate-denied-by") or has("gate-approval-required-by");
   def consistent($mode; $nrules):
     (keys == ["enforced", "matched", "outcome", "reason"])
@@ -109,6 +110,8 @@ summary="$(printf '%s' "$obj" | jq -r '
      and ([$rows[].matched[]] | unique | length) <= $nrules
      and (($rows[0].matched | length) >= 10 or ($rows[1].matched | length) >= 10
           or ($rows[0].matched | sort) != ($rows[1].matched | sort) or $rows[0] == $rows[1])
+     and ([$rows[0].matched[] | select(. as $x | $rows[1].matched | index($x))]
+          == [$rows[1].matched[] | select(. as $x | $rows[0].matched | index($x))])
      and .result == (if all($rows[]; .enforced == "allow" and .reason != "sentinels-disagree" and .reason != "narrow-match") then "pass" else "fail" end)
   then
     "\(.result)|\(.mode)|\(.rules)|\(.pinned)",

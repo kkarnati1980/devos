@@ -249,3 +249,13 @@ test("Codex PR238-r10: the same matched rules in another order for the other act
   const ok = run({ cli: cli.replace(`["${ID2}","${ID}"]`, `["${ID}","${ID2}"]`) });
   assert.equal(ok.code, 0, ok.out);
 });
+
+test("Codex PR238-r11: rules both actions name must come in the same relative order", () => {
+  const ID3 = "33333333-3333-4333-8333-333333333333";
+  const mk = (b) => line({ result: "pass", mode: "enforce", rules: 3, pinned: 0, actions: {
+    "teardown.archive": act("allow", "allow", "allowed-by", [ID, ID2]), "teardown.restore": act("allow", "allow", "allowed-by", b) } });
+  const r = run({ cli: mk([ID2, ID, ID3]) });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /^fail: unreadable rules check output$/m);
+  for (const b of [[ID, ID2, ID3], [ID, ID3, ID2], [ID3, ID, ID2]]) assert.equal(run({ cli: mk(b) }).code, 0, JSON.stringify(b));
+});
