@@ -1148,3 +1148,31 @@ test("M2.5-b5 decision 19 (Codex PR240-r15): a stop raise deduplicated onto an e
   await s.job.tick();
   assert.equal((await s.purgeCards("pending")).length, 0);
 });
+
+test("M2.5-b5 decision 20 (Codex PR240-r16): a stop raise deduplicated onto a newer archive's stop card never expires it, and the ended archive's stop is dropped", async () => {
+  const s = setup({ purgeImpl: async () => { throw new TeardownError("policy_denied", false, "denied"); } });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const counts = s.job.d.activeCounts;
+  let newer = null;
+  s.job.d.activeCounts = async (id) => {
+    if (!newer && (await s.approvals.store.list({ action: PURGE_ACTION, status: "approved", limit: 5 })).length) {
+      // After deliverStops' re-read: Restore, a new Archive, and another process's stop card for that new archive.
+      const p = s.projects.get(P);
+      p.archivedAt = new Date(s.now());
+      newer = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 1 }));
+    }
+    return counts(id);
+  };
+  await s.job.tick();
+  assert.ok(newer);
+  assert.equal((await s.approvals.store.get(newer.id)).status, "pending", "the newer archive's stop card is left alone");
+  const stops = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 });
+  assert.equal(stops.length, 1, "no stop is written for the ended archive");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "archive-superseded"));
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(newer.id)).status, "pending", "still open on the next tick");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
+});

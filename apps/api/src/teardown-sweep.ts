@@ -83,6 +83,12 @@ const stopId = (raised: unknown): string => {
   return id;
 };
 
+/** Decision 20: the stored twin names an archive older than `p`'s (or none, from before decision 18). */
+const twinOlder = (raised: unknown, p: TeardownProject): boolean => {
+  const reason = (raised as { reason?: unknown } | null)?.reason;
+  return typeof reason === "string" && olderArchive({ reason }, p);
+};
+
 /** Decision 18: `b` (a fresh read) is still the archive `a` was read in. */
 const sameArchive = (a: TeardownProject, b: TeardownProject | null): boolean =>
   b !== null && b.stage === "archived" && a.archivedAt !== null && b.archivedAt?.getTime() === a.archivedAt.getTime();
@@ -464,8 +470,17 @@ export class TeardownSweepJob {
         // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
         // read proved the archive has moved on from it) and the stop is raised again; if a twin of another archive still
         // comes back, or the expiry fails, the stop stays owed and is retried next tick.
+        // Decision 20 (Codex PR240-r16): only a twin of an archive OLDER than this stop's is expired. A twin naming a
+        // newer archive means a Restore and a new Archive landed after the re-read and that archive has its own stop: it
+        // is never touched, and this stop (for an archive that has ended) is dropped, as in decision 18.
         let raised = await this.d.raise(card);
         if (!this.stopServes(raised, card)) {
+          if (typeof (raised as { reason?: unknown } | null)?.reason !== "string") throw new Error("stop-card-not-raised");
+          if (!twinOlder(raised, o.p)) {
+            this.stopsOwed.delete(id);
+            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
+            continue;
+          }
           await this.d.expire([stopId(raised)], "stop-card-archive-ended");
           raised = await this.d.raise(card);
           if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
