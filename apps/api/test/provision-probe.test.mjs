@@ -198,6 +198,10 @@ test("DEVOS-21 part 13: a purge a provider refused is re-run once on the next ch
   refuse = null;
   const cleaned = (await runToEnd(d)).at(-1);
   assert.deepEqual([cleaned.cycle, cleaned.code], [4, "previous-purge-pending"], "once the provider allows it, the leftovers are purged");
+  d.cycleStart = async () => "ready";
+  const real = await probeStep(d);
+  assert.deepEqual([real.cycle, real.phase], [5, "run1"], "the real cycle follows the cleanup");
+  assert.equal(d.log.at(-1).refusalRetry, undefined, "the real cycle carries no refusal marker");
 
   // the form whose tail was dropped (over 120 characters) still counts; a kind with a digit counts
   for (const detail of ["purge-permission:coolify/application", "purge-permission:coolify/env_var2:delete:http-401"]) {
