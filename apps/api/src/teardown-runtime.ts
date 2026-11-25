@@ -171,9 +171,9 @@ export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownS
       }));
       return rows.find((g) => g.uses === 0 && g.maxUses >= 1)?.id ?? null;
     },
-    keepArchived: (projectId: string, from: Date, to: Date, approvalId: string) =>
+    keepArchived: (projectId: string, from: Date, to: Date, approvalId: string, archivedAt: Date) =>
       tx(async (t: any) => {
-        const r = await t.project.updateMany({ where: { id: projectId, stage: "archived", purgeAfter: from }, data: { purgeAfter: to } });
+        const r = await t.project.updateMany({ where: { id: projectId, stage: "archived", purgeAfter: from, archivedAt }, data: { purgeAfter: to } });
         if (r.count !== 1) return false;
         await t.auditEvent.create({ data: { actor: "system", action: "teardown.keep_archived", summary: "Kept archived another 30 days (purge card rejected)", projectId, details: { approvalId, purgeAfter: to.toISOString() } } });
         return true;

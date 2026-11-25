@@ -128,7 +128,8 @@ export interface TeardownSweepDeps {
    */
   purge(projectId: string, grantId: string, card: { createdAt: Date; archive: string | null }): Promise<PurgeResultLike>;
   /** `purge_after` from `from` to `to`, only while the project is archived and `purge_after` is still `from`. */
-  keepArchived(projectId: string, from: Date, to: Date, approvalId: string): Promise<boolean>;
+  /** Decision 26 (Codex PR240-r22): moves `purge_after` only while the row is still the archive `archivedAt` names. */
+  keepArchived(projectId: string, from: Date, to: Date, approvalId: string, archivedAt: Date): Promise<boolean>;
   log(e: { level: "info" | "warn"; msg: string; projectId?: string; code?: string; approvalId?: string }): void;
   /**
    * M2.5-b5 decision 1 (DEVOS-255, from Codex PR239-r21): runs `fn` under the project lifecycle lock (the teardown store's
@@ -268,6 +269,8 @@ export class TeardownSweepJob {
    * needs KK's approval before anything more is deleted.
    */
   private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string }>();
+  /** Decision 26: where each action's cleanup scan resumes on the next tick (the last card id read at the bound). */
+  private readonly scanFrom = new Map<string, string>();
   /**
    * M2.5-b5 decision 6 (Codex PR240-r3): purge cards written but not proven to belong to the archive they were built
    * for (the fence's re-read failed or found a new archive) whose expiry also failed, by card id → project id. Retried
@@ -354,13 +357,19 @@ export class TeardownSweepJob {
    */
   private async allPending(action: string): Promise<PurgeCardLike[]> {
     const out: PurgeCardLike[] = [];
-    let cursor: string | undefined;
+    // Decision 26 (Codex PR240-r22): a scan that stops at the bound resumes on the next tick after the last card it
+    // read, and starts again from the newest only once it reaches the end, so every pending card is reached in turn.
+    let cursor = this.scanFrom.get(action);
     while (out.length < CLEANUP_SCAN_MAX) {
       const page = await this.d.cards({ status: "pending", action, cursor, limit: Math.min(CARD_PAGE, CLEANUP_SCAN_MAX - out.length) });
       out.push(...page);
-      if (page.length < CARD_PAGE) break;
+      if (page.length < CARD_PAGE) {
+        this.scanFrom.delete(action);
+        return out;
+      }
       cursor = page[page.length - 1]!.id;
     }
+    this.scanFrom.set(action, cursor!);
     return out;
   }
 
@@ -373,10 +382,12 @@ export class TeardownSweepJob {
       // A card raised before purge_after (an early ask) leaves purge_after as it is; a moved purge_after is later than
       // the card, so each rejection moves it once.
       // Decision 9 (Codex PR240-r5): only a card naming the current archive moves its purge date.
-      if (!p || p.stage !== "archived" || !p.purgeAfter || c.createdAt.getTime() < p.purgeAfter.getTime() || !raisedThisArchive(c, p)) continue;
+      if (!p || p.stage !== "archived" || !p.purgeAfter || !p.archivedAt || c.createdAt.getTime() < p.purgeAfter.getTime() || !raisedThisArchive(c, p)) continue;
       const from = p.purgeAfter;
       const base = Math.max(from.getTime(), (c.decidedAt ?? c.createdAt).getTime());
-      if (await this.d.keepArchived(p.id, from, new Date(base + KEEP_ARCHIVED_MS), c.id)) {
+      // Decision 26 (Codex PR240-r22): the write also matches this read's archive, so a Restore and a new Archive with
+      // the same purge date in between never lets this rejection postpone the new archive.
+      if (await this.d.keepArchived(p.id, from, new Date(base + KEEP_ARCHIVED_MS), c.id, p.archivedAt)) {
         this.d.log({ level: "info", msg: "teardown-keep-archived", projectId: p.id, approvalId: c.id });
       }
     }

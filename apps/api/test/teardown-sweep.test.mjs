@@ -10,7 +10,7 @@ import { Approvals, MemoryApprovalStore, parseCard } from "../dist/approvals.js"
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
-  cardArchive, CARD_PAGE,
+  cardArchive, CARD_PAGE, CLEANUP_SCAN_MAX,
 } from "../dist/teardown-sweep.js";
 import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
@@ -67,9 +67,9 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
       return [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses === 0)?.id ?? null;
     },
     purge,
-    keepArchived: async (id, from, to, approvalId) => {
+    keepArchived: async (id, from, to, approvalId, archivedAt) => {
       const p = projects.get(id);
-      if (!p || p.stage !== "archived" || p.purgeAfter?.getTime() !== from.getTime()) return false;
+      if (!p || p.stage !== "archived" || p.purgeAfter?.getTime() !== from.getTime() || p.archivedAt?.getTime() !== archivedAt?.getTime()) return false;
       p.purgeAfter = to;
       calls.keep.push({ id, to, approvalId });
       return true;
@@ -380,8 +380,9 @@ test("pre-review 6: the production queries: an unspent grant only, and Keep arch
   const g = seen.find((x) => x[0] === "grant")[1];
   assert.deepEqual(g.where, { approvalId: "a1", revokedAt: null, expiresAt: { gt: now }, uses: 0 });
   const from = new Date(T0), to = new Date(T0 + KEEP_ARCHIVED_MS);
-  assert.equal(await job.d.keepArchived(P, from, to, "a1"), true);
-  assert.deepEqual(seen.find((x) => x[0] === "update")[1], { where: { id: P, stage: "archived", purgeAfter: from }, data: { purgeAfter: to } });
+  const archivedAt = new Date(T0 - 31 * DAY);
+  assert.equal(await job.d.keepArchived(P, from, to, "a1", archivedAt), true);
+  assert.deepEqual(seen.find((x) => x[0] === "update")[1], { where: { id: P, stage: "archived", purgeAfter: from, archivedAt }, data: { purgeAfter: to } });
   const audit = seen.find((x) => x[0] === "audit")[1].data;
   assert.equal(audit.action, "teardown.keep_archived");
   assert.equal(audit.details.approvalId, "a1");
@@ -1088,6 +1089,43 @@ test("M2.5-b5 decision 25 (Codex PR240-r21): the cleanup pages past a full first
   assert.equal((await s.approvals.store.get(restoredCard.id)).status, "expired", "the restored project's purge card is closed");
   const live = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 200 });
   assert.equal(live.filter((c) => c.target !== `project:${P}`).length, CARD_PAGE + 5, "current stop cards stay open");
+});
+
+test("M2.5-b5 decision 26 (Codex PR240-r22): a cleanup scan that stops at its bound resumes on the next tick and reaches an older stale stop card", async () => {
+  const s = setup();
+  const old = { id: P, slug: "acme", archivedAt: new Date(T0 - 60 * DAY) };
+  const staleStop = await s.approvals.raiseCard(purgeStoppedCard(old, "leftover", { github: 1 }));
+  s.advance(1);
+  for (let i = 0; i < CLEANUP_SCAN_MAX + 5; i++) {
+    const id = `55555555-5555-4555-8555-${String(i).padStart(12, "0")}`;
+    const at = new Date(T0 - DAY);
+    s.projects.set(id, { id, slug: `p${i}`, stage: "archived", archivedAt: at, purgeAfter: new Date(T0 + 29 * DAY) });
+    await s.approvals.raiseCard(purgeStoppedCard({ id, slug: `p${i}`, archivedAt: at }, "leftover", { github: 1 }));
+  }
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(staleStop.id)).status, "pending", "the first scan stops at its bound");
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(staleStop.id)).status, "expired", "the next tick resumes and closes it");
+});
+
+test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await s.approvals.reject(s.session, c.id);
+  const p = s.projects.get(P);
+  const before = p.purgeAfter.getTime();
+  const keep = s.job.d.keepArchived;
+  s.job.d.keepArchived = async (...a) => {
+    // A Restore and a new Archive with the same purge date land between the pass's read and its write.
+    p.archivedAt = new Date(p.archivedAt.getTime() + 1000);
+    return keep(...a);
+  };
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(p.purgeAfter.getTime(), before, "the new archive's purge date is not moved");
+  assert.equal(s.calls.keep.length, 0);
 });
 
 test("M2.5-b5 decision 16 (Codex PR240-r12): an early ask hands out an existing card only behind the fence; a superseded card is never returned", async () => {
