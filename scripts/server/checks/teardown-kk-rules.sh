@@ -21,12 +21,14 @@ nonul() { local n; n="$(LC_ALL=C tr -cd '\000' < "$1" | wc -c)" || return 1; [[ 
 timeout "$EXEC_S" docker ps --filter label=io.devos.service=api --filter status=running --format '{{.ID}}' >"$tmpd/ps.out" 2>/dev/null; prc=$?
 [[ $prc -eq 0 ]] || { echo "fail: docker ps failed (exit $prc)"; exit 1; }
 nonul "$tmpd/ps.out" || { echo "fail: unreadable docker ps output"; exit 1; }
+# Pre-review r2 1: read through a variable, so a last line without a newline is still read (never a false skip).
+ps="$(cat -- "$tmpd/ps.out")" || { echo "fail: unreadable docker ps output"; exit 1; }
 ID=""
 while IFS= read -r l; do
   [[ -z "${l//[[:space:]]/}" ]] && continue
   [[ "$l" =~ ^[0-9a-f]{12,64}$ ]] || { echo "fail: unreadable docker ps output"; exit 1; }
   [[ -z "$ID" ]] && ID="$l"
-done <"$tmpd/ps.out"
+done <<<"$ps"
 [[ -n "$ID" ]] || { echo "skipped: no running DevOS API container (DevOS not deployed yet)"; exit 3; }
 timeout "$EXEC_S" docker exec "$ID" "${CLI[@]}" >"$tmpd/cli.out" 2>/dev/null; rc=$?
 nonul "$tmpd/cli.out" || { echo "fail: unreadable rules check output"; exit 1; }

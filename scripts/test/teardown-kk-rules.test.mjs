@@ -20,7 +20,7 @@ function run({ cli, cliRc = 0, api = true, psRc = 0, noDocker = false } = {}) {
     fs.writeFileSync(path.join(bin, "docker"), `#!/usr/bin/env bash
 echo "$*" >> "$FAKE_DIR/docker.args"
 case "$1" in
-  ps) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; exit "$FAKE_PS_RC";;
+  ps) [[ "$FAKE_API" == 1 ]] && echo abcdef123456; [[ "$FAKE_API" == 2 ]] && printf abcdef123456; exit "$FAKE_PS_RC";;
   exec) cat "$FAKE_DIR/cli"; exit "$FAKE_CLI_RC";;
 esac
 exit 99
@@ -31,7 +31,7 @@ exit 99
   if (jq) fs.symlinkSync(jq, path.join(bin, "jq"));
   // PATH holds the fake bin and the system tools, never a real docker.
   const r = spawnSync("bash", [CHECK], {
-    env: { PATH: `${bin}:/usr/bin:/bin`, FAKE_DIR: bin, FAKE_API: api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_PS_RC: String(psRc) },
+    env: { PATH: `${bin}:/usr/bin:/bin`, FAKE_DIR: bin, FAKE_API: api === "nonl" ? "2" : api ? "1" : "0", FAKE_CLI_RC: String(cliRc), FAKE_PS_RC: String(psRc) },
     encoding: "utf8",
   });
   const args = fs.existsSync(path.join(bin, "docker.args")) ? fs.readFileSync(path.join(bin, "docker.args"), "utf8") : "";
@@ -87,6 +87,8 @@ test("DEVOS-112: an exit code that disagrees with the result fails", () => {
 test("DEVOS-112: skipped only when DevOS is not deployed; a failed docker ps or a missing database fails", () => {
   assert.equal(run({ cli: PASS, api: false }).code, 3);
   assert.equal(run({ cli: PASS, psRc: 1 }).code, 1);
+  // Pre-review r2 1: a container id without a trailing newline is still found.
+  assert.equal(run({ cli: PASS, api: "nonl" }).code, 0);
   const r = run({ cli: line({ code: "skipped", detail: "database-not-configured" }), cliRc: 3 });
   assert.equal(r.code, 1);
   assert.match(r.out, /no database/);
