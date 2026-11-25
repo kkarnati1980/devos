@@ -324,11 +324,11 @@ test("Codex PR239-r1: a retried card tick uses the card this archive already has
 test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's grant, and probeExistingCard is bounded", async () => {
   const created = new Date("2026-11-25T10:00:00Z");
   const card = { status: "approved", decidedAt: created, createdAt: created, projectId: "p-1", action: "teardown.purge" };
-  const run = async (decisions) => {
+  const run = async (decisions, approved = [{ id: "c-1", decidedAt: created }]) => {
     const seen = {};
     const tx = {
       project: { findUnique: async () => ({ stage: "purged" }) },
-      approval: { findUnique: async () => card },
+      approval: { findUnique: async () => card, findMany: async (q) => { seen.a = q; return approved; } },
       policyDecision: { findMany: async (q) => { seen.q = q; return decisions; } },
     };
     const out = await probeCardOutcome({ $transaction: async (fn) => fn(tx) }, "p-1", "c-1", 5000);
@@ -342,6 +342,19 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
   for (const ds of [[], [mine, { approvalGrant: { approvalId: "other" } }], [{ approvalGrant: null }], Array(50).fill(mine)]) {
     assert.equal((await run(ds)).out.byCard, false, JSON.stringify(ds).slice(0, 80));
   }
+  // Codex PR239-r3: the sweep purges under the newest approved card of the archive, which may be a later twin.
+  assert.deepEqual(r.seen.a.where, { projectId: "p-1", action: "teardown.purge", target: "project:p-1", status: "approved", createdAt: { gte: created } });
+  assert.deepEqual(r.seen.a.orderBy, [{ createdAt: "desc" }, { id: "desc" }]);
+  const later = new Date("2026-11-25T11:00:00Z");
+  const twin = { approvalGrant: { approvalId: "c-2" } };
+  r = await run([twin], [{ id: "c-2", decidedAt: later }, { id: "c-1", decidedAt: created }]);
+  assert.deepEqual(r.out, { stage: "purged", card: "approved", decidedAt: later.toISOString(), byCard: true });
+  // A grant for a card that is not an approved purge card of this archive never counts, and no approved card at all is
+  // the tracked card's own status.
+  assert.equal((await run([twin])).out.byCard, false);
+  r = await run([mine], []);
+  assert.equal(r.out.byCard, false);
+  assert.equal(r.out.card, "approved");
   const seen = {};
   const x = { $transaction: async (fn, o) => { seen.o = o; return fn({ approval: { findFirst: async (q) => { seen.q = q; return { id: "c-9" }; } } }); } };
   assert.equal(await probeExistingCard(x, "p-1", created, 5000), "c-9");

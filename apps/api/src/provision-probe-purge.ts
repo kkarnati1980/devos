@@ -328,23 +328,38 @@ export async function probeCardOutcome(db: any, projectId: string, cardId: strin
     const c = await tx.approval.findUnique({ where: { id: cardId }, select: { status: true, decidedAt: true, createdAt: true, projectId: true, action: true } });
     // Only this project's own purge card counts; anything else reads as missing.
     const ok = c && c.projectId === projectId && c.action === "teardown.purge" && (CARD_STATUSES as readonly string[]).includes(String(c.status));
-    // Codex PR239-r1 (high): AT10 needs the purge to have run under this card's grant. Every allowed `teardown.purge`
-    // decision for this project since the card was raised must carry a grant issued for this card, and there must be
-    // one: a purge under the probe's grant or another card's never counts.
+    // Codex PR239-r3 (medium): the sweep purges under the newest approved purge card of the archive
+    // (`Approvals.list`, createdAt desc), which may be a later twin of the tracked one. So the cards that count are
+    // this project's approved `teardown.purge` cards on `project:<id>` raised at or after the tracked card (the same
+    // archive, pre-review 2), newest first; the newest one gives the status and decision time reported.
+    const approved: { id: string; decidedAt: unknown }[] = ok && c.createdAt instanceof Date
+      ? await tx.approval.findMany({
+        where: { projectId, action: "teardown.purge", target: `project:${projectId}`, status: "approved", createdAt: { gte: c.createdAt } },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        select: { id: true, decidedAt: true },
+        take: 20,
+      })
+      : [];
+    const ids = new Set(approved.map((a) => a.id).filter((id) => typeof id === "string" && id !== ""));
+    // Codex PR239-r1 (high): AT10 needs the purge to have run under an approved card's grant. Every allowed
+    // `teardown.purge` decision for this project since the tracked card was raised must carry a grant issued for one of
+    // those cards, and there must be one: a purge under the probe's grant or any other card's never counts.
     let byCard = false;
-    if (ok && String(p.stage) === "purged" && c.createdAt instanceof Date) {
+    if (ok && ids.size > 0 && String(p.stage) === "purged") {
       const ds: { approvalGrant: { approvalId: string | null } | null }[] = await tx.policyDecision.findMany({
         where: { projectId, ts: { gte: c.createdAt }, enforcedOutcome: "allow", action: { path: ["type"], equals: "teardown.purge" } },
         select: { approvalGrant: { select: { approvalId: true } } },
         orderBy: { ts: "asc" },
         take: 50,
       });
-      byCard = ds.length > 0 && ds.length < 50 && ds.every((x) => x.approvalGrant?.approvalId === cardId);
+      byCard = ds.length > 0 && ds.length < 50 && ds.every((x) => typeof x.approvalGrant?.approvalId === "string" && ids.has(x.approvalGrant.approvalId));
     }
+    const newest = approved[0];
+    const decided = newest ? newest.decidedAt : ok ? c.decidedAt : null;
     return {
       stage: String(p.stage),
-      card: ok ? (String(c.status) as CardOutcome["card"]) : "missing",
-      decidedAt: ok && c.decidedAt instanceof Date ? c.decidedAt.toISOString() : null,
+      card: !ok ? "missing" : newest ? "approved" : (String(c.status) as CardOutcome["card"]),
+      decidedAt: decided instanceof Date ? decided.toISOString() : null,
       byCard,
     };
   }, { timeout: timeoutMs, maxWait: timeoutMs });
