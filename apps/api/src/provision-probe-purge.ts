@@ -248,8 +248,17 @@ export async function probeStage(db: any, projectId: string, timeoutMs: number):
  */
 export async function probeGrantOutlasts(db: any, projectId: string, until: Date, timeoutMs: number, grantProblem: GrantProblem): Promise<boolean> {
   const stage = await probeStage(db, projectId, timeoutMs);
-  return (await findProbeGrant(db, projectId, until, timeoutMs, grantProblem, PROBE_GRANT_ACTIONS, stage === "archived" ? 0 : 1)) !== null;
+  const spare = (stage === "archived" ? 0 : 1) + PROBE_PURGE_RETRY_USES;
+  return (await findProbeGrant(db, projectId, until, timeoutMs, grantProblem, PROBE_GRANT_ACTIONS, spare)) !== null;
 }
+
+/**
+ * Codex PR239-r9 (decision 11): uses kept for a fallback purge that a retryable provider stop (say `delete_unconfirmed`)
+ * leaves unfinished, since each later tick presents the grant again. Past these, a grant that runs out ends the cycle
+ * `purge-permission`, as for every probe cycle (d3c-2a decision 4), and the next cycle asks KK for a grant first
+ * (DEVOS-110), then starts with the purge (`purge-pending`), so the resources are still cleaned up.
+ */
+export const PROBE_PURGE_RETRY_USES = 3;
 
 /** DEVOS-110 decision 2: a rejected (or approved, then revoked) grant card is not raised again for one probe cycle. */
 export const PROBE_CARD_REASK_MS = 7 * 24 * 60 * 60 * 1000;
