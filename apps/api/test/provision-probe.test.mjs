@@ -176,6 +176,62 @@ test("DEVOS-21: after a cleanup cycle whose purge passed, the real cycle starts 
   assert.equal((await probeStep(e)).code, "probed", "a cleanup whose purge failed is not re-run at once");
 });
 
+test("DEVOS-21 part 13: a purge a provider refused is re-run once on the next check run; other purge failures wait", async () => {
+  let refuse = "purge-permission:coolify/application:delete:http-403";
+  const d = fake({ cycleStart: async () => "purge-pending", purge: async () => (refuse ? { error: refuse } : "done") });
+  const first = (await runToEnd(d)).at(-1);
+  assert.deepEqual([first.cycle, first.code, first.detail, first.cause], [1, "purge-failed", refuse, "previous-purge-pending"]);
+  const again = await probeStep(d);
+  assert.deepEqual([again.cycle, again.phase], [2, "purge"], "the refused purge is tried again at once");
+  assert.equal(d.log.at(-1).refusalRetry, refuse, "the re-run carries the refusal it follows");
+  const second = (await runToEnd(d)).at(-1);
+  assert.deepEqual([second.cycle, second.code, second.detail], [2, "purge-failed", refuse]);
+  assert.equal((await probeStep(d)).code, "probed", "the same refusal is retried only once (each purge spends grant uses)");
+  assert.equal(d.calls.provision, 0, "a refused purge never provisions");
+  // a different refusal is retried once again
+  refuse = "purge-permission:github/repo:delete:http-403";
+  d.tick(PROBE_EVERY_MS);
+  const third = (await runToEnd(d)).at(-1);
+  assert.deepEqual([third.cycle, third.code, third.detail], [3, "purge-failed", refuse]);
+  const fourth = await probeStep(d);
+  assert.deepEqual([fourth.cycle, fourth.phase], [4, "purge"], "a github refusal is retried too");
+  refuse = null;
+  const cleaned = (await runToEnd(d)).at(-1);
+  assert.deepEqual([cleaned.cycle, cleaned.code], [4, "previous-purge-pending"], "once the provider allows it, the leftovers are purged");
+  d.cycleStart = async () => "ready";
+  const real = await probeStep(d);
+  assert.deepEqual([real.cycle, real.phase], [5, "run1"], "the real cycle follows the cleanup");
+  assert.equal(d.log.at(-1).refusalRetry, undefined, "the real cycle carries no refusal marker");
+
+  // the form whose tail was dropped (over 120 characters) still counts; a kind with a digit counts
+  for (const detail of ["purge-permission:coolify/application", "purge-permission:coolify/env_var2:delete:http-401"]) {
+    const e = fake({ cycleStart: async () => "purge-pending", purge: async () => ({ error: detail }) });
+    await runToEnd(e);
+    assert.equal((await probeStep(e)).phase, "purge", detail);
+  }
+
+  for (const detail of ["purge-permission", "purge-permission:preflight:github-counts", "purge-permission:approval_required", "purge-permission:policy_denied", "purge-permission:resource", "purge-provider-error:coolify/application:archive:http-405", "purge-permission:coolifyx/application"]) {
+    const e = fake({ cycleStart: async () => "purge-pending", purge: async () => ({ error: detail }) });
+    const end = (await runToEnd(e)).at(-1);
+    assert.equal(end.code, "purge-failed", detail);
+    assert.equal((await probeStep(e)).code, "probed", `${detail} waits for a token save, a deploy or 7 days`);
+  }
+});
+
+test("DEVOS-21 part 13: after the one retry, a token save still starts the next cycle", async () => {
+  let saved = null;
+  const refuse = "purge-permission:coolify/application:delete:http-403";
+  const d = fake({ cycleStart: async () => "purge-pending", purge: async () => ({ error: refuse }), credentialsUpdatedAt: async () => saved });
+  await runToEnd(d); // cycle 1 refused
+  await runToEnd(d); // cycle 2, the one retry, refused again
+  assert.equal((await probeStep(d)).code, "probed");
+  d.tick(60_000);
+  saved = d.now().toISOString();
+  d.tick(60_000);
+  const r = await probeStep(d);
+  assert.deepEqual([r.cycle, r.phase], [3, "purge"], "a key saved after the retry starts the next cycle");
+});
+
 test("inventoryDiff ignores row order and names a missing or extra row", () => {
   assert.equal(inventoryDiff(ROWS, [...ROWS].reverse()), null);
   assert.equal(inventoryDiff(ROWS, [ROWS[0]]), "missing-in-run2:coolify_project");
