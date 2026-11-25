@@ -356,7 +356,9 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
         // cycle passes and the sweep's `project-not-archived` pass expires the card.
         if (d.expirePurgeCards) {
           const post = await attempt(() => d.expirePurgeCards!());
-          if (!post.ok && !late) return wait("card-expire-after-purge");
+          // Codex PR239-r24: the row is already purged, so no fallback purge can follow and the grant is not checked;
+          // a plain wait keeps the proof already seen.
+          if (!post.ok && !late) return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
         }
         return finish(true, PASS_CARD);
       }

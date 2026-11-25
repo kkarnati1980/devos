@@ -823,9 +823,17 @@ test("Codex PR239-r23 (DEVOS-254 d22): a pass-card in cardwait first expires the
   d.expirePurgeCards = async () => { d.calls.expire++; if (fail) throw new Error("db"); };
   let r = await probeStep(d);
   assert.deepEqual(r, { exit: 3, phase: "cardwait", cycle: 1, code: "in_progress", detail: "card-expire-after-purge" });
+  // Codex PR239-r24: a short or unreadable grant does not divert a purged, proven cycle into the fallback purge.
+  d.cardGrantOutlasts = async () => false;
+  r = await probeStep(d);
+  assert.equal(r.detail, "card-expire-after-purge");
+  d.cardGrantOutlasts = async () => { throw new Error("db"); };
+  r = await probeStep(d);
+  assert.equal(r.detail, "card-expire-after-purge");
+  assert.equal(d.log.at(-1).phase, "cardwait");
   fail = false;
   r = await probeStep(d);
   assert.deepEqual(r, { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
-  assert.equal(d.calls.expire, 2);
+  assert.equal(d.calls.expire, 4);
   assert.equal(d.calls.purge, 0);
 });
