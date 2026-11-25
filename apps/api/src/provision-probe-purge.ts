@@ -444,10 +444,10 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   // nothing expired it) would be skipped by the sweep (`card-before-archive`), so it is not used.
   const archived = await d.archivedAt();
   if (!(archived instanceof Date) || !(card.createdAt instanceof Date) || card.createdAt.getTime() < archived.getTime()) throw new Error("probe-card-stale");
-  // Codex PR239-r12 (medium): the card belongs to the archive this tick read before raising it. A Restore and a new
-  // Archive in between (a later `archived_at`) supersede that archive, so this tick raises nothing for it; the next tick
-  // starts from the new archive and its own card lookup.
-  if (archived.getTime() !== since.getTime()) throw new Error("probe-card-archive-changed");
+  // Codex PR239-r12/r13: the card is bound to the archive read after the raise, which it was created within (the check
+  // above), never to the one read before it. A Restore and a new Archive in between supersede the first read; the card
+  // then belongs to the new archive, which the sweep acts on and `probeCardOutcome` checks (r6), so it is tracked and
+  // never left pending behind a fallback purge (r13 replaces r12's `probe-card-archive-changed`).
   // Codex PR239-r2: another purge card for this archive raised between the lookup and the raise (and approved, so
   // the pending dedupe missed it) is the one the sweep acts on first; track the oldest.
   return (await d.existing(archived)) ?? card.id;

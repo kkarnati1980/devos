@@ -16,6 +16,8 @@ export const PROBE_CARD_MAX_MS = 8 * 24 * 60 * 60 * 1000;
  * purge itself (`PROBE_PHASE_MAX_MS`); the start adds one more day for the phases before `card`.
  */
 export const PROBE_CARD_RAISE_GRANT_MS = PROBE_CARD_MAX_MS + 24 * 60 * 60 * 1000;
+/** Codex PR239-r13 (decision 13): the room a waiting tick needs left on the probe grant: the next tick and the purge. */
+export const PROBE_CARD_PURGE_ROOM_MS = PROBE_CARD_RAISE_GRANT_MS - PROBE_CARD_MAX_MS;
 export const PROBE_CARD_START_GRANT_MS = PROBE_CARD_RAISE_GRANT_MS + 24 * 60 * 60 * 1000;
 /** DEVOS-254 decision 1: the result code of a cycle whose purge went through KK's approved purge card. */
 export const PASS_CARD = "pass-card";
@@ -300,7 +302,15 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // Decisions 4 and 5: wait for KK's answer and the sweep's purge; every other end is purged by the probe.
       if (!d.cardOutcome || !last.cardId) return toPurge(failed("card-not-wired"));
       const cardId = last.cardId;
-      const wait = (detail: string): ProbeTick => ({ exit: 3, phase, cycle, code: "in_progress", detail });
+      // Codex PR239-r13 (medium): every tick that would keep waiting first checks that the probe grant still outlasts
+      // the next tick and the purge after it (`PROBE_CARD_PURGE_ROOM_MS`). A wait whose deadline moved (a card reused
+      // after a failed record, then an unreadable raise time) can therefore never outrun the grant the fallback purge
+      // needs; a short grant, or a check that fails, ends the wait with the probe's own purge (`card-grant-short`).
+      const wait = async (detail: string): Promise<ProbeTick> => {
+        const g = await attempt(async () => (d.cardGrantOutlasts ? (await d.cardGrantOutlasts(new Date(d.now().getTime() + PROBE_CARD_PURGE_ROOM_MS))) === true : false));
+        if (!g.ok || g.value !== true) return toPurge(failed("card-grant-short", detail));
+        return { exit: 3, phase, cycle, code: "in_progress", detail };
+      };
       const r = await attempt(() => d.cardOutcome!(cardId));
       // Codex PR239-r12 (medium): the 8-day wait runs from the earlier of the card's raise and the tick that recorded
       // it. A card raised by a tick that failed to record `cardwait` and reused later keeps its own deadline, so the
