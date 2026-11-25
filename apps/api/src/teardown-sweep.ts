@@ -126,6 +126,12 @@ const twinOlder = (raised: unknown, p: TeardownProject): boolean => {
   return typeof reason === "string" && olderArchive({ reason }, p);
 };
 
+/** Decision 37: the stored twin was written after `at` (a stop owed later than the one being delivered). */
+const twinAfter = (raised: unknown, at: number): boolean => {
+  const created = (raised as { createdAt?: unknown } | null)?.createdAt;
+  return created instanceof Date && created.getTime() > at;
+};
+
 /** Decision 18: `b` (a fresh read) is still the archive `a` was read in. */
 const sameArchive = (a: TeardownProject, b: TeardownProject | null): boolean =>
   b !== null && b.stage === "archived" && a.archivedAt !== null && b.archivedAt?.getTime() === a.archivedAt.getTime();
@@ -316,7 +322,7 @@ export class TeardownSweepJob {
    * dedupes a pending twin). In memory: after a restart the daily run raises a fresh purge card instead, which still
    * needs KK's approval before anything more is deleted.
    */
-  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string; due: string | null }>();
+  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string; due: string | null; at: number }>();
   /** Decision 26: where each action's cleanup scan resumes on the next tick (the last card id read at the bound). */
   private readonly scanFrom = new Map<string, string>();
   /**
@@ -627,7 +633,7 @@ export class TeardownSweepJob {
     if (owed?.p.archivedAt && (!p.archivedAt || p.archivedAt.getTime() < owed.p.archivedAt.getTime())) {
       this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "archive-superseded" });
     } else {
-      this.stopsOwed.set(p.id, { p, code, due });
+      this.stopsOwed.set(p.id, { p, code, due, at: this.now() });
     }
     await this.deliverStops();
   }
@@ -666,6 +672,16 @@ export class TeardownSweepJob {
         if (!this.stopServes(raised, card)) {
           if (typeof (raised as { reason?: unknown } | null)?.reason !== "string") throw new Error("stop-card-not-raised");
           const sameArchiveTwin = this.stopSameArchive(raised, card);
+          // Decision 37 (Codex PR240-r33): a same-archive twin is superseded only by the newest stop. A later stop (a
+          // timed-out purge finishing meanwhile) replaces this entry in `stopsOwed` before its own delivery writes its
+          // card, so a delivery whose entry was replaced, or whose twin was written after this stop was owed, is the
+          // older failure: it drops itself and never expires the newer card. Nothing is awaited between this check
+          // and the expiry below.
+          if (sameArchiveTwin && (this.stopsOwed.get(id) !== o || twinAfter(raised, o.at))) {
+            this.dropOwed(id, o);
+            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
+            continue;
+          }
           if (!sameArchiveTwin && !twinOlder(raised, o.p)) {
             this.dropOwed(id, o);
             this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });

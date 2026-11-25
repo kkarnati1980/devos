@@ -1814,3 +1814,33 @@ test("M2.5-b5 decision 36 (Codex PR240-r32): a Keep archived scan that stops at 
   assert.equal(s.calls.keep[0].approvalId, c.id);
   assert.ok(reads > 0);
 });
+
+test("M2.5-b5 decision 37 (Codex PR240-r33): an older stop's delivery never supersedes the newer failure's card for the same archive", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "policy_denied");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "the earlier stop is owed");
+  // The earlier stop's delivery is slow at its re-read; meanwhile a timed-out purge finishes with a newer failure.
+  const read = s.job.d.project;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let first = true;
+  s.job.d.project = async (id) => { if (first) { first = false; await gate; } return read(id); };
+  const tick = s.job.tick();
+  await new Promise((r) => setImmediate(r));
+  s.advance(60_000);
+  await s.job.raiseStopped({ ...p }, "leftover");
+  const [newer] = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(stopWhy(newer.reason), "after deleting, the leftover check still found resources of this project");
+  release();
+  await tick;
+  s.job.d.project = read;
+  assert.equal((await s.approvals.store.get(newer.id)).status, "pending", "the newer failure's card is left open");
+  const stops = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 });
+  assert.equal(stops.length, 1, "the older failure is not raised over it");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-superseded"));
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(newer.id)).status, "pending");
+});
