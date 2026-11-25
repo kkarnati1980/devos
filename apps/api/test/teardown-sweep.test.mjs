@@ -875,3 +875,36 @@ test("M2.5-b5 decision 9 (Codex PR240-r5): a pending stale card is expired by th
   assert.equal(t.projects.get(P).purgeAfter.getTime(), before, "a stale card's rejection does not move purge_after");
   assert.equal(t.calls.keep.length, 0);
 });
+
+test("M2.5-b5 decision 10 (Codex PR240-r6): a stale card's rejection or 7-day expiry never suppresses or uses up the current archive's purge cards", async () => {
+  // A card built for an earlier archive lands after purge_after (its fence expiry fails), and KK rejects it.
+  const t = setup();
+  const traise = t.job.d.raise;
+  t.job.d.raise = async (c) => { t.job.d.raise = traise; t.projects.get(P).archivedAt = new Date(t.now() - 1); return traise(c); };
+  const texpire = t.job.d.expire;
+  t.job.d.expire = async () => { throw new Error("db blip"); };
+  await t.job.tick();
+  t.job.d.expire = texpire;
+  const [old] = await t.purgeCards("pending");
+  assert.notEqual(cardArchive(old), t.projects.get(P).archivedAt.toISOString());
+  await t.approvals.reject(t.session, old.id);
+  t.advance(60_000);
+  await new TeardownSweepJob(t.job.d).tick();
+  const pending = await t.purgeCards("pending");
+  assert.equal(pending.length, 1, "the current archive still gets its scheduled card");
+  assert.equal(cardArchive(pending[0]), t.projects.get(P).archivedAt.toISOString());
+  // Two stale cards that expire unanswered after their whole 7 days do not use up the current archive's quota.
+  const s = setup();
+  const at = s.projects.get(P).archivedAt;
+  for (let i = 0; i < 2; i++) {
+    const stale = await s.job.d.raise(purgeCard({ ...s.projects.get(P), archivedAt: new Date(at.getTime() - 1000 * (i + 1)) }, {}));
+    assert.ok(stale?.id);
+    s.advance(7 * DAY + 60_000);
+    await s.job.d.expire([stale.id], "unanswered");
+  }
+  const all = await s.purgeCards();
+  assert.equal(all.length, 2);
+  assert.ok(all.every((c) => c.status === "expired" && cardArchive(c) !== at.toISOString()));
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 1, "stale unanswered expiries do not count against the current archive");
+});

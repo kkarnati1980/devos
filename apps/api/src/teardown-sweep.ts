@@ -500,7 +500,9 @@ export class TeardownSweepJob {
     const since = p.purgeAfter.getTime();
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
     if (cards.some((c) => c.status === "pending")) return false;
-    const period = cards.filter((c) => c.createdAt.getTime() >= since);
+    // Decision 10 (Codex PR240-r6): the period counts only this archive's cards (decision 8's stamp), so a stale
+    // card's rejection or 7-day expiry never suppresses or uses up the current archive's raises.
+    const period = cards.filter((c) => c.createdAt.getTime() >= since && raisedThisArchive(c, p));
     if (period.some((c) => c.status === "rejected")) return false;
     for (const c of cards.filter((x) => x.status === "approved" && raisedThisArchive(x, p))) {
       if (await this.d.unspentGrant(c.id, new Date(this.now()))) return false;
