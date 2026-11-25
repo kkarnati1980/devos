@@ -49,10 +49,14 @@ export async function findProbeGrant(
 }
 
 /** The M1.7 authorizer with the KK grant presented (policyAuthorizer's shape, plus `approvalGrantId`). */
-export function grantAuthorizer(policy: { decide(r: unknown): Promise<{ enforcedOutcome: string }> }, projectId: string, grantId: string): Authorize {
+export function grantAuthorizer(policy: { decide(r: unknown): Promise<{ enforcedOutcome: string; approvalGrantId?: string | null }> }, projectId: string, grantId: string): Authorize {
   return async (action, resource) => {
     const d = await policy.decide({ identity: PROVISIONER_IDENTITY, action: { type: action, resource, projectId }, approvalGrantId: grantId });
-    return d.enforcedOutcome === "allow" ? "allow" : d.enforcedOutcome === "require_approval" ? "require_approval" : "deny";
+    // Codex PR239-r18 (high): "allow" only when M1.7 allowed by using KK's probe grant, as the sweep's
+    // `purgeCardAuthorizer` does; an allow that did not consume it (an un-gated allow, e.g. observe mode, or a policy
+    // that needs no approval) is "require_approval", never a probe Archive or purge without the grant.
+    if (d.enforcedOutcome === "allow") return d.approvalGrantId === grantId ? "allow" : "require_approval";
+    return d.enforcedOutcome === "require_approval" ? "require_approval" : "deny";
   };
 }
 

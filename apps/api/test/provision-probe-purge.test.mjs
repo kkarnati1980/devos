@@ -207,11 +207,21 @@ test("Codex PR239-r7/r8: probeGrantOutlasts asks for the grant at the later time
 
 test("d3c-2a decision 3: the authorizer presents the grant to the M1.7 engine as the system provisioner", async () => {
   const seen = [];
-  const policy = { decide: async (r) => { seen.push(r); return { enforcedOutcome: seen.length === 1 ? "allow" : seen.length === 2 ? "require_approval" : "deny" }; } };
+  const answers = [
+    { enforcedOutcome: "allow", approvalGrantId: "g-1" },
+    { enforcedOutcome: "require_approval" },
+    { enforcedOutcome: "deny" },
+    // Codex PR239-r18 (high): an allow that did not use the probe grant (null, missing or another grant) is not one.
+    { enforcedOutcome: "allow", approvalGrantId: null },
+    { enforcedOutcome: "allow" },
+    { enforcedOutcome: "allow", approvalGrantId: "g-2" },
+  ];
+  const policy = { decide: async (r) => { seen.push(r); return answers[seen.length - 1]; } };
   const a = grantAuthorizer(policy, PID, "g-1");
   assert.equal(await a("teardown.purge", PID), "allow");
   assert.equal(await a("teardown.purge", PID), "require_approval");
   assert.equal(await a("teardown.purge", PID), "deny");
+  for (let i = 0; i < 3; i++) assert.equal(await a("teardown.purge", PID), "require_approval");
   assert.deepEqual(seen[0], { identity: { id: "system:provisioner", type: "system" }, action: { type: "teardown.purge", resource: PID, projectId: PID }, approvalGrantId: "g-1" });
 });
 
