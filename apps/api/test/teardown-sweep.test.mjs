@@ -10,7 +10,7 @@ import { Approvals, MemoryApprovalStore, parseCard, EXPIRE_IDS_MAX } from "../di
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
-  cardArchive, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
+  cardArchive, cardDue, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
 } from "../dist/teardown-sweep.js";
 import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
@@ -43,7 +43,7 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
   const purge = async (projectId, grantId, card) => {
     calls.purge.push({ projectId, grantId });
     // The real purge checks `teardown.purge` once before any provider call (M2.5-a1), with the production authorizer.
-    const d = await purgeCardAuthorizer(engine, projectId, grantId, card, async () => projects.get(projectId)?.archivedAt ?? null)("teardown.purge", `project:${projectId}`);
+    const d = await purgeCardAuthorizer(engine, projectId, grantId, card, async () => projects.get(projectId)?.archivedAt ?? null, async () => projects.get(projectId)?.purgeAfter ?? null)("teardown.purge", `project:${projectId}`);
     if (d !== "allow") throw new TeardownError("approval_required", false, "approval needed");
     calls.providerCalls++;
     if (purgeImpl) return purgeImpl(projectId);
@@ -1221,6 +1221,75 @@ test("M2.5-b5 decision 29 (Codex PR240-r25): a deduplicated twin stored before t
   await s.job.tick();
   assert.equal((await s.approvals.store.get(twin.id)).status, "pending", "the early ask's card stays open");
   assert.equal((await s.purgeCards()).length, 1, "nothing else was written");
+});
+
+test("M2.5-b5 decision 30 (Codex PR240-r26): a scheduled card names its purge date; an early ask names none", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  assert.equal(cardDue(c), s.projects.get(P).purgeAfter.toISOString());
+  assert.equal(cardArchive(c), s.projects.get(P).archivedAt.toISOString(), "the archive stamp still reads back");
+  assert.equal(cardDue(purgeCard(s.projects.get(P), { github: 1 })), null);
+});
+
+test("M2.5-b5 decision 30 (Codex PR240-r26): a scheduled card left pending after a failed purge-date re-read is expired by the next cleanup", async () => {
+  const s = setup();
+  const raise = s.job.d.raise;
+  const project = s.job.d.project;
+  let armed = false;
+  s.job.d.raise = async (c) => {
+    const r = await raise(c);
+    s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+    armed = true;
+    return r;
+  };
+  s.job.d.project = async (id) => {
+    if (armed) { armed = false; throw new Error("db blip"); }
+    return project(id);
+  };
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  assert.ok(c, "the failed re-read left the card pending");
+  s.job.d.raise = raise;
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(c.id)).status, "expired", "the cleanup expired the no-longer-due card");
+  assert.equal((await s.purgeCards("pending")).length, 0);
+});
+
+test("M2.5-b5 decision 30 (Codex PR240-r26): an approved scheduled card whose purge date moved never purges, and the authorizer refuses it", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  // Keep archived (from another card) moved the purge date after this card was raised.
+  s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 0, "no purge ran");
+  assert.ok(s.logs.some((l) => l.code === "purge-card-not-due"));
+  const stored = await s.approvals.store.get(c.id);
+  const grant = [...s.policyStore.grants].find((g) => g.approvalId === c.id);
+  const auth = purgeCardAuthorizer(s.engine, P, grant.id, { createdAt: stored.createdAt, archive: cardArchive(stored), due: cardDue(stored) },
+    async () => s.projects.get(P).archivedAt, async () => s.projects.get(P).purgeAfter);
+  assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
+  const noDueGetter = purgeCardAuthorizer(s.engine, P, grant.id, { createdAt: stored.createdAt, archive: cardArchive(stored), due: cardDue(stored) },
+    async () => s.projects.get(P).archivedAt);
+  assert.equal(await noDueGetter("teardown.purge", `project:${P}`), "deny", "a scheduled card needs the purge date read");
+});
+
+test("M2.5-b5 decision 30 (Codex PR240-r26): an early ask stored while the daily raise is in flight is never expired by the purge-date fence", async () => {
+  const s = setup();
+  const raise = s.job.d.raise;
+  let twin = null;
+  s.job.d.raise = async (c) => {
+    // After a lost lock, KK's early ask stores its card during the daily raise, then Keep archived moves the date.
+    twin = await s.approvals.raiseCard(purgeCard(s.projects.get(P), { github: 2, coolify: 5 }));
+    s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+    return raise(c);
+  };
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(twin.id)).status, "pending", "the early ask's card stays open");
 });
 
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {

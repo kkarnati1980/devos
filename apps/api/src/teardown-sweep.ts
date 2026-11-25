@@ -67,6 +67,20 @@ export const cardArchive = (c: { reason?: string | null }): string | null =>
   (typeof c.reason === "string" ? ARCHIVE_STAMP.exec(c.reason)?.[1] : undefined) ?? null;
 
 /**
+ * M2.5-b5 decision 30 (Codex PR240-r26): a scheduled (daily) card also names the purge date it was raised for
+ * (`Due <iso>.`, just before the archive stamp). An early ask has no due stamp. Keep archived moves `purge_after`, so a
+ * scheduled card whose due date is no longer the project's is stale: it is expired while pending and never purges.
+ */
+const DUE_STAMP = / Due (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\. Archive [^ ]+\.$/;
+export const cardDue = (c: { reason?: string | null }): string | null =>
+  (typeof c.reason === "string" ? DUE_STAMP.exec(c.reason)?.[1] : undefined) ?? null;
+/** Decision 30: a scheduled card whose due date is not the project's current `purge_after`. */
+const dueMoved = (c: { reason?: string | null }, p: { purgeAfter: Date | null }): boolean => {
+  const due = cardDue(c);
+  return due !== null && due !== (p.purgeAfter?.toISOString() ?? null);
+};
+
+/**
  * A card belongs to the project's current archive only if it was raised at or after `archived_at` and (decision 8) it
  * names that same archive, so a card built from an earlier archive's state but written after a new Archive never counts.
  */
@@ -131,7 +145,7 @@ export interface TeardownSweepDeps {
    * allows only when M1.7 actually used this grant (so the attempt spends it, whatever the policy mode or rules) and,
    * re-read under the project lock, the card is not older than the project's `archived_at`.
    */
-  purge(projectId: string, grantId: string, card: { createdAt: Date; archive: string | null }): Promise<PurgeResultLike>;
+  purge(projectId: string, grantId: string, card: { createdAt: Date; archive: string | null; due?: string | null }): Promise<PurgeResultLike>;
   /** `purge_after` from `from` to `to`, only while the project is archived and `purge_after` is still `from`. */
   /** Decision 26 (Codex PR240-r22): moves `purge_after` only while the row is still the archive `archivedAt` names. */
   keepArchived(projectId: string, from: Date, to: Date, approvalId: string, archivedAt: Date): Promise<boolean>;
@@ -171,10 +185,16 @@ const safeSlug = (slug: string): string => (SLUG.test(slug) ? slug : "(unnamed)"
  * Decision (a): the purge card. Gate 5 (typed confirmation), action `teardown.purge`, target `project:<id>`, fixed
  * wording with the per-provider counts from the inventory (decision 2), so KK knows what will be deleted.
  */
-export function purgeCard(p: { id: string; slug: string; archivedAt: Date | null }, counts: Record<string, number>) {
+export function purgeCard(
+  p: { id: string; slug: string; archivedAt: Date | null },
+  counts: Record<string, number>,
+  opts: { due?: Date | null } = {},
+) {
   const slug = safeSlug(p.slug);
   // Decision 8: the archive this card is for, as its last sentence; read back by `cardArchive`.
-  const stamp = p.archivedAt ? ` Archive ${p.archivedAt.toISOString()}.` : "";
+  // Decision 30: a scheduled card also names its purge date, just before; read back by `cardDue`.
+  const due = opts.due && p.archivedAt ? ` Due ${opts.due.toISOString()}.` : "";
+  const stamp = p.archivedAt ? `${due} Archive ${p.archivedAt.toISOString()}.` : "";
   return {
     gate: "purge" as const,
     action: PURGE_ACTION,
@@ -334,6 +354,7 @@ export class TeardownSweepJob {
     const pending = scan.cards;
     const restored: string[] = [];
     const unanswered: string[] = [];
+    const notDue: string[] = [];
     const cutoff = this.now() - PURGE_CARD_WINDOW_MS;
     for (const c of pending) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
@@ -342,9 +363,12 @@ export class TeardownSweepJob {
       // Decision 9 (Codex PR240-r5): a pending card that does not name the current archive (a stale card whose fence
       // expiry failed, also after a restart) is expired here, so it never blocks the current archive's card.
       else if (p && !raisedThisArchive(c, p)) restored.push(c.id);
+      // Decision 30 (Codex PR240-r26): a scheduled card whose purge date Keep archived has moved is no longer due.
+      else if (p && dueMoved(c, p)) notDue.push(c.id);
       else if (c.createdAt.getTime() <= cutoff) unanswered.push(c.id);
     }
     await this.expireBatched(restored, "project-not-archived");
+    await this.expireBatched(notDue, "purge-card-not-due");
     await this.expireBatched(unanswered, "purge-card-unanswered-7-days");
     // Decision 27 (Codex PR240-r23): the resume point moves only after this batch's cleanup has succeeded.
     this.commitScan(PURGE_ACTION, scan.next);
@@ -439,12 +463,17 @@ export class TeardownSweepJob {
         this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: pid, approvalId: c.id, code: !p ? "project-missing" : p.stage === "archived" ? "card-before-archive" : `stage-${p.stage}` });
         continue;
       }
+      // Decision 30 (Codex PR240-r26): an approved scheduled card whose purge date has since moved never purges.
+      if (dueMoved(c, p)) {
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: pid, approvalId: c.id, code: "purge-card-not-due" });
+        continue;
+      }
       seen.add(pid);
-      await this.runPurge(p, c.id, grant, { createdAt: c.createdAt, archive: cardArchive(c) });
+      await this.runPurge(p, c.id, grant, { createdAt: c.createdAt, archive: cardArchive(c), due: cardDue(c) });
     }
   }
 
-  private async runPurge(p: TeardownProject, approvalId: string, grantId: string, card: { createdAt: Date; archive: string | null }): Promise<void> {
+  private async runPurge(p: TeardownProject, approvalId: string, grantId: string, card: { createdAt: Date; archive: string | null; due?: string | null }): Promise<void> {
     const run = this.d.purge(p.id, grantId, card);
     this.purging.add(p.id);
     run.then(() => this.purging.delete(p.id), () => this.purging.delete(p.id));
@@ -612,7 +641,7 @@ export class TeardownSweepJob {
     // Decision 6: a card still owed its expiry keeps this row unserved (the daily run stays open).
     this.assertNoUnfenced(p.id);
     if (!(await this.shouldRaise(p))) return false;
-    const card = purgeCard(p, await this.d.activeCounts(p.id));
+    const card = purgeCard(p, await this.d.activeCounts(p.id), { due: p.purgeAfter });
     await this.d.lockHeld?.(p.id);
     await this.raiseFenced(p, card, { due: true });
     return true;
@@ -625,8 +654,7 @@ export class TeardownSweepJob {
    * creation time, so `raisedThisArchive` already refuses the card for that archive.
    */
   private async raiseFenced(p: TeardownProject, card: Parameters<TeardownSweepDeps["raise"]>[0], opts: { due?: boolean } = {}): Promise<{ id: string }> {
-    const raiseStart = this.now();
-    const raised = (await this.d.raise(card)) as { id?: unknown; createdAt?: unknown } | null;
+    const raised = (await this.d.raise(card)) as { id?: unknown } | null;
     if (!raised || typeof raised.id !== "string") throw new Error("purge-card-not-raised");
     const id = raised.id;
     // Decision 11 (Codex PR240-r7): a deduplicated raise returns the pending twin already stored. If that card names
@@ -643,14 +671,14 @@ export class TeardownSweepJob {
       await this.expireCard(id, p.id, "purge-card-stale-archive");
       throw new Error("purge-card-stale-archive");
     }
-    // Decision 29 (Codex PR240-r25): Keep archived moves `purge_after` but not `archived_at`, so the archive check above
-    // cannot see it. A daily (scheduled) card is due only while the fresh read still has the locked read's purge date.
-    // If it moved, the card this raise wrote is expired. A deduplicated twin stored before this raise began (createdAt is
-    // the approvals core's clock, the same process) is another caller's card, such as KK's own early ask: it is left
-    // alone. The call fails, so the daily run stays open and its next pass finds the row no longer due.
+    // Decision 29 (Codex PR240-r25), as amended by decision 30 (Codex PR240-r26): Keep archived moves `purge_after` but
+    // not `archived_at`, so the archive check above cannot see it. A daily card is due only while the fresh read still has
+    // the purge date it was raised for. If it moved, a returned card that names this due date (the one this raise wrote,
+    // or an identical scheduled twin) is expired; an early ask's card names no due date and is never expired here. If
+    // this re-read or the expiry fails, decision 30's cleanup expires the pending card and the approved-card pass and
+    // the purge authorizer refuse it, so it never purges. The call fails, so the daily run stays open.
     if (opts.due && now.purgeAfter?.getTime() !== p.purgeAfter?.getTime()) {
-      const at = raised.createdAt instanceof Date ? raised.createdAt.getTime() : Number.NaN;
-      if (!(at < raiseStart)) await this.expireCard(id, p.id, "purge-card-not-due");
+      if (cardDue(raised as { reason?: string | null }) === (p.purgeAfter?.toISOString() ?? null)) await this.expireCard(id, p.id, "purge-card-not-due");
       throw new Error("purge-card-not-due");
     }
     return { id };

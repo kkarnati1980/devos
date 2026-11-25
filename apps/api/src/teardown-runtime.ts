@@ -124,8 +124,9 @@ export function purgeCardAuthorizer(
   policy: { decide(r: unknown): Promise<{ enforcedOutcome: string; approvalGrantId?: string | null }> },
   projectId: string,
   grantId: string,
-  card: { createdAt: Date; archive: string | null },
+  card: { createdAt: Date; archive: string | null; due?: string | null },
   archivedAt: () => Promise<Date | null>,
+  purgeAfter?: () => Promise<Date | null>,
 ): Authorize {
   return async (action, resource) => {
     if (action !== "teardown.purge" || resource !== teardownResource(projectId)) return "deny";
@@ -133,6 +134,11 @@ export function purgeCardAuthorizer(
     if (!since || card.createdAt.getTime() < since.getTime()) return "deny";
     // M2.5-b5 decision 8 (Codex PR240-r4): re-read under the project lock, the card must name this very archive.
     if (card.archive !== since.toISOString()) return "deny";
+    // M2.5-b5 decision 30 (Codex PR240-r26): a scheduled card purges only while its purge date is still the project's.
+    if (card.due) {
+      const due = purgeAfter ? await purgeAfter() : null;
+      if (!due || due.toISOString() !== card.due) return "deny";
+    }
     const d = await policy.decide({ identity: PROVISIONER_IDENTITY, action: { type: action, resource, projectId }, approvalGrantId: grantId });
     if (d.enforcedOutcome === "allow") return d.approvalGrantId === grantId ? "allow" : "require_approval";
     return d.enforcedOutcome === "require_approval" ? "require_approval" : "deny";
@@ -224,7 +230,11 @@ export function buildTeardownSweep(w: {
     unspentGrant: q.unspentGrant,
     purge: async (projectId, grantId, card) => {
       const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs, linear: w.linear ?? null });
-      const authorize = purgeCardAuthorizer(w.policy, projectId, grantId, card, async () => (await store.project(projectId))?.archivedAt ?? null);
+      const authorize = purgeCardAuthorizer(
+        w.policy, projectId, grantId, card,
+        async () => (await store.project(projectId))?.archivedAt ?? null,
+        async () => (await store.project(projectId))?.purgeAfter ?? null,
+      );
       return td.purgeProject(projectId, { store, authorize, ops: wiring.ops, scanners: wiring.scanners, preflight: wiring.preflight });
     },
     keepArchived: q.keepArchived,
