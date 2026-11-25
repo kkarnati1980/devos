@@ -614,7 +614,7 @@ export class TeardownSweepJob {
     if (!(await this.shouldRaise(p))) return false;
     const card = purgeCard(p, await this.d.activeCounts(p.id));
     await this.d.lockHeld?.(p.id);
-    await this.raiseFenced(p, card);
+    await this.raiseFenced(p, card, { due: true });
     return true;
   }
 
@@ -624,8 +624,9 @@ export class TeardownSweepJob {
    * written is expired and nothing is raised. A change after this read gives a newer `archivedAt` than the card's own
    * creation time, so `raisedThisArchive` already refuses the card for that archive.
    */
-  private async raiseFenced(p: TeardownProject, card: Parameters<TeardownSweepDeps["raise"]>[0]): Promise<{ id: string }> {
-    const raised = (await this.d.raise(card)) as { id?: unknown } | null;
+  private async raiseFenced(p: TeardownProject, card: Parameters<TeardownSweepDeps["raise"]>[0], opts: { due?: boolean } = {}): Promise<{ id: string }> {
+    const raiseStart = this.now();
+    const raised = (await this.d.raise(card)) as { id?: unknown; createdAt?: unknown } | null;
     if (!raised || typeof raised.id !== "string") throw new Error("purge-card-not-raised");
     const id = raised.id;
     // Decision 11 (Codex PR240-r7): a deduplicated raise returns the pending twin already stored. If that card names
@@ -641,6 +642,16 @@ export class TeardownSweepJob {
     if (!now || now.stage !== "archived" || now.archivedAt?.getTime() !== p.archivedAt?.getTime()) {
       await this.expireCard(id, p.id, "purge-card-stale-archive");
       throw new Error("purge-card-stale-archive");
+    }
+    // Decision 29 (Codex PR240-r25): Keep archived moves `purge_after` but not `archived_at`, so the archive check above
+    // cannot see it. A daily (scheduled) card is due only while the fresh read still has the locked read's purge date.
+    // If it moved, the card this raise wrote is expired. A deduplicated twin stored before this raise began (createdAt is
+    // the approvals core's clock, the same process) is another caller's card, such as KK's own early ask: it is left
+    // alone. The call fails, so the daily run stays open and its next pass finds the row no longer due.
+    if (opts.due && now.purgeAfter?.getTime() !== p.purgeAfter?.getTime()) {
+      const at = raised.createdAt instanceof Date ? raised.createdAt.getTime() : Number.NaN;
+      if (!(at < raiseStart)) await this.expireCard(id, p.id, "purge-card-not-due");
+      throw new Error("purge-card-not-due");
     }
     return { id };
   }

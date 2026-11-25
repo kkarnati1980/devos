@@ -1182,6 +1182,47 @@ test("M2.5-b5 decision 28 (Codex PR240-r24): a failed purge-card cleanup never h
   assert.ok(!s.logs.some((l) => l.code === "teardown-stop-cleanup-failed"));
 });
 
+test("M2.5-b5 decision 29 (Codex PR240-r25): a daily card written after Keep archived moved purge_after is expired, and the next pass raises nothing", async () => {
+  const s = setup();
+  const raise = s.job.d.raise;
+  let once = 1;
+  s.job.d.raise = async (c) => {
+    // A lost-lock early ask's card was rejected and Keep archived applied between the locked read and the write.
+    if (once-- > 0) s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+    return raise(c);
+  };
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0, "no actionable card after the archive was extended");
+  const [c] = await s.purgeCards("expired");
+  assert.ok(c, "the card this raise wrote was expired");
+  assert.ok(s.logs.some((l) => l.code === "purge-due"), "the daily run stays open");
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0, "the row is no longer due");
+});
+
+test("M2.5-b5 decision 29 (Codex PR240-r25): a deduplicated twin stored before the raise (KK's early ask) is never expired by the purge-date fence", async () => {
+  const s = setup();
+  const counts = s.job.d.activeCounts;
+  let twin = null;
+  s.job.d.activeCounts = async (id) => {
+    // KK's early ask stores this archive's card just before the daily raise begins.
+    if (!twin) {
+      twin = await s.approvals.raiseCard(purgeCard(s.projects.get(P), { github: 2, coolify: 5 }));
+      s.advance(1);
+    }
+    return counts(id);
+  };
+  const raise = s.job.d.raise;
+  s.job.d.raise = async (c) => {
+    s.projects.get(P).purgeAfter = new Date(s.now() + KEEP_ARCHIVED_MS);
+    return raise(c);
+  };
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(twin.id)).status, "pending", "the early ask's card stays open");
+  assert.equal((await s.purgeCards()).length, 1, "nothing else was written");
+});
+
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
   const s = setup();
   await s.job.tick();
