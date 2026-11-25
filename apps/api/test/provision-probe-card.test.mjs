@@ -563,7 +563,7 @@ test("Codex PR239-r15: a card raise that throws across 6 h server checks leaves 
   d.tick(6 * HOUR);
   const end = await probeStep(d);
   assert.deepEqual([end.phase, end.code], ["done", "card-raise-failed"]);
-  assert.deepEqual(order, ["expire", "purge"], "the pending card is expired before the probe purges");
+  assert.deepEqual(order, ["expire", "purge", "expire"], "the pending card is expired before the probe purges (and once more after, r20)");
 });
 
 test("Codex PR239-r15: every way out of card and cardwait to the probe's purge expires the cards first; a normal cycle never does", async () => {
@@ -577,7 +577,7 @@ test("Codex PR239-r15: every way out of card and cardwait to the probe's purge e
     else d.state.card = card;
     assert.equal((await probeStep(d)).phase, "purge");
     assert.equal((await probeStep(d)).phase, "done");
-    assert.deepEqual(order, ["expire", "purge"], card);
+    assert.deepEqual(order, ["expire", "purge", "expire"], card);
   }
   const n = fake();
   n.state.proven = true;
@@ -649,6 +649,7 @@ test("Codex PR239-r15/r16: a failing expiry holds the purge while the grant last
   d.purge = async () => { d.calls.purge++; return "done"; };
   r = await probeStep(d);
   assert.deepEqual([r.phase, r.code], ["done", "card-rejected"]);
+  assert.equal(d.calls.expire, 3, "r20: once purged, the cards are expired once more");
 });
 
 test("Codex PR239-r15: expireProbePurgeCards expires the project's pending purge cards and resolves only when none is left", async () => {
@@ -763,4 +764,51 @@ test("Codex PR239-r19: the archived-state checks and the raise run under the lif
   // A lock that cannot be taken raises nothing.
   stage = "archived";
   await assert.rejects(raiseProbePurgeCard("p-1", { ...d, locked: async () => { throw new Error("lock_timeout"); } }), /lock_timeout/);
+});
+
+test("Codex PR239-r20: a card asked for during the fallback purge is expired once the row is purged", async () => {
+  // KK's "Ask to delete now" raises a card after the pre-purge expiry; the purge then finishes.
+  const pending = new Set();
+  const d = fake({ purge: async () => { pending.add("asked-card"); d.calls.purge++; return "done"; } });
+  let fail = 0;
+  d.expirePurgeCards = async () => { if (fail > 0) { fail--; throw new Error("db"); } pending.clear(); };
+  await until(d, "cardwait");
+  d.state.card = "rejected";
+  assert.equal((await probeStep(d)).phase, "purge");
+  let r = await probeStep(d);
+  assert.deepEqual([r.phase, r.code], ["done", "card-rejected"]);
+  assert.equal(pending.size, 0, "no pending card is left for a purged project");
+  // A failing post-purge expiry holds the cycle in purge (one row per call) and is retried; the purge is a no-op then.
+  const e = fake({ purge: async () => { e.calls.purge++; return "done"; } });
+  fail = 0;
+  e.expirePurgeCards = async () => { if (fail > 0) { fail--; throw new Error("db"); } };
+  await until(e, "cardwait");
+  e.state.card = "expired";
+  await probeStep(e);
+  // The pre-purge expiry fails once (held while the grant lasts), then the post-purge one fails once.
+  let call = 0;
+  e.expirePurgeCards = async () => { call++; if (call === 1 || call === 3) throw new Error("db"); };
+  e.grantUntil = e.now().getTime() + 3 * DAY;
+  assert.equal((await probeStep(e)).detail, "card-expire-retry");
+  r = await probeStep(e);
+  assert.deepEqual([r.phase, r.detail], ["purge", "card-expire-after-purge"]);
+  r = await probeStep(e);
+  assert.deepEqual([r.phase, r.code], ["done", "card-expired"]);
+  // Past the phase bound the cycle ends as it would have.
+  const t = fake({ purge: async () => "done" });
+  t.expirePurgeCards = async () => {};
+  await until(t, "cardwait");
+  t.state.card = "rejected";
+  await probeStep(t);
+  t.expirePurgeCards = async () => { if (t.calls.pre === undefined) { t.calls.pre = 1; return; } throw new Error("db"); };
+  r = await probeStep(t);
+  assert.equal(r.detail, "card-expire-after-purge");
+  t.tick(PROBE_PHASE_MAX_MS);
+  r = await probeStep(t);
+  assert.deepEqual([r.phase, r.code], ["done", "card-rejected"]);
+  // A normal cycle never expires.
+  const n = fake();
+  n.state.proven = true;
+  await until(n, "done");
+  assert.equal(n.calls.expire, undefined);
 });

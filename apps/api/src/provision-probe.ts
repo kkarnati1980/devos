@@ -386,6 +386,20 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       }
       // Pre-review L1: the earlier failure stays in the done row as `cause`.
       if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier, restart);
+      // Codex PR239-r20 (medium, DEVOS-254 decision 20): KK's "Ask to delete now" could raise a fresh purge card after the
+      // expiry above and before the purge moved the row out of `archived`. Once purged (no new card can be asked for),
+      // a card cycle expires the probe's pending purge cards once more. A failed expiry is retried on later ticks
+      // within the phase bound (the purge itself is then a no-op `done`), unless the expiry before the purge was already
+      // given up (decision 15); past it the cycle ends as it would have, and
+      // the sweep, which is on whenever "Ask to delete now" is offered, expires the card (`project-not-archived`).
+      if (last.viaCard && d.expirePurgeCards) {
+        const post = await attempt(() => d.expirePurgeCards!());
+        const gaveUp = restart?.cardExpireGaveUp === true || last.cardExpireGaveUp === true;
+        if (!post.ok && !gaveUp && (restart || !timedOut())) {
+          if (restart) await d.record({ ...last, ...restart });
+          return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
+        }
+      }
       // Codex PR239-r17 (medium): a card cycle whose sweep purge under KK's approved card finished after `cardwait` gave
       // up on it (`card-purge-unfinished`, then the sweep completed before this tick) is AT10's proof after all. The
       // tracked card is read once more; only a purged row whose every allowed purge decision ran under an approved
