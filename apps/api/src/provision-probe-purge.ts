@@ -313,7 +313,8 @@ const CARD_STATUSES = ["pending", "approved", "rejected", "expired"] as const;
 export async function probeExistingCard(db: any, projectId: string, since: Date, timeoutMs: number): Promise<string | null> {
   const c = await db.$transaction((tx: any) => tx.approval.findFirst({
     where: { projectId, action: "teardown.purge", target: `project:${projectId}`, createdAt: { gte: since } },
-    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    // Codex PR239-r2: the oldest, so a card raised by someone else first is the one tracked.
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     select: { id: true },
   }), { timeout: timeoutMs, maxWait: timeoutMs });
   return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
@@ -353,7 +354,7 @@ export interface ProbePurgeCardDeps {
   stage(): Promise<string>;
   /** The row's `archived_at` (pre-review 2: a card raised before it belongs to an earlier archive). */
   archivedAt(): Promise<Date | null>;
-  /** The id of the newest `teardown.purge` card of this project raised at or after `since`, any status, or null. */
+  /** The id of the oldest `teardown.purge` card of this project raised at or after `since`, any status, or null. */
   existing(since: Date): Promise<string | null>;
   /** Archive under the probe's KK grant (`teardown.archive` only); called only when the row is not archived yet. */
   archive(): Promise<void>;
@@ -387,7 +388,9 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   // nothing expired it) would be skipped by the sweep (`card-before-archive`), so it is not used.
   const archived = await d.archivedAt();
   if (!(archived instanceof Date) || !(card.createdAt instanceof Date) || card.createdAt.getTime() < archived.getTime()) throw new Error("probe-card-stale");
-  return card.id;
+  // Codex PR239-r2: another purge card for this archive raised between the lookup and the raise (and approved, so
+  // the pending dedupe missed it) is the one the sweep acts on first; track the oldest.
+  return (await d.existing(archived)) ?? card.id;
 }
 
 /**

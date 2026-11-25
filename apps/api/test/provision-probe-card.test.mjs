@@ -346,7 +346,20 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
   const x = { $transaction: async (fn, o) => { seen.o = o; return fn({ approval: { findFirst: async (q) => { seen.q = q; return { id: "c-9" }; } } }); } };
   assert.equal(await probeExistingCard(x, "p-1", created, 5000), "c-9");
   assert.deepEqual(seen.q.where, { projectId: "p-1", action: "teardown.purge", target: "project:p-1", createdAt: { gte: created } });
+  assert.deepEqual(seen.q.orderBy, [{ createdAt: "asc" }, { id: "asc" }]);
   assert.deepEqual(seen.o, { timeout: 5000, maxWait: 5000 });
   const none = { $transaction: async (fn) => fn({ approval: { findFirst: async () => null } }) };
   assert.equal(await probeExistingCard(none, "p-1", created, 5000), null);
+});
+
+test("Codex PR239-r2: a card raised by someone else between the lookup and the raise is the one tracked", async () => {
+  const AT = new Date("2026-11-25T10:00:00Z"), LATER = new Date("2026-11-25T10:00:05Z");
+  let reads = 0;
+  const id = await raiseProbePurgeCard("p-1", {
+    stage: async () => "archived", archivedAt: async () => AT,
+    existing: async () => (reads++ === 0 ? null : "card-first"),
+    archive: async () => {}, counts: async () => ({}), raise: async () => ({ id: "card-probe", createdAt: LATER }),
+  });
+  assert.equal(id, "card-first");
+  assert.equal(reads, 2);
 });
