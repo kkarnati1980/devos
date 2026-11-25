@@ -1844,3 +1844,33 @@ test("M2.5-b5 decision 37 (Codex PR240-r33): an older stop's delivery never supe
   await s.job.tick();
   assert.equal((await s.approvals.store.get(newer.id)).status, "pending");
 });
+
+test("M2.5-b5 decision 38 (Codex PR240-r34): an older delivery whose entry was replaced writes nothing, so the newer failure is delivered", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "policy_denied");
+  const counts = s.job.d.activeCounts;
+  const gates = [];
+  s.job.d.activeCounts = async (id) => { await new Promise((r) => gates.push(r)); return counts(id); };
+  // The older delivery pauses in activeCounts; a newer failure replaces its entry and pauses in its own delivery.
+  const tick = s.job.tick();
+  await new Promise((r) => setImmediate(r));
+  s.advance(60_000);
+  const late = s.job.raiseStopped({ ...p }, "leftover");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(gates.length, 2);
+  s.advance(60_000);
+  gates[0]();
+  await new Promise((r) => setImmediate(r));
+  gates[1]();
+  await Promise.all([tick, late]);
+  s.job.d.activeCounts = counts;
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project", "the newer failure reaches KK");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1, "the older failure wrote nothing");
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 }))[0].id, pending[0].id);
+});
