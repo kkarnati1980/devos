@@ -590,7 +590,7 @@ test("Codex PR239-r15: every way out of card and cardwait to the probe's purge e
   assert.equal(w.calls.raise, 0);
 });
 
-test("Codex PR239-r15: an expiry that fails holds the purge while the grant lasts, then purges anyway; a late success restarts the bound", async () => {
+test("Codex PR239-r15/r16: a failing expiry holds the purge while the grant lasts, then purges in that same tick with its own bound", async () => {
   let d = fake();
   let fail = true;
   d.expirePurgeCards = async () => { if (fail) throw new Error("db"); };
@@ -603,23 +603,32 @@ test("Codex PR239-r15: an expiry that fails holds the purge while the grant last
     assert.equal((await probeStep(d)).detail, "card-expire-retry");
   }
   assert.equal(d.calls.purge, 0, "no purge past a card that may still be pending");
-  // The grant would no longer outlast the next tick and the purge: the purge goes ahead, with a full bound.
+  // r16: the grant would no longer outlast the next tick and the purge, so the purge runs now, under the grant
+  // that is still valid, never deferred to a later check.
   d.tick(DAY + 1);
   let r = await probeStep(d);
-  assert.deepEqual([r.phase, r.detail], ["purge", "card-expire-gave-up"]);
-  assert.equal(d.log.at(-1).cardExpireGaveUp, true);
-  assert.equal(d.log.at(-1).expireCards, false);
-  r = await probeStep(d);
   assert.deepEqual([r.phase, r.code], ["done", "card-rejected"]);
   assert.equal(d.calls.purge, 1);
-  // A throwing grant check gives up at once, never holds forever.
+  assert.equal(d.log.at(-1).cardExpireGaveUp, true);
+  // Given up with a purge still in progress: one row restarts the bound from that tick.
   d = fake({ expirePurgeCards: async () => { throw new Error("db"); } });
   await until(d, "cardwait");
   d.state.card = "expired";
   await probeStep(d);
   d.cardGrantOutlasts = async () => { throw new Error("db"); };
-  assert.equal((await probeStep(d)).detail, "card-expire-gave-up");
-  // An expiry that succeeds after retries purges in that same tick, as any purge tick does.
+  d.purge = async () => { d.calls.purge++; return "in_progress"; };
+  d.tick(6 * HOUR);
+  const rows = d.log.length;
+  r = await probeStep(d);
+  assert.deepEqual([r.phase, r.detail, d.calls.purge], ["purge", "card-expire-gave-up", 1], "a throwing grant check gives up at once and purges");
+  assert.equal(d.log.length, rows + 1, "one row per call");
+  assert.deepEqual([d.log.at(-1).at, d.log.at(-1).expireCards, d.log.at(-1).cardExpireGaveUp], [d.now().toISOString(), false, true]);
+  d.tick(PROBE_PHASE_MAX_MS - 1);
+  assert.equal((await probeStep(d)).phase, "purge", "the bound runs from the restart");
+  d.tick(1);
+  r = await probeStep(d);
+  assert.deepEqual([r.phase, r.code, r.cause], ["done", "purge-failed", "card-expired"]);
+  // r16: an expiry that succeeds after retries purges in that same tick, and the purge's bound runs from that tick.
   d = fake();
   fail = true;
   d.expirePurgeCards = async () => { d.calls.expire = (d.calls.expire ?? 0) + 1; if (fail) throw new Error("db"); };
@@ -629,10 +638,17 @@ test("Codex PR239-r15: an expiry that fails holds the purge while the grant last
   d.tick(6 * HOUR);
   assert.equal((await probeStep(d)).detail, "card-expire-retry");
   fail = false;
+  d.purge = async () => { d.calls.purge++; return "in_progress"; };
   d.tick(6 * HOUR);
   r = await probeStep(d);
+  assert.deepEqual([r.phase, r.code, d.calls.purge], ["purge", "in_progress", 1], "a retryable first purge is not failed by the time spent expiring");
+  assert.deepEqual([d.log.at(-1).at, d.log.at(-1).expireCards], [d.now().toISOString(), false]);
+  d.tick(HOUR);
+  assert.equal((await probeStep(d)).phase, "purge");
+  assert.equal(d.calls.expire, 2, "later purge ticks do not expire again once recorded");
+  d.purge = async () => { d.calls.purge++; return "done"; };
+  r = await probeStep(d);
   assert.deepEqual([r.phase, r.code], ["done", "card-rejected"]);
-  assert.deepEqual([d.calls.expire, d.calls.purge], [2, 1]);
 });
 
 test("Codex PR239-r15: expireProbePurgeCards expires the project's pending purge cards and resolves only when none is left", async () => {

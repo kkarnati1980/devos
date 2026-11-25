@@ -263,10 +263,10 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     await d.record({ ...last, ...extra, phase: to, at: at() });
     return { exit: 3, phase: to, cycle, code: "in_progress" };
   };
-  const finish = async (ok: boolean, code: string, detail?: string, cause?: { code: string; detail?: string }): Promise<ProbeTick> => {
+  const finish = async (ok: boolean, code: string, detail?: string, cause?: { code: string; detail?: string }, extra: Partial<PhaseRecord> = {}): Promise<ProbeTick> => {
     const why = cause ? { cause: cause.code, ...(cause.detail !== undefined ? { causeDetail: cause.detail } : {}) } : {};
     const result = { ok, code, ...(detail !== undefined ? { detail } : {}), ...why };
-    await d.record({ ...last, phase: "done", at: at(), result });
+    await d.record({ ...last, ...extra, phase: "done", at: at(), result });
     return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail, ...why };
   };
 
@@ -362,30 +362,32 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       return leaveCard(failed("card-ended", words.join(":")));
     }
     case "purge": {
+      // Codex PR239-r15/r16: a purge that follows a card first expires the probe's pending purge cards (`expireCards`).
+      let restart: Partial<PhaseRecord> | undefined;
       if (last.expireCards) {
         const e = await attempt(async () => { if (!d.expirePurgeCards) throw new Error("not-wired"); await d.expirePurgeCards(); });
         if (!e.ok) {
-          // Retried on later ticks while the probe grant still outlasts the next tick and the purge after it
+          // Held on later ticks while the probe grant still outlasts the next tick and the purge after it
           // (`PROBE_CARD_PURGE_ROOM_MS`, decision 13); then the purge goes ahead, so the resources are still removed.
           const g = await attempt(async () => (d.cardGrantOutlasts ? (await d.cardGrantOutlasts(new Date(d.now().getTime() + PROBE_CARD_PURGE_ROOM_MS))) === true : false));
           if (g.ok && g.value === true) return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-retry" };
         }
-        // Expired: the purge runs in this same tick, exactly as a purge did before r15 (a later purge tick expires
-        // again, a no-op once none is pending). Given up: one row (pre-review L2) records it and restarts the purge
-        // phase with its own full bound on the next tick.
-        if (!e.ok) {
-          await d.record({ ...last, at: at(), expireCards: false, cardExpireGaveUp: true });
-          return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-gave-up" };
-        }
+        // Codex PR239-r16 (2 medium): expired or given up, the purge starts in this same tick, while the grant that
+        // was just checked is still valid, and its `PROBE_PHASE_MAX_MS` bound runs from this tick, never from the row
+        // written before the expiry and its retries. The one row this call writes (pre-review L2) carries the restart.
+        restart = { at: at(), expireCards: false, ...(e.ok ? {} : { cardExpireGaveUp: true }) };
       }
       const r = await attempt(() => d.purge());
       const v = r.ok ? r.value : "in_progress";
       const earlier = last.result && !last.result.ok ? last.result : undefined;
-      if (v === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
+      if (v === "in_progress" && (restart || !timedOut())) {
+        if (restart) await d.record({ ...last, ...restart });
+        return { exit: 3, phase, cycle, code: "in_progress", ...(restart?.cardExpireGaveUp ? { detail: "card-expire-gave-up" } : {}) };
+      }
       // Pre-review L1: the earlier failure stays in the done row as `cause`.
-      if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier);
-      if (earlier) return finish(false, earlier.code, earlier.detail);
-      return finish(true, "pass");
+      if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier, restart);
+      if (earlier) return finish(false, earlier.code, earlier.detail, undefined, restart);
+      return finish(true, "pass", undefined, undefined, restart);
     }
     default:
       return { exit: 1, phase, cycle, code: "unknown-phase" };
