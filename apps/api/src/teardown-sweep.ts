@@ -628,6 +628,11 @@ export class TeardownSweepJob {
     const owed = this.stopsOwed.get(p.id);
     if (owed?.p.archivedAt && (!p.archivedAt || p.archivedAt.getTime() < owed.p.archivedAt.getTime())) {
       this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "archive-superseded" });
+    } else if (owed && owed.due === null && due !== null && owed.p.archivedAt?.getTime() === p.archivedAt?.getTime()) {
+      // Decision 40 (Codex PR240-r36): a stop that delivery may still drop (a scheduled card's denial before any
+      // deletion, decision 35) never replaces an owed stop for the same archive that must be reported (one after
+      // deletions ran, or any stop without a due date). The owed one stays and is delivered; the denial deleted nothing.
+      this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "stop-owed-kept" });
     } else {
       this.stopsOwed.set(p.id, { p, code, due });
     }

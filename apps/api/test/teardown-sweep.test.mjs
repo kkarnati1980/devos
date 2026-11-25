@@ -1911,3 +1911,28 @@ test("M2.5-b5 decision 39 (Codex PR240-r35): a newer stop raised while an older 
   await s.job.tick();
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 }))[0].id, pending[0].id);
 });
+
+test("M2.5-b5 decision 40 (Codex PR240-r36): a droppable denial never replaces an owed stop that must be reported", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "the partial purge's report is owed");
+  // A later scheduled approval is denied because Keep archived moved its date; its handler used an old snapshot.
+  await s.job.raiseStopped({ ...p }, "policy_denied", new Date(p.purgeAfter.getTime() - DAY).toISOString());
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-owed-kept"));
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1, "KK still gets the partial purge's report");
+  assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+});
+
+test("M2.5-b5 decision 40 (Codex PR240-r36): a stop that must be reported still replaces an owed droppable denial", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "policy_denied", p.purgeAfter.toISOString());
+  await s.job.raiseStopped({ ...p }, "leftover");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project");
+});
