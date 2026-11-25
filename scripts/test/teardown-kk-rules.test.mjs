@@ -237,3 +237,15 @@ test("Codex PR238-r9: two deciding codes (`default-deny;denied-by`) are unreadab
     assert.doesNotMatch(r.out, /^ok:/m);
   }
 });
+
+test("Codex PR238-r10: the same matched rules in another order for the other action are unreadable", () => {
+  const cli = line({ result: "pass", mode: "enforce", rules: 2, pinned: 0, actions: {
+    "teardown.archive": act("allow", "allow", "allowed-by", [ID, ID2]),
+    "teardown.restore": act("allow", "allow", "allowed-by", [ID2, ID]) } });
+  const r = run({ cli });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /^fail: unreadable rules check output$/m);
+  // The same order is read.
+  const ok = run({ cli: cli.replace(`["${ID2}","${ID}"]`, `["${ID}","${ID2}"]`) });
+  assert.equal(ok.code, 0, ok.out);
+});
