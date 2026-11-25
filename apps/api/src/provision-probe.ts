@@ -101,12 +101,21 @@ function nextPhase(p: Phase): Phase {
   return PHASES[Math.min(PHASES.indexOf(p) + 1, PHASES.length - 1)] ?? "done";
 }
 
+/** A teardown call a provider refused, as `purgeStop` names it (part 12): `purge-permission:coolify/application:delete:http-403`. */
+const PROVIDER_REFUSAL = /^purge-permission:(?:github|coolify)\/[a-z_]+(?::|$)/;
+
 async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   if (last.fingerprint !== d.fingerprint) return true;
   if (d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS) return true;
   // DEVOS-21: a cycle that only purged an earlier cycle's leftovers (its purge passed) tested nothing, so the real
   // cycle is due on the next check run. If that purge had failed, the code would be `purge-failed`, which waits.
   if (last.result?.ok === false && last.result.code === "previous-purge-pending") return true;
+  // DEVOS-21 part 13: a purge that a provider refused (`purge-permission:<provider>/<kind>:...`) is fixed on the
+  // provider side, often by editing the existing token's permissions, which no vault save records. Such a cycle is
+  // due on the next check run (a new SHA, the 6-hour timer or a `/recheck`), so the fix is tested at once. It
+  // starts with the purge again and creates nothing; if the refusal repeats it ends the same way, bounded by that
+  // cadence. A preflight refusal, a lapsed grant or a bare code keeps the earlier rules.
+  if (last.result?.ok === false && last.result.code === "purge-failed" && PROVIDER_REFUSAL.test(last.result.detail ?? "")) return true;
   // DEVOS-21: a failed cycle is re-run as soon as KK saves a new provider token after it ended (a passed cycle waits
   // the 7 days). A read that throws, or a time that is not a valid ISO date, keeps the 7-day rule.
   if (last.result?.ok !== false || !d.credentialsUpdatedAt) return false;
