@@ -24,6 +24,11 @@ export const CARD_PAGE = 50;
 export const DUE_PAGE = 100;
 /** Decision 25: the tick's cleanup pages through pending cards (newest first) up to this many per action. */
 export const CLEANUP_SCAN_MAX = 1000;
+/**
+ * Decision 28 (Codex PR240-r24): the most card ids sent in one expiry call. Equal to the approvals API's
+ * EXPIRE_IDS_MAX (a test pins the two together); kept here so this job stays free of the approvals module's imports.
+ */
+export const EXPIRE_BATCH = 500;
 /** Decision 1: the card is raised once, then re-raised once after an unanswered one; then nothing happens. */
 export const MAX_UNANSWERED = 2;
 /** Decision 1: a purge card unanswered for 7 days expires (then it is re-raised once). */
@@ -297,6 +302,8 @@ export class TeardownSweepJob {
       await this.deliverStops();
       await this.expireUnfenced();
       await this.step("teardown-restored-pass-failed", () => this.closeRestored());
+      // Decision 28 (Codex PR240-r24): the stop-card cleanup runs even when the purge-card cleanup failed.
+      await this.step("teardown-stop-cleanup-failed", () => this.closeEndedStops());
       await this.step("teardown-keep-pass-failed", () => this.keepArchivedPass());
       await this.step("teardown-approved-pass-failed", () => this.approvedPass());
       // Pre-review 5: a failed (or partly failed) daily run is tried again on the next tick, not a day later.
@@ -337,10 +344,14 @@ export class TeardownSweepJob {
       else if (p && !raisedThisArchive(c, p)) restored.push(c.id);
       else if (c.createdAt.getTime() <= cutoff) unanswered.push(c.id);
     }
-    if (restored.length) await this.d.expire(restored, "project-not-archived");
-    if (unanswered.length) await this.d.expire(unanswered, "purge-card-unanswered-7-days");
+    await this.expireBatched(restored, "project-not-archived");
+    await this.expireBatched(unanswered, "purge-card-unanswered-7-days");
     // Decision 27 (Codex PR240-r23): the resume point moves only after this batch's cleanup has succeeded.
     this.commitScan(PURGE_ACTION, scan.next);
+  }
+
+  /** 1b. Decision 28: the stop-card cleanup is its own step, so a failed purge-card cleanup never holds it back. */
+  private async closeEndedStops(): Promise<void> {
     // Decision 18 (Codex PR240-r14): a pending stop card that does not name the current archive (raised after a Restore,
     // or a Restore and a new Archive, slipped in before its write; or unstamped, from before decision 18) is closed
     // here, so KK is not left a stop prompt for an archive that has ended, and it never blocks the current one's card.
@@ -352,8 +363,17 @@ export class TeardownSweepJob {
       const p = await this.d.project(c.projectId);
       if (p && !raisedThisArchive(c, p)) ended.push(c.id);
     }
-    if (ended.length) await this.d.expire(ended, "stop-card-archive-ended");
+    await this.expireBatched(ended, "stop-card-archive-ended");
     this.commitScan(PURGE_STOPPED_ACTION, stopScan.next);
+  }
+
+  /**
+   * Decision 28 (Codex PR240-r24): a cleanup batch can hold up to CLEANUP_SCAN_MAX ids, more than the approvals API
+   * takes in one call, so it is sent in chunks of EXPIRE_BATCH. A failed chunk throws, so the resume point stays put
+   * (decision 27); the chunks already expired are not pending on the re-read, so the retry sends only what is left.
+   */
+  private async expireBatched(ids: string[], reason: string): Promise<void> {
+    for (let i = 0; i < ids.length; i += EXPIRE_BATCH) await this.d.expire(ids.slice(i, i + EXPIRE_BATCH), reason);
   }
 
   /**

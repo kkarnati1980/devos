@@ -6,11 +6,11 @@ import assert from "node:assert/strict";
 import { MemoryPolicyStore, PolicyEngine } from "@devos/policy";
 import { TeardownError } from "@devos/teardown";
 import { KkSessionRegistry } from "../dist/auth.js";
-import { Approvals, MemoryApprovalStore, parseCard } from "../dist/approvals.js";
+import { Approvals, MemoryApprovalStore, parseCard, EXPIRE_IDS_MAX } from "../dist/approvals.js";
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
-  cardArchive, CARD_PAGE, CLEANUP_SCAN_MAX,
+  cardArchive, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
 } from "../dist/teardown-sweep.js";
 import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
@@ -1132,6 +1132,54 @@ test("M2.5-b5 decision 27 (Codex PR240-r23): a failed cleanup keeps its resume p
   s.advance(5 * 60_000);
   await s.job.tick();
   assert.equal((await s.approvals.store.get(staleStop.id)).status, "expired", "the next tick re-reads the same batch and closes it");
+});
+
+test("M2.5-b5 decision 28 (Codex PR240-r24): the job's expiry chunk is the approvals API's limit", () => {
+  assert.equal(EXPIRE_BATCH, EXPIRE_IDS_MAX);
+  assert.ok(CLEANUP_SCAN_MAX > EXPIRE_IDS_MAX, "a full cleanup batch needs more than one expiry call");
+});
+
+test("M2.5-b5 decision 28 (Codex PR240-r24): more stale cards than one expiry call takes are all closed in one tick, in chunks the approvals API accepts", async () => {
+  const s = setup();
+  s.projects.clear();
+  const N = EXPIRE_IDS_MAX + 100;
+  const stops = [];
+  const purges = [];
+  for (let i = 0; i < N; i++) {
+    const id = `77777777-7777-4777-8777-${String(i).padStart(12, "0")}`;
+    const old = { id, slug: `p${i}`, archivedAt: new Date(T0 - 60 * DAY) };
+    stops.push(await s.approvals.raiseCard(purgeStoppedCard(old, "leftover", { github: 1 })));
+    purges.push(await s.approvals.raiseCard(purgeCard({ ...old, stage: "archived" }, { github: 1 })));
+    // Restored since (purge card stale), then archived again (stop card names an ended archive).
+    s.projects.set(id, { id, slug: `p${i}`, stage: "active", archivedAt: null, purgeAfter: null });
+  }
+  const sizes = [];
+  const expire = s.job.d.expire;
+  s.job.d.expire = async (ids, reason) => {
+    sizes.push(ids.length);
+    return expire(ids, reason);
+  };
+  await s.job.tick();
+  assert.ok(sizes.length >= 4 && sizes.every((n) => n <= EXPIRE_IDS_MAX), `chunked expiry calls: ${sizes}`);
+  for (const c of [...stops, ...purges]) assert.equal((await s.approvals.store.get(c.id)).status, "expired");
+  assert.equal(s.logs.filter((l) => l.msg === "teardown-sweep-failed").length, 0);
+});
+
+test("M2.5-b5 decision 28 (Codex PR240-r24): a failed purge-card cleanup never holds back the stop-card cleanup", async () => {
+  const s = setup();
+  const old = { id: P, slug: "acme", archivedAt: new Date(T0 - 60 * DAY) };
+  const staleStop = await s.approvals.raiseCard(purgeStoppedCard(old, "leftover", { github: 1 }));
+  s.projects.get(P).stage = "active";
+  await s.approvals.raiseCard(purgeCard({ ...old, stage: "archived" }, { github: 1 }));
+  const expire = s.job.d.expire;
+  s.job.d.expire = async (ids, reason) => {
+    if (reason === "project-not-archived") throw new Error("db blip");
+    return expire(ids, reason);
+  };
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(staleStop.id)).status, "expired", "the stop cleanup ran");
+  assert.ok(s.logs.some((l) => l.code === "teardown-restored-pass-failed"));
+  assert.ok(!s.logs.some((l) => l.code === "teardown-stop-cleanup-failed"));
 });
 
 test("M2.5-b5 decision 26 (Codex PR240-r22): a rejection never postpones a replacement archive that kept the same purge date", async () => {
