@@ -50,17 +50,28 @@ fi
 # Pre-review 1: the outcomes are one of the three effects, and the verdict is recomputed here from the rows: pass
 # only when both are enforced `allow`, the two random sentinels agreed (Codex PR238-r1) and no rule matched through a
 # narrow pattern (PR238-r2). In enforce mode the evaluator enforces its rule outcome, so a row whose two differ is
-# malformed (PR238-r3). A `result` that disagrees with its rows is unreadable, never a pass.
+# malformed (PR238-r3). In either mode a row must agree with the evaluator's gate rules (PR238-r4): a gate reason
+# appears only in observe mode; `gate-denied-by` only with an enforced and recorded deny; `gate-approval-required-by`
+# only with an enforced approval; an enforced deny only with a recorded deny, and an enforced approval never with a
+# recorded allow. A `result` that disagrees with its rows is unreadable, never a pass.
 # Fields are joined with `|` (not in any allowed field), so an empty field never shifts the columns.
 summary="$(printf '%s' "$obj" | jq -r '
   def eff($s): $s == "allow" or $s == "deny" or $s == "require_approval";
   def ok($s): ($s | type) == "string" and ($s | test("\\A[a-z;-]{1,80}\\z"));
+  def has($p): any(.reason | split(";")[]; . == $p);
+  def gates($mode):
+    (($mode == "observe") or ((has("gate-denied-by") or has("gate-approval-required-by")) | not))
+    and ((has("gate-denied-by") | not) or (.enforced == "deny" and .outcome == "deny"))
+    and ((has("gate-approval-required-by") | not) or .enforced == "require_approval")
+    and (.enforced != "deny" or .outcome == "deny")
+    and (.enforced != "require_approval" or .outcome != "allow");
   [.actions["teardown.archive"], .actions["teardown.restore"]] as $rows | .mode as $mode |
   if (.mode == "observe" or .mode == "enforce")
      and (.rules | type) == "number" and (.pinned | type) == "number" and (.actions | type) == "object"
      and all($rows[]; type == "object"
              and eff(.outcome) and eff(.enforced) and ok(.reason)
              and ($mode != "enforce" or .outcome == .enforced)
+             and gates($mode)
              and (.matched | type) == "array" and all(.matched[]; type == "string" and test("\\A[A-Za-z0-9-]{1,64}\\z")))
      and .result == (if all($rows[]; .enforced == "allow" and .reason != "sentinels-disagree" and .reason != "narrow-match") then "pass" else "fail" end)
   then

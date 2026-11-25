@@ -78,6 +78,13 @@ test("DEVOS-112 pre-review 2: rules pinned to a login or a project are reported,
   const obs = run({ cli: line({ result: "pass", mode: "observe", rules: 0, pinned: 0, actions: { "teardown.archive": act("allow", "deny", "default-deny", []), "teardown.restore": act("allow", "deny", "default-deny", []) } }) });
   assert.equal(obs.code, 0, obs.out);
   // Codex PR238-r1: sentinels that disagree are a fail, shown as such.
+  // Codex PR238-r4: valid observe-mode gate rows are read and fail, naming the gate.
+  for (const a of [act("deny", "deny", "denied-by;gate-denied-by"), act("require_approval", "require_approval", "approval-required-by;gate-approval-required-by")]) {
+    const g = run({ cli: line({ result: "fail", mode: "observe", rules: 2, pinned: 0, actions: { "teardown.archive": a, "teardown.restore": act("allow") } }), cliRc: 1 });
+    assert.equal(g.code, 1, g.out);
+    assert.match(g.out, /KK teardown\.archive: (deny|require_approval) \(rule outcome/);
+    assert.match(g.out, /^fail: KK's Archive or Restore would be refused/m);
+  }
   const dis = run({ cli: line({ result: "fail", mode: "enforce", rules: 1, pinned: 1, actions: { "teardown.archive": act("allow", "allow", "sentinels-disagree"), "teardown.restore": act("allow") } }), cliRc: 1 });
   assert.equal(dis.code, 1, dis.out);
   assert.match(dis.out, /KK teardown.archive: allow \(rule outcome allow, sentinels-disagree/);
@@ -121,6 +128,12 @@ test("DEVOS-112: malformed output is unreadable, never a pass", () => {
     line({ result: "pass", mode: "legacy", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow"), "teardown.restore": act("allow") } }),
     line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "allow", "x\nok: fake"), "teardown.restore": act("allow") } }),
     line({ result: "pass", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "allow", "allowed-by", ["a b"]), "teardown.restore": act("allow") } }),
+    // Codex PR238-r4: an observe-mode row that contradicts the evaluator's gate rules.
+    line({ result: "pass", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "deny", "denied-by;gate-denied-by"), "teardown.restore": act("allow") } }),
+    line({ result: "pass", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("allow", "require_approval", "approval-required-by;gate-approval-required-by"), "teardown.restore": act("allow") } }),
+    line({ result: "fail", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("deny", "allow", "allowed-by"), "teardown.restore": act("allow") } }),
+    line({ result: "fail", mode: "observe", rules: 1, pinned: 0, actions: { "teardown.archive": act("require_approval", "allow", "allowed-by"), "teardown.restore": act("allow") } }),
+    line({ result: "fail", mode: "enforce", rules: 1, pinned: 0, actions: { "teardown.archive": act("deny", "deny", "denied-by;gate-denied-by"), "teardown.restore": act("allow") } }),
     PASS.replace("\n", "\u0000\n")]) {
     const r = run({ cli });
     assert.equal(r.code, 1, `${JSON.stringify(cli)} → ${r.out}`);
