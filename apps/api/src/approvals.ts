@@ -637,15 +637,17 @@ export class MemoryApprovalStore implements ApprovalStore {
 
   async list(f: ListFilter) {
     let all = [...this.cards.values()].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : -1));
+    // Decision 55 (Codex PR240-r51): as in the Postgres store, the cursor is found before any filter, so a page resumes
+    // after a card whose status changed since (e.g. one the caller has just expired) instead of returning nothing.
+    if (f.cursor) {
+      const i = all.findIndex((c) => c.id === f.cursor);
+      all = i < 0 ? [] : all.slice(i + 1);
+    }
     if (f.status) all = all.filter((c) => c.status === f.status);
     if (f.projectId) all = all.filter((c) => c.projectId === f.projectId);
     if (f.gate) all = all.filter((c) => c.gate === f.gate);
     if (f.action !== undefined) all = all.filter((c) => c.action === f.action);
     if (f.target !== undefined) all = all.filter((c) => c.target === f.target);
-    if (f.cursor) {
-      const i = all.findIndex((c) => c.id === f.cursor);
-      all = i < 0 ? [] : all.slice(i + 1);
-    }
     return all.slice(0, f.limit).map((c) => ({ ...c }));
   }
 
