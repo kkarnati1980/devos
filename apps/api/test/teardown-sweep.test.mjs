@@ -1779,7 +1779,9 @@ test("M2.5-b5 decision 41 (Codex PR240-r37): a scheduled card's denial deduplica
 test("M2.5-b5 decision 36 (Codex PR240-r32): a twin with this archive and this failure serves the stop and is kept", async () => {
   const s = setup();
   const p = s.projects.get(P);
-  const twin = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 9 }));
+  // Decision 45 (Codex PR240-r41): the twin is stamped at the stop's own time; an unstamped twin predates it and is
+  // superseded instead (covered by the decision 45 tests).
+  const twin = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 9 }, new Date(s.now())));
   await s.job.raiseStopped({ ...p }, "leftover");
   assert.equal((await s.approvals.store.get(twin.id)).status, "pending");
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
@@ -2121,4 +2123,38 @@ test("M2.5-b5 decision 40 (Codex PR240-r36): a stop that must be reported still 
   const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1);
   assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project");
+});
+
+test("M2.5-b5 decision 45 (Codex PR240-r41): a newer report of the same failure advances the stored stamp, so an older failure owed by another instance never replaces it", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch"); // failure A at t1, delivered
+  const [first] = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  s.advance(60_000);
+  // Another sweep instance owes failure B at t2; its first delivery fails, so it stays owed there.
+  const other = new TeardownSweepJob({ ...s.job.d });
+  s.failRaise.n = 1;
+  await other.raiseStopped({ ...p }, "leftover");
+  s.advance(60_000);
+  const t3 = s.now();
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch"); // failure A again at t3
+  assert.equal((await s.approvals.store.get(first.id)).status, "expired", "the t1 report is superseded by the t3 one");
+  let pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopAt(pending[0].reason), t3, "the stored stamp advanced to the newest report");
+  await other.tick(); // B (t2) now finds A stamped t3 and drops itself
+  pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+  assert.equal(stopAt(pending[0].reason), t3);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-superseded"));
+});
+
+test("M2.5-b5 decision 45 (Codex PR240-r41): a same-failure card stamped at or after the stop still serves it", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  const card = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 1 }, new Date(s.now() + 60_000)));
+  await s.job.raiseStopped({ ...p }, "leftover");
+  assert.equal((await s.approvals.store.get(card.id)).status, "pending");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
 });

@@ -738,7 +738,11 @@ export class TeardownSweepJob {
     }
     await this.d.lockHeld?.(o.p.id);
     let raised = await this.d.raise(card);
-    if (!this.stopServes(raised, card)) {
+    // Decision 45 (Codex PR240-r41): a same-archive twin reporting this same failure serves this stop only if its
+    // stamp is not older than this stop's. A twin stamped earlier (or unstamped) is superseded and this stop raised,
+    // so the stored stamp always advances to the newest report; otherwise an older failure owed elsewhere (another
+    // sweep instance) would compare against the stale stamp and replace this newer one (decisions 42 and 43).
+    if (!this.stopServes(raised, card) || !this.stampCurrent(raised, o.at)) {
       if (typeof (raised as { reason?: unknown } | null)?.reason !== "string") throw new Error("stop-card-not-raised");
       const sameArchiveTwin = this.stopSameArchive(raised, card);
       // Decision 37 (Codex PR240-r33): a same-archive twin is superseded only by the newest stop. A later stop (a
@@ -810,6 +814,13 @@ export class TeardownSweepJob {
   private stopServes(raised: unknown, card: { reason: string }): boolean {
     const named = (raised as { reason?: unknown } | null)?.reason;
     return this.stopSameArchive(raised, card) && typeof named === "string" && stopWhy(named) === stopWhy(card.reason);
+  }
+
+  /** Decision 45: the stored card's stop stamp is at or after this stop's (an unstamped card predates it). */
+  private stampCurrent(raised: unknown, at: number): boolean {
+    const named = (raised as { reason?: unknown } | null)?.reason;
+    const twinAt = typeof named === "string" ? stopAt(named) : null;
+    return twinAt !== null && twinAt >= at;
   }
 
   /** Decision 36: the stored stop card names the same archive as the one built, whatever failure it reports. */
