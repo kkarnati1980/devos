@@ -2221,3 +2221,20 @@ test("M2.5-b5 decision 47 (Codex PR240-r43): a replacement raise that fails afte
   const whys = stopWhys(pending[0].reason);
   for (const code of ["leftover", "ownership_mismatch"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
 });
+
+test("M2.5-b5 decision 48 (Codex PR240-r44): a same-failure twin that leaves out a carried failure does not serve the stop", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch"); // A owed; its delivery fails
+  s.advance(60_000);
+  // Another instance raised B, stamped later, without A.
+  const twin = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "provider_forbidden", { github: 1 }, new Date(s.now() + 60_000)));
+  await s.job.raiseStopped({ ...p }, "provider_forbidden"); // B replaces A here, carrying it (decision 47)
+  assert.equal((await s.approvals.store.get(twin.id)).status, "expired", "the twin without A is superseded");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  const whys = stopWhys(pending[0].reason);
+  for (const code of ["provider_forbidden", "ownership_mismatch"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
+  assert.equal(stopAt(pending[0].reason), stopAt(twin.reason), "the later stamp is kept");
+});

@@ -843,7 +843,11 @@ export class TeardownSweepJob {
    */
   private stopServes(raised: unknown, card: { reason: string }): boolean {
     const named = (raised as { reason?: unknown } | null)?.reason;
-    return this.stopSameArchive(raised, card) && typeof named === "string" && stopWhy(named) === stopWhy(card.reason);
+    // Decision 48 (Codex PR240-r44): and it names every failure this card names (decisions 46 and 47), so a twin
+    // with the same first failure that leaves out a carried one never stands in for it; it is superseded and merged.
+    if (!(this.stopSameArchive(raised, card) && typeof named === "string" && stopWhy(named) === stopWhy(card.reason))) return false;
+    const have = new Set(stopWhys(named));
+    return stopWhys(card.reason).every((w) => have.has(w));
   }
 
   /** Decision 45: the stored card's stop stamp is at or after this stop's (an unstamped card predates it). */
