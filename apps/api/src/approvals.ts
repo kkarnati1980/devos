@@ -515,7 +515,8 @@ export class Approvals {
    * notified once, as `raiseCard` does.
    */
   async supersedeCard(oldId: string, input: unknown, reason: string): Promise<Card> {
-    if (typeof oldId !== "string" || !UUID.test(oldId)) throw new ApprovalError("invalid-input");
+    // Pre-review (DEVOS-256): the id is lowercased before the check, as expireCardsById does.
+    if (typeof oldId !== "string" || !UUID.test(oldId.toLowerCase())) throw new ApprovalError("invalid-input");
     const why = text(reason, EXPIRE_REASON_MAX, false);
     if (!why) throw new ApprovalError("invalid-input");
     if (looksSecret(why)) throw new ApprovalError("card-contains-secret");
