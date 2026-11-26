@@ -85,11 +85,14 @@ const dueMoved = (c: { reason?: string | null }, p: { purgeAfter: Date | null })
 };
 
 /**
- * A card belongs to the project's current archive only if it was raised at or after `archived_at` and (decision 8) it
- * names that same archive, so a card built from an earlier archive's state but written after a new Archive never counts.
+ * A card belongs to the project's current archive only if (decision 8) it names that same archive, so a card built
+ * from an earlier archive's state but written after a new Archive never counts. Decision 56 (Codex PR240-r52): its
+ * creation time is not compared with `archived_at`. The two come from different clocks (the app's and the database's),
+ * so with skew a card correctly built from this archive could look older than it; the stamp, copied from a read of
+ * this very archive, already proves which archive the card was built for.
  */
-const raisedThisArchive = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject): boolean =>
-  p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime() && cardArchive(c) === p.archivedAt.toISOString();
+const raisedThisArchive = (c: { reason?: string | null }, p: TeardownProject): boolean =>
+  p.stage === "archived" && p.archivedAt !== null && cardArchive(c) === p.archivedAt.toISOString();
 
 /** Decision 53 (Codex PR240-r49): a stop card names the current archive by its stamp (its creation time is not compared). */
 const stopNamesArchive = (c: { reason?: string | null }, p: TeardownProject): boolean =>

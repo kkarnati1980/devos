@@ -115,9 +115,9 @@ export function buildTeardownServices(w: {
 // grant to M1.7), on teardownWiring's pinned clients, scanners and preflight list. Every read is bounded.
 
 /**
- * M2.5-b2 rule 4 (pre-review r2 1 and 2): the purge's authorizer. Only `teardown.purge`; refused when the card is older
- * than the project's `archived_at` (re-read when purgeProject asks, which is under the project lock, so a Restore and a
- * new Archive in between are seen); and "allow" only when M1.7 allowed **by using this grant**, so every attempt spends
+ * M2.5-b2 rule 4 (pre-review r2 1 and 2): the purge's authorizer. Only `teardown.purge`; refused unless the card names
+ * the project's current `archived_at` (re-read when purgeProject asks, which is under the project lock, so a Restore and
+ * a new Archive in between are seen; M2.5-b5 decisions 8 and 56); and "allow" only when M1.7 allowed **by using this grant**, so every attempt spends
  * a use whatever the policy mode or rules (an un-gated allow, e.g. observe mode, is "require_approval", never a purge).
  */
 export function purgeCardAuthorizer(
@@ -131,9 +131,10 @@ export function purgeCardAuthorizer(
   return async (action, resource) => {
     if (action !== "teardown.purge" || resource !== teardownResource(projectId)) return "deny";
     const since = await archivedAt();
-    if (!since || card.createdAt.getTime() < since.getTime()) return "deny";
     // M2.5-b5 decision 8 (Codex PR240-r4): re-read under the project lock, the card must name this very archive.
-    if (card.archive !== since.toISOString()) return "deny";
+    // Decision 56 (Codex PR240-r52): the stamp alone binds the card; its app-clock creation time is not compared with
+    // the database's `archived_at`, so clock skew never denies a card built from this archive.
+    if (!since || card.archive !== since.toISOString()) return "deny";
     // M2.5-b5 decision 30 (Codex PR240-r26): a scheduled card purges only while its purge date is still the project's.
     if (card.due) {
       const due = purgeAfter ? await purgeAfter() : null;

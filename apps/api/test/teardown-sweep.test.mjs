@@ -408,14 +408,46 @@ test("pre-review r2 1: observe mode or an allow rule never purges un-gated; one 
   }
 });
 
-test("pre-review r2 2: the authorizer refuses a card older than archived_at, re-read when the purge asks", async () => {
+test("pre-review r2 2 (amended by decision 56): the authorizer refuses a card of an older archive, re-read when the purge asks", async () => {
   const s = setup();
   let archivedAt = new Date(T0);
+  // A card built from an earlier archive (its stamp names T0 - 1) is refused against the archive of T0.
+  const old = purgeCardAuthorizer(s.engine, P, "00000000-0000-4000-8000-0000000000ff", { createdAt: new Date(T0 + 5), archive: new Date(T0 - 1).toISOString() }, async () => archivedAt);
+  assert.equal(await old("teardown.purge", `project:${P}`), "deny");
   const auth = purgeCardAuthorizer(s.engine, P, "00000000-0000-4000-8000-0000000000ff", { createdAt: new Date(T0 - 1), archive: new Date(T0).toISOString() }, async () => archivedAt);
-  assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
   assert.equal(await auth("teardown.archive", `project:${P}`), "deny");
+  // Re-read on every ask: after a Restore and a new Archive, or with no archive, this card is refused.
+  archivedAt = new Date(T0 + 60_000);
+  assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
   archivedAt = null;
   assert.equal(await auth("teardown.purge", `project:${P}`), "deny");
+});
+
+test("decision 56 (Codex PR240-r52): app-clock skew never expires or denies a card built from the current archive", async () => {
+  const s = setup();
+  // The card's creation time (app clock) is 1 s before archived_at (database clock), but it names this archive.
+  const archive = new Date(T0).toISOString();
+  const auth = purgeCardAuthorizer(s.engine, P, "00000000-0000-4000-8000-0000000000ff", { createdAt: new Date(T0 - 1000), archive }, async () => new Date(T0));
+  // Not refused on the binding: it reaches the policy check, which for an unknown grant asks for approval.
+  assert.notEqual(await auth("teardown.purge", `project:${P}`), "deny");
+  // End to end: the database's clock is 1 s ahead, so archived_at is later than the card's app-clock creation time.
+  s.projects.get(P).archivedAt = new Date(T0 + 1000);
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  assert.ok(c, "the daily card was raised");
+  assert.ok(c.createdAt.getTime() < s.projects.get(P).archivedAt.getTime(), "the card's creation time is before archived_at");
+  assert.equal(cardArchive(c), s.projects.get(P).archivedAt.toISOString());
+  // The next tick's cleanup keeps it pending (it is not expired as a restored archive's card) ...
+  s.advance(60_000);
+  await s.job.tick();
+  assert.deepEqual((await s.purgeCards("pending")).map((x) => x.id), [c.id]);
+  // ... and once KK approves, the purge's authorizer lets it run.
+  await s.approvals.approve(s.session, c.id, { confirmation: `PURGE project:${P}`, maxUses: 1, expiresInHours: 72 });
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 1);
+  assert.equal(s.calls.providerCalls, 1, "the policy check allowed the purge");
+  assert.equal(s.projects.get(P).stage, "purged");
 });
 
 test("pre-review r2 3: not_archived (Restore while waiting for the lock) is a skip, never a stop card, and not re-run", async () => {
