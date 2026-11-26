@@ -63,6 +63,8 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
       return approvals.raiseCard(c);
     },
     expire: (ids, reason) => approvals.expireCardsById(ids, reason),
+    // WIP (decision 51): composed from the job's own hooks so existing tests keep their injection points.
+    supersede: async (oldId, c, reason) => { await job.d.expire([oldId], reason); return job.d.raise(c); },
     unspentGrant: async (approvalId, at) => {
       return [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses === 0)?.id ?? null;
     },

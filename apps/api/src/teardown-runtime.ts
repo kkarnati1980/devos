@@ -152,6 +152,8 @@ export interface TeardownSweepCards {
   list(f: { status?: string; action: string; target?: string; cursor?: string; limit: number }): Promise<PurgeCardLike[]>;
   raise(card: unknown): Promise<unknown>;
   expire(ids: readonly string[], reason: string): Promise<string[]>;
+  /** M2.5-b5 decision 51: `Approvals.supersedeCard` (expire and raise in one transaction). */
+  supersede(oldId: string, card: unknown, reason: string): Promise<unknown>;
 }
 
 /**
@@ -227,6 +229,7 @@ export function buildTeardownSweep(w: {
     cards: (f) => cards.list(f),
     raise: (card) => cards.raise(card),
     expire: (ids, reason) => cards.expire(ids, reason),
+    supersede: (oldId, card, reason) => cards.supersede(oldId, card, reason),
     unspentGrant: q.unspentGrant,
     purge: async (projectId, grantId, card) => {
       const wiring = await teardownWiring(pm, td, { gh, cf, store, db: w.db, projectId, owner: cfg.owner, timeoutMs: w.timeoutMs, linear: w.linear ?? null });
