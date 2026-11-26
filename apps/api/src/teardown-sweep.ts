@@ -242,11 +242,18 @@ const STOP_WORDS: Record<string, string> = {
  * Decision (c): the plain-language card for a non-retryable stop or a scan with hits. Every word is fixed here: only
  * the slug, a fixed reason for the code and the per-provider counts go in, never a provider message.
  */
-export function purgeStoppedCard(p: { id: string; slug: string; archivedAt: Date | null }, code: string, counts: Record<string, number>) {
+export function purgeStoppedCard(
+  p: { id: string; slug: string; archivedAt: Date | null },
+  code: string,
+  counts: Record<string, number>,
+  stoppedAt: Date | null = null,
+) {
   const slug = safeSlug(p.slug);
   const why = STOP_WORDS[code] ?? "it stopped with an error it cannot retry";
   // M2.5-b5 decision 18 (Codex PR240-r14): a stop card names its archive too (decision 8's stamp), so it counts only for it.
-  const stamp = p.archivedAt ? ` Archive ${p.archivedAt.toISOString()}.` : "";
+  // Decision 42 (Codex PR240-r38): and when the stop happened, before the archive stamp, so deliveries in different sweep
+  // instances can tell which of two failures of one archive is the newer one.
+  const stamp = (stoppedAt ? ` Stopped ${stoppedAt.toISOString()}.` : "") + (p.archivedAt ? ` Archive ${p.archivedAt.toISOString()}.` : "");
   return {
     gate: "decision" as const,
     action: PURGE_STOPPED_ACTION,
@@ -267,6 +274,22 @@ export function purgeStoppedCard(p: { id: string; slug: string; archivedAt: Date
  */
 const STOP_WHY = /^Deleting project \S+ stopped: (.+?)\. The project stays archived\. /;
 export const stopWhy = (reason: string): string | null => STOP_WHY.exec(reason)?.[1] ?? null;
+
+/** Decision 42 (Codex PR240-r38): when a stop card's failure happened (null on a card raised before the stamp). */
+const STOPPED_STAMP = / Stopped (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\.(?: Archive [^ ]+\.)?$/;
+export const stopAt = (reason: string): number | null => {
+  const iso = STOPPED_STAMP.exec(reason)?.[1];
+  return iso ? Date.parse(iso) : null;
+};
+
+/**
+ * Decisions 35 and 42 (Codex PR240-r31, r38): the purge's authorizer check (`policy_denied` or `approval_required`)
+ * throws before any resource is read or deleted, for a scheduled card and an early ask alike. Every other stop may
+ * follow deletions and must be reported.
+ */
+const DENIALS = new Set(["policy_denied", "approval_required"]);
+export const beforeDeletion = (code: string): boolean => DENIALS.has(code);
+const DENIAL_WHYS = new Set([...DENIALS].map((c) => STOP_WORDS[c]));
 
 /** The fields of `@devos/teardown`'s TeardownError the job reads. */
 const teardownStop = (e: unknown): { code: string; retryable: boolean } | null => {
@@ -316,7 +339,7 @@ export class TeardownSweepJob {
    * dedupes a pending twin). In memory: after a restart the daily run raises a fresh purge card instead, which still
    * needs KK's approval before anything more is deleted.
    */
-  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string; due: string | null }>();
+  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string; due: string | null; at: number }>();
   /** Decision 39: the tail of the queued stop deliveries (one pass at a time). */
   private deliveryChain: Promise<void> = Promise.resolve();
   /** Decision 26: where each action's cleanup scan resumes on the next tick (the last card id read at the bound). */
@@ -593,7 +616,7 @@ export class TeardownSweepJob {
       // Decision 35 (Codex PR240-r31): only the purge's authorizer check (`policy_denied` or `approval_required`, thrown
       // by purgeProject's `check` before any resource is read or deleted) proves no deletion ran. Any other stop (e.g.
       // `ownership_mismatch` after a resource was deleted) is always reported, even if Keep archived moved the date.
-      const denied = stop.code === "policy_denied" || stop.code === "approval_required";
+      const denied = beforeDeletion(stop.code);
       if (denied && due !== null && due !== (now.purgeAfter?.toISOString() ?? null)) {
         this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, approvalId, code: "purge-card-not-due" });
         return;
@@ -628,13 +651,14 @@ export class TeardownSweepJob {
     const owed = this.stopsOwed.get(p.id);
     if (owed?.p.archivedAt && (!p.archivedAt || p.archivedAt.getTime() < owed.p.archivedAt.getTime())) {
       this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "archive-superseded" });
-    } else if (owed && owed.due === null && due !== null && owed.p.archivedAt?.getTime() === p.archivedAt?.getTime()) {
-      // Decision 40 (Codex PR240-r36): a stop that delivery may still drop (a scheduled card's denial before any
-      // deletion, decision 35) never replaces an owed stop for the same archive that must be reported (one after
-      // deletions ran, or any stop without a due date). The owed one stays and is delivered; the denial deleted nothing.
+    } else if (owed && !beforeDeletion(owed.code) && beforeDeletion(code) && owed.p.archivedAt?.getTime() === p.archivedAt?.getTime()) {
+      // Decision 40 (Codex PR240-r36): a denial before any deletion (decision 35) never replaces an owed stop for the
+      // same archive that must be reported (one that may follow deletions). The owed one stays and is delivered; the
+      // denial deleted nothing. Decision 42 (Codex PR240-r38): this keys on the stop's code, not on a due date, so an
+      // early ask's denial (which carries no due date) is held back too.
       this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "stop-owed-kept" });
     } else {
-      this.stopsOwed.set(p.id, { p, code, due });
+      this.stopsOwed.set(p.id, { p, code, due, at: this.now() });
     }
     await this.deliverStops();
   }
@@ -670,7 +694,7 @@ export class TeardownSweepJob {
           this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "purge-card-not-due" });
           continue;
         }
-        const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id));
+        const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id), new Date(o.at));
         // Decision 19 (Codex PR240-r15): the store dedupes on action and target, so it can hand back a pending twin from
         // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
         // read proved the archive has moved on from it) and the stop is raised again; if a twin of another archive still
@@ -707,9 +731,22 @@ export class TeardownSweepJob {
           // 35) never supersedes a pending stop for this same archive. That card may be the report of a purge that
           // stopped after deleting (decision 40 protects it only while it is owed), and the denial deleted nothing, so
           // the pending card stands and the denial is dropped.
-          if (sameArchiveTwin && o.due !== null) {
+          // Decision 42 (Codex PR240-r38): keyed on the stop's code (an early ask's denial carries no due date), and
+          // only a pending card that may report deletions is kept; a pending denial is superseded as before.
+          const twinWhy = stopWhy((raised as { reason: string }).reason);
+          if (sameArchiveTwin && beforeDeletion(o.code) && !(twinWhy !== null && DENIAL_WHYS.has(twinWhy))) {
             this.dropOwed(id, o);
             this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-pending-kept" });
+            continue;
+          }
+          // Decision 42 (Codex PR240-r38): `stopsOwed` and the delivery chain are local to one sweep instance. A
+          // same-archive twin stamped with a stop at or after this one's is a newer failure (perhaps delivered by
+          // another instance while this delivery paused), so this older stop drops itself and never expires it. A
+          // twin without the stamp predates it and counts as older.
+          const twinAt = stopAt((raised as { reason: string }).reason);
+          if (sameArchiveTwin && twinAt !== null && twinAt >= o.at) {
+            this.dropOwed(id, o);
+            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
             continue;
           }
           if (!sameArchiveTwin && !twinOlder(raised, o.p)) {

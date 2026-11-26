@@ -10,7 +10,7 @@ import { Approvals, MemoryApprovalStore, parseCard, EXPIRE_IDS_MAX } from "../di
 import {
   TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
-  cardArchive, cardDue, stopWhy, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
+  cardArchive, cardDue, stopWhy, stopAt, beforeDeletion, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
 } from "../dist/teardown-sweep.js";
 import { buildTeardownSweep, purgeCardAuthorizer } from "../dist/teardown-runtime.js";
 
@@ -1970,6 +1970,80 @@ test("M2.5-b5 decision 41 (Codex PR240-r37): a droppable denial never supersedes
   s.advance(60_000);
   await s.job.tick();
   assert.equal((await s.approvals.store.get(report.id)).status, "pending");
+});
+
+test("M2.5-b5 decision 42 (Codex PR240-r38): an early ask's denial (no due date) never replaces an owed report of a partial purge", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch");
+  s.advance(60_000);
+  await s.job.raiseStopped({ ...p }, "policy_denied");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-owed-kept"));
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+});
+
+test("M2.5-b5 decision 42 (Codex PR240-r38): an early ask's denial (no due date) never supersedes a pending report of a partial purge", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch");
+  const [report] = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  s.advance(60_000);
+  await s.job.raiseStopped({ ...p }, "approval_required");
+  assert.equal((await s.approvals.store.get(report.id)).status, "pending");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-pending-kept"));
+});
+
+test("M2.5-b5 decision 42 (Codex PR240-r38): a newer denial still supersedes a pending older denial of the same archive", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  await s.job.raiseStopped({ ...p }, "approval_required");
+  const [old] = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  s.advance(60_000);
+  await s.job.raiseStopped({ ...p }, "policy_denied");
+  assert.equal((await s.approvals.store.get(old.id)).status, "expired");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), "a DevOS rule does not allow this purge");
+});
+
+test("M2.5-b5 decision 42 (Codex PR240-r38): an older delivery never expires a newer failure's card that another sweep instance raised", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "leftover");
+  const olderAt = s.now();
+  const counts = s.job.d.activeCounts;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let paused = false;
+  s.job.d.activeCounts = async (id) => { paused = true; await gate; return counts(id); };
+  // The older delivery pauses after its archive read; another instance raises a newer failure's card meanwhile.
+  const tick = s.job.tick();
+  while (!paused) await new Promise((r) => setImmediate(r));
+  s.advance(60_000);
+  const newer = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "ownership_mismatch", { github: 1 }, new Date(s.now())));
+  release();
+  await tick;
+  s.job.d.activeCounts = counts;
+  assert.ok(stopAt(newer.reason) > olderAt);
+  assert.equal((await s.approvals.store.get(newer.id)).status, "pending", "the newer failure's card is kept");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1, "the older failure is not raised over it");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-superseded"));
+});
+
+test("M2.5-b5 decision 42 (Codex PR240-r38): a stop card stamps when it stopped before its archive stamp; denials are the authorizer's codes", () => {
+  const at = new Date("2026-11-26T00:10:00.000Z");
+  const archivedAt = new Date("2026-10-01T00:00:00.000Z");
+  const c = purgeStoppedCard({ id: P, slug: "acme", archivedAt }, "leftover", { github: 1 }, at);
+  assert.equal(stopAt(c.reason), at.getTime());
+  assert.equal(cardArchive(c), archivedAt.toISOString());
+  assert.equal(stopAt(purgeStoppedCard({ id: P, slug: "acme", archivedAt }, "leftover", {}).reason), null);
+  assert.equal(stopAt(purgeStoppedCard({ id: P, slug: "acme", archivedAt: null }, "leftover", {}, at).reason), at.getTime());
+  assert.deepEqual(["policy_denied", "approval_required", "ownership_mismatch", "leftover"].map(beforeDeletion), [true, true, false, false]);
 });
 
 test("M2.5-b5 decision 40 (Codex PR240-r36): a stop that must be reported still replaces an owed droppable denial", async () => {
