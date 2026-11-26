@@ -91,8 +91,20 @@ const dueMoved = (c: { reason?: string | null }, p: { purgeAfter: Date | null })
  * project is due carries the stamp: the daily run's, and (decision 59) an early ask's made after that date. A card with
  * no stamp is an early ask made before the date, which by design leaves `purge_after` as it is.
  */
-const forThisDue = (c: { reason?: string | null }, p: { purgeAfter: Date | null }): boolean =>
-  !!p.purgeAfter && cardDue(c) === p.purgeAfter.toISOString();
+const forThisDue = (c: { createdAt?: Date; reason?: string | null }, p: { purgeAfter: Date | null }): boolean =>
+  !!p.purgeAfter && (cardDue(c) === p.purgeAfter.toISOString() || (legacyCard(c) && legacyAtOrAfter(c, p.purgeAfter)));
+
+/**
+ * Decision 61 (Codex PR240-r56 finding 1): a card raised by the code on main before decision 8 carries no `Archive`
+ * stamp. Such cards can be pending, approved or rejected on the server when this change is deployed, and none is ever
+ * written again (every card raised for an archived row now names its archive). They keep the rule they were raised
+ * under, the base's creation-time rule: a card raised at or after `archived_at` is this archive's, and one raised at or
+ * after `purge_after` is that date's. So a deploy never closes an unanswered card, strands an approved purge or drops a
+ * Keep archived. A card with no creation time (a twin read back without one) is never taken as current.
+ */
+const legacyCard = (c: { reason?: string | null }): boolean => cardArchive(c) === null;
+const legacyAtOrAfter = (c: { createdAt?: Date }, at: Date): boolean =>
+  c.createdAt instanceof Date && c.createdAt.getTime() >= at.getTime();
 
 /**
  * A card belongs to the project's current archive only if (decision 8) it names that same archive, so a card built
@@ -101,12 +113,12 @@ const forThisDue = (c: { reason?: string | null }, p: { purgeAfter: Date | null 
  * so with skew a card correctly built from this archive could look older than it; the stamp, copied from a read of
  * this very archive, already proves which archive the card was built for.
  */
-const raisedThisArchive = (c: { reason?: string | null }, p: TeardownProject): boolean =>
-  p.stage === "archived" && p.archivedAt !== null && cardArchive(c) === p.archivedAt.toISOString();
+const raisedThisArchive = (c: { createdAt?: Date; reason?: string | null }, p: TeardownProject): boolean =>
+  p.stage === "archived" && p.archivedAt !== null &&
+  (cardArchive(c) === p.archivedAt.toISOString() || (legacyCard(c) && legacyAtOrAfter(c, p.archivedAt)));
 
 /** Decision 53 (Codex PR240-r49): a stop card names the current archive by its stamp (its creation time is not compared). */
-const stopNamesArchive = (c: { reason?: string | null }, p: TeardownProject): boolean =>
-  p.stage === "archived" && p.archivedAt !== null && cardArchive(c) === p.archivedAt.toISOString();
+const stopNamesArchive = (c: { createdAt?: Date; reason?: string | null }, p: TeardownProject): boolean => raisedThisArchive(c, p);
 
 /**
  * Decision 31 (Codex PR240-r27): a card that can still purge: it names the current archive and, if scheduled, the
@@ -126,10 +138,11 @@ const keepApplies = (c: { createdAt: Date; reason?: string | null }, p: Teardown
  * Decision 13: a card of an archive older than the project's `archivedAt` in this read (its stamp names an earlier
  * archive), or an unstamped card from before decision 8, which never purges.
  */
-const olderArchive = (c: { reason?: string | null }, p: TeardownProject): boolean => {
+const olderArchive = (c: { createdAt?: Date; reason?: string | null }, p: TeardownProject): boolean => {
   if (!p.archivedAt) return false;
   const named = cardArchive(c);
-  return named === null || Date.parse(named) < p.archivedAt.getTime();
+  // Decision 61: a card from before decision 8 is older only if the base's time rule says so.
+  return named === null ? !legacyAtOrAfter(c, p.archivedAt) : Date.parse(named) < p.archivedAt.getTime();
 };
 
 /** Decision 19: the id of a stored card, or a throw (a stop stays owed). */
@@ -141,8 +154,10 @@ const stopId = (raised: unknown): string => {
 
 /** Decision 20: the stored twin names an archive older than `p`'s (or none, from before decision 18). */
 const twinOlder = (raised: unknown, p: TeardownProject): boolean => {
-  const reason = (raised as { reason?: unknown } | null)?.reason;
-  return typeof reason === "string" && olderArchive({ reason }, p);
+  const r = raised as { reason?: unknown; createdAt?: unknown } | null;
+  const reason = r?.reason;
+  const createdAt = r?.createdAt instanceof Date ? r.createdAt : undefined;
+  return typeof reason === "string" && olderArchive({ reason, createdAt }, p);
 };
 
 /** Decision 18: `b` (a fresh read) is still the archive `a` was read in. */
@@ -590,6 +605,19 @@ export class TeardownSweepJob {
       }
     }
     this.commitScan(KEEP_SCAN_KEY, scan.next);
+  }
+
+  /**
+   * Decision 62: Keep archived for a card the ask raised once the project was due but wrote without the date. Called
+   * under the ask's lifecycle lock; the row is read again and must still be this archive with this purge date.
+   */
+  private async keepRaisedDue(c: PurgeCardLike, p: TeardownProject): Promise<boolean> {
+    const now = await this.d.project(p.id);
+    if (!sameArchive(p, now) || !now!.purgeAfter || now!.purgeAfter.getTime() !== p.purgeAfter?.getTime() || !raisedThisArchive(c, now!)) return false;
+    const from = now!.purgeAfter;
+    const base = Math.max(from.getTime(), (c.decidedAt ?? c.createdAt).getTime());
+    await this.d.lockHeld?.(p.id);
+    return this.d.keepArchived(p.id, from, new Date(base + KEEP_ARCHIVED_MS), c.id, now!.archivedAt!);
   }
 
   private async keepLocked(c: PurgeCardLike, projectId: string): Promise<boolean> {
@@ -1177,11 +1205,20 @@ export class TeardownSweepJob {
     const dueAt = (): Date | null => (p.purgeAfter && p.purgeAfter.getTime() <= this.now() ? p.purgeAfter : null);
     const due = dueAt();
     let card = await this.raiseFenced(p, purgeCard(p, counts, { due }));
+    // Decision 62 (Codex PR240-r56 finding 2): the card is looked up whatever its status. KK is notified as the raise
+    // commits, so he may already have answered it, and the approval decision does not take the project lock.
     const written = !due && dueAt()
-      ? (await this.d.cards({ status: "pending", action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).find((c) => c.id === card.id)
+      ? (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).find((c) => c.id === card.id)
       : undefined;
-    // Only an unstamped card is replaced (a deduplicated twin that already names the date is kept, decision 11).
-    if (written && cardDue(written) === null) {
+    // A card raised once the project was due that KK has already rejected is his Keep archived for this date: the
+    // 30-day move is applied here (it names no date, so Keep archived's pass would skip it), and nothing is re-raised.
+    if (written && written.status === "rejected" && cardDue(written) === null) {
+      if (await this.keepRaisedDue(written, p)) this.d.log({ level: "info", msg: "teardown-keep-archived", projectId: p.id, approvalId: written.id });
+      return { ok: true, approvalId: card.id, raised: true };
+    }
+    // Only an unstamped pending card is replaced (a deduplicated twin that already names the date is kept, decision
+    // 11). An approved one purges as an early ask does (no date to move, so `liveCard` keeps it).
+    if (written && written.status === "pending" && cardDue(written) === null) {
       // If this raise then fails, KK's ask fails and nothing unstamped is left pending; the daily run raises the card.
       await this.d.lockHeld?.(p.id);
       await this.d.expire([card.id], "purge-card-now-due");

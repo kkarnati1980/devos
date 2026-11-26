@@ -255,6 +255,72 @@ test("decision 60 (Codex PR240-r55 2): a same-archive stop replacing an owed one
   assert.equal(o.at, T0 + 5000, "the stamp never moves backward");
 });
 
+// A card raised by main's code before decision 8: the same words, no Archive (or Due) stamp.
+const legacyPurgeCard = (s) => purgeCard({ ...s.projects.get(P), archivedAt: null }, { github: 2 });
+const legacyStopCard = (s) => purgeStoppedCard({ ...s.projects.get(P), archivedAt: null }, "ownership_mismatch", { github: 2 });
+
+test("decision 61 (Codex PR240-r56 1): a pending or approved card from before the stamp keeps working after the deploy", async () => {
+  const s = setup();
+  const legacy = await s.approvals.raiseCard(legacyPurgeCard(s));
+  assert.equal(cardArchive(legacy), null);
+  await s.job.tick();
+  assert.equal((await s.store.get(legacy.id)).status, "pending", "cleanup leaves the unanswered card alone");
+  assert.equal((await s.purgeCards("pending")).length, 1, "and no second card is raised");
+  await approve(s, legacy.id);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 1, "the approval KK gave before the deploy purges");
+  assert.equal(s.calls.providerCalls, 1, "its authorizer allows it");
+  assert.equal(s.projects.get(P).stage, "purged");
+  // A card from an earlier archive (raised before archived_at) is still stale.
+  const s2 = setup();
+  const old = await s2.approvals.raiseCard(legacyPurgeCard(s2));
+  s2.projects.get(P).archivedAt = new Date(T0 + 1000);
+  s2.projects.get(P).purgeAfter = new Date(T0 + 1000);
+  s2.advance(2000);
+  await s2.job.tick();
+  assert.equal((await s2.store.get(old.id)).status, "expired");
+});
+
+test("decision 61 (Codex PR240-r56 1): Keep archived on a card from before the stamp moves the date once; its stop card stays open", async () => {
+  const s = setup();
+  const legacy = await s.approvals.raiseCard(legacyPurgeCard(s));
+  await s.approvals.reject(s.session, legacy.id);
+  const from = s.projects.get(P).purgeAfter.getTime();
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1);
+  assert.equal(s.projects.get(P).purgeAfter.getTime(), Math.max(from, T0) + KEEP_ARCHIVED_MS);
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1, "once");
+  assert.equal((await s.purgeCards("pending")).length, 0, "no card is raised for the moved date yet");
+  // An unstamped stop card of the current archive is not closed, and it holds back a new purge card.
+  const s2 = setup();
+  const stop = await s2.approvals.raiseCard(legacyStopCard(s2));
+  await s2.job.tick();
+  assert.equal((await s2.store.get(stop.id)).status, "pending");
+  assert.equal((await s2.purgeCards("pending")).length, 0);
+});
+
+test("decision 62 (Codex PR240-r56 2): a card raised as the date passes that KK rejects before the repair is his Keep archived", async () => {
+  const s = setup();
+  s.projects.get(P).purgeAfter = new Date(T0 + 500);
+  const raise = s.store.raise.bind(s.store);
+  let first = true;
+  s.store.raise = async (...a) => {
+    const out = await raise(...a);
+    if (first) { first = false; s.advance(1000); await s.approvals.reject(s.session, out.card?.id ?? out.id); }
+    return out;
+  };
+  const r = await s.job.askPurge(P);
+  assert.equal(r.ok, true);
+  assert.equal((await s.store.get(r.approvalId)).status, "rejected");
+  assert.equal(s.calls.keep.length, 1, "the rejection moved the purge date");
+  assert.equal(s.projects.get(P).purgeAfter.getTime(), T0 + 1000 + KEEP_ARCHIVED_MS);
+  assert.equal((await s.purgeCards("pending")).length, 0, "nothing re-raised");
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1);
+  assert.equal((await s.purgeCards("pending")).length, 0, "the daily run does not ask again");
+});
+
 test("decision 1: the job itself expires an unanswered card after 7 days and re-raises it once, then nothing happens (Codex PR181-r2)", async () => {
   const s = setup();
   await s.job.tick();

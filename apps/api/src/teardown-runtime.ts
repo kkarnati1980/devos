@@ -134,7 +134,10 @@ export function purgeCardAuthorizer(
     // M2.5-b5 decision 8 (Codex PR240-r4): re-read under the project lock, the card must name this very archive.
     // Decision 56 (Codex PR240-r52): the stamp alone binds the card; its app-clock creation time is not compared with
     // the database's `archived_at`, so clock skew never denies a card built from this archive.
-    if (!since || card.archive !== since.toISOString()) return "deny";
+    // Decision 61 (Codex PR240-r56 finding 1): a card from before decision 8 (no stamp) keeps the base's rule, raised at
+    // or after `archived_at`, so an approval KK gave before the deploy still purges its own archive.
+    const legacyOk = card.archive === null && card.createdAt instanceof Date && card.createdAt.getTime() >= (since?.getTime() ?? Infinity);
+    if (!since || (card.archive !== since.toISOString() && !legacyOk)) return "deny";
     // M2.5-b5 decision 30 (Codex PR240-r26): a scheduled card purges only while its purge date is still the project's.
     if (card.due) {
       const due = purgeAfter ? await purgeAfter() : null;
