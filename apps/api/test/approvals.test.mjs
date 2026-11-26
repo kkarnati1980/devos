@@ -528,3 +528,41 @@ test("DEVOS-190 list filters by gate, action and target, newest first, paged by 
   await approvals.reject(session, other.id, "no");
   assert.deepEqual(ids(await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", status: "rejected", limit: 10 })), [a2.id]);
 });
+
+test("M2.5-b5 decision 51: supersedeCard expires the pending card, raises the replacement and notifies once", async () => {
+  const sent = [];
+  const { approvals, store } = setup({ notifier: { notify: async (n) => sent.push(n) } });
+  const old = await approvals.raiseCard(card());
+  const next = await approvals.supersedeCard(old.id, card({ reason: "Second report" }), "stop-card-superseded");
+  assert.notEqual(next.id, old.id);
+  assert.equal((await store.get(old.id)).status, "expired");
+  assert.equal((await store.get(next.id)).reason, "Second report");
+  assert.equal(sent.length, 2, "the first raise and the replacement each notify once");
+  assert.ok(store.audit.some((a) => a.action === "approval.expired" && a.details.approvalId === old.id && a.details.reason === "stop-card-superseded"));
+});
+
+test("M2.5-b5 decision 51: supersedeCard checks the id, the reason and the card before writing anything", async () => {
+  const { approvals, store } = setup();
+  const old = await approvals.raiseCard(card());
+  const before = store.audit.length;
+  await assert.rejects(approvals.supersedeCard("not-a-uuid", card(), "r"), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  await assert.rejects(approvals.supersedeCard(old.id, card(), ""), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  await assert.rejects(approvals.supersedeCard(old.id, card({ target: "" }), "r"), (e) => e instanceof ApprovalError);
+  assert.equal((await store.get(old.id)).status, "pending");
+  assert.equal(store.audit.length, before);
+});
+
+test("M2.5-b5 decision 55 (Codex PR240-r51): a status-filtered page resumes after a cursor card whose status has since changed, as in Postgres", async () => {
+  const { approvals, store, session } = setup();
+  const mk = (n) => approvals.raiseCard(card({ action: "question.a", target: `req:${n}` }), []);
+  const c1 = await mk(1);
+  const c2 = await mk(2);
+  const c3 = await mk(3);
+  const p1 = await store.list({ projectId: PROJECT, status: "pending", action: "question.a", limit: 2 });
+  assert.deepEqual(p1.map((c) => c.id), [c3.id, c2.id]);
+  // The caller decides the last card of the page (as the sweep's cleanup expires it) before reading the next page.
+  await approvals.reject(session, c2.id);
+  const p2 = await store.list({ projectId: PROJECT, status: "pending", action: "question.a", limit: 2, cursor: c2.id });
+  assert.deepEqual(p2.map((c) => c.id), [c1.id], "the next page still holds the older pending card");
+  assert.deepEqual(await store.list({ projectId: PROJECT, status: "pending", limit: 2, cursor: "99999999-9999-4999-8999-999999999999" }), [], "an unknown cursor still reads nothing");
+});

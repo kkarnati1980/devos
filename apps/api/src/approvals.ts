@@ -159,6 +159,12 @@ export interface ApprovalStore {
    * concurrent `decide` on the same row, so a card is either decided or expired, never both. Returns the ids expired.
    */
   expireIds(ids: readonly string[], at: Date, reason: string): Promise<string[]>;
+  /**
+   * M2.5-b5 decision 51 (Codex PR240-r47): in one transaction, expire `oldId` if it is still pending (as `expireIds`,
+   * `reason` in the audit details) and raise `input` (as `raise`, with no blockers). Both commit or neither does, so a
+   * pending card is never replaced by nothing when the process stops between the two writes.
+   */
+  supersede(oldId: string, input: CardInput, audit: AuditEntry, now: Date, reason: string): Promise<{ card: Card; created: boolean }>;
   /** One audit_event outside any decision (e.g. a grant that could not be revoked). */
   recordAudit(a: AuditEntry): Promise<void>;
 }
@@ -502,6 +508,35 @@ export class Approvals {
     if (!unique.length) return [];
     return this.deps.store.expireIds(unique, new Date(this.now()), why);
   }
+
+  /**
+   * M2.5-b5 decision 51 (Codex PR240-r47): expire one pending card and raise its replacement atomically (the store's
+   * `supersede`); the input and reason are checked as `raiseCard` and `expireCardsById` check them, and a new card is
+   * notified once, as `raiseCard` does.
+   */
+  async supersedeCard(oldId: string, input: unknown, reason: string): Promise<Card> {
+    if (typeof oldId !== "string" || !UUID.test(oldId)) throw new ApprovalError("invalid-input");
+    const why = text(reason, EXPIRE_REASON_MAX, false);
+    if (!why) throw new ApprovalError("invalid-input");
+    if (looksSecret(why)) throw new ApprovalError("card-contains-secret");
+    const card = parseCard(input);
+    if (typeof card === "string") throw new ApprovalError(card);
+    const audit = { action: "approval.raised", summary: `Decision card: ${card.action}`, details: { gate: card.gate, blocks: 0, supersedes: oldId.toLowerCase() } };
+    const { card: stored, created } = await this.deps.store.supersede(oldId.toLowerCase(), card, audit, new Date(this.now()), why);
+    if (created && this.deps.notifier) {
+      await this.deps.notifier
+        .notify({
+          kind: "approval",
+          title: stored.action.slice(0, 120),
+          body: `${stored.target}\n\n${stored.reason}`.slice(0, 2000),
+          reasons: [`Gate: ${stored.gate}`],
+          projectId: stored.projectId,
+          approvalId: stored.id,
+        })
+        .catch(() => undefined);
+    }
+    return stored;
+  }
 }
 
 /** In-memory store for tests and local runs: same semantics as the Postgres store, serialised by a promise lock. */
@@ -536,7 +571,29 @@ export class MemoryApprovalStore implements ApprovalStore {
   }
 
   raise(input: CardInput, blocks: readonly string[], audit: AuditEntry, now: Date) {
+    return this.serial(() => this.raiseNow(input, blocks, audit, now));
+  }
+
+  supersede(oldId: string, input: CardInput, audit: AuditEntry, now: Date, reason: string) {
+    // One serialised step: nothing else runs between the expiry and the raise (decision 51).
+    // A raise that throws undoes the expiry, as the Postgres transaction rolls back.
     return this.serial(() => {
+      const old = this.cards.get(oldId);
+      const before = old ? { status: old.status, decidedAt: old.decidedAt, decidedBy: old.decidedBy } : null;
+      const audits = this.audit.length;
+      this.expireNow([oldId], now, reason);
+      try {
+        return this.raiseNow(input, [], audit, now);
+      } catch (e) {
+        if (old && before) Object.assign(old, before);
+        this.audit.length = audits;
+        throw e;
+      }
+    });
+  }
+
+  private raiseNow(input: CardInput, blocks: readonly string[], audit: AuditEntry, now: Date) {
+    {
       for (const t of blocks) if (!this.tasks.has(t)) throw new ApprovalError("task-not-found", 404);
       if (input.projectId && blocks.some((t) => (this.tasks.get(t)?.projectId ?? null) !== input.projectId)) {
         throw new ApprovalError("task-other-project", 409);
@@ -570,7 +627,7 @@ export class MemoryApprovalStore implements ApprovalStore {
       }
       this.audit.push(audit);
       return { card: { ...card }, created };
-    });
+    }
   }
 
   async get(id: string) {
@@ -580,15 +637,17 @@ export class MemoryApprovalStore implements ApprovalStore {
 
   async list(f: ListFilter) {
     let all = [...this.cards.values()].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : -1));
+    // Decision 55 (Codex PR240-r51): as in the Postgres store, the cursor is found before any filter, so a page resumes
+    // after a card whose status changed since (e.g. one the caller has just expired) instead of returning nothing.
+    if (f.cursor) {
+      const i = all.findIndex((c) => c.id === f.cursor);
+      all = i < 0 ? [] : all.slice(i + 1);
+    }
     if (f.status) all = all.filter((c) => c.status === f.status);
     if (f.projectId) all = all.filter((c) => c.projectId === f.projectId);
     if (f.gate) all = all.filter((c) => c.gate === f.gate);
     if (f.action !== undefined) all = all.filter((c) => c.action === f.action);
     if (f.target !== undefined) all = all.filter((c) => c.target === f.target);
-    if (f.cursor) {
-      const i = all.findIndex((c) => c.id === f.cursor);
-      all = i < 0 ? [] : all.slice(i + 1);
-    }
     return all.slice(0, f.limit).map((c) => ({ ...c }));
   }
 
@@ -652,7 +711,11 @@ export class MemoryApprovalStore implements ApprovalStore {
   }
 
   expireIds(ids: readonly string[], at: Date, reason: string) {
-    return this.serial(() => {
+    return this.serial(() => this.expireNow(ids, at, reason));
+  }
+
+  private expireNow(ids: readonly string[], at: Date, reason: string) {
+    {
       const out: string[] = [];
       for (const id of [...new Set(ids)].sort()) {
         const c = this.cards.get(id);
@@ -664,7 +727,7 @@ export class MemoryApprovalStore implements ApprovalStore {
         this.audit.push({ action: "approval.expired", summary: `Expired: ${c.action}`, details: { gate: c.gate, approvalId: id, reason } });
       }
       return out;
-    });
+    }
   }
 }
 
@@ -686,6 +749,11 @@ function toCard(r: any): Card {
     confirmationHash: r.confirmationHash ?? null,
     createdAt: r.createdAt,
   };
+}
+
+/** The advisory-lock key a raise takes, so two raises of one gate, action and target serialise (decision 51 reuses it). */
+function raiseKey(input: CardInput): string {
+  return `devos:approval:${input.projectId ?? "-"}:${input.gate}:${input.action}:${input.target}`;
 }
 
 async function audit(tx: any, a: AuditEntry, projectId: string | null): Promise<void> {
@@ -732,10 +800,23 @@ export class PrismaApprovalStore implements ApprovalStore {
   }
 
   raise(input: CardInput, blocks: readonly string[], a: AuditEntry, now: Date) {
+    return this.tx((tx) => this.raiseIn(tx, input, blocks, a, now));
+  }
+
+  supersede(oldId: string, input: CardInput, a: AuditEntry, now: Date, reason: string) {
     return this.tx(async (tx) => {
+      // Decision 51: the raise's advisory lock is taken first (it is re-entrant within the transaction), so this keeps
+      // the order a plain raise uses (advisory lock, then the twin row) and cannot deadlock against one.
+      await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${raiseKey(input)}))) AS l`;
+      await this.expireIn(tx, [oldId], now, reason);
+      return this.raiseIn(tx, input, [], a, now);
+    });
+  }
+
+  private async raiseIn(tx: any, input: CardInput, blocks: readonly string[], a: AuditEntry, now: Date) {
+    {
       const projectId = input.projectId ?? null;
-      const key = `devos:approval:${projectId ?? "-"}:${input.gate}:${input.action}:${input.target}`;
-      await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${key}))) AS l`;
+      await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${raiseKey(input)}))) AS l`;
       const ids = [...new Set(blocks)];
       if (ids.length) {
         const found = await tx.task.findMany({ where: { id: { in: ids } }, select: { id: true, projectId: true } });
@@ -778,7 +859,7 @@ export class PrismaApprovalStore implements ApprovalStore {
       }
       await audit(tx, { ...a, details: { ...a.details, approvalId: row.id } }, projectId);
       return { card: toCard(row), created };
-    });
+    }
   }
 
   get(id: string) {
@@ -891,8 +972,12 @@ export class PrismaApprovalStore implements ApprovalStore {
   }
 
   expireIds(ids: readonly string[], at: Date, reason: string) {
+    return this.tx((tx) => this.expireIn(tx, ids, at, reason));
+  }
+
+  private async expireIn(tx: any, ids: readonly string[], at: Date, reason: string): Promise<string[]> {
     const sorted = [...new Set(ids)].sort();
-    return this.tx(async (tx) => {
+    {
       // FOR UPDATE (not SKIP LOCKED) in id order: a concurrent decide on one of these rows finishes first, and the
       // WHERE is re-checked on the committed row, so a card it approved or rejected is not selected here.
       const rows: { id: string; action: string; gate: string; projectId: string | null }[] = await tx.$queryRaw`
@@ -913,6 +998,6 @@ export class PrismaApprovalStore implements ApprovalStore {
         })),
       });
       return out;
-    });
+    }
   }
 }
