@@ -820,6 +820,11 @@ export class TeardownSweepJob {
         // expired, so a replacement raise that fails is retried with them (the expired twin is no longer returned).
         o.also = [...new Set([...o.also, ...stopWhys(twinReason)])];
         o.at = Math.max(o.at, twinAt ?? 0);
+        // Decision 50 (Codex PR240-r46): a pending stop card carries no due date, so the twin may be an early ask's
+        // denial, whose delivery never depended on the scheduled date. The merged entry therefore keeps no due date:
+        // if the replacement raise fails and Keep archived then moves the date, the next tick still delivers every
+        // merged failure instead of dropping them with the scheduled denial (decisions 47 and 49).
+        o.due = null;
         card = purgeStoppedCard(o.p, o.code, counts, new Date(o.at), o.also);
       }
       if (!sameArchiveTwin && !twinOlder(raised, o.p)) {

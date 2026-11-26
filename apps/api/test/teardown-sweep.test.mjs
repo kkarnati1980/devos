@@ -2271,3 +2271,23 @@ test("M2.5-b5 decision 49 (Codex PR240-r45): a scheduled denial that replaces an
   assert.equal(pending.length, 1, "the merged stop is still delivered");
   assert.ok(stopWhys(pending[0].reason).includes(stopWhy(purgeStoppedCard(p, "approval_required", {}).reason)), "the early ask's denial is kept");
 });
+
+test("M2.5-b5 decision 50 (Codex PR240-r46): a scheduled denial that absorbs a pending early-ask denial keeps both when the replacement raise fails and the date moves", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  await s.job.raiseStopped({ ...p }, "approval_required"); // early ask: pending card, no due date
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 1);
+  s.advance(60_000);
+  const raise = s.job.d.raise;
+  let n = 0;
+  s.job.d.raise = (c) => (++n === 2 ? Promise.reject(new Error("db blip")) : raise(c)); // the replacement raise fails
+  await s.job.raiseStopped({ ...p }, "policy_denied", p.purgeAfter.toISOString()); // scheduled denial merges the twin
+  s.job.d.raise = raise;
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 0, "the twin was expired");
+  p.purgeAfter = new Date(p.purgeAfter.getTime() + 30 * DAY); // Keep archived moves the date
+  await s.job.tick();
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1, "the merged stop is still delivered");
+  const whys = stopWhys(pending[0].reason);
+  for (const code of ["policy_denied", "approval_required"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
+});
