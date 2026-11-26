@@ -222,6 +222,39 @@ test("decision 59 (Codex PR240-r54): an early ask made after the purge date name
   assert.equal(s2.calls.keep.length, 0);
 });
 
+test("decision 60 (Codex PR240-r55 1): an ask whose wait crosses the purge date still names it", async () => {
+  // The date passes while the ask reads the inventory counts.
+  const s = setup();
+  s.projects.get(P).purgeAfter = new Date(T0 + 500);
+  Object.defineProperty(s.counts, P, { get: () => { s.advance(1000); return { github: 2 }; } });
+  const r = await s.job.askPurge(P);
+  assert.equal(cardDue(s.store.cards.get(r.approvalId)), new Date(T0 + 500).toISOString());
+  // The date passes while the card is written: the unstamped card is replaced by one that names the date.
+  const s2 = setup();
+  s2.projects.get(P).purgeAfter = new Date(T0 + 500);
+  const raise = s2.store.raise.bind(s2.store);
+  let first = true;
+  s2.store.raise = async (...a) => { const out = await raise(...a); if (first) { first = false; s2.advance(1000); } return out; };
+  const r2 = await s2.job.askPurge(P);
+  assert.equal(r2.ok, true);
+  const pending = await s2.purgeCards("pending");
+  assert.deepEqual(pending.map((c) => c.id), [r2.approvalId]);
+  assert.equal(cardDue(pending[0]), new Date(T0 + 500).toISOString());
+  assert.equal((await s2.purgeCards("expired")).length, 1, "the unstamped card was expired");
+});
+
+test("decision 60 (Codex PR240-r55 2): a same-archive stop replacing an owed one keeps the later stamp", async () => {
+  const s = setup();
+  const p = { ...s.projects.get(P) };
+  s.failRaise.n = 10;
+  // An owed stop whose entry already carries a later stamp (copied from a twin, decision 47).
+  s.job.stopsOwed.set(P, { p, code: "ownership_mismatch", due: null, at: T0 + 5000, also: [] });
+  await s.job.raiseStopped(p, "provider_error");
+  const o = s.job.stopsOwed.get(P);
+  assert.equal(o.code, "provider_error");
+  assert.equal(o.at, T0 + 5000, "the stamp never moves backward");
+});
+
 test("decision 1: the job itself expires an unanswered card after 7 days and re-raises it once, then nothing happens (Codex PR181-r2)", async () => {
   const s = setup();
   await s.job.tick();

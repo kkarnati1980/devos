@@ -745,7 +745,10 @@ export class TeardownSweepJob {
       const also = merge ? [stopWords(owed.code), ...owed.also] : [];
       // Decision 49 (Codex PR240-r45): a merged entry keeps a due date (and so can be dropped when that date moves,
       // decision 34) only if every failure it carries had that same date; otherwise it is never dropped on a date move.
-      this.stopsOwed.set(p.id, { p, code, due: merge && owed.due !== due ? null : due, at: this.now(), also });
+      // Decision 60 (Codex PR240-r55 finding 2): a merged entry keeps the later of the two stamps (the owed one may
+      // already carry a later twin's stamp, decision 47), so the stored stamp never moves backward.
+      const at = merge ? Math.max(this.now(), owed.at) : this.now();
+      this.stopsOwed.set(p.id, { p, code, due: merge && owed.due !== due ? null : due, at, also });
     }
     await this.deliverStops();
   }
@@ -1164,13 +1167,27 @@ export class TeardownSweepJob {
     // never dedupes onto it and hands KK a card the authorizer would refuse.
     const notDue = pending.filter((c) => raisedThisArchive(c, p) && dueMoved(c, p));
     if (notDue.length) await this.d.expire(notDue.map((c) => c.id), "purge-card-not-due");
-    // Decision 59 (Codex PR240-r54): an ask made once the project is due (by this job's clock, the one `listDue` is
-    // given) names the purge date like a daily card, so Keep archived and the re-raise count match it by its stamp.
-    const due = p.purgeAfter && p.purgeAfter.getTime() <= this.now() ? p.purgeAfter : null;
-    const next = purgeCard(p, await this.d.activeCounts(p.id), { due });
+    const counts = await this.d.activeCounts(p.id);
     // Decision 4: the lock is still ours right before the write, or nothing is raised.
     await this.d.lockHeld?.(p.id);
-    const card = await this.raiseFenced(p, next);
+    // Decision 59 (Codex PR240-r54): an ask made once the project is due (by this job's clock, the one `listDue` is
+    // given) names the purge date like a daily card, so Keep archived and the re-raise count match it by its stamp.
+    // Decision 60 (Codex PR240-r55 finding 1): the clock is read after the last wait before the write, and again
+    // after it: an unstamped card written as the date passed is expired and raised again with the date.
+    const dueAt = (): Date | null => (p.purgeAfter && p.purgeAfter.getTime() <= this.now() ? p.purgeAfter : null);
+    const due = dueAt();
+    let card = await this.raiseFenced(p, purgeCard(p, counts, { due }));
+    const written = !due && dueAt()
+      ? (await this.d.cards({ status: "pending", action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).find((c) => c.id === card.id)
+      : undefined;
+    // Only an unstamped card is replaced (a deduplicated twin that already names the date is kept, decision 11).
+    if (written && cardDue(written) === null) {
+      // If this raise then fails, KK's ask fails and nothing unstamped is left pending; the daily run raises the card.
+      await this.d.lockHeld?.(p.id);
+      await this.d.expire([card.id], "purge-card-now-due");
+      await this.d.lockHeld?.(p.id);
+      card = await this.raiseFenced(p, purgeCard(p, counts, { due: dueAt() }));
+    }
     this.d.log({ level: "info", msg: "teardown-purge-asked", projectId: p.id, approvalId: card.id });
     return { ok: true, approvalId: card.id, raised: true };
   }
