@@ -91,8 +91,22 @@ const dueMoved = (c: { reason?: string | null }, p: { purgeAfter: Date | null })
  * project is due carries the stamp: the daily run's, and (decision 59) an early ask's made after that date. A card with
  * no stamp is an early ask made before the date, which by design leaves `purge_after` as it is.
  */
-const forThisDue = (c: { createdAt?: Date; reason?: string | null }, p: { purgeAfter: Date | null }): boolean =>
-  !!p.purgeAfter && (cardDue(c) === p.purgeAfter.toISOString() || (legacyCard(c) && legacyAtOrAfter(c, p.purgeAfter)));
+const forThisDue = (
+  c: { createdAt?: Date; reason?: string | null; status?: string; decidedAt?: Date | null },
+  p: { purgeAfter: Date | null },
+): boolean =>
+  !!p.purgeAfter &&
+  (cardDue(c) === p.purgeAfter.toISOString() || (legacyCard(c) && legacyAtOrAfter(c, p.purgeAfter)) || rejectedOnceDue(c, p.purgeAfter));
+
+/**
+ * Decision 64 (Codex PR240-r58): a card with no due stamp that KK rejected at or after the purge date. Decisions 62–63
+ * apply such a rejection in the ask itself, but a failed read, lock probe or write there leaves nothing to retry; so
+ * Keep archived and the re-raise count also take it as this date's. Rejecting it was KK's "keep archived for another
+ * 30 days", the card's own words, once the date had come. The move happens once: it sets `purge_after` past the
+ * decision time. A pending or approved card has no decision time, so it is never matched this way.
+ */
+const rejectedOnceDue = (c: { reason?: string | null; status?: string; decidedAt?: Date | null }, at: Date): boolean =>
+  c.status === "rejected" && cardDue(c) === null && !legacyCard(c) && c.decidedAt instanceof Date && c.decidedAt.getTime() >= at.getTime();
 
 /**
  * Decision 61 (Codex PR240-r56 finding 1): a card raised by the code on main before decision 8 carries no `Archive`

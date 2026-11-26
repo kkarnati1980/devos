@@ -342,6 +342,33 @@ test("decision 63 (Codex PR240-r57): KK rejecting the card between the repair's 
   assert.equal((await s.purgeCards("pending")).length, 0, "the daily run does not ask again");
 });
 
+test("decision 64 (Codex PR240-r58): a Keep archived the ask could not apply is applied by the next tick", async () => {
+  const s = setup();
+  s.projects.get(P).purgeAfter = new Date(T0 + 500);
+  const raise = s.store.raise.bind(s.store);
+  let first = true;
+  s.store.raise = async (...a) => {
+    const out = await raise(...a);
+    if (first) { first = false; s.advance(1000); await s.approvals.reject(s.session, out.card.id); }
+    return out;
+  };
+  const keep = s.job.d.keepArchived;
+  let failOnce = true;
+  s.job.d.keepArchived = async (...a) => { if (failOnce) { failOnce = false; throw new Error("db blip"); } return keep(...a); };
+  await s.job.askPurge(P).catch(() => undefined);
+  assert.equal(s.calls.keep.length, 0, "the ask's move failed");
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1, "the next tick applies it");
+  assert.equal((await s.purgeCards("pending")).length, 0, "and KK is not asked again");
+  // An early ask rejected before the date still leaves the date alone.
+  const s2 = setup();
+  s2.projects.get(P).purgeAfter = new Date(T0 + DAY);
+  const r = await s2.job.askPurge(P);
+  await s2.approvals.reject(s2.session, r.approvalId);
+  await s2.job.tick();
+  assert.equal(s2.calls.keep.length, 0);
+});
+
 test("decision 1: the job itself expires an unanswered card after 7 days and re-raises it once, then nothing happens (Codex PR181-r2)", async () => {
   const s = setup();
   await s.job.tick();
