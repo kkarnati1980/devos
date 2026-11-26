@@ -1221,7 +1221,18 @@ export class TeardownSweepJob {
     if (written && written.status === "pending" && cardDue(written) === null) {
       // If this raise then fails, KK's ask fails and nothing unstamped is left pending; the daily run raises the card.
       await this.d.lockHeld?.(p.id);
-      await this.d.expire([card.id], "purge-card-now-due");
+      const expired = await this.d.expire([card.id], "purge-card-now-due");
+      // Decision 63 (Codex PR240-r57): KK can answer the card between the read above and this expiry (the approval
+      // decision does not take the project lock); the expiry then skips it. The card is read again and handled by
+      // what he decided: a rejection is his Keep archived (decision 62), an approval purges; nothing is raised.
+      if (!expired.includes(card.id)) {
+        const now = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).find((c) => c.id === card.id);
+        if (now?.status === "pending") throw new Error("purge-card-not-expired");
+        if (now?.status === "rejected" && (await this.keepRaisedDue(now, p))) {
+          this.d.log({ level: "info", msg: "teardown-keep-archived", projectId: p.id, approvalId: now.id });
+        }
+        return { ok: true, approvalId: card.id, raised: true };
+      }
       await this.d.lockHeld?.(p.id);
       card = await this.raiseFenced(p, purgeCard(p, counts, { due: dueAt() }));
     }

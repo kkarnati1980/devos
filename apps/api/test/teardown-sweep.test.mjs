@@ -321,6 +321,27 @@ test("decision 62 (Codex PR240-r56 2): a card raised as the date passes that KK 
   assert.equal((await s.purgeCards("pending")).length, 0, "the daily run does not ask again");
 });
 
+test("decision 63 (Codex PR240-r57): KK rejecting the card between the repair's read and its expiry is still his Keep archived", async () => {
+  const s = setup();
+  s.projects.get(P).purgeAfter = new Date(T0 + 500);
+  const raise = s.store.raise.bind(s.store);
+  let first = true;
+  s.store.raise = async (...a) => { const out = await raise(...a); if (first) { first = false; s.advance(1000); } return out; };
+  const expireIds = s.store.expireIds.bind(s.store);
+  s.store.expireIds = async (ids, at, reason) => {
+    if (reason === "purge-card-now-due") for (const id of ids) await s.approvals.reject(s.session, id);
+    return expireIds(ids, at, reason);
+  };
+  const r = await s.job.askPurge(P);
+  assert.equal(r.ok, true);
+  assert.equal((await s.store.get(r.approvalId)).status, "rejected");
+  assert.equal(s.calls.keep.length, 1, "the rejection moved the purge date");
+  assert.equal((await s.purgeCards("pending")).length, 0, "no replacement card was raised");
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1);
+  assert.equal((await s.purgeCards("pending")).length, 0, "the daily run does not ask again");
+});
+
 test("decision 1: the job itself expires an unanswered card after 7 days and re-raises it once, then nothing happens (Codex PR181-r2)", async () => {
   const s = setup();
   await s.job.tick();
