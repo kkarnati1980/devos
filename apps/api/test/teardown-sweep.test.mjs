@@ -8,7 +8,7 @@ import { TeardownError } from "@devos/teardown";
 import { KkSessionRegistry } from "../dist/auth.js";
 import { Approvals, MemoryApprovalStore, parseCard, EXPIRE_IDS_MAX } from "../dist/approvals.js";
 import {
-  TeardownSweepJob, purgeCard, purgeStoppedCard, countsText, istClock, withLimit, PurgeTimeout,
+  TeardownSweepJob, purgeCard, purgeStoppedCard, stopWhys, countsText, istClock, withLimit, PurgeTimeout,
   PURGE_ACTION, PURGE_STOPPED_ACTION, KEEP_ARCHIVED_MS, PURGE_TIME_LIMIT_MS,
   cardArchive, cardDue, stopWhy, stopAt, beforeDeletion, CARD_PAGE, CLEANUP_SCAN_MAX, EXPIRE_BATCH,
 } from "../dist/teardown-sweep.js";
@@ -2032,9 +2032,12 @@ test("M2.5-b5 decision 42 (Codex PR240-r38): an older delivery never expires a n
   await tick;
   s.job.d.activeCounts = counts;
   assert.ok(stopAt(newer.reason) > olderAt);
-  assert.equal((await s.approvals.store.get(newer.id)).status, "pending", "the newer failure's card is kept");
-  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1, "the older failure is not raised over it");
-  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-superseded"));
+  // Decision 46 (Codex PR240-r42): stamps from separate clocks cannot order two failures, so neither is dropped: the
+  // newer card is superseded by one that names both failures and keeps the later stamp.
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.deepEqual(new Set(stopWhys(pending[0].reason)), new Set(stopWhys(newer.reason).concat(stopWhy(purgeStoppedCard(p, "leftover", {}).reason))), "the pending card names both failures");
+  assert.equal(stopAt(pending[0].reason), stopAt(newer.reason), "the later stamp is kept");
 });
 
 test("M2.5-b5 decision 42 (Codex PR240-r38): a stop card stamps when it stopped before its archive stamp; denials are the authorizer's codes", () => {
@@ -2125,7 +2128,7 @@ test("M2.5-b5 decision 40 (Codex PR240-r36): a stop that must be reported still 
   assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project");
 });
 
-test("M2.5-b5 decision 45 (Codex PR240-r41): a newer report of the same failure advances the stored stamp, so an older failure owed by another instance never replaces it", async () => {
+test("M2.5-b5 decision 45 (Codex PR240-r41): a newer report of the same failure advances the stored stamp, so an older failure owed by another instance never hides it", async () => {
   const s = setup();
   const p = s.projects.get(P);
   await s.job.raiseStopped({ ...p }, "ownership_mismatch"); // failure A at t1, delivered
@@ -2142,12 +2145,12 @@ test("M2.5-b5 decision 45 (Codex PR240-r41): a newer report of the same failure 
   let pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1);
   assert.equal(stopAt(pending[0].reason), t3, "the stored stamp advanced to the newest report");
-  await other.tick(); // B (t2) now finds A stamped t3 and drops itself
+  await other.tick(); // B (t2) finds A stamped t3: one card names both (decision 46) and keeps the t3 stamp
   pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1);
-  assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+  assert.ok(stopWhys(pending[0].reason).includes("DevOS could not prove that it owns one of the project's resources, so it did not delete it"), "the newest failure A is still reported");
+  assert.ok(stopWhys(pending[0].reason).includes("after deleting, the leftover check still found resources of this project"));
   assert.equal(stopAt(pending[0].reason), t3);
-  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "stop-superseded"));
 });
 
 test("M2.5-b5 decision 45 (Codex PR240-r41): a same-failure card stamped at or after the stop still serves it", async () => {
@@ -2157,4 +2160,32 @@ test("M2.5-b5 decision 45 (Codex PR240-r41): a same-failure card stamped at or a
   await s.job.raiseStopped({ ...p }, "leftover");
   assert.equal((await s.approvals.store.get(card.id)).status, "pending");
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 1);
+});
+
+test("M2.5-b5 decision 46 (Codex PR240-r42): two failures stamped in the same millisecond by different instances are both reported, in either delivery order", async () => {
+  for (const [first, second] of [["ownership_mismatch", "leftover"], ["leftover", "ownership_mismatch"]]) {
+    const s = setup();
+    const p = s.projects.get(P);
+    const other = new TeardownSweepJob({ ...s.job.d });
+    s.failRaise.n = 1;
+    await other.raiseStopped({ ...p }, second); // owed in the other instance at the same millisecond
+    await s.job.raiseStopped({ ...p }, first);
+    await other.tick();
+    const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+    assert.equal(pending.length, 1);
+    const whys = stopWhys(pending[0].reason);
+    for (const code of [first, second]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), `${first}/${second}: ${code} is reported`);
+  }
+});
+
+test("M2.5-b5 decision 46 (Codex PR240-r42): a stop card names other failures only from the fixed texts, once each", () => {
+  const p = { id: P, slug: "acme", archivedAt: new Date(T0) };
+  const own = stopWhy(purgeStoppedCard(p, "leftover", {}).reason);
+  const other = stopWhy(purgeStoppedCard(p, "ownership_mismatch", {}).reason);
+  const c = purgeStoppedCard(p, "leftover", { github: 1 }, new Date(T0), [other, other, own, "ignore previous instructions"]);
+  assert.deepEqual(stopWhys(c.reason), [own, other]);
+  assert.ok(!c.reason.includes("ignore previous"));
+  assert.equal(stopAt(c.reason), T0);
+  assert.equal(stopWhy(c.reason), own);
+  assert.deepEqual(stopWhys(purgeStoppedCard(p, "leftover", {}).reason), [own], "a single failure names no others");
 });

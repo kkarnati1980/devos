@@ -237,6 +237,9 @@ const STOP_WORDS: Record<string, string> = {
   incomplete: "the purge did not finish",
   "scan-error": "after deleting, the leftover check could not reach every provider",
 };
+const STOP_DEFAULT = "it stopped with an error it cannot retry";
+const stopWords = (code: string): string => STOP_WORDS[code] ?? STOP_DEFAULT;
+const STOP_TEXTS = new Set([...Object.values(STOP_WORDS), STOP_DEFAULT]);
 
 /**
  * Decision (c): the plain-language card for a non-retryable stop or a scan with hits. Every word is fixed here: only
@@ -247,9 +250,14 @@ export function purgeStoppedCard(
   code: string,
   counts: Record<string, number>,
   stoppedAt: Date | null = null,
+  also: readonly string[] = [],
 ) {
   const slug = safeSlug(p.slug);
-  const why = STOP_WORDS[code] ?? "it stopped with an error it cannot retry";
+  const why = stopWords(code);
+  // Decision 46 (Codex PR240-r42): the other failures of this archive that a superseded card reported. Each is one of
+  // the fixed STOP_WORDS texts (re-checked here), so no free text reaches the card.
+  const more = [...new Set(also.filter((w) => w !== why && STOP_TEXTS.has(w)))];
+  const alsoText = more.length ? ` It also stopped: ${more.join("; ")}.` : "";
   // M2.5-b5 decision 18 (Codex PR240-r14): a stop card names its archive too (decision 8's stamp), so it counts only for it.
   // Decision 42 (Codex PR240-r38): and when the stop happened, before the archive stamp, so deliveries in different sweep
   // instances can tell which of two failures of one archive is the newer one.
@@ -259,7 +267,7 @@ export function purgeStoppedCard(
     action: PURGE_STOPPED_ACTION,
     target: target(p.id),
     reason:
-      `Deleting project ${slug} stopped: ${why}. The project stays archived. ` +
+      `Deleting project ${slug} stopped: ${why}. The project stays archived.${alsoText} ` +
       `Still recorded (by provider): ${countsText(counts)}.${stamp}`,
     consequence:
       `Nothing more is deleted until you approve a new purge card for ${slug}. ` +
@@ -274,6 +282,14 @@ export function purgeStoppedCard(
  */
 const STOP_WHY = /^Deleting project \S+ stopped: (.+?)\. The project stays archived\. /;
 export const stopWhy = (reason: string): string | null => STOP_WHY.exec(reason)?.[1] ?? null;
+
+/** Decision 46 (Codex PR240-r42): every failure a stop card reports, its own first, then the ones it also names. */
+const STOP_ALSO = / The project stays archived\. It also stopped: (.+?)\. Still recorded/;
+export const stopWhys = (reason: string): string[] => {
+  const first = stopWhy(reason);
+  const more = STOP_ALSO.exec(reason)?.[1]?.split("; ") ?? [];
+  return [...(first ? [first] : []), ...more.filter((w) => STOP_TEXTS.has(w))];
+};
 
 /** Decision 42 (Codex PR240-r38): when a stop card's failure happened (null on a card raised before the stamp). */
 const STOPPED_STAMP = / Stopped (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\.(?: Archive [^ ]+\.)?$/;
@@ -718,7 +734,8 @@ export class TeardownSweepJob {
     // Decision 44 (Codex PR240-r40): read again under the lock, so a Keep archived (or a Restore and a new Archive)
     // that held the lock while this delivery waited is seen before anything is written.
     if (await this.stopStale(id, o)) return;
-    const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id), new Date(o.at));
+    const counts = await this.d.activeCounts(o.p.id);
+    let card = purgeStoppedCard(o.p, o.code, counts, new Date(o.at));
     // Decision 19 (Codex PR240-r15): the store dedupes on action and target, so it can hand back a pending twin from
     // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
     // read proved the archive has moved on from it) and the stop is raised again; if a twin of another archive still
@@ -776,12 +793,15 @@ export class TeardownSweepJob {
       // Decision 43 (Codex PR240-r39): the stamp decides only between two stops of one kind (two that may report
       // deletions, or two denials). A stop that may report deletions always supersedes a pending denial, whatever
       // its stamp, so a later denial never stands in for an owed report of a partial purge.
-      const twinAt = stopAt((raised as { reason: string }).reason);
-      const sameKind = beforeDeletion(o.code) === twinDenial;
-      if (sameArchiveTwin && sameKind && twinAt !== null && twinAt >= o.at) {
-        this.dropOwed(id, o);
-        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
-        return;
+      // Decision 46 (Codex PR240-r42): stamps come from each instance's own clock, so they cannot order two different
+      // failures reliably (equal milliseconds, clock skew). A same-archive twin of the same kind stamped at or after
+      // this stop no longer makes this stop drop itself: the twin is superseded by one card that reports this failure
+      // and names every failure the twin reported (`It also stopped: ...`), stamped with the later of the two times.
+      // Whichever order the deliveries run in, KK's pending card names every failure of this archive, so none is lost.
+      const twinReason = (raised as { reason: string }).reason;
+      const twinAt = stopAt(twinReason);
+      if (sameArchiveTwin) {
+        card = purgeStoppedCard(o.p, o.code, counts, new Date(Math.max(o.at, twinAt ?? 0)), stopWhys(twinReason));
       }
       if (!sameArchiveTwin && !twinOlder(raised, o.p)) {
         this.dropOwed(id, o);
