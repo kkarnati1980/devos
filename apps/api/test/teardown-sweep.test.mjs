@@ -2097,6 +2097,21 @@ test("M2.5-b5 decision 43 (Codex PR240-r39): a stop whose lock cannot be taken s
   assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project");
 });
 
+test("M2.5-b5 decision 44 (Codex PR240-r40): a denial's stop is read again under the lock, so a date Keep archived moved meanwhile drops it", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  const due = p.purgeAfter.toISOString();
+  // Keep archived holds the lock and moves the date while this delivery waits for it.
+  s.job.d.locked = async (id, fn) => {
+    const row = s.projects.get(id);
+    s.projects.set(id, { ...row, purgeAfter: new Date(row.purgeAfter.getTime() + 30 * DAY) });
+    return fn();
+  };
+  await s.job.raiseStopped({ ...p }, "policy_denied", due);
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0, "no stop card for the moved date");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-skipped" && l.code === "purge-card-not-due"));
+});
+
 test("M2.5-b5 decision 40 (Codex PR240-r36): a stop that must be reported still replaces an owed droppable denial", async () => {
   const s = setup();
   const p = s.projects.get(P);

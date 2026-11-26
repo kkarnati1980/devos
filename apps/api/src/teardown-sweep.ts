@@ -678,22 +678,7 @@ export class TeardownSweepJob {
   private async deliverOnce(): Promise<void> {
     for (const [id, o] of this.stopsOwed) {
       try {
-        // Decision 18 (Codex PR240-r14): re-read before each try; a stop owed for an archive that has ended is dropped
-        // (KK's newer word), never raised. A failed re-read keeps it owed. One that slips in after this read names its
-        // archive, so it blocks nothing, and the tick's first pass closes it.
-        const fresh = await this.d.project(o.p.id);
-        if (!sameArchive(o.p, fresh)) {
-          this.dropOwed(id, o);
-          this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
-          continue;
-        }
-        // Decision 34: a stop owed for a scheduled card whose purge date has since moved is KK's newer word (the
-        // authorizer's denial followed the move), so it is dropped, never raised.
-        if (o.due !== null && o.due !== (fresh?.purgeAfter?.toISOString() ?? null)) {
-          this.dropOwed(id, o);
-          this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "purge-card-not-due" });
-          continue;
-        }
+        if (await this.stopStale(id, o)) continue;
         // Decision 43 (Codex PR240-r39): the raise and any supersede run under the project's lifecycle lock (the
         // provisioning advisory lock), so deliveries in different sweep instances never interleave: one cannot expire a
         // card another has just relied on. A purge of this process still running holds that lock, so the stop stays
@@ -708,7 +693,31 @@ export class TeardownSweepJob {
     }
   }
 
+  /** Decisions 18 and 34: the re-read that drops a stop owed for an archive that has ended or a date that moved. */
+  private async stopStale(id: string, o: { p: TeardownProject; code: string; due: string | null }): Promise<boolean> {
+    // Decision 18 (Codex PR240-r14): re-read before each try; a stop owed for an archive that has ended is dropped
+    // (KK's newer word), never raised. A failed re-read keeps it owed. One that slips in after this read names its
+    // archive, so it blocks nothing, and the tick's first pass closes it.
+    const fresh = await this.d.project(o.p.id);
+    if (!sameArchive(o.p, fresh)) {
+      this.dropOwed(id, o);
+      this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
+      return true;
+    }
+    // Decision 34: a stop owed for a scheduled card whose purge date has since moved is KK's newer word (the
+    // authorizer's denial followed the move), so it is dropped, never raised.
+    if (o.due !== null && o.due !== (fresh?.purgeAfter?.toISOString() ?? null)) {
+      this.dropOwed(id, o);
+      this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "purge-card-not-due" });
+      return true;
+    }
+    return false;
+  }
+
   private async deliverLocked(id: string, o: { p: TeardownProject; code: string; due: string | null; at: number }): Promise<void> {
+    // Decision 44 (Codex PR240-r40): read again under the lock, so a Keep archived (or a Restore and a new Archive)
+    // that held the lock while this delivery waited is seen before anything is written.
+    if (await this.stopStale(id, o)) return;
     const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id), new Date(o.at));
     // Decision 19 (Codex PR240-r15): the store dedupes on action and target, so it can hand back a pending twin from
     // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
