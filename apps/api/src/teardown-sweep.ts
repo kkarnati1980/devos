@@ -313,6 +313,9 @@ const teardownStop = (e: unknown): { code: string; retryable: boolean } | null =
   return x && x.name === "TeardownError" && typeof x.code === "string" ? { code: x.code, retryable: x.retryable === true } : null;
 };
 
+/** A stop the sweep still owes KK; decision 47 (Codex PR240-r43): with every other failure of the archive it must name. */
+type OwedStop = { p: TeardownProject; code: string; due: string | null; at: number; also: string[] };
+
 export class PurgeTimeout extends Error {
   constructor() {
     super("teardown-purge-timeout");
@@ -355,7 +358,7 @@ export class TeardownSweepJob {
    * dedupes a pending twin). In memory: after a restart the daily run raises a fresh purge card instead, which still
    * needs KK's approval before anything more is deleted.
    */
-  private readonly stopsOwed = new Map<string, { p: TeardownProject; code: string; due: string | null; at: number }>();
+  private readonly stopsOwed = new Map<string, OwedStop>();
   /** Decision 39: the tail of the queued stop deliveries (one pass at a time). */
   private deliveryChain: Promise<void> = Promise.resolve();
   /** Decision 26: where each action's cleanup scan resumes on the next tick (the last card id read at the bound). */
@@ -674,7 +677,10 @@ export class TeardownSweepJob {
       // early ask's denial (which carries no due date) is held back too.
       this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: p.id, code: "stop-owed-kept" });
     } else {
-      this.stopsOwed.set(p.id, { p, code, due, at: this.now() });
+      // Decision 47 (Codex PR240-r43): a newer stop of the same archive that replaces an owed one (its delivery failed
+      // before any card was written) carries the owed one's failures, so a failed delivery never loses a failure.
+      const also = owed && owed.p.archivedAt?.getTime() === p.archivedAt?.getTime() ? [stopWords(owed.code), ...owed.also] : [];
+      this.stopsOwed.set(p.id, { p, code, due, at: this.now(), also });
     }
     await this.deliverStops();
   }
@@ -730,12 +736,12 @@ export class TeardownSweepJob {
     return false;
   }
 
-  private async deliverLocked(id: string, o: { p: TeardownProject; code: string; due: string | null; at: number }): Promise<void> {
+  private async deliverLocked(id: string, o: OwedStop): Promise<void> {
     // Decision 44 (Codex PR240-r40): read again under the lock, so a Keep archived (or a Restore and a new Archive)
     // that held the lock while this delivery waited is seen before anything is written.
     if (await this.stopStale(id, o)) return;
     const counts = await this.d.activeCounts(o.p.id);
-    let card = purgeStoppedCard(o.p, o.code, counts, new Date(o.at));
+    let card = purgeStoppedCard(o.p, o.code, counts, new Date(o.at), o.also);
     // Decision 19 (Codex PR240-r15): the store dedupes on action and target, so it can hand back a pending twin from
     // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
     // read proved the archive has moved on from it) and the stop is raised again; if a twin of another archive still
@@ -801,7 +807,11 @@ export class TeardownSweepJob {
       const twinReason = (raised as { reason: string }).reason;
       const twinAt = stopAt(twinReason);
       if (sameArchiveTwin) {
-        card = purgeStoppedCard(o.p, o.code, counts, new Date(Math.max(o.at, twinAt ?? 0)), stopWhys(twinReason));
+        // Decision 47 (Codex PR240-r43): the merged failures and stamp are kept on the owed entry before the twin is
+        // expired, so a replacement raise that fails is retried with them (the expired twin is no longer returned).
+        o.also = [...new Set([...o.also, ...stopWhys(twinReason)])];
+        o.at = Math.max(o.at, twinAt ?? 0);
+        card = purgeStoppedCard(o.p, o.code, counts, new Date(o.at), o.also);
       }
       if (!sameArchiveTwin && !twinOlder(raised, o.p)) {
         this.dropOwed(id, o);

@@ -2189,3 +2189,35 @@ test("M2.5-b5 decision 46 (Codex PR240-r42): a stop card names other failures on
   assert.equal(stopWhy(c.reason), own);
   assert.deepEqual(stopWhys(purgeStoppedCard(p, "leftover", {}).reason), [own], "a single failure names no others");
 });
+
+test("M2.5-b5 decision 47 (Codex PR240-r43): a newer stop that replaces an owed one whose delivery failed still names the owed failure", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch"); // delivery fails before any card is written
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
+  s.advance(60_000);
+  await s.job.raiseStopped({ ...p }, "provider_forbidden");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), stopWhy(purgeStoppedCard(p, "provider_forbidden", {}).reason));
+  assert.ok(stopWhys(pending[0].reason).includes(stopWhy(purgeStoppedCard(p, "ownership_mismatch", {}).reason)), "the earlier failure is not lost");
+});
+
+test("M2.5-b5 decision 47 (Codex PR240-r43): a replacement raise that fails after the twin was expired is retried with the twin's failures", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch"); // pending card A
+  s.advance(60_000);
+  const raise = s.job.d.raise;
+  let n = 0;
+  s.job.d.raise = (c) => (++n === 2 ? Promise.reject(new Error("db blip")) : raise(c)); // the replacement raise fails
+  await s.job.raiseStopped({ ...p }, "leftover");
+  s.job.d.raise = raise;
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 0, "the twin was expired");
+  await s.job.tick();
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  const whys = stopWhys(pending[0].reason);
+  for (const code of ["leftover", "ownership_mismatch"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
+});
