@@ -63,6 +63,7 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
       return approvals.raiseCard(c);
     },
     expire: (ids, reason) => approvals.expireCardsById(ids, reason),
+    supersede: (oldId, c, reason) => approvals.supersedeCard(oldId, c, reason),
     unspentGrant: async (approvalId, at) => {
       return [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses === 0)?.id ?? null;
     },
@@ -1915,13 +1916,14 @@ test("M2.5-b5 decision 39 (Codex PR240-r35): a newer stop raised while an older 
   const a = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 1 }));
   s.failRaise.n = 1;
   await s.job.raiseStopped({ ...p }, "ownership_mismatch");
-  const expire = s.job.d.expire;
+  // Decision 51: the supersede (expiry and raise in one transaction) is where the delivery pauses.
+  const supersede = s.job.d.supersede;
   let release;
   const gate = new Promise((r) => (release = r));
   let paused = false;
-  s.job.d.expire = async (ids, reason) => {
+  s.job.d.supersede = async (oldId, c, reason) => {
     if (reason === "stop-card-superseded" && !paused) { paused = true; await gate; }
-    return expire(ids, reason);
+    return supersede(oldId, c, reason);
   };
   // B's delivery deduplicates onto A's card and starts superseding it; a newer stop for failure A arrives meanwhile.
   const tick = s.job.tick();
@@ -1931,7 +1933,7 @@ test("M2.5-b5 decision 39 (Codex PR240-r35): a newer stop raised while an older 
   await new Promise((r) => setImmediate(r));
   release();
   await Promise.all([tick, late]);
-  s.job.d.expire = expire;
+  s.job.d.supersede = supersede;
   assert.equal((await s.approvals.store.get(a.id)).status, "expired");
   const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1, "KK has a card for the newest failure");
@@ -2073,16 +2075,17 @@ test("M2.5-b5 decision 43 (Codex PR240-r39): a stop is raised and superseded onl
   let inLock = false;
   const writes = [];
   const raise = s.job.d.raise;
-  const expire = s.job.d.expire;
+  const supersede = s.job.d.supersede;
   s.job.d.raise = async (c) => { writes.push(["raise", inLock]); return raise(c); };
-  s.job.d.expire = async (ids, r) => { writes.push(["expire", inLock]); return expire(ids, r); };
+  s.job.d.supersede = async (id, c, r) => { writes.push(["supersede", inLock]); return supersede(id, c, r); };
   const held = [];
   s.job.d.lockHeld = async (id) => { held.push(id); };
   s.job.d.locked = async (id, fn) => { assert.equal(id, P); inLock = true; try { return await fn(); } finally { inLock = false; } };
   s.advance(60_000);
   await s.job.raiseStopped({ ...p }, "ownership_mismatch");
-  assert.deepEqual(writes, [["raise", true], ["expire", true], ["raise", true]]);
-  assert.equal(held.length, 3, "the lock is checked before each write");
+  // Decision 51: the expiry and the replacement raise are one write (`supersede`).
+  assert.deepEqual(writes, [["raise", true], ["supersede", true]]);
+  assert.equal(held.length, 2, "the lock is checked before each write");
   const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
 });
@@ -2209,12 +2212,12 @@ test("M2.5-b5 decision 47 (Codex PR240-r43): a replacement raise that fails afte
   const p = s.projects.get(P);
   await s.job.raiseStopped({ ...p }, "ownership_mismatch"); // pending card A
   s.advance(60_000);
-  const raise = s.job.d.raise;
-  let n = 0;
-  s.job.d.raise = (c) => (++n === 2 ? Promise.reject(new Error("db blip")) : raise(c)); // the replacement raise fails
+  const supersede = s.job.d.supersede;
+  s.job.d.supersede = () => Promise.reject(new Error("db blip")); // the supersede (expiry and replacement raise) fails
   await s.job.raiseStopped({ ...p }, "leftover");
-  s.job.d.raise = raise;
-  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 0, "the twin was expired");
+  s.job.d.supersede = supersede;
+  // Decision 51: the failed supersede rolled back, so the twin is still pending (it was never replaced by nothing).
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 1, "the twin is still pending");
   await s.job.tick();
   const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1);
@@ -2278,16 +2281,35 @@ test("M2.5-b5 decision 50 (Codex PR240-r46): a scheduled denial that absorbs a p
   await s.job.raiseStopped({ ...p }, "approval_required"); // early ask: pending card, no due date
   assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 1);
   s.advance(60_000);
-  const raise = s.job.d.raise;
-  let n = 0;
-  s.job.d.raise = (c) => (++n === 2 ? Promise.reject(new Error("db blip")) : raise(c)); // the replacement raise fails
+  const supersede = s.job.d.supersede;
+  s.job.d.supersede = () => Promise.reject(new Error("db blip")); // the supersede fails
   await s.job.raiseStopped({ ...p }, "policy_denied", p.purgeAfter.toISOString()); // scheduled denial merges the twin
-  s.job.d.raise = raise;
-  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 })).length, 0, "the twin was expired");
+  s.job.d.supersede = supersede;
   p.purgeAfter = new Date(p.purgeAfter.getTime() + 30 * DAY); // Keep archived moves the date
   await s.job.tick();
   const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
   assert.equal(pending.length, 1, "the merged stop is still delivered");
   const whys = stopWhys(pending[0].reason);
   for (const code of ["policy_denied", "approval_required"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
+});
+
+test("M2.5-b5 decision 51 (Codex PR240-r47): a supersede that fails after its expiry leaves the pending stop card in place", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  const twin = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "ownership_mismatch", { github: 1 }));
+  s.advance(60_000);
+  // The store expires the twin, then the replacement raise fails inside the same step (a crash or a db blip).
+  const store = s.approvals.store;
+  const raiseNow = store.raiseNow;
+  let n = 0;
+  store.raiseNow = function (...a) { if (++n === 2) throw new Error("db blip"); return raiseNow.apply(this, a); }; // the supersede's raise
+  await s.job.raiseStopped({ ...p }, "leftover");
+  store.raiseNow = raiseNow;
+  assert.equal(n, 2, "the supersede ran and its raise failed");
+  assert.equal((await store.get(twin.id)).status, "pending", "KK's earlier report is still pending");
+  await s.job.tick(); // the owed stop is delivered: one card names both failures
+  const pending = await store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  const whys = stopWhys(pending[0].reason);
+  for (const code of ["leftover", "ownership_mismatch"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
 });

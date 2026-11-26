@@ -290,6 +290,7 @@ export async function buildRuntime(
     list: (f) => approvalsCore.store.list(f as Parameters<typeof approvalsCore.store.list>[0]),
     raise: (card) => approvalsCore.raiseCard(card),
     expire: (ids, reason) => approvalsCore.expireCardsById(ids, reason),
+    supersede: (oldId, card, reason) => approvalsCore.supersedeCard(oldId, card, reason),
   };
   const ts = buildTeardownSweep({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownSweep>[0]["policy"], cards: purgeCards, env, timeoutMs: t, log, linear: linearTeardown });
   if ("off" in ts) log({ level: "warn", msg: "teardown-sweep-off", code: ts.off });

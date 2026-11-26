@@ -154,6 +154,11 @@ export interface TeardownSweepDeps {
   /** `Approvals.expireCardsById`. */
   expire(ids: readonly string[], reason: string): Promise<string[]>;
   /**
+   * Decision 51 (Codex PR240-r47): `Approvals.supersedeCard`, which expires a pending stop card and raises its
+   * replacement in one transaction, so a restart between the two writes never leaves KK with neither card.
+   */
+  supersede(oldId: string, card: ReturnType<typeof purgeStoppedCard>, reason: string): Promise<unknown>;
+  /**
    * The card's own grant when it is unrevoked, unexpired and still unspent (`uses = 0`); read-only. One purge attempt
    * per approval: the purge's single policy check, before any provider call, spends a use.
    */
@@ -832,11 +837,12 @@ export class TeardownSweepJob {
         this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
         return;
       }
-      await this.d.lockHeld?.(o.p.id);
-      await this.d.expire([stopId(raised)], sameArchiveTwin ? "stop-card-superseded" : "stop-card-archive-ended");
+      // Decision 51 (Codex PR240-r47): the twin's expiry and this stop's raise are one transaction (`supersede`). The
+      // merged failures live only in this process until the replacement commits, so a restart between two separate
+      // writes could leave KK with no pending report at all; now either both commit or the twin stays pending.
       if (this.stopsOwed.get(id) !== o) return;
       await this.d.lockHeld?.(o.p.id);
-      raised = await this.d.raise(card);
+      raised = await this.d.supersede(stopId(raised), card, sameArchiveTwin ? "stop-card-superseded" : "stop-card-archive-ended");
       if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
     }
     this.dropOwed(id, o);

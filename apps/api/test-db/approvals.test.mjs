@@ -468,3 +468,43 @@ test("DEVOS-190 (db): list filters by gate, action and target, newest first, pag
   await approvals.reject(KK, a2.id, "no");
   assert.deepEqual(ids(await store.list({ projectId, gate: "decision", action, status: "rejected", limit: 10 })), [a2.id]);
 });
+
+test("M2.5-b5 decision 51 (db): supersedeCard expires the pending card and raises its replacement in one transaction", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals, store } = setup();
+  const base = card(projectId);
+  const old = await approvals.raiseCard(base);
+  const next = await approvals.supersedeCard(old.id, { ...base, reason: "Second report" }, "stop-card-superseded");
+  assert.notEqual(next.id, old.id);
+  assert.equal(next.status, "pending");
+  assert.equal(next.reason, "Second report");
+  assert.equal((await store.get(old.id)).status, "expired");
+  const audits = await db.auditEvent.findMany({ where: { action: "approval.expired", details: { path: ["approvalId"], equals: old.id } } });
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].details.reason, "stop-card-superseded");
+});
+
+test("M2.5-b5 decision 51 (db): a supersede whose raise fails leaves the old card pending (the expiry rolls back)", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals, store } = setup();
+  const base = card(projectId);
+  const old = await approvals.raiseCard(base);
+  // A replacement for a project row that does not exist fails on its foreign key inside the same transaction.
+  await assert.rejects(approvals.supersedeCard(old.id, { ...base, projectId: randomUUID() }, "stop-card-superseded"));
+  assert.equal((await store.get(old.id)).status, "pending");
+  assert.equal(await db.auditEvent.count({ where: { action: "approval.expired", details: { path: ["approvalId"], equals: old.id } } }), 0);
+});
+
+test("M2.5-b5 decision 51 (db): a supersede racing a plain raise of the same card never deadlocks and leaves one pending card", async () => {
+  const { projectId } = await fixture(0);
+  const { approvals, store } = setup();
+  const base = card(projectId);
+  const old = await approvals.raiseCard(base);
+  const [a, b] = await Promise.all([
+    approvals.supersedeCard(old.id, { ...base, reason: "Replacement" }, "stop-card-superseded"),
+    approvals.raiseCard({ ...base, reason: "Plain raise" }),
+  ]);
+  const pending = await store.list({ status: "pending", projectId, action: base.action, limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.ok([a.id, b.id].includes(pending[0].id));
+});

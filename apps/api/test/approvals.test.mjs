@@ -528,3 +528,26 @@ test("DEVOS-190 list filters by gate, action and target, newest first, paged by 
   await approvals.reject(session, other.id, "no");
   assert.deepEqual(ids(await store.list({ projectId: PROJECT, gate: "decision", action: "question.a", status: "rejected", limit: 10 })), [a2.id]);
 });
+
+test("M2.5-b5 decision 51: supersedeCard expires the pending card, raises the replacement and notifies once", async () => {
+  const sent = [];
+  const { approvals, store } = setup({ notifier: { notify: async (n) => sent.push(n) } });
+  const old = await approvals.raiseCard(card());
+  const next = await approvals.supersedeCard(old.id, card({ reason: "Second report" }), "stop-card-superseded");
+  assert.notEqual(next.id, old.id);
+  assert.equal((await store.get(old.id)).status, "expired");
+  assert.equal((await store.get(next.id)).reason, "Second report");
+  assert.equal(sent.length, 2, "the first raise and the replacement each notify once");
+  assert.ok(store.audit.some((a) => a.action === "approval.expired" && a.details.approvalId === old.id && a.details.reason === "stop-card-superseded"));
+});
+
+test("M2.5-b5 decision 51: supersedeCard checks the id, the reason and the card before writing anything", async () => {
+  const { approvals, store } = setup();
+  const old = await approvals.raiseCard(card());
+  const before = store.audit.length;
+  await assert.rejects(approvals.supersedeCard("not-a-uuid", card(), "r"), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  await assert.rejects(approvals.supersedeCard(old.id, card(), ""), (e) => e instanceof ApprovalError && e.code === "invalid-input");
+  await assert.rejects(approvals.supersedeCard(old.id, card({ target: "" }), "r"), (e) => e instanceof ApprovalError);
+  assert.equal((await store.get(old.id)).status, "pending");
+  assert.equal(store.audit.length, before);
+});
