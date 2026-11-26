@@ -85,6 +85,18 @@ const dueMoved = (c: { reason?: string | null }, p: { purgeAfter: Date | null })
 };
 
 /**
+ * Decision 58 (Codex PR240-r53): a card raised for the project's current purge date. A scheduled card is known by its
+ * `Due <iso>.` stamp (decision 30), never by comparing its app-clock creation time with the database's `purge_after`,
+ * so clock skew never drops it from Keep archived or from the re-raise count. A card with no due stamp (an early ask)
+ * keeps the time rule: raised at or after `purge_after`.
+ */
+const forThisDue = (c: { createdAt: Date; reason?: string | null }, p: { purgeAfter: Date | null }): boolean => {
+  if (!p.purgeAfter) return false;
+  const due = cardDue(c);
+  return due !== null ? due === p.purgeAfter.toISOString() : c.createdAt.getTime() >= p.purgeAfter.getTime();
+};
+
+/**
  * A card belongs to the project's current archive only if (decision 8) it names that same archive, so a card built
  * from an earlier archive's state but written after a new Archive never counts. Decision 56 (Codex PR240-r52): its
  * creation time is not compared with `archived_at`. The two come from different clocks (the app's and the database's),
@@ -110,7 +122,7 @@ const liveCard = (c: { createdAt: Date; reason?: string | null }, p: TeardownPro
  * than the card, so each rejection moves it once) and (decision 9, Codex PR240-r5) the card names the current archive.
  */
 const keepApplies = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject | null): boolean =>
-  !!p && p.stage === "archived" && !!p.purgeAfter && !!p.archivedAt && c.createdAt.getTime() >= p.purgeAfter.getTime() && raisedThisArchive(c, p);
+  !!p && p.stage === "archived" && !!p.purgeAfter && !!p.archivedAt && forThisDue(c, p) && raisedThisArchive(c, p);
 
 /**
  * Decision 13: a card of an archive older than the project's `archivedAt` in this read (its stamp names an earlier
@@ -1046,7 +1058,6 @@ export class TeardownSweepJob {
     // Decision 18: only a stop owed for this same archive holds the card back (deliverStops drops one that has ended).
     const owed = this.stopsOwed.get(p.id);
     if (owed && sameArchive(owed.p, p)) return false;
-    const since = p.purgeAfter.getTime();
     const cards = (await this.d.cards({ action: PURGE_ACTION, target: target(p.id), limit: CARD_PAGE })).filter((c) => c.projectId === p.id);
     // Decision 15 (Codex PR240-r11): a pending card that does not name this archive (a stale writer's card whose fence
     // re-read failed, decision 12) does not serve this row: the daily run stays open, the next tick's first pass
@@ -1071,7 +1082,8 @@ export class TeardownSweepJob {
     if (pending.length) return false;
     // Decision 10 (Codex PR240-r6): the period counts only this archive's cards (decision 8's stamp), so a stale
     // card's rejection or 7-day expiry never suppresses or uses up the current archive's raises.
-    const period = cards.filter((c) => c.createdAt.getTime() >= since && raisedThisArchive(c, p));
+    // Decision 58 (Codex PR240-r53): a scheduled card counts by its due stamp, not by its creation time.
+    const period = cards.filter((c) => forThisDue(c, p) && raisedThisArchive(c, p));
     if (period.some((c) => c.status === "rejected")) return false;
     // Decision 31: an approval that can no longer purge (its purge date moved) never holds back a new card.
     for (const c of cards.filter((x) => x.status === "approved" && liveCard(x, p))) {

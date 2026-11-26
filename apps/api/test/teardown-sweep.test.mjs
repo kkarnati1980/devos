@@ -166,6 +166,39 @@ test("AT3: Keep archived (reject) moves purge_after by 30 days, once; no purge; 
   assert.equal((await s.purgeCards("pending")).length, 1, "a new card after the new purge_after");
 });
 
+test("decision 58 (Codex PR240-r53): a scheduled card whose app-clock creation time is before purge_after still gets Keep archived", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  // The approvals clock was behind the database's: the stored creation time is before purge_after.
+  s.store.cards.get(c.id).createdAt = new Date(s.projects.get(P).purgeAfter.getTime() - 1000);
+  s.advance(DAY);
+  await s.approvals.reject(s.session, c.id);
+  const decidedAt = s.now();
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1, "Keep archived applies to the scheduled card");
+  assert.equal(s.projects.get(P).purgeAfter.getTime(), decidedAt + KEEP_ARCHIVED_MS);
+});
+
+test("decision 58 (Codex PR240-r53): skewed scheduled cards still count against the single re-raise", async () => {
+  const s = setup();
+  const skew = async () => {
+    for (const c of await s.purgeCards("pending")) s.store.cards.get(c.id).createdAt = new Date(s.projects.get(P).purgeAfter.getTime() - 1000);
+  };
+  await s.job.tick();
+  await skew();
+  s.advance(8 * DAY);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 1, "re-raised once");
+  await skew();
+  s.advance(8 * DAY);
+  await s.job.tick();
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0, "no third card");
+  assert.equal((await s.purgeCards("expired")).length, 2);
+});
+
 test("decision 1: the job itself expires an unanswered card after 7 days and re-raises it once, then nothing happens (Codex PR181-r2)", async () => {
   const s = setup();
   await s.job.tick();
