@@ -26,6 +26,8 @@ export const DUE_PAGE = 100;
 export const CLEANUP_SCAN_MAX = 1000;
 /** Decision 36: the resume-point key of Keep archived's scan of rejected purge cards (cleanup keys are action names). */
 const KEEP_SCAN_KEY = "keep:rejected";
+/** Decision 49 (Codex PR240-r45): the approved-card pass's own resume point. */
+const APPROVED_SCAN_KEY = "purge:approved";
 /**
  * Decision 28 (Codex PR240-r24): the most card ids sent in one expiry call. Equal to the approvals API's
  * EXPIRE_IDS_MAX (a test pins the two together); kept here so this job stays free of the approvals module's imports.
@@ -566,9 +568,12 @@ export class TeardownSweepJob {
    * archive period the card was raised in (pre-review 1: a Restore, then a new Archive, never purges on an old card).
    */
   private async approvedPass(): Promise<void> {
-    const approved = await this.d.cards({ status: "approved", action: PURGE_ACTION, limit: CARD_PAGE });
+    // Decision 49 (Codex PR240-r45): approved cards that can no longer run (a spent grant, an older archive, a moved
+    // date) stay approved, so a fixed newest page could hide a current approval below them for good. The pass pages
+    // through every approved card by cursor and resumes where the last tick stopped at its bound (decisions 25–26).
+    const scan = await this.scanCards("approved", PURGE_ACTION, APPROVED_SCAN_KEY);
     const seen = new Set<string>();
-    for (const c of approved) {
+    for (const c of scan.cards) {
       const pid = c.projectId;
       if (!pid || c.target !== target(pid) || seen.has(pid) || this.waitForDaily.has(c.id) || this.stopped.has(c.id)) continue;
       const grant = await this.d.unspentGrant(c.id, new Date(this.now()));
@@ -587,6 +592,7 @@ export class TeardownSweepJob {
       seen.add(pid);
       await this.runPurge(p, c.id, grant, { createdAt: c.createdAt, archive: cardArchive(c), due: cardDue(c) });
     }
+    this.commitScan(APPROVED_SCAN_KEY, scan.next);
   }
 
   private async runPurge(p: TeardownProject, approvalId: string, grantId: string, card: { createdAt: Date; archive: string | null; due?: string | null }): Promise<void> {
@@ -679,8 +685,11 @@ export class TeardownSweepJob {
     } else {
       // Decision 47 (Codex PR240-r43): a newer stop of the same archive that replaces an owed one (its delivery failed
       // before any card was written) carries the owed one's failures, so a failed delivery never loses a failure.
-      const also = owed && owed.p.archivedAt?.getTime() === p.archivedAt?.getTime() ? [stopWords(owed.code), ...owed.also] : [];
-      this.stopsOwed.set(p.id, { p, code, due, at: this.now(), also });
+      const merge = !!owed && owed.p.archivedAt?.getTime() === p.archivedAt?.getTime();
+      const also = merge ? [stopWords(owed.code), ...owed.also] : [];
+      // Decision 49 (Codex PR240-r45): a merged entry keeps a due date (and so can be dropped when that date moves,
+      // decision 34) only if every failure it carries had that same date; otherwise it is never dropped on a date move.
+      this.stopsOwed.set(p.id, { p, code, due: merge && owed.due !== due ? null : due, at: this.now(), also });
     }
     await this.deliverStops();
   }

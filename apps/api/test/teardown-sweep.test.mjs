@@ -2238,3 +2238,36 @@ test("M2.5-b5 decision 48 (Codex PR240-r44): a same-failure twin that leaves out
   for (const code of ["provider_forbidden", "ownership_mismatch"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
   assert.equal(stopAt(pending[0].reason), stopAt(twin.reason), "the later stamp is kept");
 });
+
+test("M2.5-b5 decision 49 (Codex PR240-r45): a current approval below a full page of approvals that can no longer run still purges", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  s.advance(5 * 60_000);
+  const cards = s.job.d.cards;
+  // A newest page of approved cards whose grants are spent sits above KK's current approval.
+  const stale = Array.from({ length: CARD_PAGE }, (_, i) => ({ ...c, id: `stale-${i}`, status: "approved" }));
+  s.job.d.cards = async (f) => {
+    if (f.status !== "approved") return cards(f);
+    if (!f.cursor) return stale.slice(0, f.limit);
+    if (f.cursor === stale[stale.length - 1].id) return cards({ ...f, cursor: undefined });
+    return [];
+  };
+  await s.job.tick();
+  s.job.d.cards = cards;
+  assert.equal(s.calls.purge.length, 1, "the current approval is reached on a later page");
+});
+
+test("M2.5-b5 decision 49 (Codex PR240-r45): a scheduled denial that replaces an owed early-ask denial is not dropped when the date moves", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 2;
+  await s.job.raiseStopped({ ...p }, "approval_required"); // early ask: no due date; delivery fails
+  await s.job.raiseStopped({ ...p }, "policy_denied", p.purgeAfter.toISOString()); // scheduled: due date; delivery fails
+  p.purgeAfter = new Date(p.purgeAfter.getTime() + 30 * DAY); // Keep archived moves the date
+  await s.job.tick(); // the owed stop is delivered on the next tick
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1, "the merged stop is still delivered");
+  assert.ok(stopWhys(pending[0].reason).includes(stopWhy(purgeStoppedCard(p, "approval_required", {}).reason)), "the early ask's denial is kept");
+});
