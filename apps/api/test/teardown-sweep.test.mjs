@@ -2313,3 +2313,48 @@ test("M2.5-b5 decision 51 (Codex PR240-r47): a supersede that fails after its ex
   const whys = stopWhys(pending[0].reason);
   for (const code of ["leftover", "ownership_mismatch"]) assert.ok(whys.includes(stopWhy(purgeStoppedCard(p, code, {}).reason)), code);
 });
+
+test("M2.5-b5 decision 52 (Codex PR240-r48): an older delivery whose entry is replaced during the lock probe writes nothing", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "policy_denied"); // owed; its delivery failed
+  const raise = s.job.d.raise;
+  const raised = [];
+  s.job.d.raise = (c) => { raised.push(stopWhy(c.reason)); return raise(c); };
+  let late = null;
+  s.job.d.lockHeld = async () => {
+    // A timed-out purge's handler replaces the entry while the older delivery's probe is pending.
+    if (!late) { s.advance(60_000); late = s.job.raiseStopped({ ...p }, "leftover"); }
+  };
+  await s.job.tick();
+  await late;
+  const denial = stopWhy(purgeStoppedCard(p, "policy_denied", {}).reason);
+  assert.ok(!raised.includes(denial), "the obsolete stop was never raised");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), stopWhy(purgeStoppedCard(p, "leftover", {}).reason));
+  assert.ok(stopWhys(pending[0].reason).includes(denial), "the newer card still names the older failure (decision 47)");
+});
+
+test("M2.5-b5 decision 52 (Codex PR240-r48): an approval whose reads keep failing never holds back the approvals after it", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  s.advance(5 * 60_000);
+  const cards = s.job.d.cards;
+  const broken = { ...c, id: "broken-0", status: "approved" };
+  s.job.d.cards = async (f) => {
+    if (f.status !== "approved") return cards(f);
+    const real = await cards({ ...f, cursor: undefined });
+    return f.cursor ? [] : [broken, ...real].slice(0, f.limit);
+  };
+  const grant = s.job.d.unspentGrant;
+  s.job.d.unspentGrant = (id, at) => (id === "broken-0" ? Promise.reject(new Error("db blip")) : grant(id, at));
+  await s.job.tick();
+  s.job.d.cards = cards;
+  s.job.d.unspentGrant = grant;
+  assert.equal(s.calls.purge.length, 1, "the current approval behind the failing one still purges");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.approvalId === "broken-0"));
+});

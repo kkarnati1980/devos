@@ -581,9 +581,18 @@ export class TeardownSweepJob {
     for (const c of scan.cards) {
       const pid = c.projectId;
       if (!pid || c.target !== target(pid) || seen.has(pid) || this.waitForDaily.has(c.id) || this.stopped.has(c.id)) continue;
-      const grant = await this.d.unspentGrant(c.id, new Date(this.now()));
-      if (!grant) continue;
-      const p = await this.d.project(pid);
+      // Decision 52 (Codex PR240-r48): a failed read skips only this card (it is retried when the scan comes round
+      // again), so one approval whose lookups keep failing never holds back the cards after it or the resume point.
+      let grant: string | null;
+      let p: TeardownProject | null;
+      try {
+        grant = await this.d.unspentGrant(c.id, new Date(this.now()));
+        if (!grant) continue;
+        p = await this.d.project(pid);
+      } catch {
+        this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: pid, approvalId: c.id, code: "approved-read-failed" });
+        continue;
+      }
       if (!p || !raisedThisArchive(c, p)) {
         // The card is raised only from Archive's state; a Restore after it is KK's newer word.
         this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: pid, approvalId: c.id, code: !p ? "project-missing" : p.stage === "archived" ? "card-before-archive" : `stage-${p.stage}` });
@@ -769,11 +778,13 @@ export class TeardownSweepJob {
     // Decision 38 (Codex PR240-r34): a delivery whose entry a newer stop has replaced writes nothing; checked just
     // before each raise (nothing awaited in between). One whose entry is replaced while its raise is in flight may
     // still write the older failure, but the newer delivery then finds that card and supersedes it (decision 36).
+    // Decision 52 (Codex PR240-r48): the lock probe is awaited first, so the entry check sits right before the raise
+    // with nothing awaited in between (a timed-out purge's handler can replace the entry while the probe runs).
+    await this.d.lockHeld?.(o.p.id);
     if (this.stopsOwed.get(id) !== o) {
       this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
       return;
     }
-    await this.d.lockHeld?.(o.p.id);
     let raised = await this.d.raise(card);
     // Decision 45 (Codex PR240-r41): a same-archive twin reporting this same failure serves this stop only if its
     // stamp is not older than this stop's. A twin stamped earlier (or unstamped) is superseded and this stop raised,
@@ -840,8 +851,8 @@ export class TeardownSweepJob {
       // Decision 51 (Codex PR240-r47): the twin's expiry and this stop's raise are one transaction (`supersede`). The
       // merged failures live only in this process until the replacement commits, so a restart between two separate
       // writes could leave KK with no pending report at all; now either both commit or the twin stays pending.
-      if (this.stopsOwed.get(id) !== o) return;
       await this.d.lockHeld?.(o.p.id);
+      if (this.stopsOwed.get(id) !== o) return; // decision 52: checked after the probe, right before the write
       raised = await this.d.supersede(stopId(raised), card, sameArchiveTwin ? "stop-card-superseded" : "stop-card-archive-ended");
       if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
     }
