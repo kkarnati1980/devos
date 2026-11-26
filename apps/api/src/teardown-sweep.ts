@@ -694,76 +694,95 @@ export class TeardownSweepJob {
           this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "purge-card-not-due" });
           continue;
         }
-        const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id), new Date(o.at));
-        // Decision 19 (Codex PR240-r15): the store dedupes on action and target, so it can hand back a pending twin from
-        // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
-        // read proved the archive has moved on from it) and the stop is raised again; if a twin of another archive still
-        // comes back, or the expiry fails, the stop stays owed and is retried next tick.
-        // Decision 20 (Codex PR240-r16): only a twin of an archive OLDER than this stop's is expired. A twin naming a
-        // newer archive means a Restore and a new Archive landed after the re-read and that archive has its own stop: it
-        // is never touched, and this stop (for an archive that has ended) is dropped, as in decision 18.
-        // Decision 36 (Codex PR240-r32): a twin for this same archive that reports another failure (an earlier stop KK
-        // has not answered) does not serve this stop either: it is superseded (expired) and this stop raised, so KK
-        // always sees the newest failure. Only a twin with this archive and this failure serves it.
-        // Decision 38 (Codex PR240-r34): a delivery whose entry a newer stop has replaced writes nothing; checked just
-        // before each raise (nothing awaited in between). One whose entry is replaced while its raise is in flight may
-        // still write the older failure, but the newer delivery then finds that card and supersedes it (decision 36).
-        if (this.stopsOwed.get(id) !== o) {
-          this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
-          continue;
-        }
-        let raised = await this.d.raise(card);
-        if (!this.stopServes(raised, card)) {
-          if (typeof (raised as { reason?: unknown } | null)?.reason !== "string") throw new Error("stop-card-not-raised");
-          const sameArchiveTwin = this.stopSameArchive(raised, card);
-          // Decision 37 (Codex PR240-r33): a same-archive twin is superseded only by the newest stop. A later stop (a
-          // timed-out purge finishing meanwhile) replaces this entry in `stopsOwed` before its own delivery writes its
-          // card, so a delivery whose entry was replaced is the older failure: it drops itself and never expires the
-          // newer card. Nothing is awaited between this check and the expiry below.
-          // Decision 38 (Codex PR240-r34): the entry check alone decides; card times are not compared, since an older
-          // delivery's raise can land after a newer stop was owed.
-          if (sameArchiveTwin && this.stopsOwed.get(id) !== o) {
-            this.dropOwed(id, o);
-            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
-            continue;
-          }
-          // Decision 41 (Codex PR240-r37): a droppable denial (a scheduled card's denial before any deletion, decision
-          // 35) never supersedes a pending stop for this same archive. That card may be the report of a purge that
-          // stopped after deleting (decision 40 protects it only while it is owed), and the denial deleted nothing, so
-          // the pending card stands and the denial is dropped.
-          // Decision 42 (Codex PR240-r38): keyed on the stop's code (an early ask's denial carries no due date), and
-          // only a pending card that may report deletions is kept; a pending denial is superseded as before.
-          const twinWhy = stopWhy((raised as { reason: string }).reason);
-          if (sameArchiveTwin && beforeDeletion(o.code) && !(twinWhy !== null && DENIAL_WHYS.has(twinWhy))) {
-            this.dropOwed(id, o);
-            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-pending-kept" });
-            continue;
-          }
-          // Decision 42 (Codex PR240-r38): `stopsOwed` and the delivery chain are local to one sweep instance. A
-          // same-archive twin stamped with a stop at or after this one's is a newer failure (perhaps delivered by
-          // another instance while this delivery paused), so this older stop drops itself and never expires it. A
-          // twin without the stamp predates it and counts as older.
-          const twinAt = stopAt((raised as { reason: string }).reason);
-          if (sameArchiveTwin && twinAt !== null && twinAt >= o.at) {
-            this.dropOwed(id, o);
-            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
-            continue;
-          }
-          if (!sameArchiveTwin && !twinOlder(raised, o.p)) {
-            this.dropOwed(id, o);
-            this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
-            continue;
-          }
-          await this.d.expire([stopId(raised)], sameArchiveTwin ? "stop-card-superseded" : "stop-card-archive-ended");
-          if (this.stopsOwed.get(id) !== o) continue;
-          raised = await this.d.raise(card);
-          if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
-        }
-        this.dropOwed(id, o);
+        // Decision 43 (Codex PR240-r39): the raise and any supersede run under the project's lifecycle lock (the
+        // provisioning advisory lock), so deliveries in different sweep instances never interleave: one cannot expire a
+        // card another has just relied on. A purge of this process still running holds that lock, so the stop stays
+        // owed for the next tick (as the daily run does); a lock that cannot be taken keeps it owed too.
+        if (this.purging.has(o.p.id)) continue;
+        const locked = this.d.locked;
+        const deliver = () => this.deliverLocked(id, o);
+        await (locked ? locked(o.p.id, deliver) : deliver());
       } catch {
         this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: o.p.id, code: o.code });
       }
     }
+  }
+
+  private async deliverLocked(id: string, o: { p: TeardownProject; code: string; due: string | null; at: number }): Promise<void> {
+    const card = purgeStoppedCard(o.p, o.code, await this.d.activeCounts(o.p.id), new Date(o.at));
+    // Decision 19 (Codex PR240-r15): the store dedupes on action and target, so it can hand back a pending twin from
+    // an earlier archive (decision 18's slipped-in card). That twin does not serve this stop: it is expired (this
+    // read proved the archive has moved on from it) and the stop is raised again; if a twin of another archive still
+    // comes back, or the expiry fails, the stop stays owed and is retried next tick.
+    // Decision 20 (Codex PR240-r16): only a twin of an archive OLDER than this stop's is expired. A twin naming a
+    // newer archive means a Restore and a new Archive landed after the re-read and that archive has its own stop: it
+    // is never touched, and this stop (for an archive that has ended) is dropped, as in decision 18.
+    // Decision 36 (Codex PR240-r32): a twin for this same archive that reports another failure (an earlier stop KK
+    // has not answered) does not serve this stop either: it is superseded (expired) and this stop raised, so KK
+    // always sees the newest failure. Only a twin with this archive and this failure serves it.
+    // Decision 38 (Codex PR240-r34): a delivery whose entry a newer stop has replaced writes nothing; checked just
+    // before each raise (nothing awaited in between). One whose entry is replaced while its raise is in flight may
+    // still write the older failure, but the newer delivery then finds that card and supersedes it (decision 36).
+    if (this.stopsOwed.get(id) !== o) {
+      this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
+      return;
+    }
+    await this.d.lockHeld?.(o.p.id);
+    let raised = await this.d.raise(card);
+    if (!this.stopServes(raised, card)) {
+      if (typeof (raised as { reason?: unknown } | null)?.reason !== "string") throw new Error("stop-card-not-raised");
+      const sameArchiveTwin = this.stopSameArchive(raised, card);
+      // Decision 37 (Codex PR240-r33): a same-archive twin is superseded only by the newest stop. A later stop (a
+      // timed-out purge finishing meanwhile) replaces this entry in `stopsOwed` before its own delivery writes its
+      // card, so a delivery whose entry was replaced is the older failure: it drops itself and never expires the
+      // newer card. Nothing is awaited between this check and the expiry below.
+      // Decision 38 (Codex PR240-r34): the entry check alone decides; card times are not compared, since an older
+      // delivery's raise can land after a newer stop was owed.
+      if (sameArchiveTwin && this.stopsOwed.get(id) !== o) {
+        this.dropOwed(id, o);
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
+        return;
+      }
+      // Decision 41 (Codex PR240-r37): a droppable denial (a scheduled card's denial before any deletion, decision
+      // 35) never supersedes a pending stop for this same archive. That card may be the report of a purge that
+      // stopped after deleting (decision 40 protects it only while it is owed), and the denial deleted nothing, so
+      // the pending card stands and the denial is dropped.
+      // Decision 42 (Codex PR240-r38): keyed on the stop's code (an early ask's denial carries no due date), and
+      // only a pending card that may report deletions is kept; a pending denial is superseded as before.
+      const twinWhy = stopWhy((raised as { reason: string }).reason);
+      const twinDenial = twinWhy !== null && DENIAL_WHYS.has(twinWhy);
+      if (sameArchiveTwin && beforeDeletion(o.code) && !twinDenial) {
+        this.dropOwed(id, o);
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-pending-kept" });
+        return;
+      }
+      // Decision 42 (Codex PR240-r38): `stopsOwed` and the delivery chain are local to one sweep instance. A
+      // same-archive twin stamped with a stop at or after this one's is a newer failure (perhaps delivered by
+      // another instance while this delivery paused), so this older stop drops itself and never expires it. A
+      // twin without the stamp predates it and counts as older.
+      // Decision 43 (Codex PR240-r39): the stamp decides only between two stops of one kind (two that may report
+      // deletions, or two denials). A stop that may report deletions always supersedes a pending denial, whatever
+      // its stamp, so a later denial never stands in for an owed report of a partial purge.
+      const twinAt = stopAt((raised as { reason: string }).reason);
+      const sameKind = beforeDeletion(o.code) === twinDenial;
+      if (sameArchiveTwin && sameKind && twinAt !== null && twinAt >= o.at) {
+        this.dropOwed(id, o);
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "stop-superseded" });
+        return;
+      }
+      if (!sameArchiveTwin && !twinOlder(raised, o.p)) {
+        this.dropOwed(id, o);
+        this.d.log({ level: "info", msg: "teardown-purge-skipped", projectId: o.p.id, code: "archive-superseded" });
+        return;
+      }
+      await this.d.lockHeld?.(o.p.id);
+      await this.d.expire([stopId(raised)], sameArchiveTwin ? "stop-card-superseded" : "stop-card-archive-ended");
+      if (this.stopsOwed.get(id) !== o) return;
+      await this.d.lockHeld?.(o.p.id);
+      raised = await this.d.raise(card);
+      if (!this.stopServes(raised, card)) throw new Error("stop-card-other-archive");
+    }
+    this.dropOwed(id, o);
   }
 
   /**

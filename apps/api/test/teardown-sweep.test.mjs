@@ -2046,6 +2046,57 @@ test("M2.5-b5 decision 42 (Codex PR240-r38): a stop card stamps when it stopped 
   assert.deepEqual(["policy_denied", "approval_required", "ownership_mismatch", "leftover"].map(beforeDeletion), [true, true, false, false]);
 });
 
+test("M2.5-b5 decision 43 (Codex PR240-r39): an owed report of a partial purge supersedes a later denial's card another instance raised", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.failRaise.n = 1;
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch");
+  s.advance(60_000);
+  const denial = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "approval_required", { github: 1 }, new Date(s.now())));
+  s.advance(60_000);
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(denial.id)).status, "expired", "the later denial does not stand in for the report");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+});
+
+test("M2.5-b5 decision 43 (Codex PR240-r39): a stop is raised and superseded only under the project's lifecycle lock", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "leftover", { github: 1 }));
+  let inLock = false;
+  const writes = [];
+  const raise = s.job.d.raise;
+  const expire = s.job.d.expire;
+  s.job.d.raise = async (c) => { writes.push(["raise", inLock]); return raise(c); };
+  s.job.d.expire = async (ids, r) => { writes.push(["expire", inLock]); return expire(ids, r); };
+  const held = [];
+  s.job.d.lockHeld = async (id) => { held.push(id); };
+  s.job.d.locked = async (id, fn) => { assert.equal(id, P); inLock = true; try { return await fn(); } finally { inLock = false; } };
+  s.advance(60_000);
+  await s.job.raiseStopped({ ...p }, "ownership_mismatch");
+  assert.deepEqual(writes, [["raise", true], ["expire", true], ["raise", true]]);
+  assert.equal(held.length, 3, "the lock is checked before each write");
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(stopWhy(pending[0].reason), "DevOS could not prove that it owns one of the project's resources, so it did not delete it");
+});
+
+test("M2.5-b5 decision 43 (Codex PR240-r39): a stop whose lock cannot be taken stays owed and is delivered on a later tick", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  s.job.d.locked = async () => { throw new Error("lock_timeout"); };
+  await s.job.raiseStopped({ ...p }, "leftover");
+  assert.equal((await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, limit: 10 })).length, 0);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.code === "leftover"));
+  s.job.d.locked = async (id, fn) => fn();
+  s.advance(60_000);
+  await s.job.tick();
+  const pending = await s.approvals.store.list({ action: PURGE_STOPPED_ACTION, status: "pending", limit: 10 });
+  assert.equal(pending.length, 1);
+  assert.equal(stopWhy(pending[0].reason), "after deleting, the leftover check still found resources of this project");
+});
+
 test("M2.5-b5 decision 40 (Codex PR240-r36): a stop that must be reported still replaces an owed droppable denial", async () => {
   const s = setup();
   const p = s.projects.get(P);
