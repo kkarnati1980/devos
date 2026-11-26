@@ -199,6 +199,29 @@ test("decision 58 (Codex PR240-r53): skewed scheduled cards still count against 
   assert.equal((await s.purgeCards("expired")).length, 2);
 });
 
+test("decision 59 (Codex PR240-r54): an early ask made after the purge date names it, so a skewed rejection still gets Keep archived", async () => {
+  const s = setup();
+  const r = await s.job.askPurge(P);
+  assert.equal(r.ok, true);
+  const c = s.store.cards.get(r.approvalId);
+  assert.equal(cardDue(c), s.projects.get(P).purgeAfter.toISOString(), "the ask names the purge date");
+  c.createdAt = new Date(s.projects.get(P).purgeAfter.getTime() - 1000);
+  s.advance(DAY);
+  await s.approvals.reject(s.session, c.id);
+  const decidedAt = s.now();
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1);
+  assert.equal(s.projects.get(P).purgeAfter.getTime(), decidedAt + KEEP_ARCHIVED_MS);
+  // Before the purge date, an early ask still names no date, and its rejection leaves purge_after as it is.
+  const s2 = setup();
+  s2.projects.get(P).purgeAfter = new Date(T0 + 10 * DAY);
+  const r2 = await s2.job.askPurge(P);
+  assert.equal(cardDue(s2.store.cards.get(r2.approvalId)), null);
+  await s2.approvals.reject(s2.session, r2.approvalId);
+  await s2.job.tick();
+  assert.equal(s2.calls.keep.length, 0);
+});
+
 test("decision 1: the job itself expires an unanswered card after 7 days and re-raises it once, then nothing happens (Codex PR181-r2)", async () => {
   const s = setup();
   await s.job.tick();

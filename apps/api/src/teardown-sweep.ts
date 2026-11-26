@@ -85,16 +85,14 @@ const dueMoved = (c: { reason?: string | null }, p: { purgeAfter: Date | null })
 };
 
 /**
- * Decision 58 (Codex PR240-r53): a card raised for the project's current purge date. A scheduled card is known by its
- * `Due <iso>.` stamp (decision 30), never by comparing its app-clock creation time with the database's `purge_after`,
- * so clock skew never drops it from Keep archived or from the re-raise count. A card with no due stamp (an early ask)
- * keeps the time rule: raised at or after `purge_after`.
+ * Decisions 58 and 59 (Codex PR240-r53, r54): a card raised for the project's current purge date. Such a card is known
+ * by its `Due <iso>.` stamp (decision 30), never by comparing its app-clock creation time with the database's
+ * `purge_after`, so clock skew never drops it from Keep archived or from the re-raise count. Every card raised once the
+ * project is due carries the stamp: the daily run's, and (decision 59) an early ask's made after that date. A card with
+ * no stamp is an early ask made before the date, which by design leaves `purge_after` as it is.
  */
-const forThisDue = (c: { createdAt: Date; reason?: string | null }, p: { purgeAfter: Date | null }): boolean => {
-  if (!p.purgeAfter) return false;
-  const due = cardDue(c);
-  return due !== null ? due === p.purgeAfter.toISOString() : c.createdAt.getTime() >= p.purgeAfter.getTime();
-};
+const forThisDue = (c: { reason?: string | null }, p: { purgeAfter: Date | null }): boolean =>
+  !!p.purgeAfter && cardDue(c) === p.purgeAfter.toISOString();
 
 /**
  * A card belongs to the project's current archive only if (decision 8) it names that same archive, so a card built
@@ -1166,7 +1164,10 @@ export class TeardownSweepJob {
     // never dedupes onto it and hands KK a card the authorizer would refuse.
     const notDue = pending.filter((c) => raisedThisArchive(c, p) && dueMoved(c, p));
     if (notDue.length) await this.d.expire(notDue.map((c) => c.id), "purge-card-not-due");
-    const next = purgeCard(p, await this.d.activeCounts(p.id));
+    // Decision 59 (Codex PR240-r54): an ask made once the project is due (by this job's clock, the one `listDue` is
+    // given) names the purge date like a daily card, so Keep archived and the re-raise count match it by its stamp.
+    const due = p.purgeAfter && p.purgeAfter.getTime() <= this.now() ? p.purgeAfter : null;
+    const next = purgeCard(p, await this.d.activeCounts(p.id), { due });
     // Decision 4: the lock is still ours right before the write, or nothing is raised.
     await this.d.lockHeld?.(p.id);
     const card = await this.raiseFenced(p, next);
