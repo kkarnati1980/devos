@@ -91,6 +91,10 @@ const dueMoved = (c: { reason?: string | null }, p: { purgeAfter: Date | null })
 const raisedThisArchive = (c: { createdAt: Date; reason?: string | null }, p: TeardownProject): boolean =>
   p.stage === "archived" && p.archivedAt !== null && c.createdAt.getTime() >= p.archivedAt.getTime() && cardArchive(c) === p.archivedAt.toISOString();
 
+/** Decision 53 (Codex PR240-r49): a stop card names the current archive by its stamp (its creation time is not compared). */
+const stopNamesArchive = (c: { reason?: string | null }, p: TeardownProject): boolean =>
+  p.stage === "archived" && p.archivedAt !== null && cardArchive(c) === p.archivedAt.toISOString();
+
 /**
  * Decision 31 (Codex PR240-r27): a card that can still purge: it names the current archive and, if scheduled, the
  * current purge date. Every check that hands a card to KK or lets an approval hold back a new card uses this.
@@ -432,7 +436,8 @@ export class TeardownSweepJob {
     const cutoff = this.now() - PURGE_CARD_WINDOW_MS;
     for (const c of pending) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
-      const p = await this.d.project(c.projectId);
+      const p = await this.cleanupRead(c);
+      if (p === undefined) continue;
       if (p && p.stage !== "archived") restored.push(c.id);
       // Decision 9 (Codex PR240-r5): a pending card that does not name the current archive (a stale card whose fence
       // expiry failed, also after a restart) is expired here, so it never blocks the current archive's card.
@@ -458,11 +463,29 @@ export class TeardownSweepJob {
     const ended: string[] = [];
     for (const c of stops) {
       if (!c.projectId || c.target !== target(c.projectId)) continue;
-      const p = await this.d.project(c.projectId);
-      if (p && !raisedThisArchive(c, p)) ended.push(c.id);
+      const p = await this.cleanupRead(c);
+      if (p === undefined) continue;
+      // Decision 53 (Codex PR240-r49): a stop card is matched on its archive stamp alone (as delivery does,
+      // `stopSameArchive`), not on its creation time: the instance that wrote it may run a clock behind the one that
+      // archived the project, and a current report must never be closed for that.
+      if (p && !stopNamesArchive(c, p)) ended.push(c.id);
     }
     await this.expireBatched(ended, "stop-card-archive-ended");
     this.commitScan(PURGE_STOPPED_ACTION, stopScan.next);
+  }
+
+  /**
+   * Decision 53 (Codex PR240-r49): a cleanup pass's project read for one card. A failed read skips only that card
+   * (`undefined`; it is read again when the scan comes round), so one project whose reads keep failing never holds
+   * back the other projects' cards or the resume point.
+   */
+  private async cleanupRead(c: { id: string; projectId: string | null }): Promise<TeardownProject | null | undefined> {
+    try {
+      return await this.d.project(c.projectId!);
+    } catch {
+      this.d.log({ level: "warn", msg: "teardown-card-failed", projectId: c.projectId ?? undefined, approvalId: c.id, code: "cleanup-read-failed" });
+      return undefined;
+    }
   }
 
   /**

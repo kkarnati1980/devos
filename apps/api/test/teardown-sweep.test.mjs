@@ -2358,3 +2358,34 @@ test("M2.5-b5 decision 52 (Codex PR240-r48): an approval whose reads keep failin
   assert.equal(s.calls.purge.length, 1, "the current approval behind the failing one still purges");
   assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.approvalId === "broken-0"));
 });
+
+test("M2.5-b5 decision 53 (Codex PR240-r49): a project whose reads keep failing never holds back the other projects' cleanup", async () => {
+  const s = setup();
+  const Q = "88888888-8888-4888-8888-000000000001";
+  const R = "88888888-8888-4888-8888-000000000002";
+  const at = new Date(T0 - DAY);
+  s.projects.set(Q, { id: Q, slug: "q", stage: "archived", archivedAt: at, purgeAfter: new Date(T0 + 29 * DAY) });
+  s.projects.set(R, { id: R, slug: "r", stage: "archived", archivedAt: at, purgeAfter: new Date(T0 + 29 * DAY) });
+  const restoredCard = await s.approvals.raiseCard(purgeCard({ id: Q, slug: "q", stage: "archived", archivedAt: at }, { github: 1 }));
+  const endedStop = await s.approvals.raiseCard(purgeStoppedCard({ id: Q, slug: "q", archivedAt: new Date(T0 - 2 * DAY) }, "leftover", { github: 1 }));
+  await s.approvals.raiseCard(purgeCard({ id: R, slug: "r", stage: "archived", archivedAt: at }, { github: 1 }));
+  await s.approvals.raiseCard(purgeStoppedCard({ id: R, slug: "r", archivedAt: at }, "leftover", { github: 1 }));
+  s.projects.get(Q).stage = "active"; // Q restored: both its cards are stale
+  const project = s.job.d.project;
+  s.job.d.project = (id) => (id === R ? Promise.reject(new Error("db blip")) : project(id));
+  await s.job.tick();
+  s.job.d.project = project;
+  assert.equal((await s.approvals.store.get(restoredCard.id)).status, "expired", "the purge-card cleanup reached Q");
+  assert.equal((await s.approvals.store.get(endedStop.id)).status, "expired", "the stop-card cleanup reached Q");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-card-failed" && l.projectId === R && l.code === "cleanup-read-failed"));
+});
+
+test("M2.5-b5 decision 53 (Codex PR240-r49): a stop card stamped with the current archive is kept even if it was written before the archive time", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  // The writing instance's clock runs behind: the card's creation time is before the project's archive time.
+  p.archivedAt = new Date(s.now() + 60_000);
+  const stop = await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "ownership_mismatch", { github: 1 }, new Date(s.now())));
+  await s.job.tick();
+  assert.equal((await s.approvals.store.get(stop.id)).status, "pending", "the current report stays with KK");
+});
