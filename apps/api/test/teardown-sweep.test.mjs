@@ -2389,3 +2389,34 @@ test("M2.5-b5 decision 53 (Codex PR240-r49): a stop card stamped with the curren
   await s.job.tick();
   assert.equal((await s.approvals.store.get(stop.id)).status, "pending", "the current report stays with KK");
 });
+
+test("M2.5-b5 decision 54 (Codex PR240-r50): a current stop card written before the archive time still blocks a new purge card", async () => {
+  const s = setup();
+  const p = s.projects.get(P);
+  // The writing instance's clock runs behind: the card's creation time is before the project's archive time.
+  p.archivedAt = new Date(s.now() + 60_000);
+  await s.approvals.raiseCard(purgeStoppedCard({ id: P, slug: "acme", archivedAt: p.archivedAt }, "ownership_mismatch", { github: 1 }, new Date(s.now())));
+  s.advance(2 * 60_000);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 0, "no new purge card while the report is with KK");
+});
+
+test("M2.5-b5 decision 54 (Codex PR240-r50): the approved-card pass never starts a second purge while this process's purge runs", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  const taken = [];
+  const locked = s.job.d.locked;
+  s.job.d.locked = (id, fn) => { taken.push(id); return locked ? locked(id, fn) : fn(); };
+  s.job.purging.add(P);
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 0, "no purge starts behind the running one");
+  assert.deepEqual(taken, [], "no lock is queued");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-deferred" && l.approvalId === c.id && l.code === "purge-running"));
+  s.job.purging.delete(P);
+  s.advance(5 * 60_000);
+  await s.job.tick();
+  assert.equal(s.calls.purge.length, 1, "the approval purges once the earlier purge has ended");
+});

@@ -604,6 +604,12 @@ export class TeardownSweepJob {
     for (const c of scan.cards) {
       const pid = c.projectId;
       if (!pid || c.target !== target(pid) || seen.has(pid) || this.waitForDaily.has(c.id) || this.stopped.has(c.id)) continue;
+      // Decision 54 (Codex PR240-r50): a purge of this process still running for the project holds its lock, so a second
+      // approval would only queue behind it and spend the tick; it is left for a later tick, as the other passes do.
+      if (this.purging.has(pid)) {
+        this.d.log({ level: "info", msg: "teardown-purge-deferred", projectId: pid, approvalId: c.id, code: "purge-running" });
+        continue;
+      }
       // Decision 52 (Codex PR240-r48): a failed read skips only this card (it is retried when the scan comes round
       // again), so one approval whose lookups keep failing never holds back the cards after it or the resume point.
       let grant: string | null;
@@ -1071,7 +1077,9 @@ export class TeardownSweepJob {
     // Decision 18 (Codex PR240-r14): only a pending stop card naming this archive blocks it; another archive's is closed
     // by the tick's first pass.
     const stops = await this.d.cards({ status: "pending", action: PURGE_STOPPED_ACTION, target: target(p.id), limit: CARD_PAGE });
-    if (stops.some((c) => c.projectId === p.id && raisedThisArchive(c, p))) return false;
+    // Decision 54 (Codex PR240-r50): as in cleanup (decision 53), a stop card names the current archive by its stamp
+    // alone, so a report written by an instance whose clock runs behind still blocks a new purge card.
+    if (stops.some((c) => c.projectId === p.id && stopNamesArchive(c, p))) return false;
     // Decision 7 (Codex PR240-r3): only a card KK left unanswered for its whole 7-day window counts against the
     // re-raise; a card expired early (a stale or unproven card, a Restore) was never his to answer.
     return period.filter((c) => c.status === "expired" && unanswered(c)).length < MAX_UNANSWERED;
