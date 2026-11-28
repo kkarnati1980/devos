@@ -477,3 +477,30 @@ test("Codex PR239-r19: an ungated policy blocks the cycle before anything is rea
   assert.deepEqual(await probeCycleStart(projectDb("live"), PID, 1234, async () => false, async () => true), { blocked: "probe-purge-not-approved" });
   await assert.rejects(probeCycleStart(projectDb("live"), PID, 1234, async () => true, async () => { throw new Error("db"); }), /db/);
 });
+
+test("Codex PR239-r34: the grant is chosen for the stage probePurge reads, so a Restore never spends an archived-only grant on an Archive", async () => {
+  const asked = [];
+  const authorizeFor = async (stage) => { asked.push(stage); return async () => "allow"; };
+  // Restored before probePurge's read: the grant asked for covers the Archive and the Purge ("live", not "archived").
+  const live = purgeDeps({ authorize: undefined, authorizeFor });
+  assert.equal(await probePurge(PID, live), "done");
+  assert.deepEqual(asked, ["live"]);
+  assert.deepEqual(live.calls.map((c) => c[0]), ["archive", "purge"]);
+  // Archived: only the purge's use is needed, and no Archive runs.
+  asked.length = 0;
+  const arch = purgeDeps({ authorize: undefined, authorizeFor, stage: async () => "archived" });
+  assert.equal(await probePurge(PID, arch), "done");
+  assert.deepEqual(asked, ["archived"]);
+  assert.deepEqual(arch.calls.map((c) => c[0]), ["purge"]);
+  // No grant for the stage read: purge-permission, and nothing is archived or purged.
+  const none = purgeDeps({ authorize: undefined, authorizeFor: async () => null, wiring: async () => { throw new Error("must not build"); } });
+  assert.deepEqual(await probePurge(PID, none), { error: "purge-permission:approval_required" });
+  assert.deepEqual(none.calls, []);
+  // A failed grant lookup is not turned into a purge code; it fails the tick as before.
+  await assert.rejects(probePurge(PID, purgeDeps({ authorize: undefined, authorizeFor: async () => { throw new Error("grant-read-timeout"); } })), /grant-read-timeout/);
+  // A purged row is done without asking for a grant.
+  asked.length = 0;
+  const gone = purgeDeps({ authorize: undefined, authorizeFor, stage: async () => "purged" });
+  assert.equal(await probePurge(PID, gone), "done");
+  assert.deepEqual(asked, []);
+});
