@@ -203,3 +203,24 @@ test("M2.5-b5b decisions 1–2: Archive stamps archived_at from the database clo
   const ev = await db.auditEvent.findFirst({ where: { projectId: s.p.id, action: "teardown.archived" } });
   assert.equal(ev.details.purgeAfter, row.purgeAfter.toISOString());
 });
+
+test("M2.5-b5b decision 11 (Codex PR244-r1): a new Archive retires every earlier purge card: grants revoked, pending expired", async () => {
+  const s = await setup();
+  await s.provision();
+  const target = `project:${s.p.id}`;
+  // From an earlier archive: an approved card with an unspent grant, and a pending one (app-clock times far ahead).
+  const ahead = new Date(Date.now() + 10 * 60_000);
+  const approved = await db.approval.create({ data: { projectId: s.p.id, gate: "purge", action: "teardown.purge", target, reason: "old", status: "approved", decidedAt: ahead, decidedBy: "kk", confirmationHash: "h", createdAt: ahead } });
+  const grant = await db.approvalGrant.create({ data: { approvalId: approved.id, projectId: s.p.id, scopeAction: "teardown.purge", issuedBy: "kk:test", expiresAt: new Date(Date.now() + 86_400_000) } });
+  const pending = await db.approval.create({ data: { projectId: s.p.id, gate: "purge", action: "teardown.purge", target, reason: "old pending", createdAt: ahead } });
+  const otherAction = await db.approval.create({ data: { projectId: s.p.id, gate: "decision", action: "teardown.purge_stopped", target, reason: "not a purge card" } });
+  const out = await archiveProject(s.p.id, { store: s.store, ops: s.ops, authorize: allowAll });
+  const g = await db.approvalGrant.findUnique({ where: { id: grant.id } });
+  assert.deepEqual(g.revokedAt, out.archivedAt, "the old card's unspent grant is revoked, though its time sorts after the archive");
+  const p = await db.approval.findUnique({ where: { id: pending.id } });
+  assert.equal(String(p.status), "expired");
+  assert.equal(String((await db.approval.findUnique({ where: { id: approved.id } })).status), "approved", "a decided card keeps its status");
+  assert.equal(String((await db.approval.findUnique({ where: { id: otherAction.id } })).status), "pending", "other actions are untouched");
+  const ev = await db.auditEvent.findFirst({ where: { projectId: s.p.id, action: "teardown.archive_retired_cards" } });
+  assert.deepEqual(ev.details, { grantsRevoked: 1, cardsExpired: 1 });
+});

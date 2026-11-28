@@ -915,8 +915,12 @@ export class PrismaApprovalStore implements ApprovalStore {
       if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
       // M2.5-b5b decision 1 (supersedes b5a decisions 9 and 10 here): the due check and the card's date use the one
       // database clock that also stamped `archived_at` and `purge_after`; the caller's app-clock `now` is unused.
-      const at = row.dbNow instanceof Date && Number.isFinite(row.dbNow.getTime()) ? row.dbNow : null;
-      if (!at) throw new ApprovalError("clock-unreadable", 503);
+      const db = row.dbNow instanceof Date && Number.isFinite(row.dbNow.getTime()) ? row.dbNow : null;
+      if (!db) throw new ApprovalError("clock-unreadable", 503);
+      // Decision 12 (Codex PR244-r1, medium): an archive stamped by the app clock before b5b may sit ahead of the
+      // database clock; the card is then dated at its archive, never before it, so the sweep honours it. On a database
+      // archive `dbNow` (read after the lock) is already at or after `archived_at`, so this changes nothing there.
+      const at = row.archivedAt && row.archivedAt.getTime() > db.getTime() ? new Date(row.archivedAt.getTime()) : db;
       const code = guardRefusal(row, guard, at);
       if (code) return { refused: code };
       return this.raiseIn(tx, input, [], a, at);

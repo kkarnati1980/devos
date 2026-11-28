@@ -149,3 +149,11 @@ test("Codex PR242-r7: the raise's row lock does not block a foreign-key check (F
     await other.end();
   }
 });
+
+test("M2.5-b5b decision 12 (Codex PR244-r1): an app-clock archive ahead of the database dates its early card at the archive, never before", async () => {
+  const archivedAt = new Date(Date.now() + 10 * 60_000); // stamped before b5b by an app clock 10 minutes ahead
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(archivedAt.getTime() + 30 * DAY) });
+  const c = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false });
+  assert.equal(c.createdAt.getTime(), archivedAt.getTime(), "the sweep's created_at >= archived_at holds");
+  assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "not-due" }, "the daily raise stays not due");
+});

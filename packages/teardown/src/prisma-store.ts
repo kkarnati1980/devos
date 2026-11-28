@@ -71,6 +71,27 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
         RETURNING project.archived_at AS "archivedAt", project.purge_after AS "purgeAfter"`;
       const row = rows[0];
       if (!row || !(row.archivedAt instanceof Date) || !(row.purgeAfter instanceof Date)) throw new Error("project_not_found");
+      // M2.5-b5b decision 11 (Codex PR244-r1, high): a new Archive retires every earlier purge card of the project in
+      // the same transaction, so no card is bound to an archive by comparing times from two clocks. An earlier card's
+      // unspent grants are revoked and a pending one expires; only a card raised in this archive can then purge it.
+      const target = `project:${projectId}`;
+      // Pre-review (r1 fix): expire first, then revoke. `approve` issues its grant before it decides the card, so a
+      // card it approved before the expiry has a committed grant the later revoke sees; one it decides after waits on
+      // this row lock, finds the card expired, and revokes its own grant.
+      const expired: number = await tx.$executeRaw`
+        UPDATE approval SET status = 'expired', decided_at = ${row.archivedAt}::timestamptz, decided_by = 'system:teardown.archive', updated_at = ${row.archivedAt}::timestamptz
+        WHERE project_id = ${projectId}::uuid AND action = 'teardown.purge' AND target = ${target} AND status = 'pending'`;
+      const revoked: number = await tx.$executeRaw`
+        UPDATE approval_grant SET revoked_at = ${row.archivedAt}::timestamptz
+        WHERE revoked_at IS NULL AND approval_id IN (
+          SELECT id FROM approval WHERE project_id = ${projectId}::uuid AND action = 'teardown.purge' AND target = ${target})`;
+      if (revoked > 0 || expired > 0) {
+        await tx.auditEvent.create({ data: {
+          actor: "system", projectId, action: "teardown.archive_retired_cards",
+          summary: "Earlier purge cards retired by a new Archive",
+          details: { grantsRevoked: revoked, cardsExpired: expired },
+        } });
+      }
       await tx.auditEvent.create({ data: {
         actor: "system", projectId, action: "teardown.archived",
         summary: `Project archived; purge only after KK confirms (not before ${row.purgeAfter.toISOString()})`,
