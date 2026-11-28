@@ -676,21 +676,31 @@ test("M2.5-b5a: the daily run never queues behind this process's own running pur
   finish({ purged: true, report: { hits: [], errors: [] } });
 });
 
-test("Codex PR242-r4: guardedAt never looks at purge_after; it floors every card at archived_at only", async () => {
-  const { guardedAt, guardRefusal } = await import("../dist/approvals.js");
+test("Codex PR242-r4/r5: a guarded card is dated by the app clock alone, and the due check uses that clock", async () => {
+  const { guardRefusal, Approvals, MemoryApprovalStore } = await import("../dist/approvals.js");
   const archivedAt = new Date(T0 - 31 * DAY);
   const purgeAfter = new Date(T0 + 60_000); // 1 minute ahead of the app clock T0
-  const row = { stage: "archived", archivedAt, purgeAfter };
-  assert.equal(guardedAt(row, new Date(T0)).getTime(), T0, "a purge_after in the future never moves the card's date");
-  assert.equal(guardedAt({ ...row, purgeAfter: null }, new Date(T0)).getTime(), T0, "same date with or without purge_after");
-  assert.equal(guardedAt(row, new Date(T0 - 40 * DAY)).getTime(), archivedAt.getTime(), "never before its archive");
-  // One clock: at app time T0 this row is not yet due, so no daily card can be dated before purge_after.
+  let row = { stage: "archived", archivedAt, purgeAfter };
   const g = { projectId: P, archivedAt, due: true };
+  // One clock: at app time T0 this row is not yet due.
   assert.equal(guardRefusal(row, g, new Date(T0)), "not-due");
-  // A daily card raised just after purge_after on the app clock is dated after it.
-  const later = new Date(purgeAfter.getTime() + 1);
-  assert.equal(guardRefusal(row, g, later), null);
-  assert.ok(guardedAt(row, later).getTime() > purgeAfter.getTime(), "dated after purge_after");
+  assert.equal(guardRefusal(row, g, new Date(purgeAfter.getTime() + 1)), null);
+  let appNow = purgeAfter.getTime() + 1;
+  const store = new MemoryApprovalStore();
+  store.guardRow = () => row;
+  const ap = new Approvals({ store, grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
+  const P2 = "11111111-2222-4333-8444-666666666666";
+  // A daily card raised just after purge_after on the app clock is dated after it: never floored at purge_after (r4).
+  const daily = await ap.raiseGuardedCard(purgeCard({ id: P, slug: "acme" }, {}), g);
+  assert.equal(daily.createdAt.getTime(), appNow);
+  assert.ok(daily.createdAt.getTime() > purgeAfter.getTime());
+  // r5: an app clock moved back behind archived_at dates the card by that clock, never floored at archived_at, so the
+  // card cannot pass "raised this archive" for this archive or for a later one archived after that clock time.
+  appNow = archivedAt.getTime() - DAY;
+  row = { stage: "archived", archivedAt, purgeAfter: new Date(T0 + 10 * DAY) };
+  const early = await ap.raiseGuardedCard(purgeCard({ id: P2, slug: "beta" }, {}), { projectId: P2, archivedAt, due: false });
+  assert.equal(early.createdAt.getTime(), appNow, "no archived_at floor");
+  assert.ok(early.createdAt.getTime() < archivedAt.getTime());
 });
 
 test("Codex PR242-r3 (2): an early ask whose project starts purging during its awaits never calls the locked raise", async () => {
