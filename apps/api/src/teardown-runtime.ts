@@ -141,6 +141,8 @@ export const PURGE_LOCK_WAIT_MS = 60_000;
 export interface TeardownSweepCards {
   list(f: { status?: string; action: string; target?: string; limit: number }): Promise<PurgeCardLike[]>;
   raise(card: unknown): Promise<unknown>;
+  /** M2.5-b5a: `Approvals.raiseGuardedCard` (the raise under the project's lifecycle lock). */
+  raiseLocked(card: unknown, guard: { projectId: string; archivedAt: Date; due: boolean }): Promise<{ id: string } | { refused: string }>;
   expire(ids: readonly string[], reason: string): Promise<string[]>;
 }
 
@@ -204,6 +206,7 @@ export function buildTeardownSweep(w: {
   const cards = w.cards;
   const q = teardownSweepQueries(w.db, w.timeoutMs);
   return new TeardownSweepJob({
+    // Codex PR242-r4 (decision 9): the due cutoff is the app clock, the one the guarded raise checks and dates by.
     listDue: q.listDue,
     project: async (id) => {
       const p = await store.project(id);
@@ -216,6 +219,7 @@ export function buildTeardownSweep(w: {
     },
     cards: (f) => cards.list(f),
     raise: (card) => cards.raise(card),
+    raiseLocked: (card, g) => cards.raiseLocked(card, { projectId: card.projectId, archivedAt: g.archivedAt, due: g.due }),
     expire: (ids, reason) => cards.expire(ids, reason),
     unspentGrant: q.unspentGrant,
     purge: async (projectId, grantId, cardCreatedAt) => {
