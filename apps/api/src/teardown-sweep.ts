@@ -379,7 +379,12 @@ export class TeardownSweepJob {
     for (const p of due) {
       try {
         // M2.5-b5a: never queue behind this process's own running purge (it may run past its limit holding the lock).
-        if (!p.archivedAt || this.purging.has(p.id) || !(await this.shouldRaise(p))) continue;
+        if (!p.archivedAt) continue;
+        if (this.purging.has(p.id)) {
+          this.d.log({ level: "info", msg: "teardown-purge-card-skipped", projectId: p.id, code: "purge-running" });
+          continue;
+        }
+        if (!(await this.shouldRaise(p))) continue;
         const r = await this.d.raiseLocked(purgeCard(p, await this.d.activeCounts(p.id)), { archivedAt: p.archivedAt, due: true });
         if ("refused" in r) {
           // Purged, restored, archived again or kept archived since listDue: the locked re-read is the newer word.

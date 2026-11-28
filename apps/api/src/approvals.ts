@@ -595,7 +595,7 @@ export function guardRefusal(row: GuardRow, g: RaiseGuard, now: Date): string | 
 }
 
 /** The provisioning lock's key (packages/provision, packages/teardown hold it as a session lock); same key space. */
-export const PROJECT_LOCK_SQL = "SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:provision'), hashtext($1))) AS l";
+export const PROJECT_LOCK_SQL = "SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:provision'), hashtext($1::text))) AS l";
 
 /** In-memory store for tests and local runs: same semantics as the Postgres store, serialised by a promise lock. */
 export class MemoryApprovalStore implements ApprovalStore {
@@ -897,7 +897,10 @@ export class PrismaApprovalStore implements ApprovalStore {
       if (!row) return { refused: "project-not-found" };
       const code = guardRefusal(row, guard, row.now);
       if (code) return { refused: code };
-      return this.raiseIn(tx, input, [], a, row.now);
+      // Until M2.5-b5b writes archived_at from the database clock too, a card raised under the lock after the archive
+      // committed is never dated before it (pre-review low 1): the later of the two times.
+      const at = row.archivedAt && row.archivedAt.getTime() > row.now.getTime() ? row.archivedAt : row.now;
+      return this.raiseIn(tx, input, [], a, at);
     });
   }
 
