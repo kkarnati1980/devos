@@ -183,3 +183,23 @@ test("AT6 on Postgres: a vault secret left for the project is a leftover (listed
   assert.deepEqual(out.report.hits.map((h) => `${h.provider}:${h.name}`), ["vault:APP_SESSION_SECRET"]);
   assert.equal((await db.project.findUnique({ where: { id: s.p.id } })).stage, "archived");
 });
+
+test("M2.5-b5b decisions 1–2: Archive stamps archived_at from the database clock in whole ms and returns what it stored", async () => {
+  const s = await setup();
+  await s.provision();
+  // The app clock is pinned far from Postgres: it only carries the 30-day window.
+  const appNow = Date.parse("2001-01-01T00:00:00Z");
+  const before = (await db.$queryRaw`SELECT clock_timestamp() AS t`)[0].t.getTime();
+  const out = await archiveProject(s.p.id, { store: s.store, ops: s.ops, authorize: allowAll, now: () => appNow });
+  const afterT = (await db.$queryRaw`SELECT clock_timestamp() AS t`)[0].t.getTime();
+  const row = await db.project.findUnique({ where: { id: s.p.id } });
+  assert.deepEqual(out, { archivedAt: row.archivedAt, purgeAfter: row.purgeAfter }, "the times the row holds");
+  assert.ok(row.archivedAt.getTime() >= before - 1 && row.archivedAt.getTime() <= afterT, "the database clock, not 2001");
+  assert.equal(row.purgeAfter.getTime() - row.archivedAt.getTime(), 30 * 86_400_000);
+  const ms = (await db.$queryRaw`SELECT (archived_at = date_trunc('milliseconds', archived_at)) AS a, (purge_after = date_trunc('milliseconds', purge_after)) AS b FROM project WHERE id = ${s.p.id}::uuid`)[0];
+  assert.deepEqual([ms.a, ms.b], [true, true], "whole milliseconds, so the millisecond Date every reader gets equals the column");
+  const exact = (await db.$queryRaw`SELECT (archived_at = ${out.archivedAt}::timestamptz) AS eq FROM project WHERE id = ${s.p.id}::uuid`)[0];
+  assert.equal(exact.eq, true, "the returned snapshot passes the guarded raise's exact archive check");
+  const ev = await db.auditEvent.findFirst({ where: { projectId: s.p.id, action: "teardown.archived" } });
+  assert.equal(ev.details.purgeAfter, row.purgeAfter.toISOString());
+});

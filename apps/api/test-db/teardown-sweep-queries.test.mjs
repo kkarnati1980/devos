@@ -1,9 +1,10 @@
 // DEVOS-112 follow-up (M2.5-b2, docs/modules/M2.5.md "M2.5-b2 follow-up: the sweep's queries on Postgres"):
-// the teardown sweep's production queries (listDue, unspentGrant, Keep archived's conditional update) against real
+// the teardown sweep's production queries (listDue, unspentGrant, Keep archived's locked conditional update (M2.5-b5b decision 3)) against real
 // Postgres, through the exact code `buildTeardownSweep` uses (`teardownSweepQueries`).
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import pg from "pg";
 import { createDb } from "@devos/db";
 import { teardownSweepQueries } from "../dist/teardown-runtime.js";
 
@@ -76,43 +77,98 @@ test("unspentGrant: an unrevoked, unexpired, unused grant of that card only; a u
   assert.equal(await q.unspentGrant(other.id, now), null, "another card's grant is never returned");
 });
 
-test("keepArchived: moves purge_after only from the expected value, once, with one audit row; a stale value or a restored project changes nothing", async () => {
-  const from = new Date(Date.UTC(2030, 5, 1));
-  const to = new Date(from.getTime() + 30 * DAY);
-  const p = await mk({ stage: "archived", archivedAt: new Date(from.getTime() - 30 * DAY), purgeAfter: from });
-  const c = await card(p.id);
-  const audit = () => db.auditEvent.findMany({ where: { projectId: p.id, action: "teardown.keep_archived" } });
-  const purgeAfter = async (id) => (await db.project.findUnique({ where: { id }, select: { purgeAfter: true } })).purgeAfter;
+// M2.5-b5b decision 3: Keep archived is one statement under the lifecycle lock on the database clock. It moves
+// purge_after once, to the later of purge_after and the database now plus 30 days, only for a rejected card raised in
+// this archive at or after purge_after.
+const KEEP = 30 * DAY;
+const rejected = (projectId, createdAt) =>
+  db.approval.create({ data: { projectId, gate: "purge", action: "teardown.purge", target: `project:${projectId}`, reason: "test purge card", status: "rejected", decidedAt: createdAt, createdAt } });
+const purgeAfterOf = async (id) => (await db.project.findUnique({ where: { id }, select: { purgeAfter: true } })).purgeAfter;
+const dbNow = async () => (await db.$queryRaw`SELECT clock_timestamp() AS t`)[0].t.getTime();
 
-  assert.equal(await q.keepArchived(p.id, from, to, c.id), true);
-  assert.deepEqual(await purgeAfter(p.id), to);
+test("keepArchived: a past purge_after moves once from the database now, with one audit row; a repeat, a stale value or a restored project changes nothing", async () => {
+  const from = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt: new Date(from.getTime() - 30 * DAY), purgeAfter: from });
+  const c = await rejected(p.id, new Date(from.getTime() + 1000));
+  const audit = () => db.auditEvent.findMany({ where: { projectId: p.id, action: "teardown.keep_archived" } });
+
+  const before = await dbNow();
+  const to = await q.keepArchived(p.id, from, c.id);
+  const afterT = await dbNow();
+  assert.ok(to instanceof Date);
+  assert.ok(to.getTime() >= before - 1 + KEEP && to.getTime() <= afterT + KEEP, "the database now plus 30 days");
+  assert.deepEqual(await purgeAfterOf(p.id), to);
   const ev = await audit();
   assert.equal(ev.length, 1);
   assert.equal(String(ev[0].actor), "system");
   assert.equal(ev[0].summary, "Kept archived another 30 days (purge card rejected)");
   assert.deepEqual(ev[0].details, { approvalId: c.id, purgeAfter: to.toISOString() });
 
-  assert.equal(await q.keepArchived(p.id, from, new Date(to.getTime() + 30 * DAY), c.id), false, "a repeat from the old value is a no-op");
-  assert.deepEqual(await purgeAfter(p.id), to);
+  assert.equal(await q.keepArchived(p.id, from, c.id), null, "a repeat from the old value is a no-op");
+  assert.equal(await q.keepArchived(p.id, to, c.id), null, "the same card again moves nothing: it is now before purge_after");
+  assert.deepEqual(await purgeAfterOf(p.id), to);
   assert.equal((await audit()).length, 1, "a no-op writes no audit row");
 
   const restored = await mk({ stage: "building", purgeAfter: from });
-  assert.equal(await q.keepArchived(restored.id, from, to, c.id), false, "a project no longer archived is not moved");
-  assert.deepEqual(await purgeAfter(restored.id), from);
+  const rc = await rejected(restored.id, new Date(from.getTime() + 1000));
+  assert.equal(await q.keepArchived(restored.id, from, rc.id), null, "a project no longer archived is not moved");
+  assert.deepEqual(await purgeAfterOf(restored.id), from);
+});
+
+test("keepArchived: a future purge_after moves from itself; an early-ask card, another archive's card or a pending card moves nothing", async () => {
+  const from = new Date(Date.UTC(2030, 5, 1));
+  const archivedAt = new Date(from.getTime() - 30 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: from });
+  const early = await rejected(p.id, new Date(from.getTime() - DAY));
+  assert.equal(await q.keepArchived(p.id, from, early.id), null, "an early ask (before purge_after) moves nothing");
+  const old = await mk({ stage: "archived", archivedAt: new Date(from.getTime() + DAY), purgeAfter: from });
+  const oldCard = await rejected(old.id, new Date(from.getTime() + 1000));
+  assert.equal(await q.keepArchived(old.id, from, oldCard.id), null, "a card raised before this archive moves nothing");
+  const pending = await card(p.id);
+  await db.$executeRaw`UPDATE approval SET created_at = ${new Date(from.getTime() + 1000)}::timestamptz WHERE id = ${pending.id}::uuid`;
+  assert.equal(await q.keepArchived(p.id, from, pending.id), null, "a card that is not rejected moves nothing");
+  const other = await mk({ stage: "archived", archivedAt, purgeAfter: from });
+  const otherCard = await rejected(other.id, new Date(from.getTime() + 1000));
+  assert.equal(await q.keepArchived(p.id, from, otherCard.id), null, "another project's card moves nothing");
+  assert.deepEqual(await purgeAfterOf(p.id), from);
+  const ok = await rejected(p.id, new Date(from.getTime() + 1000));
+  assert.deepEqual(await q.keepArchived(p.id, from, ok.id), new Date(from.getTime() + KEEP), "from purge_after itself while it is in the future");
+});
+
+test("keepArchived: waits for a held lifecycle lock and then reads the row its holder left", async () => {
+  const from = new Date(Date.now() - DAY);
+  const p = await mk({ stage: "archived", archivedAt: new Date(from.getTime() - 30 * DAY), purgeAfter: from });
+  const c = await rejected(p.id, new Date(from.getTime() + 1000));
+  const holder = new pg.Client({ connectionString: url });
+  await holder.connect();
+  try {
+    await holder.query("SELECT pg_advisory_lock(hashtext('devos:provision'), hashtext($1))", [p.id]);
+    let settled = false;
+    const keeping = q.keepArchived(p.id, from, c.id).finally(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(settled, false, "Keep archived waits on the lifecycle lock");
+    // The holder (a Restore) moves the row out of the archive before it lets go.
+    await holder.query("UPDATE project SET stage = 'building', archived_at = NULL, purge_after = NULL WHERE id = $1::uuid", [p.id]);
+    await holder.query("SELECT pg_advisory_unlock(hashtext('devos:provision'), hashtext($1))", [p.id]);
+    assert.equal(await keeping, null);
+    assert.equal(await purgeAfterOf(p.id), null);
+  } finally {
+    await holder.end();
+  }
 });
 
 test("keepArchived: a failed audit insert rolls the purge_after move back", async () => {
   const from = new Date(Date.UTC(2031, 0, 1));
-  const p = await mk({ stage: "archived", archivedAt: from, purgeAfter: from });
+  const p = await mk({ stage: "archived", archivedAt: new Date(from.getTime() - 30 * DAY), purgeAfter: from });
+  const c = await rejected(p.id, new Date(from.getTime() + 1000));
   // The audit insert is made to fail inside the same real transaction: the transaction client is wrapped so that
   // only auditEvent.create throws, after the real project update has run.
   const failing = {
     $transaction: (fn, opts) =>
-      db.$transaction((t) => fn(new Proxy(t, { get: (o, k) => (k === "auditEvent" ? { create: async () => { throw new Error("audit down"); } } : o[k]) })), opts),
+      db.$transaction((t) => fn(new Proxy(t, { get: (o, k) => (k === "auditEvent" ? { create: async () => { throw new Error("audit down"); } } : typeof o[k] === "function" ? o[k].bind(o) : o[k]) })), opts),
   };
   const qf = teardownSweepQueries(failing, 5000);
-  await assert.rejects(qf.keepArchived(p.id, from, new Date(from.getTime() + 30 * DAY), "x"), /audit down/);
-  const row = await db.project.findUnique({ where: { id: p.id }, select: { purgeAfter: true } });
-  assert.deepEqual(row.purgeAfter, from, "the update is rolled back with the failed audit insert");
+  await assert.rejects(qf.keepArchived(p.id, from, c.id), /audit down/);
+  assert.deepEqual(await purgeAfterOf(p.id), from, "the update is rolled back with the failed audit insert");
   assert.equal((await db.auditEvent.findMany({ where: { projectId: p.id, action: "teardown.keep_archived" } })).length, 0);
 });

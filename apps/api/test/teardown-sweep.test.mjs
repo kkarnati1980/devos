@@ -74,12 +74,16 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
       return [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses === 0)?.id ?? null;
     },
     purge,
-    keepArchived: async (id, from, to, approvalId) => {
+    // M2.5-b5b decision 3: the store's rule, on the job's clock (Postgres uses its own under the lifecycle lock).
+    keepArchived: async (id, from, approvalId) => {
       const p = projects.get(id);
-      if (!p || p.stage !== "archived" || p.purgeAfter?.getTime() !== from.getTime()) return false;
+      if (!p || p.stage !== "archived" || p.purgeAfter?.getTime() !== from.getTime()) return null;
+      const c = (await approvals.store.list({ status: "rejected", action: PURGE_ACTION, limit: 50 })).find((x) => x.id === approvalId);
+      if (!c || c.projectId !== id || c.createdAt.getTime() < from.getTime() || (p.archivedAt && c.createdAt.getTime() < p.archivedAt.getTime())) return null;
+      const to = new Date(Math.max(from.getTime(), now) + KEEP_ARCHIVED_MS);
       p.purgeAfter = to;
       calls.keep.push({ id, to, approvalId });
-      return true;
+      return to;
     },
     log: (e) => logs.push(e),
     now: () => now,
@@ -370,8 +374,13 @@ test("pre-review 6: the production queries: an unspent grant only, and Keep arch
   const seen = [];
   const tx = {
     approvalGrant: { findMany: async (q) => { seen.push(["grant", q]); return [{ id: "g1", uses: 0, maxUses: 1 }]; } },
-    project: { updateMany: async (q) => { seen.push(["update", q]); return { count: 1 }; } },
     auditEvent: { create: async (q) => { seen.push(["audit", q]); return {}; } },
+    $queryRawUnsafe: async (sql, ...args) => { seen.push(["lock", sql, args]); return [{ locked: 1 }]; },
+    $queryRaw: async (strings, ...vals) => {
+      const sql = strings.join("?");
+      seen.push([sql.includes("UPDATE project") ? "update" : "raw", sql, vals]);
+      return sql.includes("UPDATE project") ? [{ purgeAfter: new Date(T0 + KEEP_ARCHIVED_MS) }] : [{}];
+    },
   };
   const db = { $transaction: async (fn, o) => { seen.push(["tx", o]); return fn(tx); } };
   class Store { project() { return null; } activeResources() { return []; } }
@@ -387,8 +396,15 @@ test("pre-review 6: the production queries: an unspent grant only, and Keep arch
   const g = seen.find((x) => x[0] === "grant")[1];
   assert.deepEqual(g.where, { approvalId: "a1", revokedAt: null, expiresAt: { gt: now }, uses: 0 });
   const from = new Date(T0), to = new Date(T0 + KEEP_ARCHIVED_MS);
-  assert.equal(await job.d.keepArchived(P, from, to, "a1"), true);
-  assert.deepEqual(seen.find((x) => x[0] === "update")[1], { where: { id: P, stage: "archived", purgeAfter: from }, data: { purgeAfter: to } });
+  assert.deepEqual(await job.d.keepArchived(P, from, "a1"), to);
+  // M2.5-b5b decision 3: the lifecycle lock first, then one conditional update on the database clock.
+  const order = seen.filter((x) => x[0] === "lock" || x[0] === "update").map((x) => x[0]);
+  assert.deepEqual(order, ["lock", "update"]);
+  assert.deepEqual(seen.find((x) => x[0] === "lock")[2], [P]);
+  const [, sql, vals] = seen.find((x) => x[0] === "update");
+  for (const part of ["clock_timestamp()", "greatest(project.purge_after, n.t)", "project.stage = 'archived'", "project.purge_after = ?::timestamptz",
+    "a.status = 'rejected'", "a.created_at >= project.purge_after", "a.created_at >= project.archived_at"]) assert.ok(sql.includes(part), part);
+  assert.deepEqual(vals, [KEEP_ARCHIVED_MS, P, from, "a1"]);
   const audit = seen.find((x) => x[0] === "audit")[1].data;
   assert.equal(audit.action, "teardown.keep_archived");
   assert.equal(audit.details.approvalId, "a1");

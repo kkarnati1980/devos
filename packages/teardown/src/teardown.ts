@@ -35,8 +35,12 @@ export interface TeardownStore {
   withProjectLock<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
   assertLockHeld(projectId: string): Promise<void>;
   project(projectId: string): Promise<TeardownProject | null>;
-  /** stage → archived, remembering the previous stage; sets archived_at and purge_after. */
-  markArchived(projectId: string, at: Date, purgeAfter: Date): Promise<void>;
+  /**
+   * stage → archived, remembering the previous stage; sets archived_at and purge_after. M2.5-b5b decisions 1–2: returns
+   * the times it stored. The Postgres store ignores `at` and stamps `archived_at` from the database clock in whole
+   * milliseconds, with `purge_after` the same window (`purgeAfter - at`) after it; the memory store stores `at` as given.
+   */
+  markArchived(projectId: string, at: Date, purgeAfter: Date): Promise<{ archivedAt: Date; purgeAfter: Date }>;
   /** stage → previous stage; clears archived_at and purge_after. */
   markRestored(projectId: string): Promise<void>;
   /** The project's active inventory rows, oldest first. */
@@ -239,8 +243,8 @@ export async function archiveProject(projectId: string, opts: ArchiveOptions): P
     }
     const at = new Date((opts.now ?? Date.now)());
     const purgeAfter = new Date(at.getTime() + windowDays * DAY_MS);
-    await opts.store.markArchived(projectId, at, purgeAfter);
-    return { archivedAt: at, purgeAfter };
+    // M2.5-b5b decision 2: what the store wrote (the database clock in Postgres), never the app clock's guess.
+    return opts.store.markArchived(projectId, at, purgeAfter);
   });
 }
 

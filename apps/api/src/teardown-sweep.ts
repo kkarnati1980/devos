@@ -87,8 +87,12 @@ export interface TeardownSweepDeps {
    * re-read under the project lock, the card is not older than the project's `archived_at`.
    */
   purge(projectId: string, grantId: string, cardCreatedAt: Date): Promise<PurgeResultLike>;
-  /** `purge_after` from `from` to `to`, only while the project is archived and `purge_after` is still `from`. */
-  keepArchived(projectId: string, from: Date, to: Date, approvalId: string): Promise<boolean>;
+  /**
+   * M2.5-b5b decision 3: under the lifecycle lock, `purge_after` from `from` to the later of `from` and the store's
+   * now, plus 30 days, only while the project is archived at `from` and the rejected card `approvalId` was raised in
+   * this archive at or after `purge_after`. The new `purge_after`, or null when nothing moved.
+   */
+  keepArchived(projectId: string, from: Date, approvalId: string): Promise<Date | null>;
   log(e: { level: "info" | "warn"; msg: string; projectId?: string; code?: string; approvalId?: string }): void;
   now?: () => number;
   intervalMs?: number;
@@ -270,9 +274,9 @@ export class TeardownSweepJob {
       // A card raised before purge_after (an early ask) leaves purge_after as it is; a moved purge_after is later than
       // the card, so each rejection moves it once.
       if (!p || p.stage !== "archived" || !p.purgeAfter || c.createdAt.getTime() < p.purgeAfter.getTime()) continue;
-      const from = p.purgeAfter;
-      const base = Math.max(from.getTime(), (c.decidedAt ?? c.createdAt).getTime());
-      if (await this.d.keepArchived(p.id, from, new Date(base + KEEP_ARCHIVED_MS), c.id)) {
+      // M2.5-b5b decision 3: the read above only picks candidates; the store re-checks the card, the archive and
+      // `from` under the lifecycle lock on the database clock, and computes the new date there.
+      if (await this.d.keepArchived(p.id, p.purgeAfter, c.id)) {
         this.d.log({ level: "info", msg: "teardown-keep-archived", projectId: p.id, approvalId: c.id });
       }
     }

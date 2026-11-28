@@ -45,9 +45,10 @@ export class MemoryTeardownStore extends MemoryStore implements TeardownStore {
     this.projects.set(projectId, { ...p, ...change });
   }
 
-  async markArchived(projectId: string, at: Date, purgeAfter: Date): Promise<void> {
+  async markArchived(projectId: string, at: Date, purgeAfter: Date): Promise<{ archivedAt: Date; purgeAfter: Date }> {
     const p = this.projects.get(projectId);
     this.patch(projectId, { previousStage: p?.stage ?? null, stage: "archived", archivedAt: at, purgeAfter });
+    return { archivedAt: new Date(at.getTime()), purgeAfter: new Date(purgeAfter.getTime()) };
   }
 
   async markRestored(projectId: string): Promise<void> {

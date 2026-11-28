@@ -55,16 +55,28 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
     };
   }
 
-  async markArchived(projectId: string, at: Date, purgeAfter: Date): Promise<void> {
-    await this.tdb.$transaction(async (tx: any) => {
+  async markArchived(projectId: string, at: Date, purgeAfter: Date): Promise<{ archivedAt: Date; purgeAfter: Date }> {
+    const windowMs = purgeAfter.getTime() - at.getTime();
+    if (!Number.isSafeInteger(windowMs) || windowMs <= 0) throw new Error("archive window must be positive");
+    return this.tdb.$transaction(async (tx: any) => {
       const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true } });
       if (!p) throw new Error("project_not_found");
-      await tx.project.update({ where: { id: projectId }, data: { stage: "archived", archivedAt: at, purgeAfter } });
+      // M2.5-b5b decision 1: one database clock, cut to whole milliseconds, so the guarded raise's exact archive
+      // equality (b5a decision 7) holds for the millisecond Date every reader gets, and `purge_after` is the window
+      // after that same instant. `at` (the app clock) only carries the window.
+      const rows: { archivedAt: Date; purgeAfter: Date }[] = await tx.$queryRaw`
+        WITH n AS (SELECT date_trunc('milliseconds', clock_timestamp()) AS t)
+        UPDATE project SET stage = 'archived', archived_at = n.t, purge_after = n.t + (${windowMs}::bigint * interval '1 millisecond'), updated_at = n.t
+        FROM n WHERE project.id = ${projectId}::uuid
+        RETURNING project.archived_at AS "archivedAt", project.purge_after AS "purgeAfter"`;
+      const row = rows[0];
+      if (!row || !(row.archivedAt instanceof Date) || !(row.purgeAfter instanceof Date)) throw new Error("project_not_found");
       await tx.auditEvent.create({ data: {
         actor: "system", projectId, action: "teardown.archived",
-        summary: `Project archived; purge only after KK confirms (not before ${purgeAfter.toISOString()})`,
-        details: { previousStage: p.stage, purgeAfter: purgeAfter.toISOString() },
+        summary: `Project archived; purge only after KK confirms (not before ${row.purgeAfter.toISOString()})`,
+        details: { previousStage: p.stage, purgeAfter: row.purgeAfter.toISOString() },
       } });
+      return { archivedAt: row.archivedAt, purgeAfter: row.purgeAfter };
     }, { timeout: this.ms, maxWait: this.ms });
   }
 

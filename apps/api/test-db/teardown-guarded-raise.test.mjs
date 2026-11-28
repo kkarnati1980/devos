@@ -1,6 +1,6 @@
 // M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): the guarded purge-card raise against real Postgres. One
 // transaction takes the project's lifecycle lock (the same key Archive, Restore and Purge hold as a session lock),
-// re-reads the row (the due check at the app clock, decision 9) and writes the card only if the row is still the archive the caller read.
+// re-reads the row (the due check and the card's date at the database clock, M2.5-b5b decision 1) and writes the card only if the row is still the archive the caller read.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
@@ -15,7 +15,7 @@ const db = createDb(url);
 after(() => db.$disconnect());
 
 const DAY = 86_400_000;
-// The app clock is pinned far in the past (a clock moved back): cards are still dated by it, with no floor.
+// The app clock is pinned far in the past (a clock moved back). Since M2.5-b5b it neither dates cards nor runs the due check.
 const APP_NOW = Date.parse("2001-01-01T00:00:00Z");
 const approvals = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => APP_NOW });
 
@@ -25,33 +25,39 @@ const mk = async (data) => {
 };
 const cardsOf = (projectId) => db.approval.findMany({ where: { projectId, action: "teardown.purge" } });
 
-test("an archived, due row gets one card, dated by the app clock alone", async () => {
+// M2.5-b5b decision 1 (supersedes b5a decisions 9 and 10, whose two app-clock tests these replace): the due check
+// and the card's date use the database clock, read under the lock, whatever the app clock says.
+const dbNow = async () => (await db.$queryRaw`SELECT clock_timestamp() AS t`)[0].t.getTime();
+
+test("M2.5-b5b: an archived, due row gets one card, dated by the database clock in whole ms, with the app clock pinned to 2001", async () => {
   const archivedAt = new Date(Date.now() - 31 * DAY);
   const purgeAfter = new Date(Date.now() - DAY);
-  // Codex PR242-r4: the due check and the card's date use one clock, the app clock. With it ahead of purge_after the
-  // daily card is dated by the app clock itself (no purge_after floor).
-  const appNow = Date.now() + 5 * 60_000;
-  const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
   const p = await mk({ stage: "archived", archivedAt, purgeAfter });
-  const c = await ahead.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
-  assert.equal(typeof c.id, "string");
-  assert.equal(c.createdAt.getTime(), appNow, "a daily card: the app clock");
-  // Codex PR242-r5: the app clock pinned to 2001, behind the archive, dates an early ask's card with no archived_at floor.
+  const before = await dbNow();
+  const c = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
+  const afterT = await dbNow();
+  assert.equal(typeof c.id, "string", "due at the database clock, though the app clock (2001) is before purge_after");
+  assert.notEqual(c.createdAt.getTime(), APP_NOW);
+  assert.ok(c.createdAt.getTime() >= Math.floor(before) - 1 && c.createdAt.getTime() <= afterT, "dated by the database clock");
+  assert.ok(c.createdAt.getTime() > purgeAfter.getTime(), "a daily card is dated after purge_after");
+  const stored = (await db.$queryRaw`SELECT (created_at = date_trunc('milliseconds', created_at)) AS ms FROM approval WHERE id = ${c.id}::uuid`)[0];
+  assert.equal(stored.ms, true, "cut to whole milliseconds");
+  // An early ask on a row archived on the database clock is dated at or after its archive.
   const early = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + DAY) });
   const e = await approvals.raiseGuardedCard(purgeCard(early, {}), { projectId: early.id, archivedAt, due: false });
-  assert.equal(e.createdAt.getTime(), APP_NOW, "an early ask: the app clock, never floored at archived_at");
+  assert.ok(e.createdAt.getTime() >= archivedAt.getTime());
   assert.equal((await cardsOf(p.id)).length, 1);
   // A second guarded raise dedupes onto the pending card, as raiseCard does.
-  const again = await ahead.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
+  const again = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
   assert.equal(again.id, c.id);
   assert.equal((await cardsOf(p.id)).length, 1);
 });
 
-test("Codex PR242-r4: the app clock pinned before purge_after gives not-due, even though Postgres sees the row as due", async () => {
-  const archivedAt = new Date(Date.now() - 31 * DAY);
-  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
-  // `approvals` runs at 2001: purge_after (yesterday at the database clock) has not passed on the app clock.
-  assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "not-due" });
+test("M2.5-b5b: an app clock far ahead of purge_after is not used: not-due while the database is before it", async () => {
+  const archivedAt = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + DAY) });
+  const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => Date.now() + 365 * DAY });
+  assert.deepEqual(await ahead.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "not-due" });
   assert.equal((await cardsOf(p.id)).length, 0);
 });
 

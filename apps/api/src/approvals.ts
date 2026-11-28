@@ -168,7 +168,8 @@ export interface ApprovalStore {
   /**
    * M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): one transaction that takes the project's lifecycle lock,
    * re-reads the project row, and raises the card (as `raise`, no blockers) only if `guardRefusal` passes (the due
-   * check at the app clock `now`, the clock that dates the card). The card is dated by `now`, exactly as `raise` dates it. A dropped
+   * check and the card's date at one clock: the Postgres store reads the database clock under the lock, M2.5-b5b decision 1;
+   * the memory store uses `now`). A dropped
    * connection rolls the card back.
    */
   raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date): Promise<{ card: Card; created: boolean } | { refused: string }>;
@@ -587,9 +588,10 @@ export interface RaiseGuard {
 export type GuardRow = { stage: string; archivedAt: Date | null; purgeAfter: Date | null } | null;
 
 /**
- * Why a guarded raise is refused, read under the lock; null when it may raise. `now` is the app clock that also dates
- * the card (Codex PR242-r4: one clock for the due check and `createdAt`, so a daily card is due exactly when its
- * `createdAt` is at or after `purge_after`, with no floor).
+ * Why a guarded raise is refused, read under the lock; null when it may raise. `now` is the clock that also dates the
+ * card (Codex PR242-r4: one clock for the due check and `createdAt`, so a daily card is due exactly when its
+ * `createdAt` is at or after `purge_after`, with no floor). Since M2.5-b5b the Postgres store passes the database
+ * clock, the one Archive stamps `archived_at` and `purge_after` with; the memory store passes its injected clock.
  */
 export function guardRefusal(row: GuardRow, g: RaiseGuard, now: Date): string | null {
   if (!row) return "project-not-found";
@@ -901,18 +903,23 @@ export class PrismaApprovalStore implements ApprovalStore {
       // lifecycle lock (Keep archived moving purge_after) either commits first and is read here, or waits for this
       // transaction. It does not block FOR KEY SHARE, so a decision or expiry holding a twin card while its audit_event
       // insert checks the project foreign key never deadlocks against this raise.
-      const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; sameArchive: boolean | null }[] = await tx.$queryRaw`
+      // M2.5-b5b decision 1: the database clock, cut to whole milliseconds as Archive cuts `archived_at`, read once
+      // under the lock; it runs the due check and dates the card, so both compare with database-clock row times.
+      const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; sameArchive: boolean | null; dbNow: Date }[] = await tx.$queryRaw`
         SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter",
-          (archived_at = ${guard.archivedAt}::timestamptz) AS "sameArchive"
+          (archived_at = ${guard.archivedAt}::timestamptz) AS "sameArchive",
+          date_trunc('milliseconds', clock_timestamp()) AS "dbNow"
         FROM project WHERE id = ${guard.projectId}::uuid FOR NO KEY UPDATE`;
       const row = rows[0];
       if (!row) return { refused: "project-not-found" };
       if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
-      // Codex PR242-r4: the due check runs at the app clock that dates the card (decision 9), not clock_timestamp().
-      const code = guardRefusal(row, guard, now);
+      // M2.5-b5b decision 1 (supersedes b5a decisions 9 and 10 here): the due check and the card's date use the one
+      // database clock that also stamped `archived_at` and `purge_after`; the caller's app-clock `now` is unused.
+      const at = row.dbNow instanceof Date && Number.isFinite(row.dbNow.getTime()) ? row.dbNow : null;
+      if (!at) throw new ApprovalError("clock-unreadable", 503);
+      const code = guardRefusal(row, guard, at);
       if (code) return { refused: code };
-      // Codex PR242-r5 (decision 10): dated by the app clock with no floor, as `raise` dates every card on main.
-      return this.raiseIn(tx, input, [], a, now);
+      return this.raiseIn(tx, input, [], a, at);
     });
   }
 

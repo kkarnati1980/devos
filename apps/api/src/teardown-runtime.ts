@@ -8,7 +8,8 @@ import { provisionConfig, vaultToken, type ProvisionModule } from "./provision-r
 import { teardownWiring, type ProvisionTeardownModule, type TeardownModule, type TeardownStoreLike } from "./teardown-wiring.js";
 import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
 import { teardownResource } from "./teardown-wiring.js";
-import { TeardownSweepJob, type PurgeCardLike, type TeardownSweepDeps } from "./teardown-sweep.js";
+import { KEEP_ARCHIVED_MS, TeardownSweepJob, type PurgeCardLike, type TeardownSweepDeps } from "./teardown-sweep.js";
+import { PROJECT_LOCK_SQL } from "./approvals.js";
 import type { ScanReportLike, TeardownActions, TeardownProjectRow, TeardownReader, TeardownServices } from "./teardown-routes.js";
 
 type Authorize = (action: string, resource: string) => Promise<"allow" | "deny" | "require_approval">;
@@ -169,12 +170,27 @@ export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownS
       }));
       return rows.find((g) => g.uses === 0 && g.maxUses >= 1)?.id ?? null;
     },
-    keepArchived: (projectId: string, from: Date, to: Date, approvalId: string) =>
+    // M2.5-b5b decision 3: one statement under the project's lifecycle lock, every comparison on the database clock.
+    // It moves purge_after only while the row is archived at `from` and the rejected card belongs to this archive and
+    // was raised at or after purge_after (an early ask moves nothing), to the later of purge_after and the database
+    // now, plus 30 days. Returns the new purge_after, or null when nothing moved.
+    keepArchived: (projectId: string, from: Date, approvalId: string) =>
       tx(async (t: any) => {
-        const r = await t.project.updateMany({ where: { id: projectId, stage: "archived", purgeAfter: from }, data: { purgeAfter: to } });
-        if (r.count !== 1) return false;
+        await t.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
+        await t.$queryRawUnsafe(PROJECT_LOCK_SQL, projectId);
+        const rows: { purgeAfter: Date }[] = await t.$queryRaw`
+          WITH n AS (SELECT date_trunc('milliseconds', clock_timestamp()) AS t)
+          UPDATE project SET purge_after = greatest(project.purge_after, n.t) + (${KEEP_ARCHIVED_MS}::bigint * interval '1 millisecond'), updated_at = n.t
+          FROM n
+          WHERE project.id = ${projectId}::uuid AND project.stage = 'archived' AND project.purge_after = ${from}::timestamptz
+            AND EXISTS (SELECT 1 FROM approval a WHERE a.id = ${approvalId}::uuid AND a.project_id = project.id
+              AND a.status = 'rejected' AND a.action = 'teardown.purge' AND a.target = 'project:' || project.id::text
+              AND a.created_at >= project.purge_after AND a.created_at >= project.archived_at)
+          RETURNING project.purge_after AS "purgeAfter"`;
+        const to = rows[0]?.purgeAfter;
+        if (!(to instanceof Date)) return null;
         await t.auditEvent.create({ data: { actor: "system", action: "teardown.keep_archived", summary: "Kept archived another 30 days (purge card rejected)", projectId, details: { approvalId, purgeAfter: to.toISOString() } } });
-        return true;
+        return to;
       }),
   };
 }
@@ -206,7 +222,9 @@ export function buildTeardownSweep(w: {
   const cards = w.cards;
   const q = teardownSweepQueries(w.db, w.timeoutMs);
   return new TeardownSweepJob({
-    // Codex PR242-r4 (decision 9): the due cutoff is the app clock, the one the guarded raise checks and dates by.
+    // M2.5-b5b decision 1: the app-clock cutoff only picks candidates. The guarded raise re-checks the due date on the
+    // database clock under the lock, so a clock ahead of Postgres gets `not-due` and one behind waits a day; neither
+    // can raise a card that is not due.
     listDue: q.listDue,
     project: async (id) => {
       const p = await store.project(id);
