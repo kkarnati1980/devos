@@ -165,6 +165,13 @@ export interface ApprovalStore {
    * pending card is never replaced by nothing when the process stops between the two writes.
    */
   supersede(oldId: string, input: CardInput, audit: AuditEntry, now: Date, reason: string): Promise<{ card: Card; created: boolean }>;
+  /**
+   * M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): one transaction that takes the project's lifecycle lock,
+   * re-reads the project row, and raises the card (as `raise`, no blockers) only if `guardRefusal` passes (the due
+   * check at the app clock `now`, the clock that dates the card). The card is dated by `now`, exactly as `raise` dates it. A dropped
+   * connection rolls the card back.
+   */
+  raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date): Promise<{ card: Card; created: boolean } | { refused: string }>;
   /** One audit_event outside any decision (e.g. a grant that could not be revoked). */
   recordAudit(a: AuditEntry): Promise<void>;
 }
@@ -321,6 +328,36 @@ export class Approvals {
         .catch(() => undefined);
     }
     return stored;
+  }
+
+  /**
+   * M2.5-b5a (DEVOS-255): raise a project card only while the project is still the archive `guard` names (and, with
+   * `guard.due`, its purge date has passed), checked and written in one transaction under the lifecycle lock. Notified
+   * once, as `raiseCard` is. A refusal is returned as its fixed code; nothing is written.
+   */
+  async raiseGuardedCard(input: unknown, guard: RaiseGuard): Promise<Card | { refused: string }> {
+    const card = parseCard(input);
+    if (typeof card === "string") throw new ApprovalError(card);
+    if (!guard || typeof guard.projectId !== "string" || !UUID.test(guard.projectId) || card.projectId !== guard.projectId) {
+      throw new ApprovalError("invalid-input");
+    }
+    if (!(guard.archivedAt instanceof Date) || Number.isNaN(guard.archivedAt.getTime())) throw new ApprovalError("invalid-input");
+    const audit = { action: "approval.raised", summary: `Decision card: ${card.action}`, details: { gate: card.gate, blocks: 0 } };
+    const r = await this.deps.store.raiseGuarded(card, audit, { projectId: guard.projectId, archivedAt: guard.archivedAt, due: guard.due === true }, new Date(this.now()));
+    if ("refused" in r) return { refused: r.refused };
+    if (r.created && this.deps.notifier) {
+      await this.deps.notifier
+        .notify({
+          kind: "approval",
+          title: r.card.action.slice(0, 120),
+          body: `${r.card.target}\n\n${r.card.reason}`.slice(0, 2000),
+          reasons: [`Gate: ${r.card.gate}`],
+          projectId: r.card.projectId,
+          approvalId: r.card.id,
+        })
+        .catch(() => undefined);
+    }
+    return r.card;
   }
 
   /** ADR-0006: a card only from an enforced `require_approval` outcome; the requesting task waits on it. */
@@ -540,6 +577,31 @@ export class Approvals {
   }
 }
 
+/** M2.5-b5a: what a guarded raise is bound to: the archive the caller read and, for the daily run, the due date. */
+export interface RaiseGuard {
+  projectId: string;
+  archivedAt: Date;
+  due: boolean;
+}
+
+export type GuardRow = { stage: string; archivedAt: Date | null; purgeAfter: Date | null } | null;
+
+/**
+ * Why a guarded raise is refused, read under the lock; null when it may raise. `now` is the app clock that also dates
+ * the card (Codex PR242-r4: one clock for the due check and `createdAt`, so a daily card is due exactly when its
+ * `createdAt` is at or after `purge_after`, with no floor).
+ */
+export function guardRefusal(row: GuardRow, g: RaiseGuard, now: Date): string | null {
+  if (!row) return "project-not-found";
+  if (row.stage !== "archived" || !row.archivedAt) return "not_archived";
+  if (row.archivedAt.getTime() !== g.archivedAt.getTime()) return "archive-changed";
+  if (g.due && (!row.purgeAfter || row.purgeAfter.getTime() > now.getTime())) return "not-due";
+  return null;
+}
+
+/** The provisioning lock's key (packages/provision, packages/teardown hold it as a session lock); same key space. */
+export const PROJECT_LOCK_SQL = "SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:provision'), hashtext($1::text))) AS l";
+
 /** In-memory store for tests and local runs: same semantics as the Postgres store, serialised by a promise lock. */
 export class MemoryApprovalStore implements ApprovalStore {
   readonly cards = new Map<string, Card>();
@@ -573,6 +635,20 @@ export class MemoryApprovalStore implements ApprovalStore {
 
   raise(input: CardInput, blocks: readonly string[], audit: AuditEntry, now: Date) {
     return this.serial(() => this.raiseNow(input, blocks, audit, now));
+  }
+
+  /**
+   * M2.5-b5a: the memory store has no projects; tests set `guardRow` to their project rows. Unset, every guarded raise
+   * is refused (`project-not-found`), so a missing wiring never raises an unchecked card.
+   */
+  guardRow: ((projectId: string) => GuardRow) | null = null;
+
+  raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date) {
+    return this.serial(() => {
+      const code = guardRefusal(this.guardRow ? this.guardRow(guard.projectId) : null, guard, now);
+      if (code) return { refused: code };
+      return this.raiseNow(input, [], audit, now);
+    });
   }
 
   supersede(oldId: string, input: CardInput, audit: AuditEntry, now: Date, reason: string) {
@@ -810,6 +886,32 @@ export class PrismaApprovalStore implements ApprovalStore {
       // the order a plain raise uses (advisory lock, then the twin row) and cannot deadlock against one.
       await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${raiseKey(input)}))) AS l`;
       await this.expireIn(tx, [oldId], now, reason);
+      return this.raiseIn(tx, input, [], a, now);
+    });
+  }
+
+  raiseGuarded(input: CardInput, a: AuditEntry, guard: RaiseGuard, now: Date) {
+    return this.tx(async (tx) => {
+      // The lifecycle lock first (bounded by this transaction's statement_timeout), then the raise's own key, the order
+      // no other path reverses: Archive, Restore and Purge hold the session form of this lock and never raise a card.
+      await tx.$queryRawUnsafe(PROJECT_LOCK_SQL, guard.projectId);
+      // Codex PR242-r1 (2): the archive is compared in Postgres at the column's full precision, never as a JS Date, so
+      // a stored value that differs from the caller's snapshot below the millisecond is another archive.
+      // Codex PR242-r6/r7 (decision 11): FOR NO KEY UPDATE holds the row until the card commits, so a write that takes no
+      // lifecycle lock (Keep archived moving purge_after) either commits first and is read here, or waits for this
+      // transaction. It does not block FOR KEY SHARE, so a decision or expiry holding a twin card while its audit_event
+      // insert checks the project foreign key never deadlocks against this raise.
+      const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; sameArchive: boolean | null }[] = await tx.$queryRaw`
+        SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter",
+          (archived_at = ${guard.archivedAt}::timestamptz) AS "sameArchive"
+        FROM project WHERE id = ${guard.projectId}::uuid FOR NO KEY UPDATE`;
+      const row = rows[0];
+      if (!row) return { refused: "project-not-found" };
+      if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
+      // Codex PR242-r4: the due check runs at the app clock that dates the card (decision 9), not clock_timestamp().
+      const code = guardRefusal(row, guard, now);
+      if (code) return { refused: code };
+      // Codex PR242-r5 (decision 10): dated by the app clock with no floor, as `raise` dates every card on main.
       return this.raiseIn(tx, input, [], a, now);
     });
   }
