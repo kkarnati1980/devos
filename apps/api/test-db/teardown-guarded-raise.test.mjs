@@ -195,15 +195,22 @@ test("M2.5-b5e decision 21: a reuse is bound in the raise's transaction, only fo
   // An early ask in this archive (dated by the 2001 app clock, so before archived_at): a reuse of it is not bound.
   const now = liveApprovals;
   const old = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false });
-  const reused = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 3, reuseSince: new Date(0) });
-  assert.equal(reused.id, old.id, "decision 34 reuse");
-  assert.equal(await probeCycleCard(db, p.id, 3, 5000), null, "a card from before the current archive is not bound");
+  // Without a cycle, decision 34's window is unchanged and reaches the earlier card.
+  assert.equal((await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, reuseSince: new Date(0) })).id, old.id, "decision 34 reuse");
+  // Codex PR245-r1: a cycle raise never reuses an unbound card from before the current archive (here expired, as the
+  // probe's expireStale leaves it); it raises a new card in this archive and binds it.
+  await db.approval.update({ where: { id: old.id }, data: { status: "expired", decidedAt: new Date(), decidedBy: "system" } });
+  const cyc = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 3, reuseSince: new Date(0) });
+  assert.notEqual(cyc.id, old.id);
+  assert.ok(cyc.createdAt.getTime() >= archivedAt.getTime());
+  assert.equal(await probeCycleCard(db, p.id, 3, 5000), cyc.id);
   // A card of the current archive found by the reuse window is bound in the same transaction.
-  await db.approval.update({ where: { id: old.id }, data: { status: "rejected", decidedAt: new Date(), decidedBy: "kk" } });
-  const fresh = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false });
-  const r2 = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 4, reuseSince: new Date(archivedAt.getTime()) });
-  assert.equal(r2.id, fresh.id);
-  assert.equal(await probeCycleCard(db, p.id, 4, 5000), fresh.id);
+  // (any status: rejected here, so the pending-twin dedupe cannot be what returns it).
+  await db.approval.update({ where: { id: cyc.id }, data: { status: "rejected", decidedAt: new Date(), decidedBy: "kk" } });
+  const r2 = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 4, reuseSince: new Date(0) });
+  assert.equal(r2.id, cyc.id);
+  assert.equal(await probeCycleCard(db, p.id, 4, 5000), cyc.id);
+  assert.equal((await cardsOf(p.id)).length, 2, "no new card");
   // An id that is not this project's purge card is refused, and nothing is written.
   const other = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
   const foreign = await now.raiseGuardedCard(purgeCard(other, {}), { projectId: other.id, archivedAt, due: false });

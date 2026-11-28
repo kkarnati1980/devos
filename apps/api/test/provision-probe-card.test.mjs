@@ -1144,3 +1144,18 @@ test("Decision 34: raiseProbePurgeCard passes the cycle start (or, without one, 
   assert.equal(await raiseProbePurgeCard("p-1", d, LATE_CYCLE), "card-1");
   assert.deepEqual(seen, [[AT, CYCLE], [AT, AT], [AT, AT]]);
 });
+
+test("b5e decision 21 (Codex PR245-r1): a cycle raise's reuse window never starts before the current archive; other raises keep decision 34's window", async () => {
+  const { reuseFrom, boundable } = await import("../dist/approvals.js");
+  const AT = new Date("2026-11-28T10:00:00Z");
+  const EARLY = new Date("2026-11-28T09:00:00Z");
+  const g = { projectId: "p", archivedAt: AT, due: false, reuseSince: EARLY };
+  assert.equal(reuseFrom(g, AT).getTime(), EARLY.getTime(), "no cycle: unchanged");
+  assert.equal(reuseFrom({ ...g, bindCycle: 2 }, AT).getTime(), AT.getTime(), "a cycle raise: from the current archive");
+  const LATE = new Date(AT.getTime() + 60_000);
+  assert.equal(reuseFrom({ ...g, bindCycle: 2, reuseSince: LATE }, AT).getTime(), LATE.getTime(), "a later window is kept");
+  assert.equal(reuseFrom({ projectId: "p", archivedAt: AT, due: false, bindCycle: 2 }, AT), undefined, "no reuse asked");
+  assert.equal(boundable(new Date(AT.getTime() - 1), AT), false);
+  assert.equal(boundable(AT, AT), true);
+  assert.equal(boundable(AT, null), false);
+});

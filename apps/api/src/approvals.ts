@@ -635,6 +635,18 @@ export function boundable(createdAt: unknown, archivedAt: Date | null): boolean 
   return createdAt instanceof Date && archivedAt instanceof Date && createdAt.getTime() >= archivedAt.getTime();
 }
 
+/**
+ * Decision 21 (Codex PR245-r1, medium): for a cycle raise, decision 34's reuse window never reaches before the row's
+ * current archive. A card from before it that this cycle did not bind is not this cycle's card (a bound one was already
+ * returned), and reusing it would hand back a card the probe's staleness check refuses on every retry, so the new
+ * archive would never get a card. Without `bindCycle` the window is unchanged.
+ */
+export function reuseFrom(guard: RaiseGuard, archivedAt: Date | null): Date | undefined {
+  if (!guard.reuseSince) return undefined;
+  if (guard.bindCycle === undefined || !(archivedAt instanceof Date)) return guard.reuseSince;
+  return archivedAt.getTime() > guard.reuseSince.getTime() ? new Date(archivedAt.getTime()) : guard.reuseSince;
+}
+
 export function validCycle(n: unknown): n is number {
   return typeof n === "number" && Number.isSafeInteger(n) && n >= 1;
 }
@@ -735,8 +747,9 @@ export class MemoryApprovalStore implements ApprovalStore {
       const code = guardRefusal(this.guardRow ? this.guardRow(guard.projectId) : null, guard, now);
       if (code) return { refused: code };
       // Decision 34: the oldest card of this project, action and target since `reuseSince`, any status.
-      if (guard.reuseSince) {
-        const since = guard.reuseSince.getTime();
+      const from = reuseFrom(guard, this.guardRow?.(guard.projectId)?.archivedAt ?? null);
+      if (from) {
+        const since = from.getTime();
         const had = [...this.cards.values()]
           .filter((c) => c.projectId === (input.projectId ?? null) && c.gate === input.gate && c.action === input.action && c.target === input.target && c.createdAt.getTime() >= since)
           .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
@@ -1018,9 +1031,10 @@ export class PrismaApprovalStore implements ApprovalStore {
       // DEVOS-254 decision 34 (Codex PR239-r36): under the lock, the oldest card of this project, action and target
       // since `reuseSince` (any status) is returned, not doubled. Every purge-card raise takes this lock (M2.5-b5a), so
       // none can commit between this read and the insert below.
-      if (guard.reuseSince) {
+      const from = reuseFrom(guard, row.archivedAt);
+      if (from) {
         const had = await tx.approval.findFirst({
-          where: { projectId: input.projectId ?? null, gate: input.gate, action: input.action, target: input.target, createdAt: { gte: guard.reuseSince } },
+          where: { projectId: input.projectId ?? null, gate: input.gate, action: input.action, target: input.target, createdAt: { gte: from } },
           orderBy: [{ createdAt: "asc" }, { id: "asc" }],
         });
         if (had) {
