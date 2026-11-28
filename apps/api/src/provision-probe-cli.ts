@@ -154,16 +154,15 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           // d3c-2a: the purge through M2.5 under the KK grant (decisions 1–5), found read-only on each use.
           purge: async () => {
             const k = w.purge;
-            // Pre-review 4: an archived row needs only the purge's use.
-            const stage = await probeStage(db, p.id, timeoutMs);
-            if (stage === "purged") return "done";
-            const grant = await findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, stage === "archived" ? ["teardown.purge"] : PROBE_GRANT_ACTIONS);
-            // Decision 4: a grant that expired or ran out mid-cycle ends the cycle as purge-permission.
-            if (!grant) return { error: "purge-permission:approval_required" };
             return probePurge(p.id, {
               teardown: k.teardownMod,
               store: k.store,
-              authorize: grantAuthorizer(k.policy, p.id, grant),
+              // Pre-review 4: an archived row needs only the purge's use. Codex PR239-r34: the grant is chosen for the
+              // stage probePurge itself reads, the read that decides whether to Archive first.
+              authorizeFor: async (stage) => {
+                const grant = await findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, stage === "archived" ? ["teardown.purge"] : PROBE_GRANT_ACTIONS);
+                return grant ? grantAuthorizer(k.policy, p.id, grant) : null;
+              },
               stage: () => probeStage(db, p.id, timeoutMs),
               wiring: () => teardownWiring(k.provisionMod, k.teardownMod, { gh: k.gh, cf: k.cf, store: k.store, db, projectId: p.id, owner: k.owner, timeoutMs }),
             });
