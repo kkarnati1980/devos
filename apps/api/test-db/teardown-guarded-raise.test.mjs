@@ -99,3 +99,26 @@ test("Codex PR242-r1: an archive that differs from the snapshot only below the m
   assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "archive-changed" });
   assert.equal((await cardsOf(p.id)).length, 0);
 });
+
+test("Codex PR242-r6: a Keep archived update in flight during the raise is waited for and read: not-due, no card", async () => {
+  const archivedAt = new Date(Date.now() - 31 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
+  const appNow = Date.now() + 60_000;
+  const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
+  const keeper = new pg.Client({ connectionString: url });
+  await keeper.connect();
+  try {
+    // Keep archived's update (teardown-runtime keepArchived), which takes no lifecycle lock, open but not committed.
+    await keeper.query("BEGIN");
+    await keeper.query("UPDATE project SET purge_after = now() + interval '30 days' WHERE id = $1::uuid", [p.id]);
+    let settled = false;
+    const raising = ahead.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }).finally(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(settled, false, "the raise waits on the row Keep archived is updating");
+    await keeper.query("COMMIT");
+    assert.deepEqual(await raising, { refused: "not-due" });
+    assert.equal((await cardsOf(p.id)).length, 0);
+  } finally {
+    await keeper.end();
+  }
+});
