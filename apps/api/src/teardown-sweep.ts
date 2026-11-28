@@ -276,7 +276,17 @@ export class TeardownSweepJob {
       if (!p || p.stage !== "archived" || !p.purgeAfter || c.createdAt.getTime() < p.purgeAfter.getTime()) continue;
       // M2.5-b5b decision 3: the read above only picks candidates; the store re-checks the card, the archive and
       // `from` under the lifecycle lock on the database clock, and computes the new date there.
-      if (await this.d.keepArchived(p.id, p.purgeAfter, c.id)) {
+      // Pre-review low 1: Keep archived now waits on the lifecycle lock, so a project this job is purging is skipped
+      // and one project's lock-wait timeout fails only its own card (retried next tick), never the rest of the pass.
+      if (this.purging.has(p.id)) continue;
+      let moved: Date | null = null;
+      try {
+        moved = await this.d.keepArchived(p.id, p.purgeAfter, c.id);
+      } catch {
+        this.d.log({ level: "warn", msg: "teardown-keep-archived-failed", projectId: p.id, approvalId: c.id });
+        continue;
+      }
+      if (moved) {
         this.d.log({ level: "info", msg: "teardown-keep-archived", projectId: p.id, approvalId: c.id });
       }
     }

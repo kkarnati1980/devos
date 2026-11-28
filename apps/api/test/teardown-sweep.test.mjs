@@ -732,3 +732,25 @@ test("Codex PR242-r3 (2): an early ask whose project starts purging during its a
   assert.equal((await s.purgeCards()).length, 0);
   void finish;
 });
+
+test("Keep archived: one failing project does not stop the pass; a project being purged is skipped (M2.5-b5b decision 10)", async () => {
+  const s = setup();
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  s.advance(2 * DAY);
+  await s.approvals.reject(s.session, c.id);
+  const real = s.job["d"].keepArchived;
+  let fails = 1;
+  s.job["d"].keepArchived = async (...a) => { if (fails-- > 0) throw new Error("lock_timeout"); return real(...a); };
+  await s.job.tick();
+  assert.ok(s.logs.some((e) => e.msg === "teardown-keep-archived-failed" && e.approvalId === c.id), "logged, not thrown");
+  assert.ok(!s.logs.some((e) => e.msg === "teardown-keep-pass-failed"), "the pass itself did not fail");
+  assert.equal(s.calls.keep.length, 0);
+  // While this job purges the project, Keep archived does not wait on its lock.
+  s.job["purging"].add(P);
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 0);
+  s.job["purging"].delete(P);
+  await s.job.tick();
+  assert.equal(s.calls.keep.length, 1, "retried on the next tick");
+});

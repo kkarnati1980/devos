@@ -44,8 +44,10 @@ test("M2.5-b5b: an archived, due row gets one card, dated by the database clock 
   assert.equal(stored.ms, true, "cut to whole milliseconds");
   // An early ask on a row archived on the database clock is dated at or after its archive.
   const early = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + DAY) });
+  const b2 = await dbNow();
   const e = await approvals.raiseGuardedCard(purgeCard(early, {}), { projectId: early.id, archivedAt, due: false });
-  assert.ok(e.createdAt.getTime() >= archivedAt.getTime());
+  const a2 = await dbNow();
+  assert.ok(e.createdAt.getTime() >= Math.floor(b2) - 1 && e.createdAt.getTime() <= a2, "an early ask: the database clock too");
   assert.equal((await cardsOf(p.id)).length, 1);
   // A second guarded raise dedupes onto the pending card, as raiseCard does.
   const again = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
@@ -114,7 +116,7 @@ test("Codex PR242-r6: a Keep archived update in flight during the raise is waite
   const keeper = new pg.Client({ connectionString: url });
   await keeper.connect();
   try {
-    // Keep archived's update (teardown-runtime keepArchived), which takes no lifecycle lock, open but not committed.
+    // A row writer that takes no lifecycle lock (Keep archived did before M2.5-b5b), open but not committed.
     await keeper.query("BEGIN");
     await keeper.query("UPDATE project SET purge_after = now() + interval '30 days' WHERE id = $1::uuid", [p.id]);
     let settled = false;
