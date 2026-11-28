@@ -174,6 +174,9 @@ export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownS
     // It moves purge_after only while the row is archived at `from` and the rejected card belongs to this archive and
     // was raised at or after purge_after (an early ask moves nothing), to the later of purge_after and the database
     // now, plus 30 days. Returns the new purge_after, or null when nothing moved.
+    // Decision 14 (Codex PR244-r2): archive membership and single use are also bound by id, with no time compare
+    // across the clock change: a card an Archive retired (its `rejectedRetired` list) never moves anything, and a card
+    // that already moved purge_after once (its `teardown.keep_archived` audit row) never moves it again.
     keepArchived: (projectId: string, from: Date, approvalId: string) =>
       tx(async (t: any) => {
         await t.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
@@ -185,7 +188,11 @@ export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownS
           WHERE project.id = ${projectId}::uuid AND project.stage = 'archived' AND project.purge_after = ${from}::timestamptz
             AND EXISTS (SELECT 1 FROM approval a WHERE a.id = ${approvalId}::uuid AND a.project_id = project.id
               AND a.status = 'rejected' AND a.action = 'teardown.purge' AND a.target = 'project:' || project.id::text
-              AND a.created_at >= project.purge_after AND a.created_at >= project.archived_at)
+              AND a.created_at >= project.purge_after AND a.created_at >= project.archived_at
+              AND NOT EXISTS (SELECT 1 FROM audit_event r WHERE r.project_id = project.id
+                AND r.action = 'teardown.archive_retired_cards' AND r.details -> 'rejectedRetired' @> jsonb_build_array(a.id::text))
+              AND NOT EXISTS (SELECT 1 FROM audit_event k WHERE k.project_id = project.id
+                AND k.action = 'teardown.keep_archived' AND k.details ->> 'approvalId' = a.id::text))
           RETURNING project.purge_after AS "purgeAfter"`;
         const to = rows[0]?.purgeAfter;
         if (!(to instanceof Date)) return null;

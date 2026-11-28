@@ -182,7 +182,9 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           ),
           // DEVOS-254 (AT10): one cycle purges through KK's gate-5 purge card and the sweep job, not the probe grant.
           cardCycle: () => probeCardCycle(db, p.id, timeoutMs),
-          raisePurgeCard: async (cycleFrom) => {
+          // M2.5-b5b decision 13: the card cycle's start on the database clock, read once when it enters `card`.
+          dbNow: async () => (await db.$transaction((tx: any) => tx.$queryRaw`SELECT clock_timestamp() AS t`, { timeout: timeoutMs, maxWait: timeoutMs }))[0].t,
+          raisePurgeCard: async (cycleFrom, cycleFromDb) => {
             const k = w.purge;
             const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
             return raiseProbePurgeCard(p.id, {
@@ -205,7 +207,8 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
               // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
               expireStale: (before) => expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason), before),
-            }, await cycleStartOnDbClock(db, cycleFrom, timeoutMs));
+            // b5b decision 13: the recorded database-clock start; only a record written before it falls back to decision 9.
+            }, cycleFromDb ?? await cycleStartOnDbClock(db, cycleFrom, timeoutMs));
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
           // Codex PR239-r28: the current archive's oldest purge card, for a purge reached without a tracked card.

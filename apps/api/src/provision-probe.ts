@@ -63,6 +63,11 @@ export interface PhaseRecord {
    * live asserts) went straight to purge and never passes as `pass-card`.
    */
   cardReached?: boolean;
+  /**
+   * M2.5-b5b decision 13 (Codex PR244-r2): when this cycle entered `card`, read once on the database clock that dates
+   * purge cards, so every later `card` tick uses the same window start, however the app clock moves in between.
+   */
+  cardFromDb?: string;
   /** Codex PR239-r30 (decision 28): when the purge phase's first proof read failed; its retries are bounded from here. */
   proofRetryFrom?: string;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
@@ -111,7 +116,10 @@ export interface ProbeDeps {
    * this archive already has, on a retried tick). `{ grantShort }` when no card was raised for decision 11.
    */
   /** Decision 33 (Codex PR239-r35): `cycleFrom` is when this cycle entered `card`; a card raised since then is reused. */
-  raisePurgeCard?(cycleFrom: Date): Promise<string | { grantShort: true }>;
+  /** b5b decision 13: `cycleFromDb` is the same moment on the database clock, recorded once (absent on an older record). */
+  raisePurgeCard?(cycleFrom: Date, cycleFromDb?: Date): Promise<string | { grantShort: true }>;
+  /** b5b decision 13: one read of the database clock (`clock_timestamp()`), taken when a card cycle enters `card`. */
+  dbNow?(): Promise<Date>;
   /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
   cardOutcome?(cardId: string): Promise<CardOutcome>;
   /**
@@ -325,14 +333,23 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       if (!r.ok) return toPurge(failed("live-assert-failed", "error"));
       if (r.value.length) return toPurge(failed("live-assert-failed", r.value.join(",")));
       // DEVOS-254 decision 2: only a card cycle goes through `card`; any other cycle purges at once, as before.
-      if (last.viaCard) return advance();
+      if (last.viaCard) {
+        // b5b decision 13: the cycle start on the database clock is read once, here, and stored with the phase record.
+        if (!d.dbNow) return advance();
+        const t = await attempt(() => d.dbNow!());
+        if (!t.ok || !(t.value instanceof Date) || !Number.isFinite(t.value.getTime())) {
+          return timedOut() ? toPurge(failed("card-clock-failed")) : { exit: 3, phase, cycle, code: "in_progress", detail: "card-clock-retry" };
+        }
+        return advance({ cardFromDb: t.value.toISOString() });
+      }
       await d.record({ ...last, phase: "purge", at: at() });
       return { exit: 3, phase: "purge", cycle, code: "in_progress" };
     }
     case "card": {
       // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
       if (!d.raisePurgeCard) return leaveCard(failed("card-not-wired"));
-      const r = await attempt(() => d.raisePurgeCard!(new Date(Date.parse(last.at))));
+      const fromDb = typeof last.cardFromDb === "string" && Number.isFinite(Date.parse(last.cardFromDb)) ? new Date(Date.parse(last.cardFromDb)) : undefined;
+      const r = await attempt(() => d.raisePurgeCard!(new Date(Date.parse(last.at)), fromDb));
       // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
       if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return leaveCard(failed("card-grant-short"));
       // Codex PR239-r14 (medium): a throw may come after the card was persisted (the reads that bind and track it), so

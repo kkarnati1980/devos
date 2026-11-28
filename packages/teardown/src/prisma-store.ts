@@ -85,11 +85,19 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
         UPDATE approval_grant SET revoked_at = ${row.archivedAt}::timestamptz
         WHERE revoked_at IS NULL AND approval_id IN (
           SELECT id FROM approval WHERE project_id = ${projectId}::uuid AND action = 'teardown.purge' AND target = ${target})`;
-      if (revoked > 0 || expired > 0) {
+      // M2.5-b5b decision 14 (Codex PR244-r2): an earlier archive's rejected cards are retired by id, not by time. Keep
+      // archived excludes every card listed here, so a rejection stamped by the old app clock can never extend this
+      // archive, however its timestamp sorts against the database-clock `archived_at` and `purge_after`.
+      const rejected: { id: string }[] = await tx.$queryRaw`
+        SELECT id::text AS id FROM approval
+        WHERE project_id = ${projectId}::uuid AND action = 'teardown.purge' AND target = ${target} AND status = 'rejected'
+        ORDER BY id`;
+      const rejectedRetired = rejected.map((r) => r.id);
+      if (revoked > 0 || expired > 0 || rejectedRetired.length > 0) {
         await tx.auditEvent.create({ data: {
           actor: "system", projectId, action: "teardown.archive_retired_cards",
           summary: "Earlier purge cards retired by a new Archive",
-          details: { grantsRevoked: revoked, cardsExpired: expired },
+          details: { grantsRevoked: revoked, cardsExpired: expired, rejectedRetired },
         } });
       }
       await tx.auditEvent.create({ data: {

@@ -135,6 +135,22 @@ test("keepArchived: a future purge_after moves from itself; an early-ask card, a
   assert.deepEqual(await q.keepArchived(p.id, from, ok.id), new Date(from.getTime() + KEEP), "from purge_after itself while it is in the future");
 });
 
+test("keepArchived (b5b decision 14): a rejection an Archive retired, or one that already moved purge_after, never moves it, however its time sorts", async () => {
+  const from = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt: new Date(from.getTime() - 30 * DAY), purgeAfter: from });
+  // An earlier archive's rejection stamped by an app clock far ahead: it sorts after both of this archive's times.
+  const ahead = await rejected(p.id, new Date(Date.now() + 365 * DAY));
+  await db.auditEvent.create({ data: { actor: "system", projectId: p.id, action: "teardown.archive_retired_cards", summary: "test", details: { grantsRevoked: 0, cardsExpired: 0, rejectedRetired: [ahead.id] } } });
+  assert.equal(await q.keepArchived(p.id, from, ahead.id), null, "a retired rejection moves nothing");
+  assert.deepEqual(await purgeAfterOf(p.id), from);
+  // A rejection that already moved purge_after once, then still sorts after the new value: no second move.
+  const twice = await rejected(p.id, new Date(Date.now() + 365 * DAY));
+  const to = await q.keepArchived(p.id, from, twice.id);
+  assert.ok(to instanceof Date, "the first move happens");
+  assert.equal(await q.keepArchived(p.id, to, twice.id), null, "the same rejection never moves it again");
+  assert.deepEqual(await purgeAfterOf(p.id), to);
+});
+
 test("keepArchived: waits for a held lifecycle lock and then reads the row its holder left", async () => {
   const from = new Date(Date.now() - DAY);
   const p = await mk({ stage: "archived", archivedAt: new Date(from.getTime() - 30 * DAY), purgeAfter: from });

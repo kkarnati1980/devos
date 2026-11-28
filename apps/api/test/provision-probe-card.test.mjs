@@ -1121,3 +1121,35 @@ test("M2.5-b5b decision 9: the cycle start moves to the database clock, opening 
   assert.equal(got.getTime(), at.getTime() - 300_010 - 20);
   await assert.rejects(cycleStartOnDbClock({ $transaction: async () => [{ t: null }] }, at, 1000), /probe-card-no-cycle-start/);
 });
+
+test("M2.5-b5b decision 13 (Codex PR244-r2): the card cycle's start is read once on the database clock and every card tick reuses it", async () => {
+  const DB = new Date("2026-11-28T09:00:00.123Z");
+  let reads = 0;
+  const seen = [];
+  let fails = 1;
+  const d = fake({
+    dbNow: async () => { reads++; if (fails-- > 0) throw new Error("db down"); return DB; },
+    raisePurgeCard: async (from, fromDb) => { seen.push(fromDb); d.calls.raise++; if (seen.length === 1) throw new Error("db after insert"); return "card-1"; },
+  });
+  // A failed clock read keeps the cycle in `assert` (retried), never enters `card` without the database start.
+  let r = await until(d, "assert");
+  assert.equal(d.log.at(-1).phase, "assert");
+  r = await probeStep(d);
+  assert.equal(r.detail, "card-clock-retry");
+  assert.equal(d.log.at(-1).phase, "assert", "no `card` record without the database start");
+  r = await until(d, "cardwait");
+  assert.equal(r.phase, "cardwait");
+  const cardRec = d.log.find((x) => x.phase === "card");
+  assert.equal(cardRec.cardFromDb, DB.toISOString(), "stored with the phase record");
+  // The first card tick threw after its insert; the retry passes the same recorded start, with no new clock read.
+  assert.deepEqual(seen.map((x) => x.toISOString()), [DB.toISOString(), DB.toISOString()]);
+  assert.equal(reads, 2, "read only when entering `card` (one failed, one ok)");
+});
+
+test("M2.5-b5b decision 13: a record written before the upgrade (no cardFromDb) passes no database start, so the wiring falls back to decision 9", async () => {
+  const seen = [];
+  const d = fake({ raisePurgeCard: async (from, fromDb) => { seen.push(fromDb); d.calls.raise++; return "card-1"; } });
+  await until(d, "cardwait");
+  assert.deepEqual(seen, [undefined]);
+  assert.equal(d.log.find((x) => x.phase === "card").cardFromDb, undefined);
+});
