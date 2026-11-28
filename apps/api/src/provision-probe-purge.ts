@@ -176,15 +176,26 @@ export interface ProbePurgeDeps {
   stage(): Promise<string>;
   wiring(): Promise<{ ops: Ops[]; scanners: Scanner[]; preflight: (() => Promise<void>)[] }>;
   store: unknown;
-  authorize: Authorize;
+  /** A fixed authorizer (tests and callers whose grant does not depend on the stage). */
+  authorize?: Authorize;
+  /**
+   * Codex PR239-r34 (medium): the authorizer for the stage read just above, or null when no usable grant covers it
+   * (`purge-permission:approval_required`). The grant is chosen from the same read that decides whether to Archive,
+   * so a Restore between an earlier read and this one can never let an archived-only grant (one use left) spend its
+   * last use on the Archive and then fail the Purge. Used instead of `authorize` when given.
+   */
+  authorizeFor?(stage: string): Promise<Authorize | null>;
 }
 
 /** Decision 1: Archive (unless already archived), then Purge; `purged` with a clean scan is done. */
 export async function probePurge(projectId: string, d: ProbePurgeDeps): Promise<PurgeOutcome> {
   const stage = await d.stage();
   if (stage === "purged") return "done";
+  const authorize = d.authorizeFor ? await d.authorizeFor(stage) : d.authorize;
+  // Decision 4: a grant that expired or ran out mid-cycle ends the cycle as purge-permission.
+  if (!authorize) return { error: "purge-permission:approval_required" };
   const w = await d.wiring();
-  const base = { store: d.store, authorize: d.authorize, ops: w.ops };
+  const base = { store: d.store, authorize, ops: w.ops };
   try {
     if (stage !== "archived") await d.teardown.archiveProject(projectId, base);
     const r = await d.teardown.purgeProject(projectId, { ...base, scanners: w.scanners, preflight: w.preflight });
