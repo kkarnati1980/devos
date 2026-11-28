@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_CARD_RAISE_GRANT_MS, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { cycleStartOnDbClock, cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeCycleCard, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, expireProbePurgeCards, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeCycleCard, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, expireProbePurgeCards, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -184,7 +184,7 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           cardCycle: () => probeCardCycle(db, p.id, timeoutMs),
           // M2.5-b5b decision 13: the card cycle's start on the database clock, read once when it enters `card`.
           dbNow: async () => (await db.$transaction((tx: any) => tx.$queryRaw`SELECT clock_timestamp() AS t`, { timeout: timeoutMs, maxWait: timeoutMs }))[0].t,
-          raisePurgeCard: async (cycleFrom, cycleFromDb) => {
+          raisePurgeCard: async (_cycleFrom, cycleFromDb) => {
             const k = w.purge;
             const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
             return raiseProbePurgeCard(p.id, {
@@ -209,9 +209,8 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
               // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
               expireStale: (before) => expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason), before),
-            // b5b decision 13: the recorded database-clock start; only a record written before it falls back to decision 9.
-            // Decision 17 (Codex PR244-r4): that fallback is the earlier of the raw and the converted start.
-            }, cycleFromDb ?? await cycleStartOnDbClock(db, cycleFrom, timeoutMs));
+            // b5b decisions 13 and 19: always the recorded database-clock start (a record without one never gets here).
+            }, cycleFromDb);
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
           // Codex PR239-r28: the current archive's oldest purge card, for a purge reached without a tracked card.

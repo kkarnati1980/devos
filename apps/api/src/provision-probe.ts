@@ -123,7 +123,7 @@ export interface ProbeDeps {
    */
   /** Decision 33 (Codex PR239-r35): `cycleFrom` is when this cycle entered `card`; a card raised since then is reused. */
   /** b5b decision 13: `cycleFromDb` is the same moment on the database clock, recorded once (absent on an older record). */
-  raisePurgeCard?(cycleFrom: Date, cycleFromDb?: Date): Promise<string | { grantShort: true }>;
+  raisePurgeCard?(cycleFrom: Date, cycleFromDb: Date): Promise<string | { grantShort: true }>;
   /** b5b decision 13: one read of the database clock (`clock_timestamp()`), taken when a card cycle enters `card`. */
   dbNow?(): Promise<Date>;
   /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
@@ -355,6 +355,11 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
       if (!d.raisePurgeCard) return leaveCard(failed("card-not-wired"));
       const fromDb = typeof last.cardFromDb === "string" && Number.isFinite(Date.parse(last.cardFromDb)) ? new Date(Date.parse(last.cardFromDb)) : undefined;
+      // M2.5-b5b decision 19 (Codex PR244-r5, round limit; supersedes decisions 9 and 17): a cycle that entered `card`
+      // before this upgrade has no database-clock start, and any card it raised was stamped by the app clock. No
+      // conversion is attempted: the cycle ends with the probe's own purge, which expires its pending purge cards first
+      // (r15), and the next card cycle runs on one clock throughout.
+      if (!fromDb) return leaveCard(failed("card-clock-upgrade"));
       const r = await attempt(() => d.raisePurgeCard!(new Date(Date.parse(last.at)), fromDb));
       // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
       if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return leaveCard(failed("card-grant-short"));
@@ -369,6 +374,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     case "cardwait": {
       // Decisions 4 and 5: wait for KK's answer and the sweep's purge; every other end is purged by the probe.
       if (!d.cardOutcome || !last.cardId) return leaveCard(failed("card-not-wired"));
+      // Decision 19 (Codex PR244-r5): a wait recorded before this upgrade tracks an app-clock card; it ends the same way.
+      if (typeof last.cardFromDb !== "string" || !Number.isFinite(Date.parse(last.cardFromDb))) return leaveCard(failed("card-clock-upgrade"));
       const cardId = last.cardId;
       // Codex PR239-r13 (medium): every tick that would keep waiting first checks that the probe grant still outlasts
       // the next tick and the purge after it (`PROBE_CARD_PURGE_ROOM_MS`). A wait whose deadline moved (a card reused
@@ -397,10 +404,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // the age measured inside Postgres on one clock, so the deadline never mixes the card's database-clock
       // `created_at` with the app-clock record. A negative or unreadable age falls back to the record time.
       const nowMs = d.now().getTime();
-      // A cycle in `cardwait` at deploy (no `cardFromDb`) raised its card on the app clock, so its `raisedAt` is used.
-      const legacy = typeof last.cardFromDb !== "string";
       const ago = r.ok && typeof r.value.raisedAgoMs === "number" && Number.isFinite(r.value.raisedAgoMs) && r.value.raisedAgoMs >= 0 ? r.value.raisedAgoMs : NaN;
-      const raised = legacy ? (r.ok && typeof r.value.raisedAt === "string" ? Date.parse(r.value.raisedAt) : NaN) : Number.isFinite(ago) ? nowMs - ago : NaN;
+      const raised = Number.isFinite(ago) ? nowMs - ago : NaN;
       const recorded = Date.parse(last.at);
       const start = Number.isFinite(raised) && raised < recorded ? raised : recorded;
       const late = nowMs - start >= PROBE_CARD_MAX_MS;

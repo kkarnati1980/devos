@@ -30,6 +30,8 @@ function fake(over = {}) {
     purge: async () => { calls.purge++; return "done"; },
     cardCycle: async () => !state.proven,
     raisePurgeCard: async () => { calls.raise++; return "card-1"; },
+    // M2.5-b5b decisions 13 and 19: the wiring always reads the database clock on entering `card`.
+    dbNow: async () => new Date("2026-11-25T09:00:00Z"),
     // Codex PR239-r7: the probe grant's expiry; by default it outlasts any card wait.
     grantUntil: Infinity,
     expirePurgeCards: async () => { calls.expire = (calls.expire ?? 0) + 1; },
@@ -318,14 +320,6 @@ test("M2.5-b5b decision 18 (Codex PR244-r4): the card wait is measured on one cl
     f.tick(1);
     assert.equal((await probeStep(f)).phase, "purge");
   }
-  // A cycle already in `cardwait` at deploy (no cardFromDb) raised its card on the app clock: its raisedAt is used.
-  const g = fake();
-  await until(g, "cardwait");
-  assert.equal(g.log.at(-1).cardFromDb, undefined);
-  g.state.raisedAt = new Date(Date.parse(g.log.at(-1).at) - 2 * DAY).toISOString();
-  g.state.raisedAgoMs = 0;
-  g.tick(PROBE_CARD_MAX_MS - 2 * DAY);
-  assert.equal((await probeStep(g)).phase, "purge", "the legacy deadline runs from its app-clock raise");
 });
 
 test("Codex PR239-r13: a waiting tick ends with the probe's own purge once the grant would not outlast the next tick and the purge", async () => {
@@ -1201,23 +1195,6 @@ test("Decision 34: raiseProbePurgeCard passes the cycle start (or, without one, 
   assert.deepEqual(seen, [[AT, CYCLE], [AT, AT], [AT, AT]]);
 });
 
-test("M2.5-b5b decision 9: the cycle start moves to the database clock, opening the window earlier by the read's round trip", async () => {
-  const { cycleStartOnDbClock } = await import("../dist/provision-probe-purge.js");
-  const at = new Date("2026-11-28T10:00:00.000Z");
-  // App clock 5 minutes ahead of Postgres; the read takes 20 ms.
-  let app = Date.parse("2026-11-28T12:05:00.000Z");
-  const db = { $transaction: async (fn, o) => { assert.equal(o.timeout, 1000); const r = await fn({ $queryRaw: async () => [{ t: new Date(app - 5 * 60_000 + 10) }] }); app += 20; return r; } };
-  const ticks = [];
-  const got = await cycleStartOnDbClock(db, at, 1000, () => { ticks.push(app); return app; });
-  // offset = db - t1 = (t0 - 300000 + 10) - (t0 + 20) = -300010; minus the 20 ms round trip.
-  assert.equal(got.getTime(), at.getTime() - 300_010 - 20);
-  await assert.rejects(cycleStartOnDbClock({ $transaction: async () => [{ t: null }] }, at, 1000), /probe-card-no-cycle-start/);
-  // Decision 17 (Codex PR244-r4): with Postgres ahead, the conversion would move past a card the legacy cycle stamped
-  // on the app clock, so the raw start (the earlier one) is used.
-  const ahead = { $transaction: async () => [{ t: new Date(Date.now() + 5 * 60_000) }] };
-  assert.equal((await cycleStartOnDbClock(ahead, at, 1000)).getTime(), at.getTime());
-});
-
 test("M2.5-b5b decision 13 (Codex PR244-r2): the card cycle's start is read once on the database clock and every card tick reuses it", async () => {
   const DB = new Date("2026-11-28T09:00:00.123Z");
   let reads = 0;
@@ -1242,10 +1219,27 @@ test("M2.5-b5b decision 13 (Codex PR244-r2): the card cycle's start is read once
   assert.equal(reads, 2, "read only when entering `card` (one failed, one ok)");
 });
 
-test("M2.5-b5b decision 13: a record written before the upgrade (no cardFromDb) passes no database start, so the wiring falls back to decision 9", async () => {
+test("M2.5-b5b decision 19 (Codex PR244-r5; supersedes decisions 9 and 17): a card cycle recorded before the upgrade (no cardFromDb) ends with the probe's own purge, never a raise or a mixed-clock wait", async () => {
+  // In `card`: no raise, straight to the purge that expires pending purge cards first.
   const seen = [];
-  const d = fake({ raisePurgeCard: async (from, fromDb) => { seen.push(fromDb); d.calls.raise++; return "card-1"; } });
-  await until(d, "cardwait");
-  assert.deepEqual(seen, [undefined]);
-  assert.equal(d.log.find((x) => x.phase === "card").cardFromDb, undefined);
+  const d = fake({ dbNow: undefined, raisePurgeCard: async (from, fromDb) => { seen.push(fromDb); d.calls.raise++; return "card-1"; } });
+  let r = await until(d, "card");
+  assert.equal(d.log.at(-1).cardFromDb, undefined);
+  r = await probeStep(d);
+  assert.equal(r.phase, "purge");
+  assert.deepEqual(seen, [], "no card is raised from an app-clock start");
+  assert.deepEqual([d.log.at(-1).result.code, d.log.at(-1).expireCards], ["card-clock-upgrade", true]);
+  // In `cardwait`: a wait recorded before the upgrade is not measured; it ends the same way, card left to the expiry.
+  const e = fake();
+  await until(e, "cardwait");
+  const rec = e.log.at(-1);
+  delete rec.cardFromDb;
+  r = await probeStep(e);
+  assert.equal(r.phase, "purge");
+  assert.equal(e.calls.outcome, 0, "the card is not read");
+  assert.deepEqual([e.log.at(-1).result.code, e.log.at(-1).expireCards], ["card-clock-upgrade", true]);
+  // A cycle entered after the upgrade carries cardFromDb from `card` into `cardwait`.
+  const f = fake();
+  await until(f, "cardwait");
+  assert.equal(f.log.at(-1).cardFromDb, "2026-11-25T09:00:00.000Z");
 });

@@ -527,24 +527,6 @@ export interface ProbePurgeCardDeps {
   expireStale(before: Date): Promise<void>;
 }
 
-/**
- * M2.5-b5b decision 9: the probe's cycle start (`last.at`, the app clock) on the database clock that dates purge cards
- * since b5b. One bounded `clock_timestamp()` read gives the offset; the round trip is subtracted so the window can only
- * open earlier, never later (an earlier cycle's cards are far older and retired by every new Archive, b5b decision 11).
- */
-export async function cycleStartOnDbClock(db: any, at: Date, timeoutMs: number, appNow: () => number = Date.now): Promise<Date> {
-  const t0 = appNow();
-  const rows: { t: Date }[] = await db.$transaction((tx: any) => tx.$queryRaw`SELECT clock_timestamp() AS t`, { timeout: timeoutMs, maxWait: timeoutMs });
-  const t1 = appNow();
-  const dbT = rows?.[0]?.t;
-  if (!(dbT instanceof Date) || !Number.isFinite(dbT.getTime()) || !Number.isFinite(at.getTime())) throw new Error("probe-card-no-cycle-start");
-  const converted = at.getTime() + (dbT.getTime() - t1) - (t1 - t0);
-  // Decision 17 (Codex PR244-r4, medium): only a record written before decision 13 comes here, and a card its cycle
-  // already raised may have been stamped by the app clock (before b5b). So the window opens at the earlier of the raw
-  // app-clock start and its conversion: with Postgres ahead, the conversion alone could move past that card.
-  return new Date(Math.min(at.getTime(), converted));
-}
-
 /** Decision 11: no new card was raised, because the probe grant would lapse before the probe could purge after it. */
 export const CARD_GRANT_SHORT = { grantShort: true } as const;
 
