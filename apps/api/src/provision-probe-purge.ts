@@ -532,10 +532,12 @@ async function raiseChecked(projectId: string, d: ProbePurgeCardDeps, cycleFrom?
   if (!lasts) return CARD_GRANT_SHORT;
   await d.expireStale(since);
   // Decision 34 (Codex PR239-r36): the cycle's one card is also enforced inside the guarded raise, under the lifecycle
-  // lock: a card raised since the cycle entered `card` (or, without a cycle start, since this archive), in any status,
-  // is returned rather than a second one, so an "Ask to delete now" KK made (and approved) after the lookups above is
-  // the card this cycle tracks.
-  const raised = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()), since, cycleFrom ?? since);
+  // lock: a card raised in the window the unlocked lookups covered, in any status, is returned rather than a second
+  // one, so an "Ask to delete now" KK made (and approved) after those lookups is the card this cycle tracks.
+  // Codex PR239-r37: the window is the earlier of this archive's `archived_at` and the cycle start, the union of both
+  // lookups, so an early ask dated between them (a row archived before the cycle entered `card`) is never missed.
+  const reuseSince = cycleFrom !== undefined && cycleFrom.getTime() < since.getTime() ? cycleFrom : since;
+  const raised = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()), since, reuseSince);
   if (raised && "refused" in raised) throw new Error(`probe-card-refused-${raised.refused}`);
   const card = raised;
   if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");

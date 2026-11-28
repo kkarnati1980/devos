@@ -1102,5 +1102,9 @@ test("Decision 34: raiseProbePurgeCard passes the cycle start (or, without one, 
   };
   assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
   assert.equal(await raiseProbePurgeCard("p-1", d), "card-1");
-  assert.deepEqual(seen, [[AT, CYCLE], [AT, AT]]);
+  // Codex PR239-r37: a row archived before the cycle entered `card` reuses from its archive, the earlier time, so an
+  // early ask dated between the archive and the cycle start is in the window.
+  const LATE_CYCLE = new Date(AT.getTime() + 60_000);
+  assert.equal(await raiseProbePurgeCard("p-1", d, LATE_CYCLE), "card-1");
+  assert.deepEqual(seen, [[AT, CYCLE], [AT, AT], [AT, AT]]);
 });
