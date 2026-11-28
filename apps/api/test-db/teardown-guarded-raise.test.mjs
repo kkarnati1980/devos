@@ -1,6 +1,6 @@
 // M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): the guarded purge-card raise against real Postgres. One
 // transaction takes the project's lifecycle lock (the same key Archive, Restore and Purge hold as a session lock),
-// re-reads the row at the database clock and writes the card only if the row is still the archive the caller read.
+// re-reads the row (the due check at the app clock, decision 9) and writes the card only if the row is still the archive the caller read.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
