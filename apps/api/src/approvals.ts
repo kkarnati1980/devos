@@ -342,8 +342,9 @@ export class Approvals {
       throw new ApprovalError("invalid-input");
     }
     if (!(guard.archivedAt instanceof Date) || Number.isNaN(guard.archivedAt.getTime())) throw new ApprovalError("invalid-input");
+    if (guard.reuseSince !== undefined && (!(guard.reuseSince instanceof Date) || Number.isNaN(guard.reuseSince.getTime()))) throw new ApprovalError("invalid-input");
     const audit = { action: "approval.raised", summary: `Decision card: ${card.action}`, details: { gate: card.gate, blocks: 0 } };
-    const r = await this.deps.store.raiseGuarded(card, audit, { projectId: guard.projectId, archivedAt: guard.archivedAt, due: guard.due === true }, new Date(this.now()));
+    const r = await this.deps.store.raiseGuarded(card, audit, { projectId: guard.projectId, archivedAt: guard.archivedAt, due: guard.due === true, ...(guard.reuseSince ? { reuseSince: guard.reuseSince } : {}) }, new Date(this.now()));
     if ("refused" in r) return { refused: r.refused };
     if (r.created && this.deps.notifier) {
       await this.deps.notifier
@@ -582,6 +583,12 @@ export interface RaiseGuard {
   projectId: string;
   archivedAt: Date;
   due: boolean;
+  /**
+   * DEVOS-254 decision 34 (Codex PR239-r36): when set, a card with the same project, gate, action and target created at or
+   * after this time, in any status, is returned instead of a new one. Read under the lifecycle lock in the raise's own
+   * transaction, so a card KK asked for (and perhaps approved) after the caller's own lookups is never doubled.
+   */
+  reuseSince?: Date;
 }
 
 export type GuardRow = { stage: string; archivedAt: Date | null; purgeAfter: Date | null } | null;
@@ -647,6 +654,14 @@ export class MemoryApprovalStore implements ApprovalStore {
     return this.serial(() => {
       const code = guardRefusal(this.guardRow ? this.guardRow(guard.projectId) : null, guard, now);
       if (code) return { refused: code };
+      // Decision 34: the oldest card of this project, action and target since `reuseSince`, any status.
+      if (guard.reuseSince) {
+        const since = guard.reuseSince.getTime();
+        const had = [...this.cards.values()]
+          .filter((c) => c.projectId === (input.projectId ?? null) && c.gate === input.gate && c.action === input.action && c.target === input.target && c.createdAt.getTime() >= since)
+          .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
+        if (had) return { card: { ...had }, created: false };
+      }
       return this.raiseNow(input, [], audit, now);
     });
   }
@@ -911,6 +926,16 @@ export class PrismaApprovalStore implements ApprovalStore {
       // Codex PR242-r4: the due check runs at the app clock that dates the card (decision 9), not clock_timestamp().
       const code = guardRefusal(row, guard, now);
       if (code) return { refused: code };
+      // DEVOS-254 decision 34 (Codex PR239-r36): under the lock, the oldest card of this project, action and target
+      // since `reuseSince` (any status) is returned, not doubled. Every purge-card raise takes this lock (M2.5-b5a), so
+      // none can commit between this read and the insert below.
+      if (guard.reuseSince) {
+        const had = await tx.approval.findFirst({
+          where: { projectId: input.projectId ?? null, gate: input.gate, action: input.action, target: input.target, createdAt: { gte: guard.reuseSince } },
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        });
+        if (had) return { card: toCard(had), created: false };
+      }
       // Codex PR242-r5 (decision 10): dated by the app clock with no floor, as `raise` dates every card on main.
       return this.raiseIn(tx, input, [], a, now);
     });

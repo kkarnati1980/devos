@@ -473,7 +473,7 @@ export interface ProbePurgeCardDeps {
    * row is still archived with exactly `archivedAt`. It dedupes a pending twin, so a retried tick gets the same card. A
    * refusal (`not_archived`, `archive-changed`, `project-not-found`) writes nothing.
    */
-  raise(card: ReturnType<typeof purgeCard>, archivedAt: Date): Promise<{ id: string; createdAt?: Date } | { refused: string }>;
+  raise(card: ReturnType<typeof purgeCard>, archivedAt: Date, reuseSince?: Date): Promise<{ id: string; createdAt?: Date } | { refused: string }>;
   /**
    * Codex PR239-r7/r8 (decision 11): true when the probe grant outlasts the card wait and the purge after it. Asked
    * only before a new card is raised, never when this archive already has one (a retried tick keeps its card).
@@ -511,10 +511,10 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   // Decision 31 (Codex PR239-r33, replaces r19's session lock around these checks): the checks below only choose
   // whether to ask; the card itself is written by the guarded raise, which re-checks the archive under the lifecycle
   // lock in the same transaction, so a Restore, Purge or new Archive after these reads refuses the raise.
-  return raiseChecked(projectId, d);
+  return raiseChecked(projectId, d, cycleFrom);
 }
 
-async function raiseChecked(projectId: string, d: ProbePurgeCardDeps): Promise<string | typeof CARD_GRANT_SHORT> {
+async function raiseChecked(projectId: string, d: ProbePurgeCardDeps, cycleFrom?: Date): Promise<string | typeof CARD_GRANT_SHORT> {
   const now = await d.stage();
   // Codex PR239-r1 (medium): a tick that raised the card but did not record its id is retried. The card this archive
   // already has (any status: KK may have approved it, the sweep may have purged) is used again, never a second one.
@@ -531,7 +531,11 @@ async function raiseChecked(projectId: string, d: ProbePurgeCardDeps): Promise<s
   try { lasts = (await d.outlasts()) === true; } catch { lasts = false; }
   if (!lasts) return CARD_GRANT_SHORT;
   await d.expireStale(since);
-  const raised = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()), since);
+  // Decision 34 (Codex PR239-r36): the cycle's one card is also enforced inside the guarded raise, under the lifecycle
+  // lock: a card raised since the cycle entered `card` (or, without a cycle start, since this archive), in any status,
+  // is returned rather than a second one, so an "Ask to delete now" KK made (and approved) after the lookups above is
+  // the card this cycle tracks.
+  const raised = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()), since, cycleFrom ?? since);
   if (raised && "refused" in raised) throw new Error(`probe-card-refused-${raised.refused}`);
   const card = raised;
   if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");

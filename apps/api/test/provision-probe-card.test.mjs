@@ -1059,3 +1059,48 @@ test("Decision 33: the card phase passes the time it entered `card` to every rai
   assert.equal((await probeStep(d)).phase, "cardwait");
   assert.deepEqual(seen.map((x) => x.getTime()), [entered, entered]);
 });
+
+test("Decision 34 (Codex PR239-r36): the guarded raise reuses, under the lock, a card KK asked for (and approved) after the lookups", async () => {
+  const { Approvals, MemoryApprovalStore } = await import("../dist/approvals.js");
+  const { purgeCard } = await import("../dist/teardown-sweep.js");
+  const P = "11111111-2222-4333-8444-555555555555";
+  const CYCLE = new Date("2026-11-28T10:00:00Z");
+  const archivedAt = new Date("2026-11-28T10:00:01Z");
+  let now = Date.parse("2026-11-28T10:00:05Z");
+  const store = new MemoryApprovalStore();
+  store.guardRow = () => ({ stage: "archived", archivedAt, purgeAfter: new Date(archivedAt.getTime() + 30 * DAY) });
+  const ap = new Approvals({ store, grants: null, notifier: null, verifyKkSession: () => false, now: () => now });
+  const card = () => purgeCard({ id: P, slug: PROBE_SLUG }, { github: 1 });
+  // KK's "Ask to delete now", raised after the probe's lookups, then decided (approved here: not pending, so the
+  // pending-twin dedupe alone would miss it).
+  const asked = await ap.raiseGuardedCard(card(), { projectId: P, archivedAt, due: false });
+  const c = store.cards.get(asked.id);
+  Object.assign(c, { status: "approved", decidedAt: new Date(now), decidedBy: "kk", confirmationHash: "h" });
+  now += 1000;
+  const got = await ap.raiseGuardedCard(card(), { projectId: P, archivedAt, due: false, reuseSince: CYCLE });
+  assert.equal(got.id, asked.id, "the card KK already has is returned");
+  assert.equal(store.cards.size, 1, "no second card");
+  // Without the window (every other caller) the approved card is not reused: a pending card is raised, as before.
+  const plain = await ap.raiseGuardedCard(card(), { projectId: P, archivedAt, due: false });
+  assert.notEqual(plain.id, asked.id);
+  assert.equal(store.cards.size, 2);
+  // A card from before the window is not reused.
+  const later = await ap.raiseGuardedCard(card(), { projectId: P, archivedAt, due: false, reuseSince: new Date(now + 1) });
+  assert.equal(later.id, plain.id, "only the pending twin, by the usual dedupe");
+  // An invalid window is refused before any read.
+  await assert.rejects(ap.raiseGuardedCard(card(), { projectId: P, archivedAt, due: false, reuseSince: new Date(NaN) }), /invalid-input/);
+});
+
+test("Decision 34: raiseProbePurgeCard passes the cycle start (or, without one, the archive) as the raise's reuse window", async () => {
+  const AT = new Date("2026-11-28T10:00:01Z");
+  const CYCLE = new Date("2026-11-28T10:00:00Z");
+  const seen = [];
+  const d = {
+    stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, archive: async () => {},
+    counts: async () => ({}), outlasts: async () => true, expireStale: async () => {},
+    raise: async (c, archivedAt, reuseSince) => { seen.push([archivedAt, reuseSince]); return { id: "card-1", createdAt: new Date(AT.getTime() + 1) }; },
+  };
+  assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
+  assert.equal(await raiseProbePurgeCard("p-1", d), "card-1");
+  assert.deepEqual(seen, [[AT, CYCLE], [AT, AT]]);
+});

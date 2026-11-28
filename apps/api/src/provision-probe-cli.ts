@@ -199,7 +199,8 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               }),
               counts: () => probeActiveCounts(db, p.id, timeoutMs),
               // Decision 31 (Codex PR239-r33): the card is written under the lifecycle lock, bound to this archive.
-              raise: (c, archivedAt) => approvals.raiseGuardedCard(c, { projectId: p.id, archivedAt, due: false }),
+              // Decision 34 (Codex PR239-r36): the cycle's card is reused under the lock, never doubled.
+              raise: (c, archivedAt, reuseSince) => approvals.raiseGuardedCard(c, { projectId: p.id, archivedAt, due: false, ...(reuseSince ? { reuseSince } : {}) }),
               // Codex PR239-r7/r8 (decision 11): only before a new card, from this tick.
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
               // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
