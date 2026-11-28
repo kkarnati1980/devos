@@ -38,6 +38,9 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
   const projects = new Map([[P, { id: P, slug: "acme", stage: "archived", archivedAt: new Date(T0 - 31 * DAY), purgeAfter: new Date(T0 - DAY) }]]);
   const counts = { [P]: { github: 2, coolify: 5 } };
   const calls = { purge: [], providerCalls: 0, keep: [] };
+  // M2.5-b5a: the guarded raise re-reads these rows (in Postgres: under the project lock, in the raise's transaction).
+  store.guardRow = (id) => (projects.has(id) ? { ...projects.get(id) } : null);
+  const hooks = { beforeLockedRaise: null };
   const logs = [];
   const purge = async (projectId, grantId, cardCreatedAt) => {
     calls.purge.push({ projectId, grantId });
@@ -61,6 +64,11 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
       if (failRaise.n > 0) { failRaise.n--; return Promise.reject(new Error("db blip")); }
       return approvals.raiseCard(c);
     },
+    raiseLocked: async (c, g) => {
+      if (hooks.beforeLockedRaise) await hooks.beforeLockedRaise(c);
+      if (failRaise.n > 0) { failRaise.n--; throw new Error("db blip"); }
+      return approvals.raiseGuardedCard(c, { projectId: c.projectId, ...g });
+    },
     expire: (ids, reason) => approvals.expireCardsById(ids, reason),
     unspentGrant: async (approvalId, at) => {
       return [...policyStore.grants].find((g) => g.approvalId === approvalId && !g.revokedAt && g.expiresAt > at && g.uses === 0)?.id ?? null;
@@ -79,7 +87,7 @@ function setup({ purgeImpl, purgeTimeoutMs, mode = "enforce", rules = [purgeRule
   });
   const session = kk.mint("kk@example.com");
   const purgeCards = (status) => approvals.store.list({ action: PURGE_ACTION, limit: 50, ...(status ? { status } : {}) });
-  return { failDue, failRaise, job, approvals, store, engine, policyStore, projects, counts, calls, logs, session, purgeCards, advance: (ms) => (now += ms), now: () => now };
+  return { hooks, failDue, failRaise, job, approvals, store, engine, policyStore, projects, counts, calls, logs, session, purgeCards, advance: (ms) => (now += ms), now: () => now };
 }
 
 const approve = (s, id) => s.approvals.approve(s.session, id, { confirmation: `PURGE project:${P}` });
@@ -354,7 +362,7 @@ test("wiring: buildTeardownSweep is off, with a code, without its modules, the v
   const mods = { ...base, mod: {}, td: {} };
   assert.deepEqual(buildTeardownSweep(mods), { off: "teardown-vault-not-configured" });
   assert.deepEqual(buildTeardownSweep({ ...mods, vault: { reveal: async () => null } }), { off: "teardown-approvals-off" });
-  const off = buildTeardownSweep({ ...mods, vault: { reveal: async () => null }, cards: { list: async () => [], raise: async () => ({}), expire: async () => [] } });
+  const off = buildTeardownSweep({ ...mods, vault: { reveal: async () => null }, cards: { list: async () => [], raise: async () => ({}), raiseLocked: async () => ({ refused: "test" }), expire: async () => [] } });
   assert.ok("off" in off && typeof off.off === "string");
 });
 
@@ -370,7 +378,7 @@ test("pre-review 6: the production queries: an unspent grant only, and Keep arch
   const mod = { GitHubClient: class {}, CoolifyClient: class {} };
   const job = buildTeardownSweep({
     mod, td: { PrismaTeardownStore: Store }, db, databaseUrl: "postgresql://x", vault: { reveal: async () => null },
-    policy: { decide: async () => ({ enforcedOutcome: "deny" }) }, cards: { list: async () => [], raise: async () => ({}), expire: async () => [] },
+    policy: { decide: async () => ({ enforcedOutcome: "deny" }) }, cards: { list: async () => [], raise: async () => ({}), raiseLocked: async () => ({ refused: "test" }), expire: async () => [] },
     env: { DEVOS_GITHUB_OWNER: "acme", DEVOS_COOLIFY_URL: "https://coolify.example.com", DEVOS_COOLIFY_SERVER_UUID: "srv-1", DEVOS_TAILNET_IP: "100.64.0.7", GIT_SHA: "a".repeat(40) }, timeoutMs: 1000, log: () => {},
   });
   assert.ok(!("off" in job), JSON.stringify(job.off));
@@ -549,6 +557,12 @@ function askHarness(purgeImpl) {
       cards.push(card);
       return card;
     },
+    raiseLocked: async (c) => {
+      const card = { ...c, id: `44444444-2222-4333-8444-55555555555${raised.length}`, status: "pending", createdAt: new Date(now) };
+      raised.push(card);
+      cards.push(card);
+      return card;
+    },
     expire: async () => [],
     unspentGrant: async () => "g1",
     purge: purgeImpl,
@@ -585,4 +599,79 @@ test("pre-review 2 (M2.5-b3): while a purge runs past its 10-minute limit, the a
   finish({ purged: true, report: { hits: [], errors: [] } });
   await new Promise((r) => setImmediate(r));
   assert.equal(h.raised.length, 0);
+});
+
+// M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): the purge card is raised under the project's lifecycle lock on
+// a fresh read of the row, so a purge, a Restore or a new Archive that lands after the caller's read gets no card.
+test("M2.5-b5a AT1: an early ask whose row is purged before its locked raise answers not_archived and raises no card", async () => {
+  const s = setup();
+  s.projects.get(P).purgeAfter = new Date(T0 + 10 * DAY);
+  s.hooks.beforeLockedRaise = async () => { s.projects.get(P).stage = "purged"; };
+  assert.deepEqual(await s.job.askPurge(P), { ok: false, code: "not_archived" });
+  assert.equal((await s.purgeCards()).length, 0, "no card for a purged row");
+  // Unchanged behaviour on an archived row: the ask raises its card.
+  s.hooks.beforeLockedRaise = null;
+  s.projects.get(P).stage = "archived";
+  const r = await s.job.askPurge(P);
+  assert.equal(r.ok, true);
+  assert.equal(r.raised, true);
+  assert.equal((await s.purgeCards("pending")).length, 1);
+});
+
+test("M2.5-b5a AT1: a failed locked raise raises nothing and is not reported as a card", async () => {
+  const s = setup();
+  s.projects.get(P).purgeAfter = new Date(T0 + 10 * DAY);
+  s.failRaise.n = 1;
+  await assert.rejects(() => s.job.askPurge(P));
+  assert.equal((await s.purgeCards()).length, 0);
+});
+
+test("M2.5-b5a AT2: a daily run whose row is purged before its locked raise raises nothing", async () => {
+  const s = setup();
+  s.hooks.beforeLockedRaise = async () => { s.projects.get(P).stage = "purged"; };
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-card-skipped" && l.code === "not_archived"));
+});
+
+test("M2.5-b5a AT3: a row restored and archived again after listDue gets no card from that run; the next day's run raises one", async () => {
+  const s = setup();
+  s.hooks.beforeLockedRaise = async () => {
+    const p = s.projects.get(P);
+    p.archivedAt = new Date(s.now());
+    p.purgeAfter = new Date(s.now() - 1000); // already due, but a different archive than listDue returned
+  };
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0, "the stale due snapshot raises nothing");
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-card-skipped" && l.code === "archive-changed"));
+  s.hooks.beforeLockedRaise = null;
+  s.advance(DAY);
+  await s.job.tick();
+  assert.equal((await s.purgeCards("pending")).length, 1, "the new archive's own daily run raises its card");
+});
+
+test("M2.5-b5a AT3: Keep archived moving the purge date after listDue refuses the daily card (not-due)", async () => {
+  const s = setup();
+  s.hooks.beforeLockedRaise = async () => { s.projects.get(P).purgeAfter = new Date(s.now() + 30 * DAY); };
+  await s.job.tick();
+  assert.equal((await s.purgeCards()).length, 0);
+  assert.ok(s.logs.some((l) => l.msg === "teardown-purge-card-skipped" && l.code === "not-due"));
+});
+
+test("M2.5-b5a: the daily run never queues behind this process's own running purge", async () => {
+  let finish;
+  const s = setup({ purgeImpl: () => new Promise((r) => { finish = r; }), purgeTimeoutMs: 5 });
+  await s.job.tick();
+  const [c] = await s.purgeCards("pending");
+  await approve(s, c.id);
+  s.advance(5 * 60_000);
+  await s.job.tick(); // runs the purge; it times out at 5 ms and keeps running under the lock
+  assert.equal(s.calls.providerCalls, 1);
+  s.advance(DAY);
+  let locked = 0;
+  s.hooks.beforeLockedRaise = async () => { locked++; };
+  await s.job.tick(); // the next day's run: the row is still archived and due, its purge still running
+  assert.equal(locked, 0, "no locked raise while this process's purge is still running");
+  assert.equal((await s.purgeCards("pending")).length, 0);
+  finish({ purged: true, report: { hits: [], errors: [] } });
 });

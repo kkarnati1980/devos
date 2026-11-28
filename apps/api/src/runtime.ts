@@ -289,6 +289,7 @@ export async function buildRuntime(
   const purgeCards: TeardownSweepCards = {
     list: (f) => approvalsCore.store.list(f as Parameters<typeof approvalsCore.store.list>[0]),
     raise: (card) => approvalsCore.raiseCard(card),
+    raiseLocked: (card, guard) => approvalsCore.raiseGuardedCard(card, guard),
     expire: (ids, reason) => approvalsCore.expireCardsById(ids, reason),
   };
   const ts = buildTeardownSweep({ mod: loaded?.mod ?? null, td, db, databaseUrl, vault, policy: engine as unknown as Parameters<typeof buildTeardownSweep>[0]["policy"], cards: purgeCards, env, timeoutMs: t, log, linear: linearTeardown });
