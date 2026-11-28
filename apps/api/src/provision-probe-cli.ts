@@ -182,7 +182,7 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           ),
           // DEVOS-254 (AT10): one cycle purges through KK's gate-5 purge card and the sweep job, not the probe grant.
           cardCycle: () => probeCardCycle(db, p.id, timeoutMs),
-          raisePurgeCard: async () => {
+          raisePurgeCard: async (cycleFrom) => {
             const k = w.purge;
             const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
             return raiseProbePurgeCard(p.id, {
@@ -204,7 +204,7 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
               // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
               expireStale: (before) => expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason), before),
-            });
+            }, cycleFrom);
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
           // Codex PR239-r28: the current archive's oldest purge card, for a purge reached without a tracked card.

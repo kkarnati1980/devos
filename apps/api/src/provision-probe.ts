@@ -110,7 +110,8 @@ export interface ProbeDeps {
    * DEVOS-254 decision 3: archive the probe project (unless archived) and raise the M2.5-b2 purge card; its id (the card
    * this archive already has, on a retried tick). `{ grantShort }` when no card was raised for decision 11.
    */
-  raisePurgeCard?(): Promise<string | { grantShort: true }>;
+  /** Decision 33 (Codex PR239-r35): `cycleFrom` is when this cycle entered `card`; a card raised since then is reused. */
+  raisePurgeCard?(cycleFrom: Date): Promise<string | { grantShort: true }>;
   /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
   cardOutcome?(cardId: string): Promise<CardOutcome>;
   /**
@@ -331,7 +332,7 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     case "card": {
       // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
       if (!d.raisePurgeCard) return leaveCard(failed("card-not-wired"));
-      const r = await attempt(() => d.raisePurgeCard!());
+      const r = await attempt(() => d.raisePurgeCard!(new Date(Date.parse(last.at))));
       // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
       if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return leaveCard(failed("card-grant-short"));
       // Codex PR239-r14 (medium): a throw may come after the card was persisted (the reads that bind and track it), so

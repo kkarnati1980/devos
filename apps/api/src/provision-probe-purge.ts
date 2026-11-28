@@ -494,7 +494,17 @@ export const CARD_GRANT_SHORT = { grantShort: true } as const;
  * `project:<id>`, fixed wording). The probe never approves it and never purges under it: the sweep job does, once KK
  * approves it in the inbox. Returns the card's id.
  */
-export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDeps): Promise<string | typeof CARD_GRANT_SHORT> {
+export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDeps, cycleFrom?: Date): Promise<string | typeof CARD_GRANT_SHORT> {
+  // Decision 33 (Codex PR239-r35, medium): one card per cycle. A tick that raised the card but failed before recording
+  // `cardwait` is retried here; if KK restored the row in between, the old order (Archive, then a lookup bound to the
+  // new `archived_at`) undid his Restore and raised a second card. So the first read, before any Archive, is for a purge
+  // card raised since this cycle entered `card`, bound to no archive. If one exists it is tracked as it is: no Archive,
+  // no raise. `cardwait` then reads a Restored row as `card-ended` (decision 4's table), M2.5-b4's Restore handling.
+  if (cycleFrom !== undefined) {
+    if (!(cycleFrom instanceof Date) || !Number.isFinite(cycleFrom.getTime())) throw new Error("probe-card-no-cycle-start");
+    const prior = await d.existing(cycleFrom);
+    if (prior) return prior;
+  }
   const stage = await d.stage();
   // The Archive takes the lifecycle lock itself and releases it before the guarded raise (decision 31) takes it again.
   if (stage !== "archived" && stage !== "purged") await d.archive();

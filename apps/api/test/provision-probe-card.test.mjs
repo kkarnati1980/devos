@@ -1003,3 +1003,59 @@ test("Codex PR239-r30 (decision 28): a proof read that throws on a check long af
   e.tick(60_000);
   assert.equal((await probeStep(e)).code, "card-raise-failed");
 });
+
+test("Decision 33 (Codex PR239-r35): a retried card tick after KK's Restore reuses this cycle's card, never re-archives or raises a second", async () => {
+  const CYCLE = new Date("2026-11-28T10:00:00Z");
+  const OLD = new Date("2026-11-28T10:00:01Z"); // the archive the first tick made
+  const CARD = new Date("2026-11-28T10:00:02Z"); // the card it raised before failing to record `cardwait`
+  const NEW = new Date("2026-11-28T10:05:00Z"); // what a re-archive would stamp
+  // KK restored the row in between: it reads live, with no archived_at.
+  let stage = "live"; let archivedAt = null;
+  const calls = { archive: 0, raise: 0, lookups: [] };
+  const cards = [{ id: "card-1", createdAt: CARD }];
+  const d = {
+    stage: async () => stage,
+    archivedAt: async () => archivedAt,
+    existing: async (since) => { calls.lookups.push(since); return cards.find((c) => c.createdAt >= since)?.id ?? null; },
+    archive: async () => { calls.archive++; stage = "archived"; archivedAt = NEW; },
+    counts: async () => ({ github: 1 }),
+    outlasts: async () => true,
+    expireStale: async () => {},
+    raise: async () => { calls.raise++; const c = { id: "card-2", createdAt: new Date(NEW.getTime() + 1) }; cards.push(c); return c; },
+  };
+  assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
+  assert.equal(calls.archive, 0, "KK's Restore is not undone");
+  assert.equal(calls.raise, 0, "no second card in the cycle");
+  assert.deepEqual(calls.lookups, [CYCLE], "the first read is the cycle's card, before any Archive");
+  // Without the cycle start (the old order) the same state re-archived and raised a second card: the r35 defect.
+  assert.equal(await raiseProbePurgeCard("p-1", { ...d }), "card-2");
+  assert.equal(calls.archive, 1);
+  // The same reuse holds when the row is still archived, or when KK archived it again himself.
+  for (const s of ["archived", "purged"]) {
+    stage = s; archivedAt = NEW; calls.raise = 0; calls.archive = 0;
+    const one = [{ id: "card-1", createdAt: CARD }];
+    assert.equal(await raiseProbePurgeCard("p-1", { ...d, existing: async (since) => one.find((c) => c.createdAt >= since)?.id ?? null }, CYCLE), "card-1");
+    assert.deepEqual([calls.archive, calls.raise], [0, 0]);
+  }
+  // No card yet in this cycle: the normal Archive-then-raise path.
+  stage = "live"; archivedAt = null; calls.raise = 0; calls.archive = 0;
+  assert.equal(await raiseProbePurgeCard("p-1", { ...d, existing: async () => null, raise: async () => ({ id: "card-3", createdAt: new Date(NEW.getTime() + 1) }) }, CYCLE), "card-3");
+  assert.equal(calls.archive, 1);
+  // An unreadable cycle start fails the tick before any read or write.
+  calls.lookups.length = 0; calls.archive = 0;
+  await assert.rejects(raiseProbePurgeCard("p-1", d, new Date(NaN)), /probe-card-no-cycle-start/);
+  assert.deepEqual([calls.lookups.length, calls.archive], [0, 0]);
+});
+
+test("Decision 33: the card phase passes the time it entered `card` to every raise, retried ticks included", async () => {
+  const d = fake();
+  const seen = [];
+  d.raisePurgeCard = async (cycleFrom) => { seen.push(cycleFrom); if (seen.length === 1) throw new Error("db after insert"); return "card-1"; };
+  await until(d, "card");
+  const entered = Date.parse(d.log.at(-1).at);
+  d.tick(60_000);
+  assert.equal((await probeStep(d)).detail, "card-raise-retry");
+  d.tick(60_000);
+  assert.equal((await probeStep(d)).phase, "cardwait");
+  assert.deepEqual(seen.map((x) => x.getTime()), [entered, entered]);
+});
