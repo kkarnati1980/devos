@@ -890,11 +890,15 @@ export class PrismaApprovalStore implements ApprovalStore {
       // The lifecycle lock first (bounded by this transaction's statement_timeout), then the raise's own key, the order
       // no other path reverses: Archive, Restore and Purge hold the session form of this lock and never raise a card.
       await tx.$queryRawUnsafe(PROJECT_LOCK_SQL, guard.projectId);
-      const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; now: Date }[] = await tx.$queryRaw`
-        SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter", clock_timestamp() AS now
+      // Codex PR242-r1 (2): the archive is compared in Postgres at the column's full precision, never as a JS Date, so
+      // a stored value that differs from the caller's snapshot below the millisecond is another archive.
+      const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; now: Date; sameArchive: boolean | null }[] = await tx.$queryRaw`
+        SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter", clock_timestamp() AS now,
+          (archived_at = ${guard.archivedAt}::timestamptz) AS "sameArchive"
         FROM project WHERE id = ${guard.projectId}::uuid`;
       const row = rows[0];
       if (!row) return { refused: "project-not-found" };
+      if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
       const code = guardRefusal(row, guard, row.now);
       if (code) return { refused: code };
       // Until M2.5-b5b writes archived_at from the database clock too, a card raised under the lock after the archive

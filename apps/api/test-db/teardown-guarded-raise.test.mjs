@@ -74,3 +74,12 @@ test("the raise waits for the session lifecycle lock and sees the purge that hel
     await holder.end();
   }
 });
+
+test("Codex PR242-r1: an archive that differs from the snapshot only below the millisecond is refused", async () => {
+  const archivedAt = new Date(Date.now() - 31 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
+  // Same millisecond, 400 microseconds later: another archive the JS snapshot cannot tell apart.
+  await db.$executeRaw`UPDATE project SET archived_at = archived_at + interval '400 microseconds' WHERE id = ${p.id}::uuid`;
+  assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "archive-changed" });
+  assert.equal((await cardsOf(p.id)).length, 0);
+});
