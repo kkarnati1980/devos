@@ -199,18 +199,12 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
                 },
               }),
               counts: () => probeActiveCounts(db, p.id, timeoutMs),
-              raise: (c) => approvals.raiseCard(c),
+              // Decision 31 (Codex PR239-r33): the card is written under the lifecycle lock, bound to this archive.
+              raise: (c, archivedAt) => approvals.raiseGuardedCard(c, { projectId: p.id, archivedAt, due: false }),
               // Codex PR239-r7/r8 (decision 11): only before a new card, from this tick.
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
               // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
               expireStale: (before) => expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason), before),
-              // Codex PR239-r19 (medium): the archived-state checks and the raise hold the project lifecycle lock.
-              locked: (fn) => {
-                const lockStore = k.store as unknown as { withProjectLock?<T>(id: string, f: () => Promise<T>): Promise<T> };
-                // Fails closed: without the lock no card is raised.
-                if (typeof lockStore.withProjectLock !== "function") throw new Error("probe-card-no-lock");
-                return lockStore.withProjectLock(p.id, fn);
-              },
             });
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),

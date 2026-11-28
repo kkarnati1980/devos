@@ -456,8 +456,13 @@ export interface ProbePurgeCardDeps {
   archive(): Promise<void>;
   /** The per-provider counts of the probe's active resources (the card's "what will be deleted"). */
   counts(): Promise<Record<string, number>>;
-  /** `Approvals.raiseCard` (it dedupes a pending twin, so a retried tick gets the same card). */
-  raise(card: ReturnType<typeof purgeCard>): Promise<{ id: string; createdAt?: Date }>;
+  /**
+   * Decision 31 (Codex PR239-r33): `Approvals.raiseGuardedCard(card, { projectId, archivedAt, due: false })`, the M2.5-b5a
+   * raise that re-reads the row and writes the card in one transaction under the project lifecycle lock, only while the
+   * row is still archived with exactly `archivedAt`. It dedupes a pending twin, so a retried tick gets the same card. A
+   * refusal (`not_archived`, `archive-changed`, `project-not-found`) writes nothing.
+   */
+  raise(card: ReturnType<typeof purgeCard>, archivedAt: Date): Promise<{ id: string; createdAt?: Date } | { refused: string }>;
   /**
    * Codex PR239-r7/r8 (decision 11): true when the probe grant outlasts the card wait and the purge after it. Asked
    * only before a new card is raised, never when this archive already has one (a retried tick keeps its card).
@@ -468,12 +473,6 @@ export interface ProbePurgeCardDeps {
    * `raiseCard`'s pending-twin dedupe cannot hand back a stale card (`probe-card-stale`). Throws when one stays pending.
    */
   expireStale(before: Date): Promise<void>;
-  /**
-   * Codex PR239-r19 (medium): runs `fn` under the project lifecycle lock (the teardown store's `withProjectLock`, the
-   * lock Archive, Restore and Purge take), so no Restore can land between the archived-state check and the raise.
-   * Production always passes it; without it `fn` runs as is (unit tests of the other steps).
-   */
-  locked?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 /** Decision 11: no new card was raised, because the probe grant would lapse before the probe could purge after it. */
@@ -486,14 +485,15 @@ export const CARD_GRANT_SHORT = { grantShort: true } as const;
  */
 export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDeps): Promise<string | typeof CARD_GRANT_SHORT> {
   const stage = await d.stage();
-  // The Archive takes the lifecycle lock itself, so it runs before the locked part (the lock is not taken twice).
+  // The Archive takes the lifecycle lock itself and releases it before the guarded raise (decision 31) takes it again.
   if (stage !== "archived" && stage !== "purged") await d.archive();
-  // Codex PR239-r19 (medium): every check from the archived state through the raise holds the lifecycle lock, so a
-  // purge card is raised only while the row is archived (M2.5: purge cards come from the archived state only).
-  return d.locked ? d.locked(() => raiseLocked(projectId, d)) : raiseLocked(projectId, d);
+  // Decision 31 (Codex PR239-r33, replaces r19's session lock around these checks): the checks below only choose
+  // whether to ask; the card itself is written by the guarded raise, which re-checks the archive under the lifecycle
+  // lock in the same transaction, so a Restore, Purge or new Archive after these reads refuses the raise.
+  return raiseChecked(projectId, d);
 }
 
-async function raiseLocked(projectId: string, d: ProbePurgeCardDeps): Promise<string | typeof CARD_GRANT_SHORT> {
+async function raiseChecked(projectId: string, d: ProbePurgeCardDeps): Promise<string | typeof CARD_GRANT_SHORT> {
   const now = await d.stage();
   // Codex PR239-r1 (medium): a tick that raised the card but did not record its id is retried. The card this archive
   // already has (any status: KK may have approved it, the sweep may have purged) is used again, never a second one.
@@ -510,7 +510,9 @@ async function raiseLocked(projectId: string, d: ProbePurgeCardDeps): Promise<st
   try { lasts = (await d.outlasts()) === true; } catch { lasts = false; }
   if (!lasts) return CARD_GRANT_SHORT;
   await d.expireStale(since);
-  const card = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()));
+  const raised = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()), since);
+  if (raised && "refused" in raised) throw new Error(`probe-card-refused-${raised.refused}`);
+  const card = raised;
   if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");
   // Pre-review 2: `raiseCard` dedupes against a pending twin. One left from an earlier archive (the sweep was off and
   // nothing expired it) would be skipped by the sweep (`card-before-archive`), so it is not used.
