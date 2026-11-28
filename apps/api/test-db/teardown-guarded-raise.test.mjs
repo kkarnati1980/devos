@@ -122,3 +122,22 @@ test("Codex PR242-r6: a Keep archived update in flight during the raise is waite
     await keeper.end();
   }
 });
+
+test("Codex PR242-r7: the raise's row lock does not block a foreign-key check (FOR KEY SHARE) on the project", async () => {
+  const archivedAt = new Date(Date.now() - 31 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
+  const appNow = Date.now() + 60_000;
+  const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
+  const other = new pg.Client({ connectionString: url });
+  await other.connect();
+  try {
+    // What an audit_event insert's foreign-key check takes on the project row, held open during the raise.
+    await other.query("BEGIN");
+    await other.query("SELECT 1 FROM project WHERE id = $1::uuid FOR KEY SHARE", [p.id]);
+    const c = await ahead.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true });
+    assert.equal(typeof c.id, "string", "the raise is not blocked by the key-share lock");
+    await other.query("COMMIT");
+  } finally {
+    await other.end();
+  }
+});

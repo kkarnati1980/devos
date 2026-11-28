@@ -897,12 +897,14 @@ export class PrismaApprovalStore implements ApprovalStore {
       await tx.$queryRawUnsafe(PROJECT_LOCK_SQL, guard.projectId);
       // Codex PR242-r1 (2): the archive is compared in Postgres at the column's full precision, never as a JS Date, so
       // a stored value that differs from the caller's snapshot below the millisecond is another archive.
-      // Codex PR242-r6 (decision 11): FOR UPDATE holds the row until the card commits, so a write that takes no lifecycle
-      // lock (Keep archived moving purge_after) either commits first and is read here, or waits for this transaction.
+      // Codex PR242-r6/r7 (decision 11): FOR NO KEY UPDATE holds the row until the card commits, so a write that takes no
+      // lifecycle lock (Keep archived moving purge_after) either commits first and is read here, or waits for this
+      // transaction. It does not block FOR KEY SHARE, so a decision or expiry holding a twin card while its audit_event
+      // insert checks the project foreign key never deadlocks against this raise.
       const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; sameArchive: boolean | null }[] = await tx.$queryRaw`
         SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter",
           (archived_at = ${guard.archivedAt}::timestamptz) AS "sameArchive"
-        FROM project WHERE id = ${guard.projectId}::uuid FOR UPDATE`;
+        FROM project WHERE id = ${guard.projectId}::uuid FOR NO KEY UPDATE`;
       const row = rows[0];
       if (!row) return { refused: "project-not-found" };
       if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
