@@ -34,7 +34,10 @@ function fake(over = {}) {
     grantUntil: Infinity,
     expirePurgeCards: async () => { calls.expire = (calls.expire ?? 0) + 1; },
     cardGrantOutlasts: async (until) => { calls.grantCheck = (calls.grantCheck ?? 0) + 1; return until.getTime() < d.grantUntil; },
-    cardOutcome: async (id) => { calls.outcome++; assert.equal(id, "card-1"); return { stage: state.stage, card: state.card, decidedAt: state.decidedAt, byCard: state.byCard, raisedAt: state.raisedAt }; },
+    cardOutcome: async (id) => { calls.outcome++; assert.equal(id, "card-1"); // M2.5-b5b decision 18: the card's age as Postgres measures it; by default the app and database clocks agree.
+      const raised = Date.parse(state.raisedAt);
+      const raisedAgoMs = state.raisedAgoMs !== undefined ? state.raisedAgoMs : Number.isFinite(raised) ? t - raised : null;
+      return { stage: state.stage, card: state.card, decidedAt: state.decidedAt, byCard: state.byCard, raisedAt: state.raisedAt, raisedAgoMs }; },
     ...over,
   };
   return d;
@@ -278,6 +281,53 @@ test("Codex PR239-r12: the card wait runs from the card's raise when an earlier 
   assert.equal((await probeStep(f)).phase, "purge");
 });
 
+test("M2.5-b5b decision 18 (Codex PR244-r4): the card wait is measured on one clock, so a database clock behind the app never ends it early", async () => {
+  // Postgres is 8 days behind the app: the new card's `created_at` reads 8 days before the record, but its age is 0.
+  const withDb = () => fake({ dbNow: async () => new Date("2026-11-25T09:00:00Z") });
+  const d = withDb();
+  await until(d, "cardwait");
+  assert.equal(typeof d.log.at(-1).cardFromDb, "string", "a cycle entered after b5b");
+  const recorded = Date.parse(d.log.at(-1).at);
+  d.state.raisedAt = new Date(recorded - 8 * DAY).toISOString();
+  d.state.raisedAgoMs = 0;
+  assert.equal((await probeStep(d)).detail, "awaiting-card", "a just-raised card is not 8 days old");
+  d.tick(PROBE_CARD_MAX_MS - 1);
+  d.state.raisedAgoMs = PROBE_CARD_MAX_MS - 1;
+  assert.equal((await probeStep(d)).detail, "awaiting-card");
+  d.tick(1);
+  d.state.raisedAgoMs = PROBE_CARD_MAX_MS;
+  assert.equal((await probeStep(d)).phase, "purge", "the deadline is the card's age on the database clock");
+  // An age a retried tick's reuse gives (2 days before the record) still sets the earlier deadline, as r12 requires.
+  const e = withDb();
+  await until(e, "cardwait");
+  e.state.raisedAt = "2000-01-01T00:00:00Z"; // any database-clock reading; not used for the deadline
+  e.state.raisedAgoMs = 2 * DAY;
+  e.tick(PROBE_CARD_MAX_MS - 2 * DAY - 1);
+  e.state.raisedAgoMs += PROBE_CARD_MAX_MS - 2 * DAY - 1;
+  assert.equal((await probeStep(e)).detail, "awaiting-card");
+  e.tick(1);
+  e.state.raisedAgoMs += 1;
+  assert.equal((await probeStep(e)).phase, "purge");
+  // A negative or unreadable age falls back to the record's deadline.
+  for (const raisedAgoMs of [-1, null, NaN]) {
+    const f = withDb();
+    await until(f, "cardwait");
+    f.state.raisedAgoMs = raisedAgoMs;
+    f.tick(PROBE_CARD_MAX_MS - 1);
+    assert.equal((await probeStep(f)).detail, "awaiting-card", String(raisedAgoMs));
+    f.tick(1);
+    assert.equal((await probeStep(f)).phase, "purge");
+  }
+  // A cycle already in `cardwait` at deploy (no cardFromDb) raised its card on the app clock: its raisedAt is used.
+  const g = fake();
+  await until(g, "cardwait");
+  assert.equal(g.log.at(-1).cardFromDb, undefined);
+  g.state.raisedAt = new Date(Date.parse(g.log.at(-1).at) - 2 * DAY).toISOString();
+  g.state.raisedAgoMs = 0;
+  g.tick(PROBE_CARD_MAX_MS - 2 * DAY);
+  assert.equal((await probeStep(g)).phase, "purge", "the legacy deadline runs from its app-clock raise");
+});
+
 test("Codex PR239-r13: a waiting tick ends with the probe's own purge once the grant would not outlast the next tick and the purge", async () => {
   const seen = [];
   const d = fake();
@@ -420,7 +470,7 @@ function db({ project = { stage: "archived", archivedAt: ARCHIVED }, approval = 
     project: { findUnique: async (q) => { seen.project = q; return project; } },
     approval: { findUnique: async (q) => { seen.approval = q; return approval; }, findMany: async () => [] },
     // M2.5-b5b decision 15: the retired check and the approved-twin read; none here.
-    $queryRawUnsafe: async () => [],
+    $queryRawUnsafe: async (sql) => (sql.includes("clock_timestamp()") ? [{ ms: 3_600_000 }] : []),
     auditEvent: { count: async (q) => { seen.count = q; return count; } },
   };
   return { seen, $transaction: async (fn, o) => { seen.opts = o; return fn(tx); } };
@@ -429,7 +479,7 @@ function db({ project = { stage: "archived", archivedAt: ARCHIVED }, approval = 
 test("probeCardOutcome reads only this project's own purge card; probeCardCycle reads the probe's phase log", async () => {
   const at = new Date("2026-11-25T10:00:00Z");
   let x = db({ approval: { status: "approved", decidedAt: at, createdAt: at, projectId: "p-1", action: "teardown.purge" } });
-  assert.deepEqual(await probeCardOutcome(x, "p-1", "c-1", 5000), { stage: "archived", card: "approved", decidedAt: at.toISOString(), raisedAt: at.toISOString(), byCard: false });
+  assert.deepEqual(await probeCardOutcome(x, "p-1", "c-1", 5000), { stage: "archived", card: "approved", decidedAt: at.toISOString(), raisedAt: at.toISOString(), raisedAgoMs: 3_600_000, byCard: false });
   assert.deepEqual(x.seen.approval.where, { id: "c-1" });
   assert.deepEqual(x.seen.opts, { timeout: 5000, maxWait: 5000 });
   for (const approval of [null, { status: "approved", projectId: "other", action: "teardown.purge" }, { status: "approved", projectId: "p-1", action: "teardown.probe-grant" }, { status: "weird", projectId: "p-1", action: "teardown.purge" }]) {
@@ -499,7 +549,12 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
       project: { findUnique: async () => ({ stage: "purged", archivedAt }) },
       approval: { findUnique: async () => card },
       // M2.5-b5b decision 15: the approved-twin read is SQL with the retired exclusion; the tracked card is not retired.
-      $queryRawUnsafe: async (sql, ...args) => { if (sql.includes("status = 'approved'")) { seen.a = { sql, args }; return approved; } return retired ? [{ id: "c-1" }] : []; },
+      $queryRawUnsafe: async (sql, ...args) => {
+        if (sql.includes("status = 'approved'")) { seen.a = { sql, args }; return approved; }
+        // M2.5-b5b decision 18: the card's age, measured in Postgres on its own clock.
+        if (sql.includes("clock_timestamp()")) { seen.age = { sql, args }; return [{ ms: "42.5" }]; }
+        return retired ? [{ id: "c-1" }] : [];
+      },
       policyDecision: { findMany: async (q) => { seen.q = q; return decisions; } },
     };
     const out = await probeCardOutcome({ $transaction: async (fn) => fn(tx) }, "p-1", "c-1", 5000);
@@ -523,7 +578,9 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
   const later = new Date("2026-11-25T11:00:00Z");
   const twin = { approvalGrant: { approvalId: "c-2" } };
   r = await run([twin], [{ id: "c-2", decidedAt: later }, { id: "c-1", decidedAt: created }]);
-  assert.deepEqual(r.out, { stage: "purged", card: "approved", decidedAt: later.toISOString(), raisedAt: created.toISOString(), byCard: true });
+  assert.deepEqual(r.out, { stage: "purged", card: "approved", decidedAt: later.toISOString(), raisedAt: created.toISOString(), raisedAgoMs: 42.5, byCard: true });
+  assert.deepEqual(r.seen.age.args, ["c-1"]);
+  assert.match(r.seen.age.sql, /EXTRACT\(EPOCH FROM \(clock_timestamp\(\) - a\.created_at\)\) \* 1000/);
   // A grant for a card that is not an approved purge card of this archive never counts, and no approved card at all is
   // the tracked card's own status.
   assert.equal((await run([twin])).out.byCard, false);
@@ -533,7 +590,7 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
   // Codex PR239-r6: after a Restore and a new Archive, the tracked card is older than the row's archived_at: it reads
   // as missing and nothing from the later archive counts, so the cycle can never end pass-card.
   r = await run([twin], [{ id: "c-2", decidedAt: later }], new Date("2026-11-25T10:30:00Z"));
-  assert.deepEqual(r.out, { stage: "purged", card: "missing", decidedAt: null, raisedAt: null, byCard: false });
+  assert.deepEqual(r.out, { stage: "purged", card: "missing", decidedAt: null, raisedAt: null, raisedAgoMs: null, byCard: false });
   r = await run([mine], undefined, null);
   assert.equal(r.out.card, "missing");
   const seen = {};
@@ -1027,6 +1084,8 @@ test("Decision 33 (Codex PR239-r35): a retried card tick after KK's Restore reus
     stage: async () => stage,
     archivedAt: async () => archivedAt,
     existing: async (since) => { calls.lookups.push(since); return cards.find((c) => c.createdAt >= since)?.id ?? null; },
+    // Decision 16: the cycle lookup is separate from the archive-bound one.
+    cycleCard: async (since) => { calls.lookups.push(since); return cards.find((c) => c.createdAt >= since)?.id ?? null; },
     archive: async () => { calls.archive++; stage = "archived"; archivedAt = NEW; },
     counts: async () => ({ github: 1 }),
     outlasts: async () => true,
@@ -1044,17 +1103,40 @@ test("Decision 33 (Codex PR239-r35): a retried card tick after KK's Restore reus
   for (const s of ["archived", "purged"]) {
     stage = s; archivedAt = NEW; calls.raise = 0; calls.archive = 0;
     const one = [{ id: "card-1", createdAt: CARD }];
-    assert.equal(await raiseProbePurgeCard("p-1", { ...d, existing: async (since) => one.find((c) => c.createdAt >= since)?.id ?? null }, CYCLE), "card-1");
+    assert.equal(await raiseProbePurgeCard("p-1", { ...d, cycleCard: async (since) => one.find((c) => c.createdAt >= since)?.id ?? null }, CYCLE), "card-1");
     assert.deepEqual([calls.archive, calls.raise], [0, 0]);
   }
   // No card yet in this cycle: the normal Archive-then-raise path.
   stage = "live"; archivedAt = null; calls.raise = 0; calls.archive = 0;
-  assert.equal(await raiseProbePurgeCard("p-1", { ...d, existing: async () => null, raise: async () => ({ id: "card-3", createdAt: new Date(NEW.getTime() + 1) }) }, CYCLE), "card-3");
+  assert.equal(await raiseProbePurgeCard("p-1", { ...d, existing: async () => null, cycleCard: async () => null, raise: async () => ({ id: "card-3", createdAt: new Date(NEW.getTime() + 1) }) }, CYCLE), "card-3");
   assert.equal(calls.archive, 1);
   // An unreadable cycle start fails the tick before any read or write.
   calls.lookups.length = 0; calls.archive = 0;
   await assert.rejects(raiseProbePurgeCard("p-1", d, new Date(NaN)), /probe-card-no-cycle-start/);
   assert.deepEqual([calls.lookups.length, calls.archive], [0, 0]);
+});
+
+test("M2.5-b5b decision 16 (Codex PR244-r4): KK re-archiving between ticks retires the cycle's card, which is still tracked, never doubled", async () => {
+  const CYCLE = new Date("2026-11-28T10:00:00Z");
+  const NEW = new Date("2026-11-28T10:05:00Z"); // KK's re-archive, which retired card-1
+  const calls = { archive: 0, raise: 0, existing: 0 };
+  const d = {
+    stage: async () => "archived", archivedAt: async () => NEW,
+    // The archive-bound lookup excludes the retired card; the cycle lookup keeps it.
+    existing: async () => { calls.existing++; return null; },
+    cycleCard: async (since) => (since.getTime() === CYCLE.getTime() ? "card-1" : null),
+    archive: async () => { calls.archive++; }, counts: async () => ({}), outlasts: async () => true, expireStale: async () => {},
+    raise: async () => { calls.raise++; return { id: "card-2", createdAt: new Date(NEW.getTime() + 1) }; },
+  };
+  assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
+  assert.deepEqual(calls, { archive: 0, raise: 0, existing: 0 }, "no Archive, no second card, and the cycle read comes first");
+  // Then the card reads as missing (retired), and the cycle ends as a failed card cycle, never a second prompt.
+  const f = fake();
+  await until(f, "cardwait");
+  f.state.card = "missing";
+  const r = await probeStep(f);
+  assert.equal(r.phase, "purge");
+  assert.equal(f.calls.raise, 1);
 });
 
 test("Decision 33: the card phase passes the time it entered `card` to every raise, retried ticks included", async () => {
@@ -1106,7 +1188,7 @@ test("Decision 34: raiseProbePurgeCard passes the cycle start (or, without one, 
   const CYCLE = new Date("2026-11-28T10:00:00Z");
   const seen = [];
   const d = {
-    stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, archive: async () => {},
+    stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, cycleCard: async () => null, archive: async () => {},
     counts: async () => ({}), outlasts: async () => true, expireStale: async () => {},
     raise: async (c, archivedAt, reuseSince) => { seen.push([archivedAt, reuseSince]); return { id: "card-1", createdAt: new Date(AT.getTime() + 1) }; },
   };
@@ -1130,6 +1212,10 @@ test("M2.5-b5b decision 9: the cycle start moves to the database clock, opening 
   // offset = db - t1 = (t0 - 300000 + 10) - (t0 + 20) = -300010; minus the 20 ms round trip.
   assert.equal(got.getTime(), at.getTime() - 300_010 - 20);
   await assert.rejects(cycleStartOnDbClock({ $transaction: async () => [{ t: null }] }, at, 1000), /probe-card-no-cycle-start/);
+  // Decision 17 (Codex PR244-r4): with Postgres ahead, the conversion would move past a card the legacy cycle stamped
+  // on the app clock, so the raw start (the earlier one) is used.
+  const ahead = { $transaction: async () => [{ t: new Date(Date.now() + 5 * 60_000) }] };
+  assert.equal((await cycleStartOnDbClock(ahead, at, 1000)).getTime(), at.getTime());
 });
 
 test("M2.5-b5b decision 13 (Codex PR244-r2): the card cycle's start is read once on the database clock and every card tick reuses it", async () => {

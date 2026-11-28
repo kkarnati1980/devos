@@ -82,6 +82,12 @@ export interface CardOutcome {
   decidedAt?: string | null;
   /** Codex PR239-r12: the tracked card's `created_at` (ISO), or null when it reads as missing. */
   raisedAt?: string | null;
+  /**
+   * M2.5-b5b decision 18 (Codex PR244-r4): how long ago the tracked card was raised, in ms, measured inside Postgres
+   * (`clock_timestamp() - created_at`, both on the database clock), or null when it reads as missing. The wait deadline
+   * uses this, never `raisedAt`, so no database-clock time is compared with the app clock.
+   */
+  raisedAgoMs?: number | null;
   /** Codex PR239-r1: every allowed purge decision since the card was raised ran under this card's grant (and one did). */
   byCard?: boolean;
 }
@@ -387,10 +393,17 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // Codex PR239-r12 (medium): the 8-day wait runs from the earlier of the card's raise and the tick that recorded
       // it. A card raised by a tick that failed to record `cardwait` and reused later keeps its own deadline, so the
       // wait never outruns the grant checked when it was raised (decision 11).
-      const raised = r.ok && typeof r.value.raisedAt === "string" ? Date.parse(r.value.raisedAt) : NaN;
+      // M2.5-b5b decision 18 (Codex PR244-r4, medium): the card's raise is placed on the app clock as now minus its age,
+      // the age measured inside Postgres on one clock, so the deadline never mixes the card's database-clock
+      // `created_at` with the app-clock record. A negative or unreadable age falls back to the record time.
+      const nowMs = d.now().getTime();
+      // A cycle in `cardwait` at deploy (no `cardFromDb`) raised its card on the app clock, so its `raisedAt` is used.
+      const legacy = typeof last.cardFromDb !== "string";
+      const ago = r.ok && typeof r.value.raisedAgoMs === "number" && Number.isFinite(r.value.raisedAgoMs) && r.value.raisedAgoMs >= 0 ? r.value.raisedAgoMs : NaN;
+      const raised = legacy ? (r.ok && typeof r.value.raisedAt === "string" ? Date.parse(r.value.raisedAt) : NaN) : Number.isFinite(ago) ? nowMs - ago : NaN;
       const recorded = Date.parse(last.at);
       const start = Number.isFinite(raised) && raised < recorded ? raised : recorded;
-      const late = d.now().getTime() - start >= PROBE_CARD_MAX_MS;
+      const late = nowMs - start >= PROBE_CARD_MAX_MS;
       if (!r.ok) return late ? leaveCard(failed("card-timeout", "error")) : wait("card-unreadable");
       const o = r.value;
       // AT10: purged by the sweep under KK's approved card. A purge with no approved card is not that proof.

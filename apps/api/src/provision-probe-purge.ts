@@ -390,6 +390,26 @@ export async function probeExistingCard(db: any, projectId: string, since: Date,
   return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
 }
 
+/**
+ * M2.5-b5b decision 16 (Codex PR244-r4, medium): the purge card this cycle already raised, for decision 33's read before
+ * any Archive. Unlike `probeExistingCard` it keeps a card a later Archive retired: if a tick raised card A and failed
+ * to record `cardwait`, and KK then restored and re-archived the row, his Archive retired A, but A is still this
+ * cycle's one card and is tracked as it is (it reads as missing in `cardwait`, so the cycle ends `card-ended`), never
+ * replaced by a second card. Only a card retired by an Archive that happened before the cycle started (`occurred_at`,
+ * the database clock, like `since`) is excluded: that card belongs to an earlier cycle whatever its `created_at` says.
+ */
+export async function probeCycleCard(db: any, projectId: string, since: Date, timeoutMs: number): Promise<string | null> {
+  const rows: { id: string }[] = await db.$transaction((tx: any) => tx.$queryRawUnsafe(
+    `SELECT a.id::text AS id FROM approval a WHERE a.project_id = $1::uuid AND a.action = 'teardown.purge' AND a.target = $2
+       AND a.created_at >= $3::timestamptz AND NOT EXISTS (SELECT 1 FROM audit_event e WHERE e.project_id = a.project_id
+         AND e.action = 'teardown.archive_retired_cards' AND e.details -> 'retired' @> jsonb_build_array(a.id::text)
+         AND e.occurred_at < $3::timestamptz)
+       ORDER BY a.created_at ASC, a.id ASC LIMIT 1`,
+    projectId, `project:${projectId}`, since), { timeout: timeoutMs, maxWait: timeoutMs });
+  const c = rows?.[0];
+  return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
+}
+
 /** Codex PR239-r15: the fixed reason the probe gives when it expires its own purge cards. */
 export const PROBE_CARD_EXPIRE_REASON = "AT13 probe: purged by the probe itself, or superseded by a later archive (DEVOS-254)";
 
@@ -454,6 +474,10 @@ export async function probeCardOutcome(db: any, projectId: string, cardId: strin
       });
       byCard = ds.length > 0 && ds.length < 50 && ds.every((x) => typeof x.approvalGrant?.approvalId === "string" && ids.has(x.approvalGrant.approvalId));
     }
+    // Decision 18 (Codex PR244-r4): the tracked card's age on the database clock alone, for the app-clock wait deadline.
+    const age: { ms: unknown }[] = ok ? await tx.$queryRawUnsafe(
+      `SELECT (EXTRACT(EPOCH FROM (clock_timestamp() - a.created_at)) * 1000)::float8 AS ms FROM approval a WHERE a.id = $1::uuid`, cardId) : [];
+    const ageMs = Number(age?.[0]?.ms);
     const newest = approved[0];
     const decided = newest ? newest.decidedAt : ok ? c.decidedAt : null;
     return {
@@ -463,6 +487,7 @@ export async function probeCardOutcome(db: any, projectId: string, cardId: strin
       // Codex PR239-r12: when the tracked card was raised, so the wait is measured from the card, not from the tick
       // that recorded it.
       raisedAt: ok && c.createdAt instanceof Date ? c.createdAt.toISOString() : null,
+      raisedAgoMs: ok && age.length > 0 && Number.isFinite(ageMs) ? ageMs : null,
       byCard,
     };
   }, { timeout: timeoutMs, maxWait: timeoutMs });
@@ -474,6 +499,11 @@ export interface ProbePurgeCardDeps {
   archivedAt(): Promise<Date | null>;
   /** The id of the oldest `teardown.purge` card of this project raised at or after `since`, any status, or null. */
   existing(since: Date): Promise<string | null>;
+  /**
+   * Decision 16 (Codex PR244-r4): `probeCycleCard`, the id of the oldest purge card raised at or after the cycle start
+   * `since`, including one a later Archive retired; read only by decision 33's lookup before any Archive.
+   */
+  cycleCard(since: Date): Promise<string | null>;
   /** Archive under the probe's KK grant (`teardown.archive` only); called only when the row is not archived yet. */
   archive(): Promise<void>;
   /** The per-provider counts of the probe's active resources (the card's "what will be deleted"). */
@@ -508,7 +538,11 @@ export async function cycleStartOnDbClock(db: any, at: Date, timeoutMs: number, 
   const t1 = appNow();
   const dbT = rows?.[0]?.t;
   if (!(dbT instanceof Date) || !Number.isFinite(dbT.getTime()) || !Number.isFinite(at.getTime())) throw new Error("probe-card-no-cycle-start");
-  return new Date(at.getTime() + (dbT.getTime() - t1) - (t1 - t0));
+  const converted = at.getTime() + (dbT.getTime() - t1) - (t1 - t0);
+  // Decision 17 (Codex PR244-r4, medium): only a record written before decision 13 comes here, and a card its cycle
+  // already raised may have been stamped by the app clock (before b5b). So the window opens at the earlier of the raw
+  // app-clock start and its conversion: with Postgres ahead, the conversion alone could move past that card.
+  return new Date(Math.min(at.getTime(), converted));
 }
 
 /** Decision 11: no new card was raised, because the probe grant would lapse before the probe could purge after it. */
@@ -527,7 +561,8 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   // no raise. `cardwait` then reads a Restored row as `card-ended` (decision 4's table), M2.5-b4's Restore handling.
   if (cycleFrom !== undefined) {
     if (!(cycleFrom instanceof Date) || !Number.isFinite(cycleFrom.getTime())) throw new Error("probe-card-no-cycle-start");
-    const prior = await d.existing(cycleFrom);
+    // Decision 16 (Codex PR244-r4): this read keeps a card KK's re-archive retired; `existing` (archive-bound) does not.
+    const prior = await d.cycleCard(cycleFrom);
     if (prior) return prior;
   }
   const stage = await d.stage();

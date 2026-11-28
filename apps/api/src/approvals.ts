@@ -169,7 +169,7 @@ export interface ApprovalStore {
    * M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): one transaction that takes the project's lifecycle lock,
    * re-reads the project row, and raises the card (as `raise`, no blockers) only if `guardRefusal` passes (the due
    * check and the card's date at one clock: the Postgres store reads the database clock under the lock, M2.5-b5b decision 1;
-   * the memory store uses `now`). A dropped
+   * the memory store uses `now`. A dropped
    * connection rolls the card back.
    */
   raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date): Promise<{ card: Card; created: boolean } | { refused: string }>;

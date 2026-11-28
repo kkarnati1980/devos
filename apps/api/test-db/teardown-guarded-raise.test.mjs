@@ -178,6 +178,27 @@ test("M2.5-b5b decision 15 (Codex PR244-r3): a card an Archive retired is never 
   assert.equal((await probeCardOutcome(db, p.id, old.id, 5000)).card, "missing", "a retired card tracked by id reads as missing");
 });
 
+test("M2.5-b5b decision 16 (Codex PR244-r4): the cycle lookup keeps a card KK's re-archive retired, but not one retired before the cycle", async () => {
+  const { probeCycleCard, probeExistingCard, probeCardOutcome } = await import("../dist/provision-probe-purge.js");
+  const archivedAt = new Date(Date.now() - 60_000);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 30 * DAY) });
+  const cycle = new Date((await dbNow()) - 30_000);
+  // An earlier cycle's card, retired by an Archive before this cycle started.
+  const prev = await db.approval.create({ data: { projectId: p.id, gate: "purge", action: "teardown.purge", target: `project:${p.id}`, reason: "prev", status: "expired", createdAt: new Date(cycle.getTime() + 1_000) } });
+  await db.auditEvent.create({ data: { actor: "system", projectId: p.id, action: "teardown.archive_retired_cards", summary: "test", occurredAt: new Date(cycle.getTime() - 1_000), details: { grantsRevoked: 0, cardsExpired: 0, retired: [prev.id] } } });
+  // This cycle's card A, then KK restores and re-archives: his Archive retires A (now, after the cycle start).
+  const a = await db.approval.create({ data: { projectId: p.id, gate: "purge", action: "teardown.purge", target: `project:${p.id}`, reason: "a", status: "expired", createdAt: new Date(cycle.getTime() + 2_000) } });
+  await db.auditEvent.create({ data: { actor: "system", projectId: p.id, action: "teardown.archive_retired_cards", summary: "test", details: { grantsRevoked: 0, cardsExpired: 1, retired: [a.id] } } });
+  assert.equal(await probeCycleCard(db, p.id, cycle, 5000), a.id, "A is still this cycle's one card");
+  assert.equal(await probeExistingCard(db, p.id, cycle, 5000), null, "the archive-bound lookup still skips it");
+  // Decision 18: the age is measured in Postgres on its own clock.
+  const c = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false });
+  const out = await probeCardOutcome(db, p.id, c.id, 5000);
+  assert.equal(typeof out.raisedAgoMs, "number");
+  assert.ok(out.raisedAgoMs >= 0 && out.raisedAgoMs < 60_000, String(out.raisedAgoMs));
+  assert.equal((await probeCardOutcome(db, p.id, a.id, 5000)).raisedAgoMs, null, "a card that reads as missing has no age");
+});
+
 test("DEVOS-254 decision 34: with reuseSince, an approved card raised in the window is returned under the lock, never doubled", async () => {
   const archivedAt = new Date(Date.now() - 2 * DAY);
   const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
