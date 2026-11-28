@@ -1,7 +1,8 @@
 // DEVOS-234 (M2.4-d3c-2a, docs/modules/M2.4.md "M2.4-d3c-2 decisions"): the AT13 probe's purge through M2.5, as any
 // project would be purged: Archive, then Purge, on the production ops, scanners and preflight list, under the M1.7
 // policy with a KK grant (never `allowAll`, never a delete by name). Output is fixed codes only.
-import type { PurgeOutcome } from "./provision-probe.js";
+import { PROBE_SLUG, type CardOutcome, type PurgeOutcome } from "./provision-probe.js";
+import { purgeCard } from "./teardown-sweep.js";
 import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
 
 type Authorize = (action: string, resource: string) => Promise<"allow" | "deny" | "require_approval">;
@@ -25,15 +26,21 @@ type GrantProblem = (grant: any, request: { identity: { id: string; type: "syste
  */
 export async function findProbeGrant(
   db: any, projectId: string, now: Date, timeoutMs: number, grantProblem: GrantProblem,
-  actions: readonly string[] = PROBE_GRANT_ACTIONS,
+  actions: readonly string[] = PROBE_GRANT_ACTIONS, spare = 0,
 ): Promise<string | null> {
   const rows: GrantRow[] = await db.$transaction((tx: any) => tx.approvalGrant.findMany({
-    where: { projectId, revokedAt: null, expiresAt: { gt: now } },
+    // Codex PR239-r5 (high): never a grant issued for a `teardown.purge` card. That grant is the sweep's (M2.5-b2,
+    // DEVOS-254): the probe spending it would bypass the sweep's archive check and use up the card's one use.
+    where: {
+      projectId, revokedAt: null, expiresAt: { gt: now },
+      OR: [{ approvalId: null }, { approval: { is: { action: { not: "teardown.purge" } } } }],
+    },
     orderBy: [{ expiresAt: "desc" }, { id: "asc" }],
     take: 20,
   }), { timeout: timeoutMs, maxWait: timeoutMs });
   for (const g of rows) {
-    if (g.maxUses - g.uses < actions.length) continue;
+    // Codex PR239-r8: `spare` uses are kept for a later step of the same cycle (decision 11).
+    if (g.maxUses - g.uses < actions.length + spare) continue;
     // Pre-review 2: the same resource string the engine is asked about (`project:<id>`).
     const ok = actions.every((type) => grantProblem(g, { identity: PROVISIONER_IDENTITY, action: { type, resource: teardownResource(projectId), projectId } }, now.getTime()) === null);
     if (ok) return g.id;
@@ -41,11 +48,37 @@ export async function findProbeGrant(
   return null;
 }
 
+type PolicyRules = { mode: "observe" | "enforce"; rules: readonly unknown[] };
+type Evaluate = (request: any, rules: readonly any[], mode: any, now: number) => { outcome: string; enforcedOutcome: string };
+
+/**
+ * Codex PR239-r19 (high, DEVOS-254 decision 18): true only when the active M1.7 policy would *use* the probe grant for
+ * every action: evaluated read-only (rules loaded, nothing persisted, no grant consumed) with the same rules
+ * evaluator `PolicyEngine.decide` runs, a grant is applied exactly when the outcome needs approval and the enforced
+ * outcome is not a deny. A policy that allows a teardown action outright (no approval gate) or denies it would make
+ * `grantAuthorizer` refuse, so the probe must not provision what it then could not clean up. A rule change after
+ * this check is the d3c-2a case: the purge fails closed and the next cycle starts with the purge.
+ */
+export async function policyUsesProbeGrant(
+  load: () => Promise<PolicyRules>, evaluate: Evaluate, projectId: string, now: Date, actions: readonly string[] = PROBE_GRANT_ACTIONS,
+): Promise<boolean> {
+  const { mode, rules } = await load();
+  return actions.every((type) => {
+    const ev = evaluate({ identity: PROVISIONER_IDENTITY, action: { type, resource: teardownResource(projectId), projectId } }, rules, mode, now.getTime());
+    const needsApproval = ev.outcome === "require_approval" || ev.enforcedOutcome === "require_approval";
+    return needsApproval && ev.enforcedOutcome !== "deny";
+  });
+}
+
 /** The M1.7 authorizer with the KK grant presented (policyAuthorizer's shape, plus `approvalGrantId`). */
-export function grantAuthorizer(policy: { decide(r: unknown): Promise<{ enforcedOutcome: string }> }, projectId: string, grantId: string): Authorize {
+export function grantAuthorizer(policy: { decide(r: unknown): Promise<{ enforcedOutcome: string; approvalGrantId?: string | null }> }, projectId: string, grantId: string): Authorize {
   return async (action, resource) => {
     const d = await policy.decide({ identity: PROVISIONER_IDENTITY, action: { type: action, resource, projectId }, approvalGrantId: grantId });
-    return d.enforcedOutcome === "allow" ? "allow" : d.enforcedOutcome === "require_approval" ? "require_approval" : "deny";
+    // Codex PR239-r18 (high): "allow" only when M1.7 allowed by using KK's probe grant, as the sweep's
+    // `purgeCardAuthorizer` does; an allow that did not consume it (an un-gated allow, e.g. observe mode, or a policy
+    // that needs no approval) is "require_approval", never a probe Archive or purge without the grant.
+    if (d.enforcedOutcome === "allow") return d.approvalGrantId === grantId ? "allow" : "require_approval";
+    return d.enforcedOutcome === "require_approval" ? "require_approval" : "deny";
   };
 }
 
@@ -204,6 +237,9 @@ export async function probePurge(projectId: string, d: ProbePurgeDeps): Promise<
     const where = hit && KIND_RE.test(hit.provider) && KIND_RE.test(hit.kind.replace(/^inventory:/, "")) ? `:${hit.provider}/${hit.kind.replace(/^inventory:/, "")}` : "";
     return { error: `purge-incomplete:${r.report.errors.length ? "scan-error" : "leftover"}${where}` };
   } catch (e) {
+    // DEVOS-254 pre-review r2 3: the sweep's purge under KK's card may have won the project lock and finished first.
+    const c = (e as { name?: unknown; code?: unknown } | null);
+    if (c && c.name === "TeardownError" && c.code === "not_archived" && (await d.stage().catch(() => "")) === "purged") return "done";
     return purgeStop(e);
   }
 }
@@ -217,7 +253,10 @@ export type CycleStart = "ready" | "purge-pending" | { blocked: string };
  * checked its `provision.probe_started` marker); an `archived` row (an earlier purge did not finish) starts the
  * cycle with the purge.
  */
-export async function probeCycleStart(db: any, projectId: string, timeoutMs: number, hasGrant: () => Promise<boolean>): Promise<CycleStart> {
+export async function probeCycleStart(db: any, projectId: string, timeoutMs: number, hasGrant: () => Promise<boolean>, policyGated?: () => Promise<boolean>): Promise<CycleStart> {
+  // Codex PR239-r19 (high): a grant the active policy would not use cannot authorize the cleanup, so the cycle is
+  // blocked before anything is created. A fixed code of its own: a new grant card would not help, so none is raised.
+  if (policyGated && !(await policyGated())) return { blocked: "probe-purge-policy-ungated" };
   if (!(await hasGrant())) return { blocked: "probe-purge-not-approved" };
   return db.$transaction(async (tx: any) => {
     const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true } });
@@ -239,6 +278,21 @@ export async function probeStage(db: any, projectId: string, timeoutMs: number):
   const p = await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: projectId }, select: { stage: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
   if (!p) throw new Error("probe-project-missing");
   return String(p.stage);
+}
+
+/**
+ * Codex PR239-r7/r8 (medium, DEVOS-254 decision 11): true when a probe grant is still valid at `until` for both
+ * `teardown.*` actions, with every use the rest of a card cycle may spend: the card's Archive (unless the row is already
+ * archived), then a fallback purge, which after a Restore needs an Archive and a purge again. So a card KK rejects, lets
+ * expire or answers with a Restore is still cleaned up by the probe under its own grant. Read-only, bounded reads.
+ * Codex PR239-r11: no extra uses are kept for purge retries. A retry inside the purge phase's d3c-2a bound may spend any
+ * use left over; past the bound, or past the grant, the cycle ends `purge-failed` or `purge-permission` and the next
+ * cycle starts with the purge (`purge-pending`), as for every probe cycle.
+ */
+export async function probeGrantOutlasts(db: any, projectId: string, until: Date, timeoutMs: number, grantProblem: GrantProblem): Promise<boolean> {
+  const stage = await probeStage(db, projectId, timeoutMs);
+  const spare = stage === "archived" ? 0 : 1;
+  return (await findProbeGrant(db, projectId, until, timeoutMs, grantProblem, PROBE_GRANT_ACTIONS, spare)) !== null;
 }
 
 /** DEVOS-110 decision 2: a rejected (or approved, then revoked) grant card is not raised again for one probe cycle. */
@@ -301,4 +355,221 @@ export async function cycleStartWithCard(start: () => Promise<CycleStart>, raise
   } catch {
     return { blocked: "probe-purge-not-approved:card-failed" };
   }
+}
+
+/**
+ * DEVOS-254 decision 1: true while no probe cycle has ended `pass-card` (read on the probe's own phase log only), so
+ * the next cycle purges `devos-probe-m24` through KK's purge card (AT10). Once one has, cycles purge directly again.
+ */
+export async function probeCardCycle(db: any, projectId: string, timeoutMs: number): Promise<boolean> {
+  const n: number = await db.$transaction((tx: any) => tx.auditEvent.count({
+    where: { projectId, action: "provision.probe_phase", details: { path: ["result", "code"], equals: "pass-card" } },
+  }), { timeout: timeoutMs, maxWait: timeoutMs });
+  return n === 0;
+}
+
+const CARD_STATUSES = ["pending", "approved", "rejected", "expired"] as const;
+
+/** Codex PR239-r1 (medium): the purge card this archive already has, in one bounded read. */
+export async function probeExistingCard(db: any, projectId: string, since: Date, timeoutMs: number): Promise<string | null> {
+  const c = await db.$transaction((tx: any) => tx.approval.findFirst({
+    where: { projectId, action: "teardown.purge", target: `project:${projectId}`, createdAt: { gte: since } },
+    // Codex PR239-r2: the oldest, so a card raised by someone else first is the one tracked.
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: { id: true },
+  }), { timeout: timeoutMs, maxWait: timeoutMs });
+  return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
+}
+
+/** Codex PR239-r15: the fixed reason the probe gives when it expires its own purge cards. */
+export const PROBE_CARD_EXPIRE_REASON = "AT13 probe: purged by the probe itself, or superseded by a later archive (DEVOS-254)";
+
+/**
+ * Codex PR239-r15 (medium): expire the probe project's pending `teardown.purge` cards on `project:<id>` (only those
+ * raised before `before`, when given) through `Approvals.expireCardsById`, then read again: resolves only when none is
+ * left pending, so a caller never purges, or raises, past a pending card. Bounded reads (ADR-0011 §9), at most 50 ids.
+ */
+export async function expireProbePurgeCards(db: any, projectId: string, timeoutMs: number, expire: (ids: string[], reason: string) => Promise<string[]>, before?: Date): Promise<void> {
+  const pending = async (): Promise<string[]> => {
+    const rows: { id: unknown }[] = await db.$transaction((tx: any) => tx.approval.findMany({
+      where: { projectId, action: "teardown.purge", target: `project:${projectId}`, status: "pending", ...(before ? { createdAt: { lt: before } } : {}) },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      select: { id: true },
+      take: 50,
+    }), { timeout: timeoutMs, maxWait: timeoutMs });
+    return rows.map((r) => r.id).filter((id): id is string => typeof id === "string" && id !== "");
+  };
+  const ids = await pending();
+  if (!ids.length) return;
+  await expire(ids, PROBE_CARD_EXPIRE_REASON);
+  if ((await pending()).length) throw new Error("probe-card-still-pending");
+}
+
+/** DEVOS-254 decision 4: the probe row's stage and its purge card's status, in one bounded read. */
+export async function probeCardOutcome(db: any, projectId: string, cardId: string, timeoutMs: number): Promise<CardOutcome> {
+  return db.$transaction(async (tx: any) => {
+    const p = await tx.project.findUnique({ where: { id: projectId }, select: { stage: true, archivedAt: true } });
+    if (!p) throw new Error("probe-project-missing");
+    const c = await tx.approval.findUnique({ where: { id: cardId }, select: { status: true, decidedAt: true, createdAt: true, projectId: true, action: true } });
+    // Only this project's own purge card counts; anything else reads as missing.
+    // Codex PR239-r6: and only while the row is still in the archive the card was raised for. A Restore clears
+    // `archived_at` and a new Archive sets a later one, so a tracked card older than the row's `archived_at` belongs to
+    // an earlier archive: it reads as missing, and the cycle ends as a failed card cycle, never `pass-card`.
+    const sameArchive = p.archivedAt instanceof Date && c?.createdAt instanceof Date && c.createdAt.getTime() >= p.archivedAt.getTime();
+    const ok = c && sameArchive && c.projectId === projectId && c.action === "teardown.purge" && (CARD_STATUSES as readonly string[]).includes(String(c.status));
+    // Codex PR239-r3 (medium): the sweep purges under the newest approved purge card of the archive
+    // (`Approvals.list`, createdAt desc), which may be a later twin of the tracked one. So the cards that count are
+    // this project's approved `teardown.purge` cards on `project:<id>` raised at or after the tracked card (the same
+    // archive, pre-review 2), newest first; the newest one gives the status and decision time reported.
+    const approved: { id: string; decidedAt: unknown }[] = ok && c.createdAt instanceof Date
+      ? await tx.approval.findMany({
+        where: { projectId, action: "teardown.purge", target: `project:${projectId}`, status: "approved", createdAt: { gte: c.createdAt } },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        select: { id: true, decidedAt: true },
+        take: 20,
+      })
+      : [];
+    const ids = new Set(approved.map((a) => a.id).filter((id) => typeof id === "string" && id !== ""));
+    // Codex PR239-r1 (high): AT10 needs the purge to have run under an approved card's grant. Every allowed
+    // `teardown.purge` decision for this project since the tracked card was raised must carry a grant issued for one of
+    // those cards, and there must be one: a purge under the probe's grant or any other card's never counts.
+    let byCard = false;
+    if (ok && ids.size > 0 && String(p.stage) === "purged") {
+      const ds: { approvalGrant: { approvalId: string | null } | null }[] = await tx.policyDecision.findMany({
+        where: { projectId, ts: { gte: c.createdAt }, enforcedOutcome: "allow", action: { path: ["request", "type"], equals: "teardown.purge" } },
+        select: { approvalGrant: { select: { approvalId: true } } },
+        orderBy: { ts: "asc" },
+        take: 50,
+      });
+      byCard = ds.length > 0 && ds.length < 50 && ds.every((x) => typeof x.approvalGrant?.approvalId === "string" && ids.has(x.approvalGrant.approvalId));
+    }
+    const newest = approved[0];
+    const decided = newest ? newest.decidedAt : ok ? c.decidedAt : null;
+    return {
+      stage: String(p.stage),
+      card: !ok ? "missing" : newest ? "approved" : (String(c.status) as CardOutcome["card"]),
+      decidedAt: decided instanceof Date ? decided.toISOString() : null,
+      // Codex PR239-r12: when the tracked card was raised, so the wait is measured from the card, not from the tick
+      // that recorded it.
+      raisedAt: ok && c.createdAt instanceof Date ? c.createdAt.toISOString() : null,
+      byCard,
+    };
+  }, { timeout: timeoutMs, maxWait: timeoutMs });
+}
+
+export interface ProbePurgeCardDeps {
+  stage(): Promise<string>;
+  /** The row's `archived_at` (pre-review 2: a card raised before it belongs to an earlier archive). */
+  archivedAt(): Promise<Date | null>;
+  /** The id of the oldest `teardown.purge` card of this project raised at or after `since`, any status, or null. */
+  existing(since: Date): Promise<string | null>;
+  /** Archive under the probe's KK grant (`teardown.archive` only); called only when the row is not archived yet. */
+  archive(): Promise<void>;
+  /** The per-provider counts of the probe's active resources (the card's "what will be deleted"). */
+  counts(): Promise<Record<string, number>>;
+  /**
+   * Decision 31 (Codex PR239-r33): `Approvals.raiseGuardedCard(card, { projectId, archivedAt, due: false })`, the M2.5-b5a
+   * raise that re-reads the row and writes the card in one transaction under the project lifecycle lock, only while the
+   * row is still archived with exactly `archivedAt`. It dedupes a pending twin, so a retried tick gets the same card. A
+   * refusal (`not_archived`, `archive-changed`, `project-not-found`) writes nothing.
+   */
+  raise(card: ReturnType<typeof purgeCard>, archivedAt: Date, reuseSince?: Date): Promise<{ id: string; createdAt?: Date } | { refused: string }>;
+  /**
+   * Codex PR239-r7/r8 (decision 11): true when the probe grant outlasts the card wait and the purge after it. Asked
+   * only before a new card is raised, never when this archive already has one (a retried tick keeps its card).
+   */
+  outlasts(): Promise<boolean>;
+  /**
+   * Codex PR239-r15: expire this project's pending purge cards raised before `before` (an earlier archive's), so
+   * `raiseCard`'s pending-twin dedupe cannot hand back a stale card (`probe-card-stale`). Throws when one stays pending.
+   */
+  expireStale(before: Date): Promise<void>;
+}
+
+/** Decision 11: no new card was raised, because the probe grant would lapse before the probe could purge after it. */
+export const CARD_GRANT_SHORT = { grantShort: true } as const;
+
+/**
+ * DEVOS-254 decision 3: Archive (unless archived), then raise the M2.5-b2 purge card unchanged (gate 5, `teardown.purge`,
+ * `project:<id>`, fixed wording). The probe never approves it and never purges under it: the sweep job does, once KK
+ * approves it in the inbox. Returns the card's id.
+ */
+export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDeps, cycleFrom?: Date): Promise<string | typeof CARD_GRANT_SHORT> {
+  // Decision 33 (Codex PR239-r35, medium): one card per cycle. A tick that raised the card but failed before recording
+  // `cardwait` is retried here; if KK restored the row in between, the old order (Archive, then a lookup bound to the
+  // new `archived_at`) undid his Restore and raised a second card. So the first read, before any Archive, is for a purge
+  // card raised since this cycle entered `card`, bound to no archive. If one exists it is tracked as it is: no Archive,
+  // no raise. `cardwait` then reads a Restored row as `card-ended` (decision 4's table), M2.5-b4's Restore handling.
+  if (cycleFrom !== undefined) {
+    if (!(cycleFrom instanceof Date) || !Number.isFinite(cycleFrom.getTime())) throw new Error("probe-card-no-cycle-start");
+    const prior = await d.existing(cycleFrom);
+    if (prior) return prior;
+  }
+  const stage = await d.stage();
+  // The Archive takes the lifecycle lock itself and releases it before the guarded raise (decision 31) takes it again.
+  if (stage !== "archived" && stage !== "purged") await d.archive();
+  // Decision 31 (Codex PR239-r33, replaces r19's session lock around these checks): the checks below only choose
+  // whether to ask; the card itself is written by the guarded raise, which re-checks the archive under the lifecycle
+  // lock in the same transaction, so a Restore, Purge or new Archive after these reads refuses the raise.
+  return raiseChecked(projectId, d, cycleFrom);
+}
+
+async function raiseChecked(projectId: string, d: ProbePurgeCardDeps, cycleFrom?: Date): Promise<string | typeof CARD_GRANT_SHORT> {
+  const now = await d.stage();
+  // Codex PR239-r1 (medium): a tick that raised the card but did not record its id is retried. The card this archive
+  // already has (any status: KK may have approved it, the sweep may have purged) is used again, never a second one.
+  const since = await d.archivedAt();
+  if ((now === "archived" || now === "purged") && since instanceof Date) {
+    const had = await d.existing(since);
+    if (had) return had;
+  }
+  if (now === "purged") throw new Error("probe-card-already-purged");
+  if (now !== "archived") throw new Error("probe-card-not-archived");
+  if (!(since instanceof Date)) throw new Error("probe-card-stale");
+  // Codex PR239-r8: checked after the lookup above, so a card raised by an earlier tick is never given up here.
+  let lasts = false;
+  try { lasts = (await d.outlasts()) === true; } catch { lasts = false; }
+  if (!lasts) return CARD_GRANT_SHORT;
+  await d.expireStale(since);
+  // Decision 34 (Codex PR239-r36): the cycle's one card is also enforced inside the guarded raise, under the lifecycle
+  // lock: a card raised in the window the unlocked lookups covered, in any status, is returned rather than a second
+  // one, so an "Ask to delete now" KK made (and approved) after those lookups is the card this cycle tracks.
+  // Codex PR239-r37: the window is the earlier of this archive's `archived_at` and the cycle start, the union of both
+  // lookups, so an early ask dated between them (a row archived before the cycle entered `card`) is never missed.
+  const reuseSince = cycleFrom !== undefined && cycleFrom.getTime() < since.getTime() ? cycleFrom : since;
+  const raised = await d.raise(purgeCard({ id: projectId, slug: PROBE_SLUG }, await d.counts()), since, reuseSince);
+  if (raised && "refused" in raised) throw new Error(`probe-card-refused-${raised.refused}`);
+  const card = raised;
+  if (!card || typeof card.id !== "string" || card.id === "") throw new Error("probe-card-not-raised");
+  // Pre-review 2: `raiseCard` dedupes against a pending twin. One left from an earlier archive (the sweep was off and
+  // nothing expired it) would be skipped by the sweep (`card-before-archive`), so it is not used.
+  const archived = await d.archivedAt();
+  if (!(archived instanceof Date) || !(card.createdAt instanceof Date) || card.createdAt.getTime() < archived.getTime()) throw new Error("probe-card-stale");
+  // Codex PR239-r12/r13: the card is bound to the archive read after the raise, which it was created within (the check
+  // above), never to the one read before it. A Restore and a new Archive in between supersede the first read; the card
+  // then belongs to the new archive, which the sweep acts on and `probeCardOutcome` checks (r6), so it is tracked and
+  // never left pending behind a fallback purge (r13 replaces r12's `probe-card-archive-changed`).
+  // Codex PR239-r2: another purge card for this archive raised between the lookup and the raise (and approved, so
+  // the pending dedupe missed it) is the one the sweep acts on first; track the oldest.
+  return (await d.existing(archived)) ?? card.id;
+}
+
+/**
+ * DEVOS-254 decision 3: the card cycle's Archive under the probe's KK grant, asked for `teardown.archive` only, so the
+ * probe grant is never presented for `teardown.purge` on this path (pre-review 6).
+ */
+export async function archiveUnderProbeGrant(d: { findGrant(actions: readonly string[]): Promise<string | null>; archive(grantId: string): Promise<void> }): Promise<void> {
+  const grant = await d.findGrant(["teardown.archive"]);
+  if (!grant) throw new Error("probe-card-no-grant");
+  await d.archive(grant);
+}
+
+/** Pre-review 5: the card's per-provider counts as one bounded grouped count (never every row). */
+export async function probeActiveCounts(db: any, projectId: string, timeoutMs: number): Promise<Record<string, number>> {
+  const rows: { provider: unknown; _count: { _all: number } }[] = await db.$transaction((tx: any) => tx.resource.groupBy({
+    by: ["provider"], where: { projectId, status: "active" }, _count: { _all: true },
+  }), { timeout: timeoutMs, maxWait: timeoutMs });
+  const out: Record<string, number> = {};
+  for (const r of rows) out[String(r.provider)] = r._count._all;
+  return out;
 }

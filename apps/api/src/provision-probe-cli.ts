@@ -9,10 +9,10 @@
 //   report   the newest finished cycle's result: 0 ok, 1 failed, 3 none yet or still running (read-only)
 //   step     advance the probe by one phase (probeStep)
 import { fileURLToPath } from "node:url";
-import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
+import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_CARD_RAISE_GRANT_MS, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, expireProbePurgeCards, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -169,12 +169,57 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           },
           // DEVOS-110: a cycle blocked for want of the grant raises the fixed grant card for KK (at most one open).
           cycleStart: () => cycleStartWithCard(
-            () => probeCycleStart(db, p.id, timeoutMs, async () => (await findProbeGrant(db, p.id, new Date(), timeoutMs, w.purge.grantProblem)) !== null),
+            () => probeCycleStart(
+              db, p.id, timeoutMs,
+              async () => (await findProbeGrant(db, p.id, new Date(), timeoutMs, w.purge.grantProblem)) !== null,
+              // Codex PR239-r19 (high): the cleanup is authorized only if the active policy would use the grant.
+              () => w.purge.policyGated(p.id),
+            ),
             async () => {
               const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
               return raiseProbeGrantCard(p.id, new Date(), { list: (f) => approvals.store.list(f), raise: (c) => approvals.raiseCard(c) });
             },
           ),
+          // DEVOS-254 (AT10): one cycle purges through KK's gate-5 purge card and the sweep job, not the probe grant.
+          cardCycle: () => probeCardCycle(db, p.id, timeoutMs),
+          raisePurgeCard: async (cycleFrom) => {
+            const k = w.purge;
+            const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
+            return raiseProbePurgeCard(p.id, {
+              stage: () => probeStage(db, p.id, timeoutMs),
+              archivedAt: async () => (await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: p.id }, select: { archivedAt: true } }), { timeout: timeoutMs, maxWait: timeoutMs }))?.archivedAt ?? null,
+              // Decision 3: the probe grant covers the archive only; the purge needs KK's card.
+              existing: (since) => probeExistingCard(db, p.id, since, timeoutMs),
+              archive: () => archiveUnderProbeGrant({
+                findGrant: (actions) => findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, actions),
+                archive: async (grant) => {
+                  const wr = await teardownWiring(k.provisionMod, k.teardownMod, { gh: k.gh, cf: k.cf, store: k.store, db, projectId: p.id, owner: k.owner, timeoutMs });
+                  await k.teardownMod.archiveProject(p.id, { store: k.store, authorize: grantAuthorizer(k.policy, p.id, grant), ops: wr.ops });
+                },
+              }),
+              counts: () => probeActiveCounts(db, p.id, timeoutMs),
+              // Decision 31 (Codex PR239-r33): the card is written under the lifecycle lock, bound to this archive.
+              // Decision 34 (Codex PR239-r36): the cycle's card is reused under the lock, never doubled.
+              raise: (c, archivedAt, reuseSince) => approvals.raiseGuardedCard(c, { projectId: p.id, archivedAt, due: false, ...(reuseSince ? { reuseSince } : {}) }),
+              // Codex PR239-r7/r8 (decision 11): only before a new card, from this tick.
+              outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
+              // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
+              expireStale: (before) => expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason), before),
+            }, cycleFrom);
+          },
+          cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
+          // Codex PR239-r28: the current archive's oldest purge card, for a purge reached without a tracked card.
+          archiveCardId: async () => {
+            const row = await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: p.id }, select: { archivedAt: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
+            return row?.archivedAt instanceof Date ? probeExistingCard(db, p.id, row.archivedAt, timeoutMs) : null;
+          },
+          // Codex PR239-r7 (decision 11): the probe grant must outlast the card wait, so the fallback purge can run.
+          cardGrantOutlasts: (until) => probeGrantOutlasts(db, p.id, until, timeoutMs, w.purge.grantProblem),
+          // Codex PR239-r15: before the probe's own purge after a card, its pending purge cards are expired.
+          expirePurgeCards: async () => {
+            const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
+            await expireProbePurgeCards(db, p.id, timeoutMs, (ids, reason) => approvals.expireCardsById(ids, reason));
+          },
           // DEVOS-21: a failed cycle re-runs once KK saves a new provider token (metadata read only).
           credentialsUpdatedAt: () => probeCredentialsUpdatedAt(w.vault),
           fingerprint: await probeFingerprint(fileURLToPath(root)),
