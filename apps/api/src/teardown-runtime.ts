@@ -150,14 +150,9 @@ export interface TeardownSweepCards {
  * The teardown sweep's three production queries (M2.5-b2), split out of `buildTeardownSweep` so the Postgres test
  * (`test-db/teardown-sweep-queries.test.mjs`, DEVOS-112 follow-up) runs the exact query code against a real database.
  */
-export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownSweepDeps, "listDue" | "unspentGrant" | "keepArchived"> & { dbNow(): Promise<Date> } {
+export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownSweepDeps, "listDue" | "unspentGrant" | "keepArchived"> {
   const tx = <T>(fn: (tx: any) => Promise<T>): Promise<T> => db.$transaction(fn, { timeout: timeoutMs, maxWait: timeoutMs });
   return {
-    /** M2.5-b5a: the database clock (`clock_timestamp()`), for the daily run's due cutoff. */
-    dbNow: () => tx(async (t: any) => {
-      const rows: { now: Date }[] = await t.$queryRaw`SELECT clock_timestamp() AS now`;
-      return rows[0]!.now;
-    }),
     listDue: (now: Date, limit: number) =>
       tx<any[]>((t) => t.project.findMany({
         where: { stage: "archived", purgeAfter: { lte: now } },
@@ -211,9 +206,8 @@ export function buildTeardownSweep(w: {
   const cards = w.cards;
   const q = teardownSweepQueries(w.db, w.timeoutMs);
   return new TeardownSweepJob({
-    // Codex PR242-r1 (1): the due cutoff is the database clock, the same clock the guarded raise checks, so a row due in
-    // Postgres is never left out by an app clock running behind it.
-    listDue: async (_now, limit) => q.listDue(await q.dbNow(), limit),
+    // Codex PR242-r4 (decision 9): the due cutoff is the app clock, the one the guarded raise checks and dates by.
+    listDue: q.listDue,
     project: async (id) => {
       const p = await store.project(id);
       return p ? { id: p.id, slug: p.slug, stage: String(p.stage), purgeAfter: p.purgeAfter ?? null, archivedAt: p.archivedAt ?? null } : null;

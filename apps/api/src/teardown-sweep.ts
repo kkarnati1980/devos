@@ -71,7 +71,7 @@ export interface TeardownSweepDeps {
   /**
    * M2.5-b5a (DEVOS-255): `Approvals.raiseGuardedCard`. The purge card is raised in one transaction that holds the
    * project's lifecycle lock and re-reads the row: only while it is still the archive `archivedAt` names and (with
-   * `due`) its purge date has passed at the database clock. A refusal writes nothing and comes back as its code.
+   * `due`) its purge date has passed at the app clock that dates the card. A refusal writes nothing and comes back as its code.
    */
   raiseLocked(card: ReturnType<typeof purgeCard>, guard: { archivedAt: Date; due: boolean }): Promise<{ id: string } | { refused: string }>;
   /** `Approvals.expireCardsById`. */

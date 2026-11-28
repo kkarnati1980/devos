@@ -116,11 +116,3 @@ test("keepArchived: a failed audit insert rolls the purge_after move back", asyn
   assert.deepEqual(row.purgeAfter, from, "the update is rolled back with the failed audit insert");
   assert.equal((await db.auditEvent.findMany({ where: { projectId: p.id, action: "teardown.keep_archived" } })).length, 0);
 });
-
-test("M2.5-b5a (Codex PR242-r1): dbNow is the database clock, not the app clock", async () => {
-  const before = await db.$queryRaw`SELECT clock_timestamp() AS now`;
-  const got = await q.dbNow();
-  const afterRows = await db.$queryRaw`SELECT clock_timestamp() AS now`;
-  assert.ok(got instanceof Date);
-  assert.ok(got.getTime() >= before[0].now.getTime() && got.getTime() <= afterRows[0].now.getTime(), "between two database reads");
-});

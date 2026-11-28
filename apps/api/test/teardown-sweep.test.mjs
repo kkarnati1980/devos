@@ -676,15 +676,21 @@ test("M2.5-b5a: the daily run never queues behind this process's own running pur
   finish({ purged: true, report: { hits: [], errors: [] } });
 });
 
-test("Codex PR242-r3 (1): guardedAt floors a daily card at purge_after and every card at archived_at", async () => {
-  const { guardedAt } = await import("../dist/approvals.js");
+test("Codex PR242-r4: guardedAt never looks at purge_after; it floors every card at archived_at only", async () => {
+  const { guardedAt, guardRefusal } = await import("../dist/approvals.js");
   const archivedAt = new Date(T0 - 31 * DAY);
-  const purgeAfter = new Date(T0 + 60_000); // reached at the database clock, 1 minute ahead of the app clock T0
+  const purgeAfter = new Date(T0 + 60_000); // 1 minute ahead of the app clock T0
   const row = { stage: "archived", archivedAt, purgeAfter };
-  assert.equal(guardedAt(row, new Date(T0), true).getTime(), purgeAfter.getTime(), "a daily card is dated in its due period");
-  assert.equal(guardedAt(row, new Date(T0), false).getTime(), T0, "an early ask keeps the app clock");
-  assert.equal(guardedAt(row, new Date(T0 - 40 * DAY), false).getTime(), archivedAt.getTime(), "never before its archive");
-  assert.equal(guardedAt(row, new Date(T0 + DAY), true).getTime(), T0 + DAY, "the app clock when it is later");
+  assert.equal(guardedAt(row, new Date(T0)).getTime(), T0, "a purge_after in the future never moves the card's date");
+  assert.equal(guardedAt({ ...row, purgeAfter: null }, new Date(T0)).getTime(), T0, "same date with or without purge_after");
+  assert.equal(guardedAt(row, new Date(T0 - 40 * DAY)).getTime(), archivedAt.getTime(), "never before its archive");
+  // One clock: at app time T0 this row is not yet due, so no daily card can be dated before purge_after.
+  const g = { projectId: P, archivedAt, due: true };
+  assert.equal(guardRefusal(row, g, new Date(T0)), "not-due");
+  // A daily card raised just after purge_after on the app clock is dated after it.
+  const later = new Date(purgeAfter.getTime() + 1);
+  assert.equal(guardRefusal(row, g, later), null);
+  assert.ok(guardedAt(row, later).getTime() > purgeAfter.getTime(), "dated after purge_after");
 });
 
 test("Codex PR242-r3 (2): an early ask whose project starts purging during its awaits never calls the locked raise", async () => {

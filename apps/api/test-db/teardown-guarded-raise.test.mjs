@@ -28,25 +28,31 @@ const cardsOf = (projectId) => db.approval.findMany({ where: { projectId, action
 test("an archived, due row gets one card, dated by the app clock but never before its archive", async () => {
   const archivedAt = new Date(Date.now() - 31 * DAY);
   const purgeAfter = new Date(Date.now() - DAY);
+  // Codex PR242-r4: the due check and the card's date use one clock, the app clock. With it ahead of purge_after the
+  // daily card is dated by the app clock itself (no purge_after floor).
+  const appNow = Date.now() + 5 * 60_000;
+  const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
   const p = await mk({ stage: "archived", archivedAt, purgeAfter });
-  // The app clock is pinned to 2001, behind the archive: a daily card is floored at purge_after (Codex PR242-r2, r3),
-  // and an early ask's card at archived_at.
-  const c = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
+  const c = await ahead.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
   assert.equal(typeof c.id, "string");
-  assert.equal(c.createdAt.getTime(), purgeAfter.getTime(), "a daily card: the latest of the app clock, archived_at and purge_after");
+  assert.equal(c.createdAt.getTime(), appNow, "a daily card: the app clock");
+  // The app clock pinned to 2001, behind the archive: an early ask's card is floored at archived_at.
   const early = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + DAY) });
   const e = await approvals.raiseGuardedCard(purgeCard(early, {}), { projectId: early.id, archivedAt, due: false });
   assert.equal(e.createdAt.getTime(), archivedAt.getTime(), "an early ask: the later of the app clock and archived_at");
-  // With the app clock ahead of the archive, the app clock dates the card (one clock with Archive's archived_at).
-  const appNow = Date.now() + 5 * 60_000;
-  const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
-  const q = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
-  assert.equal((await ahead.raiseGuardedCard(purgeCard(q, {}), { projectId: q.id, archivedAt, due: true })).createdAt.getTime(), appNow);
   assert.equal((await cardsOf(p.id)).length, 1);
   // A second guarded raise dedupes onto the pending card, as raiseCard does.
-  const again = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
+  const again = await ahead.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
   assert.equal(again.id, c.id);
   assert.equal((await cardsOf(p.id)).length, 1);
+});
+
+test("Codex PR242-r4: the app clock pinned before purge_after gives not-due, even though Postgres sees the row as due", async () => {
+  const archivedAt = new Date(Date.now() - 31 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
+  // `approvals` runs at 2001: purge_after (yesterday at the database clock) has not passed on the app clock.
+  assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "not-due" });
+  assert.equal((await cardsOf(p.id)).length, 0);
 });
 
 test("refusals write nothing: not archived, another archive, not yet due, missing project", async () => {

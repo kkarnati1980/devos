@@ -167,8 +167,8 @@ export interface ApprovalStore {
   supersede(oldId: string, input: CardInput, audit: AuditEntry, now: Date, reason: string): Promise<{ card: Card; created: boolean }>;
   /**
    * M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): one transaction that takes the project's lifecycle lock,
-   * re-reads the project row and the database clock, and raises the card (as `raise`, no blockers) only if
-   * `guardRefusal` passes (the due check at the database clock). The card is dated by `guardedAt`. A dropped
+   * re-reads the project row, and raises the card (as `raise`, no blockers) only if `guardRefusal` passes (the due
+   * check at the app clock `now`, the clock that dates the card). The card is dated by `guardedAt`. A dropped
    * connection rolls the card back.
    */
   raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date): Promise<{ card: Card; created: boolean } | { refused: string }>;
@@ -586,7 +586,11 @@ export interface RaiseGuard {
 
 export type GuardRow = { stage: string; archivedAt: Date | null; purgeAfter: Date | null } | null;
 
-/** Why a guarded raise is refused, read under the lock at the database clock `now`; null when it may raise. */
+/**
+ * Why a guarded raise is refused, read under the lock; null when it may raise. `now` is the app clock that also dates
+ * the card (Codex PR242-r4: one clock for the due check and `createdAt`, so a daily card is due exactly when its
+ * `createdAt` is at or after `purge_after`, with no floor).
+ */
 export function guardRefusal(row: GuardRow, g: RaiseGuard, now: Date): string | null {
   if (!row) return "project-not-found";
   if (row.stage !== "archived" || !row.archivedAt) return "not_archived";
@@ -600,12 +604,12 @@ export function guardRefusal(row: GuardRow, g: RaiseGuard, now: Date): string | 
  * M2.5-b5b, so "raised for this archive" compares one clock; floored at the row's `archived_at`, read under the lock
  * after that archive committed, so the card is never dated before the archive it was raised for (pre-review low 1).
  */
-export function guardedAt(row: GuardRow, now: Date, due = false): Date {
+export function guardedAt(row: GuardRow, now: Date): Date {
+  // Codex PR242-r4: never floored at purge_after. That floor could date a card in the future of the app clock, so a
+  // later Restore and Archive could sort at or before it and inherit KK's approval. archived_at is never in the future:
+  // it is read under the lock after that archive committed.
   let t = now.getTime();
   if (row?.archivedAt) t = Math.max(t, row.archivedAt.getTime());
-  // Codex PR242-r3 (1): a daily card belongs to the due period it was raised for, so it is never dated before
-  // purge_after (which the guard just checked had passed at the database clock).
-  if (due && row?.purgeAfter) t = Math.max(t, row.purgeAfter.getTime());
   return new Date(t);
 }
 
@@ -657,7 +661,7 @@ export class MemoryApprovalStore implements ApprovalStore {
     return this.serial(() => {
       const code = guardRefusal(this.guardRow ? this.guardRow(guard.projectId) : null, guard, now);
       if (code) return { refused: code };
-      return this.raiseNow(input, [], audit, guardedAt(this.guardRow!(guard.projectId), now, guard.due));
+      return this.raiseNow(input, [], audit, guardedAt(this.guardRow!(guard.projectId), now));
     });
   }
 
@@ -907,16 +911,17 @@ export class PrismaApprovalStore implements ApprovalStore {
       await tx.$queryRawUnsafe(PROJECT_LOCK_SQL, guard.projectId);
       // Codex PR242-r1 (2): the archive is compared in Postgres at the column's full precision, never as a JS Date, so
       // a stored value that differs from the caller's snapshot below the millisecond is another archive.
-      const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; now: Date; sameArchive: boolean | null }[] = await tx.$queryRaw`
-        SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter", clock_timestamp() AS now,
+      const rows: { stage: string; archivedAt: Date | null; purgeAfter: Date | null; sameArchive: boolean | null }[] = await tx.$queryRaw`
+        SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter",
           (archived_at = ${guard.archivedAt}::timestamptz) AS "sameArchive"
         FROM project WHERE id = ${guard.projectId}::uuid`;
       const row = rows[0];
       if (!row) return { refused: "project-not-found" };
       if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
-      const code = guardRefusal(row, guard, row.now);
+      // Codex PR242-r4: the due check runs at the app clock that dates the card (decision 9), not clock_timestamp().
+      const code = guardRefusal(row, guard, now);
       if (code) return { refused: code };
-      return this.raiseIn(tx, input, [], a, guardedAt(row, now, guard.due));
+      return this.raiseIn(tx, input, [], a, guardedAt(row, now));
     });
   }
 
