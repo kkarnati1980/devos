@@ -404,9 +404,15 @@ export async function bindProbeCycleCard(db: any, projectId: string, cycle: numb
     const had = await readCycleCardIn(tx, projectId, cycle);
     if (had) return had;
     // Pre-review low 4: only this project's purge card on its own target is ever bound.
-    const ok: { id: string }[] = await tx.$queryRaw`SELECT a.id::text AS id FROM approval a WHERE a.id::text = ${cardId}
+    const ok: { id: string; current: boolean }[] = await tx.$queryRaw`SELECT a.id::text AS id,
+        (p.stage IN ('archived', 'purged') AND p.archived_at IS NOT NULL AND a.created_at >= p.archived_at) AS current
+      FROM approval a JOIN project p ON p.id = a.project_id WHERE a.id::text = ${cardId}
       AND a.project_id = ${projectId}::uuid AND a.action = 'teardown.purge' AND a.target = ${`project:${projectId}`}`;
     if (ok.length !== 1) throw new Error("probe-card-bind-invalid");
+    // Codex PR245-r2 (medium): the caller found the card before this lock. A Restore and re-archive in between makes it
+    // an earlier archive's card, so it is re-checked here, under the lock, against the row's current archive; a stale
+    // card is never bound (the tick fails and its retry looks again).
+    if (ok[0]?.current !== true) throw new Error("probe-card-stale");
     return bindCycleCardIn(tx, projectId, cycle, cardId);
   }, { timeout: timeoutMs, maxWait: timeoutMs });
 }

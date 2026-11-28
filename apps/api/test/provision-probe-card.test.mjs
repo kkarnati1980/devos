@@ -1159,3 +1159,18 @@ test("b5e decision 21 (Codex PR245-r1): a cycle raise's reuse window never start
   assert.equal(boundable(AT, AT), true);
   assert.equal(boundable(AT, null), false);
 });
+
+test("b5e decision 21 (Codex PR245-r2): a card record from before cards were bound ends card-bind-upgrade with no raise and no Archive", async () => {
+  const d = fake();
+  await until(d, "card");
+  assert.equal(d.log.at(-1).cardBound, true, "the assert→card step marks the record");
+  // An in-flight `card` record written by the earlier version: no `cardBound`.
+  const legacy = { ...d.log.at(-1) };
+  delete legacy.cardBound;
+  d.log.push(legacy);
+  const raises = d.calls.raise;
+  const r = await probeStep(d);
+  assert.equal(r.phase, "purge");
+  assert.equal(d.calls.raise, raises, "no card raised");
+  assert.deepEqual([d.log.at(-1).result?.code, d.log.at(-1).expireCards], ["card-bind-upgrade", true]);
+});

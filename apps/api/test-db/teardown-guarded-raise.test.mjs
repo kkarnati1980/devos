@@ -217,4 +217,10 @@ test("M2.5-b5e decision 21: a reuse is bound in the raise's transaction, only fo
   await assert.rejects(bindProbeCycleCard(db, p.id, 5, foreign.id, 5000), /probe-card-bind-invalid/);
   await assert.rejects(bindProbeCycleCard(db, p.id, 5, "11111111-2222-4333-8444-555555555555", 5000), /probe-card-bind-invalid/);
   assert.equal(await probeCycleCard(db, p.id, 5, 5000), null);
+  // Codex PR245-r2: a card found before the lock, then made an earlier archive's by a re-archive, is never bound.
+  await db.project.update({ where: { id: p.id }, data: { archivedAt: new Date() } });
+  await assert.rejects(bindProbeCycleCard(db, p.id, 6, cyc.id, 5000), /probe-card-stale/);
+  await db.project.update({ where: { id: p.id }, data: { stage: "building", archivedAt: null } });
+  await assert.rejects(bindProbeCycleCard(db, p.id, 6, cyc.id, 5000), /probe-card-stale/);
+  assert.equal(await probeCycleCard(db, p.id, 6, 5000), null);
 });

@@ -63,6 +63,11 @@ export interface PhaseRecord {
    * live asserts) went straight to purge and never passes as `pass-card`.
    */
   cardReached?: boolean;
+  /**
+   * M2.5-b5e decision 21 (Codex PR245-r2): set when a card cycle enters `card` on a version that binds the cycle's card
+   * by id. A `card` record without it was written before that, so a card it raised may have no binding.
+   */
+  cardBound?: boolean;
   /** Codex PR239-r30 (decision 28): when the purge phase's first proof read failed; its retries are bounded from here. */
   proofRetryFrom?: string;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
@@ -326,13 +331,18 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       if (!r.ok) return toPurge(failed("live-assert-failed", "error"));
       if (r.value.length) return toPurge(failed("live-assert-failed", r.value.join(",")));
       // DEVOS-254 decision 2: only a card cycle goes through `card`; any other cycle purges at once, as before.
-      if (last.viaCard) return advance();
+      if (last.viaCard) return advance({ cardBound: true });
       await d.record({ ...last, phase: "purge", at: at() });
       return { exit: 3, phase: "purge", cycle, code: "in_progress" };
     }
     case "card": {
       // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
       if (!d.raisePurgeCard) return leaveCard(failed("card-not-wired"));
+      // M2.5-b5e decision 21 (Codex PR245-r2): a cycle that entered `card` before cards were bound by id may have
+      // raised a card with no binding (a tick that failed to record `cardwait`). No time window is used to find it: the
+      // cycle ends with the probe's own purge, which expires its pending purge cards first (r15), and the next card
+      // cycle binds its card from the start.
+      if (last.cardBound !== true) return leaveCard(failed("card-bind-upgrade"));
       const r = await attempt(() => d.raisePurgeCard!(new Date(Date.parse(last.at)), last.cycle));
       // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
       if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return leaveCard(failed("card-grant-short"));
