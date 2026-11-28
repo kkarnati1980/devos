@@ -121,10 +121,11 @@ export interface ProbeDeps {
   /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
   cardOutcome?(cardId: string): Promise<CardOutcome>;
   /**
-   * Codex PR239-r28 (decision 25): the oldest purge card raised in the probe row's current archive (at or after its
-   * `archived_at`), or null. Used only when a card cycle reached `purge` without a tracked `cardId`.
+   * Codex PR239-r28 (decision 25), M2.5-b5e decision 21 item 9 (Codex PR245-r3): the purge card bound to cycle `cycle`
+   * by id (`probeCycleCard`), or null. Used only when a card cycle reached `purge` without a tracked `cardId`; never a
+   * card found by time, so a Restore and re-archive cannot make it a different card from the cycle's own.
    */
-  archiveCardId?(): Promise<string | null>;
+  cycleCardId?(cycle: number): Promise<string | null>;
   /** Codex PR239-r7: true when a probe grant with every use the cycle may still spend is valid at `until` (decision 11). */
   cardGrantOutlasts?(until: Date): Promise<boolean>;
   /**
@@ -281,8 +282,9 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
   // Codex PR239-r15 (medium): every way out of `card` and `cardwait` to the probe's own purge first expires the probe's
   // pending purge cards (in the purge phase, `expireCards`), so a card persisted by a throwing tick is never left
   // pending behind the fallback purge, however far apart the server checks run.
-  const leaveCard = async (result: { ok: boolean; code: string; detail?: string }): Promise<ProbeTick> => {
-    await d.record({ ...last, phase: "purge", at: at(), result, expireCards: true, cardReached: true });
+  // M2.5-b5e decision 21 item 9 (Codex PR245-r3): `reached: false` leaves without AT10's proof open (`cardReached`).
+  const leaveCard = async (result: { ok: boolean; code: string; detail?: string }, reached = true): Promise<ProbeTick> => {
+    await d.record({ ...last, phase: "purge", at: at(), result, expireCards: true, cardReached: reached });
     return { exit: 3, phase: "purge", cycle, code: "in_progress" };
   };
   const advance = async (extra: Partial<PhaseRecord> = {}): Promise<ProbeTick> => {
@@ -342,7 +344,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // raised a card with no binding (a tick that failed to record `cardwait`). No time window is used to find it: the
       // cycle ends with the probe's own purge, which expires its pending purge cards first (r15), and the next card
       // cycle binds its card from the start.
-      if (last.cardBound !== true) return leaveCard(failed("card-bind-upgrade"));
+      // Codex PR245-r3: such a cycle has no binding, so it can never be AT10's proof (`cardReached` is false).
+      if (last.cardBound !== true) return leaveCard(failed("card-bind-upgrade"), false);
       const r = await attempt(() => d.raisePurgeCard!(new Date(Date.parse(last.at)), last.cycle));
       // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
       if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return leaveCard(failed("card-grant-short"));
@@ -469,7 +472,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // tracked card is read once more; only a purged row whose every allowed purge decision ran under an approved
       // card's grant (`byCard`, r1) passes. A purge by the probe itself is under its own grant, so it never does.
       // Codex PR239-r28 (decision 25): a `card` phase that timed out after persisting its card reaches here without a
-      // `cardId`; the current archive's card is looked up instead, so a sweep purge under KK's approved card still counts.
+      // `cardId`; the card bound to this cycle is looked up instead (b5e decision 21 item 9, Codex PR245-r3: by id, never
+      // the current archive's oldest card), so a sweep purge under KK's approved card still counts.
       // Codex PR239-r30 (decision 27): only a cycle that reached the card phases is checked for that proof.
       const proofOpen = last.viaCard === true && last.cardReached === true;
       let id = last.cardId;
@@ -477,8 +481,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // no-op `done`), so a transient failure never loses AT10's proof; past the retry window (decision 28) the earlier
       // result stands.
       let readFailed = false;
-      if (proofOpen && !id && d.archiveCardId) {
-        const f = await attempt(() => d.archiveCardId!());
+      if (proofOpen && !id && d.cycleCardId) {
+        const f = await attempt(() => d.cycleCardId!(cycle));
         if (!f.ok) readFailed = true;
         else if (typeof f.value === "string" && f.value !== "") id = f.value;
       }

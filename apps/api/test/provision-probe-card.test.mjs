@@ -909,17 +909,17 @@ test("Codex PR239-r28: a card persisted by a raise that then timed out is still 
     d.tick(6 * HOUR);
     return probeStep(d);
   };
-  assert.deepEqual(await run({ archiveCardId: async () => "card-1" }), { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
+  assert.deepEqual(await run({ cycleCardId: async () => "card-1" }), { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
   // No card in the current archive, a lookup that throws, or no lookup wired: the earlier failure stands.
-  assert.equal((await run({ archiveCardId: async () => null })).code, "card-raise-failed");
+  assert.equal((await run({ cycleCardId: async () => null })).code, "card-raise-failed");
   // A lookup that throws is retried within the purge phase's bound (r29), then the earlier failure stands.
-  assert.equal((await run({ archiveCardId: async () => { throw new Error("db"); } })).detail, "card-proof-retry");
+  assert.equal((await run({ cycleCardId: async () => { throw new Error("db"); } })).detail, "card-proof-retry");
   assert.equal((await run({})).code, "card-raise-failed");
 });
 
 test("Codex PR239-r29: a proof read that fails transiently after a card-authorized purge is retried, so AT10's proof is kept", async () => {
-  for (const which of ["archiveCardId", "cardOutcome"]) {
-    const d = fake({ archiveCardId: async () => "card-1" });
+  for (const which of ["cycleCardId", "cardOutcome"]) {
+    const d = fake({ cycleCardId: async () => "card-1" });
     await until(d, "card");
     d.raisePurgeCard = async () => { throw new Error("db after insert"); };
     await probeStep(d);
@@ -933,7 +933,7 @@ test("Codex PR239-r29: a proof read that fails transiently after a card-authoriz
     for (let i = 0; i < 2; i++) assert.equal((await probeStep(d)).detail, "card-proof-retry", `${which}: retried`);
     assert.deepEqual(await probeStep(d), { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
     // Throwing past the purge phase's bound: the earlier failure stands, and the cycle ends.
-    const e = fake({ archiveCardId: async () => "card-1" });
+    const e = fake({ cycleCardId: async () => "card-1" });
     await until(e, "card");
     e.raisePurgeCard = async () => { throw new Error("db after insert"); };
     await probeStep(e);
@@ -948,7 +948,7 @@ test("Codex PR239-r29: a proof read that fails transiently after a card-authoriz
 
 test("Codex PR239-r30 (decision 27): a card cycle that failed before the card phase never passes as pass-card, even if a card purge followed", async () => {
   for (const fail of ["provision", "inventory", "assert"]) {
-    const d = fake({ archiveCardId: async () => "card-1" });
+    const d = fake({ cycleCardId: async () => "card-1" });
     if (fail === "provision") d.provisionOnce = async () => ({ error: "boom" });
     if (fail === "inventory") d.inventory = async () => { throw new Error("db"); };
     if (fail === "assert") d.liveAsserts = async () => ["repo-private"];
@@ -967,7 +967,7 @@ test("Codex PR239-r30 (decision 27): a card cycle that failed before the card ph
 });
 
 test("Codex PR239-r30 (decision 28): a proof read that throws on a check long after the purge started is still retried, from its own window", async () => {
-  const d = fake({ archiveCardId: async () => "card-1" });
+  const d = fake({ cycleCardId: async () => "card-1" });
   await until(d, "card");
   d.raisePurgeCard = async () => { throw new Error("db after insert"); };
   await probeStep(d);
@@ -988,7 +988,7 @@ test("Codex PR239-r30 (decision 28): a proof read that throws on a check long af
   assert.equal((await probeStep(d)).detail, "card-proof-retry");
   assert.deepEqual(await probeStep(d), { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
   // A read that keeps throwing gives up once its own window has passed.
-  const e = fake({ archiveCardId: async () => "card-1" });
+  const e = fake({ cycleCardId: async () => "card-1" });
   await until(e, "card");
   e.raisePurgeCard = async () => { throw new Error("db after insert"); };
   await probeStep(e);
@@ -1173,4 +1173,49 @@ test("b5e decision 21 (Codex PR245-r2): a card record from before cards were bou
   assert.equal(r.phase, "purge");
   assert.equal(d.calls.raise, raises, "no card raised");
   assert.deepEqual([d.log.at(-1).result?.code, d.log.at(-1).expireCards], ["card-bind-upgrade", true]);
+});
+
+test("b5e decision 21 item 9 (Codex PR245-r3): a purge reached without a tracked card reads the cycle's binding by its cycle number, never the archive's card", async () => {
+  const asked = [];
+  const d = fake({ cycleCardId: async (n) => { asked.push(n); return n === 1 ? "card-1" : "card-other"; } });
+  await until(d, "card");
+  d.raisePurgeCard = async () => { throw new Error("db after insert"); };
+  await probeStep(d);
+  d.tick(PROBE_PHASE_MAX_MS);
+  assert.equal((await probeStep(d)).phase, "purge");
+  assert.equal(d.log.at(-1).cardId, undefined);
+  // KK restored and re-archived; the bound card (card-1) was approved and the sweep purged under it.
+  Object.assign(d.state, { stage: "purged", card: "approved", decidedAt: d.now().toISOString(), byCard: true });
+  d.tick(6 * HOUR);
+  assert.deepEqual(await probeStep(d), { exit: 0, phase: "done", cycle: 1, code: "pass-card", detail: undefined });
+  assert.deepEqual(asked, [1], "the binding of this cycle only");
+  // No binding (the cycle never tracked a card): no proof, the earlier failure stands, with no outcome read.
+  const e = fake({ cycleCardId: async () => null });
+  await until(e, "card");
+  e.raisePurgeCard = async () => { throw new Error("db after insert"); };
+  await probeStep(e);
+  e.tick(PROBE_PHASE_MAX_MS);
+  await probeStep(e);
+  Object.assign(e.state, { stage: "purged", card: "approved", decidedAt: e.now().toISOString(), byCard: true });
+  const outcomes = e.calls.outcome;
+  const done = await probeStep(e);
+  assert.equal(done.code, "card-raise-failed");
+  assert.equal(e.calls.outcome, outcomes, "no card read without a binding");
+});
+
+test("b5e decision 21 item 9 (Codex PR245-r3): a cycle that ended card-bind-upgrade never passes as pass-card, even if an approved card purge followed", async () => {
+  const d = fake({ cycleCardId: async () => "card-1" });
+  await until(d, "card");
+  const legacy = { ...d.log.at(-1) };
+  delete legacy.cardBound;
+  d.log.push(legacy);
+  assert.equal((await probeStep(d)).phase, "purge");
+  assert.equal(d.log.at(-1).cardReached, false);
+  Object.assign(d.state, { stage: "purged", card: "approved", decidedAt: d.now().toISOString(), byCard: true });
+  const outcomes = d.calls.outcome;
+  const done = await probeStep(d);
+  assert.equal(done.phase, "done");
+  assert.equal(done.code, "card-bind-upgrade");
+  assert.equal(done.exit, 1);
+  assert.equal(d.calls.outcome, outcomes, "no proof read");
 });
