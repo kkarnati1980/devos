@@ -158,6 +158,26 @@ test("M2.5-b5b decision 12 (Codex PR244-r1): an app-clock archive ahead of the d
   assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "not-due" }, "the daily raise stays not due");
 });
 
+test("M2.5-b5b decision 15 (Codex PR244-r3): a card an Archive retired is never reused or looked up as this cycle's, however its time sorts", async () => {
+  const { probeExistingCard } = await import("../dist/provision-probe-purge.js");
+  const archivedAt = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  const since = new Date(Date.now() - 60_000);
+  // An earlier archive's approved card, stamped by an app clock ahead of Postgres, and retired by the later Archive.
+  const old = await db.approval.create({ data: { projectId: p.id, gate: "purge", action: "teardown.purge", target: `project:${p.id}`, reason: "old", status: "approved", decidedAt: new Date(), decidedBy: "kk", confirmationHash: "h", createdAt: new Date(Date.now() + 10 * 60_000) } });
+  await db.auditEvent.create({ data: { actor: "system", projectId: p.id, action: "teardown.archive_retired_cards", summary: "test", details: { grantsRevoked: 0, cardsExpired: 0, retired: [old.id] } } });
+  assert.equal(await probeExistingCard(db, p.id, since, 5000), null, "the probe's lookup skips the retired card");
+  const got = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, reuseSince: since });
+  assert.notEqual(got.id, old.id, "the guarded raise does not reuse it: a new card is raised for this archive");
+  assert.equal(await probeExistingCard(db, p.id, since, 5000), got.id, "the new card is the one the probe tracks");
+  // probeCardOutcome: the retired approved card, though it sorts after the tracked one, never stands for it.
+  const { probeCardOutcome } = await import("../dist/provision-probe-purge.js");
+  const out = await probeCardOutcome(db, p.id, got.id, 5000);
+  assert.equal(out.card, "pending", "the tracked card's own status, not the retired card's approval");
+  assert.equal(out.decidedAt, null);
+  assert.equal((await probeCardOutcome(db, p.id, old.id, 5000)).card, "missing", "a retired card tracked by id reads as missing");
+});
+
 test("DEVOS-254 decision 34: with reuseSince, an approved card raised in the window is returned under the lock, never doubled", async () => {
   const archivedAt = new Date(Date.now() - 2 * DAY);
   const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });

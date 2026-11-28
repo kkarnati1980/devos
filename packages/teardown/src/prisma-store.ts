@@ -85,19 +85,22 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
         UPDATE approval_grant SET revoked_at = ${row.archivedAt}::timestamptz
         WHERE revoked_at IS NULL AND approval_id IN (
           SELECT id FROM approval WHERE project_id = ${projectId}::uuid AND action = 'teardown.purge' AND target = ${target})`;
-      // M2.5-b5b decision 14 (Codex PR244-r2): an earlier archive's rejected cards are retired by id, not by time. Keep
-      // archived excludes every card listed here, so a rejection stamped by the old app clock can never extend this
-      // archive, however its timestamp sorts against the database-clock `archived_at` and `purge_after`.
-      const rejected: { id: string }[] = await tx.$queryRaw`
-        SELECT id::text AS id FROM approval
-        WHERE project_id = ${projectId}::uuid AND action = 'teardown.purge' AND target = ${target} AND status = 'rejected'
-        ORDER BY id`;
-      const rejectedRetired = rejected.map((r) => r.id);
-      if (revoked > 0 || expired > 0 || rejectedRetired.length > 0) {
+      // M2.5-b5b decisions 14-15 (Codex PR244-r2/r3): every earlier purge card is also retired by id, not by time:
+      // its id goes in this Archive's `retired` list (any status, each id listed once across archives). Keep
+      // archived, the probe's lookups and the guarded raise's reuse exclude listed cards, so a card stamped by the old
+      // app clock can never extend, stand for or be reused by this archive, however its timestamp sorts.
+      const listed: { id: string }[] = await tx.$queryRaw`
+        SELECT a.id::text AS id FROM approval a
+        WHERE a.project_id = ${projectId}::uuid AND a.action = 'teardown.purge' AND a.target = ${target}
+          AND NOT EXISTS (SELECT 1 FROM audit_event e WHERE e.project_id = a.project_id
+            AND e.action = 'teardown.archive_retired_cards' AND e.details -> 'retired' @> jsonb_build_array(a.id::text))
+        ORDER BY a.id`;
+      const retired = listed.map((r) => r.id);
+      if (revoked > 0 || expired > 0 || retired.length > 0) {
         await tx.auditEvent.create({ data: {
           actor: "system", projectId, action: "teardown.archive_retired_cards",
           summary: "Earlier purge cards retired by a new Archive",
-          details: { grantsRevoked: revoked, cardsExpired: expired, rejectedRetired },
+          details: { grantsRevoked: revoked, cardsExpired: expired, retired },
         } });
       }
       await tx.auditEvent.create({ data: {

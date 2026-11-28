@@ -1,7 +1,7 @@
 // M2.3 decision cards (docs/modules/M2.3.md): ACTION / TARGET / REASON cards, KK-only decisions that issue one
 // scoped, expiring, limited-use M1.7 grant, and blocked tasks that wait only on the cards they depend on.
 import { createHash } from "node:crypto";
-import { probeGrantCard } from "./provision-probe-purge.js";
+import { NOT_RETIRED_SQL, probeGrantCard } from "./provision-probe-purge.js";
 import { looksSecret, type NoticeInput } from "./notify.js";
 import type { KkSession } from "./auth.js";
 
@@ -942,10 +942,12 @@ export class PrismaApprovalStore implements ApprovalStore {
       // since `reuseSince` (any status) is returned, not doubled. Every purge-card raise takes this lock (M2.5-b5a), so
       // none can commit between this read and the insert below.
       if (guard.reuseSince) {
-        const had = await tx.approval.findFirst({
-          where: { projectId: input.projectId ?? null, gate: input.gate, action: input.action, target: input.target, createdAt: { gte: guard.reuseSince } },
-          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-        });
+        // M2.5-b5b decision 15 (Codex PR244-r3): never a card an Archive retired, however its time sorts.
+        const ids: { id: string }[] = await tx.$queryRawUnsafe(
+          `SELECT a.id::text AS id FROM approval a WHERE a.project_id IS NOT DISTINCT FROM $1::uuid AND a.gate::text = $2 AND a.action = $3 AND a.target = $4
+             AND a.created_at >= $5::timestamptz AND ${NOT_RETIRED_SQL} ORDER BY a.created_at ASC, a.id ASC LIMIT 1`,
+          input.projectId ?? null, input.gate, input.action, input.target, guard.reuseSince);
+        const had = ids[0] ? await tx.approval.findUnique({ where: { id: ids[0].id } }) : null;
         if (had) return { card: toCard(had), created: false };
       }
       return this.raiseIn(tx, input, [], a, at);

@@ -419,6 +419,8 @@ function db({ project = { stage: "archived", archivedAt: ARCHIVED }, approval = 
   const tx = {
     project: { findUnique: async (q) => { seen.project = q; return project; } },
     approval: { findUnique: async (q) => { seen.approval = q; return approval; }, findMany: async () => [] },
+    // M2.5-b5b decision 15: the retired check and the approved-twin read; none here.
+    $queryRawUnsafe: async () => [],
     auditEvent: { count: async (q) => { seen.count = q; return count; } },
   };
   return { seen, $transaction: async (fn, o) => { seen.opts = o; return fn(tx); } };
@@ -490,11 +492,14 @@ test("Codex PR239-r1: a retried card tick uses the card this archive already has
 test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's grant, and probeExistingCard is bounded", async () => {
   const created = new Date("2026-11-25T10:00:00Z");
   const card = { status: "approved", decidedAt: created, createdAt: created, projectId: "p-1", action: "teardown.purge" };
+  let retired = false;
   const run = async (decisions, approved = [{ id: "c-1", decidedAt: created }], archivedAt = new Date("2026-11-25T09:00:00Z")) => {
     const seen = {};
     const tx = {
       project: { findUnique: async () => ({ stage: "purged", archivedAt }) },
-      approval: { findUnique: async () => card, findMany: async (q) => { seen.a = q; return approved; } },
+      approval: { findUnique: async () => card },
+      // M2.5-b5b decision 15: the approved-twin read is SQL with the retired exclusion; the tracked card is not retired.
+      $queryRawUnsafe: async (sql, ...args) => { if (sql.includes("status = 'approved'")) { seen.a = { sql, args }; return approved; } return retired ? [{ id: "c-1" }] : []; },
       policyDecision: { findMany: async (q) => { seen.q = q; return decisions; } },
     };
     const out = await probeCardOutcome({ $transaction: async (fn) => fn(tx) }, "p-1", "c-1", 5000);
@@ -509,8 +514,12 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
     assert.equal((await run(ds)).out.byCard, false, JSON.stringify(ds).slice(0, 80));
   }
   // Codex PR239-r3: the sweep purges under the newest approved card of the archive, which may be a later twin.
-  assert.deepEqual(r.seen.a.where, { projectId: "p-1", action: "teardown.purge", target: "project:p-1", status: "approved", createdAt: { gte: created } });
-  assert.deepEqual(r.seen.a.orderBy, [{ createdAt: "desc" }, { id: "desc" }]);
+  assert.deepEqual(r.seen.a.args, ["p-1", "project:p-1", created]);
+  assert.match(r.seen.a.sql, /a\.action = 'teardown\.purge'.*a\.target = \$2 AND a\.status = 'approved' AND a\.created_at >= \$3::timestamptz AND NOT EXISTS .*teardown\.archive_retired_cards.*ORDER BY a\.created_at DESC, a\.id DESC LIMIT 20/s);
+  // M2.5-b5b decision 15 (Codex PR244-r3): a tracked card an Archive retired reads as missing.
+  retired = true;
+  assert.equal((await run([mine])).out.card, "missing");
+  retired = false;
   const later = new Date("2026-11-25T11:00:00Z");
   const twin = { approvalGrant: { approvalId: "c-2" } };
   r = await run([twin], [{ id: "c-2", decidedAt: later }, { id: "c-1", decidedAt: created }]);
@@ -528,12 +537,13 @@ test("Codex PR239-r1: probeCardOutcome proves the purge ran under this card's gr
   r = await run([mine], undefined, null);
   assert.equal(r.out.card, "missing");
   const seen = {};
-  const x = { $transaction: async (fn, o) => { seen.o = o; return fn({ approval: { findFirst: async (q) => { seen.q = q; return { id: "c-9" }; } } }); } };
+  const x = { $transaction: async (fn, o) => { seen.o = o; return fn({ $queryRawUnsafe: async (sql, ...args) => { seen.q = { sql, args }; return [{ id: "c-9" }]; } }); } };
   assert.equal(await probeExistingCard(x, "p-1", created, 5000), "c-9");
-  assert.deepEqual(seen.q.where, { projectId: "p-1", action: "teardown.purge", target: "project:p-1", createdAt: { gte: created } });
-  assert.deepEqual(seen.q.orderBy, [{ createdAt: "asc" }, { id: "asc" }]);
+  // M2.5-b5b decision 15 (Codex PR244-r3): a card an Archive retired is excluded, in SQL; the oldest is tracked.
+  assert.deepEqual(seen.q.args, ["p-1", "project:p-1", created]);
+  assert.match(seen.q.sql, /a\.action = 'teardown\.purge' AND a\.target = \$2\s+AND a\.created_at >= \$3::timestamptz AND NOT EXISTS .*teardown\.archive_retired_cards.*ORDER BY a\.created_at ASC, a\.id ASC LIMIT 1/s);
   assert.deepEqual(seen.o, { timeout: 5000, maxWait: 5000 });
-  const none = { $transaction: async (fn) => fn({ approval: { findFirst: async () => null } }) };
+  const none = { $transaction: async (fn) => fn({ $queryRawUnsafe: async () => [] }) };
   assert.equal(await probeExistingCard(none, "p-1", created, 5000), null);
 });
 

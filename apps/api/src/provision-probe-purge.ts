@@ -370,14 +370,23 @@ export async function probeCardCycle(db: any, projectId: string, timeoutMs: numb
 
 const CARD_STATUSES = ["pending", "approved", "rejected", "expired"] as const;
 
+/**
+ * M2.5-b5b decision 15 (Codex PR244-r3): an Archive lists every earlier purge card of the project by id (the `retired`
+ * list of its `teardown.archive_retired_cards` audit row, decision 14). A listed card belongs to an earlier archive
+ * whatever its `created_at` says, so every lookup that binds a card to a cycle or an archive by time adds this
+ * condition on `approval a`, in SQL (no id list is loaded, so it stays bounded however many cycles have run).
+ */
+export const NOT_RETIRED_SQL = "NOT EXISTS (SELECT 1 FROM audit_event e WHERE e.project_id = a.project_id AND e.action = 'teardown.archive_retired_cards' AND e.details -> 'retired' @> jsonb_build_array(a.id::text))";
+
 /** Codex PR239-r1 (medium): the purge card this archive already has, in one bounded read. */
 export async function probeExistingCard(db: any, projectId: string, since: Date, timeoutMs: number): Promise<string | null> {
-  const c = await db.$transaction((tx: any) => tx.approval.findFirst({
-    where: { projectId, action: "teardown.purge", target: `project:${projectId}`, createdAt: { gte: since } },
-    // Codex PR239-r2: the oldest, so a card raised by someone else first is the one tracked.
-    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-    select: { id: true },
-  }), { timeout: timeoutMs, maxWait: timeoutMs });
+  // Decision 15: never a card an Archive retired. Codex PR239-r2: the oldest, so a card raised by someone else first
+  // is the one tracked.
+  const rows: { id: string }[] = await db.$transaction((tx: any) => tx.$queryRawUnsafe(
+    `SELECT a.id::text AS id FROM approval a WHERE a.project_id = $1::uuid AND a.action = 'teardown.purge' AND a.target = $2
+       AND a.created_at >= $3::timestamptz AND ${NOT_RETIRED_SQL} ORDER BY a.created_at ASC, a.id ASC LIMIT 1`,
+    projectId, `project:${projectId}`, since), { timeout: timeoutMs, maxWait: timeoutMs });
+  const c = rows?.[0];
   return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
 }
 
@@ -415,19 +424,21 @@ export async function probeCardOutcome(db: any, projectId: string, cardId: strin
     // Codex PR239-r6: and only while the row is still in the archive the card was raised for. A Restore clears
     // `archived_at` and a new Archive sets a later one, so a tracked card older than the row's `archived_at` belongs to
     // an earlier archive: it reads as missing, and the cycle ends as a failed card cycle, never `pass-card`.
-    const sameArchive = p.archivedAt instanceof Date && c?.createdAt instanceof Date && c.createdAt.getTime() >= p.archivedAt.getTime();
+    // Decision 15 (Codex PR244-r3): and a tracked card an Archive retired is from an earlier archive, by id.
+    const retired: { id: string }[] = c ? await tx.$queryRawUnsafe(`SELECT a.id::text AS id FROM approval a WHERE a.id = $1::uuid AND NOT (${NOT_RETIRED_SQL})`, cardId) : [];
+    const sameArchive = retired.length === 0 && p.archivedAt instanceof Date && c?.createdAt instanceof Date && c.createdAt.getTime() >= p.archivedAt.getTime();
     const ok = c && sameArchive && c.projectId === projectId && c.action === "teardown.purge" && (CARD_STATUSES as readonly string[]).includes(String(c.status));
     // Codex PR239-r3 (medium): the sweep purges under the newest approved purge card of the archive
     // (`Approvals.list`, createdAt desc), which may be a later twin of the tracked one. So the cards that count are
     // this project's approved `teardown.purge` cards on `project:<id>` raised at or after the tracked card (the same
     // archive, pre-review 2), newest first; the newest one gives the status and decision time reported.
     const approved: { id: string; decidedAt: unknown }[] = ok && c.createdAt instanceof Date
-      ? await tx.approval.findMany({
-        where: { projectId, action: "teardown.purge", target: `project:${projectId}`, status: "approved", createdAt: { gte: c.createdAt } },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        select: { id: true, decidedAt: true },
-        take: 20,
-      })
+      // Decision 15 (Codex PR244-r3): a retired card (an earlier archive's, its grant revoked) never counts.
+      ? await tx.$queryRawUnsafe(
+        `SELECT a.id::text AS id, a.decided_at AS "decidedAt" FROM approval a WHERE a.project_id = $1::uuid AND a.action = 'teardown.purge'
+           AND a.target = $2 AND a.status = 'approved' AND a.created_at >= $3::timestamptz AND ${NOT_RETIRED_SQL}
+           ORDER BY a.created_at DESC, a.id DESC LIMIT 20`,
+        projectId, `project:${projectId}`, c.createdAt)
       : [];
     const ids = new Set(approved.map((a) => a.id).filter((id) => typeof id === "string" && id !== ""));
     // Codex PR239-r1 (high): AT10 needs the purge to have run under an approved card's grant. Every allowed

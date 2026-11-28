@@ -140,7 +140,7 @@ test("keepArchived (b5b decision 14): a rejection an Archive retired, or one tha
   const p = await mk({ stage: "archived", archivedAt: new Date(from.getTime() - 30 * DAY), purgeAfter: from });
   // An earlier archive's rejection stamped by an app clock far ahead: it sorts after both of this archive's times.
   const ahead = await rejected(p.id, new Date(Date.now() + 365 * DAY));
-  await db.auditEvent.create({ data: { actor: "system", projectId: p.id, action: "teardown.archive_retired_cards", summary: "test", details: { grantsRevoked: 0, cardsExpired: 0, rejectedRetired: [ahead.id] } } });
+  await db.auditEvent.create({ data: { actor: "system", projectId: p.id, action: "teardown.archive_retired_cards", summary: "test", details: { grantsRevoked: 0, cardsExpired: 0, retired: [ahead.id] } } });
   assert.equal(await q.keepArchived(p.id, from, ahead.id), null, "a retired rejection moves nothing");
   assert.deepEqual(await purgeAfterOf(p.id), from);
   // A rejection that already moved purge_after once, then still sorts after the new value: no second move.

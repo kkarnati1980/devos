@@ -175,7 +175,7 @@ export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownS
     // was raised at or after purge_after (an early ask moves nothing), to the later of purge_after and the database
     // now, plus 30 days. Returns the new purge_after, or null when nothing moved.
     // Decision 14 (Codex PR244-r2): archive membership and single use are also bound by id, with no time compare
-    // across the clock change: a card an Archive retired (its `rejectedRetired` list) never moves anything, and a card
+    // across the clock change: a card an Archive retired (its `retired` list) never moves anything, and a card
     // that already moved purge_after once (its `teardown.keep_archived` audit row) never moves it again.
     keepArchived: (projectId: string, from: Date, approvalId: string) =>
       tx(async (t: any) => {
@@ -190,7 +190,7 @@ export function teardownSweepQueries(db: any, timeoutMs: number): Pick<TeardownS
               AND a.status = 'rejected' AND a.action = 'teardown.purge' AND a.target = 'project:' || project.id::text
               AND a.created_at >= project.purge_after AND a.created_at >= project.archived_at
               AND NOT EXISTS (SELECT 1 FROM audit_event r WHERE r.project_id = project.id
-                AND r.action = 'teardown.archive_retired_cards' AND r.details -> 'rejectedRetired' @> jsonb_build_array(a.id::text))
+                AND r.action = 'teardown.archive_retired_cards' AND r.details -> 'retired' @> jsonb_build_array(a.id::text))
               AND NOT EXISTS (SELECT 1 FROM audit_event k WHERE k.project_id = project.id
                 AND k.action = 'teardown.keep_archived' AND k.details ->> 'approvalId' = a.id::text))
           RETURNING project.purge_after AS "purgeAfter"`;
