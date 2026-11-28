@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { probeStep, probeProvisionOnce, ensureProbeProject, PrismaProbeLog, PROBE_CARD_RAISE_GRANT_MS, PROBE_SLUG, type PhaseRecord, type ProbeDeps } from "./provision-probe.js";
 import { probeCredentialsUpdatedAt, probeFingerprint, readProbeInventory } from "./provision-probe-cli-parts.js";
 import { liveAssertsFor } from "./provision-probe-asserts.js";
-import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, probeCardOutcome, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, expireProbePurgeCards, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
+import { cycleStartWithCard, findProbeGrant, grantAuthorizer, probeCardCycle, bindProbeCycleCard, probeCardOutcome, probeCycleCard, probeExistingCard, probeGrantOutlasts, probeCycleStart, probePurge, probeStage, raiseProbeGrantCard, raiseProbePurgeCard, archiveUnderProbeGrant, expireProbePurgeCards, probeActiveCounts, teardownWiring, PROBE_GRANT_ACTIONS } from "./provision-probe-purge.js";
 
 export interface CliResult { code: 0 | 1 | 2 | 3; out: Record<string, unknown> }
 
@@ -182,7 +182,7 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
           ),
           // DEVOS-254 (AT10): one cycle purges through KK's gate-5 purge card and the sweep job, not the probe grant.
           cardCycle: () => probeCardCycle(db, p.id, timeoutMs),
-          raisePurgeCard: async (cycleFrom) => {
+          raisePurgeCard: async (cycleFrom, cycle) => {
             const k = w.purge;
             const approvals = await probeApprovals(db, w.vault, env, timeoutMs);
             return raiseProbePurgeCard(p.id, {
@@ -190,6 +190,9 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               archivedAt: async () => (await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: p.id }, select: { archivedAt: true } }), { timeout: timeoutMs, maxWait: timeoutMs }))?.archivedAt ?? null,
               // Decision 3: the probe grant covers the archive only; the purge needs KK's card.
               existing: (since) => probeExistingCard(db, p.id, since, timeoutMs),
+              // M2.5-b5e decision 21 (Codex PR244-r6): the cycle's one card, bound by id, never found by a time window.
+              cycleCard: () => probeCycleCard(db, p.id, cycle, timeoutMs),
+              bind: (cardId) => bindProbeCycleCard(db, p.id, cycle, cardId, timeoutMs),
               archive: () => archiveUnderProbeGrant({
                 findGrant: (actions) => findProbeGrant(db, p.id, new Date(), timeoutMs, k.grantProblem, actions),
                 archive: async (grant) => {
@@ -200,7 +203,7 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
               counts: () => probeActiveCounts(db, p.id, timeoutMs),
               // Decision 31 (Codex PR239-r33): the card is written under the lifecycle lock, bound to this archive.
               // Decision 34 (Codex PR239-r36): the cycle's card is reused under the lock, never doubled.
-              raise: (c, archivedAt, reuseSince) => approvals.raiseGuardedCard(c, { projectId: p.id, archivedAt, due: false, ...(reuseSince ? { reuseSince } : {}) }),
+              raise: (c, archivedAt, reuseSince) => approvals.raiseGuardedCard(c, { projectId: p.id, archivedAt, due: false, bindCycle: cycle, ...(reuseSince ? { reuseSince } : {}) }),
               // Codex PR239-r7/r8 (decision 11): only before a new card, from this tick.
               outlasts: () => probeGrantOutlasts(db, p.id, new Date(Date.now() + PROBE_CARD_RAISE_GRANT_MS), timeoutMs, k.grantProblem),
               // Codex PR239-r15: an earlier archive's pending card is expired before the raise, so dedupe never returns it.
@@ -208,11 +211,9 @@ async function main(env: NodeJS.ProcessEnv): Promise<CliResult> {
             }, cycleFrom);
           },
           cardOutcome: (cardId) => probeCardOutcome(db, p.id, cardId, timeoutMs),
-          // Codex PR239-r28: the current archive's oldest purge card, for a purge reached without a tracked card.
-          archiveCardId: async () => {
-            const row = await db.$transaction((tx: any) => tx.project.findUnique({ where: { id: p.id }, select: { archivedAt: true } }), { timeout: timeoutMs, maxWait: timeoutMs });
-            return row?.archivedAt instanceof Date ? probeExistingCard(db, p.id, row.archivedAt, timeoutMs) : null;
-          },
+          // Codex PR239-r28, b5e decision 21 item 9 (Codex PR245-r3): the cycle's bound card, for a purge reached
+          // without a tracked card; never the current archive's oldest card.
+          cycleCardId: (n) => probeCycleCard(db, p.id, n, timeoutMs),
           // Codex PR239-r7 (decision 11): the probe grant must outlast the card wait, so the fallback purge can run.
           cardGrantOutlasts: (until) => probeGrantOutlasts(db, p.id, until, timeoutMs, w.purge.grantProblem),
           // Codex PR239-r15: before the probe's own purge after a card, its pending purge cards are expired.

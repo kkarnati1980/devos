@@ -343,8 +343,9 @@ export class Approvals {
     }
     if (!(guard.archivedAt instanceof Date) || Number.isNaN(guard.archivedAt.getTime())) throw new ApprovalError("invalid-input");
     if (guard.reuseSince !== undefined && (!(guard.reuseSince instanceof Date) || Number.isNaN(guard.reuseSince.getTime()))) throw new ApprovalError("invalid-input");
+    if (guard.bindCycle !== undefined && !validCycle(guard.bindCycle)) throw new ApprovalError("invalid-input");
     const audit = { action: "approval.raised", summary: `Decision card: ${card.action}`, details: { gate: card.gate, blocks: 0 } };
-    const r = await this.deps.store.raiseGuarded(card, audit, { projectId: guard.projectId, archivedAt: guard.archivedAt, due: guard.due === true, ...(guard.reuseSince ? { reuseSince: guard.reuseSince } : {}) }, new Date(this.now()));
+    const r = await this.deps.store.raiseGuarded(card, audit, { projectId: guard.projectId, archivedAt: guard.archivedAt, due: guard.due === true, ...(guard.reuseSince ? { reuseSince: guard.reuseSince } : {}), ...(guard.bindCycle !== undefined ? { bindCycle: guard.bindCycle } : {}) }, new Date(this.now()));
     if ("refused" in r) return { refused: r.refused };
     if (r.created && this.deps.notifier) {
       await this.deps.notifier
@@ -589,6 +590,65 @@ export interface RaiseGuard {
    * transaction, so a card KK asked for (and perhaps approved) after the caller's own lookups is never doubled.
    */
   reuseSince?: Date;
+  /**
+   * M2.5-b5e decision 21 (Codex PR244-r6): the AT10 probe cycle this raise is for. The raise's transaction first returns
+   * the card already bound to this cycle, if any (no raise), and otherwise binds the card it raises or reuses to it, by
+   * id, in a `provision.probe_cycle_card` audit row. A card is never bound to a cycle by comparing times.
+   */
+  bindCycle?: number;
+}
+
+/** M2.5-b5e decision 21: the audit action that binds one AT10 probe cycle to its one purge card, by id. */
+export const CYCLE_CARD_ACTION = "provision.probe_cycle_card";
+
+/** Decision 21: the card id bound to `cycle` of this project's probe, or null; the first binding wins. */
+export async function readCycleCardIn(tx: any, projectId: string, cycle: number): Promise<string | null> {
+  const rows: { id: unknown }[] = await tx.$queryRaw`
+    SELECT e.details ->> 'cardId' AS id FROM audit_event e
+    WHERE e.project_id = ${projectId}::uuid AND e.action = ${CYCLE_CARD_ACTION} AND e.details ->> 'cycle' = ${String(cycle)}
+    ORDER BY e.occurred_at ASC, e.id ASC LIMIT 1`;
+  const id = rows?.[0]?.id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/**
+ * Decision 21: bind `cardId` to `cycle` unless the cycle already has a card; returns the bound id. The caller holds the
+ * project's lifecycle lock in `tx` (every binding path takes it), so two bindings of one cycle cannot both insert.
+ */
+export async function bindCycleCardIn(tx: any, projectId: string, cycle: number, cardId: string): Promise<string> {
+  const had = await readCycleCardIn(tx, projectId, cycle);
+  if (had) return had;
+  await tx.auditEvent.create({ data: {
+    actor: "system", projectId, action: CYCLE_CARD_ACTION,
+    summary: `AT10 probe cycle ${cycle} tracks purge card ${cardId}`,
+    details: { cycle: String(cycle), cardId },
+  } });
+  return cardId;
+}
+
+/**
+ * Decision 21 (pre-review low 1): only a card raised in the row's current archive is bound, the same test the probe's
+ * staleness check applies after the raise, so a card that check rejects (reused from an earlier archive) is never
+ * tracked by a retry.
+ */
+export function boundable(createdAt: unknown, archivedAt: Date | null): boolean {
+  return createdAt instanceof Date && archivedAt instanceof Date && createdAt.getTime() >= archivedAt.getTime();
+}
+
+/**
+ * Decision 21 (Codex PR245-r1, medium): for a cycle raise, decision 34's reuse window never reaches before the row's
+ * current archive. A card from before it that this cycle did not bind is not this cycle's card (a bound one was already
+ * returned), and reusing it would hand back a card the probe's staleness check refuses on every retry, so the new
+ * archive would never get a card. Without `bindCycle` the window is unchanged.
+ */
+export function reuseFrom(guard: RaiseGuard, archivedAt: Date | null): Date | undefined {
+  if (!guard.reuseSince) return undefined;
+  if (guard.bindCycle === undefined || !(archivedAt instanceof Date)) return guard.reuseSince;
+  return archivedAt.getTime() > guard.reuseSince.getTime() ? new Date(archivedAt.getTime()) : guard.reuseSince;
+}
+
+export function validCycle(n: unknown): n is number {
+  return typeof n === "number" && Number.isSafeInteger(n) && n >= 1;
 }
 
 export type GuardRow = { stage: string; archivedAt: Date | null; purgeAfter: Date | null } | null;
@@ -650,20 +710,53 @@ export class MemoryApprovalStore implements ApprovalStore {
    */
   guardRow: ((projectId: string) => GuardRow) | null = null;
 
+  /** M2.5-b5e decision 21: `<projectId>:<cycle>` → the card bound to that probe cycle (first binding wins). */
+  cycleCards = new Map<string, string>();
+
+  bindCycleCard(projectId: string, cycle: number, cardId: string): Promise<string> {
+    return this.serial(() => {
+      const k = `${projectId}:${cycle}`;
+      const had = this.cycleCards.get(k);
+      if (had) return had;
+      this.cycleCards.set(k, cardId);
+      return cardId;
+    });
+  }
+
   raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date) {
     return this.serial(() => {
+      const r = this.raiseGuardedNow(input, audit, guard, now);
+      const row = this.guardRow ? this.guardRow(guard.projectId) : null;
+      if (guard.bindCycle !== undefined && !("refused" in r) && boundable(r.card.createdAt, row?.archivedAt ?? null)) {
+        const k = `${guard.projectId}:${guard.bindCycle}`;
+        if (!this.cycleCards.has(k)) this.cycleCards.set(k, r.card.id);
+      }
+      return r;
+    });
+  }
+
+  private raiseGuardedNow(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date): { card: Card; created: boolean } | { refused: string } {
+    {
+      // Decision 21: a cycle that already has its card gets that card back, whatever the archive now is.
+      if (guard.bindCycle !== undefined) {
+        const bound = this.cycleCards.get(`${guard.projectId}:${guard.bindCycle}`);
+        const c = bound ? this.cards.get(bound) : undefined;
+        if (c) return { card: { ...c }, created: false };
+        if (bound) return { refused: "cycle-card-missing" };
+      }
       const code = guardRefusal(this.guardRow ? this.guardRow(guard.projectId) : null, guard, now);
       if (code) return { refused: code };
       // Decision 34: the oldest card of this project, action and target since `reuseSince`, any status.
-      if (guard.reuseSince) {
-        const since = guard.reuseSince.getTime();
+      const from = reuseFrom(guard, this.guardRow?.(guard.projectId)?.archivedAt ?? null);
+      if (from) {
+        const since = from.getTime();
         const had = [...this.cards.values()]
           .filter((c) => c.projectId === (input.projectId ?? null) && c.gate === input.gate && c.action === input.action && c.target === input.target && c.createdAt.getTime() >= since)
           .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
         if (had) return { card: { ...had }, created: false };
       }
       return this.raiseNow(input, [], audit, now);
-    });
+    }
   }
 
   supersede(oldId: string, input: CardInput, audit: AuditEntry, now: Date, reason: string) {
@@ -920,6 +1013,15 @@ export class PrismaApprovalStore implements ApprovalStore {
         SELECT stage::text AS stage, archived_at AS "archivedAt", purge_after AS "purgeAfter",
           (archived_at = ${guard.archivedAt}::timestamptz) AS "sameArchive"
         FROM project WHERE id = ${guard.projectId}::uuid FOR NO KEY UPDATE`;
+      // M2.5-b5e decision 21: a cycle that already has its card gets that card back, under this lock, whatever the
+      // archive now is (a Restore and re-archive in between never yields a second card for one cycle).
+      if (guard.bindCycle !== undefined) {
+        const bound = await readCycleCardIn(tx, guard.projectId, guard.bindCycle);
+        if (bound) {
+          const c = await tx.approval.findUnique({ where: { id: bound } });
+          return c ? { card: toCard(c), created: false } : { refused: "cycle-card-missing" };
+        }
+      }
       const row = rows[0];
       if (!row) return { refused: "project-not-found" };
       if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
@@ -929,15 +1031,23 @@ export class PrismaApprovalStore implements ApprovalStore {
       // DEVOS-254 decision 34 (Codex PR239-r36): under the lock, the oldest card of this project, action and target
       // since `reuseSince` (any status) is returned, not doubled. Every purge-card raise takes this lock (M2.5-b5a), so
       // none can commit between this read and the insert below.
-      if (guard.reuseSince) {
+      const from = reuseFrom(guard, row.archivedAt);
+      if (from) {
         const had = await tx.approval.findFirst({
-          where: { projectId: input.projectId ?? null, gate: input.gate, action: input.action, target: input.target, createdAt: { gte: guard.reuseSince } },
+          where: { projectId: input.projectId ?? null, gate: input.gate, action: input.action, target: input.target, createdAt: { gte: from } },
           orderBy: [{ createdAt: "asc" }, { id: "asc" }],
         });
-        if (had) return { card: toCard(had), created: false };
+        if (had) {
+          // Decision 21: the reused card is bound to the cycle in this same transaction.
+          if (guard.bindCycle !== undefined && boundable(had.createdAt, row.archivedAt)) await bindCycleCardIn(tx, guard.projectId, guard.bindCycle, had.id);
+          return { card: toCard(had), created: false };
+        }
       }
       // Codex PR242-r5 (decision 10): dated by the app clock with no floor, as `raise` dates every card on main.
-      return this.raiseIn(tx, input, [], a, now);
+      const r = await this.raiseIn(tx, input, [], a, now);
+      // Decision 21: the raised (or pending-twin) card is bound to the cycle in the transaction that commits it.
+      if (guard.bindCycle !== undefined && boundable(r.card.createdAt, row.archivedAt)) await bindCycleCardIn(tx, guard.projectId, guard.bindCycle, r.card.id);
+      return r;
     });
   }
 

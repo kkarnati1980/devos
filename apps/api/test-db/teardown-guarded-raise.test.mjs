@@ -156,3 +156,71 @@ test("DEVOS-254 decision 34: with reuseSince, an approved card raised in the win
   assert.notEqual(fresh.id, asked.id);
   assert.equal((await cardsOf(p.id)).length, 2);
 });
+
+// M2.5-b5e: a live app clock, so a card is raised in the row's current archive (only such a card is bound, decision 21).
+const liveApprovals = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => Date.now() });
+
+test("M2.5-b5e decision 21 (Codex PR244-r6): a probe cycle's card is bound by id in the raise's transaction, and kept across a restore and re-archive", async () => {
+  const { bindProbeCycleCard, probeCycleCard } = await import("../dist/provision-probe-purge.js");
+  const archivedAt = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  assert.equal(await probeCycleCard(db, p.id, 7, 5000), null);
+  const a = await liveApprovals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 7 });
+  assert.equal(typeof a.id, "string");
+  assert.equal(await probeCycleCard(db, p.id, 7, 5000), a.id, "bound in the raise's own transaction");
+  assert.equal(await probeCycleCard(db, p.id, 8, 5000), null, "another cycle has no card");
+  // KK restores and archives again; his raw re-archive moves archived_at, so a plain guarded raise is refused.
+  const later = new Date(archivedAt.getTime() + 60_000);
+  await db.project.update({ where: { id: p.id }, data: { archivedAt: later } });
+  assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false }), { refused: "archive-changed" });
+  // The cycle's raise returns its bound card under the lock whatever the archive now is: never a second card.
+  const again = await liveApprovals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt: later, due: false, bindCycle: 7 });
+  assert.equal(again.id, a.id);
+  assert.equal((await cardsOf(p.id)).length, 1);
+  // An adopted card is bound under the lifecycle lock; the first binding wins.
+  assert.equal(await bindProbeCycleCard(db, p.id, 9, a.id, 5000), a.id);
+  assert.equal(await bindProbeCycleCard(db, p.id, 9, "11111111-2222-4333-8444-555555555555", 5000), a.id);
+  assert.equal(await bindProbeCycleCard(db, p.id, 7, "11111111-2222-4333-8444-555555555555", 5000), a.id);
+  const rows = await db.auditEvent.findMany({ where: { projectId: p.id, action: "provision.probe_cycle_card" } });
+  assert.equal(rows.length, 2, "one binding row per cycle");
+  // A bad cycle number is refused before any write.
+  await assert.rejects(liveApprovals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt: later, due: false, bindCycle: 0 }), /invalid-input/);
+  await assert.rejects(bindProbeCycleCard(db, p.id, 1.5, a.id, 5000), /probe-card-no-cycle/);
+});
+
+test("M2.5-b5e decision 21: a reuse is bound in the raise's transaction, only for a card of the current archive; a foreign id is never bound", async () => {
+  const { bindProbeCycleCard, probeCycleCard } = await import("../dist/provision-probe-purge.js");
+  const archivedAt = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  // An early ask in this archive (dated by the 2001 app clock, so before archived_at): a reuse of it is not bound.
+  const now = liveApprovals;
+  const old = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false });
+  // Without a cycle, decision 34's window is unchanged and reaches the earlier card.
+  assert.equal((await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, reuseSince: new Date(0) })).id, old.id, "decision 34 reuse");
+  // Codex PR245-r1: a cycle raise never reuses an unbound card from before the current archive (here expired, as the
+  // probe's expireStale leaves it); it raises a new card in this archive and binds it.
+  await db.approval.update({ where: { id: old.id }, data: { status: "expired", decidedAt: new Date(), decidedBy: "system" } });
+  const cyc = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 3, reuseSince: new Date(0) });
+  assert.notEqual(cyc.id, old.id);
+  assert.ok(cyc.createdAt.getTime() >= archivedAt.getTime());
+  assert.equal(await probeCycleCard(db, p.id, 3, 5000), cyc.id);
+  // A card of the current archive found by the reuse window is bound in the same transaction.
+  // (any status: rejected here, so the pending-twin dedupe cannot be what returns it).
+  await db.approval.update({ where: { id: cyc.id }, data: { status: "rejected", decidedAt: new Date(), decidedBy: "kk" } });
+  const r2 = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 4, reuseSince: new Date(0) });
+  assert.equal(r2.id, cyc.id);
+  assert.equal(await probeCycleCard(db, p.id, 4, 5000), cyc.id);
+  assert.equal((await cardsOf(p.id)).length, 2, "no new card");
+  // An id that is not this project's purge card is refused, and nothing is written.
+  const other = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  const foreign = await now.raiseGuardedCard(purgeCard(other, {}), { projectId: other.id, archivedAt, due: false });
+  await assert.rejects(bindProbeCycleCard(db, p.id, 5, foreign.id, 5000), /probe-card-bind-invalid/);
+  await assert.rejects(bindProbeCycleCard(db, p.id, 5, "11111111-2222-4333-8444-555555555555", 5000), /probe-card-bind-invalid/);
+  assert.equal(await probeCycleCard(db, p.id, 5, 5000), null);
+  // Codex PR245-r2: a card found before the lock, then made an earlier archive's by a re-archive, is never bound.
+  await db.project.update({ where: { id: p.id }, data: { archivedAt: new Date() } });
+  await assert.rejects(bindProbeCycleCard(db, p.id, 6, cyc.id, 5000), /probe-card-stale/);
+  await db.project.update({ where: { id: p.id }, data: { stage: "building", archivedAt: null } });
+  await assert.rejects(bindProbeCycleCard(db, p.id, 6, cyc.id, 5000), /probe-card-stale/);
+  assert.equal(await probeCycleCard(db, p.id, 6, 5000), null);
+});
