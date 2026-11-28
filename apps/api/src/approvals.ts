@@ -168,7 +168,8 @@ export interface ApprovalStore {
   /**
    * M2.5-b5a (DEVOS-255, docs/modules/M2.5.md "M2.5-b5a"): one transaction that takes the project's lifecycle lock,
    * re-reads the project row and the database clock, and raises the card (as `raise`, no blockers) only if
-   * `guardRefusal` passes. The card's `createdAt` is that database clock. A dropped connection rolls the card back.
+   * `guardRefusal` passes (the due check at the database clock). The card is dated by `guardedAt`. A dropped
+   * connection rolls the card back.
    */
   raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date): Promise<{ card: Card; created: boolean } | { refused: string }>;
   /** One audit_event outside any decision (e.g. a grant that could not be revoked). */
@@ -594,6 +595,15 @@ export function guardRefusal(row: GuardRow, g: RaiseGuard, now: Date): string | 
   return null;
 }
 
+/**
+ * A guarded card's `createdAt` (Codex PR242-r2): the app clock, the clock Archive dates `archived_at` with until
+ * M2.5-b5b, so "raised for this archive" compares one clock; floored at the row's `archived_at`, read under the lock
+ * after that archive committed, so the card is never dated before the archive it was raised for (pre-review low 1).
+ */
+export function guardedAt(row: GuardRow, now: Date): Date {
+  return row?.archivedAt && row.archivedAt.getTime() > now.getTime() ? row.archivedAt : now;
+}
+
 /** The provisioning lock's key (packages/provision, packages/teardown hold it as a session lock); same key space. */
 export const PROJECT_LOCK_SQL = "SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext('devos:provision'), hashtext($1::text))) AS l";
 
@@ -642,7 +652,7 @@ export class MemoryApprovalStore implements ApprovalStore {
     return this.serial(() => {
       const code = guardRefusal(this.guardRow ? this.guardRow(guard.projectId) : null, guard, now);
       if (code) return { refused: code };
-      return this.raiseNow(input, [], audit, now);
+      return this.raiseNow(input, [], audit, guardedAt(this.guardRow!(guard.projectId), now));
     });
   }
 
@@ -885,7 +895,7 @@ export class PrismaApprovalStore implements ApprovalStore {
     });
   }
 
-  raiseGuarded(input: CardInput, a: AuditEntry, guard: RaiseGuard, _now: Date) {
+  raiseGuarded(input: CardInput, a: AuditEntry, guard: RaiseGuard, now: Date) {
     return this.tx(async (tx) => {
       // The lifecycle lock first (bounded by this transaction's statement_timeout), then the raise's own key, the order
       // no other path reverses: Archive, Restore and Purge hold the session form of this lock and never raise a card.
@@ -901,10 +911,7 @@ export class PrismaApprovalStore implements ApprovalStore {
       if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
       const code = guardRefusal(row, guard, row.now);
       if (code) return { refused: code };
-      // Until M2.5-b5b writes archived_at from the database clock too, a card raised under the lock after the archive
-      // committed is never dated before it (pre-review low 1): the later of the two times.
-      const at = row.archivedAt && row.archivedAt.getTime() > row.now.getTime() ? row.archivedAt : row.now;
-      return this.raiseIn(tx, input, [], a, at);
+      return this.raiseIn(tx, input, [], a, guardedAt(row, now));
     });
   }
 

@@ -15,7 +15,7 @@ const db = createDb(url);
 after(() => db.$disconnect());
 
 const DAY = 86_400_000;
-// The app clock is pinned far in the past: a card's createdAt must come from the database clock instead.
+// The app clock is pinned far in the past: a card's createdAt is then floored at the row's archived_at.
 const APP_NOW = Date.parse("2001-01-01T00:00:00Z");
 const approvals = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => APP_NOW });
 
@@ -25,13 +25,18 @@ const mk = async (data) => {
 };
 const cardsOf = (projectId) => db.approval.findMany({ where: { projectId, action: "teardown.purge" } });
 
-test("an archived, due row gets one card whose createdAt is the database clock", async () => {
+test("an archived, due row gets one card, dated by the app clock but never before its archive", async () => {
   const archivedAt = new Date(Date.now() - 31 * DAY);
   const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
-  const before = Date.now() - 60_000;
+  // The app clock is pinned to 2001, behind the archive: the card is floored at archived_at (Codex PR242-r2).
   const c = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
   assert.equal(typeof c.id, "string");
-  assert.ok(c.createdAt.getTime() > before, "not the pinned app clock");
+  assert.equal(c.createdAt.getTime(), archivedAt.getTime(), "the later of the app clock and archived_at");
+  // With the app clock ahead of the archive, the app clock dates the card (one clock with Archive's archived_at).
+  const appNow = Date.now() + 5 * 60_000;
+  const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
+  const q = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
+  assert.equal((await ahead.raiseGuardedCard(purgeCard(q, {}), { projectId: q.id, archivedAt, due: true })).createdAt.getTime(), appNow);
   assert.equal((await cardsOf(p.id)).length, 1);
   // A second guarded raise dedupes onto the pending card, as raiseCard does.
   const again = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
