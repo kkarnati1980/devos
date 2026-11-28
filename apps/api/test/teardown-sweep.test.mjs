@@ -675,3 +675,28 @@ test("M2.5-b5a: the daily run never queues behind this process's own running pur
   assert.equal((await s.purgeCards("pending")).length, 0);
   finish({ purged: true, report: { hits: [], errors: [] } });
 });
+
+test("Codex PR242-r3 (1): guardedAt floors a daily card at purge_after and every card at archived_at", async () => {
+  const { guardedAt } = await import("../dist/approvals.js");
+  const archivedAt = new Date(T0 - 31 * DAY);
+  const purgeAfter = new Date(T0 + 60_000); // reached at the database clock, 1 minute ahead of the app clock T0
+  const row = { stage: "archived", archivedAt, purgeAfter };
+  assert.equal(guardedAt(row, new Date(T0), true).getTime(), purgeAfter.getTime(), "a daily card is dated in its due period");
+  assert.equal(guardedAt(row, new Date(T0), false).getTime(), T0, "an early ask keeps the app clock");
+  assert.equal(guardedAt(row, new Date(T0 - 40 * DAY), false).getTime(), archivedAt.getTime(), "never before its archive");
+  assert.equal(guardedAt(row, new Date(T0 + DAY), true).getTime(), T0 + DAY, "the app clock when it is later");
+});
+
+test("Codex PR242-r3 (2): an early ask whose project starts purging during its awaits never calls the locked raise", async () => {
+  let finish;
+  const s = setup({ purgeImpl: () => new Promise((r) => { finish = r; }), purgeTimeoutMs: 5 });
+  s.projects.get(P).purgeAfter = new Date(T0 + 10 * DAY);
+  const counts = s.job["d"].activeCounts;
+  let locked = 0;
+  s.hooks.beforeLockedRaise = async () => { locked++; };
+  s.job["d"].activeCounts = async (id) => { s.job["purging"].add(id); return counts(id); };
+  assert.deepEqual(await s.job.askPurge(P), { ok: false, code: "purge-already-approved" });
+  assert.equal(locked, 0);
+  assert.equal((await s.purgeCards()).length, 0);
+  void finish;
+});

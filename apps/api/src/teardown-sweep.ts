@@ -385,7 +385,9 @@ export class TeardownSweepJob {
           continue;
         }
         if (!(await this.shouldRaise(p))) continue;
-        const r = await this.d.raiseLocked(purgeCard(p, await this.d.activeCounts(p.id)), { archivedAt: p.archivedAt, due: true });
+        const counts = await this.d.activeCounts(p.id);
+        if (this.purging.has(p.id)) continue; // a purge started during the awaits above (Codex PR242-r3 (2))
+        const r = await this.d.raiseLocked(purgeCard(p, counts), { archivedAt: p.archivedAt, due: true });
         if ("refused" in r) {
           // Purged, restored, archived again or kept archived since listDue: the locked re-read is the newer word.
           this.d.log({ level: "info", msg: "teardown-purge-card-skipped", projectId: p.id, code: r.refused });
@@ -459,7 +461,10 @@ export class TeardownSweepJob {
     if (pending.length) await this.d.expire(pending.map((c) => c.id), "purge-card-older-archive");
     // M2.5-b5a: the card is written only if, under the lifecycle lock, the row is still the archive read above (a purge,
     // a Restore or a new Archive since then refuses it, and nothing is written).
-    const r = await this.d.raiseLocked(purgeCard(p, await this.d.activeCounts(p.id)), { archivedAt: p.archivedAt, due: false });
+    const counts = await this.d.activeCounts(p.id);
+    // Codex PR242-r3 (2): a tick may have started this process's purge during the awaits above; never queue on it.
+    if (this.purging.has(p.id)) return { ok: false, code: "purge-already-approved" };
+    const r = await this.d.raiseLocked(purgeCard(p, counts), { archivedAt: p.archivedAt, due: false });
     if ("refused" in r) {
       this.d.log({ level: "info", msg: "teardown-purge-ask-refused", projectId: p.id, code: r.refused });
       return { ok: false, code: r.refused === "project-not-found" ? "project-not-found" : "not_archived" };

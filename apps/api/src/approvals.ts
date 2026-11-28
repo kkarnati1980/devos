@@ -600,8 +600,13 @@ export function guardRefusal(row: GuardRow, g: RaiseGuard, now: Date): string | 
  * M2.5-b5b, so "raised for this archive" compares one clock; floored at the row's `archived_at`, read under the lock
  * after that archive committed, so the card is never dated before the archive it was raised for (pre-review low 1).
  */
-export function guardedAt(row: GuardRow, now: Date): Date {
-  return row?.archivedAt && row.archivedAt.getTime() > now.getTime() ? row.archivedAt : now;
+export function guardedAt(row: GuardRow, now: Date, due = false): Date {
+  let t = now.getTime();
+  if (row?.archivedAt) t = Math.max(t, row.archivedAt.getTime());
+  // Codex PR242-r3 (1): a daily card belongs to the due period it was raised for, so it is never dated before
+  // purge_after (which the guard just checked had passed at the database clock).
+  if (due && row?.purgeAfter) t = Math.max(t, row.purgeAfter.getTime());
+  return new Date(t);
 }
 
 /** The provisioning lock's key (packages/provision, packages/teardown hold it as a session lock); same key space. */
@@ -652,7 +657,7 @@ export class MemoryApprovalStore implements ApprovalStore {
     return this.serial(() => {
       const code = guardRefusal(this.guardRow ? this.guardRow(guard.projectId) : null, guard, now);
       if (code) return { refused: code };
-      return this.raiseNow(input, [], audit, guardedAt(this.guardRow!(guard.projectId), now));
+      return this.raiseNow(input, [], audit, guardedAt(this.guardRow!(guard.projectId), now, guard.due));
     });
   }
 
@@ -911,7 +916,7 @@ export class PrismaApprovalStore implements ApprovalStore {
       if (row.stage === "archived" && row.archivedAt && row.sameArchive !== true) return { refused: "archive-changed" };
       const code = guardRefusal(row, guard, row.now);
       if (code) return { refused: code };
-      return this.raiseIn(tx, input, [], a, guardedAt(row, now));
+      return this.raiseIn(tx, input, [], a, guardedAt(row, now, guard.due));
     });
   }
 
