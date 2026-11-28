@@ -157,3 +157,18 @@ test("M2.5-b5b decision 12 (Codex PR244-r1): an app-clock archive ahead of the d
   assert.equal(c.createdAt.getTime(), archivedAt.getTime(), "the sweep's created_at >= archived_at holds");
   assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: true }), { refused: "not-due" }, "the daily raise stays not due");
 });
+
+test("DEVOS-254 decision 34: with reuseSince, an approved card raised in the window is returned under the lock, never doubled", async () => {
+  const archivedAt = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  const since = new Date(Date.now() - 60_000);
+  // KK's earlier ask, already approved (a purge card needs its confirmation hash), inside the window.
+  const asked = await db.approval.create({ data: { projectId: p.id, gate: "purge", action: "teardown.purge", target: `project:${p.id}`, reason: "asked", status: "approved", decidedAt: new Date(), decidedBy: "kk", confirmationHash: "h", createdAt: new Date(Date.now() - 1000) } });
+  const got = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, reuseSince: since });
+  assert.equal(got.id, asked.id);
+  assert.equal((await cardsOf(p.id)).length, 1, "no second card");
+  // Outside the window the approved card is not reused: a new pending card is raised, as every other caller gets.
+  const fresh = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, reuseSince: new Date(asked.createdAt.getTime() + 1) });
+  assert.notEqual(fresh.id, asked.id);
+  assert.equal((await cardsOf(p.id)).length, 2);
+});

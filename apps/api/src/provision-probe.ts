@@ -7,8 +7,23 @@ export const PROBE_SLUG = "devos-probe-m24";
 export const PROBE_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
 /** A run or purge still "in progress" after this long ends the cycle (`<phase>-timeout`), so a stuck provider never hides. */
 export const PROBE_PHASE_MAX_MS = 2 * 60 * 60 * 1000;
+/** DEVOS-254 decision 5: how long a card cycle waits for KK's answer (the card itself expires after 7 days). */
+export const PROBE_CARD_MAX_MS = 8 * 24 * 60 * 60 * 1000;
+/**
+ * Codex PR239-r7 (DEVOS-254 decision 11): a card cycle starts only while a probe grant stays valid this long, and its
+ * card is raised only while one stays valid `PROBE_CARD_RAISE_GRANT_MS` from then, so the probe can still purge after
+ * the longest card wait. The extra day covers the tick after the bound (the check runs at least every 6 h) and the
+ * purge itself (`PROBE_PHASE_MAX_MS`); the start adds one more day for the phases before `card`.
+ */
+export const PROBE_CARD_RAISE_GRANT_MS = PROBE_CARD_MAX_MS + 24 * 60 * 60 * 1000;
+/** Codex PR239-r13 (decision 13): the room a waiting tick needs left on the probe grant: the next tick and the purge. */
+export const PROBE_CARD_PURGE_ROOM_MS = PROBE_CARD_RAISE_GRANT_MS - PROBE_CARD_MAX_MS;
+export const PROBE_CARD_START_GRANT_MS = PROBE_CARD_RAISE_GRANT_MS + 24 * 60 * 60 * 1000;
+/** DEVOS-254 decision 1: the result code of a cycle whose purge went through KK's approved purge card. */
+export const PASS_CARD = "pass-card";
 
-export const PHASES = ["run1", "inventory1", "run2", "inventory2", "assert", "purge", "done"] as const;
+// DEVOS-254 (M2.5-b4): `card` and `cardwait` run only in a card cycle (`viaCard`), between `assert` and `purge`.
+export const PHASES = ["run1", "inventory1", "run2", "inventory2", "assert", "card", "cardwait", "purge", "done"] as const;
 export type Phase = (typeof PHASES)[number];
 
 /** One inventory row, as AT13 compares it (key, provider, external id, name). */
@@ -23,11 +38,48 @@ export interface PhaseRecord {
   inventory1?: InventoryRow[];
   /** DEVOS-21 part 13: the provider refusal (`purge-permission:<provider>/<kind>…`) the cycle before this one ended with, if any. */
   refusalRetry?: string;
+  /** DEVOS-254: this cycle purges through KK's purge card (AT10), set when the cycle starts. */
+  viaCard?: boolean;
+  /** DEVOS-254: the purge card the `card` phase raised. */
+  cardId?: string;
+  /**
+   * Codex PR239-r15: set when a card cycle leaves `card` or `cardwait` for the probe's own purge. The purge phase then
+   * first expires the probe's pending purge cards (`expirePurgeCards`), so KK never sees a pending request for a purge
+   * the probe already did, and no stale card is left for the next cycle's dedupe.
+   */
+  expireCards?: boolean;
+  /** Codex PR239-r15: the purge went ahead without that expiry, because the probe grant would not outlast more retries. */
+  cardExpireGaveUp?: boolean;
+  /** Codex PR239-r25: `cardwait` saw the sweep's purge under KK's approved card (AT10's proof); only the expiry is left. */
+  cardProven?: boolean;
+  /**
+   * Codex PR239-r26: recorded with `cardProven`, the start the 8-day wait was measured from (the earlier of the card's
+   * raise and the `cardwait` record), so the expiry retries keep the deadline the original raise set.
+   */
+  cardWaitFrom?: string;
+  /**
+   * Codex PR239-r30 (DEVOS-254 decision 27): set when a card cycle leaves `card` or `cardwait` for the probe's own purge.
+   * Only such a cycle can find AT10's proof in the purge phase; one that failed earlier (provisioning, the compare, the
+   * live asserts) went straight to purge and never passes as `pass-card`.
+   */
+  cardReached?: boolean;
+  /** Codex PR239-r30 (decision 28): when the purge phase's first proof read failed; its retries are bounded from here. */
+  proofRetryFrom?: string;
   result?: { ok: boolean; code: string; detail?: string; cause?: string; causeDetail?: string };
 }
 
 export type RunOutcome = "done" | "in_progress" | { error: string };
 export type PurgeOutcome = "done" | "in_progress" | { error: string };
+/** DEVOS-254 decision 4: the probe row's stage and the purge card's status (`missing` when the card is gone). */
+export interface CardOutcome {
+  stage: string;
+  card: "pending" | "approved" | "rejected" | "expired" | "missing";
+  decidedAt?: string | null;
+  /** Codex PR239-r12: the tracked card's `created_at` (ISO), or null when it reads as missing. */
+  raisedAt?: string | null;
+  /** Codex PR239-r1: every allowed purge decision since the card was raised ran under this card's grant (and one did). */
+  byCard?: boolean;
+}
 
 export interface ProbeDeps {
   /** null when the sweep is off (provisionConfig / vault): the probe is skipped. */
@@ -52,6 +104,28 @@ export interface ProbeDeps {
    * after that cycle ended starts the next cycle at once. Absent means the 7-day rule alone.
    */
   credentialsUpdatedAt?(): Promise<string | null>;
+  /** DEVOS-254 decision 1: true while no cycle has ended `pass-card`, so the next cycle purges through KK's card. */
+  cardCycle?(): Promise<boolean>;
+  /**
+   * DEVOS-254 decision 3: archive the probe project (unless archived) and raise the M2.5-b2 purge card; its id (the card
+   * this archive already has, on a retried tick). `{ grantShort }` when no card was raised for decision 11.
+   */
+  /** Decision 33 (Codex PR239-r35): `cycleFrom` is when this cycle entered `card`; a card raised since then is reused. */
+  raisePurgeCard?(cycleFrom: Date): Promise<string | { grantShort: true }>;
+  /** DEVOS-254 decision 4: one read of the probe row's stage and the card's status. */
+  cardOutcome?(cardId: string): Promise<CardOutcome>;
+  /**
+   * Codex PR239-r28 (decision 25): the oldest purge card raised in the probe row's current archive (at or after its
+   * `archived_at`), or null. Used only when a card cycle reached `purge` without a tracked `cardId`.
+   */
+  archiveCardId?(): Promise<string | null>;
+  /** Codex PR239-r7: true when a probe grant with every use the cycle may still spend is valid at `until` (decision 11). */
+  cardGrantOutlasts?(until: Date): Promise<boolean>;
+  /**
+   * Codex PR239-r15: expire every pending `teardown.purge` card of the probe project (any archive). Resolves only once
+   * none is left pending; throws otherwise.
+   */
+  expirePurgeCards?(): Promise<void>;
   fingerprint: string;
   now(): Date;
 }
@@ -115,6 +189,10 @@ function refusalOf(last: PhaseRecord): string | undefined {
 async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   if (last.fingerprint !== d.fingerprint) return true;
   if (d.now().getTime() - Date.parse(last.at) >= PROBE_EVERY_MS) return true;
+  // DEVOS-254 decision 1: the first card cycle is due on the next check run after a passed non-card cycle. A failed
+  // cycle, card or not, waits the rules below (pre-review 1: a failing cleanup purge must not repeat on every check
+  // run, spending KK's probe grant), so a card is raised at most once per cycle.
+  if (last.result?.ok === true && !last.viaCard && (await isCardCycle(d))) return true;
   // DEVOS-21: a cycle that only purged an earlier cycle's leftovers (its purge passed) tested nothing, so the real
   // cycle is due on the next check run. If that purge had failed, the code would be `purge-failed`, which waits
   // (except a provider refusal, part 13, below).
@@ -135,6 +213,20 @@ async function due(last: PhaseRecord, d: ProbeDeps): Promise<boolean> {
   const t = u === null ? NaN : Date.parse(u);
   return Number.isFinite(t) && t > Date.parse(last.at);
 }
+
+/**
+ * DEVOS-254 decision 1: a read that throws, or a probe without the card wiring, is a normal cycle. Decision 11 (Codex
+ * PR239-r7): so is one whose probe grant would lapse before a card left unanswered could still be purged.
+ */
+async function isCardCycle(d: ProbeDeps): Promise<boolean> {
+  if (!d.cardCycle || !d.raisePurgeCard || !d.cardOutcome || !d.cardGrantOutlasts || !d.expirePurgeCards) return false;
+  try {
+    if ((await d.cardCycle()) !== true) return false;
+    return (await d.cardGrantOutlasts(new Date(d.now().getTime() + PROBE_CARD_START_GRANT_MS))) === true;
+  } catch { return false; }
+}
+
+const CARD_WORD = /^[a-z_]{1,20}$/;
 
 /** Runs one effect; a throw becomes `{ thrown: true }` (its message is never kept: it may quote a provider body). */
 async function attempt<T>(fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false }> {
@@ -164,7 +256,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       await d.record({ cycle, phase: "purge", at: at(), fingerprint: d.fingerprint, ...mark, result: { ok: false, code: "previous-purge-pending" } });
       return { exit: 3, phase: "purge", cycle, code: "in_progress" };
     }
-    await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint, ...mark });
+    const card = (await isCardCycle(d)) ? { viaCard: true } : {};
+    await d.record({ cycle, phase: "run1", at: at(), fingerprint: d.fingerprint, ...mark, ...card });
     return { exit: 3, phase: "run1", cycle, code: "in_progress" };
   }
   if (last.phase === "done") {
@@ -179,20 +272,28 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     await d.record({ ...last, phase: "purge", at: at(), result });
     return { exit: 3, phase: "purge", cycle, code: "in_progress" };
   };
+  // Codex PR239-r15 (medium): every way out of `card` and `cardwait` to the probe's own purge first expires the probe's
+  // pending purge cards (in the purge phase, `expireCards`), so a card persisted by a throwing tick is never left
+  // pending behind the fallback purge, however far apart the server checks run.
+  const leaveCard = async (result: { ok: boolean; code: string; detail?: string }): Promise<ProbeTick> => {
+    await d.record({ ...last, phase: "purge", at: at(), result, expireCards: true, cardReached: true });
+    return { exit: 3, phase: "purge", cycle, code: "in_progress" };
+  };
   const advance = async (extra: Partial<PhaseRecord> = {}): Promise<ProbeTick> => {
     const to = nextPhase(phase);
     await d.record({ ...last, ...extra, phase: to, at: at() });
     return { exit: 3, phase: to, cycle, code: "in_progress" };
   };
-  const finish = async (ok: boolean, code: string, detail?: string, cause?: { code: string; detail?: string }): Promise<ProbeTick> => {
+  const finish = async (ok: boolean, code: string, detail?: string, cause?: { code: string; detail?: string }, extra: Partial<PhaseRecord> = {}): Promise<ProbeTick> => {
     const why = cause ? { cause: cause.code, ...(cause.detail !== undefined ? { causeDetail: cause.detail } : {}) } : {};
     const result = { ok, code, ...(detail !== undefined ? { detail } : {}), ...why };
-    await d.record({ ...last, phase: "done", at: at(), result });
+    await d.record({ ...last, ...extra, phase: "done", at: at(), result });
     return { exit: ok ? 0 : 1, phase: "done", cycle, code, detail, ...why };
   };
 
-  // Pre-review L3: a deploy that changed the provisioning code mid-cycle makes the compare meaningless.
-  if (last.fingerprint !== d.fingerprint && phase !== "purge") return toPurge(failed("fingerprint-changed"));
+  // Pre-review L3: a deploy that changed the provisioning code mid-cycle makes the compare meaningless. DEVOS-254
+  // decision 6: the card phases come after the compare, so a deploy while KK's card waits does not end the cycle.
+  if (last.fingerprint !== d.fingerprint && phase !== "purge" && phase !== "card" && phase !== "cardwait") return toPurge(failed("fingerprint-changed"));
 
   switch (phase) {
     case "run1":
@@ -222,17 +323,171 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
     case "assert": {
       const r = await attempt(() => d.liveAsserts());
       if (!r.ok) return toPurge(failed("live-assert-failed", "error"));
-      return r.value.length ? toPurge(failed("live-assert-failed", r.value.join(","))) : advance();
+      if (r.value.length) return toPurge(failed("live-assert-failed", r.value.join(",")));
+      // DEVOS-254 decision 2: only a card cycle goes through `card`; any other cycle purges at once, as before.
+      if (last.viaCard) return advance();
+      await d.record({ ...last, phase: "purge", at: at() });
+      return { exit: 3, phase: "purge", cycle, code: "in_progress" };
+    }
+    case "card": {
+      // Decision 3: archive, then raise KK's purge card; a failure is purged by the probe itself.
+      if (!d.raisePurgeCard) return leaveCard(failed("card-not-wired"));
+      const r = await attempt(() => d.raisePurgeCard!(new Date(Date.parse(last.at))));
+      // Decision 11 (Codex PR239-r7/r8): no new card unless the probe's grant outlasts the wait and the purge after it.
+      if (r.ok && typeof r.value === "object" && r.value !== null && r.value.grantShort === true) return leaveCard(failed("card-grant-short"));
+      // Codex PR239-r14 (medium): a throw may come after the card was persisted (the reads that bind and track it), so
+      // the tick is retried in `card`, whose lookup then finds that card (r1), rather than leaving for a fallback purge
+      // while it is pending. Only after `PROBE_PHASE_MAX_MS` in `card` (the bound every phase has) is it purged.
+      if (!r.ok) return timedOut() ? leaveCard(failed("card-raise-failed", "timeout")) : { exit: 3, phase, cycle, code: "in_progress", detail: "card-raise-retry" };
+      if (typeof r.value !== "string" || r.value === "") return leaveCard(failed("card-raise-failed"));
+      await d.record({ ...last, phase: "cardwait", at: at(), cardId: r.value });
+      return { exit: 3, phase: "cardwait", cycle, code: "in_progress" };
+    }
+    case "cardwait": {
+      // Decisions 4 and 5: wait for KK's answer and the sweep's purge; every other end is purged by the probe.
+      if (!d.cardOutcome || !last.cardId) return leaveCard(failed("card-not-wired"));
+      const cardId = last.cardId;
+      // Codex PR239-r13 (medium): every tick that would keep waiting first checks that the probe grant still outlasts
+      // the next tick and the purge after it (`PROBE_CARD_PURGE_ROOM_MS`). A wait whose deadline moved (a card reused
+      // after a failed record, then an unreadable raise time) can therefore never outrun the grant the fallback purge
+      // needs; a short grant, or a check that fails, ends the wait with the probe's own purge (`card-grant-short`).
+      const wait = async (detail: string): Promise<ProbeTick> => {
+        const g = await attempt(async () => (d.cardGrantOutlasts ? (await d.cardGrantOutlasts(new Date(d.now().getTime() + PROBE_CARD_PURGE_ROOM_MS))) === true : false));
+        if (!g.ok || g.value !== true) return leaveCard(failed("card-grant-short", detail));
+        return { exit: 3, phase, cycle, code: "in_progress", detail };
+      };
+      // Codex PR239-r25 (medium): once the proof was seen and recorded, later ticks only retry the expiry; the proof
+      // is never read again, so a failing read or a short grant cannot lose it.
+      if (last.cardProven) {
+        const post = await attempt(async () => { if (d.expirePurgeCards) await d.expirePurgeCards(); });
+        // Codex PR239-r26 (medium): measured from the wait's recorded start, never from a later record time alone.
+        const from = typeof last.cardWaitFrom === "string" ? Date.parse(last.cardWaitFrom) : NaN;
+        const lateProof = d.now().getTime() - (Number.isFinite(from) && from < Date.parse(last.at) ? from : Date.parse(last.at)) >= PROBE_CARD_MAX_MS;
+        if (!post.ok && !lateProof) return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
+        return finish(true, PASS_CARD);
+      }
+      const r = await attempt(() => d.cardOutcome!(cardId));
+      // Codex PR239-r12 (medium): the 8-day wait runs from the earlier of the card's raise and the tick that recorded
+      // it. A card raised by a tick that failed to record `cardwait` and reused later keeps its own deadline, so the
+      // wait never outruns the grant checked when it was raised (decision 11).
+      const raised = r.ok && typeof r.value.raisedAt === "string" ? Date.parse(r.value.raisedAt) : NaN;
+      const recorded = Date.parse(last.at);
+      const start = Number.isFinite(raised) && raised < recorded ? raised : recorded;
+      const late = d.now().getTime() - start >= PROBE_CARD_MAX_MS;
+      if (!r.ok) return late ? leaveCard(failed("card-timeout", "error")) : wait("card-unreadable");
+      const o = r.value;
+      // AT10: purged by the sweep under KK's approved card. A purge with no approved card is not that proof.
+      if (o.stage === "purged") {
+        // Codex PR239-r27 (medium): a purged probe that is not AT10's proof also expires its pending purge cards first,
+        // best effort (a failed expiry is left to the sweep's `project-not-archived` pass), so no prompt is left open.
+        const endPurged = async (code: string, detail?: string): Promise<ProbeTick> => {
+          await attempt(async () => { if (d.expirePurgeCards) await d.expirePurgeCards(); });
+          return finish(false, code, detail);
+        };
+        if (o.card !== "approved") return endPurged("card-ended", `${CARD_WORD.test(o.card) ? o.card : "unknown"}:purged`);
+        // Codex PR239-r1 (high): purged, but not provably under this card's grant, is not AT10's proof.
+        if (o.byCard !== true) return endPurged("card-unproven");
+        // Codex PR239-r23 (medium, DEVOS-254 decision 22): KK could ask again between his approval and the sweep's
+        // purge, so a pass first expires the probe's pending purge cards (decision 20's rule, on this path too). Once
+        // purged no card can follow (M2.5-b5, DEVOS-255). A failed expiry waits within the 8-day bound; past it the
+        // cycle passes and the sweep's `project-not-archived` pass expires the card.
+        if (d.expirePurgeCards) {
+          const post = await attempt(() => d.expirePurgeCards!());
+          // Codex PR239-r24: the row is already purged, so no fallback purge can follow and the grant is not checked;
+          // a plain wait keeps the proof already seen.
+          if (!post.ok && !late) {
+            // Codex PR239-r25: the proof is recorded first, so the retries never read the card again.
+            // Codex PR239-r26: with the wait's effective start, so the retries keep the original raise's deadline.
+            await d.record({ ...last, cardProven: true, cardWaitFrom: new Date(start).toISOString() });
+            return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
+          }
+        }
+        return finish(true, PASS_CARD);
+      }
+      if (o.stage === "archived" && o.card === "pending") return late ? leaveCard(failed("card-timeout")) : wait("awaiting-card");
+      if (o.stage === "archived" && o.card === "approved") {
+        const t = typeof o.decidedAt === "string" ? Date.parse(o.decidedAt) : NaN;
+        const purging = Number.isFinite(t) && d.now().getTime() - t < PROBE_PHASE_MAX_MS;
+        return purging && !late ? wait("card-approved") : leaveCard(failed("card-purge-unfinished"));
+      }
+      if (o.card === "rejected" || o.card === "expired") return leaveCard(failed(`card-${o.card}`));
+      const words = [o.card, o.stage].map((w) => (typeof w === "string" && CARD_WORD.test(w) ? w : "unknown"));
+      return leaveCard(failed("card-ended", words.join(":")));
     }
     case "purge": {
+      // Codex PR239-r15/r16: a purge that follows a card first expires the probe's pending purge cards (`expireCards`).
+      let restart: Partial<PhaseRecord> | undefined;
+      if (last.expireCards) {
+        const e = await attempt(async () => { if (!d.expirePurgeCards) throw new Error("not-wired"); await d.expirePurgeCards(); });
+        if (!e.ok) {
+          // Held on later ticks while the probe grant still outlasts the next tick and the purge after it
+          // (`PROBE_CARD_PURGE_ROOM_MS`, decision 13); then the purge goes ahead, so the resources are still removed.
+          const g = await attempt(async () => (d.cardGrantOutlasts ? (await d.cardGrantOutlasts(new Date(d.now().getTime() + PROBE_CARD_PURGE_ROOM_MS))) === true : false));
+          if (g.ok && g.value === true) return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-retry" };
+        }
+        // Codex PR239-r16 (2 medium): expired or given up, the purge starts in this same tick, while the grant that
+        // was just checked is still valid, and its `PROBE_PHASE_MAX_MS` bound runs from this tick, never from the row
+        // written before the expiry and its retries. The one row this call writes (pre-review L2) carries the restart.
+        restart = { at: at(), expireCards: false, ...(e.ok ? {} : { cardExpireGaveUp: true }) };
+      }
       const r = await attempt(() => d.purge());
       const v = r.ok ? r.value : "in_progress";
       const earlier = last.result && !last.result.ok ? last.result : undefined;
-      if (v === "in_progress" && !timedOut()) return { exit: 3, phase, cycle, code: "in_progress" };
+      if (v === "in_progress" && (restart || !timedOut())) {
+        if (restart) await d.record({ ...last, ...restart });
+        return { exit: 3, phase, cycle, code: "in_progress", ...(restart?.cardExpireGaveUp ? { detail: "card-expire-gave-up" } : {}) };
+      }
       // Pre-review L1: the earlier failure stays in the done row as `cause`.
-      if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier);
-      if (earlier) return finish(false, earlier.code, earlier.detail);
-      return finish(true, "pass");
+      if (v !== "done") return finish(false, "purge-failed", v === "in_progress" ? (r.ok ? "timeout" : "error-timeout") : v.error, earlier, restart);
+      // Codex PR239-r20 (medium, DEVOS-254 decision 20): KK's "Ask to delete now" could raise a fresh purge card after the
+      // expiry above and before the purge moved the row out of `archived`. Once purged (no new card can be asked for),
+      // a card cycle expires the probe's pending purge cards once more. A failed expiry is retried on later ticks
+      // within the phase bound (the purge itself is then a no-op `done`), unless the expiry before the purge was already
+      // given up (decision 15); past it the cycle ends as it would have, and
+      // the sweep, which is on whenever "Ask to delete now" is offered, expires the card (`project-not-archived`).
+      if (last.viaCard && d.expirePurgeCards) {
+        const post = await attempt(() => d.expirePurgeCards!());
+        const gaveUp = restart?.cardExpireGaveUp === true || last.cardExpireGaveUp === true;
+        if (!post.ok && !gaveUp && (restart || !timedOut())) {
+          if (restart) await d.record({ ...last, ...restart });
+          return { exit: 3, phase, cycle, code: "in_progress", detail: "card-expire-after-purge" };
+        }
+      }
+      // Codex PR239-r17 (medium): a card cycle whose sweep purge under KK's approved card finished after `cardwait` gave
+      // up on it (`card-purge-unfinished`, then the sweep completed before this tick) is AT10's proof after all. The
+      // tracked card is read once more; only a purged row whose every allowed purge decision ran under an approved
+      // card's grant (`byCard`, r1) passes. A purge by the probe itself is under its own grant, so it never does.
+      // Codex PR239-r28 (decision 25): a `card` phase that timed out after persisting its card reaches here without a
+      // `cardId`; the current archive's card is looked up instead, so a sweep purge under KK's approved card still counts.
+      // Codex PR239-r30 (decision 27): only a cycle that reached the card phases is checked for that proof.
+      const proofOpen = last.viaCard === true && last.cardReached === true;
+      let id = last.cardId;
+      // Codex PR239-r29 (decision 26): a proof read that throws is retried on later ticks (the purge itself is then a
+      // no-op `done`), so a transient failure never loses AT10's proof; past the retry window (decision 28) the earlier
+      // result stands.
+      let readFailed = false;
+      if (proofOpen && !id && d.archiveCardId) {
+        const f = await attempt(() => d.archiveCardId!());
+        if (!f.ok) readFailed = true;
+        else if (typeof f.value === "string" && f.value !== "") id = f.value;
+      }
+      if (proofOpen && id && d.cardOutcome) {
+        const cardId = id;
+        const o = await attempt(() => d.cardOutcome!(cardId));
+        if (!o.ok) readFailed = true;
+        else if (o.value.stage === "purged" && o.value.card === "approved" && o.value.byCard === true) return finish(true, PASS_CARD, undefined, undefined, restart);
+      }
+      // Codex PR239-r30 (decision 28): the retries are bounded by their own window, from the first failed read, never by
+      // the purge's timer, so a check that comes long after the purge still gets them.
+      if (readFailed) {
+        const from = last.proofRetryFrom ?? at();
+        if (d.now().getTime() - Date.parse(from) < PROBE_PHASE_MAX_MS) {
+          if (restart || last.proofRetryFrom === undefined) await d.record({ ...last, ...restart, proofRetryFrom: from });
+          return { exit: 3, phase, cycle, code: "in_progress", detail: "card-proof-retry" };
+        }
+      }
+      if (earlier) return finish(false, earlier.code, earlier.detail, undefined, restart);
+      return finish(true, "pass", undefined, undefined, restart);
     }
     default:
       return { exit: 1, phase, cycle, code: "unknown-phase" };

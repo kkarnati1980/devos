@@ -1,6 +1,7 @@
 // DEVOS-234 (M2.4-d3c-1): the probe's provisioner, wired exactly as runtime.ts wires the sweep's (same modules, vault,
 // M1.7 policy engine and S4 afterStack hook), so the probe exercises the production path. Never `allowAll`.
-import { PolicyEngine, PrismaPolicyStore, grantProblem } from "@devos/policy";
+import { PolicyEngine, PrismaPolicyStore, evaluateRules, grantProblem } from "@devos/policy";
+import { policyUsesProbeGrant } from "./provision-probe-purge.js";
 import { PrismaVaultStore, Vault, parseVaultKey, parseVaultKeyVersion } from "./vault.js";
 import { PrismaIsolationStore } from "./isolation-store.js";
 import { buildProvisioner, PrismaProvisioningRows, provisionConfig, vaultToken, type Provisioner, type ProvisionModule, type ProvisionWiring } from "./provision-runtime.js";
@@ -16,6 +17,8 @@ export interface PurgeKit {
   store: TeardownStoreLike;
   policy: { decide(r: unknown): Promise<{ enforcedOutcome: string }> };
   grantProblem: typeof grantProblem;
+  /** Codex PR239-r19 (high): read-only, the active policy would use the probe grant for both teardown actions. */
+  policyGated: (projectId: string) => Promise<boolean>;
 }
 
 export async function stepWiring(db: any, databaseUrl: string, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<{ provisioner: Provisioner; purge: PurgeKit; vault: Vault } | { off: string }> {
@@ -31,7 +34,8 @@ export async function stepWiring(db: any, databaseUrl: string, env: NodeJS.Proce
   }
   const vault = vaultKey ? new Vault(new PrismaVaultStore(db, timeoutMs), vaultKey, vaultKeyVersion) : null;
   // The probe acts as the system provisioner; it never needs a KK session.
-  const engine = new PolicyEngine({ store: new PrismaPolicyStore(db), hmacKey: Buffer.from(hmac, "utf8"), verifyKkSession: () => false });
+  const policyStore = new PrismaPolicyStore(db);
+  const engine = new PolicyEngine({ store: policyStore, hmacKey: Buffer.from(hmac, "utf8"), verifyKkSession: () => false });
   let loaded: {
     mod: ProvisionModule;
     apply: ProvisionWiring["apply"];
@@ -77,6 +81,7 @@ export async function stepWiring(db: any, databaseUrl: string, env: NodeJS.Proce
     store: new loaded.teardown.PrismaTeardownStore(db, { databaseUrl, dbTimeoutMs: timeoutMs, lockWaitMs: 30_000 }),
     policy: engine as unknown as PurgeKit["policy"],
     grantProblem,
+    policyGated: (projectId) => policyUsesProbeGrant(() => policyStore.loadPolicy(), evaluateRules, projectId, new Date()),
   };
   // DEVOS-110: the vault is also what the grant card's notice reads its delivery secrets from (as runtime.ts does).
   return { provisioner: pv, purge, vault };
