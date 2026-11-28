@@ -226,6 +226,9 @@ test("M2.5-b5b decision 11 (Codex PR244-r1): a new Archive retires every earlier
   const ev = await db.auditEvent.findFirst({ where: { projectId: s.p.id, action: "teardown.archive_retired_cards" } });
   assert.deepEqual(ev.details, { grantsRevoked: 1, cardsExpired: 1, retired: [approved.id, pending.id, rejectedOld.id].sort() }, "every earlier purge card, any status, by id (decisions 14-15)");
   assert.equal(String((await db.approval.findUnique({ where: { id: rejectedOld.id } })).status), "rejected", "a retired rejection keeps its status");
+  // b5b decision 20: the listing row is dated on the database clock, at this Archive's archived_at.
+  const archivedRow = await db.project.findUnique({ where: { id: s.p.id }, select: { archivedAt: true } });
+  assert.equal(ev.occurredAt.getTime(), archivedRow.archivedAt.getTime(), "occurred_at is the Archive's database time");
   // Decision 15: a later Archive lists only cards no earlier list holds.
   const fresh = await db.approval.create({ data: { projectId: s.p.id, gate: "purge", action: "teardown.purge", target, reason: "this archive's", status: "rejected", decidedAt: new Date(), decidedBy: "kk" } });
   await s.store.markArchived(s.p.id, new Date(), new Date(Date.now() + 30 * 86_400_000));

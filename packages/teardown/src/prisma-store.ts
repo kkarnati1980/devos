@@ -99,6 +99,9 @@ export class PrismaTeardownStore extends PrismaStore implements TeardownStore {
       if (revoked > 0 || expired > 0 || retired.length > 0) {
         await tx.auditEvent.create({ data: {
           actor: "system", projectId, action: "teardown.archive_retired_cards",
+          // b5b decision 20 (pre-review r6): stamped with this Archive's database-clock time. The column's default is
+          // filled by the Prisma client (the app clock), and the probe's cycle lookup compares it with a database time.
+          occurredAt: row.archivedAt,
           summary: "Earlier purge cards retired by a new Archive",
           details: { grantsRevoked: revoked, cardsExpired: expired, retired },
         } });

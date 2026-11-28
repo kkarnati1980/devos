@@ -341,7 +341,8 @@ export async function probeStep(d: ProbeDeps): Promise<ProbeTick> {
       // DEVOS-254 decision 2: only a card cycle goes through `card`; any other cycle purges at once, as before.
       if (last.viaCard) {
         // b5b decision 13: the cycle start on the database clock is read once, here, and stored with the phase record.
-        if (!d.dbNow) return advance();
+        // Pre-review r6 low 4: a wiring without the clock read is not wired for a card cycle.
+        if (!d.dbNow) return toPurge(failed("card-not-wired"));
         const t = await attempt(() => d.dbNow!());
         if (!t.ok || !(t.value instanceof Date) || !Number.isFinite(t.value.getTime())) {
           return timedOut() ? toPurge(failed("card-clock-failed")) : { exit: 3, phase, cycle, code: "in_progress", detail: "card-clock-retry" };

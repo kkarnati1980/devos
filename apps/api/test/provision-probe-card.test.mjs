@@ -1222,9 +1222,9 @@ test("M2.5-b5b decision 13 (Codex PR244-r2): the card cycle's start is read once
 test("M2.5-b5b decision 19 (Codex PR244-r5; supersedes decisions 9 and 17): a card cycle recorded before the upgrade (no cardFromDb) ends with the probe's own purge, never a raise or a mixed-clock wait", async () => {
   // In `card`: no raise, straight to the purge that expires pending purge cards first.
   const seen = [];
-  const d = fake({ dbNow: undefined, raisePurgeCard: async (from, fromDb) => { seen.push(fromDb); d.calls.raise++; return "card-1"; } });
+  const d = fake({ raisePurgeCard: async (from, fromDb) => { seen.push(fromDb); d.calls.raise++; return "card-1"; } });
   let r = await until(d, "card");
-  assert.equal(d.log.at(-1).cardFromDb, undefined);
+  delete d.log.at(-1).cardFromDb; // as written before the upgrade
   r = await probeStep(d);
   assert.equal(r.phase, "purge");
   assert.deepEqual(seen, [], "no card is raised from an app-clock start");
@@ -1242,4 +1242,9 @@ test("M2.5-b5b decision 19 (Codex PR244-r5; supersedes decisions 9 and 17): a ca
   const f = fake();
   await until(f, "cardwait");
   assert.equal(f.log.at(-1).cardFromDb, "2026-11-25T09:00:00.000Z");
+  // Pre-review r6 low 4: a wiring without the clock read is not wired for a card cycle.
+  const g = fake({ dbNow: undefined });
+  r = await until(g, "purge");
+  assert.equal(g.log.at(-1).result.code, "card-not-wired");
+  assert.equal(g.calls.raise, 0);
 });

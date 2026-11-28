@@ -396,7 +396,7 @@ export async function probeExistingCard(db: any, projectId: string, since: Date,
  * to record `cardwait`, and KK then restored and re-archived the row, his Archive retired A, but A is still this
  * cycle's one card and is tracked as it is (it reads as missing in `cardwait`, so the cycle ends `card-ended`), never
  * replaced by a second card. Only a card retired by an Archive that happened before the cycle started (`occurred_at`,
- * the database clock, like `since`) is excluded: that card belongs to an earlier cycle whatever its `created_at` says.
+ * the database clock, like `since`: Archive stamps it with its `archived_at`, decision 20) is excluded: that card belongs to an earlier cycle whatever its `created_at` says.
  */
 export async function probeCycleCard(db: any, projectId: string, since: Date, timeoutMs: number): Promise<string | null> {
   const rows: { id: string }[] = await db.$transaction((tx: any) => tx.$queryRawUnsafe(
