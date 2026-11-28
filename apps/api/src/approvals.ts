@@ -626,6 +626,15 @@ export async function bindCycleCardIn(tx: any, projectId: string, cycle: number,
   return cardId;
 }
 
+/**
+ * Decision 21 (pre-review low 1): only a card raised in the row's current archive is bound, the same test the probe's
+ * staleness check applies after the raise, so a card that check rejects (reused from an earlier archive) is never
+ * tracked by a retry.
+ */
+export function boundable(createdAt: unknown, archivedAt: Date | null): boolean {
+  return createdAt instanceof Date && archivedAt instanceof Date && createdAt.getTime() >= archivedAt.getTime();
+}
+
 export function validCycle(n: unknown): n is number {
   return typeof n === "number" && Number.isSafeInteger(n) && n >= 1;
 }
@@ -705,7 +714,8 @@ export class MemoryApprovalStore implements ApprovalStore {
   raiseGuarded(input: CardInput, audit: AuditEntry, guard: RaiseGuard, now: Date) {
     return this.serial(() => {
       const r = this.raiseGuardedNow(input, audit, guard, now);
-      if (guard.bindCycle !== undefined && !("refused" in r)) {
+      const row = this.guardRow ? this.guardRow(guard.projectId) : null;
+      if (guard.bindCycle !== undefined && !("refused" in r) && boundable(r.card.createdAt, row?.archivedAt ?? null)) {
         const k = `${guard.projectId}:${guard.bindCycle}`;
         if (!this.cycleCards.has(k)) this.cycleCards.set(k, r.card.id);
       }
@@ -1015,14 +1025,14 @@ export class PrismaApprovalStore implements ApprovalStore {
         });
         if (had) {
           // Decision 21: the reused card is bound to the cycle in this same transaction.
-          if (guard.bindCycle !== undefined) await bindCycleCardIn(tx, guard.projectId, guard.bindCycle, had.id);
+          if (guard.bindCycle !== undefined && boundable(had.createdAt, row.archivedAt)) await bindCycleCardIn(tx, guard.projectId, guard.bindCycle, had.id);
           return { card: toCard(had), created: false };
         }
       }
       // Codex PR242-r5 (decision 10): dated by the app clock with no floor, as `raise` dates every card on main.
       const r = await this.raiseIn(tx, input, [], a, now);
       // Decision 21: the raised (or pending-twin) card is bound to the cycle in the transaction that commits it.
-      if (guard.bindCycle !== undefined) await bindCycleCardIn(tx, guard.projectId, guard.bindCycle, r.card.id);
+      if (guard.bindCycle !== undefined && boundable(r.card.createdAt, row.archivedAt)) await bindCycleCardIn(tx, guard.projectId, guard.bindCycle, r.card.id);
       return r;
     });
   }

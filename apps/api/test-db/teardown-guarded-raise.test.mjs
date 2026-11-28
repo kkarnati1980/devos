@@ -184,3 +184,27 @@ test("M2.5-b5e decision 21 (Codex PR244-r6): a probe cycle's card is bound by id
   await assert.rejects(approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt: later, due: false, bindCycle: 0 }), /invalid-input/);
   await assert.rejects(bindProbeCycleCard(db, p.id, 1.5, a.id, 5000), /probe-card-no-cycle/);
 });
+
+test("M2.5-b5e decision 21: a reuse is bound in the raise's transaction, only for a card of the current archive; a foreign id is never bound", async () => {
+  const { bindProbeCycleCard, probeCycleCard } = await import("../dist/provision-probe-purge.js");
+  const archivedAt = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  // An early ask in this archive (dated by the 2001 app clock, so before archived_at): a reuse of it is not bound.
+  const now = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => Date.now() });
+  const old = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false });
+  const reused = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 3, reuseSince: new Date(0) });
+  assert.equal(reused.id, old.id, "decision 34 reuse");
+  assert.equal(await probeCycleCard(db, p.id, 3, 5000), null, "a card from before the current archive is not bound");
+  // A card of the current archive found by the reuse window is bound in the same transaction.
+  await db.approval.update({ where: { id: old.id }, data: { status: "rejected" } });
+  const fresh = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false });
+  const r2 = await now.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 4, reuseSince: new Date(archivedAt.getTime()) });
+  assert.equal(r2.id, fresh.id);
+  assert.equal(await probeCycleCard(db, p.id, 4, 5000), fresh.id);
+  // An id that is not this project's purge card is refused, and nothing is written.
+  const other = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  const foreign = await now.raiseGuardedCard(purgeCard(other, {}), { projectId: other.id, archivedAt, due: false });
+  await assert.rejects(bindProbeCycleCard(db, p.id, 5, foreign.id, 5000), /probe-card-bind-invalid/);
+  await assert.rejects(bindProbeCycleCard(db, p.id, 5, "11111111-2222-4333-8444-555555555555", 5000), /probe-card-bind-invalid/);
+  assert.equal(await probeCycleCard(db, p.id, 5, 5000), null);
+});

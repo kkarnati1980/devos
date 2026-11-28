@@ -1028,7 +1028,7 @@ test("Decision 33 (Codex PR239-r35), b5e decision 21: a retried card tick after 
   };
   assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
   assert.deepEqual([calls.archive, calls.raise, calls.existing, calls.cycleReads], [0, 0, 0, 1], "the binding is read first; no Archive, no raise, no time-window read");
-  // The same holds when the row is still archived, purged, or archived again by KK (his Archive retired card-1).
+  // The same holds when the row is still archived, purged, or archived again by KK.
   for (const s of ["archived", "purged"]) {
     stage = s; archivedAt = NEW; calls.raise = 0; calls.archive = 0;
     assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
@@ -1069,14 +1069,15 @@ test("b5e decision 21 (Codex PR244-r6): a card adopted from before the cycle sta
   // Tick 1 adopts the early card through the archive lookup; the binding commits, then recording `cardwait` fails.
   assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "early");
   assert.deepEqual([bound, binds], ["early", ["early"]]);
-  // KK restores and archives again: his Archive retires `early` (the archive lookup no longer sees it).
+  // KK restores and archives again: `early` predates the new archive, so the archive lookup no longer sees it.
   archivedAt = NEW;
   assert.equal(await d.existing(CYCLE), null, "the archive-bound and time-window reads both miss the adopted card");
   // The retried tick tracks the bound card: no Archive, no second card.
   assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "early");
   assert.deepEqual([raised, archives], [0, 0]);
   // Had the binding not committed, the cycle never tracked `early`: it is not this cycle's card, and the new archive
-  // gets one card (the retired one's grants were revoked and its pending state expired by the Archive).
+  // gets one card (the raise first expires pending cards from before the new archive, and the sweep acts only on a
+  // card raised in the current archive).
   bound = null; binds.length = 0;
   assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "second");
   assert.deepEqual([raised, bound], [1, "second"]);

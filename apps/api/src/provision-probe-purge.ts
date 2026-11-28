@@ -401,6 +401,12 @@ export async function bindProbeCycleCard(db: any, projectId: string, cycle: numb
   return db.$transaction(async (tx: any) => {
     await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
     await tx.$queryRawUnsafe(PROJECT_LOCK_SQL, projectId);
+    const had = await readCycleCardIn(tx, projectId, cycle);
+    if (had) return had;
+    // Pre-review low 4: only this project's purge card on its own target is ever bound.
+    const ok: { id: string }[] = await tx.$queryRaw`SELECT a.id::text AS id FROM approval a WHERE a.id::text = ${cardId}
+      AND a.project_id = ${projectId}::uuid AND a.action = 'teardown.purge' AND a.target = ${`project:${projectId}`}`;
+    if (ok.length !== 1) throw new Error("probe-card-bind-invalid");
     return bindCycleCardIn(tx, projectId, cycle, cardId);
   }, { timeout: timeoutMs, maxWait: timeoutMs });
 }
