@@ -29,7 +29,7 @@ function fake(over = {}) {
     liveAsserts: async () => [],
     purge: async () => { calls.purge++; return "done"; },
     cardCycle: async () => !state.proven,
-    raisePurgeCard: async () => { calls.raise++; return "card-1"; },
+    raisePurgeCard: async (_from, cycle) => { calls.raise++; calls.cycles = [...(calls.cycles ?? []), cycle]; return "card-1"; },
     // Codex PR239-r7: the probe grant's expiry; by default it outlasts any card wait.
     grantUntil: Infinity,
     expirePurgeCards: async () => { calls.expire = (calls.expire ?? 0) + 1; },
@@ -57,6 +57,8 @@ test("AT10: a card cycle raises KK's purge card after the asserts, waits, and pa
   assert.equal(d.log[0].viaCard, true);
   assert.equal(d.log.at(-1).cardId, "card-1");
   assert.equal(d.calls.raise, 1);
+  // M2.5-b5e decision 21: the raise is told which cycle the card is bound to.
+  assert.deepEqual(d.calls.cycles, [d.log.at(-1).cycle]);
   // Pending: every tick waits, no purge, no second card.
   for (let i = 0; i < 3; i++) {
     d.tick(DAY);
@@ -1004,49 +1006,81 @@ test("Codex PR239-r30 (decision 28): a proof read that throws on a check long af
   assert.equal((await probeStep(e)).code, "card-raise-failed");
 });
 
-test("Decision 33 (Codex PR239-r35): a retried card tick after KK's Restore reuses this cycle's card, never re-archives or raises a second", async () => {
-  const CYCLE = new Date("2026-11-28T10:00:00Z");
+test("Decision 33 (Codex PR239-r35), b5e decision 21: a retried card tick after KK's Restore reuses this cycle's bound card, never re-archives or raises a second", async () => {
   const OLD = new Date("2026-11-28T10:00:01Z"); // the archive the first tick made
-  const CARD = new Date("2026-11-28T10:00:02Z"); // the card it raised before failing to record `cardwait`
+  const CYCLE = new Date("2026-11-28T10:00:00Z");
   const NEW = new Date("2026-11-28T10:05:00Z"); // what a re-archive would stamp
   // KK restored the row in between: it reads live, with no archived_at.
   let stage = "live"; let archivedAt = null;
-  const calls = { archive: 0, raise: 0, lookups: [] };
-  const cards = [{ id: "card-1", createdAt: CARD }];
+  const calls = { archive: 0, raise: 0, cycleReads: 0, existing: 0 };
+  let bound = "card-1"; // the first tick's guarded raise bound card-1 in its own transaction, then failed to record `cardwait`
   const d = {
     stage: async () => stage,
     archivedAt: async () => archivedAt,
-    existing: async (since) => { calls.lookups.push(since); return cards.find((c) => c.createdAt >= since)?.id ?? null; },
+    existing: async () => { calls.existing++; return null; },
+    cycleCard: async () => { calls.cycleReads++; return bound; },
+    bind: async (id) => { bound ??= id; return bound; },
     archive: async () => { calls.archive++; stage = "archived"; archivedAt = NEW; },
     counts: async () => ({ github: 1 }),
     outlasts: async () => true,
     expireStale: async () => {},
-    raise: async () => { calls.raise++; const c = { id: "card-2", createdAt: new Date(NEW.getTime() + 1) }; cards.push(c); return c; },
+    raise: async () => { calls.raise++; const c = { id: "card-2", createdAt: new Date(NEW.getTime() + 1) }; bound ??= c.id; return c; },
   };
   assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
-  assert.equal(calls.archive, 0, "KK's Restore is not undone");
-  assert.equal(calls.raise, 0, "no second card in the cycle");
-  assert.deepEqual(calls.lookups, [CYCLE], "the first read is the cycle's card, before any Archive");
-  // Without the cycle start (the old order) the same state re-archived and raised a second card: the r35 defect.
-  assert.equal(await raiseProbePurgeCard("p-1", { ...d }), "card-2");
-  assert.equal(calls.archive, 1);
-  // The same reuse holds when the row is still archived, or when KK archived it again himself.
+  assert.deepEqual([calls.archive, calls.raise, calls.existing, calls.cycleReads], [0, 0, 0, 1], "the binding is read first; no Archive, no raise, no time-window read");
+  // The same holds when the row is still archived, purged, or archived again by KK (his Archive retired card-1).
   for (const s of ["archived", "purged"]) {
     stage = s; archivedAt = NEW; calls.raise = 0; calls.archive = 0;
-    const one = [{ id: "card-1", createdAt: CARD }];
-    assert.equal(await raiseProbePurgeCard("p-1", { ...d, existing: async (since) => one.find((c) => c.createdAt >= since)?.id ?? null }, CYCLE), "card-1");
+    assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
     assert.deepEqual([calls.archive, calls.raise], [0, 0]);
   }
-  // No card yet in this cycle: the normal Archive-then-raise path.
-  stage = "live"; archivedAt = null; calls.raise = 0; calls.archive = 0;
-  assert.equal(await raiseProbePurgeCard("p-1", { ...d, existing: async () => null, raise: async () => ({ id: "card-3", createdAt: new Date(NEW.getTime() + 1) }) }, CYCLE), "card-3");
-  assert.equal(calls.archive, 1);
+  void OLD;
+  // No card bound yet in this cycle: the normal Archive-then-raise path, and the raised card is the cycle's.
+  stage = "live"; archivedAt = null; calls.raise = 0; calls.archive = 0; bound = null;
+  assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-2");
+  assert.deepEqual([calls.archive, calls.raise, bound], [1, 1, "card-2"]);
   // An unreadable cycle start fails the tick before any read or write.
-  calls.lookups.length = 0; calls.archive = 0;
+  calls.cycleReads = 0; calls.archive = 0;
   await assert.rejects(raiseProbePurgeCard("p-1", d, new Date(NaN)), /probe-card-no-cycle-start/);
-  assert.deepEqual([calls.lookups.length, calls.archive], [0, 0]);
+  assert.deepEqual([calls.cycleReads, calls.archive], [0, 0]);
+  // A card-cycle wiring without the binding reads is not wired.
+  await assert.rejects(raiseProbePurgeCard("p-1", { ...d, cycleCard: undefined }, CYCLE), /probe-card-not-wired/);
+  await assert.rejects(raiseProbePurgeCard("p-1", { ...d, bind: undefined }, CYCLE), /probe-card-not-wired/);
 });
 
+test("b5e decision 21 (Codex PR244-r6): a card adopted from before the cycle start is bound before it is tracked, so KK's restore and re-archive never yield a second card", async () => {
+  const BEFORE = new Date("2026-11-28T09:59:00Z"); // an early ask KK made in this archive, before the cycle entered `card`
+  const AT = new Date("2026-11-28T09:58:00Z");
+  const CYCLE = new Date("2026-11-28T10:00:00Z");
+  const NEW = new Date("2026-11-28T10:05:00Z");
+  let stage = "archived"; let archivedAt = AT;
+  let bound = null; const binds = []; let raised = 0; let archives = 0;
+  const cards = [{ id: "early", createdAt: BEFORE }];
+  const d = {
+    stage: async () => stage, archivedAt: async () => archivedAt,
+    // archive-bound lookup; an Archive retires earlier cards, so it never returns one from before the row's archive
+    existing: async (since) => cards.find((c) => c.createdAt >= since && c.createdAt >= archivedAt)?.id ?? null,
+    cycleCard: async () => bound,
+    bind: async (id) => { binds.push(id); bound ??= id; return bound; },
+    archive: async () => { archives++; stage = "archived"; archivedAt = NEW; },
+    counts: async () => ({}), outlasts: async () => true, expireStale: async () => {},
+    raise: async () => { raised++; const c = { id: "second", createdAt: new Date(NEW.getTime() + 1) }; cards.push(c); return c; },
+  };
+  // Tick 1 adopts the early card through the archive lookup; the binding commits, then recording `cardwait` fails.
+  assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "early");
+  assert.deepEqual([bound, binds], ["early", ["early"]]);
+  // KK restores and archives again: his Archive retires `early` (the archive lookup no longer sees it).
+  archivedAt = NEW;
+  assert.equal(await d.existing(CYCLE), null, "the archive-bound and time-window reads both miss the adopted card");
+  // The retried tick tracks the bound card: no Archive, no second card.
+  assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "early");
+  assert.deepEqual([raised, archives], [0, 0]);
+  // Had the binding not committed, the cycle never tracked `early`: it is not this cycle's card, and the new archive
+  // gets one card (the retired one's grants were revoked and its pending state expired by the Archive).
+  bound = null; binds.length = 0;
+  assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "second");
+  assert.deepEqual([raised, bound], [1, "second"]);
+});
 test("Decision 33: the card phase passes the time it entered `card` to every raise, retried ticks included", async () => {
   const d = fake();
   const seen = [];
@@ -1099,6 +1133,7 @@ test("Decision 34: raiseProbePurgeCard passes the cycle start (or, without one, 
     stage: async () => "archived", archivedAt: async () => AT, existing: async () => null, archive: async () => {},
     counts: async () => ({}), outlasts: async () => true, expireStale: async () => {},
     raise: async (c, archivedAt, reuseSince) => { seen.push([archivedAt, reuseSince]); return { id: "card-1", createdAt: new Date(AT.getTime() + 1) }; },
+    cycleCard: async () => null, bind: async (id) => id,
   };
   assert.equal(await raiseProbePurgeCard("p-1", d, CYCLE), "card-1");
   assert.equal(await raiseProbePurgeCard("p-1", d), "card-1");

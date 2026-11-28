@@ -1,6 +1,7 @@
 // DEVOS-234 (M2.4-d3c-2a, docs/modules/M2.4.md "M2.4-d3c-2 decisions"): the AT13 probe's purge through M2.5, as any
 // project would be purged: Archive, then Purge, on the production ops, scanners and preflight list, under the M1.7
 // policy with a KK grant (never `allowAll`, never a delete by name). Output is fixed codes only.
+import { PROJECT_LOCK_SQL, bindCycleCardIn, readCycleCardIn, validCycle } from "./approvals.js";
 import { PROBE_SLUG, type CardOutcome, type PurgeOutcome } from "./provision-probe.js";
 import { purgeCard } from "./teardown-sweep.js";
 import { PROVISIONER_IDENTITY } from "./provision-runtime.js";
@@ -381,6 +382,29 @@ export async function probeExistingCard(db: any, projectId: string, since: Date,
   return c && typeof c.id === "string" && c.id !== "" ? c.id : null;
 }
 
+/**
+ * M2.5-b5e decision 21 (Codex PR244-r6): the purge card bound to AT10 probe cycle `cycle`, by id (its
+ * `provision.probe_cycle_card` audit row), or null. No time window: a card adopted from before the cycle started, or
+ * one a later Archive retired, is still found once bound.
+ */
+export async function probeCycleCard(db: any, projectId: string, cycle: number, timeoutMs: number): Promise<string | null> {
+  if (!validCycle(cycle)) throw new Error("probe-card-no-cycle");
+  return db.$transaction((tx: any) => readCycleCardIn(tx, projectId, cycle), { timeout: timeoutMs, maxWait: timeoutMs });
+}
+
+/**
+ * Decision 21: bind an adopted card to the cycle under the project's lifecycle lock (the lock the guarded raise binds
+ * under), unless the cycle already has one; returns the cycle's card. The binding commits before the id is tracked.
+ */
+export async function bindProbeCycleCard(db: any, projectId: string, cycle: number, cardId: string, timeoutMs: number): Promise<string> {
+  if (!validCycle(cycle)) throw new Error("probe-card-no-cycle");
+  return db.$transaction(async (tx: any) => {
+    await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true) AS statement_timeout`;
+    await tx.$queryRawUnsafe(PROJECT_LOCK_SQL, projectId);
+    return bindCycleCardIn(tx, projectId, cycle, cardId);
+  }, { timeout: timeoutMs, maxWait: timeoutMs });
+}
+
 /** Codex PR239-r15: the fixed reason the probe gives when it expires its own purge cards. */
 export const PROBE_CARD_EXPIRE_REASON = "AT13 probe: purged by the probe itself, or superseded by a later archive (DEVOS-254)";
 
@@ -463,6 +487,13 @@ export interface ProbePurgeCardDeps {
   archivedAt(): Promise<Date | null>;
   /** The id of the oldest `teardown.purge` card of this project raised at or after `since`, any status, or null. */
   existing(since: Date): Promise<string | null>;
+  /**
+   * M2.5-b5e decision 21: the card already bound to this cycle (`probeCycleCard`), or null. Required on the card-cycle
+   * path (`cycleFrom` given); it replaces decision 33's time-window lookup.
+   */
+  cycleCard?(): Promise<string | null>;
+  /** Decision 21: bind an adopted card to this cycle (`bindProbeCycleCard`); returns the cycle's card. */
+  bind?(cardId: string): Promise<string>;
   /** Archive under the probe's KK grant (`teardown.archive` only); called only when the row is not archived yet. */
   archive(): Promise<void>;
   /** The per-provider counts of the probe's active resources (the card's "what will be deleted"). */
@@ -502,7 +533,11 @@ export async function raiseProbePurgeCard(projectId: string, d: ProbePurgeCardDe
   // no raise. `cardwait` then reads a Restored row as `card-ended` (decision 4's table), M2.5-b4's Restore handling.
   if (cycleFrom !== undefined) {
     if (!(cycleFrom instanceof Date) || !Number.isFinite(cycleFrom.getTime())) throw new Error("probe-card-no-cycle-start");
-    const prior = await d.existing(cycleFrom);
+    // M2.5-b5e decision 21 (Codex PR244-r6): the cycle's card is found by its binding, by id, not by a time window:
+    // a card adopted from before the cycle started, then retired by KK's Restore and re-archive, is still this
+    // cycle's one card, and a card the cycle never bound is never taken for it.
+    if (!d.cycleCard || !d.bind) throw new Error("probe-card-not-wired");
+    const prior = await d.cycleCard();
     if (prior) return prior;
   }
   const stage = await d.stage();
@@ -521,7 +556,8 @@ async function raiseChecked(projectId: string, d: ProbePurgeCardDeps, cycleFrom?
   const since = await d.archivedAt();
   if ((now === "archived" || now === "purged") && since instanceof Date) {
     const had = await d.existing(since);
-    if (had) return had;
+    // Decision 21: an adopted card is bound to the cycle (committed) before it is tracked, so a retry finds it by id.
+    if (had) return cycleFrom !== undefined && d.bind ? d.bind(had) : had;
   }
   if (now === "purged") throw new Error("probe-card-already-purged");
   if (now !== "archived") throw new Error("probe-card-not-archived");
@@ -551,7 +587,11 @@ async function raiseChecked(projectId: string, d: ProbePurgeCardDeps, cycleFrom?
   // never left pending behind a fallback purge (r13 replaces r12's `probe-card-archive-changed`).
   // Codex PR239-r2: another purge card for this archive raised between the lookup and the raise (and approved, so
   // the pending dedupe missed it) is the one the sweep acts on first; track the oldest.
-  return (await d.existing(archived)) ?? card.id;
+  // Decision 21: the guarded raise bound its card to the cycle in its own transaction; under the lock it returned the
+  // oldest card since `reuseSince` (at or before this archive), so this is the same card, and `bind` returns the
+  // cycle's card either way.
+  const oldest = (await d.existing(archived)) ?? card.id;
+  return cycleFrom !== undefined && d.bind ? d.bind(oldest) : oldest;
 }
 
 /**

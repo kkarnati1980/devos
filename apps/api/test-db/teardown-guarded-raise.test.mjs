@@ -156,3 +156,31 @@ test("DEVOS-254 decision 34: with reuseSince, an approved card raised in the win
   assert.notEqual(fresh.id, asked.id);
   assert.equal((await cardsOf(p.id)).length, 2);
 });
+
+test("M2.5-b5e decision 21 (Codex PR244-r6): a probe cycle's card is bound by id in the raise's transaction, and kept across a restore and re-archive", async () => {
+  const { bindProbeCycleCard, probeCycleCard } = await import("../dist/provision-probe-purge.js");
+  const archivedAt = new Date(Date.now() - 2 * DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + 28 * DAY) });
+  assert.equal(await probeCycleCard(db, p.id, 7, 5000), null);
+  const a = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false, bindCycle: 7 });
+  assert.equal(typeof a.id, "string");
+  assert.equal(await probeCycleCard(db, p.id, 7, 5000), a.id, "bound in the raise's own transaction");
+  assert.equal(await probeCycleCard(db, p.id, 8, 5000), null, "another cycle has no card");
+  // KK restores and archives again; his raw re-archive moves archived_at, so a plain guarded raise is refused.
+  const later = new Date(archivedAt.getTime() + 60_000);
+  await db.project.update({ where: { id: p.id }, data: { archivedAt: later } });
+  assert.deepEqual(await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt, due: false }), { refused: "archive-changed" });
+  // The cycle's raise returns its bound card under the lock whatever the archive now is: never a second card.
+  const again = await approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt: later, due: false, bindCycle: 7 });
+  assert.equal(again.id, a.id);
+  assert.equal((await cardsOf(p.id)).length, 1);
+  // An adopted card is bound under the lifecycle lock; the first binding wins.
+  assert.equal(await bindProbeCycleCard(db, p.id, 9, a.id, 5000), a.id);
+  assert.equal(await bindProbeCycleCard(db, p.id, 9, "11111111-2222-4333-8444-555555555555", 5000), a.id);
+  assert.equal(await bindProbeCycleCard(db, p.id, 7, "11111111-2222-4333-8444-555555555555", 5000), a.id);
+  const rows = await db.auditEvent.findMany({ where: { projectId: p.id, action: "provision.probe_cycle_card" } });
+  assert.equal(rows.length, 2, "one binding row per cycle");
+  // A bad cycle number is refused before any write.
+  await assert.rejects(approvals.raiseGuardedCard(purgeCard(p, {}), { projectId: p.id, archivedAt: later, due: false, bindCycle: 0 }), /invalid-input/);
+  await assert.rejects(bindProbeCycleCard(db, p.id, 1.5, a.id, 5000), /probe-card-no-cycle/);
+});
