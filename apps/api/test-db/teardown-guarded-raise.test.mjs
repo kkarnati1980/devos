@@ -27,11 +27,16 @@ const cardsOf = (projectId) => db.approval.findMany({ where: { projectId, action
 
 test("an archived, due row gets one card, dated by the app clock but never before its archive", async () => {
   const archivedAt = new Date(Date.now() - 31 * DAY);
-  const p = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() - DAY) });
-  // The app clock is pinned to 2001, behind the archive: the card is floored at archived_at (Codex PR242-r2).
+  const purgeAfter = new Date(Date.now() - DAY);
+  const p = await mk({ stage: "archived", archivedAt, purgeAfter });
+  // The app clock is pinned to 2001, behind the archive: a daily card is floored at purge_after (Codex PR242-r2, r3),
+  // and an early ask's card at archived_at.
   const c = await approvals.raiseGuardedCard(purgeCard(p, { github: 1 }), { projectId: p.id, archivedAt, due: true });
   assert.equal(typeof c.id, "string");
-  assert.equal(c.createdAt.getTime(), archivedAt.getTime(), "the later of the app clock and archived_at");
+  assert.equal(c.createdAt.getTime(), purgeAfter.getTime(), "a daily card: the latest of the app clock, archived_at and purge_after");
+  const early = await mk({ stage: "archived", archivedAt, purgeAfter: new Date(Date.now() + DAY) });
+  const e = await approvals.raiseGuardedCard(purgeCard(early, {}), { projectId: early.id, archivedAt, due: false });
+  assert.equal(e.createdAt.getTime(), archivedAt.getTime(), "an early ask: the later of the app clock and archived_at");
   // With the app clock ahead of the archive, the app clock dates the card (one clock with Archive's archived_at).
   const appNow = Date.now() + 5 * 60_000;
   const ahead = new Approvals({ store: new PrismaApprovalStore(db, 5000), grants: null, notifier: null, verifyKkSession: () => false, now: () => appNow });
